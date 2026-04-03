@@ -27,20 +27,24 @@ src/     — Bun CLI + server + MCP + transcription
 Five tables per vault. Vaults start blank — no predefined tags or schema. Clients create the tags they need.
 
 ```sql
-notes       (id, content, path, created_at, updated_at)
+notes       (id, content, path, metadata, created_at, updated_at)
 tags        (name)
 note_tags   (note_id, tag_name)
 attachments (id, note_id, path, mime_type, created_at)
-links       (source_id, target_id, relationship, created_at)
+links       (source_id, target_id, relationship, metadata, created_at)
 ```
 
-### MCP Tools (16)
+Metadata is a JSON column on notes and links. Queryable via `json_extract()`.
 
-Core: `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`, `tag-note`, `untag-note`, `create-link`, `delete-link`, `get-links`, `list-tags`
+### MCP Tools (18)
+
+Core: `get-note`, `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`, `tag-note`, `untag-note`, `create-link`, `delete-link`, `get-links`, `list-tags`
 
 Bulk: `create-notes`, `batch-tag`, `batch-untag`
 
 Graph: `traverse-links`, `find-path`
+
+Multi-vault: `list-vaults`
 
 ## Bun-native
 
