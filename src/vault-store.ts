@@ -30,6 +30,14 @@ export class BunStore implements Store {
     return noteOps.getNote(this.db, id);
   }
 
+  getNoteByPath(path: string): Note | null {
+    return noteOps.getNoteByPath(this.db, path);
+  }
+
+  getNotes(ids: string[]): Note[] {
+    return noteOps.getNotes(this.db, ids);
+  }
+
   updateNote(id: string, updates: { content?: string; path?: string }): Note {
     return noteOps.updateNote(this.db, id, updates);
   }

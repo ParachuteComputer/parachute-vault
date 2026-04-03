@@ -326,7 +326,8 @@ describe("MCP tools", () => {
     expect(names).toContain("batch-untag");
     expect(names).toContain("traverse-links");
     expect(names).toContain("find-path");
-    expect(tools).toHaveLength(16);
+    expect(names).toContain("get-note");
+    expect(tools).toHaveLength(17);
   });
 
   it("create-note tool works", () => {

@@ -145,6 +145,37 @@ describe("BunStore", () => {
     const tags = store.listTags();
     expect(tags.length).toBe(0);
   });
+
+  test("gets note by path", () => {
+    store.createNote("README content", { path: "Projects/Parachute/README" });
+    const note = store.getNoteByPath("Projects/Parachute/README");
+    expect(note).not.toBeNull();
+    expect(note!.content).toBe("README content");
+    expect(note!.path).toBe("Projects/Parachute/README");
+  });
+
+  test("gets multiple notes by IDs", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    const c = store.createNote("C");
+
+    const fetched = store.getNotes([a.id, c.id]);
+    expect(fetched.length).toBe(2);
+    expect(fetched.map((n) => n.content)).toContain("A");
+    expect(fetched.map((n) => n.content)).toContain("C");
+  });
+
+  test("queries by path prefix", () => {
+    store.createNote("Root README", { path: "README" });
+    store.createNote("Project README", { path: "Projects/Parachute/README" });
+    store.createNote("Project Notes", { path: "Projects/Parachute/Notes" });
+    store.createNote("Other", { path: "Other/Stuff" });
+
+    const results = store.queryNotes({ pathPrefix: "Projects/Parachute" });
+    expect(results.length).toBe(2);
+    expect(results.map((n) => n.path)).toContain("Projects/Parachute/README");
+    expect(results.map((n) => n.path)).toContain("Projects/Parachute/Notes");
+  });
 });
 
 describe("bulk operations", () => {
@@ -238,6 +269,23 @@ describe("deeper link queries", () => {
     expect(result!.relationships).toEqual(["related-to", "mentions"]);
   });
 
+  test("get-links returns hydrated note summaries", () => {
+    const a = store.createNote("Note A", { path: "a", tags: ["important"] });
+    const b = store.createNote("Note B", { path: "b" });
+    store.createLink(a.id, b.id, "related-to");
+
+    // Use MCP tool
+    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
+    const tools = generateVaultMcpTools(db, config);
+    const getLinksTool = tools.find((t) => t.name === "get-links")!;
+
+    const result = getLinksTool.execute({ id: a.id }) as any[];
+    expect(result.length).toBe(1);
+    expect(result[0].targetNote.path).toBe("b");
+    expect(result[0].sourceNote.path).toBe("a");
+    expect(result[0].sourceNote.tags).toContain("important");
+  });
+
   test("returns null when no path exists", () => {
     const a = store.createNote("A");
     const b = store.createNote("B");
@@ -249,16 +297,17 @@ describe("deeper link queries", () => {
 });
 
 describe("MCP tools", () => {
-  test("generates all 16 tools", () => {
+  test("generates all 17 tools", () => {
     const config: VaultConfig = {
       name: "test",
       api_keys: [],
       created_at: new Date().toISOString(),
     };
     const tools = generateVaultMcpTools(db, config);
-    expect(tools.length).toBe(16);
+    expect(tools.length).toBe(17);
 
     const names = tools.map((t) => t.name);
+    expect(names).toContain("get-note");
     expect(names).toContain("create-note");
     expect(names).toContain("create-notes");
     expect(names).toContain("batch-tag");
@@ -266,7 +315,38 @@ describe("MCP tools", () => {
     expect(names).toContain("traverse-links");
     expect(names).toContain("find-path");
     expect(names).toContain("list-tags");
-    // No template-specific tools — templates are just notes tagged #template
+  });
+
+  test("get-note tool works by id", () => {
+    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
+    const tools = generateVaultMcpTools(db, config);
+    const note = store.createNote("By ID", { path: "test/note" });
+
+    const getTool = tools.find((t) => t.name === "get-note")!;
+    const result = getTool.execute({ id: note.id }) as any;
+    expect(result.content).toBe("By ID");
+    expect(result.path).toBe("test/note");
+  });
+
+  test("get-note tool works by path", () => {
+    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
+    const tools = generateVaultMcpTools(db, config);
+    store.createNote("By Path", { path: "Projects/README" });
+
+    const getTool = tools.find((t) => t.name === "get-note")!;
+    const result = getTool.execute({ path: "Projects/README" }) as any;
+    expect(result.content).toBe("By Path");
+  });
+
+  test("get-note tool fetches multiple by ids", () => {
+    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
+    const tools = generateVaultMcpTools(db, config);
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+
+    const getTool = tools.find((t) => t.name === "get-note")!;
+    const result = getTool.execute({ ids: [a.id, b.id] }) as any[];
+    expect(result.length).toBe(2);
   });
 
   test("enriches descriptions with vault hints", () => {
