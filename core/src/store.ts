@@ -16,7 +16,7 @@ export class SqliteStore implements Store {
 
   // ---- Notes ----
 
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[] }): Note {
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> }): Note {
     return noteOps.createNote(this.db, content, opts);
   }
 
@@ -32,7 +32,7 @@ export class SqliteStore implements Store {
     return noteOps.getNotes(this.db, ids);
   }
 
-  updateNote(id: string, updates: { content?: string; path?: string }): Note {
+  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note {
     return noteOps.updateNote(this.db, id, updates);
   }
 
@@ -64,8 +64,8 @@ export class SqliteStore implements Store {
 
   // ---- Links ----
 
-  createLink(sourceId: string, targetId: string, relationship: string): Link {
-    return linkOps.createLink(this.db, sourceId, targetId, relationship);
+  createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Link {
+    return linkOps.createLink(this.db, sourceId, targetId, relationship, metadata);
   }
 
   deleteLink(sourceId: string, targetId: string, relationship: string): void {

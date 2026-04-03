@@ -44,36 +44,40 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "create-note",
-      description: `Create a new note with optional tags and path. Path works like a filesystem — use it to organize notes (e.g., 'Projects/Parachute/README', 'Meetings/2026-04-03').`,
+      description: `Create a new note with optional tags, path, and metadata. Path works like a filesystem (e.g., 'Projects/Parachute/README'). Metadata is a JSON object for structured properties (e.g., { "status": "draft", "priority": "high" }).`,
       inputSchema: {
         type: "object",
         properties: {
           content: { type: "string", description: "Note content (markdown)" },
           tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
           path: { type: "string", description: "Optional path/name (e.g., 'Grocery List', 'Blog/My Post')" },
+          metadata: { type: "object", description: "Structured metadata (e.g., { status: 'draft', priority: 'high' })" },
         },
         required: ["content"],
       },
       execute: (params) => notes.createNote(db, params.content as string, {
         tags: params.tags as string[] | undefined,
         path: params.path as string | undefined,
+        metadata: params.metadata as Record<string, unknown> | undefined,
       }),
     },
     {
       name: "update-note",
-      description: "Update an existing note's content or path.",
+      description: "Update a note's content, path, or metadata.",
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "string", description: "Note ID" },
           content: { type: "string", description: "New content" },
           path: { type: "string", description: "New path/name" },
+          metadata: { type: "object", description: "New metadata (replaces existing)" },
         },
         required: ["id"],
       },
       execute: (params) => notes.updateNote(db, params.id as string, {
         content: params.content as string | undefined,
         path: params.path as string | undefined,
+        metadata: params.metadata as Record<string, unknown> | undefined,
       }),
     },
     {
@@ -93,13 +97,14 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "read-notes",
-      description: `Read notes, filtered by tags, path prefix, and/or date range. Use path_prefix to browse notes like a filesystem (e.g., 'Projects/' returns all project notes).`,
+      description: `Read notes, filtered by tags, path prefix, metadata, and/or date range. Use path_prefix to browse like a filesystem. Use metadata to filter by structured properties (e.g., { "status": "in-progress" }).`,
       inputSchema: {
         type: "object",
         properties: {
           tags: { type: "array", items: { type: "string" }, description: "Filter by tags (AND)" },
           exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
-          path_prefix: { type: "string", description: "Filter by path prefix (e.g., 'Projects/Parachute' matches 'Projects/Parachute/README')" },
+          path_prefix: { type: "string", description: "Filter by path prefix (e.g., 'Projects/Parachute')" },
+          metadata: { type: "object", description: "Filter by metadata values (exact match per key)" },
           date_from: { type: "string", description: "Start date (ISO, inclusive)" },
           date_to: { type: "string", description: "End date (ISO, exclusive — use the day after your range)" },
           sort: { type: "string", enum: ["asc", "desc"], description: "Sort by created_at" },
@@ -111,6 +116,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         tags: params.tags as string[] | undefined,
         excludeTags: params.exclude_tags as string[] | undefined,
         pathPrefix: params.path_prefix as string | undefined,
+        metadata: params.metadata as Record<string, unknown> | undefined,
         dateFrom: params.date_from as string | undefined,
         dateTo: params.date_to as string | undefined,
         sort: params.sort as "asc" | "desc" | undefined,
@@ -169,13 +175,14 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "create-link",
-      description: "Create a directed link between two notes (e.g., mentions, quotes, related-to).",
+      description: "Create a directed link between two notes (e.g., mentions, quotes, related-to). Optional metadata for context (e.g., { confidence: 0.9, context: 'mentioned in meeting' }).",
       inputSchema: {
         type: "object",
         properties: {
           source_id: { type: "string", description: "Source note ID" },
           target_id: { type: "string", description: "Target note ID" },
           relationship: { type: "string", description: "Relationship type (e.g., mentions, related-to)" },
+          metadata: { type: "object", description: "Optional link metadata" },
         },
         required: ["source_id", "target_id", "relationship"],
       },
@@ -184,6 +191,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         params.source_id as string,
         params.target_id as string,
         params.relationship as string,
+        params.metadata as Record<string, unknown> | undefined,
       ),
     },
     {

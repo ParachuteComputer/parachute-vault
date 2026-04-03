@@ -22,14 +22,15 @@ export function generateId(): string {
 export function createNote(
   db: Database,
   content: string,
-  opts?: { id?: string; path?: string; tags?: string[] },
+  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> },
 ): Note {
   const id = opts?.id ?? generateId();
   const now = new Date().toISOString();
+  const metadata = opts?.metadata ? JSON.stringify(opts.metadata) : "{}";
 
   db.prepare(
-    `INSERT INTO notes (id, content, path, created_at) VALUES (?, ?, ?, ?)`,
-  ).run(id, content, opts?.path ?? null, now);
+    `INSERT INTO notes (id, content, path, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
+  ).run(id, content, opts?.path ?? null, metadata, now);
 
   if (opts?.tags && opts.tags.length > 0) {
     tagNote(db, id, opts.tags);
@@ -72,7 +73,7 @@ export function getNotes(db: Database, ids: string[]): Note[] {
 export function updateNote(
   db: Database,
   id: string,
-  updates: { content?: string; path?: string },
+  updates: { content?: string; path?: string; metadata?: Record<string, unknown> },
 ): Note {
   const now = new Date().toISOString();
   const sets: string[] = ["updated_at = ?"];
@@ -85,6 +86,10 @@ export function updateNote(
   if (updates.path !== undefined) {
     sets.push("path = ?");
     values.push(updates.path);
+  }
+  if (updates.metadata !== undefined) {
+    sets.push("metadata = ?");
+    values.push(JSON.stringify(updates.metadata));
   }
 
   values.push(id);
@@ -123,6 +128,14 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   if (opts.pathPrefix) {
     conditions.push("n.path LIKE ?");
     params.push(opts.pathPrefix + "%");
+  }
+
+  // Metadata filters
+  if (opts.metadata) {
+    for (const [key, value] of Object.entries(opts.metadata)) {
+      conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
+      params.push(key, typeof value === "string" ? value : JSON.stringify(value));
+    }
   }
 
   // Date range
@@ -360,15 +373,21 @@ interface NoteRow {
   id: string;
   content: string;
   path: string | null;
+  metadata: string | null;
   created_at: string;
   updated_at: string | null;
 }
 
 function rowToNote(row: NoteRow): Note {
+  let metadata: Record<string, unknown> | undefined;
+  if (row.metadata && row.metadata !== "{}") {
+    try { metadata = JSON.parse(row.metadata); } catch {}
+  }
   return {
     id: row.id,
     content: row.content,
     path: row.path ?? undefined,
+    metadata,
     createdAt: row.created_at,
     updatedAt: row.updated_at ?? undefined,
   };

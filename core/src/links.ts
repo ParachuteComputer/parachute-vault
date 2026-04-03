@@ -7,13 +7,15 @@ export function createLink(
   sourceId: string,
   targetId: string,
   relationship: string,
+  metadata?: Record<string, unknown>,
 ): Link {
   const now = new Date().toISOString();
+  const metadataJson = metadata ? JSON.stringify(metadata) : "{}";
 
   db.prepare(
-    `INSERT OR IGNORE INTO links (source_id, target_id, relationship, created_at)
-     VALUES (?, ?, ?, ?)`,
-  ).run(sourceId, targetId, relationship, now);
+    `INSERT OR IGNORE INTO links (source_id, target_id, relationship, metadata, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(sourceId, targetId, relationship, metadataJson, now);
 
   const row = db.prepare(
     `SELECT * FROM links WHERE source_id = ? AND target_id = ? AND relationship = ?`,
@@ -57,21 +59,28 @@ export function getLinks(
 
 // ---- Note Summaries (for hydrated results) ----
 
-interface NoteRow {
+interface SummaryRow {
   id: string;
   path: string | null;
+  metadata: string | null;
   created_at: string;
   updated_at: string | null;
 }
 
+function parseMetadata(raw: string | null): Record<string, unknown> | undefined {
+  if (!raw || raw === "{}") return undefined;
+  try { return JSON.parse(raw); } catch { return undefined; }
+}
+
 function getNoteSummary(db: Database, noteId: string): NoteSummary | undefined {
   const row = db.prepare(
-    "SELECT id, path, created_at, updated_at FROM notes WHERE id = ?",
-  ).get(noteId) as NoteRow | undefined;
+    "SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id = ?",
+  ).get(noteId) as SummaryRow | undefined;
   if (!row) return undefined;
   return {
     id: row.id,
     path: row.path ?? undefined,
+    metadata: parseMetadata(row.metadata),
     createdAt: row.created_at,
     updatedAt: row.updated_at ?? undefined,
     tags: getNoteTags(db, row.id),
@@ -83,12 +92,13 @@ function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSumm
   if (noteIds.length === 0) return map;
   const placeholders = noteIds.map(() => "?").join(", ");
   const rows = db.prepare(
-    `SELECT id, path, created_at, updated_at FROM notes WHERE id IN (${placeholders})`,
-  ).all(...noteIds) as NoteRow[];
+    `SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id IN (${placeholders})`,
+  ).all(...noteIds) as SummaryRow[];
   for (const row of rows) {
     map.set(row.id, {
       id: row.id,
       path: row.path ?? undefined,
+      metadata: parseMetadata(row.metadata),
       createdAt: row.created_at,
       updatedAt: row.updated_at ?? undefined,
       tags: getNoteTags(db, row.id),
@@ -292,14 +302,20 @@ interface LinkRow {
   source_id: string;
   target_id: string;
   relationship: string;
+  metadata: string | null;
   created_at: string;
 }
 
 function rowToLink(row: LinkRow): Link {
+  let metadata: Record<string, unknown> | undefined;
+  if (row.metadata && row.metadata !== "{}") {
+    try { metadata = JSON.parse(row.metadata); } catch {}
+  }
   return {
     sourceId: row.source_id,
     targetId: row.target_id,
     relationship: row.relationship,
+    metadata,
     createdAt: row.created_at,
   };
 }

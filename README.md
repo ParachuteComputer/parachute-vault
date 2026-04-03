@@ -78,22 +78,24 @@ When an AI connects to a vault, it gets these tools:
 
 | Tool | Description |
 |------|-------------|
-| `create-note` | Create a note with optional tags and path |
-| `update-note` | Update a note's content or path |
+| `get-note` | Fetch a note by ID, path, or batch of IDs |
+| `create-note` | Create a note with optional tags, path, and metadata |
+| `update-note` | Update a note's content, path, or metadata |
 | `delete-note` | Delete a note |
-| `read-notes` | Query notes by tags, date range, with pagination |
+| `read-notes` | Query notes by tags, path prefix, metadata, and date range |
 | `search-notes` | Full-text search |
 | `tag-note` | Add tags to a note |
 | `untag-note` | Remove tags from a note |
-| `create-link` | Create a directed link between notes |
+| `create-link` | Create a directed link between notes (with optional metadata) |
 | `delete-link` | Delete a link |
-| `get-links` | Get links for a note |
+| `get-links` | Get links for a note (hydrated with note summaries) |
 | `list-tags` | List all tags with counts |
 | `create-notes` | Bulk create notes (one transaction) |
 | `batch-tag` | Tag multiple notes at once |
 | `batch-untag` | Untag multiple notes at once |
-| `traverse-links` | Multi-hop graph traversal |
+| `traverse-links` | Multi-hop graph traversal (with note summaries) |
 | `find-path` | Find shortest path between two notes |
+| `list-vaults` | List available vaults |
 
 ### Per-vault MCP descriptions
 
@@ -111,7 +113,7 @@ The vault teaches the AI how to use it. Different vaults can have different conv
 
 ## REST API
 
-All routes are under `/vaults/{name}/api/`:
+Routes are available per-vault at `/vaults/{name}/api/` or at `/api/` (routes to default vault):
 
 ```
 GET    /vaults/{name}/api/notes          # query notes
@@ -126,6 +128,8 @@ POST   /vaults/{name}/api/links          # create link
 DELETE /vaults/{name}/api/links          # delete link
 GET    /vaults/{name}/api/search?q=...   # full-text search
 
+POST   /mcp                              # unified MCP (all vaults)
+*      /vaults/{name}/mcp               # per-vault scoped MCP
 POST   /v1/audio/transcriptions          # transcribe audio (Whisper-compatible)
 GET    /v1/models                        # list transcription providers
 GET    /health                           # server health
@@ -136,11 +140,17 @@ GET    /health                           # server health
 Each vault is a SQLite database with five tables:
 
 ```
-notes       (id, content, path, created_at, updated_at)
+notes       (id, content, path, metadata, created_at, updated_at)
 tags        (name)
 note_tags   (note_id, tag_name)
-links       (source_id, target_id, relationship, created_at)
+links       (source_id, target_id, relationship, metadata, created_at)
 attachments (id, note_id, path, mime_type, created_at)
+```
+
+Metadata is a JSON column — store any structured properties:
+
+```json
+{ "status": "draft", "priority": "high", "author": "Aaron", "due": "2026-04-15" }
 ```
 
 Vaults start blank — no predefined tags or schema. Clients create the tags and conventions they need.
