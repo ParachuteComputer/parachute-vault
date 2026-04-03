@@ -20,6 +20,7 @@ const TAG_DOCS = `Built-in tags:
   #pinned — kept prominent (applies to any note)
   #archived — user is done with this (applies to any note)
   #voice — note was transcribed from voice
+  #template — reusable note templates (read these before creating structured notes)
 Users may create additional tags. Apply them as instructed.`;
 
 /**

@@ -150,6 +150,7 @@ describe("BunStore", () => {
     expect(names).toContain("pinned");
     expect(names).toContain("archived");
     expect(names).toContain("voice");
+    expect(names).toContain("template");
   });
 });
 
@@ -272,6 +273,7 @@ describe("MCP tools", () => {
     expect(names).toContain("traverse-links");
     expect(names).toContain("find-path");
     expect(names).toContain("list-tags");
+    // No template-specific tools — templates are just notes tagged #template
   });
 
   test("enriches descriptions with vault hints", () => {
@@ -304,82 +306,4 @@ describe("MCP tools", () => {
     expect(result.tags).toContain("daily");
   });
 
-  test("adds template tools when vault has templates", () => {
-    const config: VaultConfig = {
-      name: "work",
-      templates: [
-        {
-          name: "meeting-notes",
-          description: "Template for meeting notes",
-          content: "# Meeting Notes\n\n**Date:** \n**Attendees:** \n\n## Agenda\n\n## Action Items",
-          tags: ["doc", "meeting"],
-          path: "meetings",
-        },
-        {
-          name: "daily-standup",
-          description: "Daily standup update",
-          content: "## Yesterday\n\n## Today\n\n## Blockers",
-          tags: ["daily"],
-        },
-      ],
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    };
-
-    const tools = generateVaultMcpTools(db, config);
-    const names = tools.map((t) => t.name);
-    expect(names).toContain("list-templates");
-    expect(names).toContain("create-from-template");
-    expect(tools.length).toBe(18); // 16 core + 2 template tools
-  });
-
-  test("list-templates returns template metadata", () => {
-    const config: VaultConfig = {
-      name: "work",
-      templates: [
-        { name: "meeting", description: "Meeting notes", content: "# Meeting", tags: ["doc"] },
-      ],
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    };
-
-    const tools = generateVaultMcpTools(db, config);
-    const listTemplates = tools.find((t) => t.name === "list-templates")!;
-    const result = listTemplates.execute({}) as any[];
-    expect(result.length).toBe(1);
-    expect(result[0].name).toBe("meeting");
-    expect(result[0].description).toBe("Meeting notes");
-  });
-
-  test("create-from-template creates note with template content", () => {
-    const config: VaultConfig = {
-      name: "work",
-      templates: [
-        {
-          name: "meeting",
-          description: "Meeting notes",
-          content: "# Meeting\n\n## Agenda",
-          tags: ["doc", "meeting"],
-          path: "meetings",
-        },
-      ],
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    };
-
-    const tools = generateVaultMcpTools(db, config);
-    const createFromTemplate = tools.find((t) => t.name === "create-from-template")!;
-    const result = createFromTemplate.execute({
-      template: "meeting",
-      content: "Discussed roadmap",
-      tags: ["q2"],
-    }) as any;
-
-    expect(result.content).toContain("# Meeting");
-    expect(result.content).toContain("Discussed roadmap");
-    expect(result.tags).toContain("doc");
-    expect(result.tags).toContain("meeting");
-    expect(result.tags).toContain("q2");
-    expect(result.path).toBe("meetings");
-  });
 });

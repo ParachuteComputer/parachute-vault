@@ -52,19 +52,10 @@ export interface StoredKey {
   last_used_at?: string;
 }
 
-export interface NoteTemplate {
-  name: string;
-  description: string;
-  content: string;
-  tags?: string[];
-  path?: string;
-}
-
 export interface VaultConfig {
   name: string;
   description?: string;
   tool_hints?: Record<string, string>;
-  templates?: NoteTemplate[];
   api_keys: StoredKey[];
   created_at: string;
 }
@@ -93,24 +84,6 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push("tool_hints:");
     for (const [key, val] of Object.entries(config.tool_hints)) {
       lines.push(`  ${key}: "${val}"`);
-    }
-  }
-
-  if (config.templates && config.templates.length > 0) {
-    lines.push("templates:");
-    for (const tmpl of config.templates) {
-      lines.push(`  - name: ${tmpl.name}`);
-      lines.push(`    description: "${tmpl.description}"`);
-      lines.push(`    content: |`);
-      for (const line of tmpl.content.split("\n")) {
-        lines.push(`      ${line}`);
-      }
-      if (tmpl.tags && tmpl.tags.length > 0) {
-        lines.push(`    tags: [${tmpl.tags.join(", ")}]`);
-      }
-      if (tmpl.path) {
-        lines.push(`    path: ${tmpl.path}`);
-      }
     }
   }
 
@@ -162,34 +135,6 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
     for (const line of hintLines) {
       const m = line.match(/^\s{2}(\S+):\s*"?([^"\n]+)"?/);
       if (m) config.tool_hints[m[1]] = m[2];
-    }
-  }
-
-  // Parse templates
-  const templatesSection = yaml.match(/^templates:\n((?:\s{2}.+\n?)+)/m);
-  if (templatesSection) {
-    config.templates = [];
-    const templateBlocks = templatesSection[1].split(/\n\s{2}-\s+name:\s+/).slice(1);
-    for (const block of templateBlocks) {
-      const tNameMatch = block.match(/^(\S.+)/);
-      const tDescMatch = block.match(/description:\s*"?([^"\n]+)"?/);
-      const tContentMatch = block.match(/content:\s*\|\n((?:\s{6}.+\n?)+)/);
-      const tTagsMatch = block.match(/tags:\s*\[([^\]]*)\]/);
-      const tPathMatch = block.match(/path:\s*(\S+)/);
-
-      if (tNameMatch && tDescMatch && tContentMatch) {
-        config.templates.push({
-          name: tNameMatch[1].trim(),
-          description: tDescMatch[1].trim(),
-          content: tContentMatch[1]
-            .split("\n")
-            .map((l) => l.replace(/^\s{6}/, ""))
-            .join("\n")
-            .trim(),
-          tags: tTagsMatch ? tTagsMatch[1].split(",").map((t) => t.trim()).filter(Boolean) : undefined,
-          path: tPathMatch?.[1],
-        });
-      }
     }
   }
 

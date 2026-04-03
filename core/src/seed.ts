@@ -8,6 +8,7 @@ export const BUILTIN_TAGS = [
   "pinned",
   "archived",
   "voice",
+  "template",
 ] as const;
 
 /**
