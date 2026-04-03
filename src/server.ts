@@ -94,6 +94,27 @@ async function route(req: Request, path: string): Promise<Response> {
     return Response.json({ vaults });
   }
 
+  // Backward-compatible: /api/* routes to default vault
+  if (path.startsWith("/api/")) {
+    const defaultVault = readGlobalConfig().default_vault ?? "default";
+    const vaultConfig = readVaultConfig(defaultVault);
+    if (!vaultConfig) {
+      return Response.json({ error: "Default vault not found" }, { status: 404 });
+    }
+    const auth = authenticateVaultRequest(req, vaultConfig);
+    if ("error" in auth) return auth.error;
+    if (!isMethodAllowed(req.method, auth.scope)) {
+      return Response.json({ error: "Forbidden", message: "Read-only API key" }, { status: 403 });
+    }
+    const store = getVaultStore(defaultVault);
+    const apiPath = path.slice(4); // strip "/api"
+    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
+    if (apiPath === "/tags") return handleTags(req, store);
+    if (apiPath === "/links") return handleLinks(req, store);
+    if (apiPath === "/search") return handleSearch(req, store);
+    if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
+  }
+
   // Vault-scoped routes: /vaults/{name}/...
   const vaultMatch = path.match(/^\/vaults\/([^/]+)(\/.*)?$/);
   if (!vaultMatch) {
