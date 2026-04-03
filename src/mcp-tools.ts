@@ -103,3 +103,27 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
 
   return tools;
 }
+
+/**
+ * Generate MCP tools scoped to a single vault.
+ * No vault param — tools operate on that vault only.
+ * Descriptions enriched with the vault's hints.
+ */
+export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
+  const store = getVaultStore(vaultName);
+  const tools = generateMcpTools(store.db);
+  const config = readVaultConfig(vaultName);
+
+  const prefix = config?.description
+    ? `[Vault: ${vaultName}] ${config.description}\n\n`
+    : "";
+  const hints = config?.tool_hints ?? {};
+
+  return tools.map((tool) => {
+    let description = tool.description;
+    if (prefix) description = prefix + description;
+    const hint = hints[tool.name];
+    if (hint) description = description + "\n\n" + hint;
+    return { ...tool, description };
+  });
+}

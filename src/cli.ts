@@ -124,12 +124,23 @@ async function cmdInit() {
     console.log(`Found ${vaults.length} existing vault(s)`);
   }
 
-  // 2. Write global config
+  // 2. Write global config + global API key
   const globalConfig = readGlobalConfig();
   if (!globalConfig.default_vault) {
     globalConfig.default_vault = "default";
-    writeGlobalConfig(globalConfig);
   }
+  let globalApiKey: string | undefined;
+  if (!globalConfig.api_keys || globalConfig.api_keys.length === 0) {
+    const { fullKey, keyId } = generateApiKey();
+    globalConfig.api_keys = [{
+      id: keyId,
+      label: "default",
+      key_hash: hashKey(fullKey),
+      created_at: new Date().toISOString(),
+    }];
+    globalApiKey = fullKey;
+  }
+  writeGlobalConfig(globalConfig);
 
   // 3. Create .env with sensible defaults if it doesn't exist
   if (!existsSync(ENV_PATH)) {
@@ -161,9 +172,16 @@ async function cmdInit() {
 
   // 7. Summary
   console.log("\n---");
+  if (globalApiKey) {
+    console.log(`\nGlobal API key: ${globalApiKey}`);
+    console.log("  Grants access to all vaults (for unified /mcp endpoint).");
+  }
   if (apiKey) {
-    console.log(`\nAPI key: ${apiKey}`);
-    console.log("Save this — it will not be shown again.");
+    console.log(`\nVault API key (default): ${apiKey}`);
+    console.log("  Grants access to the 'default' vault only.");
+  }
+  if (globalApiKey || apiKey) {
+    console.log("\nSave these — they will not be shown again.");
   }
   console.log(`\nConfig:   ${CONFIG_DIR}`);
   console.log(`Server:   http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);

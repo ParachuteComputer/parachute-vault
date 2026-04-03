@@ -5,19 +5,17 @@
  * Routes:
  *   GET  /health                           — health check
  *   *    /mcp                              — unified MCP (all vaults, vault param)
+ *   *    /vaults/{name}/mcp                — scoped MCP (single vault, no vault param)
  *   POST /v1/audio/transcriptions          — transcription (via scribe)
  *   GET  /v1/models                        — transcription providers
  *   GET  /vaults                           — list vaults
- *   *    /vaults/{name}/api/notes[/...]     — note CRUD
- *   *    /vaults/{name}/api/tags            — tag listing
- *   *    /vaults/{name}/api/links           — link CRUD
- *   GET  /vaults/{name}/api/search          — full-text search
+ *   *    /vaults/{name}/api/...            — per-vault REST API
  */
 
 import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
-import { authenticateRequest } from "./auth.ts";
+import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { handleMcpHttp } from "./mcp-http.ts";
+import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleLinks, handleSearch, handleTranscription, handleModels } from "./routes.ts";
 
 ensureConfigDirSync();
@@ -33,7 +31,6 @@ const server = Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // CORS headers
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
@@ -68,12 +65,14 @@ async function route(req: Request, path: string): Promise<Response> {
     return Response.json({ status: "ok", vaults: listVaults() });
   }
 
-  // Unified MCP endpoint (all vaults via `vault` param on each tool)
+  // Unified MCP (all vaults, global auth)
   if (path === "/mcp" || path.startsWith("/mcp/")) {
-    return handleMcpHttp(req);
+    const authError = authenticateGlobalRequest(req);
+    if (authError) return authError;
+    return handleUnifiedMcp(req);
   }
 
-  // Whisper-compatible transcription
+  // Transcription
   if (path === "/v1/audio/transcriptions" && req.method === "POST") {
     return handleTranscription(req);
   }
@@ -95,7 +94,7 @@ async function route(req: Request, path: string): Promise<Response> {
     return Response.json({ vaults });
   }
 
-  // Vault-scoped REST API: /vaults/{name}/api/...
+  // Vault-scoped routes: /vaults/{name}/...
   const vaultMatch = path.match(/^\/vaults\/([^/]+)(\/.*)?$/);
   if (!vaultMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
@@ -112,12 +111,17 @@ async function route(req: Request, path: string): Promise<Response> {
     );
   }
 
-  const authError = authenticateRequest(req, vaultConfig);
+  // Auth: per-vault key OR global key
+  const authError = authenticateVaultRequest(req, vaultConfig);
   if (authError) return authError;
 
-  const store = getVaultStore(vaultName);
+  // Per-vault scoped MCP
+  if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
+    return handleScopedMcp(req, vaultName);
+  }
 
-  // REST API routes under /vaults/{name}/api/...
+  // REST API
+  const store = getVaultStore(vaultName);
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });

@@ -1,8 +1,9 @@
 /**
- * Streamable HTTP MCP transport — single unified endpoint.
+ * Streamable HTTP MCP transport.
  *
- * Mounted at /mcp. All vaults accessible through the `vault` parameter
- * on each tool. Uses the raw Server class with JSON Schema (no Zod).
+ * Two modes:
+ *   /mcp              — unified, all vaults via `vault` param + list-vaults
+ *   /vaults/{name}/mcp — scoped to one vault, no vault param, clean 17 tools
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -11,7 +12,8 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { generateUnifiedMcpTools } from "./mcp-tools.ts";
+import { generateUnifiedMcpTools, generateScopedMcpTools } from "./mcp-tools.ts";
+import type { McpToolDef } from "../core/src/mcp.ts";
 import crypto from "node:crypto";
 
 interface Session {
@@ -21,10 +23,21 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 
-/**
- * Handle an MCP HTTP request.
- */
-export async function handleMcpHttp(req: Request): Promise<Response> {
+/** Handle unified MCP at /mcp (all vaults). */
+export async function handleUnifiedMcp(req: Request): Promise<Response> {
+  return handleMcp(req, () => generateUnifiedMcpTools(), "parachute-vault");
+}
+
+/** Handle scoped MCP at /vaults/{name}/mcp (single vault). */
+export async function handleScopedMcp(req: Request, vaultName: string): Promise<Response> {
+  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`);
+}
+
+async function handleMcp(
+  req: Request,
+  getTools: () => McpToolDef[],
+  serverName: string,
+): Promise<Response> {
   const sessionId = req.headers.get("mcp-session-id");
   const existing = sessionId ? sessions.get(sessionId) : undefined;
 
@@ -32,15 +45,12 @@ export async function handleMcpHttp(req: Request): Promise<Response> {
     return existing.transport.handleRequest(req);
   }
 
-  const session = createSession();
+  const session = createSession(getTools(), serverName);
   await session.server.connect(session.transport);
   return session.transport.handleRequest(req);
 }
 
-function createSession(): Session {
-  // Generate tools fresh for each session (picks up vault changes)
-  const mcpTools = generateUnifiedMcpTools();
-
+function createSession(mcpTools: McpToolDef[], serverName: string): Session {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
     onsessioninitialized: (id) => {
@@ -52,7 +62,7 @@ function createSession(): Session {
   });
 
   const server = new Server(
-    { name: "parachute-vault", version: "0.1.0" },
+    { name: serverName, version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
 

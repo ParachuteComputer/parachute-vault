@@ -1,37 +1,18 @@
 /**
- * Per-vault API key authentication for the multi-vault server.
+ * API key authentication for the vault server.
  *
- * Each vault has its own set of API keys stored in vault.yaml.
- * Auth is checked per-request based on the vault being accessed.
+ * Two scopes:
+ *   - Global keys (in config.yaml): access unified /mcp and all vaults
+ *   - Per-vault keys (in vault.yaml): access that vault's /vaults/{name}/mcp and API
+ *
+ * Localhost bypasses auth for both.
  */
 
-import { readVaultConfig, writeVaultConfig, verifyKey } from "./config.ts";
-import type { VaultConfig } from "./config.ts";
-
-/**
- * Validate an API key against a vault's stored keys.
- * Returns the matched key ID or null if invalid.
- */
-export function validateVaultKey(
-  vaultConfig: VaultConfig,
-  providedKey: string,
-): string | null {
-  for (const stored of vaultConfig.api_keys) {
-    if (verifyKey(providedKey, stored.key_hash)) {
-      // Update last_used_at (fire-and-forget)
-      stored.last_used_at = new Date().toISOString();
-      try {
-        writeVaultConfig(vaultConfig);
-      } catch {}
-      return stored.id;
-    }
-  }
-  return null;
-}
+import { readVaultConfig, readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
+import type { VaultConfig, GlobalConfig, StoredKey } from "./config.ts";
 
 /**
  * Extract API key from request headers.
- * Supports both Bearer token and X-API-Key header.
  */
 export function extractApiKey(req: Request): string | null {
   const authHeader = req.headers.get("authorization");
@@ -48,20 +29,31 @@ export function isLocalhost(req: Request): boolean {
     const first = forwarded.split(",")[0].trim();
     return first === "127.0.0.1" || first === "::1" || first === "::ffff:127.0.0.1";
   }
-  // Bun.serve() binds to 127.0.0.1 — all connections are local
   return true;
 }
 
 /**
- * Authenticate a request for a specific vault.
- * Localhost bypasses auth. Remote requires a valid API key.
- * Returns null if authorized, or an error Response if not.
+ * Validate a key against a list of stored keys.
+ * Returns the matched key ID or null.
  */
-export function authenticateRequest(
+function validateKey(keys: StoredKey[], providedKey: string): string | null {
+  for (const stored of keys) {
+    if (verifyKey(providedKey, stored.key_hash)) {
+      stored.last_used_at = new Date().toISOString();
+      return stored.id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Authenticate for a specific vault.
+ * Accepts per-vault keys OR global keys.
+ */
+export function authenticateVaultRequest(
   req: Request,
   vaultConfig: VaultConfig,
 ): Response | null {
-  // Localhost bypasses auth
   if (isLocalhost(req)) return null;
 
   const key = extractApiKey(req);
@@ -72,13 +64,48 @@ export function authenticateRequest(
     );
   }
 
-  const keyId = validateVaultKey(vaultConfig, key);
-  if (!keyId) {
+  // Check per-vault keys first
+  if (validateKey(vaultConfig.api_keys, key)) {
+    try { writeVaultConfig(vaultConfig); } catch {}
+    return null;
+  }
+
+  // Check global keys
+  const globalConfig = readGlobalConfig();
+  if (globalConfig.api_keys && validateKey(globalConfig.api_keys, key)) {
+    try { writeGlobalConfig(globalConfig); } catch {}
+    return null;
+  }
+
+  return Response.json(
+    { error: "Unauthorized", message: "Invalid API key" },
+    { status: 401 },
+  );
+}
+
+/**
+ * Authenticate for the unified /mcp endpoint.
+ * Accepts global keys only.
+ */
+export function authenticateGlobalRequest(req: Request): Response | null {
+  if (isLocalhost(req)) return null;
+
+  const key = extractApiKey(req);
+  if (!key) {
     return Response.json(
-      { error: "Unauthorized", message: "Invalid API key" },
+      { error: "Unauthorized", message: "API key required" },
       { status: 401 },
     );
   }
 
-  return null;
+  const globalConfig = readGlobalConfig();
+  if (globalConfig.api_keys && validateKey(globalConfig.api_keys, key)) {
+    try { writeGlobalConfig(globalConfig); } catch {}
+    return null;
+  }
+
+  return Response.json(
+    { error: "Unauthorized", message: "Invalid API key" },
+    { status: 401 },
+  );
 }
