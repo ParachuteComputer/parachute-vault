@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
 import { initSchema } from "./schema.js";
 import { seedBuiltins } from "./seed.js";
@@ -9,7 +9,7 @@ import * as linkOps from "./links.js";
  * SQLite-backed Store implementation.
  */
 export class SqliteStore implements Store {
-  constructor(public readonly db: Database.Database) {
+  constructor(public readonly db: Database) {
     initSchema(db);
     seedBuiltins(db);
   }

@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import * as notes from "./notes.js";
 import * as links from "./links.js";
 
@@ -25,7 +25,7 @@ Users may create additional tags. Apply them as instructed.`;
 /**
  * Generate hardcoded MCP tools for the Parachute Daily system.
  */
-export function generateMcpTools(db: Database.Database): McpToolDef[] {
+export function generateMcpTools(db: Database): McpToolDef[] {
   return [
     {
       name: "create-note",
@@ -218,6 +218,6 @@ export function generateMcpTools(db: Database.Database): McpToolDef[] {
 /**
  * Format tool definitions for MCP protocol listing (without execute function).
  */
-export function listMcpTools(db: Database.Database): Omit<McpToolDef, "execute">[] {
+export function listMcpTools(db: Database): Omit<McpToolDef, "execute">[] {
   return generateMcpTools(db).map(({ execute, ...rest }) => rest);
 }

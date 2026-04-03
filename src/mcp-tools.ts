@@ -7,8 +7,8 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import { Database } from "bun:sqlite";
 import type { VaultConfig } from "./config.ts";
-import type { CompatDatabase } from "./db.ts";
 
 /**
  * Generate MCP tools for a vault, enriched with per-vault hints.
@@ -17,10 +17,10 @@ import type { CompatDatabase } from "./db.ts";
  * If it has `tool_hints`, matching tool descriptions are appended.
  */
 export function generateVaultMcpTools(
-  db: CompatDatabase,
+  db: Database,
   vaultConfig: VaultConfig,
 ): McpToolDef[] {
-  const tools = generateMcpTools(db as any);
+  const tools = generateMcpTools(db);
 
   const prefix = vaultConfig.description
     ? `[Vault: ${vaultConfig.name}] ${vaultConfig.description}\n\n`

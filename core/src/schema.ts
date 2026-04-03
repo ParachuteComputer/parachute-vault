@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 
 export const SCHEMA_VERSION = 3;
 
@@ -82,9 +82,9 @@ CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
 /**
  * Initialize database schema. Idempotent — safe to call on every startup.
  */
-export function initSchema(db: Database.Database): void {
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+export function initSchema(db: Database): void {
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
 
   // Check if we need to migrate from v2
   const hasOldTables = hasTable(db, "things");
@@ -101,7 +101,7 @@ export function initSchema(db: Database.Database): void {
   );
 }
 
-function hasTable(db: Database.Database, name: string): boolean {
+function hasTable(db: Database, name: string): boolean {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name);
   return !!row;
 }
@@ -109,12 +109,12 @@ function hasTable(db: Database.Database, name: string): boolean {
 /**
  * Migrate from v2 (things/thing_tags/edges/tools) to v3 (notes/note_tags/links).
  */
-function migrateFromV2(db: Database.Database): void {
+function migrateFromV2(db: Database): void {
   const alreadyMigrated = hasTable(db, "notes");
   if (alreadyMigrated) return;
 
   // Disable FK checks during migration to allow dropping tables freely
-  db.pragma("foreign_keys = OFF");
+  db.exec("PRAGMA foreign_keys = OFF");
 
   // Drop old FTS, triggers, and tables that will be recreated with new schema
   db.exec("DROP TRIGGER IF EXISTS things_fts_insert");
@@ -174,5 +174,5 @@ function migrateFromV2(db: Database.Database): void {
   db.exec("DROP TABLE IF EXISTS _old_tags");
 
   // Re-enable FK checks
-  db.pragma("foreign_keys = ON");
+  db.exec("PRAGMA foreign_keys = ON");
 }

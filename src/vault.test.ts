@@ -3,22 +3,22 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, rmSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
-import { CompatDatabase } from "./db.ts";
 import { generateVaultMcpTools } from "./mcp-tools.ts";
 import type { VaultConfig } from "./config.ts";
 
-let db: CompatDatabase;
+let db: Database;
 let store: BunStore;
 let tmpDir: string;
 
 beforeEach(() => {
   tmpDir = join(tmpdir(), `vault-test-${Date.now()}`);
   mkdirSync(tmpDir, { recursive: true });
-  db = new CompatDatabase(join(tmpDir, "test.db"));
+  db = new Database(join(tmpDir, "test.db"));
   store = new BunStore(db);
 });
 
