@@ -15,7 +15,7 @@
  *   parachute vault status                  — show full status
  */
 
-import { resolve, dirname } from "path";
+import { resolve } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, rmSync } from "fs";
 import {
@@ -144,9 +144,8 @@ async function cmdInit() {
   await installAgent();
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
-  // 5. Install MCP for default vault
-  const defaultVault = globalConfig.default_vault ?? "default";
-  installMcpConfig(defaultVault);
+  // 5. Install MCP (single HTTP entry for all vaults)
+  installMcpConfig();
   console.log(`  MCP server added to ~/.claude.json`);
 
   // 6. Check scribe
@@ -218,21 +217,10 @@ function cmdList() {
   }
 }
 
-function cmdMcpInstall(args: string[]) {
-  const name = args[0];
-  if (!name) {
-    console.error("Usage: parachute vault mcp-install <name>");
-    process.exit(1);
-  }
-
-  const config = readVaultConfig(name);
-  if (!config) {
-    console.error(`Vault "${name}" not found.`);
-    process.exit(1);
-  }
-
-  installMcpConfig(name);
-  console.log(`Added MCP server "parachute-vault/${name}" to ~/.claude.json`);
+function cmdMcpInstall(_args: string[]) {
+  installMcpConfig();
+  console.log(`Added MCP server "parachute-vault" to ~/.claude.json`);
+  console.log(`All vaults accessible via the 'vault' parameter on each tool.`);
 }
 
 function cmdRemove(args: string[]) {
@@ -257,7 +245,6 @@ function cmdRemove(args: string[]) {
   }
 
   rmSync(vaultDir(name), { recursive: true, force: true });
-  removeMcpConfig(name);
   console.log(`Vault "${name}" removed.`);
 }
 
@@ -409,7 +396,7 @@ function createVault(name: string): string {
   return fullKey;
 }
 
-function installMcpConfig(vaultName: string) {
+function installMcpConfig() {
   const claudeJsonPath = resolve(homedir(), ".claude.json");
   let config: any = {};
   if (existsSync(claudeJsonPath)) {
@@ -420,26 +407,38 @@ function installMcpConfig(vaultName: string) {
 
   if (!config.mcpServers) config.mcpServers = {};
 
-  const mcpStdioPath = resolve(dirname(import.meta.path), "mcp-stdio.ts");
-  const bunPath = Bun.which("bun") || resolve(homedir(), ".bun", "bin", "bun");
+  const globalConfig = readGlobalConfig();
+  const port = globalConfig.port || DEFAULT_PORT;
 
-  config.mcpServers[`parachute-vault/${vaultName}`] = {
-    command: bunPath,
-    args: [mcpStdioPath, vaultName],
+  // Clean up old per-vault stdio entries
+  for (const key of Object.keys(config.mcpServers)) {
+    if (key.startsWith("parachute-vault/")) {
+      delete config.mcpServers[key];
+    }
+  }
+
+  // Single HTTP MCP entry
+  config.mcpServers["parachute-vault"] = {
+    type: "url",
+    url: `http://127.0.0.1:${port}/mcp`,
   };
 
   writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
 }
 
-function removeMcpConfig(vaultName: string) {
+function removeMcpConfig() {
   const claudeJsonPath = resolve(homedir(), ".claude.json");
   if (!existsSync(claudeJsonPath)) return;
   try {
     const config = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
-    if (config.mcpServers?.[`parachute-vault/${vaultName}`]) {
-      delete config.mcpServers[`parachute-vault/${vaultName}`];
-      writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
+    delete config.mcpServers?.["parachute-vault"];
+    // Also clean up any old per-vault entries
+    for (const key of Object.keys(config.mcpServers ?? {})) {
+      if (key.startsWith("parachute-vault/")) {
+        delete config.mcpServers[key];
+      }
     }
+    writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
   } catch {}
 }
 
@@ -455,7 +454,7 @@ Vaults:
   parachute vault create <name>            Create a new vault
   parachute vault list                     List all vaults
   parachute vault remove <name> [--yes]    Remove a vault
-  parachute vault mcp-install <name>       Add vault MCP to Claude
+  parachute vault mcp-install              Add vault MCP to Claude
 
 Config:
   parachute vault config                   Show current configuration

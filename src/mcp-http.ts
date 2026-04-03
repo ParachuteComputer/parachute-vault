@@ -1,8 +1,8 @@
 /**
- * Streamable HTTP MCP transport for multi-vault server.
+ * Streamable HTTP MCP transport — single unified endpoint.
  *
- * Each vault gets its own MCP endpoint at /vaults/{name}/mcp.
- * Uses the raw Server class with JSON Schema (no Zod).
+ * Mounted at /mcp. All vaults accessible through the `vault` parameter
+ * on each tool. Uses the raw Server class with JSON Schema (no Zod).
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -11,7 +11,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { McpToolDef } from "../core/src/mcp.ts";
+import { generateUnifiedMcpTools } from "./mcp-tools.ts";
 import crypto from "node:crypto";
 
 interface Session {
@@ -22,13 +22,9 @@ interface Session {
 const sessions = new Map<string, Session>();
 
 /**
- * Handle an MCP HTTP request for a vault.
+ * Handle an MCP HTTP request.
  */
-export async function handleMcpHttp(
-  req: Request,
-  mcpTools: McpToolDef[],
-  vaultName: string,
-): Promise<Response> {
+export async function handleMcpHttp(req: Request): Promise<Response> {
   const sessionId = req.headers.get("mcp-session-id");
   const existing = sessionId ? sessions.get(sessionId) : undefined;
 
@@ -36,13 +32,15 @@ export async function handleMcpHttp(
     return existing.transport.handleRequest(req);
   }
 
-  // New session
-  const session = createSession(mcpTools, vaultName);
+  const session = createSession();
   await session.server.connect(session.transport);
   return session.transport.handleRequest(req);
 }
 
-function createSession(mcpTools: McpToolDef[], vaultName: string): Session {
+function createSession(): Session {
+  // Generate tools fresh for each session (picks up vault changes)
+  const mcpTools = generateUnifiedMcpTools();
+
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
     onsessioninitialized: (id) => {
@@ -54,7 +52,7 @@ function createSession(mcpTools: McpToolDef[], vaultName: string): Session {
   });
 
   const server = new Server(
-    { name: `parachute-vault/${vaultName}`, version: "0.1.0" },
+    { name: "parachute-vault", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
 

@@ -3,19 +3,20 @@
  * Multi-vault HTTP server using Bun.serve().
  *
  * Routes:
- *   GET  /health                          — health check
- *   *    /vaults/{name}/api/notes[/...]    — note CRUD
- *   *    /vaults/{name}/api/tags           — tag listing
- *   *    /vaults/{name}/api/links          — link CRUD
- *   GET  /vaults/{name}/api/search         — full-text search
- *   *    /vaults/{name}/mcp               — MCP over HTTP
- *   GET  /vaults                          — list vaults
+ *   GET  /health                           — health check
+ *   *    /mcp                              — unified MCP (all vaults, vault param)
+ *   POST /v1/audio/transcriptions          — transcription (via scribe)
+ *   GET  /v1/models                        — transcription providers
+ *   GET  /vaults                           — list vaults
+ *   *    /vaults/{name}/api/notes[/...]     — note CRUD
+ *   *    /vaults/{name}/api/tags            — tag listing
+ *   *    /vaults/{name}/api/links           — link CRUD
+ *   GET  /vaults/{name}/api/search          — full-text search
  */
 
 import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
 import { authenticateRequest } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { generateVaultMcpTools } from "./mcp-tools.ts";
 import { handleMcpHttp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleLinks, handleSearch, handleTranscription, handleModels } from "./routes.ts";
 
@@ -45,7 +46,6 @@ const server = Bun.serve({
 
     try {
       const response = await route(req, path);
-      // Add CORS headers to response
       for (const [k, v] of Object.entries(corsHeaders)) {
         response.headers.set(k, v);
       }
@@ -68,12 +68,15 @@ async function route(req: Request, path: string): Promise<Response> {
     return Response.json({ status: "ok", vaults: listVaults() });
   }
 
-  // Whisper-compatible transcription endpoint (served by parachute-scribe)
+  // Unified MCP endpoint (all vaults via `vault` param on each tool)
+  if (path === "/mcp" || path.startsWith("/mcp/")) {
+    return handleMcpHttp(req);
+  }
+
+  // Whisper-compatible transcription
   if (path === "/v1/audio/transcriptions" && req.method === "POST") {
     return handleTranscription(req);
   }
-
-  // Whisper-compatible models endpoint (health check for clients)
   if (path === "/v1/models" && req.method === "GET") {
     return handleModels();
   }
@@ -92,7 +95,7 @@ async function route(req: Request, path: string): Promise<Response> {
     return Response.json({ vaults });
   }
 
-  // Vault-scoped routes: /vaults/{name}/...
+  // Vault-scoped REST API: /vaults/{name}/api/...
   const vaultMatch = path.match(/^\/vaults\/([^/]+)(\/.*)?$/);
   if (!vaultMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
@@ -101,7 +104,6 @@ async function route(req: Request, path: string): Promise<Response> {
   const vaultName = vaultMatch[1];
   const subpath = vaultMatch[2] ?? "";
 
-  // Load vault config
   const vaultConfig = readVaultConfig(vaultName);
   if (!vaultConfig) {
     return Response.json(
@@ -110,18 +112,10 @@ async function route(req: Request, path: string): Promise<Response> {
     );
   }
 
-  // Auth check (skip for health)
   const authError = authenticateRequest(req, vaultConfig);
   if (authError) return authError;
 
-  // Get or create store
   const store = getVaultStore(vaultName);
-
-  // MCP endpoint
-  if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
-    const mcpTools = generateVaultMcpTools(store.db, vaultConfig);
-    return handleMcpHttp(req, mcpTools, vaultName);
-  }
 
   // REST API routes under /vaults/{name}/api/...
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
@@ -131,28 +125,18 @@ async function route(req: Request, path: string): Promise<Response> {
 
   const apiPath = apiMatch[1] ?? "";
 
-  // /api/notes[/...]
   if (apiPath.startsWith("/notes")) {
-    const notePath = apiPath.slice(6); // strip "/notes"
-    return handleNotes(req, store, notePath);
+    return handleNotes(req, store, apiPath.slice(6));
   }
-
-  // /api/tags
   if (apiPath === "/tags") {
     return handleTags(req, store);
   }
-
-  // /api/links
   if (apiPath === "/links") {
     return handleLinks(req, store);
   }
-
-  // /api/search
   if (apiPath === "/search") {
     return handleSearch(req, store);
   }
-
-  // /api/health
   if (apiPath === "/health") {
     return Response.json({ status: "ok", vault: vaultName });
   }
