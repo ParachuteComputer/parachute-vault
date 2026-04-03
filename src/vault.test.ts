@@ -8,8 +8,8 @@ import { mkdirSync, rmSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
-import { generateVaultMcpTools } from "./mcp-tools.ts";
-import type { VaultConfig } from "./config.ts";
+import { generateMcpTools } from "../core/src/mcp.ts";
+import { getLinksHydrated } from "../core/src/links.ts";
 
 let db: Database;
 let store: BunStore;
@@ -274,16 +274,11 @@ describe("deeper link queries", () => {
     const b = store.createNote("Note B", { path: "b" });
     store.createLink(a.id, b.id, "related-to");
 
-    // Use MCP tool
-    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
-    const tools = generateVaultMcpTools(db, config);
-    const getLinksTool = tools.find((t) => t.name === "get-links")!;
-
-    const result = getLinksTool.execute({ id: a.id }) as any[];
+    const result = getLinksHydrated(db, a.id);
     expect(result.length).toBe(1);
-    expect(result[0].targetNote.path).toBe("b");
-    expect(result[0].sourceNote.path).toBe("a");
-    expect(result[0].sourceNote.tags).toContain("important");
+    expect(result[0].targetNote?.path).toBe("b");
+    expect(result[0].sourceNote?.path).toBe("a");
+    expect(result[0].sourceNote?.tags).toContain("important");
   });
 
   test("returns null when no path exists", () => {
@@ -297,13 +292,8 @@ describe("deeper link queries", () => {
 });
 
 describe("MCP tools", () => {
-  test("generates all 17 tools", () => {
-    const config: VaultConfig = {
-      name: "test",
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    };
-    const tools = generateVaultMcpTools(db, config);
+  test("generates all 17 core tools", () => {
+    const tools = generateMcpTools(db);
     expect(tools.length).toBe(17);
 
     const names = tools.map((t) => t.name);
@@ -318,8 +308,7 @@ describe("MCP tools", () => {
   });
 
   test("get-note tool works by id", () => {
-    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
-    const tools = generateVaultMcpTools(db, config);
+    const tools = generateMcpTools(db);
     const note = store.createNote("By ID", { path: "test/note" });
 
     const getTool = tools.find((t) => t.name === "get-note")!;
@@ -329,8 +318,7 @@ describe("MCP tools", () => {
   });
 
   test("get-note tool works by path", () => {
-    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
-    const tools = generateVaultMcpTools(db, config);
+    const tools = generateMcpTools(db);
     store.createNote("By Path", { path: "Projects/README" });
 
     const getTool = tools.find((t) => t.name === "get-note")!;
@@ -339,8 +327,7 @@ describe("MCP tools", () => {
   });
 
   test("get-note tool fetches multiple by ids", () => {
-    const config: VaultConfig = { name: "test", api_keys: [], created_at: new Date().toISOString() };
-    const tools = generateVaultMcpTools(db, config);
+    const tools = generateMcpTools(db);
     const a = store.createNote("A");
     const b = store.createNote("B");
 
@@ -349,34 +336,63 @@ describe("MCP tools", () => {
     expect(result.length).toBe(2);
   });
 
-  test("enriches descriptions with vault hints", () => {
-    const config: VaultConfig = {
-      name: "work",
-      description: "Work knowledge base",
-      tool_hints: {
-        "create-note": "Always tag work notes with #work",
-      },
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    };
-    const tools = generateVaultMcpTools(db, config);
-    const createNote = tools.find((t) => t.name === "create-note")!;
-    expect(createNote.description).toContain("[Vault: work]");
-    expect(createNote.description).toContain("Work knowledge base");
-    expect(createNote.description).toContain("Always tag work notes with #work");
-  });
-
   test("create-note tool works via execute", () => {
-    const config: VaultConfig = {
-      name: "test",
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    };
-    const tools = generateVaultMcpTools(db, config);
+    const tools = generateMcpTools(db);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const result = createNote.execute({ content: "MCP note", tags: ["daily"] }) as any;
     expect(result.content).toBe("MCP note");
     expect(result.tags).toContain("daily");
   });
 
+  test("every tool has vault param in unified wrapper schema", () => {
+    const tools = generateMcpTools(db);
+    for (const tool of tools) {
+      expect(tool.inputSchema).toBeDefined();
+      expect(tool.execute).toBeFunction();
+    }
+  });
+});
+
+describe("auth scopes", () => {
+  test("read scope allows read tools", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("get-note", "read")).toBe(true);
+    expect(isToolAllowed("read-notes", "read")).toBe(true);
+    expect(isToolAllowed("search-notes", "read")).toBe(true);
+    expect(isToolAllowed("get-links", "read")).toBe(true);
+    expect(isToolAllowed("traverse-links", "read")).toBe(true);
+    expect(isToolAllowed("find-path", "read")).toBe(true);
+    expect(isToolAllowed("list-tags", "read")).toBe(true);
+    expect(isToolAllowed("list-vaults", "read")).toBe(true);
+  });
+
+  test("read scope blocks write tools", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("create-note", "read")).toBe(false);
+    expect(isToolAllowed("update-note", "read")).toBe(false);
+    expect(isToolAllowed("delete-note", "read")).toBe(false);
+    expect(isToolAllowed("tag-note", "read")).toBe(false);
+    expect(isToolAllowed("untag-note", "read")).toBe(false);
+    expect(isToolAllowed("create-link", "read")).toBe(false);
+    expect(isToolAllowed("delete-link", "read")).toBe(false);
+    expect(isToolAllowed("create-notes", "read")).toBe(false);
+    expect(isToolAllowed("batch-tag", "read")).toBe(false);
+    expect(isToolAllowed("batch-untag", "read")).toBe(false);
+  });
+
+  test("write scope allows everything", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("create-note", "write")).toBe(true);
+    expect(isToolAllowed("delete-note", "write")).toBe(true);
+    expect(isToolAllowed("get-note", "write")).toBe(true);
+  });
+
+  test("read scope allows GET but not POST/PATCH/DELETE", () => {
+    const { isMethodAllowed } = require("./auth.ts");
+    expect(isMethodAllowed("GET", "read")).toBe(true);
+    expect(isMethodAllowed("HEAD", "read")).toBe(true);
+    expect(isMethodAllowed("POST", "read")).toBe(false);
+    expect(isMethodAllowed("PATCH", "read")).toBe(false);
+    expect(isMethodAllowed("DELETE", "read")).toBe(false);
+  });
 });

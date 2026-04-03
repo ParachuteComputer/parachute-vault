@@ -10,7 +10,6 @@
   "scripts": {
     "start": "bun src/server.ts",
     "cli": "bun src/cli.ts",
-    "mcp": "bun src/mcp-stdio.ts",
     "test": "bun test src/",
     "test:core": "cd core && node --experimental-vm-modules node_modules/vitest/dist/cli.js run"
   },
