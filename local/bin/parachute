@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Parachute CLI launcher — uses tsx to run TypeScript directly
-# Resolve the real path (follows symlinks) to find the repo
-REAL_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c "import os; print(os.path.realpath('$0'))")"
-DIR="$(cd "$(dirname "$REAL_PATH")/.." && pwd)"
-exec npx --prefix "$DIR" tsx "$DIR/src/cli.ts" "$@"

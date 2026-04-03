@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 
 /** Built-in tags seeded on startup. */
 export const BUILTIN_TAGS = [
@@ -13,7 +13,7 @@ export const BUILTIN_TAGS = [
 /**
  * Seed builtin tags. Idempotent — skips if already present.
  */
-export function seedBuiltins(db: Database.Database): void {
+export function seedBuiltins(db: Database): void {
   const stmt = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
   for (const tag of BUILTIN_TAGS) {
     stmt.run(tag);

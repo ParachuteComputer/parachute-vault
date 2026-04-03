@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { BUILTIN_TAGS } from "./seed.js";
 import { generateMcpTools } from "./mcp.js";
 
 let store: SqliteStore;
-let db: Database.Database;
+let db: Database;
 
 beforeEach(() => {
   db = new Database(":memory:");

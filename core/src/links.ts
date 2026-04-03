@@ -1,8 +1,8 @@
-import type Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import type { Link } from "./types.js";
 
 export function createLink(
-  db: Database.Database,
+  db: Database,
   sourceId: string,
   targetId: string,
   relationship: string,
@@ -21,7 +21,7 @@ export function createLink(
 }
 
 export function deleteLink(
-  db: Database.Database,
+  db: Database,
   sourceId: string,
   targetId: string,
   relationship: string,
@@ -32,7 +32,7 @@ export function deleteLink(
 }
 
 export function getLinks(
-  db: Database.Database,
+  db: Database,
   noteId: string,
   opts?: { direction?: "outbound" | "inbound" | "both" },
 ): Link[] {

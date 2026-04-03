@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import type { Note, QueryOpts } from "./types.js";
 
 let idCounter = 0;
@@ -20,7 +20,7 @@ export function generateId(): string {
 }
 
 export function createNote(
-  db: Database.Database,
+  db: Database,
   content: string,
   opts?: { id?: string; path?: string; tags?: string[] },
 ): Note {
@@ -38,7 +38,7 @@ export function createNote(
   return getNote(db, id)!;
 }
 
-export function getNote(db: Database.Database, id: string): Note | null {
+export function getNote(db: Database, id: string): Note | null {
   const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | undefined;
   if (!row) return null;
 
@@ -48,7 +48,7 @@ export function getNote(db: Database.Database, id: string): Note | null {
 }
 
 export function updateNote(
-  db: Database.Database,
+  db: Database,
   id: string,
   updates: { content?: string; path?: string },
 ): Note {
@@ -71,11 +71,11 @@ export function updateNote(
   return getNote(db, id)!;
 }
 
-export function deleteNote(db: Database.Database, id: string): void {
+export function deleteNote(db: Database, id: string): void {
   db.prepare("DELETE FROM notes WHERE id = ?").run(id);
 }
 
-export function queryNotes(db: Database.Database, opts: QueryOpts): Note[] {
+export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const conditions: string[] = [];
   const params: unknown[] = [];
   const joins: string[] = [];
@@ -131,7 +131,7 @@ export function queryNotes(db: Database.Database, opts: QueryOpts): Note[] {
 }
 
 export function searchNotes(
-  db: Database.Database,
+  db: Database,
   query: string,
   opts?: { tags?: string[]; limit?: number },
 ): Note[] {
@@ -178,7 +178,7 @@ export function searchNotes(
 
 // ---- Tag Operations ----
 
-export function tagNote(db: Database.Database, noteId: string, tags: string[]): void {
+export function tagNote(db: Database, noteId: string, tags: string[]): void {
   const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
   const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
 
@@ -188,21 +188,21 @@ export function tagNote(db: Database.Database, noteId: string, tags: string[]): 
   }
 }
 
-export function untagNote(db: Database.Database, noteId: string, tags: string[]): void {
+export function untagNote(db: Database, noteId: string, tags: string[]): void {
   const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
   for (const tag of tags) {
     stmt.run(noteId, tag);
   }
 }
 
-export function getNoteTags(db: Database.Database, noteId: string): string[] {
+export function getNoteTags(db: Database, noteId: string): string[] {
   const rows = db.prepare(
     "SELECT tag_name FROM note_tags WHERE note_id = ? ORDER BY tag_name",
   ).all(noteId) as { tag_name: string }[];
   return rows.map((r) => r.tag_name);
 }
 
-export function listTags(db: Database.Database): { name: string; count: number }[] {
+export function listTags(db: Database): { name: string; count: number }[] {
   const rows = db.prepare(`
     SELECT t.name, COUNT(nt.note_id) as count
     FROM tags t
