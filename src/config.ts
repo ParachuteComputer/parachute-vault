@@ -26,7 +26,7 @@ export const VAULTS_DIR = join(CONFIG_DIR, "vaults");
 export const GLOBAL_CONFIG_PATH = join(CONFIG_DIR, "config.yaml");
 export const LOG_PATH = join(CONFIG_DIR, "vault.log");
 export const ERR_PATH = join(CONFIG_DIR, "vault.err");
-export const DEFAULT_PORT = 1941;
+export const DEFAULT_PORT = 1940;
 
 export function vaultDir(name: string): string {
   return join(VAULTS_DIR, name);
