@@ -3,34 +3,43 @@
  * Parachute Vault CLI.
  *
  * Usage:
- *   parachute vault init              — initialize ~/.parachute, seed default vault, install daemon
- *   parachute vault create <name>     — create a new vault
- *   parachute vault list              — list all vaults
- *   parachute vault mcp-install <name> — add vault MCP to ~/.claude.json
- *   parachute vault remove <name>     — remove a vault
- *   parachute vault serve             — run the server (foreground)
+ *   parachute vault init                    — set up everything, one command
+ *   parachute vault create <name>           — create a new vault
+ *   parachute vault list                    — list all vaults
+ *   parachute vault mcp-install <name>      — add vault MCP to ~/.claude.json
+ *   parachute vault remove <name>           — remove a vault
+ *   parachute vault config                  — show all config
+ *   parachute vault config set <key> <val>  — set a config value
+ *   parachute vault config unset <key>      — remove a config value
+ *   parachute vault serve                   — run the server (foreground)
+ *   parachute vault status                  — show full status
  */
 
 import { resolve, dirname } from "path";
 import { homedir } from "os";
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, rmSync } from "fs";
 import {
   ensureConfigDirSync,
   readVaultConfig,
   writeVaultConfig,
   readGlobalConfig,
   writeGlobalConfig,
+  readEnvFile,
+  writeEnvFile,
+  setEnvVar,
+  unsetEnvVar,
+  loadEnvFile,
+  getScribeStatus,
   listVaults,
   vaultDir,
-  vaultConfigPath,
   generateApiKey,
   hashKey,
   DEFAULT_PORT,
   CONFIG_DIR,
-  VAULTS_DIR,
+  ENV_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
-import { installAgent, uninstallAgent, isAgentLoaded } from "./launchd.ts";
+import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -72,11 +81,17 @@ switch (command) {
   case "rm":
     cmdRemove(cmdArgs);
     break;
+  case "config":
+    await cmdConfig(cmdArgs);
+    break;
   case "serve":
     await cmdServe();
     break;
   case "status":
     await cmdStatus();
+    break;
+  case "restart":
+    await cmdRestart();
     break;
   case "help":
   case "--help":
@@ -96,37 +111,67 @@ switch (command) {
 async function cmdInit() {
   ensureConfigDirSync();
 
-  // Create default vault if none exist
+  console.log("Parachute Vault — self-hosted knowledge graph\n");
+
+  // 1. Create default vault if none exist
   const vaults = listVaults();
+  let apiKey: string | undefined;
   if (vaults.length === 0) {
     console.log("Creating default vault...");
-    const key = createVault("default", "Default vault");
-    console.log(`  Vault: default`);
-    console.log(`  API key: ${key}`);
-    console.log(`  Save this key — it will not be shown again.`);
-    console.log();
+    apiKey = createVault("default");
+    console.log("  Created vault: default");
+  } else {
+    console.log(`Found ${vaults.length} existing vault(s)`);
   }
 
-  // Write global config
+  // 2. Write global config
   const globalConfig = readGlobalConfig();
   if (!globalConfig.default_vault) {
     globalConfig.default_vault = "default";
     writeGlobalConfig(globalConfig);
   }
 
-  // Install launchd agent
-  console.log("Installing launchd agent...");
-  await installAgent();
-  console.log(`  Label: computer.parachute.vault`);
-  console.log(`  Server: http://127.0.0.1:${globalConfig.port}`);
-  console.log();
+  // 3. Create .env with sensible defaults if it doesn't exist
+  if (!existsSync(ENV_PATH)) {
+    writeEnvFile({
+      PORT: String(globalConfig.port || DEFAULT_PORT),
+    });
+    console.log("  Created ~/.parachute/.env");
+  }
 
-  // Install MCP for default vault
+  // 4. Install launchd daemon
+  console.log("\nInstalling daemon...");
+  await installAgent();
+  console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
+
+  // 5. Install MCP for default vault
   const defaultVault = globalConfig.default_vault ?? "default";
   installMcpConfig(defaultVault);
-  console.log(`Added MCP server "parachute-vault" to ~/.claude.json`);
-  console.log();
-  console.log("Parachute Vault initialized.");
+  console.log(`  MCP server added to ~/.claude.json`);
+
+  // 6. Check scribe
+  loadEnvFile();
+  const scribe = await getScribeStatus();
+  if (scribe.available) {
+    console.log(`\nTranscription: ${scribe.activeTranscriber} (via parachute-scribe)`);
+    console.log(`  Cleanup: ${scribe.activeCleaner}`);
+  } else {
+    console.log("\nTranscription: not available");
+    console.log("  Install parachute-scribe to enable: bun add parachute-scribe");
+  }
+
+  // 7. Summary
+  console.log("\n---");
+  if (apiKey) {
+    console.log(`\nAPI key: ${apiKey}`);
+    console.log("Save this — it will not be shown again.");
+  }
+  console.log(`\nConfig:   ${CONFIG_DIR}`);
+  console.log(`Server:   http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
+  console.log(`\nNext steps:`);
+  console.log(`  parachute vault status        — check everything is running`);
+  console.log(`  parachute vault config        — view/edit configuration`);
+  console.log(`  parachute vault create <name> — create another vault`);
 }
 
 function cmdCreate(args: string[]) {
@@ -148,13 +193,12 @@ function cmdCreate(args: string[]) {
   }
 
   ensureConfigDirSync();
-  const description = args.slice(1).join(" ") || undefined;
-  const key = createVault(name, description);
+  const key = createVault(name);
 
   console.log(`Vault "${name}" created.`);
   console.log(`  Path: ${vaultDir(name)}`);
   console.log(`  API key: ${key}`);
-  console.log(`  Save this key — it will not be shown again.`);
+  console.log(`  Save this — it will not be shown again.`);
   console.log();
   console.log(`To add MCP to Claude: parachute vault mcp-install ${name}`);
 }
@@ -162,20 +206,15 @@ function cmdCreate(args: string[]) {
 function cmdList() {
   const vaults = listVaults();
   if (vaults.length === 0) {
-    console.log("No vaults found. Run: parachute vault init");
+    console.log("No vaults. Run: parachute vault init");
     return;
   }
 
-  console.log("Vaults:\n");
   for (const name of vaults) {
     const config = readVaultConfig(name);
     const keys = config?.api_keys.length ?? 0;
     const desc = config?.description ? ` — ${config.description}` : "";
-    console.log(`  ${name}${desc}`);
-    console.log(`    Path: ${vaultDir(name)}`);
-    console.log(`    Keys: ${keys}`);
-    console.log(`    Created: ${config?.created_at ?? "unknown"}`);
-    console.log();
+    console.log(`  ${name}${desc}  (${keys} key${keys !== 1 ? "s" : ""})`);
   }
 }
 
@@ -188,7 +227,7 @@ function cmdMcpInstall(args: string[]) {
 
   const config = readVaultConfig(name);
   if (!config) {
-    console.error(`Vault "${name}" not found. Run: parachute vault create ${name}`);
+    console.error(`Vault "${name}" not found.`);
     process.exit(1);
   }
 
@@ -209,44 +248,141 @@ function cmdRemove(args: string[]) {
     process.exit(1);
   }
 
-  // Check for --yes / -y flag
   const force = args.includes("--yes") || args.includes("-y");
   if (!force) {
     console.log(`This will permanently delete vault "${name}" and all its data.`);
     console.log(`  Path: ${vaultDir(name)}`);
-    console.log(`\nTo confirm, run: parachute vault remove ${name} --yes`);
+    console.log(`\nTo confirm: parachute vault remove ${name} --yes`);
     return;
   }
 
   rmSync(vaultDir(name), { recursive: true, force: true });
-
-  // Remove from ~/.claude.json
   removeMcpConfig(name);
-
   console.log(`Vault "${name}" removed.`);
 }
 
+async function cmdConfig(args: string[]) {
+  const subcmd = args[0];
+
+  // parachute vault config — show current config
+  if (!subcmd) {
+    loadEnvFile();
+    const env = readEnvFile();
+    const globalConfig = readGlobalConfig();
+
+    console.log("Parachute Vault Configuration");
+    console.log(`  Config dir: ${CONFIG_DIR}`);
+    console.log(`  Env file:   ${ENV_PATH}`);
+    console.log(`  Port:       ${globalConfig.port}`);
+    console.log();
+
+    if (Object.keys(env).length === 0) {
+      console.log("  No env vars set. Use: parachute vault config set <key> <value>");
+    } else {
+      for (const [key, val] of Object.entries(env)) {
+        // Mask sensitive values
+        const display = key.includes("KEY") || key.includes("SECRET")
+          ? val.slice(0, 8) + "..."
+          : val;
+        console.log(`  ${key}=${display}`);
+      }
+    }
+
+    console.log();
+    console.log("Common settings:");
+    console.log("  TRANSCRIBE_PROVIDER  — parakeet-mlx, groq, openai");
+    console.log("  CLEANUP_PROVIDER     — claude, ollama, none");
+    console.log("  GROQ_API_KEY         — for Groq transcription");
+    console.log("  OPENAI_API_KEY       — for OpenAI transcription");
+    console.log("  ANTHROPIC_API_KEY    — for Claude cleanup");
+    console.log("  OLLAMA_MODEL         — Ollama model for cleanup");
+    console.log("  OLLAMA_URL           — Ollama server URL");
+    return;
+  }
+
+  // parachute vault config set <key> <value>
+  if (subcmd === "set") {
+    const key = args[1];
+    const value = args.slice(2).join(" ");
+    if (!key || !value) {
+      console.error("Usage: parachute vault config set <key> <value>");
+      process.exit(1);
+    }
+    setEnvVar(key, value);
+    console.log(`Set ${key}=${key.includes("KEY") ? value.slice(0, 8) + "..." : value}`);
+    console.log("Restart the daemon to apply: parachute vault restart");
+    return;
+  }
+
+  // parachute vault config unset <key>
+  if (subcmd === "unset") {
+    const key = args[1];
+    if (!key) {
+      console.error("Usage: parachute vault config unset <key>");
+      process.exit(1);
+    }
+    unsetEnvVar(key);
+    console.log(`Removed ${key}`);
+    console.log("Restart the daemon to apply: parachute vault restart");
+    return;
+  }
+
+  console.error(`Unknown config command: ${subcmd}`);
+  console.error("Usage: parachute vault config [set <key> <value> | unset <key>]");
+  process.exit(1);
+}
+
 async function cmdServe() {
-  // Import and run the server directly
   await import("./server.ts");
 }
 
+async function cmdRestart() {
+  console.log("Restarting daemon...");
+  await restartAgent();
+  console.log("Done.");
+}
+
 async function cmdStatus() {
+  loadEnvFile();
   const loaded = await isAgentLoaded();
   const vaults = listVaults();
   const globalConfig = readGlobalConfig();
+  const scribe = await getScribeStatus();
 
-  console.log("Parachute Vault Status\n");
-  console.log(`  Config: ${CONFIG_DIR}`);
-  console.log(`  Port: ${globalConfig.port}`);
-  console.log(`  Daemon: ${loaded ? "running" : "stopped"}`);
-  console.log(`  Vaults: ${vaults.length}`);
+  console.log("Parachute Vault\n");
 
-  if (vaults.length > 0) {
-    console.log();
-    for (const name of vaults) {
-      const config = readVaultConfig(name);
-      console.log(`    ${name} (${config?.api_keys.length ?? 0} keys)`);
+  // Server
+  console.log(`  Server:   ${loaded ? "running" : "stopped"} on port ${globalConfig.port}`);
+  console.log(`  Config:   ${CONFIG_DIR}`);
+
+  // Vaults
+  console.log(`  Vaults:   ${vaults.length}`);
+  for (const name of vaults) {
+    const config = readVaultConfig(name);
+    const desc = config?.description ? ` — ${config.description}` : "";
+    console.log(`            ${name}${desc}`);
+  }
+
+  // Transcription
+  console.log();
+  if (scribe.available) {
+    console.log(`  Transcription:  ${scribe.activeTranscriber}`);
+    console.log(`  Cleanup:        ${scribe.activeCleaner}`);
+    console.log(`  Providers:      ${scribe.transcription.join(", ")}`);
+  } else {
+    console.log(`  Transcription:  not available`);
+    console.log(`                  bun add parachute-scribe to enable`);
+  }
+
+  // Quick health check if daemon is running
+  if (loaded) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${globalConfig.port}/health`);
+      if (resp.ok) {
+        console.log(`\n  Health:   ok`);
+      }
+    } catch {
+      console.log(`\n  Health:   daemon loaded but not responding`);
     }
   }
 }
@@ -255,11 +391,10 @@ async function cmdStatus() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function createVault(name: string, description?: string): string {
+function createVault(name: string): string {
   const { fullKey, keyId } = generateApiKey();
   const config: VaultConfig = {
     name,
-    description,
     api_keys: [
       {
         id: keyId,
@@ -310,16 +445,25 @@ function removeMcpConfig(vaultName: string) {
 
 function usage() {
   console.log(`
-Parachute Vault — Agent-native knowledge graph
+Parachute Vault — self-hosted knowledge graph
 
-Usage:
-  parachute vault init                  Initialize Parachute Vault
-  parachute vault create <name> [desc]  Create a new vault
-  parachute vault list                  List all vaults
-  parachute vault mcp-install <name>    Add vault MCP to ~/.claude.json
-  parachute vault remove <name> [--yes] Remove a vault
-  parachute vault serve                 Run the server (foreground)
-  parachute vault status                Show status
-  parachute vault help                  Show this help
+Setup:
+  parachute vault init                     Set up everything (one command)
+  parachute vault status                   Check what's running
+
+Vaults:
+  parachute vault create <name>            Create a new vault
+  parachute vault list                     List all vaults
+  parachute vault remove <name> [--yes]    Remove a vault
+  parachute vault mcp-install <name>       Add vault MCP to Claude
+
+Config:
+  parachute vault config                   Show current configuration
+  parachute vault config set <key> <val>   Set a config value
+  parachute vault config unset <key>       Remove a config value
+
+Server:
+  parachute vault serve                    Run server (foreground)
+  parachute vault restart                  Restart the daemon
 `);
 }

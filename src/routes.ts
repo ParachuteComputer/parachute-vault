@@ -204,3 +204,55 @@ export function handleSearch(req: Request, store: Store): Response {
   const results = store.searchNotes(query, { tags, limit });
   return json(results);
 }
+
+// ---------------------------------------------------------------------------
+// Transcription (via parachute-scribe)
+// ---------------------------------------------------------------------------
+
+let scribeAvailable: boolean | null = null;
+
+async function getScribe() {
+  if (scribeAvailable === false) return null;
+  try {
+    const scribe = await import("parachute-scribe");
+    scribeAvailable = true;
+    return scribe;
+  } catch {
+    scribeAvailable = false;
+    return null;
+  }
+}
+
+export async function handleTranscription(req: Request): Promise<Response> {
+  const scribe = await getScribe();
+  if (!scribe) {
+    return json({ error: "Transcription not available — parachute-scribe is not installed" }, 501);
+  }
+
+  const form = await req.formData();
+  const file = form.get("file");
+
+  if (!(file instanceof File)) {
+    return json({ error: "missing 'file' field" }, 400);
+  }
+
+  try {
+    const text = await scribe.transcribe(file);
+    return json({ text });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "transcription failed";
+    console.error("Transcription error:", message);
+    return json({ error: message }, 500);
+  }
+}
+
+export async function handleModels(): Promise<Response> {
+  const scribe = await getScribe();
+  if (!scribe) {
+    return json({ data: [] });
+  }
+  const providers = scribe.availableProviders();
+  return json({
+    data: providers.transcription.map((id: string) => ({ id, object: "model" })),
+  });
+}
