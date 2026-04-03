@@ -439,7 +439,7 @@ function installMcpConfig() {
 
   // Single HTTP MCP entry
   config.mcpServers["parachute-vault"] = {
-    type: "url",
+    type: "http",
     url: `http://127.0.0.1:${port}/mcp`,
   };
 
