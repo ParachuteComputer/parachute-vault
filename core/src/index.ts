@@ -22,4 +22,4 @@ export { generateMcpTools, listMcpTools } from "./mcp.js";
 export type { McpToolDef } from "./mcp.js";
 
 // Seed
-export { seedBuiltins, BUILTIN_TAGS } from "./seed.js";
+export { seedBuiltins } from "./seed.js";

@@ -10,26 +10,13 @@ export interface McpToolDef {
 }
 
 /**
- * Tag descriptions included in MCP tool descriptions so the AI
- * knows what tags are available and what they mean.
- */
-const TAG_DOCS = `Built-in tags:
-  #daily — user-captured content (voice memos, typed notes)
-  #doc — persistent documents (blog drafts, grocery lists, reference notes)
-  #digest — AI/system-created content for the user to consume
-  #pinned — kept prominent (applies to any note)
-  #archived — user is done with this (applies to any note)
-  #voice — note was transcribed from voice
-Users may create additional tags. Apply them as instructed.`;
-
-/**
- * Generate hardcoded MCP tools for the Parachute Daily system.
+ * Generate MCP tools for a vault.
  */
 export function generateMcpTools(db: Database): McpToolDef[] {
   return [
     {
       name: "create-note",
-      description: `Create a new note with optional tags and path. ${TAG_DOCS}`,
+      description: `Create a new note with optional tags and path.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -78,7 +65,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "read-notes",
-      description: `Read notes, optionally filtered by tags and date range. ${TAG_DOCS}`,
+      description: `Read notes, optionally filtered by tags and date range.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -211,6 +198,104 @@ export function generateMcpTools(db: Database): McpToolDef[] {
       description: "List all tags with usage counts.",
       inputSchema: { type: "object", properties: {} },
       execute: () => notes.listTags(db),
+    },
+
+    // ---- Bulk Operations ----
+
+    {
+      name: "create-notes",
+      description: `Create multiple notes in one call. Much more efficient than calling create-note repeatedly.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          notes: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                content: { type: "string", description: "Note content (markdown)" },
+                tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
+                path: { type: "string", description: "Optional path/name" },
+              },
+              required: ["content"],
+            },
+            description: "Array of notes to create",
+          },
+        },
+        required: ["notes"],
+      },
+      execute: (params) => notes.createNotes(db, params.notes as any[]),
+    },
+    {
+      name: "batch-tag",
+      description: "Add tags to multiple notes at once. More efficient than tagging one at a time.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          note_ids: { type: "array", items: { type: "string" }, description: "Note IDs to tag" },
+          tags: { type: "array", items: { type: "string" }, description: "Tags to add" },
+        },
+        required: ["note_ids", "tags"],
+      },
+      execute: (params) => {
+        const count = notes.batchTag(db, params.note_ids as string[], params.tags as string[]);
+        return { tagged: true, count };
+      },
+    },
+    {
+      name: "batch-untag",
+      description: "Remove tags from multiple notes at once.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          note_ids: { type: "array", items: { type: "string" }, description: "Note IDs to untag" },
+          tags: { type: "array", items: { type: "string" }, description: "Tags to remove" },
+        },
+        required: ["note_ids", "tags"],
+      },
+      execute: (params) => {
+        const count = notes.batchUntag(db, params.note_ids as string[], params.tags as string[]);
+        return { untagged: true, count };
+      },
+    },
+
+    // ---- Deeper Link Queries ----
+
+    {
+      name: "traverse-links",
+      description: "Traverse the link graph from a note. Returns all notes reachable within N hops. Useful for exploring knowledge clusters and building context.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Starting note ID" },
+          max_depth: { type: "number", description: "Maximum hops to traverse (default 2, max 5)" },
+          relationship: { type: "string", description: "Optional: only follow links with this relationship type" },
+        },
+        required: ["id"],
+      },
+      execute: (params) => links.traverseLinks(db, params.id as string, {
+        max_depth: Math.min((params.max_depth as number) ?? 2, 5),
+        relationship: params.relationship as string | undefined,
+      }),
+    },
+    {
+      name: "find-path",
+      description: "Find the shortest path between two notes in the link graph. Returns the chain of note IDs and relationships connecting them, or null if no path exists.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          source_id: { type: "string", description: "Starting note ID" },
+          target_id: { type: "string", description: "Target note ID" },
+          max_depth: { type: "number", description: "Maximum path length to search (default 5)" },
+        },
+        required: ["source_id", "target_id"],
+      },
+      execute: (params) => links.findPath(
+        db,
+        params.source_id as string,
+        params.target_id as string,
+        { max_depth: Math.min((params.max_depth as number) ?? 5, 10) },
+      ),
     },
   ];
 }

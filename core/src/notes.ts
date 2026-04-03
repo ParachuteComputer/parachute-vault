@@ -213,6 +213,119 @@ export function listTags(db: Database): { name: string; count: number }[] {
   return rows;
 }
 
+// ---- Bulk Operations ----
+
+export interface BulkNoteInput {
+  content: string;
+  id?: string;
+  path?: string;
+  tags?: string[];
+}
+
+export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
+  const results: Note[] = [];
+  const insertNote = db.prepare(
+    "INSERT INTO notes (id, content, path, created_at) VALUES (?, ?, ?, ?)",
+  );
+  const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
+  const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
+
+  db.exec("BEGIN");
+  try {
+    for (const input of inputs) {
+      const id = input.id ?? generateId();
+      const now = new Date().toISOString();
+      insertNote.run(id, input.content, input.path ?? null, now);
+
+      if (input.tags && input.tags.length > 0) {
+        for (const tag of input.tags) {
+          insertTag.run(tag);
+          insertNoteTag.run(id, tag);
+        }
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  // Fetch all created notes with tags
+  for (const input of inputs) {
+    const id = input.id ?? undefined;
+    // For notes without explicit IDs, we need to find them
+    // Since we're in a batch, fetch by content order
+  }
+
+  // Simpler: just re-query them all
+  // We know the IDs if provided, otherwise query recent
+  const ids = inputs.map((input) => input.id).filter(Boolean) as string[];
+  if (ids.length === inputs.length) {
+    // All had explicit IDs
+    for (const id of ids) {
+      results.push(getNote(db, id)!);
+    }
+  } else {
+    // Some auto-generated — query recent notes by count
+    const rows = db.prepare(
+      `SELECT * FROM notes ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+    ).all(inputs.length) as NoteRow[];
+    for (const row of rows.reverse()) {
+      const note = rowToNote(row);
+      note.tags = getNoteTags(db, note.id);
+      results.push(note);
+    }
+  }
+
+  return results;
+}
+
+export function batchTag(db: Database, noteIds: string[], tags: string[]): number {
+  const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
+  const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
+  let count = 0;
+
+  db.exec("BEGIN");
+  try {
+    for (const tag of tags) {
+      insertTag.run(tag);
+    }
+    for (const noteId of noteIds) {
+      for (const tag of tags) {
+        insertNoteTag.run(noteId, tag);
+        count++;
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  return count;
+}
+
+export function batchUntag(db: Database, noteIds: string[], tags: string[]): number {
+  const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
+  let count = 0;
+
+  db.exec("BEGIN");
+  try {
+    for (const noteId of noteIds) {
+      for (const tag of tags) {
+        stmt.run(noteId, tag);
+        count++;
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  return count;
+}
+
 // ---- Internal ----
 
 interface NoteRow {

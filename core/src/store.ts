@@ -68,6 +68,30 @@ export class SqliteStore implements Store {
     return linkOps.getLinks(this.db, noteId, opts);
   }
 
+  // ---- Bulk Operations ----
+
+  createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Note[] {
+    return noteOps.createNotes(this.db, inputs);
+  }
+
+  batchTag(noteIds: string[], tags: string[]): number {
+    return noteOps.batchTag(this.db, noteIds, tags);
+  }
+
+  batchUntag(noteIds: string[], tags: string[]): number {
+    return noteOps.batchUntag(this.db, noteIds, tags);
+  }
+
+  // ---- Deeper Link Queries ----
+
+  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }) {
+    return linkOps.traverseLinks(this.db, noteId, opts);
+  }
+
+  findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }) {
+    return linkOps.findPath(this.db, sourceId, targetId, opts);
+  }
+
   // ---- Attachments ----
 
   addAttachment(noteId: string, filePath: string, mimeType: string): Attachment {

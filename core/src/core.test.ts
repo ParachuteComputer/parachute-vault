@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { BUILTIN_TAGS } from "./seed.js";
 import { generateMcpTools } from "./mcp.js";
 
 let store: SqliteStore;
@@ -82,11 +81,9 @@ describe("notes", () => {
 // ---- Tags ----
 
 describe("tags", () => {
-  it("seeds builtin tags", () => {
+  it("starts with no tags", () => {
     const tags = store.listTags();
-    for (const builtin of BUILTIN_TAGS) {
-      expect(tags.some((t) => t.name === builtin)).toBe(true);
-    }
+    expect(tags).toHaveLength(0);
   });
 
   it("tags a note", () => {
@@ -324,7 +321,12 @@ describe("MCP tools", () => {
     expect(names).toContain("delete-link");
     expect(names).toContain("get-links");
     expect(names).toContain("list-tags");
-    expect(tools).toHaveLength(11);
+    expect(names).toContain("create-notes");
+    expect(names).toContain("batch-tag");
+    expect(names).toContain("batch-untag");
+    expect(names).toContain("traverse-links");
+    expect(names).toContain("find-path");
+    expect(tools).toHaveLength(16);
   });
 
   it("create-note tool works", () => {
