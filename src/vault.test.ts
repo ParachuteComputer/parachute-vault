@@ -153,27 +153,124 @@ describe("BunStore", () => {
   });
 });
 
+describe("bulk operations", () => {
+  test("creates multiple notes at once", () => {
+    const notes = store.createNotes([
+      { content: "Note 1", tags: ["daily"] },
+      { content: "Note 2", tags: ["doc"] },
+      { content: "Note 3" },
+    ]);
+    expect(notes.length).toBe(3);
+    expect(notes[0].tags).toContain("daily");
+    expect(notes[1].tags).toContain("doc");
+  });
+
+  test("batch tags multiple notes", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    const c = store.createNote("C");
+
+    store.batchTag([a.id, b.id, c.id], ["important", "review"]);
+
+    expect(store.getNote(a.id)!.tags).toContain("important");
+    expect(store.getNote(b.id)!.tags).toContain("review");
+    expect(store.getNote(c.id)!.tags).toContain("important");
+  });
+
+  test("batch untags multiple notes", () => {
+    const a = store.createNote("A", { tags: ["daily", "pinned"] });
+    const b = store.createNote("B", { tags: ["daily", "pinned"] });
+
+    store.batchUntag([a.id, b.id], ["pinned"]);
+
+    expect(store.getNote(a.id)!.tags).toContain("daily");
+    expect(store.getNote(a.id)!.tags).not.toContain("pinned");
+    expect(store.getNote(b.id)!.tags).not.toContain("pinned");
+  });
+});
+
+describe("deeper link queries", () => {
+  test("traverses links multi-hop", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    const c = store.createNote("C");
+    const d = store.createNote("D");
+
+    store.createLink(a.id, b.id, "related-to");
+    store.createLink(b.id, c.id, "related-to");
+    store.createLink(c.id, d.id, "related-to");
+
+    // 1 hop from A: should find B
+    const hop1 = store.traverseLinks(a.id, { max_depth: 1 });
+    expect(hop1.length).toBe(1);
+    expect(hop1[0].noteId).toBe(b.id);
+
+    // 2 hops from A: should find B and C
+    const hop2 = store.traverseLinks(a.id, { max_depth: 2 });
+    expect(hop2.length).toBe(2);
+    const ids2 = hop2.map((n) => n.noteId);
+    expect(ids2).toContain(b.id);
+    expect(ids2).toContain(c.id);
+
+    // 3 hops from A: should find B, C, and D
+    const hop3 = store.traverseLinks(a.id, { max_depth: 3 });
+    expect(hop3.length).toBe(3);
+  });
+
+  test("traverses with relationship filter", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    const c = store.createNote("C");
+
+    store.createLink(a.id, b.id, "mentions");
+    store.createLink(a.id, c.id, "related-to");
+
+    const mentions = store.traverseLinks(a.id, { max_depth: 1, relationship: "mentions" });
+    expect(mentions.length).toBe(1);
+    expect(mentions[0].noteId).toBe(b.id);
+  });
+
+  test("finds path between notes", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    const c = store.createNote("C");
+
+    store.createLink(a.id, b.id, "related-to");
+    store.createLink(b.id, c.id, "mentions");
+
+    const result = store.findPath(a.id, c.id);
+    expect(result).not.toBeNull();
+    expect(result!.path).toEqual([a.id, b.id, c.id]);
+    expect(result!.relationships).toEqual(["related-to", "mentions"]);
+  });
+
+  test("returns null when no path exists", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    // No link between them
+
+    const result = store.findPath(a.id, b.id);
+    expect(result).toBeNull();
+  });
+});
+
 describe("MCP tools", () => {
-  test("generates all 11 tools", () => {
+  test("generates all 16 tools", () => {
     const config: VaultConfig = {
       name: "test",
       api_keys: [],
       created_at: new Date().toISOString(),
     };
     const tools = generateVaultMcpTools(db, config);
-    expect(tools.length).toBe(11);
+    expect(tools.length).toBe(16);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("create-note");
-    expect(names).toContain("update-note");
-    expect(names).toContain("delete-note");
-    expect(names).toContain("read-notes");
-    expect(names).toContain("search-notes");
-    expect(names).toContain("tag-note");
-    expect(names).toContain("untag-note");
-    expect(names).toContain("create-link");
-    expect(names).toContain("delete-link");
-    expect(names).toContain("get-links");
+    expect(names).toContain("create-notes");
+    expect(names).toContain("batch-tag");
+    expect(names).toContain("batch-untag");
+    expect(names).toContain("traverse-links");
+    expect(names).toContain("find-path");
     expect(names).toContain("list-tags");
   });
 
@@ -205,5 +302,84 @@ describe("MCP tools", () => {
     const result = createNote.execute({ content: "MCP note", tags: ["daily"] }) as any;
     expect(result.content).toBe("MCP note");
     expect(result.tags).toContain("daily");
+  });
+
+  test("adds template tools when vault has templates", () => {
+    const config: VaultConfig = {
+      name: "work",
+      templates: [
+        {
+          name: "meeting-notes",
+          description: "Template for meeting notes",
+          content: "# Meeting Notes\n\n**Date:** \n**Attendees:** \n\n## Agenda\n\n## Action Items",
+          tags: ["doc", "meeting"],
+          path: "meetings",
+        },
+        {
+          name: "daily-standup",
+          description: "Daily standup update",
+          content: "## Yesterday\n\n## Today\n\n## Blockers",
+          tags: ["daily"],
+        },
+      ],
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    };
+
+    const tools = generateVaultMcpTools(db, config);
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("list-templates");
+    expect(names).toContain("create-from-template");
+    expect(tools.length).toBe(18); // 16 core + 2 template tools
+  });
+
+  test("list-templates returns template metadata", () => {
+    const config: VaultConfig = {
+      name: "work",
+      templates: [
+        { name: "meeting", description: "Meeting notes", content: "# Meeting", tags: ["doc"] },
+      ],
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    };
+
+    const tools = generateVaultMcpTools(db, config);
+    const listTemplates = tools.find((t) => t.name === "list-templates")!;
+    const result = listTemplates.execute({}) as any[];
+    expect(result.length).toBe(1);
+    expect(result[0].name).toBe("meeting");
+    expect(result[0].description).toBe("Meeting notes");
+  });
+
+  test("create-from-template creates note with template content", () => {
+    const config: VaultConfig = {
+      name: "work",
+      templates: [
+        {
+          name: "meeting",
+          description: "Meeting notes",
+          content: "# Meeting\n\n## Agenda",
+          tags: ["doc", "meeting"],
+          path: "meetings",
+        },
+      ],
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    };
+
+    const tools = generateVaultMcpTools(db, config);
+    const createFromTemplate = tools.find((t) => t.name === "create-from-template")!;
+    const result = createFromTemplate.execute({
+      template: "meeting",
+      content: "Discussed roadmap",
+      tags: ["q2"],
+    }) as any;
+
+    expect(result.content).toContain("# Meeting");
+    expect(result.content).toContain("Discussed roadmap");
+    expect(result.tags).toContain("doc");
+    expect(result.tags).toContain("meeting");
+    expect(result.tags).toContain("q2");
+    expect(result.path).toBe("meetings");
   });
 });

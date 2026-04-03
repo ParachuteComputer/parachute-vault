@@ -62,6 +62,15 @@ export interface Store {
   deleteLink(sourceId: string, targetId: string, relationship: string): void;
   getLinks(noteId: string, opts?: { direction?: "outbound" | "inbound" | "both" }): Link[];
 
+  // Bulk operations
+  createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Note[];
+  batchTag(noteIds: string[], tags: string[]): number;
+  batchUntag(noteIds: string[], tags: string[]): number;
+
+  // Deeper link queries
+  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): { noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[];
+  findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): { path: string[]; relationships: string[] } | null;
+
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string): Attachment;
   getAttachments(noteId: string): Attachment[];
