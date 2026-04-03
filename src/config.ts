@@ -24,6 +24,7 @@ import crypto from "node:crypto";
 export const CONFIG_DIR = join(homedir(), ".parachute");
 export const VAULTS_DIR = join(CONFIG_DIR, "vaults");
 export const GLOBAL_CONFIG_PATH = join(CONFIG_DIR, "config.yaml");
+export const ENV_PATH = join(CONFIG_DIR, ".env");
 export const LOG_PATH = join(CONFIG_DIR, "vault.log");
 export const ERR_PATH = join(CONFIG_DIR, "vault.err");
 export const DEFAULT_PORT = 1940;
@@ -242,6 +243,117 @@ export function generateApiKey(): { fullKey: string; keyId: string } {
     fullKey: `pvk_${random}`,
     keyId: `k_${random.slice(0, 12)}`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Environment file (~/.parachute/.env)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the .env file as key-value pairs.
+ */
+export function readEnvFile(): Record<string, string> {
+  const env: Record<string, string> = {};
+  try {
+    if (!existsSync(ENV_PATH)) return env;
+    const content = readFileSync(ENV_PATH, "utf-8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let val = trimmed.slice(eqIdx + 1).trim();
+      // Strip surrounding quotes
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      env[key] = val;
+    }
+  } catch {}
+  return env;
+}
+
+/**
+ * Write the .env file from key-value pairs.
+ */
+export function writeEnvFile(env: Record<string, string>): void {
+  ensureConfigDirSync();
+  const lines: string[] = [
+    "# Parachute Vault configuration",
+    "# Managed by: parachute vault config",
+    "",
+  ];
+  for (const [key, val] of Object.entries(env)) {
+    if (val.includes(" ") || val.includes('"')) {
+      lines.push(`${key}="${val}"`);
+    } else {
+      lines.push(`${key}=${val}`);
+    }
+  }
+  writeFileSync(ENV_PATH, lines.join("\n") + "\n");
+}
+
+/**
+ * Set a single env var in the .env file.
+ */
+export function setEnvVar(key: string, value: string): void {
+  const env = readEnvFile();
+  env[key] = value;
+  writeEnvFile(env);
+}
+
+/**
+ * Remove an env var from the .env file.
+ */
+export function unsetEnvVar(key: string): void {
+  const env = readEnvFile();
+  delete env[key];
+  writeEnvFile(env);
+}
+
+/**
+ * Load .env file into process.env (for server startup).
+ */
+export function loadEnvFile(): void {
+  const env = readEnvFile();
+  for (const [key, val] of Object.entries(env)) {
+    if (process.env[key] === undefined) {
+      process.env[key] = val;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scribe status
+// ---------------------------------------------------------------------------
+
+export async function getScribeStatus(): Promise<{
+  available: boolean;
+  transcription: string[];
+  cleanup: string[];
+  activeTranscriber: string;
+  activeCleaner: string;
+}> {
+  try {
+    const scribe = await import("parachute-scribe");
+    const providers = scribe.availableProviders();
+    return {
+      available: true,
+      transcription: providers.transcription,
+      cleanup: providers.cleanup,
+      activeTranscriber: process.env.TRANSCRIBE_PROVIDER ?? "parakeet-mlx",
+      activeCleaner: process.env.CLEANUP_PROVIDER ?? "none",
+    };
+  } catch {
+    return {
+      available: false,
+      transcription: [],
+      cleanup: [],
+      activeTranscriber: "none",
+      activeCleaner: "none",
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -12,21 +12,22 @@
  *   GET  /vaults                          — list vaults
  */
 
-import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync } from "./config.ts";
+import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
 import { authenticateRequest } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { generateVaultMcpTools } from "./mcp-tools.ts";
 import { handleMcpHttp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleSearch } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleSearch, handleTranscription, handleModels } from "./routes.ts";
 
 ensureConfigDirSync();
+loadEnvFile();
 
 const globalConfig = readGlobalConfig();
 const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PORT;
 
 const server = Bun.serve({
   port,
-  hostname: "127.0.0.1",
+  hostname: "0.0.0.0",
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -59,12 +60,22 @@ const server = Bun.serve({
   },
 });
 
-console.log(`Parachute Vault server listening on http://127.0.0.1:${server.port}`);
+console.log(`Parachute Vault server listening on http://0.0.0.0:${server.port}`);
 
 async function route(req: Request, path: string): Promise<Response> {
   // Health check
   if (path === "/health") {
     return Response.json({ status: "ok", vaults: listVaults() });
+  }
+
+  // Whisper-compatible transcription endpoint (served by parachute-scribe)
+  if (path === "/v1/audio/transcriptions" && req.method === "POST") {
+    return handleTranscription(req);
+  }
+
+  // Whisper-compatible models endpoint (health check for clients)
+  if (path === "/v1/models" && req.method === "GET") {
+    return handleModels();
   }
 
   // List vaults

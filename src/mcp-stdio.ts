@@ -9,7 +9,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readVaultConfig, ensureConfigDirSync } from "./config.ts";
+import { readVaultConfig, ensureConfigDirSync, loadEnvFile } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { generateVaultMcpTools } from "./mcp-tools.ts";
 
@@ -20,6 +20,7 @@ if (!vaultName) {
 }
 
 ensureConfigDirSync();
+loadEnvFile();
 
 const vaultConfig = readVaultConfig(vaultName);
 if (!vaultConfig) {
