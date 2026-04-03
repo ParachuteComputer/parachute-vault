@@ -141,16 +141,9 @@ describe("BunStore", () => {
     expect(atts[0].mimeType).toBe("image/png");
   });
 
-  test("seeds built-in tags", () => {
+  test("starts with no tags", () => {
     const tags = store.listTags();
-    const names = tags.map((t) => t.name);
-    expect(names).toContain("daily");
-    expect(names).toContain("doc");
-    expect(names).toContain("digest");
-    expect(names).toContain("pinned");
-    expect(names).toContain("archived");
-    expect(names).toContain("voice");
-    expect(names).toContain("template");
+    expect(tags.length).toBe(0);
   });
 });
 

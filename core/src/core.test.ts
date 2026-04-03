@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { BUILTIN_TAGS } from "./seed.js";
 import { generateMcpTools } from "./mcp.js";
 
 let store: SqliteStore;
@@ -82,11 +81,9 @@ describe("notes", () => {
 // ---- Tags ----
 
 describe("tags", () => {
-  it("seeds builtin tags", () => {
+  it("starts with no tags", () => {
     const tags = store.listTags();
-    for (const builtin of BUILTIN_TAGS) {
-      expect(tags.some((t) => t.name === builtin)).toBe(true);
-    }
+    expect(tags).toHaveLength(0);
   });
 
   it("tags a note", () => {

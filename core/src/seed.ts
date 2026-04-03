@@ -1,22 +1,9 @@
 import { Database } from "bun:sqlite";
 
-/** Built-in tags seeded on startup. */
-export const BUILTIN_TAGS = [
-  "daily",
-  "doc",
-  "digest",
-  "pinned",
-  "archived",
-  "voice",
-  "template",
-] as const;
-
 /**
- * Seed builtin tags. Idempotent — skips if already present.
+ * Seed initial database state. Currently a no-op — vaults start blank.
+ * Clients (e.g., parachute-daily) create the tags they need on connect.
  */
 export function seedBuiltins(db: Database): void {
-  const stmt = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
-  for (const tag of BUILTIN_TAGS) {
-    stmt.run(tag);
-  }
+  // Intentionally empty. Tags are created on use.
 }

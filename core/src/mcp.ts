@@ -10,27 +10,13 @@ export interface McpToolDef {
 }
 
 /**
- * Tag descriptions included in MCP tool descriptions so the AI
- * knows what tags are available and what they mean.
- */
-const TAG_DOCS = `Built-in tags:
-  #daily — user-captured content (voice memos, typed notes)
-  #doc — persistent documents (blog drafts, grocery lists, reference notes)
-  #digest — AI/system-created content for the user to consume
-  #pinned — kept prominent (applies to any note)
-  #archived — user is done with this (applies to any note)
-  #voice — note was transcribed from voice
-  #template — reusable note templates (read these before creating structured notes)
-Users may create additional tags. Apply them as instructed.`;
-
-/**
- * Generate hardcoded MCP tools for the Parachute Daily system.
+ * Generate MCP tools for a vault.
  */
 export function generateMcpTools(db: Database): McpToolDef[] {
   return [
     {
       name: "create-note",
-      description: `Create a new note with optional tags and path. ${TAG_DOCS}`,
+      description: `Create a new note with optional tags and path.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -79,7 +65,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "read-notes",
-      description: `Read notes, optionally filtered by tags and date range. ${TAG_DOCS}`,
+      description: `Read notes, optionally filtered by tags and date range.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -218,7 +204,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
 
     {
       name: "create-notes",
-      description: `Create multiple notes in one call. Much more efficient than calling create-note repeatedly. ${TAG_DOCS}`,
+      description: `Create multiple notes in one call. Much more efficient than calling create-note repeatedly.`,
       inputSchema: {
         type: "object",
         properties: {
