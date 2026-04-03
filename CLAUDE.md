@@ -1,34 +1,30 @@
 # Parachute Vault
 
-Agent-native knowledge graph. Notes, tags, links over MCP. Any AI gets a personal knowledge vault in seconds.
-
-## What this is
-
-Parachute Vault is the tool all AI agents need — a dead simple knowledge graph (notes, tags, links) exposed over MCP. One command to spin up a vault, hand any AI an MCP endpoint and API token, and it has a structured knowledge base.
+Agent-native knowledge graph. Notes, tags, links over MCP. Self-hosted, one command setup.
 
 ## Architecture
 
 ```
-parachute vault init          →  ~/.parachute/ config + daemon
-parachute vault create work   →  new vault (SQLite DB + config + API key)
-parachute vault mcp-install   →  writes MCP config into ~/.claude.json
+parachute vault init     →  ~/.parachute/ (config, .env, daemon, MCP)
+parachute vault create   →  new vault (SQLite DB + vault.yaml + API key)
+parachute vault config   →  manage env vars (API keys, providers)
 
-CLI  →  Bun server (single process)  →  multiple vaults (each its own SQLite DB)
-                                              ↑
-Any AI  →  MCP (stdio or HTTP)  ──────────────┘
+CLI  →  Bun server (port 1940)  →  multiple vaults (each its own SQLite DB)
+                                         ↑
+Any AI  →  MCP (stdio or HTTP)  ─────────┘
+Phone   →  REST API + transcription  ────┘
 ```
 
 ## Packages
 
 ```
-core/    — TypeScript library: schema, store, MCP tools (from parachute-daily)
-local/   — Reference: old Hono server (being rewritten as Bun multi-vault server)
-src/     — New Bun CLI + server + MCP (the main code)
+core/    — TypeScript library: schema, store, MCP tools (bun:sqlite)
+src/     — Bun CLI + server + MCP + transcription
 ```
 
 ## Data Model
 
-Five tables per vault:
+Five tables per vault. Vaults start blank — no predefined tags or schema. Clients create the tags they need.
 
 ```sql
 notes       (id, content, path, created_at, updated_at)
@@ -38,59 +34,56 @@ attachments (id, note_id, path, mime_type, created_at)
 links       (source_id, target_id, relationship, created_at)
 ```
 
-### Built-in Tags
+### MCP Tools (16)
 
-```
-#daily      — user-captured content (voice memos, typed notes)
-#doc        — persistent documents (blog drafts, meeting notes, lists)
-#digest     — AI/system-created content for the user to consume
-#pinned     — kept prominent
-#archived   — done with this
-#voice      — transcribed from voice
-```
+Core: `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`, `tag-note`, `untag-note`, `create-link`, `delete-link`, `get-links`, `list-tags`
 
-### MCP Tools (11)
+Bulk: `create-notes`, `batch-tag`, `batch-untag`
 
-`create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`, `tag-note`, `untag-note`, `create-link`, `delete-link`, `get-links`, `list-tags`
+Graph: `traverse-links`, `find-path`
 
 ## Bun-native
 
-Use Bun for everything. No Node.js build step.
+Use Bun for everything. No Node.js.
 
-- `Bun.serve()` for HTTP server (not express, not hono)
-- `bun:sqlite` for SQLite (not better-sqlite3)
-- `Bun.file` over `node:fs` readFile/writeFile
-- `Bun.$` for shell commands (not execa)
+- `Bun.serve()` for HTTP server
+- `bun:sqlite` for SQLite
+- `Bun.$` for shell commands
 - `bun test` for tests
-- `bun install` for deps
-- Bun auto-loads .env, no dotenv needed
 
 ## Key design decisions
 
-- **Multi-vault**: One server process hosts many vaults. Each vault = own SQLite DB + config + API keys.
-- **Per-vault MCP descriptions**: Each vault has a config (vault.yaml) that enriches MCP tool descriptions when an AI connects. The vault teaches the AI how to use it.
-- **CLI pattern**: Follow PCC (`~/.claude.json` auto-config) and tailshare (launchd daemon, `Bun.serve()`) patterns. See `/Users/parachute/Code/pcc/` and `/Users/parachute/Code/parachute-serve/` for reference.
+- **Bare primitives**: Vault has no opinions about tags or conventions. It's the engine, not the schema. Clients (parachute-daily, etc.) bring their own tag schema.
+- **Multi-vault**: One server hosts many vaults. Each vault = own SQLite DB + config + API keys.
+- **Per-vault MCP descriptions**: vault.yaml enriches MCP tool descriptions. The vault teaches the AI how to use it.
+- **Unified config**: All env vars in `~/.parachute/.env`. Managed via `vault config set/unset`. Launchd daemon sources it via wrapper script.
+- **Optional transcription**: parachute-scribe is an optional dependency. If installed, vault exposes Whisper-compatible endpoints. If not, vault works fine without it.
+
+## Config
+
+All configuration in `~/.parachute/.env`:
+
+```
+PORT=1940
+TRANSCRIBE_PROVIDER=groq        # or parakeet-mlx, openai
+CLEANUP_PROVIDER=claude          # or ollama, none
+GROQ_API_KEY=...
+ANTHROPIC_API_KEY=...
+```
 
 ## Naming
 
 - Domain: `parachute.computer`
 - Package ID: `computer.parachute.vault`
 - npm scope: `@parachute/`
-- Subdomain: `vault.parachute.computer`
+- Launchd label: `computer.parachute.vault`
 
 ## Running
 
 ```bash
-bun run src/cli.ts vault init
-bun run src/cli.ts vault create <name>
-bun run src/cli.ts vault list
-
-# Tests (from core/)
-cd core && npm test
+bun src/cli.ts vault init          # setup everything
+bun src/cli.ts vault status        # check status
+bun src/cli.ts vault config        # view/edit config
+bun test src/                      # run tests
+bun test core/src/core.test.ts     # run core tests
 ```
-
-## Reference repos
-
-- `/Users/parachute/Code/pcc/` — PCC/meshwork: Bun CLI, auto MCP config, session management
-- `/Users/parachute/Code/parachute-serve/` — tailshare: Bun CLI, launchd daemon, multi-service serving
-- `/Users/parachute/Code/parachute-daily/` — original monorepo, Flutter app stays there
