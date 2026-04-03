@@ -43,8 +43,30 @@ export function getNote(db: Database, id: string): Note | null {
   if (!row) return null;
 
   const note = rowToNote(row);
-  note.tags = getNoteTags(db, id);
+  note.tags = getNoteTags(db, note.id);
   return note;
+}
+
+export function getNoteByPath(db: Database, path: string): Note | null {
+  const row = db.prepare("SELECT * FROM notes WHERE path = ?").get(path) as NoteRow | undefined;
+  if (!row) return null;
+
+  const note = rowToNote(row);
+  note.tags = getNoteTags(db, note.id);
+  return note;
+}
+
+export function getNotes(db: Database, ids: string[]): Note[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db.prepare(
+    `SELECT * FROM notes WHERE id IN (${placeholders}) ORDER BY created_at`,
+  ).all(...ids) as NoteRow[];
+  return rows.map((row) => {
+    const note = rowToNote(row);
+    note.tags = getNoteTags(db, note.id);
+    return note;
+  });
 }
 
 export function updateNote(
@@ -95,6 +117,12 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
       conditions.push(`NOT EXISTS (SELECT 1 FROM note_tags ex WHERE ex.note_id = n.id AND ex.tag_name = ?)`);
       params.push(tag);
     }
+  }
+
+  // Path prefix
+  if (opts.pathPrefix) {
+    conditions.push("n.path LIKE ?");
+    params.push(opts.pathPrefix + "%");
   }
 
   // Date range

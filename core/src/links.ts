@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
-import type { Link } from "./types.js";
+import type { Link, NoteSummary, HydratedLink } from "./types.js";
+import { getNoteTags } from "./notes.js";
 
 export function createLink(
   db: Database,
@@ -54,6 +55,75 @@ export function getLinks(
   return rows.map(rowToLink);
 }
 
+// ---- Note Summaries (for hydrated results) ----
+
+interface NoteRow {
+  id: string;
+  path: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+function getNoteSummary(db: Database, noteId: string): NoteSummary | undefined {
+  const row = db.prepare(
+    "SELECT id, path, created_at, updated_at FROM notes WHERE id = ?",
+  ).get(noteId) as NoteRow | undefined;
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    path: row.path ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at ?? undefined,
+    tags: getNoteTags(db, row.id),
+  };
+}
+
+function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSummary> {
+  const map = new Map<string, NoteSummary>();
+  if (noteIds.length === 0) return map;
+  const placeholders = noteIds.map(() => "?").join(", ");
+  const rows = db.prepare(
+    `SELECT id, path, created_at, updated_at FROM notes WHERE id IN (${placeholders})`,
+  ).all(...noteIds) as NoteRow[];
+  for (const row of rows) {
+    map.set(row.id, {
+      id: row.id,
+      path: row.path ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at ?? undefined,
+      tags: getNoteTags(db, row.id),
+    });
+  }
+  return map;
+}
+
+/**
+ * Get links for a note with hydrated note summaries.
+ * Always includes note path/tags. Optionally includes content.
+ */
+export function getLinksHydrated(
+  db: Database,
+  noteId: string,
+  opts?: { direction?: "outbound" | "inbound" | "both"; include_content?: boolean },
+): HydratedLink[] {
+  const links = getLinks(db, noteId, opts);
+
+  // Collect all note IDs we need to hydrate
+  const noteIds = new Set<string>();
+  for (const link of links) {
+    noteIds.add(link.sourceId);
+    noteIds.add(link.targetId);
+  }
+
+  const summaries = getNoteSummaries(db, [...noteIds]);
+
+  return links.map((link) => ({
+    ...link,
+    sourceNote: summaries.get(link.sourceId),
+    targetNote: summaries.get(link.targetId),
+  }));
+}
+
 // ---- Deeper Link Queries ----
 
 export interface TraversalNode {
@@ -61,6 +131,7 @@ export interface TraversalNode {
   depth: number;
   relationship: string;
   direction: "outbound" | "inbound";
+  note?: NoteSummary;
 }
 
 /**
@@ -135,6 +206,13 @@ export function traverseLinks(
 
     frontier = nextFrontier;
     if (frontier.length === 0) break;
+  }
+
+  // Hydrate with note summaries
+  const noteIds = results.map((r) => r.noteId);
+  const summaries = getNoteSummaries(db, noteIds);
+  for (const result of results) {
+    result.note = summaries.get(result.noteId);
   }
 
   return results;

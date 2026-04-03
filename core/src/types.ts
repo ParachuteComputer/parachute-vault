@@ -34,11 +34,27 @@ export interface Attachment {
 export interface QueryOpts {
   tags?: string[];
   excludeTags?: string[];
-  dateFrom?: string; // ISO date
-  dateTo?: string;   // ISO date
+  pathPrefix?: string; // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
+  dateFrom?: string;   // ISO date
+  dateTo?: string;     // ISO date
   sort?: "asc" | "desc";
   limit?: number;
   offset?: number;
+}
+
+/** Note summary — everything except content. Used in link results. */
+export interface NoteSummary {
+  id: string;
+  path?: string;
+  createdAt: string;
+  updatedAt?: string;
+  tags?: string[];
+}
+
+/** Link with hydrated note summaries. */
+export interface HydratedLink extends Link {
+  sourceNote?: NoteSummary;
+  targetNote?: NoteSummary;
 }
 
 // ---- Store Interface ----
@@ -47,6 +63,8 @@ export interface Store {
   // Notes
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[] }): Note;
   getNote(id: string): Note | null;
+  getNoteByPath(path: string): Note | null;
+  getNotes(ids: string[]): Note[];
   updateNote(id: string, updates: { content?: string; path?: string }): Note;
   deleteNote(id: string): void;
   queryNotes(opts: QueryOpts): Note[];

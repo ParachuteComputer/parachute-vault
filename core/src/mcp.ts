@@ -15,8 +15,36 @@ export interface McpToolDef {
 export function generateMcpTools(db: Database): McpToolDef[] {
   return [
     {
+      name: "get-note",
+      description: "Get a note by ID or path. Use this to look up a specific note when you have its ID (e.g., from link results) or its path (e.g., 'Projects/Parachute/README').",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Note ID" },
+          path: { type: "string", description: "Note path (e.g., 'Projects/Parachute/README')" },
+          ids: { type: "array", items: { type: "string" }, description: "Multiple note IDs to fetch at once" },
+        },
+      },
+      execute: (params) => {
+        if (params.ids) {
+          return notes.getNotes(db, params.ids as string[]);
+        }
+        if (params.path) {
+          const note = notes.getNoteByPath(db, params.path as string);
+          if (!note) return { error: "Note not found", path: params.path };
+          return note;
+        }
+        if (params.id) {
+          const note = notes.getNote(db, params.id as string);
+          if (!note) return { error: "Note not found", id: params.id };
+          return note;
+        }
+        return { error: "Provide id, path, or ids" };
+      },
+    },
+    {
       name: "create-note",
-      description: `Create a new note with optional tags and path.`,
+      description: `Create a new note with optional tags and path. Path works like a filesystem — use it to organize notes (e.g., 'Projects/Parachute/README', 'Meetings/2026-04-03').`,
       inputSchema: {
         type: "object",
         properties: {
@@ -65,12 +93,13 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "read-notes",
-      description: `Read notes, optionally filtered by tags and date range.`,
+      description: `Read notes, filtered by tags, path prefix, and/or date range. Use path_prefix to browse notes like a filesystem (e.g., 'Projects/' returns all project notes).`,
       inputSchema: {
         type: "object",
         properties: {
           tags: { type: "array", items: { type: "string" }, description: "Filter by tags (AND)" },
           exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
+          path_prefix: { type: "string", description: "Filter by path prefix (e.g., 'Projects/Parachute' matches 'Projects/Parachute/README')" },
           date_from: { type: "string", description: "Start date (ISO, inclusive)" },
           date_to: { type: "string", description: "End date (ISO, exclusive — use the day after your range)" },
           sort: { type: "string", enum: ["asc", "desc"], description: "Sort by created_at" },
@@ -81,6 +110,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
       execute: (params) => notes.queryNotes(db, {
         tags: params.tags as string[] | undefined,
         excludeTags: params.exclude_tags as string[] | undefined,
+        pathPrefix: params.path_prefix as string | undefined,
         dateFrom: params.date_from as string | undefined,
         dateTo: params.date_to as string | undefined,
         sort: params.sort as "asc" | "desc" | undefined,
@@ -180,18 +210,39 @@ export function generateMcpTools(db: Database): McpToolDef[] {
     },
     {
       name: "get-links",
-      description: "Get links for a note. Returns connected notes.",
+      description: "Get links for a note. Returns connected notes with their path, tags, and metadata. Use include_content to also get note content.",
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "string", description: "Note ID" },
           direction: { type: "string", enum: ["outbound", "inbound", "both"], default: "both" },
+          include_content: { type: "boolean", description: "Include full note content in results (default false)" },
         },
         required: ["id"],
       },
-      execute: (params) => links.getLinks(db, params.id as string, {
-        direction: params.direction as "outbound" | "inbound" | "both" | undefined,
-      }),
+      execute: (params) => {
+        const hydrated = links.getLinksHydrated(db, params.id as string, {
+          direction: params.direction as "outbound" | "inbound" | "both" | undefined,
+        });
+        if (params.include_content) {
+          // Fetch full notes for content
+          const noteIds = new Set<string>();
+          for (const link of hydrated) {
+            noteIds.add(link.sourceId);
+            noteIds.add(link.targetId);
+          }
+          const fullNotes = new Map<string, any>();
+          for (const note of notes.getNotes(db, [...noteIds])) {
+            fullNotes.set(note.id, note);
+          }
+          return hydrated.map((link) => ({
+            ...link,
+            sourceNote: fullNotes.get(link.sourceId) ?? link.sourceNote,
+            targetNote: fullNotes.get(link.targetId) ?? link.targetNote,
+          }));
+        }
+        return hydrated;
+      },
     },
     {
       name: "list-tags",
@@ -263,7 +314,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
 
     {
       name: "traverse-links",
-      description: "Traverse the link graph from a note. Returns all notes reachable within N hops. Useful for exploring knowledge clusters and building context.",
+      description: "Traverse the link graph from a note. Returns all notes reachable within N hops, with their path, tags, and metadata. Useful for exploring knowledge clusters.",
       inputSchema: {
         type: "object",
         properties: {
