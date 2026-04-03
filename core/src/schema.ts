@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
   content TEXT DEFAULT '',
   path TEXT,
+  metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT
 );
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS links (
   source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
   target_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
   relationship TEXT NOT NULL,
+  metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL,
   UNIQUE(source_id, target_id, relationship)
 );
@@ -94,11 +96,31 @@ export function initSchema(db: Database): void {
 
   db.exec(SCHEMA_SQL);
 
+  // Migrate v3 → v4: add metadata columns
+  migrateToV4(db);
+
   // Record schema version
   db.prepare("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(
     SCHEMA_VERSION,
     new Date().toISOString(),
   );
+}
+
+function hasColumn(db: Database, table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return rows.some((r) => r.name === column);
+}
+
+/**
+ * Migrate v3 → v4: add metadata JSON columns to notes and links.
+ */
+function migrateToV4(db: Database): void {
+  if (hasTable(db, "notes") && !hasColumn(db, "notes", "metadata")) {
+    db.exec("ALTER TABLE notes ADD COLUMN metadata TEXT DEFAULT '{}'");
+  }
+  if (hasTable(db, "links") && !hasColumn(db, "links", "metadata")) {
+    db.exec("ALTER TABLE links ADD COLUMN metadata TEXT DEFAULT '{}'");
+  }
 }
 
 function hasTable(db: Database, name: string): boolean {

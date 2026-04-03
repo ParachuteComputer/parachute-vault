@@ -178,6 +178,66 @@ describe("BunStore", () => {
   });
 });
 
+describe("metadata", () => {
+  test("creates note with metadata", () => {
+    const note = store.createNote("Meeting notes", {
+      path: "Meetings/standup",
+      metadata: { status: "draft", priority: "high", attendees: ["alice", "bob"] },
+    });
+    expect(note.metadata).toBeDefined();
+    expect(note.metadata!.status).toBe("draft");
+    expect(note.metadata!.priority).toBe("high");
+    expect(note.metadata!.attendees).toEqual(["alice", "bob"]);
+  });
+
+  test("updates note metadata", () => {
+    const note = store.createNote("Doc", { metadata: { status: "draft" } });
+    const updated = store.updateNote(note.id, { metadata: { status: "published", version: 2 } });
+    expect(updated.metadata!.status).toBe("published");
+    expect(updated.metadata!.version).toBe(2);
+  });
+
+  test("queries notes by metadata", () => {
+    store.createNote("Draft 1", { metadata: { status: "draft" } });
+    store.createNote("Draft 2", { metadata: { status: "draft" } });
+    store.createNote("Published", { metadata: { status: "published" } });
+
+    const drafts = store.queryNotes({ metadata: { status: "draft" } });
+    expect(drafts.length).toBe(2);
+
+    const published = store.queryNotes({ metadata: { status: "published" } });
+    expect(published.length).toBe(1);
+    expect(published[0].content).toBe("Published");
+  });
+
+  test("notes without metadata return undefined metadata", () => {
+    const note = store.createNote("Plain note");
+    expect(note.metadata).toBeUndefined();
+  });
+
+  test("creates link with metadata", () => {
+    const a = store.createNote("A");
+    const b = store.createNote("B");
+    const link = store.createLink(a.id, b.id, "related-to", {
+      confidence: 0.9,
+      context: "mentioned in meeting",
+    });
+    expect(link.metadata).toBeDefined();
+    expect(link.metadata!.confidence).toBe(0.9);
+    expect(link.metadata!.context).toBe("mentioned in meeting");
+  });
+
+  test("hydrated links include note metadata", () => {
+    const a = store.createNote("A", { metadata: { type: "project" } });
+    const b = store.createNote("B", { metadata: { type: "task" } });
+    store.createLink(a.id, b.id, "contains");
+
+    const links = getLinksHydrated(db, a.id);
+    expect(links[0].sourceNote?.metadata?.type).toBe("project");
+    expect(links[0].targetNote?.metadata?.type).toBe("task");
+  });
+});
+
 describe("bulk operations", () => {
   test("creates multiple notes at once", () => {
     const notes = store.createNotes([

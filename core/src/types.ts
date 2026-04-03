@@ -4,6 +4,7 @@ export interface Note {
   id: string;
   content: string;
   path?: string;
+  metadata?: Record<string, unknown>;
   createdAt: string; // ISO-8601
   updatedAt?: string;
   tags?: string[];
@@ -16,6 +17,7 @@ export interface Link {
   sourceId: string;
   targetId: string;
   relationship: string;
+  metadata?: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -34,9 +36,10 @@ export interface Attachment {
 export interface QueryOpts {
   tags?: string[];
   excludeTags?: string[];
-  pathPrefix?: string; // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
-  dateFrom?: string;   // ISO date
-  dateTo?: string;     // ISO date
+  pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
+  metadata?: Record<string, unknown>; // filter by metadata values (exact match on each key)
+  dateFrom?: string;    // ISO date
+  dateTo?: string;      // ISO date
   sort?: "asc" | "desc";
   limit?: number;
   offset?: number;
@@ -46,6 +49,7 @@ export interface QueryOpts {
 export interface NoteSummary {
   id: string;
   path?: string;
+  metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt?: string;
   tags?: string[];
@@ -61,11 +65,11 @@ export interface HydratedLink extends Link {
 
 export interface Store {
   // Notes
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[] }): Note;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> }): Note;
   getNote(id: string): Note | null;
   getNoteByPath(path: string): Note | null;
   getNotes(ids: string[]): Note[];
-  updateNote(id: string, updates: { content?: string; path?: string }): Note;
+  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note;
   deleteNote(id: string): void;
   queryNotes(opts: QueryOpts): Note[];
   searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Note[];
@@ -76,7 +80,7 @@ export interface Store {
   listTags(): { name: string; count: number }[];
 
   // Links
-  createLink(sourceId: string, targetId: string, relationship: string): Link;
+  createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Link;
   deleteLink(sourceId: string, targetId: string, relationship: string): void;
   getLinks(noteId: string, opts?: { direction?: "outbound" | "inbound" | "both" }): Link[];
 
