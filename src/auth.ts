@@ -5,11 +5,48 @@
  *   - Global keys (in config.yaml): access unified /mcp and all vaults
  *   - Per-vault keys (in vault.yaml): access that vault's /vaults/{name}/mcp and API
  *
+ * Key permissions:
+ *   - scope: "write" — full access (default)
+ *   - scope: "read"  — read-only (blocked from create/update/delete operations)
+ *
  * Localhost bypasses auth for both.
  */
 
 import { readVaultConfig, readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
-import type { VaultConfig, GlobalConfig, StoredKey } from "./config.ts";
+import type { VaultConfig, GlobalConfig, StoredKey, KeyScope } from "./config.ts";
+
+/** Result of a successful auth check. */
+export interface AuthResult {
+  keyId: string;
+  scope: KeyScope;
+}
+
+/** Read-only tools (allowed for scope: "read"). */
+const READ_TOOLS = new Set([
+  "get-note",
+  "read-notes",
+  "search-notes",
+  "get-links",
+  "traverse-links",
+  "find-path",
+  "list-tags",
+  "list-vaults",
+]);
+
+/** Check if a tool call is allowed for a given scope. */
+export function isToolAllowed(toolName: string, scope: KeyScope): boolean {
+  if (scope === "write") return true;
+  return READ_TOOLS.has(toolName);
+}
+
+/** Read-only HTTP methods. */
+const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Check if an HTTP method is allowed for a given scope. */
+export function isMethodAllowed(method: string, scope: KeyScope): boolean {
+  if (scope === "write") return true;
+  return READ_METHODS.has(method);
+}
 
 /**
  * Extract API key from request headers.
@@ -34,13 +71,13 @@ export function isLocalhost(req: Request): boolean {
 
 /**
  * Validate a key against a list of stored keys.
- * Returns the matched key ID or null.
+ * Returns the matched key or null.
  */
-function validateKey(keys: StoredKey[], providedKey: string): string | null {
+function validateKey(keys: StoredKey[], providedKey: string): StoredKey | null {
   for (const stored of keys) {
     if (verifyKey(providedKey, stored.key_hash)) {
       stored.last_used_at = new Date().toISOString();
-      return stored.id;
+      return stored;
     }
   }
   return null;
@@ -49,63 +86,62 @@ function validateKey(keys: StoredKey[], providedKey: string): string | null {
 /**
  * Authenticate for a specific vault.
  * Accepts per-vault keys OR global keys.
+ * Returns null (allowed) or error Response.
+ * Sets x-key-scope header on success for downstream use.
  */
 export function authenticateVaultRequest(
   req: Request,
   vaultConfig: VaultConfig,
-): Response | null {
-  if (isLocalhost(req)) return null;
+): { error: Response } | { scope: KeyScope } {
+  if (isLocalhost(req)) return { scope: "write" };
 
   const key = extractApiKey(req);
   if (!key) {
-    return Response.json(
-      { error: "Unauthorized", message: "API key required" },
-      { status: 401 },
-    );
+    return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
 
   // Check per-vault keys first
-  if (validateKey(vaultConfig.api_keys, key)) {
+  const vaultKey = validateKey(vaultConfig.api_keys, key);
+  if (vaultKey) {
     try { writeVaultConfig(vaultConfig); } catch {}
-    return null;
+    return { scope: vaultKey.scope ?? "write" };
   }
 
   // Check global keys
   const globalConfig = readGlobalConfig();
-  if (globalConfig.api_keys && validateKey(globalConfig.api_keys, key)) {
-    try { writeGlobalConfig(globalConfig); } catch {}
-    return null;
+  if (globalConfig.api_keys) {
+    const globalKey = validateKey(globalConfig.api_keys, key);
+    if (globalKey) {
+      try { writeGlobalConfig(globalConfig); } catch {}
+      return { scope: globalKey.scope ?? "write" };
+    }
   }
 
-  return Response.json(
-    { error: "Unauthorized", message: "Invalid API key" },
-    { status: 401 },
-  );
+  return { error: Response.json({ error: "Unauthorized", message: "Invalid API key" }, { status: 401 }) };
 }
 
 /**
  * Authenticate for the unified /mcp endpoint.
  * Accepts global keys only.
  */
-export function authenticateGlobalRequest(req: Request): Response | null {
-  if (isLocalhost(req)) return null;
+export function authenticateGlobalRequest(
+  req: Request,
+): { error: Response } | { scope: KeyScope } {
+  if (isLocalhost(req)) return { scope: "write" };
 
   const key = extractApiKey(req);
   if (!key) {
-    return Response.json(
-      { error: "Unauthorized", message: "API key required" },
-      { status: 401 },
-    );
+    return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
 
   const globalConfig = readGlobalConfig();
-  if (globalConfig.api_keys && validateKey(globalConfig.api_keys, key)) {
-    try { writeGlobalConfig(globalConfig); } catch {}
-    return null;
+  if (globalConfig.api_keys) {
+    const matched = validateKey(globalConfig.api_keys, key);
+    if (matched) {
+      try { writeGlobalConfig(globalConfig); } catch {}
+      return { scope: matched.scope ?? "write" };
+    }
   }
 
-  return Response.json(
-    { error: "Unauthorized", message: "Invalid API key" },
-    { status: 401 },
-  );
+  return { error: Response.json({ error: "Unauthorized", message: "Invalid API key" }, { status: 401 }) };
 }

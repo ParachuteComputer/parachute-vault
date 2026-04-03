@@ -135,6 +135,7 @@ async function cmdInit() {
     globalConfig.api_keys = [{
       id: keyId,
       label: "default",
+      scope: "write",
       key_hash: hashKey(fullKey),
       created_at: new Date().toISOString(),
     }];
@@ -404,6 +405,7 @@ function createVault(name: string): string {
       {
         id: keyId,
         label: "default",
+        scope: "write",
         key_hash: hashKey(fullKey),
         created_at: new Date().toISOString(),
       },

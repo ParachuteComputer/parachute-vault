@@ -13,7 +13,7 @@
  */
 
 import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
-import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
+import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleLinks, handleSearch, handleTranscription, handleModels } from "./routes.ts";
@@ -67,9 +67,9 @@ async function route(req: Request, path: string): Promise<Response> {
 
   // Unified MCP (all vaults, global auth)
   if (path === "/mcp" || path.startsWith("/mcp/")) {
-    const authError = authenticateGlobalRequest(req);
-    if (authError) return authError;
-    return handleUnifiedMcp(req);
+    const auth = authenticateGlobalRequest(req);
+    if ("error" in auth) return auth.error;
+    return handleUnifiedMcp(req, auth.scope);
   }
 
   // Transcription
@@ -112,15 +112,22 @@ async function route(req: Request, path: string): Promise<Response> {
   }
 
   // Auth: per-vault key OR global key
-  const authError = authenticateVaultRequest(req, vaultConfig);
-  if (authError) return authError;
+  const auth = authenticateVaultRequest(req, vaultConfig);
+  if ("error" in auth) return auth.error;
 
   // Per-vault scoped MCP
   if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
-    return handleScopedMcp(req, vaultName);
+    return handleScopedMcp(req, vaultName, auth.scope);
   }
 
-  // REST API
+  // REST API — enforce read-only scope
+  if (!isMethodAllowed(req.method, auth.scope)) {
+    return Response.json(
+      { error: "Forbidden", message: "Read-only API key cannot perform write operations" },
+      { status: 403 },
+    );
+  }
+
   const store = getVaultStore(vaultName);
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
   if (!apiMatch) {

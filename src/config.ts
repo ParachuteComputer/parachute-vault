@@ -45,10 +45,13 @@ export function vaultConfigPath(name: string): string {
 // Types
 // ---------------------------------------------------------------------------
 
+export type KeyScope = "read" | "write";
+
 export interface StoredKey {
   id: string;
   label: string;
   key_hash: string;
+  scope: KeyScope;
   created_at: string;
   last_used_at?: string;
 }
@@ -93,6 +96,7 @@ function serializeVaultConfig(config: VaultConfig): string {
   for (const key of config.api_keys) {
     lines.push(`  - id: ${key.id}`);
     lines.push(`    label: ${key.label}`);
+    lines.push(`    scope: ${key.scope ?? "write"}`);
     lines.push(`    key_hash: ${key.key_hash}`);
     lines.push(`    created_at: "${key.created_at}"`);
     if (key.last_used_at) {
@@ -145,6 +149,7 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   for (const block of keyBlocks) {
     const idMatch = block.match(/^(\S+)/);
     const labelMatch = block.match(/label:\s*(.+)/);
+    const scopeMatch = block.match(/scope:\s*(\S+)/);
     const hashMatch = block.match(/key_hash:\s*(\S+)/);
     const createdAtMatch = block.match(/created_at:\s*"?([^"\n]+)"?/);
     const lastUsedMatch = block.match(/last_used_at:\s*"?([^"\n]+)"?/);
@@ -153,6 +158,7 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
       config.api_keys.push({
         id: idMatch[1],
         label: (labelMatch?.[1] ?? "default").trim(),
+        scope: (scopeMatch?.[1] as KeyScope) ?? "write",
         key_hash: hashMatch[1],
         created_at: createdAtMatch?.[1] ?? new Date().toISOString(),
         last_used_at: lastUsedMatch?.[1],

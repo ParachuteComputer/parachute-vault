@@ -346,10 +346,53 @@ describe("MCP tools", () => {
 
   test("every tool has vault param in unified wrapper schema", () => {
     const tools = generateMcpTools(db);
-    // Verify all tools have the expected input schema structure
     for (const tool of tools) {
       expect(tool.inputSchema).toBeDefined();
       expect(tool.execute).toBeFunction();
     }
+  });
+});
+
+describe("auth scopes", () => {
+  test("read scope allows read tools", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("get-note", "read")).toBe(true);
+    expect(isToolAllowed("read-notes", "read")).toBe(true);
+    expect(isToolAllowed("search-notes", "read")).toBe(true);
+    expect(isToolAllowed("get-links", "read")).toBe(true);
+    expect(isToolAllowed("traverse-links", "read")).toBe(true);
+    expect(isToolAllowed("find-path", "read")).toBe(true);
+    expect(isToolAllowed("list-tags", "read")).toBe(true);
+    expect(isToolAllowed("list-vaults", "read")).toBe(true);
+  });
+
+  test("read scope blocks write tools", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("create-note", "read")).toBe(false);
+    expect(isToolAllowed("update-note", "read")).toBe(false);
+    expect(isToolAllowed("delete-note", "read")).toBe(false);
+    expect(isToolAllowed("tag-note", "read")).toBe(false);
+    expect(isToolAllowed("untag-note", "read")).toBe(false);
+    expect(isToolAllowed("create-link", "read")).toBe(false);
+    expect(isToolAllowed("delete-link", "read")).toBe(false);
+    expect(isToolAllowed("create-notes", "read")).toBe(false);
+    expect(isToolAllowed("batch-tag", "read")).toBe(false);
+    expect(isToolAllowed("batch-untag", "read")).toBe(false);
+  });
+
+  test("write scope allows everything", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("create-note", "write")).toBe(true);
+    expect(isToolAllowed("delete-note", "write")).toBe(true);
+    expect(isToolAllowed("get-note", "write")).toBe(true);
+  });
+
+  test("read scope allows GET but not POST/PATCH/DELETE", () => {
+    const { isMethodAllowed } = require("./auth.ts");
+    expect(isMethodAllowed("GET", "read")).toBe(true);
+    expect(isMethodAllowed("HEAD", "read")).toBe(true);
+    expect(isMethodAllowed("POST", "read")).toBe(false);
+    expect(isMethodAllowed("PATCH", "read")).toBe(false);
+    expect(isMethodAllowed("DELETE", "read")).toBe(false);
   });
 });
