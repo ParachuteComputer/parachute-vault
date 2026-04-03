@@ -5,13 +5,8 @@ A self-hosted knowledge graph for AI agents. Notes, tags, and links — exposed 
 ## Quick start
 
 ```bash
-# Install
-git clone https://github.com/ParachuteComputer/parachute-vault.git
-cd parachute-vault
-bun install
-
-# Set up everything
-bun src/cli.ts vault init
+bun install -g github:ParachuteComputer/parachute-vault
+parachute vault init
 ```
 
 That's it. `vault init` creates a vault, starts a background daemon, and configures Claude Code's MCP automatically. Your AI can now read and write to the vault.
