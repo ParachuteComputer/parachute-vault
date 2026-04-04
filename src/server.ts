@@ -43,7 +43,10 @@ const server = Bun.serve({
     }
 
     try {
+      const start = Date.now();
       const response = await route(req, path);
+      const ms = Date.now() - start;
+      console.log(`${req.method} ${path} ${response.status} ${ms}ms`);
       for (const [k, v] of Object.entries(corsHeaders)) {
         response.headers.set(k, v);
       }
