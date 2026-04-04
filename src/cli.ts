@@ -17,7 +17,7 @@
 
 import { resolve } from "path";
 import { homedir } from "os";
-import { existsSync, readFileSync, writeFileSync, rmSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "fs";
 import {
   ensureConfigDirSync,
   readVaultConfig,
@@ -36,6 +36,7 @@ import {
   hashKey,
   DEFAULT_PORT,
   CONFIG_DIR,
+  ASSETS_DIR,
   ENV_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
@@ -143,7 +144,10 @@ async function cmdInit() {
   }
   writeGlobalConfig(globalConfig);
 
-  // 3. Create .env with sensible defaults if it doesn't exist
+  // 3. Ensure assets directory exists
+  mkdirSync(ASSETS_DIR, { recursive: true });
+
+  // 4. Create .env with sensible defaults if it doesn't exist
   if (!existsSync(ENV_PATH)) {
     writeEnvFile({
       PORT: String(globalConfig.port || DEFAULT_PORT),

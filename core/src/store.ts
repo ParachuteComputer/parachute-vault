@@ -102,27 +102,35 @@ export class SqliteStore implements Store {
 
   // ---- Attachments ----
 
-  addAttachment(noteId: string, filePath: string, mimeType: string): Attachment {
+  addAttachment(noteId: string, filePath: string, mimeType: string, metadata?: Record<string, unknown>): Attachment {
     const id = noteOps.generateId();
     const now = new Date().toISOString();
+    const metadataJson = metadata ? JSON.stringify(metadata) : "{}";
     this.db.prepare(
-      "INSERT INTO attachments (id, note_id, path, mime_type, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(id, noteId, filePath, mimeType, now);
+      "INSERT INTO attachments (id, note_id, path, mime_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(id, noteId, filePath, mimeType, metadataJson, now);
 
-    return { id, noteId, path: filePath, mimeType, createdAt: now };
+    return { id, noteId, path: filePath, mimeType, metadata, createdAt: now };
   }
 
   getAttachments(noteId: string): Attachment[] {
     const rows = this.db.prepare(
       "SELECT * FROM attachments WHERE note_id = ? ORDER BY created_at",
-    ).all(noteId) as { id: string; note_id: string; path: string; mime_type: string; created_at: string }[];
+    ).all(noteId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string }[];
 
-    return rows.map((r) => ({
-      id: r.id,
-      noteId: r.note_id,
-      path: r.path,
-      mimeType: r.mime_type,
-      createdAt: r.created_at,
-    }));
+    return rows.map((r) => {
+      let metadata: Record<string, unknown> | undefined;
+      if (r.metadata && r.metadata !== "{}") {
+        try { metadata = JSON.parse(r.metadata); } catch {}
+      }
+      return {
+        id: r.id,
+        noteId: r.note_id,
+        path: r.path,
+        mimeType: r.mime_type,
+        metadata,
+        createdAt: r.created_at,
+      };
+    });
   }
 }

@@ -8,7 +8,7 @@
 import type { Store } from "@parachute/core";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
-import { homedir } from "os";
+import { ASSETS_DIR as DEFAULT_ASSETS_DIR } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -212,13 +212,15 @@ export function handleSearch(req: Request, store: Store): Response {
 // Storage (file upload/serve)
 // ---------------------------------------------------------------------------
 
-const ASSETS_DIR = join(homedir(), ".parachute", "daily", "assets");
+const ASSETS_DIR = process.env.ASSETS_DIR ?? DEFAULT_ASSETS_DIR;
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
 const ALLOWED_EXTENSIONS = new Set([
   ".wav", ".mp3", ".m4a", ".ogg", ".webm",
   ".png", ".jpg", ".jpeg", ".gif", ".webp",
 ]);
+
+const AUDIO_EXTENSIONS = new Set([".wav", ".mp3", ".m4a", ".ogg", ".webm"]);
 
 const MIME_TYPES: Record<string, string> = {
   ".wav": "audio/wav",
@@ -249,6 +251,7 @@ export async function handleStorage(req: Request, path: string): Promise<Respons
       return json({ error: `File type ${ext} not allowed` }, 400);
     }
 
+    // Store the file
     const date = new Date().toISOString().split("T")[0];
     const dir = join(ASSETS_DIR, date);
     mkdirSync(dir, { recursive: true });
@@ -259,7 +262,28 @@ export async function handleStorage(req: Request, path: string): Promise<Respons
     writeFileSync(filePath, buffer);
 
     const relativePath = `${date}/${filename}`;
-    return json({ path: relativePath, size: buffer.length }, 201);
+    const result: Record<string, unknown> = {
+      path: relativePath,
+      size: buffer.length,
+      mime_type: MIME_TYPES[ext] ?? "application/octet-stream",
+    };
+
+    // Optional: transcribe audio in the same request
+    const shouldTranscribe = form.get("transcribe");
+    if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
+      const scribe = await getScribe();
+      if (scribe) {
+        try {
+          // Re-create File from buffer for scribe
+          const audioFile = new File([buffer], file.name, { type: file.type });
+          result.transcription = await scribe.transcribe(audioFile);
+        } catch (err: unknown) {
+          result.transcription_error = err instanceof Error ? err.message : "transcription failed";
+        }
+      }
+    }
+
+    return json(result, 201);
   }
 
   // GET /storage/:date/:file

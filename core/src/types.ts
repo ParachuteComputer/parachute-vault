@@ -28,6 +28,7 @@ export interface Attachment {
   noteId: string;
   path: string;
   mimeType: string;
+  metadata?: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -94,6 +95,6 @@ export interface Store {
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): { path: string[]; relationships: string[] } | null;
 
   // Attachments
-  addAttachment(noteId: string, path: string, mimeType: string): Attachment;
+  addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Attachment;
   getAttachments(noteId: string): Attachment[];
 }
