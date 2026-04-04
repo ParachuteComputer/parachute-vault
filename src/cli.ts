@@ -299,14 +299,26 @@ async function cmdConfig(args: string[]) {
     }
 
     console.log();
-    console.log("Common settings:");
+    console.log("Transcription (which engine transcribes audio):");
     console.log("  TRANSCRIBE_PROVIDER  — parakeet-mlx, groq, openai");
-    console.log("  CLEANUP_PROVIDER     — claude, ollama, none");
     console.log("  GROQ_API_KEY         — for Groq transcription");
     console.log("  OPENAI_API_KEY       — for OpenAI transcription");
+    console.log();
+    console.log("Cleanup (which LLM cleans up transcripts):");
+    console.log("  CLEANUP_PROVIDER     — claude, openai, gemini, groq, ollama, custom, none");
     console.log("  ANTHROPIC_API_KEY    — for Claude cleanup");
-    console.log("  OLLAMA_MODEL         — Ollama model for cleanup");
+    console.log("  OPENAI_API_KEY       — for OpenAI cleanup");
+    console.log("  GEMINI_API_KEY       — for Gemini cleanup");
+    console.log("  OLLAMA_MODEL         — Ollama model (default: llama3.1)");
     console.log("  OLLAMA_URL           — Ollama server URL");
+    console.log("  CLEANUP_URL          — custom OpenAI-compatible endpoint");
+    console.log("  CLEANUP_API_KEY      — custom endpoint API key");
+    console.log("  CLEANUP_MODEL        — override model for any provider");
+    console.log();
+    console.log("Example:");
+    console.log("  parachute vault config set CLEANUP_PROVIDER claude");
+    console.log("  parachute vault config set ANTHROPIC_API_KEY sk-ant-...");
+    console.log("  parachute vault restart");
     return;
   }
 
