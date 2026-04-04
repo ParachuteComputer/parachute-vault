@@ -27,6 +27,7 @@ const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PO
 const server = Bun.serve({
   port,
   hostname: "0.0.0.0",
+  idleTimeout: 120, // seconds — transcription can take a while
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
