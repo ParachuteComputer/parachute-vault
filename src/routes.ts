@@ -6,6 +6,9 @@
  */
 
 import type { Store } from "@parachute/core";
+import { join, extname, normalize } from "path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { homedir } from "os";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -203,6 +206,89 @@ export function handleSearch(req: Request, store: Store): Response {
 
   const results = store.searchNotes(query, { tags, limit });
   return json(results);
+}
+
+// ---------------------------------------------------------------------------
+// Storage (file upload/serve)
+// ---------------------------------------------------------------------------
+
+const ASSETS_DIR = join(homedir(), ".parachute", "daily", "assets");
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
+
+const ALLOWED_EXTENSIONS = new Set([
+  ".wav", ".mp3", ".m4a", ".ogg", ".webm",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp",
+]);
+
+const MIME_TYPES: Record<string, string> = {
+  ".wav": "audio/wav",
+  ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4",
+  ".ogg": "audio/ogg",
+  ".webm": "audio/webm",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+};
+
+export async function handleStorage(req: Request, path: string): Promise<Response> {
+  // POST /storage/upload
+  if (req.method === "POST" && path === "/upload") {
+    const form = await req.formData();
+    const file = form.get("file");
+    if (!(file instanceof File)) {
+      return json({ error: "file is required" }, 400);
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
+    }
+    const ext = extname(file.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      return json({ error: `File type ${ext} not allowed` }, 400);
+    }
+
+    const date = new Date().toISOString().split("T")[0];
+    const dir = join(ASSETS_DIR, date);
+    mkdirSync(dir, { recursive: true });
+
+    const filename = `${Date.now()}-${file.name}`;
+    const filePath = join(dir, filename);
+    const buffer = Buffer.from(await file.arrayBuffer());
+    writeFileSync(filePath, buffer);
+
+    const relativePath = `${date}/${filename}`;
+    return json({ path: relativePath, size: buffer.length }, 201);
+  }
+
+  // GET /storage/:date/:file
+  const fileMatch = path.match(/^\/([^/]+)\/(.+)$/);
+  if (req.method === "GET" && fileMatch) {
+    const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
+    const filePath = normalize(join(ASSETS_DIR, reqPath));
+
+    if (!filePath.startsWith(ASSETS_DIR)) {
+      return json({ error: "Invalid path" }, 403);
+    }
+    if (!existsSync(filePath)) {
+      return json({ error: "Not found" }, 404);
+    }
+
+    const stat = statSync(filePath);
+    const ext = extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+    const fileBuffer = readFileSync(filePath);
+
+    return new Response(fileBuffer, {
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(stat.size),
+      },
+    });
+  }
+
+  return json({ error: "Not found" }, 404);
 }
 
 // ---------------------------------------------------------------------------
