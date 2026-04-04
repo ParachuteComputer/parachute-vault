@@ -16,7 +16,7 @@ import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConf
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleTranscription, handleModels } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels } from "./routes.ts";
 
 ensureConfigDirSync();
 loadEnvFile();
@@ -116,7 +116,8 @@ async function route(req: Request, path: string): Promise<Response> {
     if (apiPath === "/tags") return handleTags(req, store);
     if (apiPath === "/links") return handleLinks(req, store);
     if (apiPath === "/search") return handleSearch(req, store);
-    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8));
+    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
+    if (apiPath === "/ingest") return handleIngest(req, store, defaultVault);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
   }
 
@@ -175,7 +176,10 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleSearch(req, store);
   }
   if (apiPath.startsWith("/storage")) {
-    return handleStorage(req, apiPath.slice(8));
+    return handleStorage(req, apiPath.slice(8), vaultName);
+  }
+  if (apiPath === "/ingest") {
+    return handleIngest(req, store, vaultName);
   }
   if (apiPath === "/health") {
     return Response.json({ status: "ok", vault: vaultName });

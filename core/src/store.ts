@@ -16,7 +16,7 @@ export class SqliteStore implements Store {
 
   // ---- Notes ----
 
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> }): Note {
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
     return noteOps.createNote(this.db, content, opts);
   }
 

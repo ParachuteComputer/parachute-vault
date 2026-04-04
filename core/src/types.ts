@@ -66,7 +66,7 @@ export interface HydratedLink extends Link {
 
 export interface Store {
   // Notes
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> }): Note;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note;
   getNote(id: string): Note | null;
   getNoteByPath(path: string): Note | null;
   getNotes(ids: string[]): Note[];
