@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS attachments (
   note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
   path TEXT NOT NULL,
   mime_type TEXT NOT NULL,
+  metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL
 );
 
@@ -120,6 +121,9 @@ function migrateToV4(db: Database): void {
   }
   if (hasTable(db, "links") && !hasColumn(db, "links", "metadata")) {
     db.exec("ALTER TABLE links ADD COLUMN metadata TEXT DEFAULT '{}'");
+  }
+  if (hasTable(db, "attachments") && !hasColumn(db, "attachments", "metadata")) {
+    db.exec("ALTER TABLE attachments ADD COLUMN metadata TEXT DEFAULT '{}'");
   }
 }
 

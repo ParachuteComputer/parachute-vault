@@ -52,6 +52,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
           tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
           path: { type: "string", description: "Optional path/name (e.g., 'Grocery List', 'Blog/My Post')" },
           metadata: { type: "object", description: "Structured metadata (e.g., { status: 'draft', priority: 'high' })" },
+          created_at: { type: "string", description: "ISO-8601 timestamp (defaults to now). Use when the note was taken at a different time than when it's being created." },
         },
         required: ["content"],
       },
@@ -59,6 +60,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         tags: params.tags as string[] | undefined,
         path: params.path as string | undefined,
         metadata: params.metadata as Record<string, unknown> | undefined,
+        created_at: params.created_at as string | undefined,
       }),
     },
     {
@@ -359,9 +361,3 @@ export function generateMcpTools(db: Database): McpToolDef[] {
   ];
 }
 
-/**
- * Format tool definitions for MCP protocol listing (without execute function).
- */
-export function listMcpTools(db: Database): Omit<McpToolDef, "execute">[] {
-  return generateMcpTools(db).map(({ execute, ...rest }) => rest);
-}

@@ -5,10 +5,10 @@
  * and the Request, and returns a Response.
  */
 
-import type { Store } from "@parachute/core";
+import type { Store } from "../core/src/types.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
-import { homedir } from "os";
+import { vaultDir } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -212,13 +212,17 @@ export function handleSearch(req: Request, store: Store): Response {
 // Storage (file upload/serve)
 // ---------------------------------------------------------------------------
 
-const ASSETS_DIR = join(homedir(), ".parachute", "daily", "assets");
+function assetsDir(vault: string): string {
+  return process.env.ASSETS_DIR ?? join(vaultDir(vault), "assets");
+}
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
 const ALLOWED_EXTENSIONS = new Set([
   ".wav", ".mp3", ".m4a", ".ogg", ".webm",
   ".png", ".jpg", ".jpeg", ".gif", ".webp",
 ]);
+
+const AUDIO_EXTENSIONS = new Set([".wav", ".mp3", ".m4a", ".ogg", ".webm"]);
 
 const MIME_TYPES: Record<string, string> = {
   ".wav": "audio/wav",
@@ -233,7 +237,9 @@ const MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-export async function handleStorage(req: Request, path: string): Promise<Response> {
+export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
+  const assets = assetsDir(vault);
+
   // POST /storage/upload
   if (req.method === "POST" && path === "/upload") {
     const form = await req.formData();
@@ -249,8 +255,9 @@ export async function handleStorage(req: Request, path: string): Promise<Respons
       return json({ error: `File type ${ext} not allowed` }, 400);
     }
 
+    // Store the file
     const date = new Date().toISOString().split("T")[0];
-    const dir = join(ASSETS_DIR, date);
+    const dir = join(assets, date);
     mkdirSync(dir, { recursive: true });
 
     const filename = `${Date.now()}-${file.name}`;
@@ -259,16 +266,37 @@ export async function handleStorage(req: Request, path: string): Promise<Respons
     writeFileSync(filePath, buffer);
 
     const relativePath = `${date}/${filename}`;
-    return json({ path: relativePath, size: buffer.length }, 201);
+    const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+    const result: Record<string, unknown> = {
+      path: relativePath,
+      size: buffer.length,
+      mime_type: mimeType,
+    };
+
+    // Optional: transcribe audio in the same request
+    const shouldTranscribe = form.get("transcribe");
+    if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
+      const scribe = await getScribe();
+      if (scribe) {
+        try {
+          const audioFile = new File([buffer], file.name, { type: file.type });
+          result.transcription = await scribe.transcribe(audioFile);
+        } catch (err: unknown) {
+          result.transcription_error = err instanceof Error ? err.message : "transcription failed";
+        }
+      }
+    }
+
+    return json(result, 201);
   }
 
   // GET /storage/:date/:file
   const fileMatch = path.match(/^\/([^/]+)\/(.+)$/);
   if (req.method === "GET" && fileMatch) {
     const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
-    const filePath = normalize(join(ASSETS_DIR, reqPath));
+    const filePath = normalize(join(assets, reqPath));
 
-    if (!filePath.startsWith(ASSETS_DIR)) {
+    if (!filePath.startsWith(normalize(assets))) {
       return json({ error: "Invalid path" }, 403);
     }
     if (!existsSync(filePath)) {
@@ -289,6 +317,122 @@ export async function handleStorage(req: Request, path: string): Promise<Respons
   }
 
   return json({ error: "Not found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Ingest — one-request voice note flow
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /ingest — Upload audio, optionally transcribe, create note, attach audio.
+ *
+ * Multipart form:
+ *   file          — audio file (required)
+ *   content       — note text (optional, e.g., client transcription or user notes)
+ *   created_at    — when the note was taken, ISO-8601 (optional, defaults to now)
+ *   tags          — comma-separated tags (optional)
+ *   path          — note path (optional)
+ *   metadata      — JSON string of note metadata (optional)
+ *   transcribe    — "true" to server-transcribe (optional)
+ *   id            — client-provided note ID (optional, for offline sync)
+ *
+ * Returns: { note, attachment, transcription? }
+ */
+export async function handleIngest(
+  req: Request,
+  store: Store,
+  vault: string,
+): Promise<Response> {
+  const form = await req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) {
+    return json({ error: "file is required" }, 400);
+  }
+
+  const ext = extname(file.name).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    return json({ error: `File type ${ext} not allowed` }, 400);
+  }
+
+  // 1. Store the file
+  const assets = assetsDir(vault);
+  const date = new Date().toISOString().split("T")[0];
+  const dir = join(assets, date);
+  mkdirSync(dir, { recursive: true });
+
+  const filename = `${Date.now()}-${file.name}`;
+  const filePath = join(dir, filename);
+  const buffer = Buffer.from(await file.arrayBuffer());
+  writeFileSync(filePath, buffer);
+  const relativePath = `${date}/${filename}`;
+  const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+
+  // 2. Optionally transcribe
+  let transcription: string | undefined;
+  const shouldTranscribe = form.get("transcribe");
+  if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
+    const scribe = await getScribe();
+    if (scribe) {
+      try {
+        const audioFile = new File([buffer], file.name, { type: file.type });
+        transcription = await scribe.transcribe(audioFile);
+      } catch {}
+    }
+  }
+
+  // 3. Build note content
+  const clientContent = form.get("content") as string | null;
+  let content: string;
+  if (transcription && clientContent) {
+    content = transcription; // server transcription takes priority, client content preserved in metadata
+  } else if (transcription) {
+    content = transcription;
+  } else if (clientContent) {
+    content = clientContent;
+  } else {
+    content = "";
+  }
+
+  // 4. Parse options
+  const createdAt = (form.get("created_at") as string) ?? undefined;
+  const tagsStr = form.get("tags") as string | null;
+  const tags = tagsStr ? tagsStr.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
+  const path = (form.get("path") as string) ?? undefined;
+  const id = (form.get("id") as string) ?? undefined;
+  let metadata: Record<string, unknown> | undefined;
+  const metadataStr = form.get("metadata") as string | null;
+  if (metadataStr) {
+    try { metadata = JSON.parse(metadataStr); } catch {}
+  }
+
+  // Enrich metadata with audio info
+  metadata = {
+    ...metadata,
+    source: "voice-memo",
+    audio_duration_bytes: buffer.length,
+    ...(clientContent && transcription ? { client_transcription: clientContent } : {}),
+  };
+
+  // 5. Create note
+  const note = store.createNote(content, {
+    id,
+    path,
+    tags,
+    metadata,
+    created_at: createdAt,
+  });
+
+  // 6. Create attachment
+  const attachment = store.addAttachment(note.id, relativePath, mimeType, {
+    size_bytes: buffer.length,
+    original_filename: file.name,
+  });
+
+  return json({
+    note,
+    attachment,
+    transcription: transcription ?? null,
+  }, 201);
 }
 
 // ---------------------------------------------------------------------------

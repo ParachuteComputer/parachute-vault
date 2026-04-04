@@ -22,15 +22,15 @@ export function generateId(): string {
 export function createNote(
   db: Database,
   content: string,
-  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> },
+  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string },
 ): Note {
   const id = opts?.id ?? generateId();
-  const now = new Date().toISOString();
+  const createdAt = opts?.created_at ?? new Date().toISOString();
   const metadata = opts?.metadata ? JSON.stringify(opts.metadata) : "{}";
 
   db.prepare(
     `INSERT INTO notes (id, content, path, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
-  ).run(id, content, opts?.path ?? null, metadata, now);
+  ).run(id, content, opts?.path ?? null, metadata, createdAt);
 
   if (opts?.tags && opts.tags.length > 0) {
     tagNote(db, id, opts.tags);

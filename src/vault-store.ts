@@ -4,7 +4,6 @@
 
 import { Database } from "bun:sqlite";
 import { initSchema } from "../core/src/schema.ts";
-import { seedBuiltins } from "../core/src/seed.ts";
 import * as noteOps from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import type { Store, Note, Link, Attachment, QueryOpts } from "../core/src/types.ts";
@@ -19,10 +18,9 @@ export class BunStore implements Store {
   constructor(db: Database) {
     this.db = db;
     initSchema(db);
-    seedBuiltins(db);
   }
 
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> }): Note {
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
     return noteOps.createNote(this.db, content, opts);
   }
 
@@ -98,26 +96,34 @@ export class BunStore implements Store {
     return linkOps.findPath(this.db, sourceId, targetId, opts);
   }
 
-  addAttachment(noteId: string, filePath: string, mimeType: string): Attachment {
+  addAttachment(noteId: string, filePath: string, mimeType: string, metadata?: Record<string, unknown>): Attachment {
     const id = noteOps.generateId();
     const now = new Date().toISOString();
+    const metadataJson = metadata ? JSON.stringify(metadata) : "{}";
     this.db.prepare(
-      "INSERT INTO attachments (id, note_id, path, mime_type, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(id, noteId, filePath, mimeType, now);
-    return { id, noteId, path: filePath, mimeType, createdAt: now };
+      "INSERT INTO attachments (id, note_id, path, mime_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(id, noteId, filePath, mimeType, metadataJson, now);
+    return { id, noteId, path: filePath, mimeType, metadata, createdAt: now };
   }
 
   getAttachments(noteId: string): Attachment[] {
     const rows = this.db.prepare(
       "SELECT * FROM attachments WHERE note_id = ? ORDER BY created_at",
-    ).all(noteId) as { id: string; note_id: string; path: string; mime_type: string; created_at: string }[];
-    return rows.map((r) => ({
-      id: r.id,
-      noteId: r.note_id,
-      path: r.path,
-      mimeType: r.mime_type,
-      createdAt: r.created_at,
-    }));
+    ).all(noteId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string }[];
+    return rows.map((r) => {
+      let metadata: Record<string, unknown> | undefined;
+      if (r.metadata && r.metadata !== "{}") {
+        try { metadata = JSON.parse(r.metadata); } catch {}
+      }
+      return {
+        id: r.id,
+        noteId: r.note_id,
+        path: r.path,
+        mimeType: r.mime_type,
+        metadata,
+        createdAt: r.created_at,
+      };
+    });
   }
 }
 

@@ -28,6 +28,7 @@ export interface Attachment {
   noteId: string;
   path: string;
   mimeType: string;
+  metadata?: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -65,7 +66,7 @@ export interface HydratedLink extends Link {
 
 export interface Store {
   // Notes
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown> }): Note;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note;
   getNote(id: string): Note | null;
   getNoteByPath(path: string): Note | null;
   getNotes(ids: string[]): Note[];
@@ -94,6 +95,6 @@ export interface Store {
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): { path: string[]; relationships: string[] } | null;
 
   // Attachments
-  addAttachment(noteId: string, path: string, mimeType: string): Attachment;
+  addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Attachment;
   getAttachments(noteId: string): Attachment[];
 }

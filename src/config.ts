@@ -28,6 +28,7 @@ export const ENV_PATH = join(CONFIG_DIR, ".env");
 export const LOG_PATH = join(CONFIG_DIR, "vault.log");
 export const ERR_PATH = join(CONFIG_DIR, "vault.err");
 export const DEFAULT_PORT = 1940;
+export const ASSETS_DIR = join(CONFIG_DIR, "assets");
 
 export function vaultDir(name: string): string {
   return join(VAULTS_DIR, name);
