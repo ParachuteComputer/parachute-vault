@@ -361,9 +361,3 @@ export function generateMcpTools(db: Database): McpToolDef[] {
   ];
 }
 
-/**
- * Format tool definitions for MCP protocol listing (without execute function).
- */
-export function listMcpTools(db: Database): Omit<McpToolDef, "execute">[] {
-  return generateMcpTools(db).map(({ execute, ...rest }) => rest);
-}

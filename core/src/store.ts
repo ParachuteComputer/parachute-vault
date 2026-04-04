@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
 import { initSchema } from "./schema.js";
-import { seedBuiltins } from "./seed.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 
@@ -11,7 +10,6 @@ import * as linkOps from "./links.js";
 export class SqliteStore implements Store {
   constructor(public readonly db: Database) {
     initSchema(db);
-    seedBuiltins(db);
   }
 
   // ---- Notes ----

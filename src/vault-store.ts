@@ -4,7 +4,6 @@
 
 import { Database } from "bun:sqlite";
 import { initSchema } from "../core/src/schema.ts";
-import { seedBuiltins } from "../core/src/seed.ts";
 import * as noteOps from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import type { Store, Note, Link, Attachment, QueryOpts } from "../core/src/types.ts";
@@ -19,7 +18,6 @@ export class BunStore implements Store {
   constructor(db: Database) {
     this.db = db;
     initSchema(db);
-    seedBuiltins(db);
   }
 
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {

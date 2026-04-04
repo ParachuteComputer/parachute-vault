@@ -5,7 +5,7 @@
  * and the Request, and returns a Response.
  */
 
-import type { Store } from "@parachute/core";
+import type { Store } from "../core/src/types.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
