@@ -3,15 +3,36 @@
  *
  * Every tool gets an optional `vault` parameter. Defaults to the
  * configured default vault. Single-vault users never notice it.
- * Multi-vault users pass `vault: "work"` to target a specific vault.
  *
- * Also adds a `list-vaults` tool for vault discovery.
+ * Vault description is sent as the MCP server instruction (not
+ * prepended to each tool). Agents get the guidance once at session
+ * start.
  */
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
-import { readVaultConfig, readGlobalConfig, listVaults as getVaultNames } from "./config.ts";
+import { readVaultConfig, writeVaultConfig, readGlobalConfig, listVaults as getVaultNames } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
+
+/**
+ * Get the MCP server instruction for a vault (or the default vault).
+ * This is sent once at session init — not per tool.
+ */
+export function getServerInstruction(vaultName?: string): string {
+  const globalConfig = readGlobalConfig();
+  const name = vaultName ?? globalConfig.default_vault ?? "default";
+  const config = readVaultConfig(name);
+
+  const parts: string[] = [
+    `You are connected to Parachute Vault "${name}".`,
+  ];
+
+  if (config?.description) {
+    parts.push("", config.description);
+  }
+
+  return parts.join("\n");
+}
 
 /**
  * Generate the unified MCP tool set.
@@ -27,25 +48,13 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
   const defaultStore = getVaultStore(defaultVault);
   const coreTools = generateMcpTools(defaultStore.db);
 
-  // Get default vault config for description enrichment
-  const defaultConfig = readVaultConfig(defaultVault);
-  const prefix = defaultConfig?.description
-    ? `[Vault: ${defaultVault}] ${defaultConfig.description}\n\n`
-    : "";
-  const hints = defaultConfig?.tool_hints ?? {};
-
   // Wrap each core tool with vault resolution
   const tools: McpToolDef[] = coreTools.map((coreTool) => {
-    // Build enriched description
     let description = coreTool.description;
-    if (prefix) description = prefix + description;
-    const hint = hints[coreTool.name];
-    if (hint) description = description + "\n\n" + hint;
     if (multiVault) {
       description += `\n\nMulti-vault: pass 'vault' to target a specific vault. Default: "${defaultVault}". Available: ${vaultNames.join(", ")}`;
     }
 
-    // Add vault param to schema
     const inputSchema = {
       ...coreTool.inputSchema,
       properties: {
@@ -63,43 +72,21 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
       inputSchema,
       execute: (params) => {
         const vaultName = (params.vault as string) ?? defaultVault;
-
-        // Validate vault exists
         const config = readVaultConfig(vaultName);
         if (!config) {
           throw new Error(`Vault "${vaultName}" not found. Available: ${getVaultNames().join(", ")}`);
         }
-
-        // Get the store and generate tools for this vault's db
         const store = getVaultStore(vaultName);
         const vaultTools = generateMcpTools(store.db);
         const tool = vaultTools.find((t) => t.name === coreTool.name)!;
-
-        // Strip vault param before passing to core tool
         const { vault: _, ...rest } = params;
         return tool.execute(rest);
       },
     };
   });
 
-  // Add list-vaults tool
-  tools.push({
-    name: "list-vaults",
-    description: "List all available vaults with their descriptions.",
-    inputSchema: { type: "object", properties: {} },
-    execute: () => {
-      const names = getVaultNames();
-      return names.map((name) => {
-        const config = readVaultConfig(name);
-        return {
-          name,
-          description: config?.description,
-          created_at: config?.created_at,
-          is_default: name === defaultVault,
-        };
-      });
-    },
-  });
+  // Vault management tools
+  addVaultManagementTools(tools, defaultVault);
 
   return tools;
 }
@@ -107,23 +94,80 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
 /**
  * Generate MCP tools scoped to a single vault.
  * No vault param — tools operate on that vault only.
- * Descriptions enriched with the vault's hints.
  */
 export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const store = getVaultStore(vaultName);
   const tools = generateMcpTools(store.db);
-  const config = readVaultConfig(vaultName);
+  addVaultManagementTools(tools, vaultName, true);
+  return tools;
+}
 
-  const prefix = config?.description
-    ? `[Vault: ${vaultName}] ${config.description}\n\n`
-    : "";
-  const hints = config?.tool_hints ?? {};
+/**
+ * Add vault management tools (list-vaults, get/update description).
+ */
+function addVaultManagementTools(tools: McpToolDef[], defaultVault: string, scoped = false) {
+  if (!scoped) {
+    tools.push({
+      name: "list-vaults",
+      description: "List all available vaults with their descriptions.",
+      inputSchema: { type: "object", properties: {} },
+      execute: () => {
+        const names = getVaultNames();
+        return names.map((name) => {
+          const config = readVaultConfig(name);
+          return {
+            name,
+            description: config?.description,
+            created_at: config?.created_at,
+            is_default: name === defaultVault,
+          };
+        });
+      },
+    });
+  }
 
-  return tools.map((tool) => {
-    let description = tool.description;
-    if (prefix) description = prefix + description;
-    const hint = hints[tool.name];
-    if (hint) description = description + "\n\n" + hint;
-    return { ...tool, description };
+  tools.push({
+    name: "get-vault-description",
+    description: "Get the description/instructions for a vault. The description tells agents how to use this vault — what tags to use, what conventions to follow, etc.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(scoped ? {} : {
+          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+        }),
+      },
+    },
+    execute: (params) => {
+      const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
+      const config = readVaultConfig(name);
+      if (!config) throw new Error(`Vault "${name}" not found`);
+      return {
+        name: config.name,
+        description: config.description ?? null,
+      };
+    },
+  });
+
+  tools.push({
+    name: "update-vault-description",
+    description: "Update the description/instructions for a vault. The description guides how AI agents use this vault — tag conventions, writing guidelines, etc. IMPORTANT: Only update when the user explicitly asks you to change the vault's configuration. Never modify unprompted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(scoped ? {} : {
+          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+        }),
+        description: { type: "string", description: "New vault description/instructions" },
+      },
+      required: ["description"],
+    },
+    execute: (params) => {
+      const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
+      const config = readVaultConfig(name);
+      if (!config) throw new Error(`Vault "${name}" not found`);
+      config.description = params.description as string;
+      writeVaultConfig(config);
+      return { updated: true, name, description: config.description };
+    },
   });
 }

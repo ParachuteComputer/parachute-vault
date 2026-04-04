@@ -3,9 +3,10 @@
  *
  * Two modes:
  *   /mcp              — unified, all vaults via `vault` param + list-vaults
- *   /vaults/{name}/mcp — scoped to one vault, no vault param, clean 17 tools
+ *   /vaults/{name}/mcp — scoped to one vault, no vault param
  *
- * Both enforce read-only scope when the API key has scope: "read".
+ * Vault description is sent as the MCP server instruction on session init.
+ * Read-only keys see fewer tools.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -14,7 +15,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { generateUnifiedMcpTools, generateScopedMcpTools } from "./mcp-tools.ts";
+import { generateUnifiedMcpTools, generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import { isToolAllowed } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import type { KeyScope } from "./config.ts";
@@ -29,12 +30,14 @@ const sessions = new Map<string, Session>();
 
 /** Handle unified MCP at /mcp (all vaults). */
 export async function handleUnifiedMcp(req: Request, scope: KeyScope): Promise<Response> {
-  return handleMcp(req, () => generateUnifiedMcpTools(), "parachute-vault", scope);
+  const instruction = getServerInstruction();
+  return handleMcp(req, () => generateUnifiedMcpTools(), "parachute-vault", scope, instruction);
 }
 
 /** Handle scoped MCP at /vaults/{name}/mcp (single vault). */
 export async function handleScopedMcp(req: Request, vaultName: string, scope: KeyScope): Promise<Response> {
-  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, scope);
+  const instruction = getServerInstruction(vaultName);
+  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, scope, instruction);
 }
 
 async function handleMcp(
@@ -42,6 +45,7 @@ async function handleMcp(
   getTools: () => McpToolDef[],
   serverName: string,
   scope: KeyScope,
+  instruction: string,
 ): Promise<Response> {
   const sessionId = req.headers.get("mcp-session-id");
   const existing = sessionId ? sessions.get(sessionId) : undefined;
@@ -50,12 +54,17 @@ async function handleMcp(
     return existing.transport.handleRequest(req);
   }
 
-  const session = createSession(getTools(), serverName, scope);
+  const session = createSession(getTools(), serverName, scope, instruction);
   await session.server.connect(session.transport);
   return session.transport.handleRequest(req);
 }
 
-function createSession(mcpTools: McpToolDef[], serverName: string, scope: KeyScope): Session {
+function createSession(
+  mcpTools: McpToolDef[],
+  serverName: string,
+  scope: KeyScope,
+  instruction: string,
+): Session {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
     onsessioninitialized: (id) => {
@@ -68,7 +77,10 @@ function createSession(mcpTools: McpToolDef[], serverName: string, scope: KeySco
 
   const server = new Server(
     { name: serverName, version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    {
+      capabilities: { tools: {} },
+      instructions: instruction,
+    },
   );
 
   // For read-only keys, only list readable tools
@@ -87,7 +99,6 @@ function createSession(mcpTools: McpToolDef[], serverName: string, scope: KeySco
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    // Enforce scope
     if (!isToolAllowed(name, scope)) {
       return {
         content: [{ type: "text" as const, text: `Forbidden: read-only key cannot call ${name}` }],

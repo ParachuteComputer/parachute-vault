@@ -60,7 +60,6 @@ export interface StoredKey {
 export interface VaultConfig {
   name: string;
   description?: string;
-  tool_hints?: Record<string, string>;
   api_keys: StoredKey[];
   created_at: string;
 }
@@ -85,13 +84,6 @@ function serializeVaultConfig(config: VaultConfig): string {
     }
   }
   lines.push(`created_at: "${config.created_at}"`);
-
-  if (config.tool_hints && Object.keys(config.tool_hints).length > 0) {
-    lines.push("tool_hints:");
-    for (const [key, val] of Object.entries(config.tool_hints)) {
-      lines.push(`  ${key}: "${val}"`);
-    }
-  }
 
   lines.push("api_keys:");
   for (const key of config.api_keys) {
@@ -132,17 +124,6 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   } else {
     const descSimple = yaml.match(/^description:\s*(.+)/m);
     if (descSimple) config.description = descSimple[1].trim().replace(/^"(.*)"$/, "$1");
-  }
-
-  // Parse tool_hints
-  const hintsSection = yaml.match(/^tool_hints:\n((?:\s{2}\S.+\n?)+)/m);
-  if (hintsSection) {
-    config.tool_hints = {};
-    const hintLines = hintsSection[1].split("\n");
-    for (const line of hintLines) {
-      const m = line.match(/^\s{2}(\S+):\s*"?([^"\n]+)"?/);
-      if (m) config.tool_hints[m[1]] = m[2];
-    }
   }
 
   // Parse api_keys
