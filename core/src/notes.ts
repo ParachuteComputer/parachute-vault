@@ -107,10 +107,10 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const params: unknown[] = [];
   const joins: string[] = [];
 
-  // Include tags — AND mode (default): must have ALL tags; OR mode: must have ANY tag
+  // Include tags — "all" (default): must have ALL tags; "any": must have ANY tag
   if (opts.tags && opts.tags.length > 0) {
-    const mode = opts.tagMode ?? "and";
-    if (mode === "or") {
+    const match = opts.tagMatch ?? "all";
+    if (match === "any") {
       const placeholders = opts.tags.map(() => "?").join(", ");
       joins.push(`JOIN note_tags nt_or ON nt_or.note_id = n.id AND nt_or.tag_name IN (${placeholders})`);
       params.push(...opts.tags);

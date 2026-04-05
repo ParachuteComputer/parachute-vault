@@ -153,7 +153,7 @@ describe("queryNotes", () => {
     store.createNote("Text daily", { tags: ["daily"] });
     store.createNote("A doc", { tags: ["doc"] });
 
-    const results = store.queryNotes({ tags: ["voice", "doc"], tagMode: "or" });
+    const results = store.queryNotes({ tags: ["voice", "doc"], tagMatch: "any" });
     expect(results).toHaveLength(2);
     const contents = results.map((n) => n.content).sort();
     expect(contents).toEqual(["A doc", "Voice daily"]);

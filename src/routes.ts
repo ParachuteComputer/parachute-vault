@@ -43,7 +43,7 @@ export async function handleNotes(
   if (method === "GET" && path === "") {
     const results = store.queryNotes({
       tags: parseQueryList(url, "tag"),
-      tagMode: (parseQuery(url, "tag_mode") as "and" | "or") ?? undefined,
+      tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? undefined,
       excludeTags: parseQueryList(url, "exclude_tag"),
       dateFrom: parseQuery(url, "date_from") ?? undefined,
       dateTo: parseQuery(url, "date_to") ?? undefined,
