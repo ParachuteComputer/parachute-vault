@@ -43,7 +43,7 @@ export async function handleNotes(
   if (method === "GET" && path === "") {
     const results = store.queryNotes({
       tags: parseQueryList(url, "tag"),
-      tagMode: (parseQuery(url, "tag_mode") as "and" | "or") ?? "or",
+      tagMode: (parseQuery(url, "tag_mode") as "and" | "or") ?? undefined,
       excludeTags: parseQueryList(url, "exclude_tag"),
       dateFrom: parseQuery(url, "date_from") ?? undefined,
       dateTo: parseQuery(url, "date_to") ?? undefined,
@@ -371,6 +371,7 @@ export async function handleIngest(
 
   // 2. Optionally transcribe (sync=true or transcribe=true)
   let transcription: string | undefined;
+  let transcriptionError: string | undefined;
   const shouldTranscribe = form.get("sync") ?? form.get("transcribe");
   if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
     const scribe = await getScribe();
@@ -378,7 +379,9 @@ export async function handleIngest(
       try {
         const audioFile = new File([buffer], file.name, { type: file.type });
         transcription = await scribe.transcribe(audioFile);
-      } catch {}
+      } catch (err) {
+        transcriptionError = err instanceof Error ? err.message : "transcription failed";
+      }
     }
   }
 
@@ -413,6 +416,7 @@ export async function handleIngest(
     source: "voice-memo",
     audio_duration_bytes: buffer.length,
     ...(clientContent && transcription ? { client_transcription: clientContent } : {}),
+    ...(transcriptionError ? { transcription_error: transcriptionError } : {}),
   };
 
   // 5. Create note
