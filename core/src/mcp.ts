@@ -103,7 +103,8 @@ export function generateMcpTools(db: Database): McpToolDef[] {
       inputSchema: {
         type: "object",
         properties: {
-          tags: { type: "array", items: { type: "string" }, description: "Filter by tags (AND)" },
+          tags: { type: "array", items: { type: "string" }, description: "Filter by tags" },
+          tag_mode: { type: "string", enum: ["and", "or"], description: "How to combine tags: 'and' = must have ALL (default), 'or' = must have ANY" },
           exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
           path_prefix: { type: "string", description: "Filter by path prefix (e.g., 'Projects/Parachute')" },
           metadata: { type: "object", description: "Filter by metadata values (exact match per key)" },
@@ -116,6 +117,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
       },
       execute: (params) => notes.queryNotes(db, {
         tags: params.tags as string[] | undefined,
+        tagMode: params.tag_mode as "and" | "or" | undefined,
         excludeTags: params.exclude_tags as string[] | undefined,
         pathPrefix: params.path_prefix as string | undefined,
         metadata: params.metadata as Record<string, unknown> | undefined,

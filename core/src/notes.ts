@@ -107,12 +107,19 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const params: unknown[] = [];
   const joins: string[] = [];
 
-  // Include tags
+  // Include tags — AND mode (default): must have ALL tags; OR mode: must have ANY tag
   if (opts.tags && opts.tags.length > 0) {
-    for (let i = 0; i < opts.tags.length; i++) {
-      const alias = `nt${i}`;
-      joins.push(`JOIN note_tags ${alias} ON ${alias}.note_id = n.id AND ${alias}.tag_name = ?`);
-      params.push(opts.tags[i]);
+    const mode = opts.tagMode ?? "and";
+    if (mode === "or") {
+      const placeholders = opts.tags.map(() => "?").join(", ");
+      joins.push(`JOIN note_tags nt_or ON nt_or.note_id = n.id AND nt_or.tag_name IN (${placeholders})`);
+      params.push(...opts.tags);
+    } else {
+      for (let i = 0; i < opts.tags.length; i++) {
+        const alias = `nt${i}`;
+        joins.push(`JOIN note_tags ${alias} ON ${alias}.note_id = n.id AND ${alias}.tag_name = ?`);
+        params.push(opts.tags[i]);
+      }
     }
   }
 

@@ -148,6 +148,17 @@ describe("queryNotes", () => {
     expect(results[0].content).toBe("Voice daily");
   });
 
+  it("queries by multiple tags (OR)", () => {
+    store.createNote("Voice daily", { tags: ["daily", "voice"] });
+    store.createNote("Text daily", { tags: ["daily"] });
+    store.createNote("A doc", { tags: ["doc"] });
+
+    const results = store.queryNotes({ tags: ["voice", "doc"], tagMode: "or" });
+    expect(results).toHaveLength(2);
+    const contents = results.map((n) => n.content).sort();
+    expect(contents).toEqual(["A doc", "Voice daily"]);
+  });
+
   it("excludes tags", () => {
     store.createNote("Active", { tags: ["digest"] });
     store.createNote("Archived", { tags: ["digest", "archived"] });
