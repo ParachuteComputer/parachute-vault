@@ -35,13 +35,11 @@ describe("config", () => {
     const config: VaultConfig = {
       name: "testvault",
       description: "A test vault for testing",
-      tool_hints: {
-        "create-note": "Always add a #test tag",
-      },
       api_keys: [
         {
           id: "k_abc123",
           label: "default",
+          scope: "write",
           key_hash: "sha256:fakehash",
           created_at: "2026-01-01T00:00:00.000Z",
         },
@@ -57,7 +55,6 @@ describe("config", () => {
     expect(loaded!.description).toBe("A test vault for testing");
     expect(loaded!.api_keys.length).toBe(1);
     expect(loaded!.api_keys[0].id).toBe("k_abc123");
-    expect(loaded!.tool_hints?.["create-note"]).toBe("Always add a #test tag");
 
     rmSync(tmpDir, { recursive: true, force: true });
   });
