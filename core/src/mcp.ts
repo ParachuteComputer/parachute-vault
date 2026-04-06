@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import type { Store } from "./types.js";
 import * as notes from "./notes.js";
 import * as links from "./links.js";
 
@@ -11,8 +12,15 @@ export interface McpToolDef {
 
 /**
  * Generate MCP tools for a vault.
+ *
+ * Accepts a Store so that create/update/delete operations go through
+ * the store's hooks (wikilink sync, path normalization, etc.).
+ * Read-only operations use the db directly for efficiency.
  */
-export function generateMcpTools(db: Database): McpToolDef[] {
+export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
+  // Support both Store and raw Database for backwards compat (tests)
+  const store: Store | null = 'createNote' in storeOrDb ? storeOrDb as Store : null;
+  const db: Database = store ? (store as any).db : storeOrDb as Database;
   return [
     {
       name: "get-note",
@@ -56,12 +64,15 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         },
         required: ["content"],
       },
-      execute: (params) => notes.createNote(db, params.content as string, {
-        tags: params.tags as string[] | undefined,
-        path: params.path as string | undefined,
-        metadata: params.metadata as Record<string, unknown> | undefined,
-        created_at: params.created_at as string | undefined,
-      }),
+      execute: (params) => {
+        const fn = store ? store.createNote.bind(store) : (c: string, o?: any) => notes.createNote(db, c, o);
+        return fn(params.content as string, {
+          tags: params.tags as string[] | undefined,
+          path: params.path as string | undefined,
+          metadata: params.metadata as Record<string, unknown> | undefined,
+          created_at: params.created_at as string | undefined,
+        });
+      },
     },
     {
       name: "update-note",
@@ -76,11 +87,14 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         },
         required: ["id"],
       },
-      execute: (params) => notes.updateNote(db, params.id as string, {
-        content: params.content as string | undefined,
-        path: params.path as string | undefined,
-        metadata: params.metadata as Record<string, unknown> | undefined,
-      }),
+      execute: (params) => {
+        const fn = store ? store.updateNote.bind(store) : (id: string, u: any) => notes.updateNote(db, id, u);
+        return fn(params.id as string, {
+          content: params.content as string | undefined,
+          path: params.path as string | undefined,
+          metadata: params.metadata as Record<string, unknown> | undefined,
+        });
+      },
     },
     {
       name: "delete-note",
@@ -93,7 +107,11 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         required: ["id"],
       },
       execute: (params) => {
-        notes.deleteNote(db, params.id as string);
+        if (store) {
+          store.deleteNote(params.id as string);
+        } else {
+          notes.deleteNote(db, params.id as string);
+        }
         return { deleted: true };
       },
     },

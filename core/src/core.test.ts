@@ -394,4 +394,20 @@ describe("MCP tools", () => {
     deleteLink.execute({ source_id: "a", target_id: "b", relationship: "mentions" });
     expect((getLinks.execute({ id: "a" }) as any[]).length).toBe(0);
   });
+
+  it("create-note via store triggers wikilink sync", () => {
+    // When MCP tools are generated with a Store, wikilinks should auto-sync
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+
+    // Create target note first
+    store.createNote("Target", { path: "Target Note" });
+
+    // Create source via MCP tool with a wikilink
+    const source = createNote.execute({ content: "See [[Target Note]]" }) as any;
+
+    // Wikilink should have been resolved into a link
+    const links = store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.relationship === "wikilink")).toBe(true);
+  });
 });
