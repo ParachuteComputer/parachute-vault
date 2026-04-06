@@ -12,6 +12,11 @@
  *   *    /vaults/{name}/api/...            — per-vault REST API
  */
 
+import { useHomebrewSQLiteIfNeeded } from "../core/src/embeddings.ts";
+
+// Must be called before any Database is opened — enables sqlite-vec on macOS
+useHomebrewSQLiteIfNeeded();
+
 import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";

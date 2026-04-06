@@ -1,4 +1,9 @@
 #!/usr/bin/env bun
+
+// Enable sqlite-vec on macOS (must be before any Database opens)
+import { useHomebrewSQLiteIfNeeded } from "../core/src/embeddings.ts";
+useHomebrewSQLiteIfNeeded();
+
 /**
  * Parachute Vault CLI.
  *
