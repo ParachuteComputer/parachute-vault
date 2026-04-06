@@ -154,6 +154,10 @@ export function getUnembeddedNoteIds(db: Database): string[] {
 
 /**
  * Semantic KNN search. Returns notes ranked by vector similarity.
+ *
+ * Filters are pushed into SQL where possible — tag/date filters use a
+ * post-KNN JOIN so only matching notes are returned. This means searching
+ * "over just my reader notes" actually works efficiently.
  */
 export function semanticSearch(
   db: Database,
@@ -162,48 +166,128 @@ export function semanticSearch(
 ): SemanticSearchResult[] {
   const limit = opts?.limit ?? 20;
   const vec = serializeVec(queryEmbedding);
+  const hasFilters = !!(opts?.tags?.length || opts?.excludeTags?.length || opts?.dateFrom || opts?.dateTo);
 
-  // Fetch more candidates than needed so we can filter
-  const fetchLimit = limit * 3;
+  // Fetch more candidates when filtering (need headroom for post-filter)
+  const fetchLimit = hasFilters ? limit * 5 : limit;
 
-  const rows = db.prepare(`
-    SELECT v.note_id, v.distance
-    FROM vec_notes v
-    WHERE v.embedding MATCH ?
-    ORDER BY v.distance
-    LIMIT ?
-  `).all(vec, fetchLimit) as { note_id: string; distance: number }[];
+  // Build the filtered query with SQL-level JOINs
+  const { sql, params } = buildFilteredVecQuery(fetchLimit, limit, opts);
+
+  const rows = db.prepare(sql).all(vec, ...params) as {
+    note_id: string;
+    distance: number;
+  }[];
 
   if (rows.length === 0) return [];
 
-  // Hydrate notes and apply filters
-  const results: SemanticSearchResult[] = [];
+  // Hydrate and score
   const maxDist = rows[rows.length - 1]?.distance || 1;
+  const results: SemanticSearchResult[] = [];
 
   for (const row of rows) {
     const note = hydrateNote(db, row.note_id);
     if (!note) continue;
 
-    // Apply tag filters
-    if (!passesTagFilter(note, opts)) continue;
-
-    // Apply date filters
-    if (opts?.dateFrom && note.createdAt < opts.dateFrom) continue;
-    if (opts?.dateTo && note.createdAt >= opts.dateTo) continue;
-
-    // Normalize distance to 0-1 similarity score
     const score = maxDist > 0 ? 1 - (row.distance / (maxDist * 1.5)) : 1;
-
     results.push({
       note,
       distance: row.distance,
       score: Math.max(0, Math.min(1, score)),
     });
-
-    if (results.length >= limit) break;
   }
 
   return results;
+}
+
+/**
+ * Build a vec0 KNN query with SQL-level filters.
+ * Uses subquery pattern: KNN first (vec0 requires LIMIT in its query),
+ * then JOIN with notes/tags to filter.
+ */
+function buildFilteredVecQuery(
+  fetchLimit: number,
+  resultLimit: number,
+  opts?: SemanticSearchOpts,
+): { sql: string; params: unknown[] } {
+  const params: unknown[] = [];
+  const joins: string[] = [];
+  const conditions: string[] = [];
+
+  // Tag includes
+  if (opts?.tags && opts.tags.length > 0) {
+    const match = opts.tagMatch ?? "all";
+    if (match === "any") {
+      const placeholders = opts.tags.map(() => "?").join(", ");
+      joins.push(`JOIN note_tags nt_inc ON nt_inc.note_id = sub.note_id AND nt_inc.tag_name IN (${placeholders})`);
+      params.push(...opts.tags);
+    } else {
+      for (let i = 0; i < opts.tags.length; i++) {
+        const alias = `nt_inc${i}`;
+        joins.push(`JOIN note_tags ${alias} ON ${alias}.note_id = sub.note_id AND ${alias}.tag_name = ?`);
+        params.push(opts.tags[i]);
+      }
+    }
+  }
+
+  // Tag excludes
+  if (opts?.excludeTags && opts.excludeTags.length > 0) {
+    for (const tag of opts.excludeTags) {
+      conditions.push(`NOT EXISTS (SELECT 1 FROM note_tags ex WHERE ex.note_id = sub.note_id AND ex.tag_name = ?)`);
+      params.push(tag);
+    }
+  }
+
+  // Date filters
+  if (opts?.dateFrom) {
+    joins.push("JOIN notes n_date ON n_date.id = sub.note_id");
+    conditions.push("n_date.created_at >= ?");
+    params.push(opts.dateFrom);
+    if (opts?.dateTo) {
+      conditions.push("n_date.created_at < ?");
+      params.push(opts.dateTo);
+    }
+  } else if (opts?.dateTo) {
+    joins.push("JOIN notes n_date ON n_date.id = sub.note_id");
+    conditions.push("n_date.created_at < ?");
+    params.push(opts.dateTo);
+  }
+
+  params.push(resultLimit);
+
+  const hasPostFilter = joins.length > 0 || conditions.length > 0;
+
+  if (!hasPostFilter) {
+    return {
+      sql: `
+        SELECT v.note_id, v.distance
+        FROM vec_notes v
+        WHERE v.embedding MATCH ?
+        ORDER BY v.distance
+        LIMIT ?
+      `,
+      params: [resultLimit],
+    };
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  return {
+    sql: `
+      SELECT DISTINCT sub.note_id, sub.distance FROM (
+        SELECT v.note_id, v.distance
+        FROM vec_notes v
+        WHERE v.embedding MATCH ?
+        ORDER BY v.distance
+        LIMIT ${fetchLimit}
+      ) sub
+      ${joins.join("\n")}
+      ${whereClause}
+      ORDER BY sub.distance
+      LIMIT ?
+    `,
+    params,
+  };
 }
 
 /**
