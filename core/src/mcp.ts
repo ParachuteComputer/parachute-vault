@@ -360,6 +360,7 @@ export function generateMcpTools(db: Database): McpToolDef[] {
         { max_depth: Math.min((params.max_depth as number) ?? 5, 10) },
       ),
     },
+
   ];
 }
 

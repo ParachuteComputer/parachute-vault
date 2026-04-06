@@ -3,6 +3,7 @@ import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
+import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 
 /**
  * SQLite-backed Store implementation.
@@ -15,7 +16,19 @@ export class SqliteStore implements Store {
   // ---- Notes ----
 
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
-    return noteOps.createNote(this.db, content, opts);
+    const note = noteOps.createNote(this.db, content, opts);
+
+    // Auto-sync wikilinks from content
+    if (content) {
+      syncWikilinks(this.db, note.id, content);
+    }
+
+    // If this note has a path, resolve any pending wikilinks targeting it
+    if (note.path) {
+      resolveUnresolvedWikilinks(this.db, note.path, note.id);
+    }
+
+    return note;
   }
 
   getNote(id: string): Note | null {
@@ -31,7 +44,19 @@ export class SqliteStore implements Store {
   }
 
   updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note {
-    return noteOps.updateNote(this.db, id, updates);
+    const note = noteOps.updateNote(this.db, id, updates);
+
+    // Re-sync wikilinks if content changed
+    if (updates.content !== undefined) {
+      syncWikilinks(this.db, id, updates.content);
+    }
+
+    // If path changed, resolve any pending wikilinks targeting the new path
+    if (updates.path !== undefined && note.path) {
+      resolveUnresolvedWikilinks(this.db, note.path, id);
+    }
+
+    return note;
   }
 
   deleteNote(id: string): void {
@@ -96,6 +121,39 @@ export class SqliteStore implements Store {
 
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }) {
     return linkOps.findPath(this.db, sourceId, targetId, opts);
+  }
+
+  // ---- Batch Wikilink Sync ----
+
+  /**
+   * Create a note without triggering wikilink sync.
+   * Use this during bulk imports, then call syncAllWikilinks() after.
+   */
+  createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
+    return noteOps.createNote(this.db, content, opts);
+  }
+
+  /**
+   * Sync wikilinks for all notes in the vault.
+   * Efficient for bulk imports — call once after importing all notes.
+   */
+  syncAllWikilinks(): { synced: number; totalAdded: number; totalRemoved: number } {
+    const allNotes = noteOps.queryNotes(this.db, { limit: 1000000 });
+    let synced = 0;
+    let totalAdded = 0;
+    let totalRemoved = 0;
+
+    for (const note of allNotes) {
+      if (!note.content) continue;
+      const result = syncWikilinks(this.db, note.id, note.content);
+      if (result.added > 0 || result.removed > 0) {
+        synced++;
+        totalAdded += result.added;
+        totalRemoved += result.removed;
+      }
+    }
+
+    return { synced, totalAdded, totalRemoved };
   }
 
   // ---- Attachments ----

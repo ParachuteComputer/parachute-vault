@@ -97,6 +97,12 @@ switch (command) {
   case "restart":
     await cmdRestart();
     break;
+  case "import":
+    await cmdImport(cmdArgs);
+    break;
+  case "export":
+    await cmdExport(cmdArgs);
+    break;
   case "help":
   case "--help":
   case "-h":
@@ -539,6 +545,180 @@ async function cmdStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// Import / Export
+// ---------------------------------------------------------------------------
+
+async function cmdImport(args: string[]) {
+  // Parse flags
+  let format = "obsidian";
+  let vaultName = "default";
+  let sourcePath = "";
+  let dryRun = false;
+
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--format") {
+      format = args[++i];
+    } else if (args[i] === "--vault") {
+      vaultName = args[++i];
+    } else if (args[i] === "--dry-run") {
+      dryRun = true;
+    } else if (args[i] === "--obsidian") {
+      format = "obsidian";
+    } else {
+      positional.push(args[i]);
+    }
+  }
+  sourcePath = positional[0] ?? "";
+
+  if (!sourcePath) {
+    console.error("Usage: parachute vault import <path> [--vault <name>] [--dry-run]");
+    console.error("\nImports an Obsidian vault into Parachute Vault.");
+    console.error("\nOptions:");
+    console.error("  --vault <name>   Target vault (default: 'default')");
+    console.error("  --dry-run        Show what would be imported without importing");
+    process.exit(1);
+  }
+
+  const { resolve: resolvePath } = await import("path");
+  const fullPath = resolvePath(sourcePath);
+
+  if (!existsSync(fullPath)) {
+    console.error(`Path not found: ${fullPath}`);
+    process.exit(1);
+  }
+
+  // Verify vault exists
+  const config = readVaultConfig(vaultName);
+  if (!config) {
+    console.error(`Vault "${vaultName}" not found. Run: parachute vault create ${vaultName}`);
+    process.exit(1);
+  }
+
+  const { parseObsidianVault } = await import("../core/src/obsidian.ts");
+  const { getVaultStore } = await import("./vault-store.ts");
+
+  console.log(`Parsing Obsidian vault: ${fullPath}`);
+  const { notes, errors } = parseObsidianVault(fullPath);
+
+  if (errors.length > 0) {
+    console.error(`\n${errors.length} file(s) failed to parse:`);
+    for (const err of errors.slice(0, 10)) {
+      console.error(`  ${err.path}: ${err.error}`);
+    }
+    if (errors.length > 10) console.error(`  ... and ${errors.length - 10} more`);
+  }
+
+  console.log(`Found ${notes.length} notes`);
+
+  // Collect all unique tags
+  const allTags = new Set<string>();
+  for (const note of notes) {
+    for (const tag of note.tags) allTags.add(tag);
+  }
+  console.log(`Tags: ${allTags.size} unique (${[...allTags].slice(0, 10).join(", ")}${allTags.size > 10 ? "..." : ""})`);
+
+  if (dryRun) {
+    console.log("\n[Dry run] Would import:");
+    for (const note of notes.slice(0, 20)) {
+      const tagStr = note.tags.length > 0 ? ` [${note.tags.join(", ")}]` : "";
+      console.log(`  ${note.path}${tagStr}`);
+    }
+    if (notes.length > 20) console.log(`  ... and ${notes.length - 20} more`);
+    return;
+  }
+
+  // Import into vault — use createNoteRaw to skip per-note wikilink sync,
+  // then do a single pass after all notes are imported (much faster for large vaults).
+  const store = getVaultStore(vaultName);
+  let imported = 0;
+  let skipped = 0;
+
+  for (const note of notes) {
+    // Skip if a note with this path already exists
+    const existing = store.getNoteByPath(note.path);
+    if (existing) {
+      skipped++;
+      continue;
+    }
+
+    // Build metadata from frontmatter (excluding tags, already extracted)
+    const metadata = Object.keys(note.frontmatter).length > 0 ? note.frontmatter : undefined;
+
+    store.createNoteRaw(note.content, {
+      path: note.path,
+      tags: note.tags.length > 0 ? note.tags : undefined,
+      metadata: metadata as Record<string, unknown>,
+    });
+    imported++;
+  }
+
+  // Single-pass wikilink sync after all notes exist
+  console.log(`\nImported ${imported} notes into vault "${vaultName}"`);
+  if (skipped > 0) console.log(`Skipped ${skipped} notes (path already exists)`);
+
+  if (imported > 0) {
+    const linkResult = store.syncAllWikilinks();
+    console.log(`Resolved ${linkResult.totalAdded} wikilinks across ${linkResult.synced} notes.`);
+  }
+}
+
+async function cmdExport(args: string[]) {
+  let vaultName = "default";
+  let outputPath = "";
+
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--vault") {
+      vaultName = args[++i];
+    } else {
+      positional.push(args[i]);
+    }
+  }
+  outputPath = positional[0] ?? "";
+
+  if (!outputPath) {
+    console.error("Usage: parachute vault export <output-path> [--vault <name>]");
+    console.error("\nExports a Parachute Vault as Obsidian-compatible markdown files.");
+    process.exit(1);
+  }
+
+  const { resolve: resolvePath } = await import("path");
+  const { mkdirSync: mkdir, writeFileSync: writeFile } = await import("fs");
+  const { join, dirname } = await import("path");
+  const fullPath = resolvePath(outputPath);
+
+  const config = readVaultConfig(vaultName);
+  if (!config) {
+    console.error(`Vault "${vaultName}" not found.`);
+    process.exit(1);
+  }
+
+  const { toObsidianMarkdown, exportFilePath } = await import("../core/src/obsidian.ts");
+  const { getVaultStore } = await import("./vault-store.ts");
+
+  const store = getVaultStore(vaultName);
+  const notes = store.queryNotes({ limit: 100000, sort: "asc" });
+
+  console.log(`Exporting ${notes.length} notes from vault "${vaultName}" to ${fullPath}`);
+  mkdir(fullPath, { recursive: true });
+
+  let exported = 0;
+  for (const note of notes) {
+    const filePath = exportFilePath(note);
+    const fullFilePath = join(fullPath, filePath);
+    const dir = dirname(fullFilePath);
+    mkdir(dir, { recursive: true });
+
+    const markdown = toObsidianMarkdown(note);
+    writeFile(fullFilePath, markdown);
+    exported++;
+  }
+
+  console.log(`Exported ${exported} notes as markdown files.`);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -633,6 +813,11 @@ Config:
   parachute vault config                   Show current configuration
   parachute vault config set <key> <val>   Set a config value
   parachute vault config unset <key>       Remove a config value
+
+Import/Export:
+  parachute vault import <path>            Import an Obsidian vault
+  parachute vault import <path> --dry-run  Preview import without writing
+  parachute vault export <path>            Export vault as Obsidian markdown
 
 Server:
   parachute vault serve                    Run server (foreground)
