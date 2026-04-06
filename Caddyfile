@@ -1,0 +1,3 @@
+{$VAULT_DOMAIN:localhost} {
+	reverse_proxy vault:1940
+}

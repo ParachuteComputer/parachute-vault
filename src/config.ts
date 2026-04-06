@@ -21,7 +21,7 @@ import crypto from "node:crypto";
 // Paths
 // ---------------------------------------------------------------------------
 
-export const CONFIG_DIR = join(homedir(), ".parachute");
+export const CONFIG_DIR = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
 export const VAULTS_DIR = join(CONFIG_DIR, "vaults");
 export const GLOBAL_CONFIG_PATH = join(CONFIG_DIR, "config.yaml");
 export const ENV_PATH = join(CONFIG_DIR, ".env");

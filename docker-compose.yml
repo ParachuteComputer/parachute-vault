@@ -1,0 +1,50 @@
+# Parachute Vault — self-hosted deployment
+#
+# Quick start:
+#   1. Copy .env.example to .env and fill in your values
+#   2. docker compose up -d
+#
+# For HTTPS (required for MCP from Claude Desktop):
+#   Set VAULT_DOMAIN in .env, ensure DNS points to this server.
+#   Caddy handles Let's Encrypt automatically.
+#
+# Without HTTPS (local/development):
+#   Leave VAULT_DOMAIN empty — Caddy proxies on port 80 only.
+
+services:
+  vault:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - vault-data:/data
+    env_file: .env
+    environment:
+      - PARACHUTE_HOME=/data
+    expose:
+      - "1940"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:1940/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - VAULT_DOMAIN=${VAULT_DOMAIN:-localhost}
+    depends_on:
+      vault:
+        condition: service_healthy
+
+volumes:
+  vault-data:
+  caddy-data:
+  caddy-config:

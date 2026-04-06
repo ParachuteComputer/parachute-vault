@@ -1,0 +1,20 @@
+[Unit]
+Description=Parachute Vault
+After=network.target
+
+[Service]
+Type=simple
+User=parachute
+WorkingDirectory=/opt/parachute-vault
+ExecStart=/usr/local/bin/bun src/server.ts
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/parachute-vault/.env
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/parachute/.parachute
+
+[Install]
+WantedBy=multi-user.target
