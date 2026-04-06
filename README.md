@@ -60,15 +60,28 @@ cloudflared tunnel login
 
 # Create a named tunnel
 cloudflared tunnel create vault
+
+# Point your domain at the tunnel
 cloudflared tunnel route dns vault vault.yourdomain.com
 
-# Run it (foreground)
-cloudflared tunnel run vault
+# Create the config file (required for background service)
+sudo mkdir -p /etc/cloudflared
+sudo tee /etc/cloudflared/config.yml << EOF
+tunnel: $(cloudflared tunnel list -o json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+credentials-file: $HOME/.cloudflared/$(cloudflared tunnel list -o json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4).json
 
-# Or install as a system service (runs in background, survives reboot)
+ingress:
+  - hostname: vault.yourdomain.com
+    service: http://localhost:1940
+  - service: http_status:404
+EOF
+
+# Install as system service (runs in background, survives reboot)
 sudo cloudflared service install
 sudo systemctl start cloudflared
 ```
+
+Or run in foreground for testing: `cloudflared tunnel run vault`
 
 See [Cloudflare Tunnel docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/) for the full guide.
 
