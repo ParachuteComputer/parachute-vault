@@ -65,6 +65,9 @@ export function generatePlist(): string {
 }
 
 export async function installAgent(): Promise<void> {
+  if (process.platform !== "darwin") {
+    throw new Error("launchd is only available on macOS. Use systemd on Linux.");
+  }
   const serverPath = resolve(dirname(import.meta.path), "server.ts");
   const bunPath = Bun.which("bun") || join(homedir(), ".bun", "bin", "bun");
 
