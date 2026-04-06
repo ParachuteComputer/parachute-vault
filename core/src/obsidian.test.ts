@@ -95,6 +95,30 @@ Content`;
     expect(content).toBe("Content");
   });
 
+  it("treats empty values as empty strings, not arrays", () => {
+    const raw = `---
+description:
+title: My Note
+---
+Content`;
+
+    const { frontmatter } = parseFrontmatter(raw);
+    expect(frontmatter.description).toBe("");
+    expect(frontmatter.title).toBe("My Note");
+  });
+
+  it("does not match keys with spaces", () => {
+    const raw = `---
+valid-key: yes
+another_key: also yes
+---
+Content`;
+
+    const { frontmatter } = parseFrontmatter(raw);
+    expect(frontmatter["valid-key"]).toBe("yes");
+    expect(frontmatter["another_key"]).toBe("also yes");
+  });
+
   it("handles date values as strings", () => {
     const raw = `---
 date: 2026-04-05

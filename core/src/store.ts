@@ -123,6 +123,39 @@ export class SqliteStore implements Store {
     return linkOps.findPath(this.db, sourceId, targetId, opts);
   }
 
+  // ---- Batch Wikilink Sync ----
+
+  /**
+   * Create a note without triggering wikilink sync.
+   * Use this during bulk imports, then call syncAllWikilinks() after.
+   */
+  createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
+    return noteOps.createNote(this.db, content, opts);
+  }
+
+  /**
+   * Sync wikilinks for all notes in the vault.
+   * Efficient for bulk imports — call once after importing all notes.
+   */
+  syncAllWikilinks(): { synced: number; totalAdded: number; totalRemoved: number } {
+    const allNotes = noteOps.queryNotes(this.db, { limit: 1000000 });
+    let synced = 0;
+    let totalAdded = 0;
+    let totalRemoved = 0;
+
+    for (const note of allNotes) {
+      if (!note.content) continue;
+      const result = syncWikilinks(this.db, note.id, note.content);
+      if (result.added > 0 || result.removed > 0) {
+        synced++;
+        totalAdded += result.added;
+        totalRemoved += result.removed;
+      }
+    }
+
+    return { synced, totalAdded, totalRemoved };
+  }
+
   // ---- Attachments ----
 
   addAttachment(noteId: string, filePath: string, mimeType: string, metadata?: Record<string, unknown>): Attachment {

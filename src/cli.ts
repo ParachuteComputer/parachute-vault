@@ -628,7 +628,8 @@ async function cmdImport(args: string[]) {
     return;
   }
 
-  // Import into vault
+  // Import into vault — use createNoteRaw to skip per-note wikilink sync,
+  // then do a single pass after all notes are imported (much faster for large vaults).
   const store = getVaultStore(vaultName);
   let imported = 0;
   let skipped = 0;
@@ -644,7 +645,7 @@ async function cmdImport(args: string[]) {
     // Build metadata from frontmatter (excluding tags, already extracted)
     const metadata = Object.keys(note.frontmatter).length > 0 ? note.frontmatter : undefined;
 
-    store.createNote(note.content, {
+    store.createNoteRaw(note.content, {
       path: note.path,
       tags: note.tags.length > 0 ? note.tags : undefined,
       metadata: metadata as Record<string, unknown>,
@@ -652,9 +653,14 @@ async function cmdImport(args: string[]) {
     imported++;
   }
 
+  // Single-pass wikilink sync after all notes exist
   console.log(`\nImported ${imported} notes into vault "${vaultName}"`);
   if (skipped > 0) console.log(`Skipped ${skipped} notes (path already exists)`);
-  console.log("Wikilinks have been automatically resolved where possible.");
+
+  if (imported > 0) {
+    const linkResult = store.syncAllWikilinks();
+    console.log(`Resolved ${linkResult.totalAdded} wikilinks across ${linkResult.synced} notes.`);
+  }
 }
 
 async function cmdExport(args: string[]) {

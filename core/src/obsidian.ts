@@ -73,28 +73,26 @@ export function parseFrontmatter(raw: string): {
       continue;
     }
 
-    // If we were building an array, save it
+    // If we were building an array, save it (or save empty string if no items found)
     if (currentArray !== null) {
-      frontmatter[currentKey] = currentArray;
+      frontmatter[currentKey] = currentArray.length > 0 ? currentArray : "";
       currentArray = null;
     }
 
-    // Key: value pair
-    const kvMatch = line.match(/^(\w[\w\s-]*?):\s*(.*)/);
+    // Key: value pair — keys must be YAML-valid (word chars and hyphens, no spaces)
+    const kvMatch = line.match(/^([\w][\w-]*):\s*(.*)/);
     if (kvMatch) {
-      const key = kvMatch[1].trim();
+      const key = kvMatch[1];
       const value = kvMatch[2].trim();
 
-      if (value === "" || value === "[]") {
-        // Could be start of array or empty value
+      if (value === "[]") {
+        frontmatter[key] = [];
+      } else if (value === "") {
+        // Empty value: could be start of array (next lines are "- item")
+        // or genuinely empty string. We start array accumulation and
+        // handle the empty case when a non-array line follows.
         currentKey = key;
-        // Peek: if empty, check if next lines are array items
-        if (value === "[]") {
-          frontmatter[key] = [];
-        } else {
-          currentKey = key;
-          currentArray = [];
-        }
+        currentArray = [];
       } else if (value.startsWith("[") && value.endsWith("]")) {
         // Inline array: [item1, item2]
         const items = value.slice(1, -1).split(",").map((s) => unquote(s.trim())).filter(Boolean);
@@ -105,9 +103,9 @@ export function parseFrontmatter(raw: string): {
     }
   }
 
-  // Save any trailing array
+  // Save any trailing array (or empty string if no items)
   if (currentArray !== null) {
-    frontmatter[currentKey] = currentArray;
+    frontmatter[currentKey] = currentArray.length > 0 ? currentArray : "";
   }
 
   return { frontmatter, content };

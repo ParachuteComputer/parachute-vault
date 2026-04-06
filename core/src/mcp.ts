@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as notes from "./notes.js";
 import * as links from "./links.js";
-import { syncWikilinks, parseWikilinks } from "./wikilinks.js";
 
 export interface McpToolDef {
   name: string;
@@ -362,33 +361,6 @@ export function generateMcpTools(db: Database): McpToolDef[] {
       ),
     },
 
-    // ---- Wikilink Operations ----
-
-    {
-      name: "extract-links",
-      description: "Parse [[wikilinks]] from a note's content and sync the links table. Automatically creates links to matching notes and tracks unresolved references. Run this after editing a note's content outside of the update-note tool, or to force re-extraction.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Note ID to extract links from" },
-        },
-        required: ["id"],
-      },
-      execute: (params) => {
-        const note = notes.getNote(db, params.id as string);
-        if (!note) return { error: "Note not found", id: params.id };
-        const result = syncWikilinks(db, note.id, note.content);
-        return {
-          ...result,
-          wikilinks: parseWikilinks(note.content).map((wl) => ({
-            target: wl.target,
-            display: wl.display,
-            anchor: wl.anchor,
-            embed: wl.embed || undefined,
-          })),
-        };
-      },
-    },
   ];
 }
 
