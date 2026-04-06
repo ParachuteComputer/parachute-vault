@@ -11,8 +11,18 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
-import { readVaultConfig, writeVaultConfig, readGlobalConfig, listVaults as getVaultNames } from "./config.ts";
+import { readVaultConfig, writeVaultConfig, readGlobalConfig, listVaults as getVaultNames, loadEnvFile } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
+import { createEmbeddingProvider, type EmbeddingProvider } from "./embed-provider.ts";
+import {
+  loadVecExtension,
+  initEmbeddingsTable,
+  upsertEmbedding,
+  getUnembeddedNoteIds,
+  semanticSearch,
+  hybridSearch,
+} from "../core/src/embeddings.ts";
+import * as noteOps from "../core/src/notes.ts";
 
 /**
  * Get the MCP server instruction for a vault (or the default vault).
@@ -88,6 +98,9 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
   // Vault management tools
   addVaultManagementTools(tools, defaultVault);
 
+  // Semantic search tools (if embeddings configured)
+  addSemanticSearchTools(tools, defaultVault, multiVault);
+
   return tools;
 }
 
@@ -99,6 +112,7 @@ export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const store = getVaultStore(vaultName);
   const tools = generateMcpTools(store.db);
   addVaultManagementTools(tools, vaultName, true);
+  addSemanticSearchTools(tools, vaultName, false);
   return tools;
 }
 
@@ -168,6 +182,160 @@ function addVaultManagementTools(tools: McpToolDef[], defaultVault: string, scop
       config.description = params.description as string;
       writeVaultConfig(config);
       return { updated: true, name, description: config.description };
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Semantic search tools
+// ---------------------------------------------------------------------------
+
+/** Cached embedding provider (lazy init). */
+let _embedProvider: EmbeddingProvider | null | undefined;
+/** Track which vaults have been initialized for embeddings. */
+const _vecInitialized = new Set<string>();
+
+function getEmbedProvider(): EmbeddingProvider | null {
+  if (_embedProvider !== undefined) return _embedProvider;
+  const env = loadEnvFile();
+  _embedProvider = createEmbeddingProvider(env);
+  return _embedProvider;
+}
+
+function ensureVecReady(vaultName: string, dimensions: number): boolean {
+  if (_vecInitialized.has(`${vaultName}:${dimensions}`)) return true;
+  const store = getVaultStore(vaultName);
+  if (!loadVecExtension(store.db)) return false;
+  initEmbeddingsTable(store.db, dimensions);
+  _vecInitialized.add(`${vaultName}:${dimensions}`);
+  return true;
+}
+
+/**
+ * Embed any notes that haven't been embedded yet.
+ */
+async function embedPending(vaultName: string, provider: EmbeddingProvider): Promise<number> {
+  const store = getVaultStore(vaultName);
+  const unembedded = getUnembeddedNoteIds(store.db);
+  if (unembedded.length === 0) return 0;
+
+  // Fetch note contents
+  const notes = noteOps.getNotes(store.db, unembedded);
+  const texts = notes.map((n) => n.content || n.path || n.id);
+
+  // Batch embed — try/catch per batch so partial progress is saved
+  const BATCH_SIZE = 100;
+  let embedded = 0;
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const batch = texts.slice(i, i + BATCH_SIZE);
+    const batchNotes = notes.slice(i, i + BATCH_SIZE);
+    try {
+      const embeddings = await provider.embedBatch(batch);
+      for (let j = 0; j < embeddings.length; j++) {
+        upsertEmbedding(store.db, batchNotes[j].id, embeddings[j], provider.model);
+        embedded++;
+      }
+    } catch (err) {
+      console.error(`Embedding batch failed (${i}-${i + batch.length}):`, err instanceof Error ? err.message : err);
+      // Continue with next batch — already-embedded notes won't be retried
+    }
+  }
+
+  return embedded;
+}
+
+function addSemanticSearchTools(tools: McpToolDef[], defaultVault: string, multiVault: boolean) {
+  const provider = getEmbedProvider();
+  if (!provider) return; // Embeddings not configured — don't add tools
+
+  // Verify sqlite-vec is loadable
+  const store = getVaultStore(defaultVault);
+  if (!loadVecExtension(store.db)) {
+    console.warn("sqlite-vec extension not available. Semantic search disabled.");
+    return;
+  }
+  initEmbeddingsTable(store.db, provider.dimensions);
+  _vecInitialized.add(`${defaultVault}:${provider.dimensions}`);
+
+  tools.push({
+    name: "semantic-search",
+    description: `Semantic search across notes using AI embeddings (${provider.name}/${provider.model}). Finds conceptually related notes even when they don't share exact keywords. Use this for exploratory queries like "what do I know about X" or when keyword search returns too few results. Automatically embeds any new/updated notes before searching.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(multiVault ? {
+          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+        } : {}),
+        query: { type: "string", description: "Natural language search query" },
+        tags: { type: "array", items: { type: "string" }, description: "Filter by tags" },
+        tag_match: { type: "string", enum: ["all", "any"], description: "How to match tags (default: all)" },
+        exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
+        date_from: { type: "string", description: "Start date (ISO, inclusive)" },
+        date_to: { type: "string", description: "End date (ISO, exclusive)" },
+        limit: { type: "number", description: "Max results (default 20)" },
+        hybrid: { type: "boolean", description: "Combine with keyword search for best results (default true)" },
+      },
+      required: ["query"],
+    },
+    execute: async (params) => {
+      const vaultName = (params.vault as string) ?? defaultVault;
+      if (!ensureVecReady(vaultName, provider.dimensions)) {
+        return { error: "sqlite-vec not available" };
+      }
+
+      const db = getVaultStore(vaultName).db;
+
+      // Embed any pending notes
+      const newlyEmbedded = await embedPending(vaultName, provider);
+
+      // Embed the query
+      const queryVec = await provider.embed(params.query as string);
+
+      const opts = {
+        tags: params.tags as string[] | undefined,
+        tagMatch: params.tag_match as "all" | "any" | undefined,
+        excludeTags: params.exclude_tags as string[] | undefined,
+        dateFrom: params.date_from as string | undefined,
+        dateTo: params.date_to as string | undefined,
+        limit: params.limit as number | undefined,
+      };
+
+      const useHybrid = params.hybrid !== false; // default true
+
+      const results = useHybrid
+        ? hybridSearch(db, params.query as string, queryVec, opts)
+        : semanticSearch(db, queryVec, opts);
+
+      return {
+        results: results.map((r) => ({
+          ...r.note,
+          _score: Math.round(r.score * 1000) / 1000,
+          _distance: Math.round(r.distance * 1000) / 1000,
+        })),
+        ...(newlyEmbedded > 0 ? { newly_embedded: newlyEmbedded } : {}),
+      };
+    },
+  });
+
+  tools.push({
+    name: "embed-notes",
+    description: "Embed all unembedded notes for semantic search. Run this after a large import or if semantic search seems to be missing recent notes. Usually not needed — semantic-search auto-embeds pending notes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(multiVault ? {
+          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+        } : {}),
+      },
+    },
+    execute: async (params) => {
+      const vaultName = (params.vault as string) ?? defaultVault;
+      if (!ensureVecReady(vaultName, provider.dimensions)) {
+        return { error: "sqlite-vec not available" };
+      }
+
+      const embedded = await embedPending(vaultName, provider);
+      return { embedded, model: provider.model };
     },
   });
 }

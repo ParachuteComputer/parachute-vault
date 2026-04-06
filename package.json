@@ -16,6 +16,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1"
   },
+  "optionalDependencies": {
+    "sqlite-vec": "^0.1.9"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

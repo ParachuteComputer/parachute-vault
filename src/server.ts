@@ -12,6 +12,19 @@
  *   *    /vaults/{name}/api/...            — per-vault REST API
  */
 
+// If embeddings are configured, swap to Homebrew SQLite on macOS (must happen before any DB opens)
+import { existsSync, readFileSync } from "fs";
+import { resolve } from "path";
+import { homedir } from "os";
+const _envPath = resolve(homedir(), ".parachute", ".env");
+if (existsSync(_envPath)) {
+  const _envContent = readFileSync(_envPath, "utf-8");
+  if (/EMBEDDING_PROVIDER\s*=/.test(_envContent) && !/EMBEDDING_PROVIDER\s*=\s*none/i.test(_envContent)) {
+    const { useHomebrewSQLiteIfNeeded } = require("../core/src/embeddings.ts");
+    useHomebrewSQLiteIfNeeded();
+  }
+}
+
 import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
