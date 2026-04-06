@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { normalizePath } from "./paths.js";
 
 export const SCHEMA_VERSION = 5;
 
@@ -142,13 +143,28 @@ function migrateToV5(db: Database): void {
   ).all();
   if (indexes.length > 0) return;
 
-  // Normalize existing paths and add unique index
-  const { normalizePath } = require("./paths.js");
+  // Normalize existing paths
   const rows = db.prepare("SELECT id, path FROM notes WHERE path IS NOT NULL").all() as { id: string; path: string }[];
   for (const row of rows) {
     const normalized = normalizePath(row.path);
     if (normalized !== row.path) {
       db.prepare("UPDATE notes SET path = ? WHERE id = ?").run(normalized, row.id);
+    }
+  }
+
+  // Handle duplicate paths (can happen after normalization) — append note ID suffix
+  const dupes = db.prepare(`
+    SELECT path, GROUP_CONCAT(id) as ids FROM notes
+    WHERE path IS NOT NULL
+    GROUP BY path COLLATE NOCASE
+    HAVING COUNT(*) > 1
+  `).all() as { path: string; ids: string }[];
+  for (const dupe of dupes) {
+    const ids = dupe.ids.split(",");
+    // Keep first, rename the rest
+    for (let i = 1; i < ids.length; i++) {
+      const newPath = `${dupe.path}-${i}`;
+      db.prepare("UPDATE notes SET path = ? WHERE id = ?").run(newPath, ids[i]);
     }
   }
 

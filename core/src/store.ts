@@ -104,6 +104,8 @@ export class SqliteStore implements Store {
       }
 
       if (updated !== row.content) {
+        // Call noteOps directly (not this.updateNote) to avoid recursive cascading.
+        // Only content changes here, so path normalization/cascading aren't needed.
         noteOps.updateNote(this.db, row.id, { content: updated });
         syncWikilinks(this.db, row.id, updated);
       }
