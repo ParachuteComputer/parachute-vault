@@ -81,8 +81,30 @@ export function loadVecExtension(db: Database): boolean {
 /**
  * Initialize the vec0 virtual table for note embeddings.
  * Must call loadVecExtension first.
+ *
+ * If the table exists with different dimensions (model change),
+ * drops and recreates it (embeddings need to be regenerated anyway).
  */
 export function initEmbeddingsTable(db: Database, dimensions: number): void {
+  // Track embedding config
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embedding_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+
+  // Check for dimension mismatch
+  const existing = db.prepare(
+    "SELECT value FROM embedding_config WHERE key = 'dimensions'",
+  ).get() as { value: string } | undefined;
+
+  if (existing && parseInt(existing.value, 10) !== dimensions) {
+    // Model changed — drop old embeddings (they're incompatible)
+    db.exec("DROP TABLE IF EXISTS vec_notes");
+    db.exec("DELETE FROM embedding_meta");
+  }
+
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_notes USING vec0(
       note_id TEXT PRIMARY KEY,
@@ -98,6 +120,11 @@ export function initEmbeddingsTable(db: Database, dimensions: number): void {
       embedded_at TEXT NOT NULL
     )
   `);
+
+  // Store current dimensions
+  db.prepare(
+    "INSERT OR REPLACE INTO embedding_config (key, value) VALUES ('dimensions', ?)",
+  ).run(String(dimensions));
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +169,8 @@ export function getUnembeddedNoteIds(db: Database): string[] {
     SELECT n.id FROM notes n
     LEFT JOIN embedding_meta em ON em.note_id = n.id
     WHERE em.note_id IS NULL
-       OR em.embedded_at < n.updated_at
+       OR em.embedded_at < n.updated_at  -- notes updated since last embed
+       -- Notes with NULL updated_at that are already embedded are fine (never changed)
     ORDER BY n.created_at
   `).all() as { id: string }[];
   return rows.map((r) => r.id);
@@ -181,19 +209,17 @@ export function semanticSearch(
 
   if (rows.length === 0) return [];
 
-  // Hydrate and score
-  const maxDist = rows[rows.length - 1]?.distance || 1;
+  // Hydrate and score — use 1/(1+d) for stable, batch-independent scoring
   const results: SemanticSearchResult[] = [];
 
   for (const row of rows) {
     const note = hydrateNote(db, row.note_id);
     if (!note) continue;
 
-    const score = maxDist > 0 ? 1 - (row.distance / (maxDist * 1.5)) : 1;
     results.push({
       note,
       distance: row.distance,
-      score: Math.max(0, Math.min(1, score)),
+      score: 1 / (1 + row.distance),
     });
   }
 

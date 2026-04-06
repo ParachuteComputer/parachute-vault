@@ -223,16 +223,21 @@ async function embedPending(vaultName: string, provider: EmbeddingProvider): Pro
   const notes = noteOps.getNotes(store.db, unembedded);
   const texts = notes.map((n) => n.content || n.path || n.id);
 
-  // Batch embed
+  // Batch embed — try/catch per batch so partial progress is saved
   const BATCH_SIZE = 100;
   let embedded = 0;
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batch = texts.slice(i, i + BATCH_SIZE);
     const batchNotes = notes.slice(i, i + BATCH_SIZE);
-    const embeddings = await provider.embedBatch(batch);
-    for (let j = 0; j < embeddings.length; j++) {
-      upsertEmbedding(store.db, batchNotes[j].id, embeddings[j], provider.model);
-      embedded++;
+    try {
+      const embeddings = await provider.embedBatch(batch);
+      for (let j = 0; j < embeddings.length; j++) {
+        upsertEmbedding(store.db, batchNotes[j].id, embeddings[j], provider.model);
+        embedded++;
+      }
+    } catch (err) {
+      console.error(`Embedding batch failed (${i}-${i + batch.length}):`, err instanceof Error ? err.message : err);
+      // Continue with next batch — already-embedded notes won't be retried
     }
   }
 
