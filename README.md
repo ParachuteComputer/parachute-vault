@@ -122,6 +122,8 @@ parachute vault restart                    # restart daemon
 
 All config lives in `~/.parachute/.env` (or `$PARACHUTE_HOME/.env` in Docker). Manage with `vault config` or edit directly.
 
+`vault init` walks you through setup interactively. To change settings later:
+
 ```bash
 # Transcription
 parachute vault config set TRANSCRIBE_PROVIDER groq
@@ -129,23 +131,40 @@ parachute vault config set GROQ_API_KEY gsk_...
 
 # Semantic search
 parachute vault config set EMBEDDING_PROVIDER openai
-parachute vault config set EMBEDDING_MODEL text-embedding-3-small
 parachute vault config set OPENAI_API_KEY sk-...
 
+# Apply changes
 parachute vault restart
+
+# See all options
+parachute vault config
 ```
 
 ### Providers
 
-| Feature | Provider | Type | Notes |
-|---------|----------|------|-------|
-| Transcription | `parakeet-mlx` | Local | Mac only (Apple Silicon). Fastest. |
-| Transcription | `groq` | API | Fast and cheap. Needs `GROQ_API_KEY`. |
-| Transcription | `openai` | API | Reference Whisper API. Needs `OPENAI_API_KEY`. |
-| Cleanup | `claude` | API | Post-transcription cleanup. Needs `ANTHROPIC_API_KEY`. |
-| Cleanup | `ollama` | Local | Needs Ollama running. |
-| Embeddings | `openai` | API | `text-embedding-3-small` (default). Needs `OPENAI_API_KEY`. |
-| Embeddings | `ollama` | Local | `nomic-embed-text` (default). Needs Ollama. |
+**Transcription** (voice → text, requires [parachute-scribe](https://github.com/ParachuteComputer/parachute-scribe)):
+
+| Provider | Type | Platform | Notes |
+|----------|------|----------|-------|
+| `groq` | Cloud API | Any | Fast, cheap (~$0.06/hr of audio). |
+| `whisper` | Local | Any | Uses faster-whisper. `pip install whisper-ctranslate2`. Free, private. |
+| `parakeet-mlx` | Local | Mac only | Fastest local option. Apple Silicon required. |
+| `openai` | Cloud API | Any | Reference Whisper API. |
+
+**Cleanup** (LLM cleans up transcriptions — filler words, punctuation):
+
+| Provider | Type | Notes |
+|----------|------|-------|
+| `claude` | Cloud API | Best quality. Needs `ANTHROPIC_API_KEY`. |
+| `groq` | Cloud API | Fast. Reuses your `GROQ_API_KEY`. |
+| `ollama` | Local | Free, private. Needs Ollama running. |
+
+**Embeddings** (semantic search):
+
+| Provider | Type | Notes |
+|----------|------|-------|
+| `openai` | Cloud API | `text-embedding-3-small`. Cheap (~$0.02/M tokens). |
+| `ollama` | Local | `nomic-embed-text`. Free, private. Needs Ollama running. |
 
 ## MCP tools
 
