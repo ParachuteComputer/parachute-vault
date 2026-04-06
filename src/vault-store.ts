@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { initSchema } from "../core/src/schema.ts";
 import * as noteOps from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
+import { syncWikilinks, resolveUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import type { Store, Note, Link, Attachment, QueryOpts } from "../core/src/types.ts";
 import { openVaultDb } from "./db.ts";
 
@@ -21,7 +22,10 @@ export class BunStore implements Store {
   }
 
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
-    return noteOps.createNote(this.db, content, opts);
+    const note = noteOps.createNote(this.db, content, opts);
+    if (content) syncWikilinks(this.db, note.id, content);
+    if (note.path) resolveUnresolvedWikilinks(this.db, note.path, note.id);
+    return note;
   }
 
   getNote(id: string): Note | null {
@@ -37,7 +41,10 @@ export class BunStore implements Store {
   }
 
   updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note {
-    return noteOps.updateNote(this.db, id, updates);
+    const note = noteOps.updateNote(this.db, id, updates);
+    if (updates.content !== undefined) syncWikilinks(this.db, id, updates.content);
+    if (updates.path !== undefined && note.path) resolveUnresolvedWikilinks(this.db, note.path, id);
+    return note;
   }
 
   deleteNote(id: string): void {
