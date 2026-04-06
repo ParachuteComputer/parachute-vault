@@ -3,6 +3,7 @@ import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
+import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 
 /**
  * SQLite-backed Store implementation.
@@ -15,7 +16,19 @@ export class SqliteStore implements Store {
   // ---- Notes ----
 
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note {
-    return noteOps.createNote(this.db, content, opts);
+    const note = noteOps.createNote(this.db, content, opts);
+
+    // Auto-sync wikilinks from content
+    if (content) {
+      syncWikilinks(this.db, note.id, content);
+    }
+
+    // If this note has a path, resolve any pending wikilinks targeting it
+    if (note.path) {
+      resolveUnresolvedWikilinks(this.db, note.path, note.id);
+    }
+
+    return note;
   }
 
   getNote(id: string): Note | null {
@@ -31,7 +44,19 @@ export class SqliteStore implements Store {
   }
 
   updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note {
-    return noteOps.updateNote(this.db, id, updates);
+    const note = noteOps.updateNote(this.db, id, updates);
+
+    // Re-sync wikilinks if content changed
+    if (updates.content !== undefined) {
+      syncWikilinks(this.db, id, updates.content);
+    }
+
+    // If path changed, resolve any pending wikilinks targeting the new path
+    if (updates.path !== undefined && note.path) {
+      resolveUnresolvedWikilinks(this.db, note.path, id);
+    }
+
+    return note;
   }
 
   deleteNote(id: string): void {

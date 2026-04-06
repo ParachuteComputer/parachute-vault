@@ -338,7 +338,8 @@ describe("MCP tools", () => {
     expect(names).toContain("traverse-links");
     expect(names).toContain("find-path");
     expect(names).toContain("get-note");
-    expect(tools).toHaveLength(17);
+    expect(names).toContain("extract-links");
+    expect(tools).toHaveLength(18);
   });
 
   it("create-note tool works", () => {

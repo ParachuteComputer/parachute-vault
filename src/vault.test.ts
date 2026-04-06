@@ -352,9 +352,9 @@ describe("deeper link queries", () => {
 });
 
 describe("MCP tools", () => {
-  test("generates all 17 core tools", () => {
+  test("generates all 18 core tools", () => {
     const tools = generateMcpTools(db);
-    expect(tools.length).toBe(17);
+    expect(tools.length).toBe(18);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("get-note");
@@ -365,6 +365,7 @@ describe("MCP tools", () => {
     expect(names).toContain("traverse-links");
     expect(names).toContain("find-path");
     expect(names).toContain("list-tags");
+    expect(names).toContain("extract-links");
   });
 
   test("get-note tool works by id", () => {
