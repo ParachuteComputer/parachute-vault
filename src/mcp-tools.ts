@@ -56,7 +56,7 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
 
   // Get tool definitions from core (using default vault for schema)
   const defaultStore = getVaultStore(defaultVault);
-  const coreTools = generateMcpTools(defaultStore.db);
+  const coreTools = generateMcpTools(defaultStore);
 
   // Wrap each core tool with vault resolution
   const tools: McpToolDef[] = coreTools.map((coreTool) => {
@@ -87,7 +87,7 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
           throw new Error(`Vault "${vaultName}" not found. Available: ${getVaultNames().join(", ")}`);
         }
         const store = getVaultStore(vaultName);
-        const vaultTools = generateMcpTools(store.db);
+        const vaultTools = generateMcpTools(store);
         const tool = vaultTools.find((t) => t.name === coreTool.name)!;
         const { vault: _, ...rest } = params;
         return tool.execute(rest);
@@ -110,7 +110,7 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
  */
 export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const store = getVaultStore(vaultName);
-  const tools = generateMcpTools(store.db);
+  const tools = generateMcpTools(store);
   addVaultManagementTools(tools, vaultName, true);
   addSemanticSearchTools(tools, vaultName, false);
   return tools;

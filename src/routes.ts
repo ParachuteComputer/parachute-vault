@@ -61,11 +61,15 @@ export async function handleNotes(
       id?: string;
       path?: string;
       tags?: string[];
+      metadata?: Record<string, unknown>;
+      created_at?: string;
     };
     const note = store.createNote(body.content ?? "", {
       id: body.id,
       path: body.path,
       tags: body.tags,
+      metadata: body.metadata,
+      created_at: body.created_at,
     });
     return json(note, 201);
   }
