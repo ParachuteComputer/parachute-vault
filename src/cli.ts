@@ -42,6 +42,8 @@ import {
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
+import { installSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
+import { confirm, ask, choose } from "./prompt.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -122,6 +124,10 @@ switch (command) {
 async function cmdInit() {
   ensureConfigDirSync();
 
+  const isMac = process.platform === "darwin";
+  const isLinux = process.platform === "linux";
+  const isFirstRun = !existsSync(ENV_PATH);
+
   console.log("Parachute Vault — self-hosted knowledge graph\n");
 
   // 1. Create default vault if none exist
@@ -158,34 +164,98 @@ async function cmdInit() {
   mkdirSync(ASSETS_DIR, { recursive: true });
 
   // 4. Create .env with sensible defaults if it doesn't exist
-  if (!existsSync(ENV_PATH)) {
-    writeEnvFile({
-      PORT: String(globalConfig.port || DEFAULT_PORT),
-    });
-    console.log("  Created ~/.parachute/.env");
+  const envVars: Record<string, string> = {};
+  if (isFirstRun) {
+    envVars.PORT = String(globalConfig.port || DEFAULT_PORT);
   }
 
-  // 4. Install launchd daemon
-  console.log("\nInstalling daemon...");
-  await installAgent();
+  // 5. Interactive setup for transcription + embeddings (first run only)
+  if (isFirstRun) {
+    console.log();
+
+    // --- Transcription ---
+    const wantTranscription = await confirm("Set up transcription (voice memos → text)?");
+    if (wantTranscription) {
+      const provider = await choose("  Transcription provider:", [
+        { label: "Groq", value: "groq", description: "cloud API, fast, cheap (~$0.06/hr)" },
+        ...(isMac ? [{ label: "Parakeet-MLX", value: "parakeet-mlx", description: "local, Mac only, fastest" }] : []),
+        { label: "OpenAI", value: "openai", description: "cloud API, reference Whisper" },
+        { label: "Skip", value: "skip", description: "configure later" },
+      ]);
+
+      if (provider !== "skip") {
+        envVars.TRANSCRIBE_PROVIDER = provider;
+
+        if (provider === "groq") {
+          const key = await ask("  GROQ_API_KEY");
+          if (key) envVars.GROQ_API_KEY = key;
+        } else if (provider === "openai") {
+          const key = await ask("  OPENAI_API_KEY");
+          if (key) envVars.OPENAI_API_KEY = key;
+        }
+
+        // Cleanup provider
+        const wantCleanup = await confirm("  Clean up transcriptions with AI? (fix filler words, punctuation)");
+        if (wantCleanup) {
+          const cleaner = await choose("  Cleanup provider:", [
+            { label: "Claude", value: "claude", description: "best quality" },
+            { label: "Groq", value: "groq", description: "fast, uses your Groq key" },
+            { label: "Ollama", value: "ollama", description: "local, requires Ollama running" },
+            { label: "Skip", value: "skip" },
+          ]);
+          if (cleaner !== "skip") {
+            envVars.CLEANUP_PROVIDER = cleaner;
+            if (cleaner === "claude" && !envVars.ANTHROPIC_API_KEY) {
+              const key = await ask("  ANTHROPIC_API_KEY");
+              if (key) envVars.ANTHROPIC_API_KEY = key;
+            }
+          }
+        }
+      }
+    }
+
+    // --- Semantic search ---
+    console.log();
+    const wantEmbeddings = await confirm("Set up semantic search (find notes by meaning, not just keywords)?");
+    if (wantEmbeddings) {
+      const provider = await choose("  Embedding provider:", [
+        { label: "OpenAI", value: "openai", description: "text-embedding-3-small, cheap (~$0.02/M tokens)" },
+        { label: "Ollama", value: "ollama", description: "local, requires Ollama running" },
+        { label: "Skip", value: "skip", description: "configure later" },
+      ]);
+
+      if (provider !== "skip") {
+        envVars.EMBEDDING_PROVIDER = provider;
+        if (provider === "openai" && !envVars.OPENAI_API_KEY) {
+          const key = await ask("  OPENAI_API_KEY");
+          if (key) envVars.OPENAI_API_KEY = key;
+        }
+      }
+    }
+
+    // Write env file
+    writeEnvFile(envVars);
+    console.log();
+  }
+
+  // 6. Install daemon (platform-aware)
+  console.log("Installing daemon...");
+  if (isMac) {
+    await installAgent();
+  } else if (isLinux && isSystemdAvailable()) {
+    await installSystemdService();
+  } else {
+    console.log("  Auto-start not available on this platform.");
+    console.log("  Run manually: bun src/server.ts");
+    console.log("  Or use Docker: docker compose up -d");
+  }
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
-  // 5. Install MCP (single HTTP entry for all vaults)
+  // 7. Install MCP for Claude Code
   installMcpConfig();
   console.log(`  MCP server added to ~/.claude.json`);
 
-  // 6. Check scribe
-  loadEnvFile();
-  const scribe = await getScribeStatus();
-  if (scribe.available) {
-    console.log(`\nTranscription: ${scribe.activeTranscriber} (via parachute-scribe)`);
-    console.log(`  Cleanup: ${scribe.activeCleaner}`);
-  } else {
-    console.log("\nTranscription: not available");
-    console.log("  Install parachute-scribe to enable: bun add parachute-scribe");
-  }
-
-  // 7. Summary
+  // 8. Summary
   console.log("\n---");
   if (globalApiKey) {
     console.log(`\nGlobal API key: ${globalApiKey}`);
@@ -198,12 +268,16 @@ async function cmdInit() {
   if (globalApiKey || apiKey) {
     console.log("\nSave these — they will not be shown again.");
   }
+
   console.log(`\nConfig:   ${CONFIG_DIR}`);
   console.log(`Server:   http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
+
   console.log(`\nNext steps:`);
-  console.log(`  parachute vault status        — check everything is running`);
-  console.log(`  parachute vault config        — view/edit configuration`);
-  console.log(`  parachute vault create <name> — create another vault`);
+  console.log(`  parachute vault status            check everything is running`);
+  console.log(`  parachute vault config             view/edit configuration`);
+  if (!isMac) {
+    console.log(`  cloudflared tunnel --url http://localhost:${globalConfig.port || DEFAULT_PORT}    expose via HTTPS`);
+  }
 }
 
 function cmdCreate(args: string[]) {
@@ -309,25 +383,26 @@ async function cmdConfig(args: string[]) {
     }
 
     console.log();
-    console.log("Transcription (which engine transcribes audio):");
-    console.log("  TRANSCRIBE_PROVIDER  — parakeet-mlx, groq, openai");
-    console.log("  GROQ_API_KEY         — for Groq transcription");
-    console.log("  OPENAI_API_KEY       — for OpenAI transcription");
+    console.log("Transcription (voice → text):");
+    console.log("  TRANSCRIBE_PROVIDER  — groq, openai, parakeet-mlx (Mac only)");
+    console.log("  GROQ_API_KEY         — for Groq (fast, cheap)");
+    console.log("  OPENAI_API_KEY       — for OpenAI Whisper");
     console.log();
-    console.log("Cleanup (which LLM cleans up transcripts):");
-    console.log("  CLEANUP_PROVIDER     — claude, openai, gemini, groq, ollama, custom, none");
+    console.log("Cleanup (LLM cleans up transcripts):");
+    console.log("  CLEANUP_PROVIDER     — claude, groq, ollama, openai, gemini, custom, none");
     console.log("  ANTHROPIC_API_KEY    — for Claude cleanup");
-    console.log("  OPENAI_API_KEY       — for OpenAI cleanup");
-    console.log("  GEMINI_API_KEY       — for Gemini cleanup");
     console.log("  OLLAMA_MODEL         — Ollama model (default: llama3.1)");
     console.log("  OLLAMA_URL           — Ollama server URL");
-    console.log("  CLEANUP_URL          — custom OpenAI-compatible endpoint");
-    console.log("  CLEANUP_API_KEY      — custom endpoint API key");
-    console.log("  CLEANUP_MODEL        — override model for any provider");
+    console.log();
+    console.log("Semantic search (find notes by meaning):");
+    console.log("  EMBEDDING_PROVIDER   — openai, ollama, none");
+    console.log("  EMBEDDING_MODEL      — model name (default: text-embedding-3-small)");
+    console.log("  OPENAI_API_KEY       — for OpenAI embeddings");
+    console.log("  OLLAMA_BASE_URL      — Ollama server (default: http://localhost:11434)");
     console.log();
     console.log("Example:");
-    console.log("  parachute vault config set CLEANUP_PROVIDER claude");
-    console.log("  parachute vault config set ANTHROPIC_API_KEY sk-ant-...");
+    console.log("  parachute vault config set EMBEDDING_PROVIDER openai");
+    console.log("  parachute vault config set OPENAI_API_KEY sk-...");
     console.log("  parachute vault restart");
     return;
   }
@@ -496,13 +571,31 @@ async function cmdServe() {
 
 async function cmdRestart() {
   console.log("Restarting daemon...");
-  await restartAgent();
+  if (process.platform === "darwin") {
+    await restartAgent();
+  } else if (isSystemdAvailable()) {
+    await restartSystemdService();
+  } else {
+    console.error("No daemon manager available. Restart manually or use Docker.");
+    process.exit(1);
+  }
   console.log("Done.");
 }
 
 async function cmdStatus() {
   loadEnvFile();
-  const loaded = await isAgentLoaded();
+  let loaded: boolean;
+  if (process.platform === "darwin") {
+    loaded = await isAgentLoaded();
+  } else if (isSystemdAvailable()) {
+    loaded = await isServiceActive();
+  } else {
+    // Check if server responds on the port
+    try {
+      const resp = await fetch(`http://127.0.0.1:${readGlobalConfig().port || DEFAULT_PORT}/health`);
+      loaded = resp.ok;
+    } catch { loaded = false; }
+  }
   const vaults = listVaults();
   const globalConfig = readGlobalConfig();
   const scribe = await getScribeStatus();
@@ -530,6 +623,17 @@ async function cmdStatus() {
   } else {
     console.log(`  Transcription:  not available`);
     console.log(`                  bun add parachute-scribe to enable`);
+  }
+
+  // Embeddings
+  const env = readEnvFile();
+  const embedProvider = env.EMBEDDING_PROVIDER;
+  if (embedProvider && embedProvider !== "none") {
+    const model = env.EMBEDDING_MODEL ?? "text-embedding-3-small";
+    console.log(`  Embeddings:     ${embedProvider}/${model}`);
+  } else {
+    console.log(`  Embeddings:     not configured`);
+    console.log(`                  vault config set EMBEDDING_PROVIDER openai`);
   }
 
   // Quick health check if daemon is running
