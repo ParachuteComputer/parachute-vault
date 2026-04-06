@@ -179,6 +179,7 @@ async function cmdInit() {
       const provider = await choose("  Transcription provider:", [
         { label: "Groq", value: "groq", description: "cloud API, fast, cheap (~$0.06/hr)" },
         ...(isMac ? [{ label: "Parakeet-MLX", value: "parakeet-mlx", description: "local, Mac only, fastest" }] : []),
+        { label: "Whisper", value: "whisper", description: "local, any platform (pip install whisper-ctranslate2)" },
         { label: "OpenAI", value: "openai", description: "cloud API, reference Whisper" },
         { label: "Skip", value: "skip", description: "configure later" },
       ]);

@@ -146,8 +146,9 @@ parachute vault config
 
 | Provider | Type | Platform | Notes |
 |----------|------|----------|-------|
-| `groq` | Cloud API | Any | Fast, cheap (~$0.06/hr of audio). Good default for VPS. |
-| `parakeet-mlx` | Local | Mac only | Fastest option. Apple Silicon required. |
+| `groq` | Cloud API | Any | Fast, cheap (~$0.06/hr of audio). |
+| `whisper` | Local | Any | Uses faster-whisper. `pip install whisper-ctranslate2`. Free, private. |
+| `parakeet-mlx` | Local | Mac only | Fastest local option. Apple Silicon required. |
 | `openai` | Cloud API | Any | Reference Whisper API. |
 
 **Cleanup** (LLM cleans up transcriptions — filler words, punctuation):
