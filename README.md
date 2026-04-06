@@ -4,44 +4,84 @@ A self-hosted knowledge graph for AI agents. Notes, tags, links, and semantic se
 
 ## Quick start (Mac)
 
+Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
+
 ```bash
 bun install -g github:ParachuteComputer/parachute-vault
 parachute vault init
 ```
 
-That's it. `vault init` creates a vault, starts a background daemon, and configures Claude Code's MCP automatically. Your AI can now read and write to the vault.
+That's it. `vault init` creates a vault, starts a background daemon, and configures Claude Code's MCP automatically. It walks you through transcription and semantic search setup interactively.
 
-## Remote access (Claude Desktop, mobile apps)
+## Quick start (Linux VPS)
 
-Your vault runs on `localhost:1940` by default. To access it from Claude Desktop, your phone, or anywhere else, you need a public HTTPS URL. The simplest way:
-
-### Cloudflare Tunnel (recommended, free)
+Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
 
 ```bash
-# Install cloudflared
-brew install cloudflared
-
-# Expose your vault (instant, temporary URL)
-cloudflared tunnel --url http://localhost:1940
-# → https://random-words.trycloudflare.com
-
-# For a permanent URL, set up a named tunnel:
-cloudflared tunnel login
-cloudflared tunnel create vault
-cloudflared tunnel route dns vault vault.yourdomain.com
-cloudflared tunnel --url http://localhost:1940 run vault
+git clone https://github.com/ParachuteComputer/parachute-vault
+cd parachute-vault
+bun install
+bun src/cli.ts vault init    # interactive setup, installs systemd service
 ```
 
-Then configure Claude Desktop:
+For remote access (Claude Desktop, mobile apps, etc.), set up a Cloudflare Tunnel — see below.
+
+## Remote access via Cloudflare Tunnel
+
+Your vault runs on `localhost:1940` by default. To access it from Claude Desktop, your phone, or anywhere else, you need a public HTTPS URL. [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) gives you one for free — no domain required, no port forwarding.
+
+### Install cloudflared
+
+```bash
+# Mac
+brew install cloudflared
+
+# Linux (Debian/Ubuntu)
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+sudo dpkg -i cloudflared.deb
+
+# Or see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+```
+
+### Quick tunnel (instant, temporary)
+
+```bash
+cloudflared tunnel --url http://localhost:1940
+# → Your vault is at https://random-words.trycloudflare.com
+```
+
+Good for testing. URL changes each time you restart.
+
+### Permanent tunnel (recommended for production)
+
+```bash
+# Authenticate with Cloudflare (free account required)
+cloudflared tunnel login
+
+# Create a named tunnel
+cloudflared tunnel create vault
+cloudflared tunnel route dns vault vault.yourdomain.com
+
+# Run it (foreground)
+cloudflared tunnel run vault
+
+# Or install as a system service (runs in background, survives reboot)
+sudo cloudflared service install
+sudo systemctl start cloudflared
+```
+
+See [Cloudflare Tunnel docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/) for the full guide.
+
+### Connect Claude Desktop
+
+Once your tunnel is running:
 - Settings → Integrations → Add MCP Server
 - URL: `https://vault.yourdomain.com/mcp`
 - Header: `Authorization: Bearer pvk_your-api-key`
 
-## Self-hosting on a VPS
+## Docker deployment
 
-For an always-on vault without relying on your Mac, deploy to a VPS:
-
-### Docker (Hetzner, DigitalOcean, any VPS)
+For VPS hosting without installing Bun directly:
 
 ```bash
 git clone https://github.com/ParachuteComputer/parachute-vault
@@ -53,17 +93,16 @@ cp .env.example .env
 echo "VAULT_DOMAIN=vault.yourdomain.com" >> .env
 docker compose up -d
 
-# Option B: Cloudflare Tunnel (no domain needed)
+# Option B: Cloudflare Tunnel (no domain needed, recommended)
 docker compose up -d vault   # just the vault, no Caddy
-cloudflared tunnel --url http://localhost:1940
+# Then set up cloudflared as above
 ```
 
-### Railway (one-click, $5/mo)
+### Cloud platforms
 
-Deploy from GitHub — Railway auto-detects the Dockerfile, adds a persistent volume. Get a public URL instantly.
+**Railway** ($5/mo) — Deploy from GitHub, auto-detects Dockerfile, persistent volume. One click.
 
-### Fly.io ($3-5/mo)
-
+**Fly.io** ($3-5/mo):
 ```bash
 fly launch --copy-config
 fly volumes create vault_data --size 1
@@ -284,9 +323,10 @@ API keys per vault (SHA-256 hashed, stored in `vault.yaml`). Localhost bypasses 
 
 ## Requirements
 
-- [Bun](https://bun.sh) runtime (for local install)
-- Docker (for VPS deployment)
-- macOS for launchd daemon (server runs on any platform)
+- [Bun](https://bun.sh) runtime — `curl -fsSL https://bun.sh/install | bash`
+- [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) — for remote HTTPS access (optional)
+- [Docker](https://docs.docker.com/get-docker/) — for containerized deployment (alternative to Bun)
+- macOS (launchd) or Linux (systemd) for background daemon
 
 ## License
 
