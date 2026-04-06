@@ -95,10 +95,12 @@ parachute vault create work                # create a new vault
 parachute vault list                       # list all vaults
 parachute vault remove work --yes          # delete a vault
 
-# Obsidian
-parachute vault import ~/Obsidian/MyVault  # import an Obsidian vault
-parachute vault export ./output            # export as Obsidian markdown
-parachute vault import <path> --dry-run    # preview import
+# Obsidian import/export (imports into an existing vault)
+parachute vault import ~/Obsidian/MyVault              # import into default vault
+parachute vault import ~/Obsidian/Work --vault work    # import into a specific vault
+parachute vault import <path> --dry-run                # preview without importing
+parachute vault export ./output                        # export default vault
+parachute vault export ./output --vault work           # export a specific vault
 
 # Config
 parachute vault config                     # show current configuration
@@ -194,13 +196,24 @@ With an embedding provider configured, `semantic-search` finds conceptually rela
 
 ### Obsidian import/export
 
+Import adds notes into an existing Parachute vault. Notes with paths that already exist are skipped (no duplicates). Wikilinks are resolved in a single pass after all notes are imported.
+
 ```bash
-# Import: frontmatter → metadata, #tags → tags, [[links]] → graph, paths preserved
+# Import into a new vault
+parachute vault create research
+parachute vault import ~/Obsidian/Research --vault research
+
+# Or import into the default vault
 parachute vault import ~/Obsidian/MyVault
 
-# Export: metadata → frontmatter, tags → frontmatter, paths → file structure
-parachute vault export ./output
+# Preview first
+parachute vault import ~/Obsidian/MyVault --dry-run
+
+# Export back to Obsidian-compatible markdown
+parachute vault export ./output --vault research
 ```
+
+What gets imported: frontmatter → metadata, `#tags` → tags table, `[[wikilinks]]` → links table, file paths → note.path.
 
 ### Path conventions
 
