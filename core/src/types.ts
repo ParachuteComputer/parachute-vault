@@ -36,6 +36,7 @@ export interface Attachment {
 
 export interface QueryOpts {
   tags?: string[];
+  tagMatch?: "all" | "any"; // "all" = must have ALL tags (default), "any" = must have ANY tag
   excludeTags?: string[];
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
   metadata?: Record<string, unknown>; // filter by metadata values (exact match on each key)

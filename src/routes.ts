@@ -43,6 +43,7 @@ export async function handleNotes(
   if (method === "GET" && path === "") {
     const results = store.queryNotes({
       tags: parseQueryList(url, "tag"),
+      tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? undefined,
       excludeTags: parseQueryList(url, "exclude_tag"),
       dateFrom: parseQuery(url, "date_from") ?? undefined,
       dateTo: parseQuery(url, "date_to") ?? undefined,
@@ -333,7 +334,8 @@ export async function handleStorage(req: Request, path: string, vault: string): 
  *   tags          — comma-separated tags (optional)
  *   path          — note path (optional)
  *   metadata      — JSON string of note metadata (optional)
- *   transcribe    — "true" to server-transcribe (optional)
+ *   sync          — "true" to transcribe server-side before responding (optional)
+ *   transcribe    — alias for sync (optional)
  *   id            — client-provided note ID (optional, for offline sync)
  *
  * Returns: { note, attachment, transcription? }
@@ -367,16 +369,19 @@ export async function handleIngest(
   const relativePath = `${date}/${filename}`;
   const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
 
-  // 2. Optionally transcribe
+  // 2. Optionally transcribe (sync=true or transcribe=true)
   let transcription: string | undefined;
-  const shouldTranscribe = form.get("transcribe");
+  let transcriptionError: string | undefined;
+  const shouldTranscribe = form.get("sync") ?? form.get("transcribe");
   if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
     const scribe = await getScribe();
     if (scribe) {
       try {
         const audioFile = new File([buffer], file.name, { type: file.type });
         transcription = await scribe.transcribe(audioFile);
-      } catch {}
+      } catch (err) {
+        transcriptionError = err instanceof Error ? err.message : "transcription failed";
+      }
     }
   }
 
@@ -411,6 +416,7 @@ export async function handleIngest(
     source: "voice-memo",
     audio_duration_bytes: buffer.length,
     ...(clientContent && transcription ? { client_transcription: clientContent } : {}),
+    ...(transcriptionError ? { transcription_error: transcriptionError } : {}),
   };
 
   // 5. Create note
