@@ -14,9 +14,10 @@
 
 // If embeddings are configured, swap to Homebrew SQLite on macOS (must happen before any DB opens)
 import { existsSync, readFileSync } from "fs";
-import { resolve } from "path";
+import { resolve, join } from "path";
 import { homedir } from "os";
-const _envPath = resolve(homedir(), ".parachute", ".env");
+const _configDir = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+const _envPath = resolve(_configDir, ".env");
 if (existsSync(_envPath)) {
   const _envContent = readFileSync(_envPath, "utf-8");
   if (/EMBEDDING_PROVIDER\s*=/.test(_envContent) && !/EMBEDDING_PROVIDER\s*=\s*none/i.test(_envContent)) {
@@ -25,7 +26,7 @@ if (existsSync(_envPath)) {
   }
 }
 
-import { readVaultConfig, readGlobalConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile } from "./config.ts";
+import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
@@ -33,6 +34,37 @@ import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, hand
 
 ensureConfigDirSync();
 loadEnvFile();
+
+// Auto-init: create a default vault if none exist (first run in Docker)
+if (listVaults().length === 0) {
+  const globalConfig = readGlobalConfig();
+  if (!globalConfig.default_vault) {
+    const { fullKey, keyId } = generateApiKey();
+    writeVaultConfig({
+      name: "default",
+      api_keys: [{
+        id: keyId,
+        label: "default",
+        scope: "write",
+        key_hash: hashKey(fullKey),
+        created_at: new Date().toISOString(),
+      }],
+      created_at: new Date().toISOString(),
+    });
+    globalConfig.default_vault = "default";
+    if (!globalConfig.api_keys?.length) {
+      globalConfig.api_keys = [{
+        id: keyId,
+        label: "default",
+        scope: "write",
+        key_hash: hashKey(fullKey),
+        created_at: new Date().toISOString(),
+      }];
+    }
+    writeGlobalConfig(globalConfig);
+    console.log(`Auto-created default vault (API key: ${fullKey})`);
+  }
+}
 
 const globalConfig = readGlobalConfig();
 const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PORT;
