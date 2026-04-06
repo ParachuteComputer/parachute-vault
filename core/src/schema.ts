@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
+import { normalizePath } from "./paths.js";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -100,6 +101,9 @@ export function initSchema(db: Database): void {
   // Migrate v3 → v4: add metadata columns
   migrateToV4(db);
 
+  // Migrate v4 → v5: unique path constraint
+  migrateToV5(db);
+
   // Record schema version
   db.prepare("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(
     SCHEMA_VERSION,
@@ -125,6 +129,48 @@ function migrateToV4(db: Database): void {
   if (hasTable(db, "attachments") && !hasColumn(db, "attachments", "metadata")) {
     db.exec("ALTER TABLE attachments ADD COLUMN metadata TEXT DEFAULT '{}'");
   }
+}
+
+/**
+ * Migrate v4 → v5: add UNIQUE constraint on path, normalize existing paths.
+ */
+function migrateToV5(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+
+  // Check if the unique index already exists
+  const indexes = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_notes_path_unique'",
+  ).all();
+  if (indexes.length > 0) return;
+
+  // Normalize existing paths
+  const rows = db.prepare("SELECT id, path FROM notes WHERE path IS NOT NULL").all() as { id: string; path: string }[];
+  for (const row of rows) {
+    const normalized = normalizePath(row.path);
+    if (normalized !== row.path) {
+      db.prepare("UPDATE notes SET path = ? WHERE id = ?").run(normalized, row.id);
+    }
+  }
+
+  // Handle duplicate paths (can happen after normalization) — append note ID suffix
+  const dupes = db.prepare(`
+    SELECT path, GROUP_CONCAT(id) as ids FROM notes
+    WHERE path IS NOT NULL
+    GROUP BY path COLLATE NOCASE
+    HAVING COUNT(*) > 1
+  `).all() as { path: string; ids: string }[];
+  for (const dupe of dupes) {
+    const ids = dupe.ids.split(",");
+    // Keep first, rename the rest
+    for (let i = 1; i < ids.length; i++) {
+      const newPath = `${dupe.path}-${i}`;
+      db.prepare("UPDATE notes SET path = ? WHERE id = ?").run(newPath, ids[i]);
+    }
+  }
+
+  // Drop the old non-unique partial index and create a unique one
+  db.exec("DROP INDEX IF EXISTS idx_notes_path");
+  db.exec("CREATE UNIQUE INDEX idx_notes_path_unique ON notes(path) WHERE path IS NOT NULL");
 }
 
 function hasTable(db: Database, name: string): boolean {

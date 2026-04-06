@@ -4,6 +4,7 @@ import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
+import { normalizePath, pathTitle } from "./paths.js";
 
 /**
  * SQLite-backed Store implementation.
@@ -44,6 +45,13 @@ export class SqliteStore implements Store {
   }
 
   updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note {
+    // Capture old path before update for rename cascading
+    let oldPath: string | undefined;
+    if (updates.path !== undefined) {
+      const existing = noteOps.getNote(this.db, id);
+      oldPath = existing?.path;
+    }
+
     const note = noteOps.updateNote(this.db, id, updates);
 
     // Re-sync wikilinks if content changed
@@ -51,12 +59,57 @@ export class SqliteStore implements Store {
       syncWikilinks(this.db, id, updates.content);
     }
 
-    // If path changed, resolve any pending wikilinks targeting the new path
+    // If path changed, cascade rename through wikilinks in other notes
     if (updates.path !== undefined && note.path) {
+      if (oldPath && oldPath !== note.path) {
+        this.cascadeRename(oldPath, note.path);
+      }
       resolveUnresolvedWikilinks(this.db, note.path, id);
     }
 
     return note;
+  }
+
+  /**
+   * When a note is renamed, update [[wikilinks]] in other notes that referenced the old path.
+   * Matches both full path and basename references.
+   */
+  private cascadeRename(oldPath: string, newPath: string): void {
+    const oldTitle = pathTitle(oldPath);
+    const newTitle = pathTitle(newPath);
+
+    // Find notes whose content contains a likely wikilink to the old path
+    // Search for both the full old path and just the old basename
+    const candidates = this.db.prepare(`
+      SELECT id, content FROM notes
+      WHERE content LIKE ? OR content LIKE ?
+    `).all(`%[[${oldPath}%`, `%[[${oldTitle}%`) as { id: string; content: string }[];
+
+    for (const row of candidates) {
+      let updated = row.content;
+
+      // Replace [[OldPath...]] with [[NewPath...]] (preserving aliases and anchors)
+      updated = updated.replace(
+        new RegExp(`\\[\\[${escapeRegex(oldPath)}([#|\\]])`, "g"),
+        `[[${newPath}$1`,
+      );
+
+      // Replace [[OldTitle...]] with [[NewTitle...]] (basename references)
+      // Only if old title !== new title and old title !== old path (avoid double-replace)
+      if (oldTitle !== newTitle && oldTitle !== oldPath) {
+        updated = updated.replace(
+          new RegExp(`\\[\\[${escapeRegex(oldTitle)}([#|\\]])`, "g"),
+          `[[${newTitle}$1`,
+        );
+      }
+
+      if (updated !== row.content) {
+        // Call noteOps directly (not this.updateNote) to avoid recursive cascading.
+        // Only content changes here, so path normalization/cascading aren't needed.
+        noteOps.updateNote(this.db, row.id, { content: updated });
+        syncWikilinks(this.db, row.id, updated);
+      }
+    }
   }
 
   deleteNote(id: string): void {
@@ -189,4 +242,8 @@ export class SqliteStore implements Store {
       };
     });
   }
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

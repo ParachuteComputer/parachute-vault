@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Note, QueryOpts } from "./types.js";
+import { normalizePath } from "./paths.js";
 
 let idCounter = 0;
 
@@ -27,10 +28,11 @@ export function createNote(
   const id = opts?.id ?? generateId();
   const createdAt = opts?.created_at ?? new Date().toISOString();
   const metadata = opts?.metadata ? JSON.stringify(opts.metadata) : "{}";
+  const path = normalizePath(opts?.path);
 
   db.prepare(
     `INSERT INTO notes (id, content, path, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
-  ).run(id, content, opts?.path ?? null, metadata, createdAt);
+  ).run(id, content, path, metadata, createdAt);
 
   if (opts?.tags && opts.tags.length > 0) {
     tagNote(db, id, opts.tags);
@@ -85,7 +87,7 @@ export function updateNote(
   }
   if (updates.path !== undefined) {
     sets.push("path = ?");
-    values.push(updates.path);
+    values.push(normalizePath(updates.path));
   }
   if (updates.metadata !== undefined) {
     sets.push("metadata = ?");
