@@ -18,25 +18,35 @@ Phone   →  REST API + transcription  ────┘
 ## Packages
 
 ```
-core/    — TypeScript library: schema, store, MCP tools (bun:sqlite)
-src/     — Bun CLI + server + MCP + transcription
+core/    — TypeScript library: schema, store, MCP tools, wikilinks, embeddings, paths (bun:sqlite)
+src/     — Bun CLI + server + MCP + transcription + embedding providers
+deploy/  — systemd unit, Dockerfile, docker-compose, fly.toml, railway.json
 ```
 
 ## Data Model
 
-Five tables per vault. Vaults start blank — no predefined tags or schema. Clients create the tags they need.
+Five core tables per vault. Vaults start blank — no predefined tags or schema. Clients create the tags they need.
 
 ```sql
 notes       (id, content, path, metadata, created_at, updated_at)
 tags        (name)
 note_tags   (note_id, tag_name)
-attachments (id, note_id, path, mime_type, created_at)
+attachments (id, note_id, path, mime_type, metadata, created_at)
 links       (source_id, target_id, relationship, metadata, created_at)
 ```
 
-Metadata is a JSON column on notes and links. Queryable via `json_extract()`.
+Additional tables (created on demand):
+- `unresolved_wikilinks` — pending wikilink resolution
+- `vec_notes` — sqlite-vec virtual table for embeddings
+- `embedding_meta` — tracks which notes are embedded
+- `embedding_config` — stores embedding dimensions
+- `schema_version` — migration tracking
 
-### MCP Tools (18)
+Metadata is a JSON column on notes, links, and attachments. Queryable via `json_extract()`.
+
+Path is unique (when set), normalized (no .md, no trailing slashes), and used for wikilink resolution.
+
+### MCP Tools (20+)
 
 Core: `get-note`, `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`, `tag-note`, `untag-note`, `create-link`, `delete-link`, `get-links`, `list-tags`
 
@@ -44,7 +54,9 @@ Bulk: `create-notes`, `batch-tag`, `batch-untag`
 
 Graph: `traverse-links`, `find-path`
 
-Multi-vault: `list-vaults`
+Vault: `list-vaults`, `get-vault-description`, `update-vault-description`
+
+Semantic (conditional): `semantic-search`, `embed-notes`
 
 ## Bun-native
 
@@ -59,9 +71,14 @@ Use Bun for everything. No Node.js.
 
 - **Bare primitives**: Vault has no opinions about tags or conventions. It's the engine, not the schema. Clients (parachute-daily, etc.) bring their own tag schema.
 - **Multi-vault**: One server hosts many vaults. Each vault = own SQLite DB + config + API keys.
-- **Per-vault MCP descriptions**: vault.yaml enriches MCP tool descriptions. The vault teaches the AI how to use it.
-- **Unified config**: All env vars in `~/.parachute/.env`. Managed via `vault config set/unset`. Launchd daemon sources it via wrapper script.
-- **Optional transcription**: parachute-scribe is an optional dependency. If installed, vault exposes Whisper-compatible endpoints. If not, vault works fine without it.
+- **Per-vault MCP descriptions**: vault.yaml is sent as MCP server instruction at session start. The vault teaches the AI how to use it.
+- **Wikilink auto-linking**: `[[wikilinks]]` in note content are automatically parsed and maintained as links. Unresolved links auto-resolve when target notes are created.
+- **Path normalization**: Paths are normalized on write (strip .md, collapse slashes, trim). UNIQUE constraint enforced. Rename cascading updates wikilinks in other notes.
+- **Semantic search**: Optional sqlite-vec integration. Embedding providers are configurable (OpenAI, Ollama). Tag/date filters pushed into SQL for efficient filtered search.
+- **Obsidian interop**: Import/export preserves frontmatter, tags, wikilinks, and file paths.
+- **Unified config**: All env vars in `~/.parachute/.env` (or `$PARACHUTE_HOME/.env` in Docker).
+- **Optional transcription**: parachute-scribe is an optional dependency. If installed, vault exposes Whisper-compatible endpoints.
+- **Docker-friendly**: `PARACHUTE_HOME` env var overrides data directory. Server auto-creates default vault on first run.
 
 ## Config
 
@@ -71,7 +88,10 @@ All configuration in `~/.parachute/.env`:
 PORT=1940
 TRANSCRIBE_PROVIDER=groq        # or parakeet-mlx, openai
 CLEANUP_PROVIDER=claude          # or ollama, none
+EMBEDDING_PROVIDER=openai        # or ollama, none
+EMBEDDING_MODEL=text-embedding-3-small
 GROQ_API_KEY=...
+OPENAI_API_KEY=...
 ANTHROPIC_API_KEY=...
 ```
 
@@ -88,6 +108,19 @@ ANTHROPIC_API_KEY=...
 bun src/cli.ts vault init          # setup everything
 bun src/cli.ts vault status        # check status
 bun src/cli.ts vault config        # view/edit config
-bun test src/                      # run tests
-bun test core/src/core.test.ts     # run core tests
+bun src/cli.ts vault import <path> # import Obsidian vault
+bun src/cli.ts vault export <path> # export as Obsidian markdown
+bun test src/                      # run server tests
+bun test core/src/                 # run core tests
 ```
+
+## Deployment
+
+Self-hosted:
+- **Mac**: `bun install && vault init` (launchd daemon, localhost)
+- **VPS**: `docker compose up -d` (Hetzner, DigitalOcean, etc.)
+- **Remote access**: Cloudflare Tunnel for HTTPS (`cloudflared tunnel --url http://localhost:1940`)
+
+Hosted (future, issue #5):
+- Cloudflare Workers + D1 + R2
+- Requires async Store interface refactor
