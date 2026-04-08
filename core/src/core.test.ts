@@ -127,6 +127,106 @@ describe("tags", () => {
   });
 });
 
+// ---- Vault Stats ----
+
+describe("vault stats", () => {
+  it("handles empty vault gracefully", () => {
+    const stats = store.getVaultStats();
+    expect(stats.total_notes).toBe(0);
+    expect(stats.earliest_note).toBeNull();
+    expect(stats.latest_note).toBeNull();
+    expect(stats.notes_by_month).toEqual([]);
+    expect(stats.top_tags).toEqual([]);
+    expect(stats.tag_count).toBe(0);
+  });
+
+  it("counts total notes and tag_count", () => {
+    store.createNote("A", { tags: ["daily", "voice"] });
+    store.createNote("B", { tags: ["daily"] });
+    store.createNote("C");
+
+    const stats = store.getVaultStats();
+    expect(stats.total_notes).toBe(3);
+    expect(stats.tag_count).toBe(2); // "daily" and "voice"
+  });
+
+  it("reports earliest and latest notes correctly", () => {
+    store.createNote("oldest", { id: "n1", created_at: "2025-01-15T10:00:00.000Z" });
+    store.createNote("middle", { id: "n2", created_at: "2025-06-20T10:00:00.000Z" });
+    store.createNote("newest", { id: "n3", created_at: "2026-03-01T10:00:00.000Z" });
+
+    const stats = store.getVaultStats();
+    expect(stats.earliest_note).toEqual({ id: "n1", created_at: "2025-01-15T10:00:00.000Z" });
+    expect(stats.latest_note).toEqual({ id: "n3", created_at: "2026-03-01T10:00:00.000Z" });
+  });
+
+  it("groups notes by month across all present months", () => {
+    store.createNote("a", { created_at: "2025-02-28T12:00:00.000Z" });
+    store.createNote("b", { created_at: "2025-03-01T08:00:00.000Z" });
+    store.createNote("c", { created_at: "2025-03-15T09:00:00.000Z" });
+    store.createNote("d", { created_at: "2025-03-20T11:00:00.000Z" });
+    store.createNote("e", { created_at: "2026-01-10T10:00:00.000Z" });
+
+    const stats = store.getVaultStats();
+    expect(stats.notes_by_month).toEqual([
+      { month: "2025-02", count: 1 },
+      { month: "2025-03", count: 3 },
+      { month: "2026-01", count: 1 },
+    ]);
+  });
+
+  it("returns top_tags ordered by count desc, capped", () => {
+    // Create notes with varying tag frequencies
+    for (let i = 0; i < 5; i++) store.createNote(`captured-${i}`, { tags: ["captured"] });
+    for (let i = 0; i < 3; i++) store.createNote(`reader-${i}`, { tags: ["reader"] });
+    store.createNote("one", { tags: ["rare"] });
+
+    const stats = store.getVaultStats();
+    expect(stats.top_tags[0]).toEqual({ tag: "captured", count: 5 });
+    expect(stats.top_tags[1]).toEqual({ tag: "reader", count: 3 });
+    expect(stats.top_tags[2]).toEqual({ tag: "rare", count: 1 });
+  });
+
+  it("caps top_tags at the requested limit", () => {
+    // 25 distinct tags, one per note
+    for (let i = 0; i < 25; i++) {
+      store.createNote(`n-${i}`, { tags: [`tag-${String(i).padStart(2, "0")}`] });
+    }
+    const stats = store.getVaultStats({ topTagsLimit: 20 });
+    expect(stats.top_tags).toHaveLength(20);
+    expect(stats.tag_count).toBe(25);
+  });
+
+  it("response shape is complete", () => {
+    store.createNote("hello", { tags: ["a"] });
+    const stats = store.getVaultStats();
+    expect(stats).toHaveProperty("total_notes");
+    expect(stats).toHaveProperty("earliest_note");
+    expect(stats).toHaveProperty("latest_note");
+    expect(stats).toHaveProperty("notes_by_month");
+    expect(stats).toHaveProperty("top_tags");
+    expect(stats).toHaveProperty("tag_count");
+  });
+
+  it("get-vault-stats MCP tool works", () => {
+    store.createNote("one", { tags: ["x"], created_at: "2025-05-01T00:00:00.000Z" });
+    store.createNote("two", { tags: ["x", "y"], created_at: "2025-06-01T00:00:00.000Z" });
+
+    const tools = generateMcpTools(db);
+    const tool = tools.find((t) => t.name === "get-vault-stats")!;
+    expect(tool).toBeTruthy();
+
+    const result = tool.execute({}) as any;
+    expect(result.total_notes).toBe(2);
+    expect(result.tag_count).toBe(2);
+    expect(result.top_tags[0].tag).toBe("x");
+    expect(result.top_tags[0].count).toBe(2);
+    expect(result.notes_by_month).toHaveLength(2);
+    expect(result.earliest_note.created_at).toBe("2025-05-01T00:00:00.000Z");
+    expect(result.latest_note.created_at).toBe("2025-06-01T00:00:00.000Z");
+  });
+});
+
 // ---- Query ----
 
 describe("queryNotes", () => {
@@ -338,7 +438,8 @@ describe("MCP tools", () => {
     expect(names).toContain("traverse-links");
     expect(names).toContain("find-path");
     expect(names).toContain("get-note");
-    expect(tools).toHaveLength(17);
+    expect(names).toContain("get-vault-stats");
+    expect(tools).toHaveLength(18);
   });
 
   it("create-note tool works", () => {
