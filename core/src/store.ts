@@ -5,13 +5,17 @@ import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { normalizePath, pathTitle } from "./paths.js";
+import { HookRegistry } from "./hooks.js";
 
 /**
  * SQLite-backed Store implementation.
  */
 export class SqliteStore implements Store {
-  constructor(public readonly db: Database) {
+  public readonly hooks: HookRegistry;
+
+  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
     initSchema(db);
+    this.hooks = opts?.hooks ?? new HookRegistry();
   }
 
   // ---- Notes ----
@@ -28,6 +32,9 @@ export class SqliteStore implements Store {
     if (note.path) {
       resolveUnresolvedWikilinks(this.db, note.path, note.id);
     }
+
+    // Dispatch async hooks post-commit. Never blocks the caller.
+    this.hooks.dispatch("created", note, this);
 
     return note;
   }
@@ -66,6 +73,9 @@ export class SqliteStore implements Store {
       }
       resolveUnresolvedWikilinks(this.db, note.path, id);
     }
+
+    // Dispatch async hooks post-commit. Never blocks the caller.
+    this.hooks.dispatch("updated", note, this);
 
     return note;
   }
@@ -161,7 +171,14 @@ export class SqliteStore implements Store {
   // ---- Bulk Operations ----
 
   createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Note[] {
-    return noteOps.createNotes(this.db, inputs);
+    const notes = noteOps.createNotes(this.db, inputs);
+    // Dispatch hooks for each created note — AFTER the bulk transaction
+    // commits inside noteOps.createNotes. Dispatch itself is async-safe
+    // (queueMicrotask), so the loop returns immediately.
+    for (const note of notes) {
+      this.hooks.dispatch("created", note, this);
+    }
+    return notes;
   }
 
   batchTag(noteIds: string[], tags: string[]): number {

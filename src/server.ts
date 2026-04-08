@@ -31,6 +31,15 @@ import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } 
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels } from "./routes.ts";
+import { defaultHookRegistry } from "../core/src/hooks.ts";
+
+// Features register their note-mutation hooks here. For now the registry
+// is empty — #38 (TTS) and #39 (async transcription) will add handlers
+// in their own PRs by calling defaultHookRegistry.onNote(...) below.
+function registerHooks(): void {
+  // No hooks registered in v1 — infrastructure only.
+}
+registerHooks();
 
 ensureConfigDirSync();
 loadEnvFile();
@@ -107,6 +116,22 @@ const server = Bun.serve({
 });
 
 console.log(`Parachute Vault server listening on http://0.0.0.0:${server.port}`);
+
+// Graceful shutdown — best-effort drain of in-flight note-mutation hooks.
+async function shutdown(signal: string): Promise<void> {
+  console.log(`\n[${signal}] shutting down; in-flight hooks: ${defaultHookRegistry.inFlightCount}`);
+  try {
+    await Promise.race([
+      defaultHookRegistry.drain(),
+      new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+    ]);
+  } catch (err) {
+    console.error("[shutdown] hook drain error:", err);
+  }
+  process.exit(0);
+}
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 async function route(req: Request, path: string): Promise<Response> {
   // Health check
