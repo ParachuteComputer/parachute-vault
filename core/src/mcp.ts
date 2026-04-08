@@ -332,6 +332,8 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
                 content: { type: "string", description: "Note content (markdown)" },
                 tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
                 path: { type: "string", description: "Optional path/name" },
+                metadata: { type: "object", description: "Optional metadata object (JSON-serializable)" },
+                created_at: { type: "string", description: "Optional ISO timestamp; defaults to now if omitted" },
               },
               required: ["content"],
             },

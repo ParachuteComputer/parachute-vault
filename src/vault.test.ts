@@ -250,6 +250,74 @@ describe("bulk operations", () => {
     expect(notes[1].tags).toContain("doc");
   });
 
+  test("createNotes accepts per-note metadata and created_at (mixed batch)", () => {
+    const notes = store.createNotes([
+      { content: "Plain", tags: ["daily"] },
+      {
+        content: "With metadata",
+        path: "Imports/with-meta",
+        metadata: { source: "tana-import", tana_type: "flow" },
+      },
+      {
+        content: "With backdated created_at",
+        path: "Imports/backdated",
+        metadata: { source: "tana-import" },
+        created_at: "2020-01-15T12:00:00.000Z",
+      },
+    ]);
+    expect(notes.length).toBe(3);
+
+    // Plain note: no source metadata, recent createdAt
+    expect(notes[0].metadata?.source).toBeUndefined();
+    expect(notes[0].tags).toContain("daily");
+
+    // Metadata-only note: metadata flows through, createdAt is recent
+    expect(notes[1].metadata?.source).toBe("tana-import");
+    expect(notes[1].metadata?.tana_type).toBe("flow");
+    expect(notes[1].path).toBe("Imports/with-meta");
+
+    // Backdated note: createdAt honored exactly
+    expect(notes[2].createdAt).toBe("2020-01-15T12:00:00.000Z");
+    expect(notes[2].metadata?.source).toBe("tana-import");
+  });
+
+  test("createNotes preserves per-note metadata isolation across many notes", () => {
+    const inputs = Array.from({ length: 5 }, (_, i) => ({
+      content: `Day ${i}`,
+      path: `Journal/2024-06-${String(i + 1).padStart(2, "0")}`,
+      tags: ["captured"],
+      metadata: {
+        source: "tana-import",
+        tana_path: `daily/2024-06-${i + 1}.md`,
+        index: i,
+      },
+      created_at: `2024-06-${String(i + 1).padStart(2, "0")}T12:00:00.000Z`,
+    }));
+    const notes = store.createNotes(inputs);
+    expect(notes.length).toBe(5);
+    for (let i = 0; i < 5; i++) {
+      expect(notes[i].path).toBe(`Journal/2024-06-${String(i + 1).padStart(2, "0")}`);
+      expect(notes[i].metadata?.index).toBe(i);
+      expect(notes[i].metadata?.tana_path).toBe(`daily/2024-06-${i + 1}.md`);
+      expect(notes[i].createdAt).toBe(`2024-06-${String(i + 1).padStart(2, "0")}T12:00:00.000Z`);
+      expect(notes[i].tags).toContain("captured");
+    }
+  });
+
+  test("createNotes is backwards compatible — omitted metadata/created_at use defaults", () => {
+    const before = new Date().toISOString();
+    const notes = store.createNotes([
+      { content: "Just content" },
+      { content: "Content + tags", tags: ["x"] },
+    ]);
+    const after = new Date().toISOString();
+    expect(notes[0].metadata?.source).toBeUndefined();
+    expect(notes[1].metadata?.source).toBeUndefined();
+    // createdAt defaults to "now" — should fall in [before, after]
+    expect(notes[0].createdAt >= before).toBe(true);
+    expect(notes[0].createdAt <= after).toBe(true);
+  });
+
   test("batch tags multiple notes", () => {
     const a = store.createNote("A");
     const b = store.createNote("B");

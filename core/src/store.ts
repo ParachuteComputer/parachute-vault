@@ -170,7 +170,7 @@ export class SqliteStore implements Store {
 
   // ---- Bulk Operations ----
 
-  createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Note[] {
+  createNotes(inputs: noteOps.BulkNoteInput[]): Note[] {
     const notes = noteOps.createNotes(this.db, inputs);
     // Dispatch hooks for each created note — AFTER the bulk transaction
     // commits inside noteOps.createNotes. Dispatch itself is async-safe
