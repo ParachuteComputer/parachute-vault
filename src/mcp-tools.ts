@@ -197,8 +197,8 @@ const _vecInitialized = new Set<string>();
 
 function getEmbedProvider(): EmbeddingProvider | null {
   if (_embedProvider !== undefined) return _embedProvider;
-  const env = loadEnvFile();
-  _embedProvider = createEmbeddingProvider(env);
+  loadEnvFile();
+  _embedProvider = createEmbeddingProvider(process.env);
   return _embedProvider;
 }
 
