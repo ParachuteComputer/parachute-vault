@@ -117,7 +117,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
     },
     {
       name: "read-notes",
-      description: `Read notes, filtered by tags, path prefix, metadata, and/or date range. Use path_prefix to browse like a filesystem. Use metadata to filter by structured properties (e.g., { "status": "in-progress" }).`,
+      description: `Read notes, filtered by tags, path prefix, metadata, and/or date range. Use path_prefix to browse like a filesystem. Use metadata to filter by structured properties (e.g., { "status": "in-progress" }). Set include_content: false to get a lightweight index (metadata + preview + byteSize) instead of full content — useful for planning batched reads over large date ranges.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -131,20 +131,49 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
           sort: { type: "string", enum: ["asc", "desc"], description: "Sort by created_at" },
           limit: { type: "number", description: "Max results (default 100)" },
           offset: { type: "number", description: "Skip this many results (for pagination, default 0)" },
+          include_content: { type: "boolean", description: "Include full note content (default true). Set false for an index-mode response: each note becomes { id, path, createdAt, updatedAt, tags, metadata, byteSize, preview } with no content field." },
         },
       },
-      execute: (params) => notes.queryNotes(db, {
-        tags: params.tags as string[] | undefined,
-        tagMatch: params.tag_match as "all" | "any" | undefined,
-        excludeTags: params.exclude_tags as string[] | undefined,
-        pathPrefix: params.path_prefix as string | undefined,
-        metadata: params.metadata as Record<string, unknown> | undefined,
-        dateFrom: params.date_from as string | undefined,
-        dateTo: params.date_to as string | undefined,
-        sort: params.sort as "asc" | "desc" | undefined,
-        limit: params.limit as number | undefined,
-        offset: params.offset as number | undefined,
-      }),
+      execute: (params) => {
+        const results = notes.queryNotes(db, {
+          tags: params.tags as string[] | undefined,
+          tagMatch: params.tag_match as "all" | "any" | undefined,
+          excludeTags: params.exclude_tags as string[] | undefined,
+          pathPrefix: params.path_prefix as string | undefined,
+          metadata: params.metadata as Record<string, unknown> | undefined,
+          dateFrom: params.date_from as string | undefined,
+          dateTo: params.date_to as string | undefined,
+          sort: params.sort as "asc" | "desc" | undefined,
+          limit: params.limit as number | undefined,
+          offset: params.offset as number | undefined,
+        });
+        if (params.include_content === false) {
+          const PREVIEW_LEN = 120;
+          return results.map((note) => {
+            const content = note.content ?? "";
+            const byteSize = Buffer.byteLength(content, "utf8");
+            // Collapse whitespace for a readable single-line preview
+            const collapsed = content.replace(/\s+/g, " ").trim();
+            // Iterate by Unicode code points so we don't split surrogate pairs
+            // (e.g. astral-plane emoji) mid-character.
+            const codePoints = Array.from(collapsed);
+            const preview = codePoints.length > PREVIEW_LEN
+              ? codePoints.slice(0, PREVIEW_LEN).join("")
+              : collapsed;
+            return {
+              id: note.id,
+              path: note.path,
+              createdAt: note.createdAt,
+              updatedAt: note.updatedAt,
+              tags: note.tags,
+              metadata: note.metadata,
+              byteSize,
+              preview,
+            };
+          });
+        }
+        return results;
+      },
     },
     {
       name: "search-notes",
