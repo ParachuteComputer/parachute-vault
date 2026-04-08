@@ -328,61 +328,30 @@ export interface BulkNoteInput {
   id?: string;
   path?: string;
   tags?: string[];
+  metadata?: Record<string, unknown>;
+  created_at?: string;
 }
 
 export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
   const results: Note[] = [];
-  const insertNote = db.prepare(
-    "INSERT INTO notes (id, content, path, created_at) VALUES (?, ?, ?, ?)",
-  );
-  const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
-  const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
 
   db.exec("BEGIN");
   try {
     for (const input of inputs) {
-      const id = input.id ?? generateId();
-      const now = new Date().toISOString();
-      insertNote.run(id, input.content, input.path ?? null, now);
-
-      if (input.tags && input.tags.length > 0) {
-        for (const tag of input.tags) {
-          insertTag.run(tag);
-          insertNoteTag.run(id, tag);
-        }
-      }
+      results.push(
+        createNote(db, input.content, {
+          id: input.id,
+          path: input.path,
+          tags: input.tags,
+          metadata: input.metadata,
+          created_at: input.created_at,
+        }),
+      );
     }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
-  }
-
-  // Fetch all created notes with tags
-  for (const input of inputs) {
-    const id = input.id ?? undefined;
-    // For notes without explicit IDs, we need to find them
-    // Since we're in a batch, fetch by content order
-  }
-
-  // Simpler: just re-query them all
-  // We know the IDs if provided, otherwise query recent
-  const ids = inputs.map((input) => input.id).filter(Boolean) as string[];
-  if (ids.length === inputs.length) {
-    // All had explicit IDs
-    for (const id of ids) {
-      results.push(getNote(db, id)!);
-    }
-  } else {
-    // Some auto-generated — query recent notes by count
-    const rows = db.prepare(
-      `SELECT * FROM notes ORDER BY created_at DESC, rowid DESC LIMIT ?`,
-    ).all(inputs.length) as NoteRow[];
-    for (const row of rows.reverse()) {
-      const note = rowToNote(row);
-      note.tags = getNoteTags(db, note.id);
-      results.push(note);
-    }
   }
 
   return results;
