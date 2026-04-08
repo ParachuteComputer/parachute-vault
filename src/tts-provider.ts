@@ -68,6 +68,17 @@ import { join } from "path";
 import { tmpdir } from "os";
 import type { Note, Store } from "../core/src/types.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
+import {
+  assertFfmpegAvailable,
+  encodeOggOpus,
+  OPUS_EXT,
+  OPUS_MIME,
+} from "./audio-encoding.ts";
+
+// Re-export the encoder so downstream callers and one-off scripts can
+// `import { encodeOggOpus } from "./tts-provider"` without caring about
+// the file split. Keeps the manual sanity-check snippet in the issue valid.
+export { encodeOggOpus } from "./audio-encoding.ts";
 
 // ---------------------------------------------------------------------------
 // Interface
@@ -351,15 +362,6 @@ export function getTtsProvider(
 // Hook: #reader → audio attachment
 // ---------------------------------------------------------------------------
 
-function mimeToExt(mime: string): string {
-  if (mime === "audio/mpeg" || mime === "audio/mp3") return ".mp3";
-  if (mime === "audio/wav") return ".wav";
-  if (mime === "audio/ogg") return ".ogg";
-  if (mime === "audio/webm") return ".webm";
-  if (mime === "audio/mp4") return ".m4a";
-  return ".bin";
-}
-
 export interface RegisterTtsHookOptions {
   provider: TtsProvider;
   /** Voice id to pass to the provider (usually env.TTS_VOICE). */
@@ -371,11 +373,27 @@ export interface RegisterTtsHookOptions {
   resolveAssetsDir: (store: Store) => string;
   /** Optional logger override. */
   logger?: { error: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
+  /**
+   * Skip the synchronous ffmpeg availability probe. Tests that stub out
+   * `encodeOggOpus` via a custom `encode` override can use this to avoid
+   * requiring ffmpeg to be installed on CI.
+   */
+  skipFfmpegCheck?: boolean;
+  /**
+   * Override the encoder. Defaults to `encodeOggOpus` from
+   * `./audio-encoding.ts`. Exposed for tests that want to stub ffmpeg.
+   */
+  encode?: (audio: Buffer, mime: string) => Promise<Buffer>;
 }
 
 /**
  * Register the `#reader` → audio hook on a HookRegistry. Returns the
  * unregister function from `HookRegistry.onNote`.
+ *
+ * Probes for ffmpeg at registration time (kicked off synchronously; errors
+ * surface via an unhandled rejection so callers see them loudly at startup).
+ * Callers that care about handling the missing-binary case gracefully should
+ * call `assertFfmpegAvailable()` themselves before registering.
  */
 export function registerTtsHook(
   hooks: HookRegistry,
@@ -383,6 +401,19 @@ export function registerTtsHook(
 ): () => void {
   const logger = opts.logger ?? console;
   const providerName = opts.provider.name;
+  const encode = opts.encode ?? encodeOggOpus;
+
+  // Fail loud if ffmpeg is missing. Kicked off without await so registration
+  // stays synchronous (matches the existing API shape), but we surface any
+  // rejection via logger so it's visible.
+  if (!opts.skipFfmpegCheck) {
+    assertFfmpegAvailable().catch((err) => {
+      logger.error(
+        "[tts-hook] ffmpeg availability check failed — TTS hook will fail at runtime:",
+        err,
+      );
+    });
+  }
 
   return hooks.onNote({
     name: "tts-reader",
@@ -439,17 +470,33 @@ export function registerTtsHook(
         throw err;
       }
 
-      // Persist the audio file under <assets>/tts/<date>/<noteId>-<ts>.<ext>.
+      // Encode to OGG Opus (48 kbps mono, VOIP profile). A 15-minute WAV
+      // from Kokoro (~33MB) shrinks to ~500KB here, which is the whole
+      // point of issue #43 — small attachments the Flutter client can
+      // re-download cheaply.
+      let encoded: Buffer;
+      try {
+        encoded = await encode(result.audio, result.mime);
+      } catch (err) {
+        logger.error(
+          `[tts-hook] failed to encode audio to OGG Opus for note ${note.id}; note left in audio_pending_at state:`,
+          err,
+        );
+        throw err;
+      }
+
+      // Persist the encoded audio file under
+      // <assets>/tts/<date>/<noteId>-<ts>.ogg.
       let relativePath: string;
+      let absPath: string;
       try {
         const assets = opts.resolveAssetsDir(store);
         const date = pendingAt.split("T")[0];
         const dir = join(assets, "tts", date);
         mkdirSync(dir, { recursive: true });
-        const ext = mimeToExt(result.mime);
-        const filename = `${note.id}-${Date.now()}${ext}`;
-        const absPath = join(dir, filename);
-        writeFileSync(absPath, result.audio);
+        const filename = `${note.id}-${Date.now()}${OPUS_EXT}`;
+        absPath = join(dir, filename);
+        writeFileSync(absPath, encoded);
         relativePath = `tts/${date}/${filename}`;
       } catch (err) {
         logger.error(
@@ -462,12 +509,19 @@ export function registerTtsHook(
 
       // Phase 2: attach the audio and mark the note as rendered. Read the
       // latest metadata first so we don't clobber concurrent edits.
+      //
+      // TODO(parachute-vault#44): once hooks no longer bump updated_at on
+      // metadata-only writes, the two store.updateNote calls in this handler
+      // could collapse into a cleaner single-write path and we'd no longer
+      // need the fresh-read + merge dance below.
       try {
-        store.addAttachment(note.id, relativePath, result.mime, {
+        store.addAttachment(note.id, relativePath, OPUS_MIME, {
           source: "tts",
           provider: providerName,
           voice: opts.voice,
-          size_bytes: result.audio.length,
+          size_bytes: encoded.length,
+          original_mime: result.mime,
+          original_size_bytes: result.audio.length,
           ...(result.duration !== undefined ? { duration: result.duration } : {}),
         });
 
