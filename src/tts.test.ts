@@ -26,6 +26,15 @@ import {
 
 const silentLogger = { error: () => {}, info: () => {} };
 
+/**
+ * A fake Opus encoder for tests — returns a buffer that starts with the
+ * OggS magic bytes so downstream sanity checks pass, without requiring
+ * ffmpeg on the test machine.
+ */
+async function fakeEncode(audio: Buffer, _mime: string): Promise<Buffer> {
+  return Buffer.concat([Buffer.from("OggS"), Buffer.from("-encoded:"), audio]);
+}
+
 /** Wait for queued dispatches + in-flight handlers to settle. */
 async function settle(hooks: HookRegistry): Promise<void> {
   // Let queueMicrotask-scheduled dispatches enqueue their tasks.
@@ -128,6 +137,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("Hello reader", { tags: ["reader"] });
@@ -146,13 +157,21 @@ describe("registerTtsHook — #reader → audio", () => {
 
     const attachments = store.getAttachments(note.id);
     expect(attachments.length).toBe(1);
-    expect(attachments[0].mimeType).toBe("audio/mpeg");
+    expect(attachments[0].mimeType).toBe("audio/ogg");
     expect(attachments[0].path.startsWith("tts/")).toBe(true);
-    expect(attachments[0].path.endsWith(".mp3")).toBe(true);
+    expect(attachments[0].path.endsWith(".ogg")).toBe(true);
+    // Attachment metadata should preserve the original mime + size so the
+    // migration script can tell what it was before encoding, and so clients
+    // can report compression stats.
+    const attMeta = attachments[0].metadata as Record<string, unknown>;
+    expect(attMeta.original_mime).toBe("audio/mpeg");
+    expect(attMeta.original_size_bytes).toBe(Buffer.from("fake-audio-bytes").length);
 
     const absPath = join(assetsBase, attachments[0].path);
     expect(existsSync(absPath)).toBe(true);
-    expect(readFileSync(absPath).toString()).toBe("fake-audio-bytes");
+    const bytes = readFileSync(absPath);
+    // Must start with the OGG magic bytes.
+    expect(bytes.toString("ascii", 0, 4)).toBe("OggS");
   });
 
   test("does not fire for notes without the #reader tag", async () => {
@@ -162,6 +181,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("No tag", { tags: ["other"] });
@@ -178,6 +199,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("Already rendered", {
@@ -201,6 +224,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("First pass", { tags: ["reader"] });
@@ -238,6 +263,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("Will fail", { tags: ["reader"] });
@@ -278,6 +305,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("", { tags: ["reader"] });
@@ -298,6 +327,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("First write", { tags: ["reader"] });
@@ -328,6 +359,8 @@ describe("registerTtsHook — #reader → audio", () => {
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
     });
 
     const note = store.createNote("Race me", { tags: ["reader"] });
