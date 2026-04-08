@@ -320,7 +320,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
 
     {
       name: "create-notes",
-      description: `Create multiple notes in one call. Much more efficient than calling create-note repeatedly.`,
+      description: `Create multiple notes in one call. Much more efficient than calling create-note repeatedly. Each note accepts the same fields as create-note: content (required), path, tags, metadata, and created_at (ISO timestamp; supports backdating for imports).`,
       inputSchema: {
         type: "object",
         properties: {
