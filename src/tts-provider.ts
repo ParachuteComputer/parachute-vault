@@ -39,6 +39,10 @@
  * - Failed synthesis requires manual recovery (clear `audio_pending_at`).
  * - If the handler crashes between phase 1 and phase 2 (e.g. process
  *   SIGKILL mid-synthesis), the note also stays in pending state.
+ * - If `store.addAttachment` throws after the audio file has been written
+ *   to disk, the file is orphaned under `<assets>/tts/<date>/`. The note
+ *   still stays in pending so no data is lost, but disk cleanup is manual.
+ *   Rare — addAttachment only touches SQLite — but worth noting.
  * - A future pass can add stale-pending recovery by widening the predicate
  *   to include notes where `audio_pending_at` is older than ~10 minutes,
  *   or by introducing a separate `audio_failed_at` marker that excludes
@@ -177,6 +181,16 @@ export function registerTtsHook(
     },
     handler: async (note: Note, store: Store) => {
       const existingMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+
+      // Handler-side re-check. The hook-registry predicate runs at dispatch
+      // time, but two synchronous mutations back-to-back can both snapshot
+      // matches before either handler's phase-1 write lands — the semaphore
+      // is global, not per-note. Re-checking here on the freshly-read note
+      // (runHandler already re-read for us) closes that window.
+      if (existingMeta.audio_pending_at || existingMeta.audio_rendered_at) {
+        return;
+      }
+
       const pendingAt = new Date().toISOString();
 
       // Phase 1: claim the note synchronously so a concurrent update cannot

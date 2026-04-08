@@ -276,7 +276,31 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(store.getAttachments(note.id).length).toBe(0);
   });
 
-  test("does not double-synthesize under two-phase marker", async () => {
+  test("two synchronous mutations in the same tick do not double-synthesize", async () => {
+    // This is the harder race: both mutations land back-to-back without an
+    // await between them, so both `dispatch()` calls snapshot matches
+    // before either handler's phase-1 write has had a chance to run. Only
+    // the handler-side re-check (not the dispatch-time predicate) can
+    // close this window.
+    const calls: Array<{ text: string; voice?: string }> = [];
+    registerTtsHook(hooks, {
+      provider: mockProvider(calls),
+      voice: "test-voice",
+      resolveAssetsDir: () => assetsBase,
+      logger: silentLogger,
+    });
+
+    const note = store.createNote("First write", { tags: ["reader"] });
+    // No await here — the second mutation lands in the same sync tick as
+    // the first dispatch's match capture.
+    store.updateNote(note.id, { content: "Second write, same tick" });
+    await settle(hooks);
+
+    expect(calls.length).toBe(1);
+    expect(store.getAttachments(note.id).length).toBe(1);
+  });
+
+  test("does not double-synthesize under two-phase marker with a slow provider", async () => {
     // Simulate the race: the provider takes a tick, and we mutate the note
     // while the handler is mid-flight. The second mutation should NOT
     // trigger a second synthesis because audio_pending_at is already set.
