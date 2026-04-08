@@ -190,6 +190,41 @@ async function migrateVault(
   const assetsBase = vaultAssetsDir(vault);
   const db = new Database(dbPath);
 
+  // Count the rows up-front so per-row logs can show [N/total] progress.
+  // Matches the SELECT below so the denominator is meaningful even when
+  // most rows turn out to be already-migrated and get fast-skipped.
+  let total = 0;
+  try {
+    const row = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM attachments WHERE mime_type LIKE 'audio/%'",
+      )
+      .get() as { c: number } | undefined;
+    total = row?.c ?? 0;
+  } catch {
+    total = 0;
+  }
+
+  // Running count of rows we've touched in any terminal way (converted,
+  // errored, or skipped). Used to prefix per-row logs with [N/total].
+  // Only emitted when total > 0 — for empty vaults the prefix is noise.
+  let processed = 0;
+  const progress = (): string =>
+    total > 0 ? `[${processed + 1}/${total}] ` : "";
+
+  // One-shot notice about missing original_size_bytes metadata on fixup
+  // rows (see the fixup branch below). We log this at most once per vault
+  // so partially-migrated vaults don't spam the summary.
+  let warnedUnknownOriginalSize = false;
+
+  // Caveat: the fixup branch (DB stale, .ogg already exists on disk) can
+  // only credit bytesBefore from the attachment's metadata
+  // (`original_size_bytes`, written by tts-provider.ts). Rows encoded by an
+  // earlier pass of this migration script never had that metadata written,
+  // so their pre-migration size is unknowable and the "saved X%" summary
+  // will undercount on those rows. The summary is cosmetic; the data is
+  // correct.
+
   try {
     const rows = db
       .prepare(
@@ -209,10 +244,12 @@ async function migrateVault(
         row.path.toLowerCase().endsWith(".ogg")
       ) {
         summary.skipped++;
+        processed++;
         continue;
       }
 
       if (!shouldMigrate(row.mime_type, row.path)) {
+        processed++;
         continue;
       }
 
@@ -226,6 +263,7 @@ async function migrateVault(
       // Idempotency: DB row already points to .ogg and file exists.
       if (row.path === relOut && existsSync(absOut)) {
         summary.skipped++;
+        processed++;
         continue;
       }
 
@@ -235,9 +273,10 @@ async function migrateVault(
       if (existsSync(absOut) && row.path !== relOut) {
         if (dryRun) {
           console.log(
-            `[${vault}] DRY-RUN fixup (ogg exists, db stale): ${row.path} -> ${relOut}`,
+            `${progress()}[${vault}] DRY-RUN fixup (ogg exists, db stale): ${row.path} -> ${relOut}`,
           );
           summary.dryRunCandidates++;
+          processed++;
           continue;
         }
         try {
@@ -246,25 +285,61 @@ async function migrateVault(
             unlinkSync(absIn);
           }
           summary.converted++;
-          // We can report output size but don't know original input size
-          // definitively; fall back to what's on disk right now.
+          let outSize = 0;
           try {
-            summary.bytesAfter += statSync(absOut).size;
+            outSize = statSync(absOut).size;
+            summary.bytesAfter += outSize;
           } catch {
             // ignore
           }
+          // Credit bytesBefore from the attachment's metadata if the
+          // encoding path recorded it (tts-provider.ts writes
+          // `original_size_bytes` alongside each OGG attachment). For
+          // pre-PR rows that were never encoded fresh we have no record
+          // of the original size — log a one-time notice per vault and
+          // skip the credit. The summary's "saved X%" will undercount on
+          // those rows; callers should treat it as a lower bound.
+          let originalBytes: number | undefined;
+          if (row.metadata) {
+            try {
+              const meta = JSON.parse(row.metadata) as Record<string, unknown>;
+              const v = meta.original_size_bytes;
+              if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+                originalBytes = v;
+              }
+            } catch {
+              // malformed metadata JSON — treat as unknown
+            }
+          }
+          if (originalBytes !== undefined) {
+            summary.bytesBefore += originalBytes;
+          } else if (!warnedUnknownOriginalSize) {
+            warnedUnknownOriginalSize = true;
+            console.log(
+              `[${vault}] note: one or more fixup rows have unknown original size (no original_size_bytes in metadata); summary savings will undercount`,
+            );
+          }
+          console.log(
+            `${progress()}[${vault}] fixup ${row.path} -> ${relOut}${
+              originalBytes !== undefined
+                ? ` (${fmtBytes(originalBytes)} -> ${fmtBytes(outSize)})`
+                : ` (${fmtBytes(outSize)}, original size unknown)`
+            }`,
+          );
         } catch (err) {
           console.error(`[${vault}] fixup failed for ${row.id}:`, err);
           summary.errors++;
         }
+        processed++;
         continue;
       }
 
       if (!existsSync(absIn)) {
         console.error(
-          `[${vault}] source file missing for attachment ${row.id}: ${absIn} — skipping`,
+          `${progress()}[${vault}] source file missing for attachment ${row.id}: ${absIn} — skipping`,
         );
         summary.errors++;
+        processed++;
         continue;
       }
 
@@ -278,8 +353,9 @@ async function migrateVault(
         summary.bytesBefore += inSize;
         summary.dryRunCandidates++;
         console.log(
-          `[${vault}] DRY-RUN convert: ${row.path} (${fmtBytes(inSize)}, ${row.mime_type}) -> ${relOut}`,
+          `${progress()}[${vault}] DRY-RUN convert: ${row.path} (${fmtBytes(inSize)}, ${row.mime_type}) -> ${relOut}`,
         );
+        processed++;
         continue;
       }
 
@@ -314,15 +390,16 @@ async function migrateVault(
         summary.bytesAfter += ogg.byteLength;
 
         console.log(
-          `[${vault}] converted ${row.path} -> ${relOut} (${fmtBytes(beforeSize)} -> ${fmtBytes(ogg.byteLength)})`,
+          `${progress()}[${vault}] converted ${row.path} -> ${relOut} (${fmtBytes(beforeSize)} -> ${fmtBytes(ogg.byteLength)})`,
         );
       } catch (err) {
         console.error(
-          `[${vault}] error converting attachment ${row.id} (${row.path}):`,
+          `${progress()}[${vault}] error converting attachment ${row.id} (${row.path}):`,
           err,
         );
         summary.errors++;
       }
+      processed++;
     }
   } finally {
     db.close();

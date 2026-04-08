@@ -40,9 +40,21 @@ export const OPUS_EXT = ".ogg";
 // ---------------------------------------------------------------------------
 
 /**
+ * Track mime types we've already warned about for this process so an unknown
+ * provider mime doesn't spam the logs on every call. Module-scoped on
+ * purpose — survives across calls within a single process.
+ */
+const warnedUnknownMimes = new Set<string>();
+
+/**
  * Pick a reasonable input extension for the temp file we pass to ffmpeg.
  * ffmpeg probes content so the extension is mostly cosmetic, but some
  * demuxers behave slightly better with a matching suffix.
+ *
+ * Unknown mimes fall through to `.bin`, which ffmpeg handles fine via its
+ * content probe. We log a one-time warning per unrecognized mime so that if
+ * a TTS provider starts emitting something new we have a breadcrumb rather
+ * than silent `.bin` fallthrough forever.
  */
 function mimeToInputExt(mime: string): string {
   const lower = mime.toLowerCase();
@@ -52,7 +64,19 @@ function mimeToInputExt(mime: string): string {
   if (lower === "audio/webm") return ".webm";
   if (lower === "audio/mp4" || lower === "audio/aac" || lower === "audio/x-m4a") return ".m4a";
   if (lower === "audio/flac") return ".flac";
+  if (!warnedUnknownMimes.has(lower)) {
+    warnedUnknownMimes.add(lower);
+    console.warn(
+      `[audio-encoding] unknown input mime "${mime}"; falling back to .bin (ffmpeg will probe the content). ` +
+        `If this is a legitimate format, add it to mimeToInputExt in src/audio-encoding.ts.`,
+    );
+  }
   return ".bin";
+}
+
+/** For tests: reset the warned-mimes set. */
+export function __resetWarnedMimesForTests(): void {
+  warnedUnknownMimes.clear();
 }
 
 // ---------------------------------------------------------------------------
