@@ -18,7 +18,13 @@
  *   KOKORO_VOICE=<voice_preset>          # optional, default "af_heart";
  *                                        #   falls back to TTS_VOICE if unset
  *   KOKORO_PYTHON_ARGS=<extra args>      # optional, space-separated; appended
- *                                        #   to the generate.py invocation
+ *                                        #   to the generate.py invocation.
+ *                                        #   Values containing spaces within
+ *                                        #   a single arg are not supported —
+ *                                        #   args are whitespace-split.
+ *   KOKORO_TIMEOUT_MS=<int ms>           # optional, default 300000 (5 min);
+ *                                        #   subprocess timeout. Non-numeric
+ *                                        #   values fall back to the default.
  *
  * The hook (registered in server.ts via `registerTtsHook`) listens for
  * `#reader`-tagged notes without an audio marker, calls the provider, writes
@@ -57,7 +63,7 @@
  *   the note from the predicate without being confused with "in-flight".
  */
 
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import type { Note, Store } from "../core/src/types.ts";
@@ -145,15 +151,18 @@ const KOKORO_DEFAULTS = {
   timeoutMs: 300_000,
 } as const;
 
-function resolveKokoroConfig(env: Record<string, string | undefined>): KokoroConfig {
+export function resolveKokoroConfig(env: Record<string, string | undefined>): KokoroConfig {
   const extraRaw = env.KOKORO_PYTHON_ARGS ?? "";
   const extraArgs = extraRaw.trim().length > 0 ? extraRaw.trim().split(/\s+/) : [];
+  const timeoutRaw = env.KOKORO_TIMEOUT_MS;
+  const parsedTimeout = timeoutRaw !== undefined ? parseInt(timeoutRaw, 10) : NaN;
+  const timeoutMs = Number.isFinite(parsedTimeout) ? parsedTimeout : KOKORO_DEFAULTS.timeoutMs;
   return {
     bin: env.KOKORO_BIN ?? KOKORO_DEFAULTS.bin,
     model: env.KOKORO_MODEL ?? KOKORO_DEFAULTS.model,
     voice: env.KOKORO_VOICE ?? env.TTS_VOICE ?? KOKORO_DEFAULTS.voice,
     extraArgs,
-    timeoutMs: KOKORO_DEFAULTS.timeoutMs,
+    timeoutMs,
   };
 }
 
@@ -297,12 +306,9 @@ export function createKokoroProvider(
         }
         return { audio, mime: "audio/wav" };
       } finally {
-        // Best-effort cleanup of the temp working directory.
-        try {
-          unlinkSync(outPath);
-        } catch {
-          // ignore
-        }
+        // Best-effort cleanup of the temp working directory. `rmSync` with
+        // `recursive: true` handles `outPath` (if it exists) plus any other
+        // files mlx-audio may have written alongside it.
         try {
           rmSync(workDir, { recursive: true, force: true });
         } catch {

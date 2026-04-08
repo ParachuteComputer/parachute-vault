@@ -18,6 +18,7 @@ import {
   createKokoroProvider,
   getTtsProvider,
   registerTtsHook,
+  resolveKokoroConfig,
   type KokoroConfig,
   type TtsProvider,
   type TtsSynthesisResult,
@@ -481,35 +482,55 @@ describe("Kokoro provider", () => {
     expect(provider!.name).toBe("kokoro");
   });
 
-  test("KOKORO_VOICE falls back to TTS_VOICE when unset", () => {
-    // Build a config manually through the same path — resolveKokoroConfig
-    // is private, but buildKokoroCommand lets us assert the observable shape
-    // via a provider invocation.
-    let capturedVoice: string | undefined;
-    // Re-create the env-derived config by invoking the factory and then
-    // stubbing a spawner through a fresh provider. Since the factory uses
-    // the default spawner, instead assert the env precedence via the
-    // exported helpers:
-    const configFromEnv: KokoroConfig = {
-      bin: "uvx",
-      model: "prince-canuma/Kokoro-82M",
-      // Simulates resolveKokoroConfig(env) precedence: KOKORO_VOICE wins,
-      // else TTS_VOICE, else default.
-      voice: "shared-tts-voice",
-      extraArgs: [],
-      timeoutMs: 300_000,
-    };
-    const provider = createKokoroProvider(configFromEnv, async (argv) => {
-      capturedVoice = argv[argv.indexOf("--voice") + 1];
-      const outDir = argv[argv.indexOf("--output_path") + 1];
-      const prefix = argv[argv.indexOf("--file_prefix") + 1];
-      const fs = require("fs");
-      fs.mkdirSync(outDir, { recursive: true });
-      fs.writeFileSync(join(outDir, `${prefix}.wav`), Buffer.from("RIFF"));
+  test("resolveKokoroConfig applies voice precedence: KOKORO_VOICE > TTS_VOICE > default", () => {
+    // KOKORO_VOICE wins when both are set.
+    const bothSet = resolveKokoroConfig({
+      KOKORO_VOICE: "kokoro-wins",
+      TTS_VOICE: "shared-tts-voice",
+    });
+    expect(bothSet.voice).toBe("kokoro-wins");
+
+    // TTS_VOICE is used when only it is set.
+    const onlyTts = resolveKokoroConfig({ TTS_VOICE: "shared-tts-voice" });
+    expect(onlyTts.voice).toBe("shared-tts-voice");
+
+    // Default when neither is set.
+    const neither = resolveKokoroConfig({});
+    expect(neither.voice).toBe("af_heart");
+  });
+
+  test("resolveKokoroConfig honors KOKORO_TIMEOUT_MS override and falls back on non-numeric", () => {
+    const override = resolveKokoroConfig({ KOKORO_TIMEOUT_MS: "12345" });
+    expect(override.timeoutMs).toBe(12345);
+
+    const bogus = resolveKokoroConfig({ KOKORO_TIMEOUT_MS: "not-a-number" });
+    expect(bogus.timeoutMs).toBe(300_000);
+
+    const unset = resolveKokoroConfig({});
+    expect(unset.timeoutMs).toBe(300_000);
+  });
+
+  test("createKokoroProvider cleans up workDir after a non-zero exit", async () => {
+    let capturedWorkDir: string | undefined;
+    const provider = createKokoroProvider(baseConfig, async (argv) => {
+      capturedWorkDir = argv[argv.indexOf("--output_path") + 1];
+      return { exitCode: 2, stderr: "boom" };
+    });
+    await expect(provider.synthesize("hello")).rejects.toThrow(/exited with code 2/);
+    expect(capturedWorkDir).toBeTruthy();
+    expect(existsSync(capturedWorkDir!)).toBe(false);
+  });
+
+  test("createKokoroProvider cleans up workDir when the output file is missing", async () => {
+    let capturedWorkDir: string | undefined;
+    const provider = createKokoroProvider(baseConfig, async (argv) => {
+      capturedWorkDir = argv[argv.indexOf("--output_path") + 1];
       return { exitCode: 0, stderr: "" };
     });
-    return provider.synthesize("hi").then(() => {
-      expect(capturedVoice).toBe("shared-tts-voice");
-    });
+    await expect(provider.synthesize("hello")).rejects.toThrow(
+      /expected output file .* was not created/,
+    );
+    expect(capturedWorkDir).toBeTruthy();
+    expect(existsSync(capturedWorkDir!)).toBe(false);
   });
 });
