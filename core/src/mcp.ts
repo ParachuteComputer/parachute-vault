@@ -117,7 +117,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
     },
     {
       name: "read-notes",
-      description: `Read notes, filtered by tags, path prefix, metadata, and/or date range. Use path_prefix to browse like a filesystem. Use metadata to filter by structured properties (e.g., { "status": "in-progress" }). Set include_content: false to get a lightweight index (metadata + preview + byte_size) instead of full content — useful for planning batched reads over large date ranges.`,
+      description: `Read notes, filtered by tags, path prefix, metadata, and/or date range. Use path_prefix to browse like a filesystem. Use metadata to filter by structured properties (e.g., { "status": "in-progress" }). Set include_content: false to get a lightweight index (metadata + preview + byteSize) instead of full content — useful for planning batched reads over large date ranges.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -154,8 +154,11 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
             const byteSize = Buffer.byteLength(content, "utf8");
             // Collapse whitespace for a readable single-line preview
             const collapsed = content.replace(/\s+/g, " ").trim();
-            const preview = collapsed.length > PREVIEW_LEN
-              ? collapsed.slice(0, PREVIEW_LEN)
+            // Iterate by Unicode code points so we don't split surrogate pairs
+            // (e.g. astral-plane emoji) mid-character.
+            const codePoints = Array.from(collapsed);
+            const preview = codePoints.length > PREVIEW_LEN
+              ? codePoints.slice(0, PREVIEW_LEN).join("")
               : collapsed;
             return {
               id: note.id,

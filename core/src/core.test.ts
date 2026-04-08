@@ -410,6 +410,43 @@ describe("MCP tools", () => {
     expect(entry.preview.includes("\n")).toBe(false); // whitespace collapsed
   });
 
+  it("read-notes index mode preview does not split astral-plane surrogate pairs", () => {
+    // "😀" is U+1F600 — outside the BMP, encoded as a UTF-16 surrogate pair.
+    // A naive .slice(0, 120) would cut on code unit 120, landing mid-pair
+    // and producing a lone surrogate. Iterating by code points avoids this.
+    const emoji = "😀";
+    const longContent = emoji.repeat(130);
+    store.createNote(longContent, { tags: ["astral"] });
+    const tools = generateMcpTools(db);
+    const readNotes = tools.find((t) => t.name === "read-notes")!;
+    const result = readNotes.execute({ tags: ["astral"], include_content: false }) as any[];
+    expect(result).toHaveLength(1);
+    const preview = result[0].preview as string;
+
+    // Must be truncated to at most 120 code points (not code units).
+    const codePoints = Array.from(preview);
+    expect(codePoints.length).toBeLessThanOrEqual(120);
+
+    // Every code point should be the full emoji — no lone surrogates.
+    for (const cp of codePoints) {
+      expect(cp).toBe(emoji);
+    }
+
+    // No unpaired surrogates anywhere in the string.
+    for (let i = 0; i < preview.length; i++) {
+      const code = preview.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        // high surrogate — must be followed by a low surrogate
+        const next = preview.charCodeAt(i + 1);
+        expect(next >= 0xdc00 && next <= 0xdfff).toBe(true);
+        i++;
+      } else {
+        // must not be a lone low surrogate
+        expect(code >= 0xdc00 && code <= 0xdfff).toBe(false);
+      }
+    }
+  });
+
   it("read-notes index mode honors existing filters (date range, path_prefix, limit, offset)", () => {
     store.createNote("A", { tags: ["keep"], path: "Projects/a", created_at: "2025-03-05T00:00:00.000Z" });
     store.createNote("B", { tags: ["keep"], path: "Projects/b", created_at: "2025-03-10T00:00:00.000Z" });
