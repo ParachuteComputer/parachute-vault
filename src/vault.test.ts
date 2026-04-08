@@ -414,6 +414,41 @@ describe("MCP tools", () => {
   });
 });
 
+describe("unified MCP wrapper", () => {
+  test("routes get-vault-stats through vault param", async () => {
+    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    // Seed a unique vault on disk under the preload-provided PARACHUTE_HOME.
+    const vaultName = `unified-stats-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    // Populate the vault with notes/tags the stats tool should observe.
+    const vaultStore = getVaultStore(vaultName);
+    vaultStore.createNote("alpha", { tags: ["x", "y"] });
+    vaultStore.createNote("beta", { tags: ["x"] });
+
+    const tools = generateUnifiedMcpTools();
+    const statsTool = tools.find((t) => t.name === "get-vault-stats");
+    expect(statsTool).toBeTruthy();
+    // Routed explicitly via the vault param, mirroring how a multi-vault
+    // client targets a specific vault.
+    const result = statsTool!.execute({ vault: vaultName }) as any;
+    expect(result.total_notes).toBe(2);
+    expect(result.tag_count).toBe(2);
+    expect(result.top_tags[0].tag).toBe("x");
+    expect(result.top_tags[0].count).toBe(2);
+
+    closeAllStores();
+  });
+});
+
 describe("auth scopes", () => {
   test("read scope allows read tools", () => {
     const { isToolAllowed } = require("./auth.ts");
@@ -424,6 +459,7 @@ describe("auth scopes", () => {
     expect(isToolAllowed("traverse-links", "read")).toBe(true);
     expect(isToolAllowed("find-path", "read")).toBe(true);
     expect(isToolAllowed("list-tags", "read")).toBe(true);
+    expect(isToolAllowed("get-vault-stats", "read")).toBe(true);
     expect(isToolAllowed("list-vaults", "read")).toBe(true);
   });
 

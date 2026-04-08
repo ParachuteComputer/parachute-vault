@@ -304,7 +304,7 @@ export function getVaultStats(
     LIMIT ?
   `).all(topTagsLimit) as { tag: string; count: number }[];
 
-  const tagCountRow = db.prepare("SELECT COUNT(*) as c FROM tags").get() as { c: number };
+  const tagCountRow = db.prepare("SELECT COUNT(DISTINCT tag_name) as c FROM note_tags").get() as { c: number };
   const tag_count = tagCountRow.c;
 
   return {
