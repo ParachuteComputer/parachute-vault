@@ -9,7 +9,7 @@ let hooks: HookRegistry;
 let store: SqliteStore;
 
 /** Silent logger so expected-error tests don't spam output. */
-const silentLogger = { error: () => {}, warn: () => {} };
+const silentLogger = { error: () => {} };
 
 beforeEach(() => {
   db = new Database(":memory:");
@@ -251,5 +251,111 @@ describe("HookRegistry", () => {
     expect(done).toBe(false);
     await hooks.drain();
     expect(done).toBe(true);
+  });
+
+  it("logs and skips a hook whose predicate throws; other hooks still run", async () => {
+    const errors: unknown[] = [];
+    const loggingHooks = new HookRegistry({
+      concurrency: 4,
+      logger: { error: (...args) => errors.push(args) },
+    });
+    const loggingStore = new SqliteStore(new Database(":memory:"), { hooks: loggingHooks });
+    let goodFired = 0;
+
+    loggingHooks.onNote({
+      name: "throwing-predicate",
+      when: () => {
+        throw new Error("predicate boom");
+      },
+      handler: () => {
+        throw new Error("should not reach here");
+      },
+    });
+    loggingHooks.onNote({
+      name: "good",
+      handler: () => {
+        goodFired++;
+      },
+    });
+
+    loggingStore.createNote("hi");
+    await Promise.resolve();
+    await Promise.resolve();
+    await loggingHooks.drain();
+
+    // The good hook ran.
+    expect(goodFired).toBe(1);
+    // The throwing predicate was logged.
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    const joined = errors.map((a) => JSON.stringify(a)).join(" ");
+    expect(joined).toContain("predicate");
+  });
+});
+
+describe("HookRegistry — HOOK_CONCURRENCY env var parsing", () => {
+  const original = process.env.HOOK_CONCURRENCY;
+  const restore = () => {
+    if (original === undefined) delete process.env.HOOK_CONCURRENCY;
+    else process.env.HOOK_CONCURRENCY = original;
+  };
+
+  it("defaults to 2 when HOOK_CONCURRENCY is unset", () => {
+    delete process.env.HOOK_CONCURRENCY;
+    const r = new HookRegistry();
+    // Acquire 3 in sequence — first 2 should resolve immediately, third should wait.
+    let resolvedCount = 0;
+    const pending: Array<Promise<() => void>> = [];
+    for (let i = 0; i < 3; i++) {
+      const p = (r as unknown as { semaphore: { acquire: () => Promise<() => void> } }).semaphore.acquire();
+      p.then(() => resolvedCount++);
+      pending.push(p);
+    }
+    return Promise.resolve().then(() => {
+      expect(resolvedCount).toBe(2);
+      restore();
+    });
+  });
+
+  it("falls back to default when HOOK_CONCURRENCY is NaN / empty / negative", () => {
+    for (const bad of ["", "abc", "0", "-5", "NaN"]) {
+      process.env.HOOK_CONCURRENCY = bad;
+      const r = new HookRegistry();
+      // Should not throw; registry is usable.
+      r.onNote({ handler: () => {} });
+      expect(r.size).toBe(1);
+    }
+    restore();
+  });
+
+  it("honors HOOK_CONCURRENCY=1 from env", async () => {
+    process.env.HOOK_CONCURRENCY = "1";
+    const r = new HookRegistry({ logger: silentLogger });
+    const s = new SqliteStore(new Database(":memory:"), { hooks: r });
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const releasers: Array<() => void> = [];
+    r.onNote({
+      handler: async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise<void>((resolve) => releasers.push(resolve));
+        concurrent--;
+      },
+    });
+
+    s.createNote("a");
+    s.createNote("b");
+    s.createNote("c");
+    await Promise.resolve();
+    await Promise.resolve();
+    // Release them one at a time and let each drain through the semaphore.
+    while (releasers.length > 0) {
+      releasers.shift()!();
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await r.drain();
+    expect(maxConcurrent).toBe(1);
+    restore();
   });
 });

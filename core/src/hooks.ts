@@ -21,6 +21,28 @@
  * - The API matches the proposal in the issue. Predicates are sync
  *   functions on the note; handlers are async and receive the note
  *   plus a `Store`-like interface so they can read/update/attach.
+ *
+ * ## Sharp edges for handler authors
+ *
+ * **1. Write your idempotency marker BEFORE any slow async work.**
+ * The predicate is re-evaluated on every dispatch. If your handler
+ * awaits a 30-second TTS call before writing the marker, a concurrent
+ * update to the same note during those 30 seconds will re-match the
+ * predicate and start a second handler run. The semaphore is global,
+ * not per-note, so it won't save you. Write the marker synchronously
+ * at the top of the handler, or — if the marker has to wait until
+ * the work actually succeeds — accept that duplicate runs are possible
+ * and make the handler idempotent in some other way.
+ *
+ * **2. No per-note serialization.** Two different hooks whose
+ * predicates match the same note run concurrently (up to the global
+ * cap). Last write wins if both touch the same fields.
+ *
+ * **3. Shutdown drain is a hard cut.** `drain()` on SIGINT/SIGTERM
+ * waits for in-flight handlers, but the server wraps it in a 5-second
+ * Promise.race. Long-running handlers (large TTS jobs, embeddings) may
+ * get killed mid-run. Handlers must not write the marker before the
+ * work is durably committed, so restart reconciliation works.
  */
 
 import type { Note, Store } from "./types.js";
@@ -83,7 +105,7 @@ export interface HookRegistryOptions {
   /** Concurrency cap for handler execution. Defaults to HOOK_CONCURRENCY env var, then 2. */
   concurrency?: number;
   /** Logger. Defaults to console. */
-  logger?: { error: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void };
+  logger?: { error: (...args: unknown[]) => void };
 }
 
 export class HookRegistry {
