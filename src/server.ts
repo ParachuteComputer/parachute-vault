@@ -32,12 +32,30 @@ import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
+import { getTtsProvider, registerTtsHook } from "./tts-provider.ts";
+import { getVaultNameForStore } from "./vault-store.ts";
+import { assetsDir } from "./routes.ts";
+import type { SqliteStore } from "../core/src/store.ts";
 
-// Features register their note-mutation hooks here. For now the registry
-// is empty — #38 (TTS) and #39 (async transcription) will add handlers
-// in their own PRs by calling defaultHookRegistry.onNote(...) below.
+// Features register their note-mutation hooks here. #38 (TTS) registers
+// the `#reader` → audio handler when TTS_PROVIDER is configured; #39
+// (async transcription) will add its handler in a later PR.
 function registerHooks(): void {
-  // No hooks registered in v1 — infrastructure only.
+  const ttsProvider = getTtsProvider(process.env);
+  if (ttsProvider) {
+    registerTtsHook(defaultHookRegistry, {
+      provider: ttsProvider,
+      voice: process.env.TTS_VOICE,
+      resolveAssetsDir: (store) => {
+        const name = getVaultNameForStore(store as SqliteStore);
+        if (!name) {
+          throw new Error("tts-hook: store is not registered with a vault");
+        }
+        return assetsDir(name);
+      },
+    });
+    console.log(`[hooks] tts-reader hook registered (provider=${ttsProvider.name})`);
+  }
 }
 registerHooks();
 
