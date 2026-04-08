@@ -217,7 +217,7 @@ export function handleSearch(req: Request, store: Store): Response {
 // Storage (file upload/serve)
 // ---------------------------------------------------------------------------
 
-function assetsDir(vault: string): string {
+export function assetsDir(vault: string): string {
   return process.env.ASSETS_DIR ?? join(vaultDir(vault), "assets");
 }
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB

@@ -15,6 +15,10 @@ export { defaultHookRegistry };
 /** Cache of open vault stores. */
 const stores = new Map<string, SqliteStore>();
 
+/** Reverse lookup: store instance → vault name. Used by hooks that need to
+ *  resolve the vault's assets directory from the store handle. */
+const storeToVault = new WeakMap<SqliteStore, string>();
+
 /** Get or create a store for a vault. */
 export function getVaultStore(name: string): SqliteStore {
   let store = stores.get(name);
@@ -24,8 +28,14 @@ export function getVaultStore(name: string): SqliteStore {
     // handlers once at startup and have them fire for every vault.
     store = new SqliteStore(db, { hooks: defaultHookRegistry });
     stores.set(name, store);
+    storeToVault.set(store, name);
   }
   return store;
+}
+
+/** Look up the vault name for a previously-opened store. */
+export function getVaultNameForStore(store: SqliteStore): string | undefined {
+  return storeToVault.get(store);
 }
 
 /** Close all open stores. */
