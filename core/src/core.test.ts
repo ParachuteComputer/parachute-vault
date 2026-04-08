@@ -357,6 +357,98 @@ describe("MCP tools", () => {
     expect(result).toHaveLength(1);
   });
 
+  it("read-notes defaults to including content (backwards compatible)", () => {
+    store.createNote("Full body content here", { tags: ["daily"] });
+    const tools = generateMcpTools(db);
+    const readNotes = tools.find((t) => t.name === "read-notes")!;
+    const result = readNotes.execute({ tags: ["daily"] }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("Full body content here");
+    expect(result[0].byteSize).toBeUndefined();
+    expect(result[0].preview).toBeUndefined();
+  });
+
+  it("read-notes with include_content: true returns full content", () => {
+    store.createNote("Explicit include", { tags: ["daily"] });
+    const tools = generateMcpTools(db);
+    const readNotes = tools.find((t) => t.name === "read-notes")!;
+    const result = readNotes.execute({ tags: ["daily"], include_content: true }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("Explicit include");
+  });
+
+  it("read-notes with include_content: false returns index metadata without content", () => {
+    const content = "This is the note body that should not come back in index mode.";
+    store.createNote(content, { tags: ["daily"], path: "Notes/index-test", metadata: { status: "draft" } });
+    const tools = generateMcpTools(db);
+    const readNotes = tools.find((t) => t.name === "read-notes")!;
+    const result = readNotes.execute({ tags: ["daily"], include_content: false }) as any[];
+    expect(result).toHaveLength(1);
+    const entry = result[0];
+    expect(entry.content).toBeUndefined();
+    expect(entry.id).toBeTruthy();
+    expect(entry.path).toBe("Notes/index-test");
+    expect(entry.createdAt).toBeTruthy();
+    expect(entry.tags).toContain("daily");
+    expect(entry.metadata).toEqual({ status: "draft" });
+    expect(entry.byteSize).toBe(Buffer.byteLength(content, "utf8"));
+    expect(entry.preview).toBe(content);
+  });
+
+  it("read-notes index mode truncates preview and counts utf-8 bytes", () => {
+    // Multi-byte chars: each "✨" is 3 bytes in utf-8
+    const longContent = "line one\nline two has\tlots    of   whitespace\n" + "x".repeat(300) + " ✨✨✨";
+    store.createNote(longContent, { tags: ["long"] });
+    const tools = generateMcpTools(db);
+    const readNotes = tools.find((t) => t.name === "read-notes")!;
+    const result = readNotes.execute({ tags: ["long"], include_content: false }) as any[];
+    expect(result).toHaveLength(1);
+    const entry = result[0];
+    expect(entry.byteSize).toBe(Buffer.byteLength(longContent, "utf8"));
+    expect(entry.byteSize).toBeGreaterThan(longContent.length); // multi-byte chars
+    expect(entry.preview.length).toBeLessThanOrEqual(120);
+    expect(entry.preview.includes("\n")).toBe(false); // whitespace collapsed
+  });
+
+  it("read-notes index mode honors existing filters (date range, path_prefix, limit, offset)", () => {
+    store.createNote("A", { tags: ["keep"], path: "Projects/a", created_at: "2025-03-05T00:00:00.000Z" });
+    store.createNote("B", { tags: ["keep"], path: "Projects/b", created_at: "2025-03-10T00:00:00.000Z" });
+    store.createNote("C", { tags: ["keep"], path: "Other/c",    created_at: "2025-03-15T00:00:00.000Z" });
+    store.createNote("D", { tags: ["keep"], path: "Projects/d", created_at: "2025-04-02T00:00:00.000Z" });
+
+    const tools = generateMcpTools(db);
+    const readNotes = tools.find((t) => t.name === "read-notes")!;
+
+    // date range filter
+    const inMarch = readNotes.execute({
+      date_from: "2025-03-01",
+      date_to: "2025-04-01",
+      sort: "asc",
+      include_content: false,
+    }) as any[];
+    expect(inMarch).toHaveLength(3);
+    expect(inMarch.every((n) => n.content === undefined)).toBe(true);
+    expect(inMarch.every((n) => typeof n.byteSize === "number")).toBe(true);
+
+    // path_prefix filter
+    const projects = readNotes.execute({
+      path_prefix: "Projects",
+      include_content: false,
+    }) as any[];
+    expect(projects).toHaveLength(3);
+    expect(projects.every((n) => n.path!.startsWith("Projects"))).toBe(true);
+
+    // limit + offset
+    const page = readNotes.execute({
+      path_prefix: "Projects",
+      sort: "asc",
+      limit: 2,
+      offset: 1,
+      include_content: false,
+    }) as any[];
+    expect(page).toHaveLength(2);
+  });
+
   it("search-notes tool works", () => {
     store.createNote("Flagstaff trail");
     const tools = generateMcpTools(db);
