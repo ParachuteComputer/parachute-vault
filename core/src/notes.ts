@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Note, QueryOpts } from "./types.js";
+import type { Note, QueryOpts, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
 
 let idCounter = 0;
@@ -261,6 +261,64 @@ export function listTags(db: Database): { name: string; count: number }[] {
     ORDER BY t.name
   `).all() as { name: string; count: number }[];
   return rows;
+}
+
+// ---- Vault stats (aggregate situational awareness) ----
+
+/**
+ * Compute aggregate vault statistics for session-start situational awareness.
+ *
+ * All computation is done via SQL aggregation — no full-table scans into memory.
+ * Safe to call on large vaults. Read-only.
+ */
+export function getVaultStats(
+  db: Database,
+  opts?: { topTagsLimit?: number },
+): VaultStats {
+  const topTagsLimit = opts?.topTagsLimit ?? 20;
+
+  const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
+  const total_notes = totalRow.c;
+
+  const earliestRow = db.prepare(
+    "SELECT id, created_at FROM notes ORDER BY created_at ASC, id ASC LIMIT 1",
+  ).get() as { id: string; created_at: string } | undefined;
+
+  const latestRow = db.prepare(
+    "SELECT id, created_at FROM notes ORDER BY created_at DESC, id DESC LIMIT 1",
+  ).get() as { id: string; created_at: string } | undefined;
+
+  const monthRows = db.prepare(`
+    SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS count
+    FROM notes
+    WHERE created_at IS NOT NULL
+    GROUP BY month
+    ORDER BY month ASC
+  `).all() as { month: string; count: number }[];
+
+  const topTagRows = db.prepare(`
+    SELECT tag_name AS tag, COUNT(*) AS count
+    FROM note_tags
+    GROUP BY tag_name
+    ORDER BY count DESC, tag_name ASC
+    LIMIT ?
+  `).all(topTagsLimit) as { tag: string; count: number }[];
+
+  const tagCountRow = db.prepare("SELECT COUNT(DISTINCT tag_name) as c FROM note_tags").get() as { c: number };
+  const tag_count = tagCountRow.c;
+
+  return {
+    total_notes,
+    earliest_note: earliestRow
+      ? { id: earliestRow.id, created_at: earliestRow.created_at }
+      : null,
+    latest_note: latestRow
+      ? { id: latestRow.id, created_at: latestRow.created_at }
+      : null,
+    notes_by_month: monthRows,
+    top_tags: topTagRows,
+    tag_count,
+  };
 }
 
 // ---- Bulk Operations ----

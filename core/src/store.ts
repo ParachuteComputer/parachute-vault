@@ -138,6 +138,12 @@ export class SqliteStore implements Store {
     return noteOps.listTags(this.db);
   }
 
+  // ---- Vault Stats ----
+
+  getVaultStats(opts?: { topTagsLimit?: number }) {
+    return noteOps.getVaultStats(this.db, opts);
+  }
+
   // ---- Links ----
 
   createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Link {

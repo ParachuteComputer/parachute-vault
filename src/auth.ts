@@ -32,6 +32,7 @@ const READ_TOOLS = new Set([
   "list-tags",
   "list-vaults",
   "get-vault-description",
+  "get-vault-stats",
 ]);
 
 /** Check if a tool call is allowed for a given scope. */

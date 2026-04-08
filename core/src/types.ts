@@ -32,6 +32,17 @@ export interface Attachment {
   createdAt: string;
 }
 
+// ---- Vault Stats ----
+
+export interface VaultStats {
+  total_notes: number;
+  earliest_note: { id: string; created_at: string } | null;
+  latest_note: { id: string; created_at: string } | null;
+  notes_by_month: { month: string; count: number }[];
+  top_tags: { tag: string; count: number }[];
+  tag_count: number;
+}
+
 // ---- Query Options ----
 
 export interface QueryOpts {
@@ -80,6 +91,9 @@ export interface Store {
   tagNote(noteId: string, tags: string[]): void;
   untagNote(noteId: string, tags: string[]): void;
   listTags(): { name: string; count: number }[];
+
+  // Vault stats (aggregate, read-only)
+  getVaultStats(opts?: { topTagsLimit?: number }): VaultStats;
 
   // Links
   createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Link;
