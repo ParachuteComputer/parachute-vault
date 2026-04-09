@@ -293,12 +293,14 @@ async function migrateVault(
             // ignore
           }
           // Credit bytesBefore from the attachment's metadata if the
-          // encoding path recorded it (tts-provider.ts writes
-          // `original_size_bytes` alongside each OGG attachment). For
-          // pre-PR rows that were never encoded fresh we have no record
-          // of the original size — log a one-time notice per vault and
-          // skip the credit. The summary's "saved X%" will undercount on
-          // those rows; callers should treat it as a lower bound.
+          // encoding path recorded it. Historically the old in-process
+          // encoder wrote `original_size_bytes` alongside each OGG
+          // attachment; the narrate-era hook (tts-hook.ts) does NOT —
+          // narrate doesn't surface the pre-encode size. So going forward,
+          // this field will be absent on all new rows; it only exists on
+          // legacy rows from before the narrate swap. For rows without it
+          // we log a one-time notice per vault and skip the credit. The
+          // summary's "saved X%" will undercount; treat it as a lower bound.
           let originalBytes: number | undefined;
           if (row.metadata) {
             try {

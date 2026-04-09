@@ -9,6 +9,7 @@ import type { Store } from "../core/src/types.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
+import type { NarrateModule } from "./tts-hook.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -495,4 +496,114 @@ export async function handleModels(): Promise<Response> {
   return json({
     data: providers.transcription.map((id: string) => ({ id, object: "model" })),
   });
+}
+
+// ---------------------------------------------------------------------------
+// TTS speech — OpenAI-compatible POST /v1/audio/speech (backed by narrate)
+// ---------------------------------------------------------------------------
+
+let narrateAvailable: boolean | null = null;
+let narrateCached: NarrateModule | null = null;
+
+async function getNarrate(): Promise<NarrateModule | null> {
+  if (narrateAvailable === false) return null;
+  if (narrateCached) return narrateCached;
+  try {
+    const mod = (await import("parachute-narrate")) as unknown as NarrateModule;
+    narrateCached = mod;
+    narrateAvailable = true;
+    return mod;
+  } catch {
+    narrateAvailable = false;
+    return null;
+  }
+}
+
+/**
+ * Dependencies for `handleTtsSpeech`. Production defaults dynamically
+ * import `parachute-narrate`; tests inject a stub module to avoid the
+ * real provider, subprocess, and ffmpeg.
+ */
+export interface TtsSpeechDeps {
+  /** Override the narrate module resolution (for tests). */
+  getNarrate?: () => Promise<NarrateModule | null>;
+}
+
+const EMPTY_INPUT_MARKER = "empty after markdown preprocessing";
+const NO_PROVIDER_MARKER = "no TTS provider configured";
+
+/**
+ * POST /v1/audio/speech — OpenAI-compatible text-to-speech.
+ *
+ * Accepts the OpenAI request shape (`model`, `voice`, `input`,
+ * `response_format`). `model` is ignored (the active provider is whatever
+ * `parachute-narrate` resolves from env at call time). `response_format`
+ * accepts `"opus"` / `"mp3"` as aliases and always returns OGG Opus,
+ * because the vault unified on that format in #43. Unknown values are
+ * rejected with 400 so callers don't silently get the "wrong" format.
+ *
+ * All heavy lifting (markdown preprocessing, provider resolution, ffmpeg
+ * encoding) lives in `parachute-narrate`. This handler's job is just
+ * request parsing, validation, narrate invocation, and error-to-status
+ * mapping.
+ */
+export async function handleTtsSpeech(req: Request, deps: TtsSpeechDeps = {}): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "invalid JSON body" }, 400);
+  }
+  if (!body || typeof body !== "object") {
+    return json({ error: "body must be a JSON object" }, 400);
+  }
+  const b = body as Record<string, unknown>;
+
+  if (typeof b.input !== "string" || b.input.length === 0) {
+    return json({ error: "'input' must be a non-empty string" }, 400);
+  }
+  if (b.voice !== undefined && typeof b.voice !== "string") {
+    return json({ error: "'voice' must be a string" }, 400);
+  }
+  if (b.response_format !== undefined) {
+    if (
+      typeof b.response_format !== "string" ||
+      (b.response_format !== "opus" && b.response_format !== "mp3")
+    ) {
+      return json({ error: "'response_format' must be 'opus' or 'mp3'" }, 400);
+    }
+  }
+
+  const resolveNarrate = deps.getNarrate ?? getNarrate;
+  const narrate = await resolveNarrate();
+  if (!narrate) {
+    return json({ error: "TTS not available — parachute-narrate is not installed" }, 501);
+  }
+
+  try {
+    const result = await narrate.synthesize(b.input, { voice: b.voice as string | undefined });
+    return new Response(result.audio, {
+      status: 200,
+      headers: {
+        "Content-Type": "audio/ogg",
+        "Content-Length": String(result.audio.length),
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "TTS synthesis failed";
+    // Narrate throws plain `Error`s with prefixed messages; we match on
+    // substring to map them to the right HTTP status. See
+    // parachute-narrate/src/synthesize.ts for the canonical messages.
+    if (message.includes(EMPTY_INPUT_MARKER)) {
+      return json(
+        { error: "input has no speakable content after markdown preprocessing" },
+        400,
+      );
+    }
+    if (message.includes(NO_PROVIDER_MARKER)) {
+      return json({ error: "TTS provider not configured" }, 503);
+    }
+    console.error("TTS synthesis error:", message);
+    return json({ error: message }, 500);
+  }
 }

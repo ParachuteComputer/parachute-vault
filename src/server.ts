@@ -7,6 +7,7 @@
  *   *    /mcp                              — unified MCP (all vaults, vault param)
  *   *    /vaults/{name}/mcp                — scoped MCP (single vault, no vault param)
  *   POST /v1/audio/transcriptions          — transcription (via scribe)
+ *   POST /v1/audio/speech                  — text-to-speech (OpenAI-compatible, OGG Opus)
  *   GET  /v1/models                        — transcription providers
  *   GET  /vaults                           — list vaults
  *   *    /vaults/{name}/api/...            — per-vault REST API
@@ -30,34 +31,52 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
-import { getTtsProvider, registerTtsHook } from "./tts-provider.ts";
+import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 import type { SqliteStore } from "../core/src/store.ts";
 
-// Features register their note-mutation hooks here. #38 (TTS) registers
-// the `#reader` → audio handler when TTS_PROVIDER is configured; #39
-// (async transcription) will add its handler in a later PR.
-function registerHooks(): void {
-  const ttsProvider = getTtsProvider(process.env);
-  if (ttsProvider) {
-    registerTtsHook(defaultHookRegistry, {
-      provider: ttsProvider,
-      voice: process.env.TTS_VOICE,
-      resolveAssetsDir: (store) => {
-        const name = getVaultNameForStore(store as SqliteStore);
-        if (!name) {
-          throw new Error("tts-hook: store is not registered with a vault");
-        }
-        return assetsDir(name);
-      },
-    });
-    console.log(`[hooks] tts-reader hook registered (provider=${ttsProvider.name})`);
+// Features register their note-mutation hooks here. The TTS (#reader →
+// audio) hook is registered if BOTH `parachute-narrate` is installed AND
+// a TTS provider is configured in env. Either missing → hook is silently
+// skipped, same shape as how transcription handles optional scribe.
+async function registerHooks(): Promise<void> {
+  let narrate: NarrateModule | null = null;
+  try {
+    narrate = (await import("parachute-narrate")) as unknown as NarrateModule;
+  } catch {
+    console.log("[hooks] parachute-narrate not installed; skipping tts-reader hook");
+    return;
   }
+
+  // Narrate is loaded but may still be unusable if no provider is
+  // configured in env. We probe via `getTtsProvider` rather than waiting
+  // for the first note to fail.
+  const narrateWithProbe = narrate as NarrateModule & {
+    getTtsProvider?: (env: Record<string, string | undefined>) => { name: string } | null;
+  };
+  const probedProvider = narrateWithProbe.getTtsProvider?.(process.env) ?? null;
+  if (!probedProvider) {
+    console.log("[hooks] no TTS provider configured in env; skipping tts-reader hook");
+    return;
+  }
+
+  registerTtsHook(defaultHookRegistry, {
+    narrate,
+    voice: process.env.TTS_VOICE,
+    resolveAssetsDir: (store) => {
+      const name = getVaultNameForStore(store as SqliteStore);
+      if (!name) {
+        throw new Error("tts-hook: store is not registered with a vault");
+      }
+      return assetsDir(name);
+    },
+  });
+  console.log(`[hooks] tts-reader hook registered (provider=${probedProvider.name}, via parachute-narrate)`);
 }
-registerHooks();
+await registerHooks();
 
 ensureConfigDirSync();
 loadEnvFile();
@@ -167,6 +186,9 @@ async function route(req: Request, path: string): Promise<Response> {
   // Transcription
   if (path === "/v1/audio/transcriptions" && req.method === "POST") {
     return handleTranscription(req);
+  }
+  if (path === "/v1/audio/speech" && req.method === "POST") {
+    return handleTtsSpeech(req);
   }
   if (path === "/v1/models" && req.method === "GET") {
     return handleModels();
