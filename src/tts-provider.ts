@@ -463,6 +463,33 @@ export function registerTtsHook(
       // transformation list and the reasoning behind each choice.
       const speechText = markdownToSpeech(note.content);
 
+      // Guard: a note containing only a fenced code block, only a
+      // horizontal rule, only HTML, etc. has non-empty raw content (so
+      // the hook predicate matches) but produces empty speechText after
+      // stripping. Without this guard the providers either throw
+      // ("refusing to synthesize empty text" — Kokoro) or send empty
+      // text to a remote API and 4xx (ElevenLabs), and either way leave
+      // the note stuck in audio_pending_at requiring manual recovery.
+      // Mark as rendered with no attachment so we don't keep retrying.
+      if (!speechText) {
+        try {
+          store.updateNote(note.id, {
+            metadata: {
+              ...existingMeta,
+              audio_pending_at: undefined,
+              audio_rendered_at: new Date().toISOString(),
+              audio_skipped_reason: "empty after markdown preprocessing",
+            },
+          });
+        } catch (err) {
+          logger.error(
+            `[tts-hook] failed to mark note ${note.id} as audio-skipped:`,
+            err,
+          );
+        }
+        return;
+      }
+
       let result: TtsSynthesisResult;
       try {
         result = await opts.provider.synthesize(speechText, { voice: opts.voice });

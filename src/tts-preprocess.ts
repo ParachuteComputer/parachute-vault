@@ -60,11 +60,15 @@ export function markdownToSpeech(text: string): string {
 
   // 4. Images: ![alt](src) → alt (or empty if alt is blank).
   //    Must run before the link pass so the leading `!` doesn't get
-  //    left behind.
-  out = out.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
+  //    left behind. URL match handles one level of balanced parens
+  //    so things like ![diagram](path/to/(v2).png) work.
+  out = out.replace(/!\[([^\]]*)\]\((?:[^()]|\([^)]*\))*\)/g, "$1");
 
   // 5. Links: [text](url) → text. Drop the URL entirely.
-  out = out.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  //    URL match handles one level of balanced parens so Wikipedia
+  //    and GitHub-style links like [Foo](https://en.wikipedia.org/wiki/Foo_(bar))
+  //    don't leave a stray ")" in the output.
+  out = out.replace(/\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)/g, "$1");
 
   // 6. Reference-style links [text][ref] → text. We don't resolve
   //    the reference definition; the `text` portion is what the

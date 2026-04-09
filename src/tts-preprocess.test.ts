@@ -178,4 +178,37 @@ describe("markdownToSpeech", () => {
     // URL was dropped.
     expect(out).not.toContain("github.com");
   });
+
+  test("link with parens in the URL doesn't leak the trailing paren", () => {
+    // Wikipedia and GitHub URLs commonly contain parens — the link
+    // regex must consume them as part of the URL, not stop at the
+    // first `)`.
+    const out = markdownToSpeech(
+      "See [Wikipedia](https://en.wikipedia.org/wiki/Wu_wei_(philosophy)) for more.",
+    );
+    expect(out).toBe("See Wikipedia for more.");
+    expect(out).not.toContain(")");
+    expect(out).not.toContain("(");
+  });
+
+  test("image with parens in src doesn't leak the trailing paren", () => {
+    const out = markdownToSpeech("![diagram](path/to/(v2).png)\n\nbody");
+    expect(out).not.toContain(")");
+    expect(out).not.toContain("(");
+    expect(out).toContain("diagram");
+    expect(out).toContain("body");
+  });
+
+  test("note containing only a fenced code block returns empty string", () => {
+    // The hook handler is responsible for guarding against this case
+    // and not leaving the note stuck in audio_pending_at; this test
+    // documents that the preprocessor itself returns empty as expected.
+    const out = markdownToSpeech("```python\nprint('hi')\n```");
+    expect(out).toBe("");
+  });
+
+  test("note containing only horizontal rules returns empty string", () => {
+    const out = markdownToSpeech("---\n\n***\n\n___");
+    expect(out).toBe("");
+  });
 });
