@@ -50,7 +50,7 @@ export interface NarrateModule {
     opts?: { voice?: string },
   ): Promise<{
     audio: Buffer;
-    mime: string;
+    mime: "audio/ogg";
     voice: string | undefined;
     provider: string;
   }>;
