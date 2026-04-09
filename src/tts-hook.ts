@@ -55,6 +55,14 @@ export interface NarrateModule {
     provider: string;
   }>;
   markdownToSpeech(text: string): string;
+  // Error classes — referenced by consumers via
+  // `err instanceof narrate.NarrateEmptyInputError` so we can distinguish
+  // "empty input" from "no provider" without substring-matching error
+  // messages. Optional so vault still loads against older narrate builds
+  // that predate parachute-narrate#2 — call sites must null-check before
+  // using them.
+  NarrateEmptyInputError?: new (...args: unknown[]) => Error;
+  NarrateNoProviderError?: new (...args: unknown[]) => Error;
 }
 
 export interface RegisterTtsHookOptions {
