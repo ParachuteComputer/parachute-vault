@@ -1,9 +1,11 @@
 /**
- * Tests for the TTS provider interface and the #reader → audio hook.
+ * Tests for the `#reader` → audio hook (vault-side integration).
  *
- * Uses a mock TtsProvider — never hits ElevenLabs. The goal here is to
- * prove the wiring (hook predicate, two-phase marker, attachment write,
- * failure path), not the cloud API.
+ * The TTS pipeline itself (providers, markdown preprocessing, encoding)
+ * lives in `parachute-narrate` and has its own tests there. These tests
+ * stub the narrate module so they cover only what vault owns: the tag
+ * predicate, two-phase marker discipline, attachment write, skip-on-empty
+ * behavior, and the failure path that leaves notes in `audio_pending_at`.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -13,31 +15,12 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { SqliteStore } from "../core/src/store.ts";
 import { HookRegistry } from "../core/src/hooks.ts";
-import {
-  buildKokoroCommand,
-  createKokoroProvider,
-  getTtsProvider,
-  registerTtsHook,
-  resolveKokoroConfig,
-  type KokoroConfig,
-  type TtsProvider,
-  type TtsSynthesisResult,
-} from "./tts-provider.ts";
+import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
 
 const silentLogger = { error: () => {}, info: () => {} };
 
-/**
- * A fake Opus encoder for tests — returns a buffer that starts with the
- * OggS magic bytes so downstream sanity checks pass, without requiring
- * ffmpeg on the test machine.
- */
-async function fakeEncode(audio: Buffer, _mime: string): Promise<Buffer> {
-  return Buffer.concat([Buffer.from("OggS"), Buffer.from("-encoded:"), audio]);
-}
-
 /** Wait for queued dispatches + in-flight handlers to settle. */
 async function settle(hooks: HookRegistry): Promise<void> {
-  // Let queueMicrotask-scheduled dispatches enqueue their tasks.
   await Promise.resolve();
   await Promise.resolve();
   await hooks.drain();
@@ -48,17 +31,38 @@ async function settle(hooks: HookRegistry): Promise<void> {
   await hooks.drain();
 }
 
-/** Mock provider that always succeeds with a deterministic payload. */
-function mockProvider(capturedCalls: Array<{ text: string; voice?: string }>): TtsProvider {
+/**
+ * Stub narrate module. `synthesize` returns deterministic OggS-prefixed
+ * bytes and captures the call args for assertion. `markdownToSpeech` is a
+ * trivial tag/syntax stripper that's sufficient for the hook's empty-input
+ * guard — the real preprocessor lives in narrate.
+ */
+function stubNarrate(
+  calls: Array<{ text: string; voice?: string }>,
+  overrides: Partial<NarrateModule> = {},
+): NarrateModule {
   return {
-    name: "mock",
-    async synthesize(text, opts): Promise<TtsSynthesisResult> {
-      capturedCalls.push({ text, voice: opts?.voice });
+    async synthesize(text, opts) {
+      calls.push({ text, voice: opts?.voice });
       return {
-        audio: Buffer.from("fake-audio-bytes"),
-        mime: "audio/mpeg",
+        audio: Buffer.concat([Buffer.from("OggS"), Buffer.from("-stub:"), Buffer.from(text)]),
+        mime: "audio/ogg",
+        voice: opts?.voice,
+        provider: "stub",
       };
     },
+    markdownToSpeech(text) {
+      // Minimal preprocessor for the tests: strip fenced code blocks and
+      // markdown syntax so the "only a code block" case returns empty,
+      // mirroring narrate's real behavior on that input.
+      const stripped = text
+        .replace(/```[\s\S]*?```/g, "")
+        .replace(/[#*[\]()]/g, "")
+        .replace(/https?:\/\/\S+/g, "")
+        .trim();
+      return stripped;
+    },
+    ...overrides,
   };
 }
 
@@ -84,61 +88,14 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("getTtsProvider factory", () => {
-  test("returns null when TTS_PROVIDER is unset", () => {
-    expect(getTtsProvider({})).toBeNull();
-  });
-
-  test("returns null when TTS_PROVIDER=none", () => {
-    expect(getTtsProvider({ TTS_PROVIDER: "none" })).toBeNull();
-  });
-
-  test("returns null when elevenlabs selected without API key", () => {
-    const warn = console.warn;
-    console.warn = () => {};
-    try {
-      expect(getTtsProvider({ TTS_PROVIDER: "elevenlabs" })).toBeNull();
-    } finally {
-      console.warn = warn;
-    }
-  });
-
-  test("returns elevenlabs provider when configured", () => {
-    const provider = getTtsProvider({
-      TTS_PROVIDER: "elevenlabs",
-      ELEVENLABS_API_KEY: "sk-test",
-    });
-    expect(provider).not.toBeNull();
-    expect(provider!.name).toBe("elevenlabs");
-  });
-
-  test("returns kokoro provider when TTS_PROVIDER=kokoro (no API key needed)", () => {
-    const provider = getTtsProvider({ TTS_PROVIDER: "kokoro" });
-    expect(provider).not.toBeNull();
-    expect(provider!.name).toBe("kokoro");
-  });
-
-  test("returns null for unknown providers", () => {
-    const warn = console.warn;
-    console.warn = () => {};
-    try {
-      expect(getTtsProvider({ TTS_PROVIDER: "bogus" })).toBeNull();
-    } finally {
-      console.warn = warn;
-    }
-  });
-});
-
 describe("registerTtsHook — #reader → audio", () => {
   test("fires for a #reader note, attaches audio, sets marker", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("Hello reader", { tags: ["reader"] });
@@ -152,7 +109,7 @@ describe("registerTtsHook — #reader → audio", () => {
     const meta = fresh!.metadata as Record<string, unknown>;
     expect(meta.audio_rendered_at).toBeTruthy();
     expect(meta.audio_voice).toBe("test-voice");
-    expect(meta.audio_provider).toBe("mock");
+    expect(meta.audio_provider).toBe("stub");
     expect(meta.audio_pending_at).toBeUndefined();
 
     const attachments = store.getAttachments(note.id);
@@ -160,12 +117,6 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(attachments[0].mimeType).toBe("audio/ogg");
     expect(attachments[0].path.startsWith("tts/")).toBe(true);
     expect(attachments[0].path.endsWith(".ogg")).toBe(true);
-    // Attachment metadata should preserve the original mime + size so the
-    // migration script can tell what it was before encoding, and so clients
-    // can report compression stats.
-    const attMeta = attachments[0].metadata as Record<string, unknown>;
-    expect(attMeta.original_mime).toBe("audio/mpeg");
-    expect(attMeta.original_size_bytes).toBe(Buffer.from("fake-audio-bytes").length);
 
     const absPath = join(assetsBase, attachments[0].path);
     expect(existsSync(absPath)).toBe(true);
@@ -174,54 +125,37 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(bytes.toString("ascii", 0, 4)).toBe("OggS");
   });
 
-  test("preprocesses markdown out of note content before synthesis", async () => {
-    // Verify the wiring: markdownToSpeech runs before provider.synthesize.
-    // The previous "Hello reader" test passed vacuously because plain text
-    // round-trips through the preprocessor unchanged.
+  test("passes raw note content through to narrate (narrate owns preprocessing)", async () => {
+    // The hook's empty-input guard uses `narrate.markdownToSpeech` only
+    // to detect unspeakable notes. For speakable notes, the raw content
+    // flows through to `narrate.synthesize`, which runs its own
+    // preprocessing. This test pins that contract.
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
-    const note = store.createNote(
-      "# Title\n\n**Bold** text and *italic* — see [link](https://example.com).",
-      { tags: ["reader"] },
-    );
+    const raw = "# Title\n\n**Bold** text and [link](https://example.com).";
+    store.createNote(raw, { tags: ["reader"] });
     await settle(hooks);
 
     expect(calls.length).toBe(1);
-    const passed = calls[0].text;
-    // Markup gone:
-    expect(passed).not.toContain("#");
-    expect(passed).not.toContain("**");
-    expect(passed).not.toContain("*italic*");
-    expect(passed).not.toContain("[");
-    expect(passed).not.toContain("](");
-    expect(passed).not.toContain("https://");
-    // Content survives:
-    expect(passed).toContain("Title");
-    expect(passed).toContain("Bold");
-    expect(passed).toContain("italic");
-    expect(passed).toContain("link");
+    // The stub captures whatever the hook passed. The hook passes the raw
+    // note content, not the stripped version, because narrate's own
+    // pipeline will strip it. (The stub doesn't re-strip; it just echoes.)
+    expect(calls[0].text).toBe(raw);
   });
 
-  test("note with only a code block is marked rendered, not stuck in pending", async () => {
-    // Without the empty-speechText guard the note would have audio_pending_at
-    // set in phase 1, then markdownToSpeech returns "", then the provider
-    // throws (Kokoro guards empty text), and the note stays pending forever.
+  test("note with only a code block is marked rendered-with-skip-reason, not stuck", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("```python\nprint('hi')\n```", {
@@ -229,7 +163,7 @@ describe("registerTtsHook — #reader → audio", () => {
     });
     await settle(hooks);
 
-    // Provider was NOT called — nothing speakable.
+    // Narrate.synthesize was NOT called — the hook's pre-check caught it.
     expect(calls.length).toBe(0);
 
     // But the note is marked rendered (with a skip reason) so the hook
@@ -240,19 +174,16 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(meta.audio_rendered_at).toBeTruthy();
     expect(meta.audio_skipped_reason).toBe("empty after markdown preprocessing");
 
-    // No attachment was written.
     expect(store.getAttachments(note.id).length).toBe(0);
   });
 
   test("does not fire for notes without the #reader tag", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("No tag", { tags: ["other"] });
@@ -265,12 +196,10 @@ describe("registerTtsHook — #reader → audio", () => {
   test("does not re-fire when audio_rendered_at is already set", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("Already rendered", {
@@ -280,7 +209,6 @@ describe("registerTtsHook — #reader → audio", () => {
     await settle(hooks);
     expect(calls.length).toBe(0);
 
-    // Mutating the note should still not re-fire.
     store.updateNote(note.id, { content: "edited" });
     await settle(hooks);
     expect(calls.length).toBe(0);
@@ -290,12 +218,10 @@ describe("registerTtsHook — #reader → audio", () => {
   test("clearing audio_rendered_at re-runs synthesis on next update", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("First pass", { tags: ["reader"] });
@@ -303,7 +229,6 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(calls.length).toBe(1);
     expect(store.getAttachments(note.id).length).toBe(1);
 
-    // Clear the marker and mutate — second synthesis should fire.
     const meta = store.getNote(note.id)!.metadata as Record<string, unknown>;
     const { audio_rendered_at: _r, audio_voice: _v, audio_provider: _p, ...rest } = meta;
     store.updateNote(note.id, { metadata: rest, content: "Second pass" });
@@ -313,49 +238,39 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(calls[1].text).toBe("Second pass");
     expect(store.getAttachments(note.id).length).toBe(2);
 
-    const fresh = store.getNote(note.id)!;
-    const freshMeta = fresh.metadata as Record<string, unknown>;
+    const freshMeta = store.getNote(note.id)!.metadata as Record<string, unknown>;
     expect(freshMeta.audio_rendered_at).toBeTruthy();
     expect(freshMeta.audio_pending_at).toBeUndefined();
   });
 
-  test("provider failure leaves note stuck in audio_pending_at (no retry loop)", async () => {
+  test("narrate failure leaves note stuck in audio_pending_at (no retry loop)", async () => {
     let callCount = 0;
-    const provider: TtsProvider = {
-      name: "mock-fail",
-      async synthesize(): Promise<TtsSynthesisResult> {
+    const failingNarrate: NarrateModule = {
+      async synthesize() {
         callCount++;
         throw new Error("boom");
       },
+      markdownToSpeech: (t) => t,
     };
     registerTtsHook(hooks, {
-      provider,
+      narrate: failingNarrate,
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("Will fail", { tags: ["reader"] });
     await settle(hooks);
 
-    // Provider called exactly once — the pending marker prevents retry.
     expect(callCount).toBe(1);
 
     const fresh = store.getNote(note.id)!;
-    expect(fresh.content).toBe("Will fail");
-    expect(fresh.tags).toContain("reader");
-
     const meta = fresh.metadata as Record<string, unknown>;
     expect(meta.audio_rendered_at).toBeUndefined();
-    // Pending marker stays set — this is the "stuck" state that requires
-    // manual recovery. Deliberate, not a bug. See tts-provider.ts header.
     expect(meta.audio_pending_at).toBeTruthy();
-
     expect(store.getAttachments(note.id).length).toBe(0);
 
-    // A subsequent mutation should NOT re-fire the hook (pending still set).
+    // A subsequent mutation should NOT re-fire (pending still set).
     store.updateNote(note.id, { content: "still failing" });
     await settle(hooks);
     expect(callCount).toBe(1);
@@ -371,12 +286,10 @@ describe("registerTtsHook — #reader → audio", () => {
   test("skips notes with empty content", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("", { tags: ["reader"] });
@@ -386,24 +299,16 @@ describe("registerTtsHook — #reader → audio", () => {
   });
 
   test("two synchronous mutations in the same tick do not double-synthesize", async () => {
-    // This is the harder race: both mutations land back-to-back without an
-    // await between them, so both `dispatch()` calls snapshot matches
-    // before either handler's phase-1 write has had a chance to run. Only
-    // the handler-side re-check (not the dispatch-time predicate) can
-    // close this window.
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {
-      provider: mockProvider(calls),
+      narrate: stubNarrate(calls),
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("First write", { tags: ["reader"] });
-    // No await here — the second mutation lands in the same sync tick as
-    // the first dispatch's match capture.
+    // No await — second mutation lands in the same sync tick.
     store.updateNote(note.id, { content: "Second write, same tick" });
     await settle(hooks);
 
@@ -411,229 +316,36 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(store.getAttachments(note.id).length).toBe(1);
   });
 
-  test("does not double-synthesize under two-phase marker with a slow provider", async () => {
-    // Simulate the race: the provider takes a tick, and we mutate the note
-    // while the handler is mid-flight. The second mutation should NOT
-    // trigger a second synthesis because audio_pending_at is already set.
+  test("does not double-synthesize under two-phase marker with a slow narrate", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
-    const slowProvider: TtsProvider = {
-      name: "slow",
+    const slowNarrate: NarrateModule = {
       async synthesize(text, opts) {
         calls.push({ text, voice: opts?.voice });
         await new Promise((r) => setTimeout(r, 20));
-        return { audio: Buffer.from("slow-audio"), mime: "audio/mpeg" };
+        return {
+          audio: Buffer.concat([Buffer.from("OggS"), Buffer.from("-slow")]),
+          mime: "audio/ogg",
+          voice: opts?.voice,
+          provider: "slow",
+        };
       },
+      markdownToSpeech: (t) => t,
     };
     registerTtsHook(hooks, {
-      provider: slowProvider,
+      narrate: slowNarrate,
       voice: "test-voice",
       resolveAssetsDir: () => assetsBase,
       logger: silentLogger,
-      skipFfmpegCheck: true,
-      encode: fakeEncode,
     });
 
     const note = store.createNote("Race me", { tags: ["reader"] });
     // Let the handler start (claim the pending marker) before mutating.
     await Promise.resolve();
     await Promise.resolve();
-    // Mutate while synthesis is running.
     store.updateNote(note.id, { content: "Race me harder" });
     await settle(hooks);
 
     expect(calls.length).toBe(1);
     expect(store.getAttachments(note.id).length).toBe(1);
-  });
-});
-
-describe("Kokoro provider", () => {
-  const baseConfig: KokoroConfig = {
-    bin: "uvx",
-    model: "prince-canuma/Kokoro-82M",
-    voice: "af_heart",
-    extraArgs: [],
-    timeoutMs: 300_000,
-  };
-
-  test("buildKokoroCommand wraps uvx with --from mlx-audio and required extras", () => {
-    const argv = buildKokoroCommand(baseConfig, "hello", "/tmp/work", "out");
-    expect(argv[0]).toBe("uvx");
-    // The first positional chunk must pull in mlx-audio plus misaki[en] and
-    // num2words, which mlx-audio imports at runtime but does not declare.
-    expect(argv).toContain("--from");
-    expect(argv[argv.indexOf("--from") + 1]).toBe("mlx-audio");
-    const withFlags: string[] = [];
-    for (let i = 0; i < argv.length - 1; i++) {
-      if (argv[i] === "--with") withFlags.push(argv[i + 1]);
-    }
-    expect(withFlags).toContain("misaki[en]");
-    expect(withFlags).toContain("num2words");
-    // python -m mlx_audio.tts.generate ...
-    expect(argv).toContain("python");
-    expect(argv).toContain("mlx_audio.tts.generate");
-    // Env-driven flags should be present.
-    const i = (f: string) => argv.indexOf(f);
-    expect(argv[i("--model") + 1]).toBe("prince-canuma/Kokoro-82M");
-    expect(argv[i("--voice") + 1]).toBe("af_heart");
-    expect(argv[i("--audio_format") + 1]).toBe("wav");
-    expect(argv[i("--output_path") + 1]).toBe("/tmp/work");
-    expect(argv[i("--file_prefix") + 1]).toBe("out");
-    expect(argv[i("--text") + 1]).toBe("hello");
-    // --join_audio ensures a single `out.wav` regardless of segment count.
-    expect(argv).toContain("--join_audio");
-  });
-
-  test("buildKokoroCommand honors env-derived overrides", () => {
-    const config: KokoroConfig = {
-      bin: "uvx",
-      model: "custom/model-id",
-      voice: "bf_emma",
-      extraArgs: ["--speed", "1.2"],
-      timeoutMs: 300_000,
-    };
-    const argv = buildKokoroCommand(config, "hi", "/tmp/w", "x");
-    expect(argv[argv.indexOf("--model") + 1]).toBe("custom/model-id");
-    expect(argv[argv.indexOf("--voice") + 1]).toBe("bf_emma");
-    // Extra args appended after the required flags.
-    expect(argv.slice(-2)).toEqual(["--speed", "1.2"]);
-  });
-
-  test("buildKokoroCommand respects per-call voice override", () => {
-    const argv = buildKokoroCommand(baseConfig, "hello", "/tmp/w", "x", "af_bella");
-    expect(argv[argv.indexOf("--voice") + 1]).toBe("af_bella");
-  });
-
-  test("buildKokoroCommand uses direct bin invocation when not uvx", () => {
-    const config: KokoroConfig = {
-      ...baseConfig,
-      bin: "/usr/bin/python3",
-    };
-    const argv = buildKokoroCommand(config, "hi", "/tmp/w", "x");
-    expect(argv[0]).toBe("/usr/bin/python3");
-    expect(argv[1]).toBe("-m");
-    expect(argv[2]).toBe("mlx_audio.tts.generate");
-  });
-
-  test("createKokoroProvider writes a WAV and returns its bytes (stubbed spawner)", async () => {
-    // Stub spawner: simulate the Python process writing the expected WAV
-    // file to the output_path / file_prefix location it was given.
-    const provider = createKokoroProvider(baseConfig, async (argv, _timeoutMs) => {
-      const outIdx = argv.indexOf("--output_path");
-      const prefixIdx = argv.indexOf("--file_prefix");
-      const outDir = argv[outIdx + 1];
-      const prefix = argv[prefixIdx + 1];
-      const path = join(outDir, `${prefix}.wav`);
-      // "RIFF....WAVE" — not a valid WAV body, but enough for a byte-count
-      // check in the test.
-      mkdirSync(outDir, { recursive: true });
-      const fs = await import("fs");
-      fs.writeFileSync(path, Buffer.from("RIFF0000WAVEfmt "));
-      return { exitCode: 0, stderr: "" };
-    });
-
-    const result = await provider.synthesize("Hello from Kokoro");
-    expect(result.mime).toBe("audio/wav");
-    expect(result.audio.byteLength).toBeGreaterThan(0);
-    expect(result.audio.toString("ascii", 0, 4)).toBe("RIFF");
-  });
-
-  test("createKokoroProvider throws on non-zero exit", async () => {
-    const provider = createKokoroProvider(baseConfig, async () => ({
-      exitCode: 2,
-      stderr: "model not found",
-    }));
-    await expect(provider.synthesize("hello")).rejects.toThrow(/exited with code 2/);
-  });
-
-  test("createKokoroProvider throws if the output WAV is missing", async () => {
-    const provider = createKokoroProvider(baseConfig, async () => ({
-      exitCode: 0,
-      stderr: "",
-    }));
-    await expect(provider.synthesize("hello")).rejects.toThrow(
-      /expected output file .* was not created/,
-    );
-  });
-
-  test("createKokoroProvider forwards per-call voice override to the command", async () => {
-    let capturedVoice: string | undefined;
-    const provider = createKokoroProvider(baseConfig, async (argv) => {
-      capturedVoice = argv[argv.indexOf("--voice") + 1];
-      const outDir = argv[argv.indexOf("--output_path") + 1];
-      const prefix = argv[argv.indexOf("--file_prefix") + 1];
-      const fs = await import("fs");
-      fs.mkdirSync(outDir, { recursive: true });
-      fs.writeFileSync(join(outDir, `${prefix}.wav`), Buffer.from("RIFF"));
-      return { exitCode: 0, stderr: "" };
-    });
-    await provider.synthesize("hi", { voice: "af_bella" });
-    expect(capturedVoice).toBe("af_bella");
-  });
-
-  test("getTtsProvider resolves KOKORO_* env vars into the Kokoro config", () => {
-    // We can't inspect the returned closure directly, but we can verify the
-    // command-building piece — which is the load-bearing part — by calling
-    // buildKokoroCommand with the same env-derived config shape that the
-    // factory uses.
-    const provider = getTtsProvider({
-      TTS_PROVIDER: "kokoro",
-      KOKORO_MODEL: "prince-canuma/Kokoro-82M",
-      KOKORO_VOICE: "bm_george",
-      TTS_VOICE: "ignored-because-kokoro-voice-wins",
-    });
-    expect(provider).not.toBeNull();
-    expect(provider!.name).toBe("kokoro");
-  });
-
-  test("resolveKokoroConfig applies voice precedence: KOKORO_VOICE > TTS_VOICE > default", () => {
-    // KOKORO_VOICE wins when both are set.
-    const bothSet = resolveKokoroConfig({
-      KOKORO_VOICE: "kokoro-wins",
-      TTS_VOICE: "shared-tts-voice",
-    });
-    expect(bothSet.voice).toBe("kokoro-wins");
-
-    // TTS_VOICE is used when only it is set.
-    const onlyTts = resolveKokoroConfig({ TTS_VOICE: "shared-tts-voice" });
-    expect(onlyTts.voice).toBe("shared-tts-voice");
-
-    // Default when neither is set.
-    const neither = resolveKokoroConfig({});
-    expect(neither.voice).toBe("af_heart");
-  });
-
-  test("resolveKokoroConfig honors KOKORO_TIMEOUT_MS override and falls back on non-numeric", () => {
-    const override = resolveKokoroConfig({ KOKORO_TIMEOUT_MS: "12345" });
-    expect(override.timeoutMs).toBe(12345);
-
-    const bogus = resolveKokoroConfig({ KOKORO_TIMEOUT_MS: "not-a-number" });
-    expect(bogus.timeoutMs).toBe(300_000);
-
-    const unset = resolveKokoroConfig({});
-    expect(unset.timeoutMs).toBe(300_000);
-  });
-
-  test("createKokoroProvider cleans up workDir after a non-zero exit", async () => {
-    let capturedWorkDir: string | undefined;
-    const provider = createKokoroProvider(baseConfig, async (argv) => {
-      capturedWorkDir = argv[argv.indexOf("--output_path") + 1];
-      return { exitCode: 2, stderr: "boom" };
-    });
-    await expect(provider.synthesize("hello")).rejects.toThrow(/exited with code 2/);
-    expect(capturedWorkDir).toBeTruthy();
-    expect(existsSync(capturedWorkDir!)).toBe(false);
-  });
-
-  test("createKokoroProvider cleans up workDir when the output file is missing", async () => {
-    let capturedWorkDir: string | undefined;
-    const provider = createKokoroProvider(baseConfig, async (argv) => {
-      capturedWorkDir = argv[argv.indexOf("--output_path") + 1];
-      return { exitCode: 0, stderr: "" };
-    });
-    await expect(provider.synthesize("hello")).rejects.toThrow(
-      /expected output file .* was not created/,
-    );
-    expect(capturedWorkDir).toBeTruthy();
-    expect(existsSync(capturedWorkDir!)).toBe(false);
   });
 });

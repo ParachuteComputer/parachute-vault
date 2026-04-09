@@ -1,44 +1,38 @@
 /**
  * Tests for POST /v1/audio/speech — the OpenAI-compatible TTS endpoint.
  *
- * These tests exercise `handleTtsSpeech` directly with an injected provider
- * + encoder so ffmpeg and Kokoro/ElevenLabs never have to be present. The
- * route-level registration in `server.ts` is a one-liner that dispatches
- * straight to this handler, so handler-level coverage is the load-bearing
- * part.
+ * Injects a stub `parachute-narrate` module so the real provider /
+ * subprocess / ffmpeg never run. Production resolves narrate via dynamic
+ * import (mirroring `getScribe`); tests pass a stub via `deps.getNarrate`.
  */
 
 import { describe, test, expect } from "bun:test";
 import { handleTtsSpeech } from "./routes.ts";
-import type { TtsProvider, TtsSynthesisResult } from "./tts-provider.ts";
+import type { NarrateModule } from "./tts-hook.ts";
 
-/**
- * Fake encoder that returns a buffer starting with the OggS magic bytes so
- * callers that sniff the response can assert "looks like an Ogg file"
- * without requiring real ffmpeg.
- */
-async function fakeEncode(audio: Buffer, _mime: string): Promise<Buffer> {
-  return Buffer.concat([Buffer.from("OggS"), audio]);
-}
-
-function stubProvider(
+function stubNarrate(
   calls: Array<{ text: string; voice?: string }>,
-): TtsProvider {
+): NarrateModule {
   return {
-    name: "stub",
-    async synthesize(text, opts): Promise<TtsSynthesisResult> {
+    async synthesize(text, opts) {
       calls.push({ text, voice: opts?.voice });
-      return { audio: Buffer.from("fake-audio"), mime: "audio/wav" };
+      return {
+        audio: Buffer.concat([Buffer.from("OggS"), Buffer.from("-stub:"), Buffer.from(text)]),
+        mime: "audio/ogg",
+        voice: opts?.voice,
+        provider: "stub",
+      };
     },
+    markdownToSpeech: (t) => t,
   };
 }
 
-function throwingProvider(): TtsProvider {
+function throwingNarrate(message: string): NarrateModule {
   return {
-    name: "throwing",
-    async synthesize(): Promise<TtsSynthesisResult> {
-      throw new Error("provider exploded");
+    async synthesize() {
+      throw new Error(message);
     },
+    markdownToSpeech: (t) => t,
   };
 }
 
@@ -59,7 +53,7 @@ describe("handleTtsSpeech", () => {
         voice: "af_heart",
         input: "Hello from the test",
       }),
-      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate(calls) },
     );
 
     expect(res.status).toBe(200);
@@ -71,31 +65,28 @@ describe("handleTtsSpeech", () => {
     expect(calls[0].voice).toBe("af_heart");
   });
 
-  test("markdown input is stripped before being sent to the provider", async () => {
+  test("markdown input flows through to narrate (narrate owns preprocessing)", async () => {
+    // Previously vault stripped markdown before calling the provider.
+    // Now narrate owns that step — the handler just forwards the raw
+    // input and lets narrate's pipeline handle it. The stub doesn't
+    // strip, so we just assert the raw text made it through.
     const calls: Array<{ text: string; voice?: string }> = [];
+    const raw = "# Heading\n\nThis has **bold** and [a link](https://example.com).";
     const res = await handleTtsSpeech(
-      makeRequest({
-        input: "# Heading\n\nThis has **bold** and [a link](https://example.com).",
-      }),
-      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+      makeRequest({ input: raw }),
+      { getNarrate: async () => stubNarrate(calls) },
     );
 
     expect(res.status).toBe(200);
     expect(calls).toHaveLength(1);
-    // The exact stripped output is owned by markdownToSpeech's own tests —
-    // here we just assert the provider never saw the raw markdown syntax.
-    expect(calls[0].text).not.toContain("**");
-    expect(calls[0].text).not.toContain("](");
-    expect(calls[0].text).not.toContain("#");
-    expect(calls[0].text).toContain("bold");
-    expect(calls[0].text).toContain("Heading");
+    expect(calls[0].text).toBe(raw);
   });
 
-  test("omitting voice leaves voice undefined for the provider", async () => {
+  test("omitting voice leaves voice undefined for narrate", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     const res = await handleTtsSpeech(
       makeRequest({ input: "no voice here" }),
-      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate(calls) },
     );
 
     expect(res.status).toBe(200);
@@ -106,7 +97,7 @@ describe("handleTtsSpeech", () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi", response_format: "mp3" }),
-      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate(calls) },
     );
 
     expect(res.status).toBe(200);
@@ -117,42 +108,17 @@ describe("handleTtsSpeech", () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi", response_format: "opus" }),
-      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate(calls) },
     );
 
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("audio/ogg");
   });
 
-  test("provider returning an empty buffer is surfaced via the encoder 500 path", async () => {
-    // Lock in the contract: if a provider hands back zero bytes, the
-    // encoder is still invoked and whatever it throws is reported as 500.
-    // The real encodeOggOpus would reject this; we simulate that here.
-    const emptyProvider: TtsProvider = {
-      name: "empty",
-      async synthesize(): Promise<TtsSynthesisResult> {
-        return { audio: Buffer.alloc(0), mime: "audio/wav" };
-      },
-    };
-    const res = await handleTtsSpeech(
-      makeRequest({ input: "hi" }),
-      {
-        getProvider: () => emptyProvider,
-        encode: async (audio) => {
-          if (audio.length === 0) throw new Error("empty audio buffer");
-          return Buffer.from("OggS");
-        },
-      },
-    );
-    expect(res.status).toBe(500);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("empty audio buffer");
-  });
-
   test("missing input returns 400", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ voice: "af_heart" }),
-      { getProvider: () => stubProvider([]), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate([]) },
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
@@ -162,30 +128,49 @@ describe("handleTtsSpeech", () => {
   test("empty input returns 400", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "" }),
-      { getProvider: () => stubProvider([]), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate([]) },
     );
     expect(res.status).toBe(400);
   });
 
-  test("input that strips to empty returns 400 with the specific error", async () => {
-    const calls: Array<{ text: string; voice?: string }> = [];
+  test("narrate reporting empty-after-preprocess returns 400 with the specific error", async () => {
+    // Mirrors the message narrate actually throws from synthesize.ts:
+    //   "narrate.synthesize: text is empty after markdown preprocessing"
     const res = await handleTtsSpeech(
       makeRequest({ input: "```\ncode\n```" }),
-      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+      {
+        getNarrate: async () =>
+          throwingNarrate(
+            "narrate.synthesize: text is empty after markdown preprocessing",
+          ),
+      },
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe(
       "input has no speakable content after markdown preprocessing",
     );
-    // Provider must not have been called.
-    expect(calls).toHaveLength(0);
+  });
+
+  test("narrate reporting no-provider returns 503 with the specific error", async () => {
+    const res = await handleTtsSpeech(
+      makeRequest({ input: "hi" }),
+      {
+        getNarrate: async () =>
+          throwingNarrate(
+            "narrate.synthesize: no TTS provider configured (set TTS_PROVIDER=kokoro|elevenlabs)",
+          ),
+      },
+    );
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("TTS provider not configured");
   });
 
   test("unknown response_format returns 400", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi", response_format: "foo" }),
-      { getProvider: () => stubProvider([]), encode: fakeEncode },
+      { getNarrate: async () => stubNarrate([]) },
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
@@ -199,44 +184,30 @@ describe("handleTtsSpeech", () => {
       body: "not-json",
     });
     const res = await handleTtsSpeech(req, {
-      getProvider: () => stubProvider([]),
-      encode: fakeEncode,
+      getNarrate: async () => stubNarrate([]),
     });
     expect(res.status).toBe(400);
   });
 
-  test("no configured provider returns 503", async () => {
+  test("narrate not installed returns 501", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi" }),
-      { getProvider: () => null, encode: fakeEncode },
+      { getNarrate: async () => null },
     );
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(501);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("TTS provider not configured");
+    expect(body.error).toBe(
+      "TTS not available — parachute-narrate is not installed",
+    );
   });
 
-  test("provider throwing returns 500 with the error message", async () => {
+  test("narrate throwing a generic error returns 500 with the error message", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi" }),
-      { getProvider: () => throwingProvider(), encode: fakeEncode },
+      { getNarrate: async () => throwingNarrate("provider exploded") },
     );
     expect(res.status).toBe(500);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("provider exploded");
-  });
-
-  test("encoder throwing returns 500", async () => {
-    const res = await handleTtsSpeech(
-      makeRequest({ input: "hi" }),
-      {
-        getProvider: () => stubProvider([]),
-        encode: async () => {
-          throw new Error("ffmpeg blew up");
-        },
-      },
-    );
-    expect(res.status).toBe(500);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("ffmpeg blew up");
   });
 });
