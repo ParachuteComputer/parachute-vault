@@ -56,6 +56,54 @@ describe("BunStore", () => {
     expect(updated.updatedAt).toBeTruthy();
   });
 
+  test("user updates bump updatedAt", () => {
+    const note = store.createNote("Original");
+    expect(note.updatedAt).toBeUndefined();
+    const updated = store.updateNote(note.id, { content: "Edited by user" });
+    expect(updated.updatedAt).toBeTruthy();
+  });
+
+  test("skipUpdatedAt preserves updatedAt (hook-style writes)", async () => {
+    // Hook writes (e.g., the reader-audio hook's metadata markers) must not
+    // count as user activity. See issue #44 — hook writes were bumping
+    // updatedAt and wrecking Daily's reader sort.
+    const note = store.createNote("Content");
+    expect(note.updatedAt).toBeUndefined();
+
+    // Fresh note: a machine write must not set updatedAt.
+    store.updateNote(note.id, {
+      metadata: { audio_pending_at: "2026-04-09T10:00:00.000Z" },
+      skipUpdatedAt: true,
+    });
+    let fetched = store.getNote(note.id)!;
+    expect(fetched.updatedAt).toBeUndefined();
+    expect((fetched.metadata as { audio_pending_at?: string } | undefined)?.audio_pending_at).toBe(
+      "2026-04-09T10:00:00.000Z",
+    );
+
+    // Now a real user edit bumps it.
+    await new Promise((r) => setTimeout(r, 5));
+    store.updateNote(note.id, { content: "User edit" });
+    fetched = store.getNote(note.id)!;
+    const userTs = fetched.updatedAt;
+    expect(userTs).toBeTruthy();
+
+    // A subsequent machine write must not overwrite the user's timestamp.
+    await new Promise((r) => setTimeout(r, 5));
+    store.updateNote(note.id, {
+      metadata: {
+        ...(fetched.metadata as Record<string, unknown>),
+        audio_rendered_at: "2026-04-09T10:05:00.000Z",
+      },
+      skipUpdatedAt: true,
+    });
+    fetched = store.getNote(note.id)!;
+    expect(fetched.updatedAt).toBe(userTs!);
+    expect((fetched.metadata as { audio_rendered_at?: string } | undefined)?.audio_rendered_at).toBe(
+      "2026-04-09T10:05:00.000Z",
+    );
+  });
+
   test("deletes a note", () => {
     const note = store.createNote("To delete");
     store.deleteNote(note.id);

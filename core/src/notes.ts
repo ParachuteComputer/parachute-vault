@@ -75,11 +75,17 @@ export function getNotes(db: Database, ids: string[]): Note[] {
 export function updateNote(
   db: Database,
   id: string,
-  updates: { content?: string; path?: string; metadata?: Record<string, unknown> },
+  updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean },
 ): Note {
-  const now = new Date().toISOString();
-  const sets: string[] = ["updated_at = ?"];
-  const values: unknown[] = [now];
+  const sets: string[] = [];
+  const values: unknown[] = [];
+
+  // Hooks and other machine-level writers pass `skipUpdatedAt: true` so
+  // their metadata markers don't look like user activity. See issue #44.
+  if (!updates.skipUpdatedAt) {
+    sets.push("updated_at = ?");
+    values.push(new Date().toISOString());
+  }
 
   if (updates.content !== undefined) {
     sets.push("content = ?");
@@ -92,6 +98,11 @@ export function updateNote(
   if (updates.metadata !== undefined) {
     sets.push("metadata = ?");
     values.push(JSON.stringify(updates.metadata));
+  }
+
+  // No-op: skipUpdatedAt with no other fields. Avoid generating invalid SQL.
+  if (sets.length === 0) {
+    return getNote(db, id)!;
   }
 
   values.push(id);
