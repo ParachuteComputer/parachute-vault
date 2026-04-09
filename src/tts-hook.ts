@@ -55,6 +55,11 @@ export interface NarrateModule {
     provider: string;
   }>;
   markdownToSpeech(text: string): string;
+  // Error classes — referenced via `instanceof err instanceof narrate.NarrateEmptyInputError`
+  // so we can distinguish "empty input" from "no provider" without substring
+  // matching on error messages.
+  NarrateEmptyInputError: new (...args: never[]) => Error;
+  NarrateNoProviderError: new (...args: never[]) => Error;
 }
 
 export interface RegisterTtsHookOptions {

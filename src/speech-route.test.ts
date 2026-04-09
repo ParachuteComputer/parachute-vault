@@ -10,6 +10,22 @@ import { describe, test, expect } from "bun:test";
 import { handleTtsSpeech } from "./routes.ts";
 import type { NarrateModule } from "./tts-hook.ts";
 
+// Local stand-ins for narrate's typed error classes. Tests don't import
+// from parachute-narrate directly — they stub the whole module — so we
+// mint local subclasses that `instanceof` correctly against themselves.
+class StubNarrateEmptyInputError extends Error {
+  constructor(message = "narrate.synthesize: text is empty after markdown preprocessing") {
+    super(message);
+  }
+}
+class StubNarrateNoProviderError extends Error {
+  constructor(
+    message = "narrate.synthesize: no TTS provider configured (set TTS_PROVIDER=kokoro|elevenlabs)",
+  ) {
+    super(message);
+  }
+}
+
 function stubNarrate(
   calls: Array<{ text: string; voice?: string }>,
 ): NarrateModule {
@@ -24,15 +40,19 @@ function stubNarrate(
       };
     },
     markdownToSpeech: (t) => t,
+    NarrateEmptyInputError: StubNarrateEmptyInputError,
+    NarrateNoProviderError: StubNarrateNoProviderError,
   };
 }
 
-function throwingNarrate(message: string): NarrateModule {
+function throwingNarrate(err: Error): NarrateModule {
   return {
     async synthesize() {
-      throw new Error(message);
+      throw err;
     },
     markdownToSpeech: (t) => t,
+    NarrateEmptyInputError: StubNarrateEmptyInputError,
+    NarrateNoProviderError: StubNarrateNoProviderError,
   };
 }
 
@@ -133,16 +153,11 @@ describe("handleTtsSpeech", () => {
     expect(res.status).toBe(400);
   });
 
-  test("narrate reporting empty-after-preprocess returns 400 with the specific error", async () => {
-    // Mirrors the message narrate actually throws from synthesize.ts:
-    //   "narrate.synthesize: text is empty after markdown preprocessing"
+  test("NarrateEmptyInputError returns 400 with the specific error", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "```\ncode\n```" }),
       {
-        getNarrate: async () =>
-          throwingNarrate(
-            "narrate.synthesize: text is empty after markdown preprocessing",
-          ),
+        getNarrate: async () => throwingNarrate(new StubNarrateEmptyInputError()),
       },
     );
     expect(res.status).toBe(400);
@@ -152,14 +167,11 @@ describe("handleTtsSpeech", () => {
     );
   });
 
-  test("narrate reporting no-provider returns 503 with the specific error", async () => {
+  test("NarrateNoProviderError returns 503 with the specific error", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi" }),
       {
-        getNarrate: async () =>
-          throwingNarrate(
-            "narrate.synthesize: no TTS provider configured (set TTS_PROVIDER=kokoro|elevenlabs)",
-          ),
+        getNarrate: async () => throwingNarrate(new StubNarrateNoProviderError()),
       },
     );
     expect(res.status).toBe(503);
@@ -204,7 +216,7 @@ describe("handleTtsSpeech", () => {
   test("narrate throwing a generic error returns 500 with the error message", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ input: "hi" }),
-      { getNarrate: async () => throwingNarrate("provider exploded") },
+      { getNarrate: async () => throwingNarrate(new Error("provider exploded")) },
     );
     expect(res.status).toBe(500);
     const body = (await res.json()) as { error: string };
