@@ -74,6 +74,7 @@ import {
   OPUS_EXT,
   OPUS_MIME,
 } from "./audio-encoding.ts";
+import { markdownToSpeech } from "./tts-preprocess.ts";
 
 // Re-export the encoder so downstream callers and one-off scripts can
 // `import { encodeOggOpus } from "./tts-provider"` without caring about
@@ -456,9 +457,15 @@ export function registerTtsHook(
         throw err;
       }
 
+      // Strip markdown syntax before synthesis. Without this the
+      // provider literally speaks "hashtag hashtag Monthly Summary
+      // asterisk asterisk" etc. See tts-preprocess.ts for the full
+      // transformation list and the reasoning behind each choice.
+      const speechText = markdownToSpeech(note.content);
+
       let result: TtsSynthesisResult;
       try {
-        result = await opts.provider.synthesize(note.content, { voice: opts.voice });
+        result = await opts.provider.synthesize(speechText, { voice: opts.voice });
       } catch (err) {
         logger.error(
           `[tts-hook] provider ${providerName} failed to synthesize note ${note.id}; note left in audio_pending_at state (manual recovery required):`,
