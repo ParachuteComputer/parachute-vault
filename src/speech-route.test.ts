@@ -14,15 +14,13 @@ import type { NarrateModule } from "./tts-hook.ts";
 // from parachute-narrate directly — they stub the whole module — so we
 // mint local subclasses that `instanceof` correctly against themselves.
 class StubNarrateEmptyInputError extends Error {
-  constructor(message = "narrate.synthesize: text is empty after markdown preprocessing") {
-    super(message);
+  constructor(...args: unknown[]) {
+    super((args[0] as string | undefined) ?? "empty after markdown preprocessing");
   }
 }
 class StubNarrateNoProviderError extends Error {
-  constructor(
-    message = "narrate.synthesize: no TTS provider configured (set TTS_PROVIDER=kokoro|elevenlabs)",
-  ) {
-    super(message);
+  constructor(...args: unknown[]) {
+    super((args[0] as string | undefined) ?? "no TTS provider configured");
   }
 }
 

@@ -590,14 +590,23 @@ export async function handleTtsSpeech(req: Request, deps: TtsSpeechDeps = {}): P
   } catch (err) {
     // Narrate exposes typed error classes on the module surface; we
     // `instanceof`-check against the resolved module to map them to HTTP
-    // statuses without substring-matching error messages.
-    if (err instanceof narrate.NarrateEmptyInputError) {
+    // statuses without substring-matching error messages. The fields are
+    // optional on `NarrateModule` so an older narrate without them doesn't
+    // crash the catch block with `instanceof undefined` — we null-check
+    // before each check.
+    if (
+      narrate.NarrateEmptyInputError &&
+      err instanceof narrate.NarrateEmptyInputError
+    ) {
       return json(
         { error: "input has no speakable content after markdown preprocessing" },
         400,
       );
     }
-    if (err instanceof narrate.NarrateNoProviderError) {
+    if (
+      narrate.NarrateNoProviderError &&
+      err instanceof narrate.NarrateNoProviderError
+    ) {
       return json({ error: "TTS provider not configured" }, 503);
     }
     const message = err instanceof Error ? err.message : "TTS synthesis failed";

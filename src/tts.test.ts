@@ -31,6 +31,21 @@ async function settle(hooks: HookRegistry): Promise<void> {
   await hooks.drain();
 }
 
+// No-op narrate error classes — the hook never catches typed errors from
+// narrate (it only uses markdownToSpeech + synthesize), but the interface
+// now requires these constructors. Define local shims so the TypeScript
+// shape matches without pulling in parachute-narrate directly.
+class StubNarrateEmptyInputError extends Error {
+  constructor(...args: unknown[]) {
+    super((args[0] as string | undefined) ?? "empty");
+  }
+}
+class StubNarrateNoProviderError extends Error {
+  constructor(...args: unknown[]) {
+    super((args[0] as string | undefined) ?? "no provider");
+  }
+}
+
 /**
  * Stub narrate module. `synthesize` returns deterministic OggS-prefixed
  * bytes and captures the call args for assertion. `markdownToSpeech` is a
@@ -62,6 +77,8 @@ function stubNarrate(
         .trim();
       return stripped;
     },
+    NarrateEmptyInputError: StubNarrateEmptyInputError,
+    NarrateNoProviderError: StubNarrateNoProviderError,
     ...overrides,
   };
 }
@@ -277,6 +294,8 @@ describe("registerTtsHook — #reader → audio", () => {
         throw new Error("boom");
       },
       markdownToSpeech: (t) => t,
+      NarrateEmptyInputError: StubNarrateEmptyInputError,
+      NarrateNoProviderError: StubNarrateNoProviderError,
     };
     registerTtsHook(hooks, {
       narrate: failingNarrate,
@@ -356,6 +375,8 @@ describe("registerTtsHook — #reader → audio", () => {
         };
       },
       markdownToSpeech: (t) => t,
+      NarrateEmptyInputError: StubNarrateEmptyInputError,
+      NarrateNoProviderError: StubNarrateNoProviderError,
     };
     registerTtsHook(hooks, {
       narrate: slowNarrate,
