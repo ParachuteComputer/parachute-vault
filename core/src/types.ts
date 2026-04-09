@@ -82,7 +82,7 @@ export interface Store {
   getNote(id: string): Note | null;
   getNoteByPath(path: string): Note | null;
   getNotes(ids: string[]): Note[];
-  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note;
+  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean }): Note;
   deleteNote(id: string): void;
   queryNotes(opts: QueryOpts): Note[];
   searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Note[];

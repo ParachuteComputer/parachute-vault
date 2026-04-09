@@ -125,6 +125,32 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(bytes.toString("ascii", 0, 4)).toBe("OggS");
   });
 
+  test("hook writes do not bump updatedAt (issue #44)", async () => {
+    // Hook metadata writes are machine-level enrichment, not user edits.
+    // They must not count as "recent activity" — anything sorting by
+    // updatedAt (e.g. parachute-daily's reader list) would otherwise show
+    // notes re-ordered by when their audio finished rendering, not by any
+    // user action.
+    const calls: Array<{ text: string; voice?: string }> = [];
+    registerTtsHook(hooks, {
+      narrate: stubNarrate(calls),
+      voice: "test-voice",
+      resolveAssetsDir: () => assetsBase,
+      logger: silentLogger,
+    });
+
+    const note = store.createNote("Hello reader", { tags: ["reader"] });
+    expect(note.updatedAt).toBeUndefined();
+    await settle(hooks);
+
+    // After the full two-phase hook run, updatedAt must still be untouched.
+    const fresh = store.getNote(note.id);
+    expect(fresh!.updatedAt).toBeUndefined();
+    // ...but the marker metadata the hook writes IS persisted.
+    const meta = fresh!.metadata as Record<string, unknown>;
+    expect(meta.audio_rendered_at).toBeTruthy();
+  });
+
   test("passes raw note content through to narrate (narrate owns preprocessing)", async () => {
     // The hook's empty-input guard uses `narrate.markdownToSpeech` only
     // to detect unspeakable notes. For speakable notes, the raw content

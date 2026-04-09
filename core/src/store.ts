@@ -51,7 +51,7 @@ export class SqliteStore implements Store {
     return noteOps.getNotes(this.db, ids);
   }
 
-  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown> }): Note {
+  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean }): Note {
     // Capture old path before update for rename cascading
     let oldPath: string | undefined;
     if (updates.path !== undefined) {

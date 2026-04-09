@@ -113,6 +113,7 @@ export function registerTtsHook(
       try {
         store.updateNote(note.id, {
           metadata: { ...existingMeta, audio_pending_at: pendingAt },
+          skipUpdatedAt: true,
         });
       } catch (err) {
         logger.error(
@@ -137,6 +138,7 @@ export function registerTtsHook(
               audio_rendered_at: new Date().toISOString(),
               audio_skipped_reason: "empty after markdown preprocessing",
             },
+            skipUpdatedAt: true,
           });
         } catch (err) {
           logger.error(
@@ -203,6 +205,7 @@ export function registerTtsHook(
             audio_voice: opts.voice,
             audio_provider: result.provider,
           },
+          skipUpdatedAt: true,
         });
       } catch (err) {
         logger.error(
