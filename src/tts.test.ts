@@ -174,6 +174,76 @@ describe("registerTtsHook — #reader → audio", () => {
     expect(bytes.toString("ascii", 0, 4)).toBe("OggS");
   });
 
+  test("preprocesses markdown out of note content before synthesis", async () => {
+    // Verify the wiring: markdownToSpeech runs before provider.synthesize.
+    // The previous "Hello reader" test passed vacuously because plain text
+    // round-trips through the preprocessor unchanged.
+    const calls: Array<{ text: string; voice?: string }> = [];
+    registerTtsHook(hooks, {
+      provider: mockProvider(calls),
+      voice: "test-voice",
+      resolveAssetsDir: () => assetsBase,
+      logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
+    });
+
+    const note = store.createNote(
+      "# Title\n\n**Bold** text and *italic* — see [link](https://example.com).",
+      { tags: ["reader"] },
+    );
+    await settle(hooks);
+
+    expect(calls.length).toBe(1);
+    const passed = calls[0].text;
+    // Markup gone:
+    expect(passed).not.toContain("#");
+    expect(passed).not.toContain("**");
+    expect(passed).not.toContain("*italic*");
+    expect(passed).not.toContain("[");
+    expect(passed).not.toContain("](");
+    expect(passed).not.toContain("https://");
+    // Content survives:
+    expect(passed).toContain("Title");
+    expect(passed).toContain("Bold");
+    expect(passed).toContain("italic");
+    expect(passed).toContain("link");
+  });
+
+  test("note with only a code block is marked rendered, not stuck in pending", async () => {
+    // Without the empty-speechText guard the note would have audio_pending_at
+    // set in phase 1, then markdownToSpeech returns "", then the provider
+    // throws (Kokoro guards empty text), and the note stays pending forever.
+    const calls: Array<{ text: string; voice?: string }> = [];
+    registerTtsHook(hooks, {
+      provider: mockProvider(calls),
+      voice: "test-voice",
+      resolveAssetsDir: () => assetsBase,
+      logger: silentLogger,
+      skipFfmpegCheck: true,
+      encode: fakeEncode,
+    });
+
+    const note = store.createNote("```python\nprint('hi')\n```", {
+      tags: ["reader"],
+    });
+    await settle(hooks);
+
+    // Provider was NOT called — nothing speakable.
+    expect(calls.length).toBe(0);
+
+    // But the note is marked rendered (with a skip reason) so the hook
+    // doesn't keep retrying.
+    const fresh = store.getNote(note.id);
+    const meta = fresh!.metadata as Record<string, unknown>;
+    expect(meta.audio_pending_at).toBeUndefined();
+    expect(meta.audio_rendered_at).toBeTruthy();
+    expect(meta.audio_skipped_reason).toBe("empty after markdown preprocessing");
+
+    // No attachment was written.
+    expect(store.getAttachments(note.id).length).toBe(0);
+  });
+
   test("does not fire for notes without the #reader tag", async () => {
     const calls: Array<{ text: string; voice?: string }> = [];
     registerTtsHook(hooks, {

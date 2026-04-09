@@ -74,6 +74,7 @@ import {
   OPUS_EXT,
   OPUS_MIME,
 } from "./audio-encoding.ts";
+import { markdownToSpeech } from "./tts-preprocess.ts";
 
 // Re-export the encoder so downstream callers and one-off scripts can
 // `import { encodeOggOpus } from "./tts-provider"` without caring about
@@ -456,9 +457,42 @@ export function registerTtsHook(
         throw err;
       }
 
+      // Strip markdown syntax before synthesis. Without this the
+      // provider literally speaks "hashtag hashtag Monthly Summary
+      // asterisk asterisk" etc. See tts-preprocess.ts for the full
+      // transformation list and the reasoning behind each choice.
+      const speechText = markdownToSpeech(note.content);
+
+      // Guard: a note containing only a fenced code block, only a
+      // horizontal rule, only HTML, etc. has non-empty raw content (so
+      // the hook predicate matches) but produces empty speechText after
+      // stripping. Without this guard the providers either throw
+      // ("refusing to synthesize empty text" — Kokoro) or send empty
+      // text to a remote API and 4xx (ElevenLabs), and either way leave
+      // the note stuck in audio_pending_at requiring manual recovery.
+      // Mark as rendered with no attachment so we don't keep retrying.
+      if (!speechText) {
+        try {
+          store.updateNote(note.id, {
+            metadata: {
+              ...existingMeta,
+              audio_pending_at: undefined,
+              audio_rendered_at: new Date().toISOString(),
+              audio_skipped_reason: "empty after markdown preprocessing",
+            },
+          });
+        } catch (err) {
+          logger.error(
+            `[tts-hook] failed to mark note ${note.id} as audio-skipped:`,
+            err,
+          );
+        }
+        return;
+      }
+
       let result: TtsSynthesisResult;
       try {
-        result = await opts.provider.synthesize(note.content, { voice: opts.voice });
+        result = await opts.provider.synthesize(speechText, { voice: opts.voice });
       } catch (err) {
         logger.error(
           `[tts-hook] provider ${providerName} failed to synthesize note ${note.id}; note left in audio_pending_at state (manual recovery required):`,
