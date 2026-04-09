@@ -7,6 +7,7 @@
  *   *    /mcp                              — unified MCP (all vaults, vault param)
  *   *    /vaults/{name}/mcp                — scoped MCP (single vault, no vault param)
  *   POST /v1/audio/transcriptions          — transcription (via scribe)
+ *   POST /v1/audio/speech                  — text-to-speech (OpenAI-compatible, OGG Opus)
  *   GET  /v1/models                        — transcription providers
  *   GET  /vaults                           — list vaults
  *   *    /vaults/{name}/api/...            — per-vault REST API
@@ -30,7 +31,7 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { getTtsProvider, registerTtsHook } from "./tts-provider.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
@@ -167,6 +168,9 @@ async function route(req: Request, path: string): Promise<Response> {
   // Transcription
   if (path === "/v1/audio/transcriptions" && req.method === "POST") {
     return handleTranscription(req);
+  }
+  if (path === "/v1/audio/speech" && req.method === "POST") {
+    return handleTtsSpeech(req);
   }
   if (path === "/v1/models" && req.method === "GET") {
     return handleModels();

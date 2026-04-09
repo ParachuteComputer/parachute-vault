@@ -9,6 +9,9 @@ import type { Store } from "../core/src/types.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
+import { getTtsProvider, type TtsProvider, type TtsSynthesisResult } from "./tts-provider.ts";
+import { encodeOggOpus } from "./audio-encoding.ts";
+import { markdownToSpeech } from "./tts-preprocess.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -494,5 +497,100 @@ export async function handleModels(): Promise<Response> {
   const providers = scribe.availableProviders();
   return json({
     data: providers.transcription.map((id: string) => ({ id, object: "model" })),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// TTS speech — OpenAI-compatible POST /v1/audio/speech
+// ---------------------------------------------------------------------------
+
+/**
+ * Dependencies for `handleTtsSpeech`. The defaults wire up the real provider
+ * factory + ffmpeg-backed encoder; tests override both to avoid external
+ * processes and the ffmpeg binary.
+ */
+export interface TtsSpeechDeps {
+  getProvider?: () => TtsProvider | null;
+  encode?: (audio: Buffer, mime: string) => Promise<Buffer>;
+}
+
+/**
+ * POST /v1/audio/speech — OpenAI-compatible text-to-speech.
+ *
+ * Accepts the OpenAI request shape (`model`, `voice`, `input`,
+ * `response_format`) but ignores `model` (the active provider is chosen at
+ * server start via `getTtsProvider`) and always returns OGG Opus regardless
+ * of `response_format`, since the vault has unified on that format (#43).
+ * `response_format` is still validated to reject unknown values so callers
+ * don't silently get the "wrong" format back.
+ *
+ * Runs the same `markdownToSpeech` preprocessing the `#reader` hook uses, so
+ * direct-synthesis callers (e.g. voice replies) get the same pipeline that
+ * reader notes do. Inputs that strip to empty return 400 rather than
+ * exploding inside the provider.
+ */
+export async function handleTtsSpeech(req: Request, deps: TtsSpeechDeps = {}): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "invalid JSON body" }, 400);
+  }
+  if (!body || typeof body !== "object") {
+    return json({ error: "body must be a JSON object" }, 400);
+  }
+  const b = body as Record<string, unknown>;
+
+  if (typeof b.input !== "string" || b.input.length === 0) {
+    return json({ error: "'input' must be a non-empty string" }, 400);
+  }
+  if (b.voice !== undefined && typeof b.voice !== "string") {
+    return json({ error: "'voice' must be a string" }, 400);
+  }
+  if (b.response_format !== undefined) {
+    if (
+      typeof b.response_format !== "string" ||
+      (b.response_format !== "opus" && b.response_format !== "mp3")
+    ) {
+      return json({ error: "'response_format' must be 'opus' or 'mp3'" }, 400);
+    }
+  }
+
+  const speechText = markdownToSpeech(b.input);
+  if (!speechText) {
+    return json({ error: "input has no speakable content after markdown preprocessing" }, 400);
+  }
+
+  const getProvider = deps.getProvider ?? (() => getTtsProvider(process.env));
+  const provider = getProvider();
+  if (!provider) {
+    return json({ error: "TTS provider not configured" }, 503);
+  }
+
+  let result: TtsSynthesisResult;
+  try {
+    result = await provider.synthesize(speechText, { voice: b.voice as string | undefined });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "TTS synthesis failed";
+    console.error("TTS synthesis error:", message);
+    return json({ error: message }, 500);
+  }
+
+  const encode = deps.encode ?? encodeOggOpus;
+  let ogg: Buffer;
+  try {
+    ogg = await encode(result.audio, result.mime);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "audio encoding failed";
+    console.error("TTS encoding error:", message);
+    return json({ error: message }, 500);
+  }
+
+  return new Response(ogg, {
+    status: 200,
+    headers: {
+      "Content-Type": "audio/ogg",
+      "Content-Length": String(ogg.length),
+    },
   });
 }
