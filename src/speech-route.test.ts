@@ -113,6 +113,42 @@ describe("handleTtsSpeech", () => {
     expect(res.headers.get("Content-Type")).toBe("audio/ogg");
   });
 
+  test("response_format: opus is accepted", async () => {
+    const calls: Array<{ text: string; voice?: string }> = [];
+    const res = await handleTtsSpeech(
+      makeRequest({ input: "hi", response_format: "opus" }),
+      { getProvider: () => stubProvider(calls), encode: fakeEncode },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("audio/ogg");
+  });
+
+  test("provider returning an empty buffer is surfaced via the encoder 500 path", async () => {
+    // Lock in the contract: if a provider hands back zero bytes, the
+    // encoder is still invoked and whatever it throws is reported as 500.
+    // The real encodeOggOpus would reject this; we simulate that here.
+    const emptyProvider: TtsProvider = {
+      name: "empty",
+      async synthesize(): Promise<TtsSynthesisResult> {
+        return { audio: Buffer.alloc(0), mime: "audio/wav" };
+      },
+    };
+    const res = await handleTtsSpeech(
+      makeRequest({ input: "hi" }),
+      {
+        getProvider: () => emptyProvider,
+        encode: async (audio) => {
+          if (audio.length === 0) throw new Error("empty audio buffer");
+          return Buffer.from("OggS");
+        },
+      },
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("empty audio buffer");
+  });
+
   test("missing input returns 400", async () => {
     const res = await handleTtsSpeech(
       makeRequest({ voice: "af_heart" }),
