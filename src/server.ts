@@ -31,7 +31,7 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleSearch, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
 import { registerTranscriptionHook, type ScribeModule } from "./transcription-hook.ts";
@@ -258,7 +258,6 @@ async function route(req: Request, path: string): Promise<Response> {
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/links") return handleLinks(req, store);
     if (apiPath === "/search") return handleSearch(req, store);
-    if (apiPath === "/resolve-wikilink") return handleResolveWikilink(req, store);
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
     if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
     if (apiPath === "/ingest") return handleIngest(req, store, defaultVault);
@@ -318,9 +317,6 @@ async function route(req: Request, path: string): Promise<Response> {
   }
   if (apiPath === "/search") {
     return handleSearch(req, store);
-  }
-  if (apiPath === "/resolve-wikilink") {
-    return handleResolveWikilink(req, store);
   }
   if (apiPath === "/unresolved-wikilinks") {
     return handleUnresolvedWikilinks(req, store);

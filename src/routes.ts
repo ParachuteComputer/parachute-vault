@@ -6,7 +6,7 @@
  */
 
 import type { Store } from "../core/src/types.ts";
-import { resolveWikilinkDetailed, listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
+import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
@@ -227,14 +227,6 @@ export function handleSearch(req: Request, store: Store): Response {
 // ---------------------------------------------------------------------------
 // Wikilinks
 // ---------------------------------------------------------------------------
-
-export function handleResolveWikilink(req: Request, store: Store): Response {
-  const url = new URL(req.url);
-  const target = url.searchParams.get("target");
-  if (!target) return json({ error: "target parameter is required" }, 400);
-  const db = (store as any).db;
-  return json(resolveWikilinkDetailed(db, target));
-}
 
 export function handleUnresolvedWikilinks(req: Request, store: Store): Response {
   const url = new URL(req.url);

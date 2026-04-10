@@ -465,9 +465,8 @@ describe("MCP tools", () => {
     expect(names).toContain("get-note");
     expect(names).toContain("get-vault-stats");
     expect(names).toContain("delete-tag");
-    expect(names).toContain("resolve-wikilink");
     expect(names).toContain("list-unresolved-wikilinks");
-    expect(tools).toHaveLength(21);
+    expect(tools).toHaveLength(20);
   });
 
   it("create-note tool works", () => {
@@ -725,47 +724,6 @@ describe("MCP tools", () => {
     const listTool = tools.find((t) => t.name === "list-tags")!;
     const tags = listTool.execute({}) as any[];
     expect(tags.some((t: any) => t.name === "mcp-tag")).toBe(false);
-  });
-
-  it("resolve-wikilink: exact match", () => {
-    store.createNote("Mickey doc", { path: "People/Mickey Myers" });
-    const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "People/Mickey Myers" }) as any;
-    expect(result.resolved).toBe(true);
-    expect(result.path).toBe("People/Mickey Myers");
-    expect(result.note_id).toBeTruthy();
-    expect(result.candidates).toEqual([]);
-  });
-
-  it("resolve-wikilink: basename match", () => {
-    store.createNote("Mickey doc", { path: "People/Mickey" });
-    const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "Mickey" }) as any;
-    expect(result.resolved).toBe(true);
-    expect(result.path).toBe("People/Mickey");
-  });
-
-  it("resolve-wikilink: ambiguous — multiple basename matches", () => {
-    store.createNote("Atlas person", { path: "People/Atlas" });
-    store.createNote("Atlas project", { path: "Projects/Atlas" });
-    const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "Atlas" }) as any;
-    expect(result.resolved).toBe(false);
-    expect(result.ambiguous).toBe(true);
-    expect(result.candidates).toHaveLength(2);
-    expect(result.candidates.map((c: any) => c.path).sort()).toEqual(["People/Atlas", "Projects/Atlas"]);
-  });
-
-  it("resolve-wikilink: no match", () => {
-    const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "Nonexistent" }) as any;
-    expect(result.resolved).toBe(false);
-    expect(result.ambiguous).toBe(false);
-    expect(result.candidates).toEqual([]);
   });
 
   it("list-unresolved-wikilinks: returns unresolved entries", () => {

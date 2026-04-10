@@ -33,7 +33,6 @@ const READ_TOOLS = new Set([
   "list-vaults",
   "get-vault-description",
   "get-vault-stats",
-  "resolve-wikilink",
   "list-unresolved-wikilinks",
 ]);
 
