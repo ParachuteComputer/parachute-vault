@@ -92,6 +92,17 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
         const { vault: _, ...rest } = params;
         const result = tool.execute(rest);
 
+        // Auto-populate metadata defaults when a tag with a schema is applied
+        if (config.tag_schemas && (coreTool.name === "tag-note" || coreTool.name === "batch-tag")) {
+          const tags = rest.tags as string[] | undefined;
+          if (tags) {
+            const noteIds = coreTool.name === "tag-note"
+              ? [rest.id as string]
+              : (rest.note_ids as string[]) ?? [];
+            populateSchemaDefaults(store, noteIds, tags, config.tag_schemas);
+          }
+        }
+
         // Soft validation: warn about missing schema fields on note-producing tools
         if (config.tag_schemas && result && typeof result === "object" && "tags" in result) {
           const warnings = checkTagSchemaWarnings(result as any, config.tag_schemas);
@@ -124,6 +135,28 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
 export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const store = getVaultStore(vaultName);
   const tools = generateMcpTools(store);
+
+  // Wrap tag tools with schema default population for scoped mode
+  const config = readVaultConfig(vaultName);
+  if (config?.tag_schemas) {
+    for (const tool of tools) {
+      if (tool.name === "tag-note" || tool.name === "batch-tag") {
+        const originalExecute = tool.execute;
+        tool.execute = (params) => {
+          const result = originalExecute(params);
+          const tags = params.tags as string[] | undefined;
+          if (tags) {
+            const noteIds = tool.name === "tag-note"
+              ? [params.id as string]
+              : (params.note_ids as string[]) ?? [];
+            populateSchemaDefaults(store, noteIds, tags, config.tag_schemas!);
+          }
+          return result;
+        };
+      }
+    }
+  }
+
   addVaultManagementTools(tools, vaultName, true);
   addTagSchemaTools(tools, vaultName, false, true);
   addSemanticSearchTools(tools, vaultName, false);
@@ -204,7 +237,59 @@ function addVaultManagementTools(tools: McpToolDef[], defaultVault: string, scop
 // Tag schema validation (soft)
 // ---------------------------------------------------------------------------
 
-import type { TagSchema } from "./config.ts";
+import type { TagSchema, TagFieldSchema } from "./config.ts";
+import type { Store } from "../core/src/types.ts";
+
+/**
+ * Auto-populate metadata defaults for notes when tags with schemas are applied.
+ * Only adds fields that are missing — never overwrites existing values.
+ * Uses skipUpdatedAt since this is system enrichment, not a user edit.
+ */
+function populateSchemaDefaults(
+  store: Store,
+  noteIds: string[],
+  tags: string[],
+  schemas: Record<string, TagSchema>,
+): void {
+  // Collect all default fields from the applied tags' schemas
+  const defaults: Record<string, unknown> = {};
+  for (const tag of tags) {
+    const schema = schemas[tag];
+    if (!schema?.fields) continue;
+    for (const [field, fieldSchema] of Object.entries(schema.fields)) {
+      if (!(field in defaults)) {
+        defaults[field] = defaultForField(fieldSchema);
+      }
+    }
+  }
+  if (Object.keys(defaults).length === 0) return;
+
+  for (const noteId of noteIds) {
+    const note = store.getNote(noteId);
+    if (!note) continue;
+    const existing = (note.metadata as Record<string, unknown> | undefined) ?? {};
+    const missing: Record<string, unknown> = {};
+    for (const [field, value] of Object.entries(defaults)) {
+      if (!(field in existing)) {
+        missing[field] = value;
+      }
+    }
+    if (Object.keys(missing).length === 0) continue;
+    store.updateNote(noteId, {
+      metadata: { ...existing, ...missing },
+      skipUpdatedAt: true,
+    });
+  }
+}
+
+function defaultForField(field: TagFieldSchema): unknown {
+  if (field.enum && field.enum.length > 0) return field.enum[0];
+  switch (field.type) {
+    case "boolean": return false;
+    case "integer": return 0;
+    default: return "";
+  }
+}
 
 /**
  * Check a note's tags against tag schemas and return warnings for missing
