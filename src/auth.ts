@@ -33,6 +33,8 @@ const READ_TOOLS = new Set([
   "list-vaults",
   "get-vault-description",
   "get-vault-stats",
+  "resolve-wikilink",
+  "list-unresolved-wikilinks",
 ]);
 
 /** Check if a tool call is allowed for a given scope. */

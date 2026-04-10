@@ -139,6 +139,94 @@ export function resolveWikilink(db: Database, target: string): string | null {
   return null;
 }
 
+/** Result of a detailed wikilink resolution. */
+export interface WikilinkResolution {
+  resolved: boolean;
+  note_id?: string;
+  path?: string;
+  ambiguous?: boolean;
+  candidates: { note_id: string; path: string }[];
+}
+
+/**
+ * Resolve a wikilink target with full detail — single match, ambiguous, or unresolved.
+ */
+export function resolveWikilinkDetailed(db: Database, target: string): WikilinkResolution {
+  // 1. Exact match (case-insensitive)
+  const exact = db.prepare(
+    "SELECT id, path FROM notes WHERE path = ? COLLATE NOCASE",
+  ).get(target) as { id: string; path: string } | undefined;
+  if (exact) {
+    return { resolved: true, note_id: exact.id, path: exact.path, candidates: [] };
+  }
+
+  // 2. Basename match
+  const basename = db.prepare(`
+    SELECT id, path FROM notes
+    WHERE path IS NOT NULL
+      AND (
+        path = ? COLLATE NOCASE
+        OR path LIKE ? COLLATE NOCASE
+      )
+  `).all(target, `%/${target}`) as { id: string; path: string }[];
+
+  if (basename.length === 1) {
+    return { resolved: true, note_id: basename[0].id, path: basename[0].path, candidates: [] };
+  }
+
+  if (basename.length > 1) {
+    return {
+      resolved: false,
+      ambiguous: true,
+      candidates: basename.map((r) => ({ note_id: r.id, path: r.path })),
+    };
+  }
+
+  return { resolved: false, ambiguous: false, candidates: [] };
+}
+
+/** Entry from the unresolved_wikilinks table. */
+export interface UnresolvedWikilink {
+  source_id: string;
+  source_path?: string;
+  target_path: string;
+}
+
+/**
+ * List unresolved wikilinks across the vault.
+ */
+export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved: UnresolvedWikilink[]; count: number } {
+  let total: number;
+  let rows: { source_id: string; target_path: string }[];
+  try {
+    total = (db.prepare("SELECT COUNT(*) as c FROM unresolved_wikilinks").get() as { c: number }).c;
+    rows = db.prepare(
+      "SELECT source_id, target_path FROM unresolved_wikilinks ORDER BY source_id LIMIT ?",
+    ).all(limit) as { source_id: string; target_path: string }[];
+  } catch {
+    // Table doesn't exist yet
+    return { unresolved: [], count: 0 };
+  }
+
+  // Hydrate source paths
+  if (rows.length === 0) return { unresolved: [], count: total };
+
+  const sourceIds = [...new Set(rows.map((r) => r.source_id))];
+  const placeholders = sourceIds.map(() => "?").join(", ");
+  const pathRows = db.prepare(
+    `SELECT id, path FROM notes WHERE id IN (${placeholders})`,
+  ).all(...sourceIds) as { id: string; path: string | null }[];
+  const pathMap = new Map(pathRows.map((r) => [r.id, r.path]));
+
+  const unresolved: UnresolvedWikilink[] = rows.map((r) => ({
+    source_id: r.source_id,
+    source_path: pathMap.get(r.source_id) ?? undefined,
+    target_path: r.target_path,
+  }));
+
+  return { unresolved, count: total };
+}
+
 // ---------------------------------------------------------------------------
 // Sync — maintain wikilink-based links for a note
 // ---------------------------------------------------------------------------

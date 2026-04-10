@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import type { Store } from "./types.js";
 import * as notes from "./notes.js";
 import * as links from "./links.js";
+import { resolveWikilinkDetailed, listUnresolvedWikilinks } from "./wikilinks.js";
 
 export interface McpToolDef {
   name: string;
@@ -431,6 +432,32 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
         params.target_id as string,
         { max_depth: Math.min((params.max_depth as number) ?? 5, 10) },
       ),
+    },
+
+    // ---- Wikilink Tools ----
+
+    {
+      name: "resolve-wikilink",
+      description: "Resolve a [[wikilink]] target to a note. Returns the matched note (resolved), multiple candidates (ambiguous), or empty (unresolved). Uses the same resolution logic as vault's write-time wikilink sync.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: { type: "string", description: "Wikilink target (e.g., 'Mickey', 'Projects/Atlas')" },
+        },
+        required: ["target"],
+      },
+      execute: (params) => resolveWikilinkDetailed(db, params.target as string),
+    },
+    {
+      name: "list-unresolved-wikilinks",
+      description: "List wikilinks that couldn't be resolved to any note. Useful for graph health audits and finding broken links.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Max results (default 50)" },
+        },
+      },
+      execute: (params) => listUnresolvedWikilinks(db, (params.limit as number) ?? 50),
     },
 
   ];
