@@ -76,7 +76,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
     },
     {
       name: "update-note",
-      description: "Update a note's content, path, or metadata.",
+      description: "Update a note's content, path, metadata, or created_at.",
       inputSchema: {
         type: "object",
         properties: {
@@ -84,6 +84,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
           content: { type: "string", description: "New content" },
           path: { type: "string", description: "New path/name" },
           metadata: { type: "object", description: "New metadata (replaces existing)" },
+          created_at: { type: "string", description: "New created_at timestamp (ISO 8601)" },
         },
         required: ["id"],
       },
@@ -93,6 +94,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
           content: params.content as string | undefined,
           path: params.path as string | undefined,
           metadata: params.metadata as Record<string, unknown> | undefined,
+          created_at: params.created_at as string | undefined,
         });
       },
     },

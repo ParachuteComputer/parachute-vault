@@ -62,6 +62,31 @@ describe("notes", () => {
     expect(updated.path).toBe("Notes/Test");
   });
 
+  it("updates created_at", () => {
+    const note = store.createNote("Test");
+    const newDate = "2025-01-15T12:00:00.000Z";
+    const updated = store.updateNote(note.id, { created_at: newDate });
+    expect(updated.createdAt).toBe(newDate);
+    expect(updated.content).toBe("Test"); // content unchanged
+    expect(updated.updatedAt).not.toBe(note.updatedAt); // updated_at bumped
+  });
+
+  it("updates metadata and created_at together", () => {
+    const note = store.createNote("Test");
+    const newDate = "2025-06-30T23:59:59.000Z";
+    const meta = { source: "import", version: 2 };
+    const updated = store.updateNote(note.id, { metadata: meta, created_at: newDate });
+    expect(updated.createdAt).toBe(newDate);
+    expect(updated.metadata).toEqual(meta);
+    expect(updated.content).toBe("Test");
+  });
+
+  it("leaves created_at unchanged when not provided", () => {
+    const note = store.createNote("Test");
+    const updated = store.updateNote(note.id, { content: "Updated" });
+    expect(updated.createdAt).toBe(note.createdAt);
+  });
+
   it("deletes a note", () => {
     const note = store.createNote("Delete me");
     store.deleteNote(note.id);
@@ -448,6 +473,25 @@ describe("MCP tools", () => {
     const result = createNote.execute({ content: "Hello", tags: ["daily"] }) as any;
     expect(result.content).toBe("Hello");
     expect(result.tags).toContain("daily");
+  });
+
+  it("update-note tool updates created_at", () => {
+    const note = store.createNote("Test");
+    const tools = generateMcpTools(db);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const newDate = "2025-03-01T00:00:00.000Z";
+    const result = updateNote.execute({ id: note.id, created_at: newDate }) as any;
+    expect(result.createdAt).toBe(newDate);
+    expect(result.content).toBe("Test");
+  });
+
+  it("update-note tool updates metadata", () => {
+    const note = store.createNote("Test");
+    const tools = generateMcpTools(db);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const meta = { importance: "high" };
+    const result = updateNote.execute({ id: note.id, metadata: meta }) as any;
+    expect(result.metadata).toEqual(meta);
   });
 
   it("read-notes tool works", () => {

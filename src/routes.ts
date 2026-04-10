@@ -93,8 +93,8 @@ export async function handleNotes(
   if (method === "PATCH" && subpath === "") {
     const existing = store.getNote(noteId);
     if (!existing) return json({ error: "Not found" }, 404);
-    const body = await req.json() as { content?: string; path?: string };
-    const updated = store.updateNote(noteId, { content: body.content, path: body.path });
+    const body = await req.json() as { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string };
+    const updated = store.updateNote(noteId, { content: body.content, path: body.path, metadata: body.metadata, created_at: body.created_at });
     return json(updated);
   }
 

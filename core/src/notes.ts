@@ -75,7 +75,7 @@ export function getNotes(db: Database, ids: string[]): Note[] {
 export function updateNote(
   db: Database,
   id: string,
-  updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean },
+  updates: { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean },
 ): Note {
   const sets: string[] = [];
   const values: unknown[] = [];
@@ -98,6 +98,10 @@ export function updateNote(
   if (updates.metadata !== undefined) {
     sets.push("metadata = ?");
     values.push(JSON.stringify(updates.metadata));
+  }
+  if (updates.created_at !== undefined) {
+    sets.push("created_at = ?");
+    values.push(updates.created_at);
   }
 
   // No-op: skipUpdatedAt with no other fields. Avoid generating invalid SQL.
