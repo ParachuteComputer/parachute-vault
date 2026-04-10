@@ -34,6 +34,7 @@ import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleLinks, handleSearch, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
+import { registerTranscriptionHook, type ScribeModule } from "./transcription-hook.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 import type { SqliteStore } from "../core/src/store.ts";
@@ -76,7 +77,38 @@ async function registerHooks(): Promise<void> {
   });
   console.log(`[hooks] tts-reader hook registered (provider=${probedProvider.name}, via parachute-narrate)`);
 }
+
+async function registerTranscriptionHooks(): Promise<void> {
+  if (process.env.AUTO_TRANSCRIBE === "false") {
+    console.log("[hooks] AUTO_TRANSCRIBE=false; skipping transcribe-capture hook");
+    return;
+  }
+
+  let scribe: ScribeModule | null = null;
+  try {
+    scribe = (await import("parachute-scribe")) as unknown as ScribeModule;
+  } catch {
+    console.log("[hooks] parachute-scribe not installed; skipping transcribe-capture hook");
+    return;
+  }
+
+  registerTranscriptionHook(defaultHookRegistry, {
+    scribe,
+    transcribeProvider: process.env.TRANSCRIBE_PROVIDER,
+    cleanupProvider: process.env.CLEANUP_PROVIDER,
+    resolveAssetsDir: (store) => {
+      const name = getVaultNameForStore(store as SqliteStore);
+      if (!name) {
+        throw new Error("transcription-hook: store is not registered with a vault");
+      }
+      return assetsDir(name);
+    },
+  });
+  console.log("[hooks] transcribe-capture hook registered (via parachute-scribe)");
+}
+
 await registerHooks();
+await registerTranscriptionHooks();
 
 ensureConfigDirSync();
 loadEnvFile();
