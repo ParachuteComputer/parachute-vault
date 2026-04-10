@@ -1,11 +1,20 @@
 /**
- * Streamable HTTP MCP transport.
+ * Streamable HTTP MCP transport — stateless mode.
+ *
+ * Each request gets a fresh transport+server pair with no session ID
+ * generator. The SDK skips session validation when sessionIdGenerator
+ * is undefined, so clients can send `tools/call` or `tools/list`
+ * directly without a prior `initialize` handshake.
+ *
+ * This means server restarts never break existing MCP clients — the
+ * root cause of vault#56. The `initialize` method still works if a
+ * client sends it (the Server class handles it natively).
  *
  * Two modes:
  *   /mcp              — unified, all vaults via `vault` param + list-vaults
  *   /vaults/{name}/mcp — scoped to one vault, no vault param
  *
- * Vault description is sent as the MCP server instruction on session init.
+ * Vault description is sent as the MCP server instruction.
  * Read-only keys see fewer tools.
  */
 
@@ -19,14 +28,6 @@ import { generateUnifiedMcpTools, generateScopedMcpTools, getServerInstruction }
 import { isToolAllowed } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import type { KeyScope } from "./config.ts";
-import crypto from "node:crypto";
-
-interface Session {
-  transport: WebStandardStreamableHTTPServerTransport;
-  server: Server;
-}
-
-const sessions = new Map<string, Session>();
 
 /** Handle unified MCP at /mcp (all vaults). */
 export async function handleUnifiedMcp(req: Request, scope: KeyScope): Promise<Response> {
@@ -47,32 +48,9 @@ async function handleMcp(
   scope: KeyScope,
   instruction: string,
 ): Promise<Response> {
-  const sessionId = req.headers.get("mcp-session-id");
-  const existing = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (existing) {
-    return existing.transport.handleRequest(req);
-  }
-
-  const session = createSession(getTools(), serverName, scope, instruction);
-  await session.server.connect(session.transport);
-  return session.transport.handleRequest(req);
-}
-
-function createSession(
-  mcpTools: McpToolDef[],
-  serverName: string,
-  scope: KeyScope,
-  instruction: string,
-): Session {
   const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
-    onsessioninitialized: (id) => {
-      sessions.set(id, session);
-    },
-    onsessionclosed: (id) => {
-      sessions.delete(id);
-    },
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
   });
 
   const server = new Server(
@@ -82,6 +60,8 @@ function createSession(
       instructions: instruction,
     },
   );
+
+  const mcpTools = getTools();
 
   // For read-only keys, only list readable tools
   const visibleTools = scope === "read"
@@ -127,6 +107,6 @@ function createSession(
     }
   });
 
-  const session: Session = { transport, server };
-  return session;
+  await server.connect(transport);
+  return transport.handleRequest(req);
 }

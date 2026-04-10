@@ -852,3 +852,129 @@ describe("auth scopes", () => {
     expect(isMethodAllowed("DELETE", "read")).toBe(false);
   });
 });
+
+describe("stateless MCP transport", () => {
+  test("tools/call works without prior initialize handshake", async () => {
+    const { handleUnifiedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `stateless-mcp-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const vaultStore = getVaultStore(vaultName);
+    vaultStore.createNote("test note", { tags: ["daily"] });
+
+    // Direct tools/call — no initialize, no session header
+    const req = new Request("http://localhost:1940/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "get-vault-stats", arguments: { vault: vaultName } },
+      }),
+    });
+
+    const res = await handleUnifiedMcp(req, "write");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as any;
+    expect(body.result).toBeDefined();
+    const content = JSON.parse(body.result.content[0].text);
+    expect(content.total_notes).toBe(1);
+
+    closeAllStores();
+  });
+
+  test("tools/list works without prior initialize handshake", async () => {
+    const { handleUnifiedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `stateless-list-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const req = new Request("http://localhost:1940/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {},
+      }),
+    });
+
+    const res = await handleUnifiedMcp(req, "write");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as any;
+    expect(body.result.tools).toBeDefined();
+    expect(body.result.tools.length).toBeGreaterThan(0);
+    const toolNames = body.result.tools.map((t: any) => t.name);
+    expect(toolNames).toContain("create-note");
+    expect(toolNames).toContain("get-vault-stats");
+
+    closeAllStores();
+  });
+
+  test("initialize still works for clients that send it", async () => {
+    const { handleUnifiedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `stateless-init-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const req = new Request("http://localhost:1940/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1.0" },
+        },
+      }),
+    });
+
+    const res = await handleUnifiedMcp(req, "write");
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as any;
+    expect(body.result.protocolVersion).toBe("2024-11-05");
+    expect(body.result.serverInfo.name).toBe("parachute-vault");
+    expect(body.result.capabilities.tools).toBeDefined();
+
+    closeAllStores();
+  });
+});
