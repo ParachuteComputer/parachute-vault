@@ -657,6 +657,120 @@ describe("unified MCP wrapper", () => {
 
     closeAllStores();
   });
+
+  test("tag-note auto-populates metadata defaults from tag schema", async () => {
+    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
+
+    const vaultName = `schema-defaults-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      tag_schemas: {
+        person: {
+          description: "A person",
+          fields: {
+            first_appeared: { type: "string", description: "When" },
+            relationship: { type: "string", description: "How" },
+          },
+        },
+        project: {
+          description: "A project",
+          fields: {
+            status: { type: "string", enum: ["active", "completed", "abandoned"], description: "Status" },
+            active: { type: "boolean", description: "Is active" },
+            priority: { type: "integer", description: "Priority level" },
+          },
+        },
+      },
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const vaultStore = getVaultStore(vaultName);
+    const tools = generateUnifiedMcpTools();
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const tagNote = tools.find((t) => t.name === "tag-note")!;
+    const getNote = tools.find((t) => t.name === "get-note")!;
+
+    // Create a note, then tag it with #person
+    const note = createNote.execute({ vault: vaultName, content: "Alice" }) as any;
+    tagNote.execute({ vault: vaultName, id: note.id, tags: ["person"] });
+    const after = getNote.execute({ vault: vaultName, id: note.id }) as any;
+    expect(after.metadata.first_appeared).toBe("");
+    expect(after.metadata.relationship).toBe("");
+
+    // Tag note that already has partial metadata — only missing fields populated
+    const note2 = createNote.execute({
+      vault: vaultName,
+      content: "Bob",
+      metadata: { first_appeared: "2023-11" },
+    }) as any;
+    tagNote.execute({ vault: vaultName, id: note2.id, tags: ["person"] });
+    const after2 = getNote.execute({ vault: vaultName, id: note2.id }) as any;
+    expect(after2.metadata.first_appeared).toBe("2023-11"); // preserved
+    expect(after2.metadata.relationship).toBe(""); // added
+
+    // Tag with no schema — no metadata changes
+    const note3 = createNote.execute({ vault: vaultName, content: "No schema" }) as any;
+    tagNote.execute({ vault: vaultName, id: note3.id, tags: ["random"] });
+    const after3 = getNote.execute({ vault: vaultName, id: note3.id }) as any;
+    expect(after3.metadata).toBeUndefined();
+
+    // Tag with #project — enum defaults to first value, boolean to false, integer to 0
+    const note4 = createNote.execute({ vault: vaultName, content: "My Project" }) as any;
+    tagNote.execute({ vault: vaultName, id: note4.id, tags: ["project"] });
+    const after4 = getNote.execute({ vault: vaultName, id: note4.id }) as any;
+    expect(after4.metadata.status).toBe("active");
+    expect(after4.metadata.active).toBe(false);
+    expect(after4.metadata.priority).toBe(0);
+
+    // Multiple schema tags at once — all defaults merged
+    const note5 = createNote.execute({ vault: vaultName, content: "Multi" }) as any;
+    tagNote.execute({ vault: vaultName, id: note5.id, tags: ["person", "project"] });
+    const after5 = getNote.execute({ vault: vaultName, id: note5.id }) as any;
+    expect(after5.metadata.first_appeared).toBe("");
+    expect(after5.metadata.relationship).toBe("");
+    expect(after5.metadata.status).toBe("active");
+    expect(after5.metadata.active).toBe(false);
+
+    close();
+  });
+
+  test("tag-note auto-populate does not bump updatedAt", async () => {
+    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
+
+    const vaultName = `schema-noupdate-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      tag_schemas: {
+        person: {
+          description: "A person",
+          fields: { name: { type: "string" } },
+        },
+      },
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const tools = generateUnifiedMcpTools();
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const tagNote = tools.find((t) => t.name === "tag-note")!;
+    const getNote = tools.find((t) => t.name === "get-note")!;
+
+    const note = createNote.execute({ vault: vaultName, content: "Test" }) as any;
+    const originalUpdatedAt = note.updatedAt;
+    tagNote.execute({ vault: vaultName, id: note.id, tags: ["person"] });
+    const after = getNote.execute({ vault: vaultName, id: note.id }) as any;
+    expect(after.updatedAt).toBe(originalUpdatedAt);
+    expect(after.metadata.name).toBe("");
+
+    close();
+  });
 });
 
 describe("auth scopes", () => {
