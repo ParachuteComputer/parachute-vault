@@ -464,7 +464,8 @@ describe("MCP tools", () => {
     expect(names).toContain("find-path");
     expect(names).toContain("get-note");
     expect(names).toContain("get-vault-stats");
-    expect(tools).toHaveLength(18);
+    expect(names).toContain("delete-tag");
+    expect(tools).toHaveLength(19);
   });
 
   it("create-note tool works", () => {
@@ -667,6 +668,61 @@ describe("MCP tools", () => {
     const deleteLink = tools.find((t) => t.name === "delete-link")!;
     deleteLink.execute({ source_id: "a", target_id: "b", relationship: "mentions" });
     expect((getLinks.execute({ id: "a" }) as any[]).length).toBe(0);
+  });
+
+  it("delete-tag with zero notes removes tag from list", () => {
+    store.createNote("Test", { tags: ["ephemeral"] });
+    store.untagNote(store.queryNotes({}).find((n) => n.tags?.includes("ephemeral"))!.id, ["ephemeral"]);
+    // Tag exists in tags table but has 0 notes
+    const before = store.listTags();
+    expect(before.some((t) => t.name === "ephemeral")).toBe(true);
+
+    const result = store.deleteTag("ephemeral");
+    expect(result).toEqual({ deleted: true, notes_untagged: 0 });
+
+    const after = store.listTags();
+    expect(after.some((t) => t.name === "ephemeral")).toBe(false);
+  });
+
+  it("delete-tag with N notes untags all but preserves notes", () => {
+    const n1 = store.createNote("A", { tags: ["doomed"] });
+    const n2 = store.createNote("B", { tags: ["doomed", "keeper"] });
+
+    const result = store.deleteTag("doomed");
+    expect(result).toEqual({ deleted: true, notes_untagged: 2 });
+
+    // Notes still exist
+    expect(store.getNote(n1.id)).not.toBeNull();
+    expect(store.getNote(n2.id)).not.toBeNull();
+
+    // Tags removed from notes
+    expect(store.getNote(n1.id)!.tags).not.toContain("doomed");
+    expect(store.getNote(n2.id)!.tags).not.toContain("doomed");
+    // Other tags preserved
+    expect(store.getNote(n2.id)!.tags).toContain("keeper");
+
+    // Tag no longer in list
+    expect(store.listTags().some((t) => t.name === "doomed")).toBe(false);
+  });
+
+  it("delete-tag nonexistent returns deleted: false", () => {
+    const result = store.deleteTag("never-existed");
+    expect(result).toEqual({ deleted: false, notes_untagged: 0 });
+  });
+
+  it("delete-tag MCP tool works", () => {
+    const tools = generateMcpTools(db);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    createNote.execute({ content: "Test", tags: ["mcp-tag"] });
+
+    const deleteTool = tools.find((t) => t.name === "delete-tag")!;
+    const result = deleteTool.execute({ tag: "mcp-tag" }) as any;
+    expect(result.deleted).toBe(true);
+    expect(result.notes_untagged).toBe(1);
+
+    const listTool = tools.find((t) => t.name === "list-tags")!;
+    const tags = listTool.execute({}) as any[];
+    expect(tags.some((t: any) => t.name === "mcp-tag")).toBe(false);
   });
 
   it("create-note via store triggers wikilink sync", () => {

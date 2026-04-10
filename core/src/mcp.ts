@@ -312,6 +312,21 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
       execute: () => notes.listTags(db),
     },
     {
+      name: "delete-tag",
+      description: "Delete a tag and remove it from all notes. Notes themselves are NOT deleted — just untagged. Use this to clean up unused or obsolete tags.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "Tag name to delete" },
+        },
+        required: ["tag"],
+      },
+      execute: (params) => {
+        const fn = store ? store.deleteTag.bind(store) : (name: string) => notes.deleteTag(db, name);
+        return fn(params.tag as string);
+      },
+    },
+    {
       name: "get-vault-stats",
       description: "Get a birds-eye view of the vault: total note count, earliest/latest note, note distribution by month, top tags, and tag count. Read-only, cheap aggregation. Call once at the start of a session to orient before doing vault-wide work (monthly summaries, reviews, trend tracking). For filtered queries use read-notes; for a full tag list use list-tags.",
       inputSchema: { type: "object", properties: {} },

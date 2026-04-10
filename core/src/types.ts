@@ -91,6 +91,7 @@ export interface Store {
   tagNote(noteId: string, tags: string[]): void;
   untagNote(noteId: string, tags: string[]): void;
   listTags(): { name: string; count: number }[];
+  deleteTag(name: string): { deleted: boolean; notes_untagged: number };
 
   // Vault stats (aggregate, read-only)
   getVaultStats(opts?: { topTagsLimit?: number }): VaultStats;

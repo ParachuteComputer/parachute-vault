@@ -148,6 +148,10 @@ export class SqliteStore implements Store {
     return noteOps.listTags(this.db);
   }
 
+  deleteTag(name: string): { deleted: boolean; notes_untagged: number } {
+    return noteOps.deleteTag(this.db, name);
+  }
+
   // ---- Vault Stats ----
 
   getVaultStats(opts?: { topTagsLimit?: number }) {
