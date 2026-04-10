@@ -468,9 +468,9 @@ describe("deeper link queries", () => {
 });
 
 describe("MCP tools", () => {
-  test("generates all 18 core tools", () => {
+  test("generates all 19 core tools", () => {
     const tools = generateMcpTools(db);
-    expect(tools.length).toBe(18);
+    expect(tools.length).toBe(19);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("get-note");

@@ -255,7 +255,7 @@ async function route(req: Request, path: string): Promise<Response> {
     const store = getVaultStore(defaultVault);
     const apiPath = path.slice(4); // strip "/api"
     if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
-    if (apiPath === "/tags") return handleTags(req, store);
+    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/links") return handleLinks(req, store);
     if (apiPath === "/search") return handleSearch(req, store);
     if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
@@ -308,8 +308,8 @@ async function route(req: Request, path: string): Promise<Response> {
   if (apiPath.startsWith("/notes")) {
     return handleNotes(req, store, apiPath.slice(6));
   }
-  if (apiPath === "/tags") {
-    return handleTags(req, store);
+  if (apiPath.startsWith("/tags")) {
+    return handleTags(req, store, apiPath.slice(5));
   }
   if (apiPath === "/links") {
     return handleLinks(req, store);

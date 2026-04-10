@@ -278,6 +278,19 @@ export function listTags(db: Database): { name: string; count: number }[] {
   return rows;
 }
 
+export function deleteTag(db: Database, name: string): { deleted: boolean; notes_untagged: number } {
+  const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(name);
+  if (!exists) return { deleted: false, notes_untagged: 0 };
+
+  const countRow = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?").get(name) as { c: number };
+  const notesUntagged = countRow.c;
+
+  db.prepare("DELETE FROM note_tags WHERE tag_name = ?").run(name);
+  db.prepare("DELETE FROM tags WHERE name = ?").run(name);
+
+  return { deleted: true, notes_untagged: notesUntagged };
+}
+
 // ---- Vault stats (aggregate situational awareness) ----
 
 /**

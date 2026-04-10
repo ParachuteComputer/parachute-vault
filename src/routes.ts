@@ -156,10 +156,19 @@ export async function handleNotes(
 // Tags
 // ---------------------------------------------------------------------------
 
-export function handleTags(req: Request, store: Store): Response {
-  if (req.method === "GET") {
+export function handleTags(req: Request, store: Store, subpath = ""): Response {
+  if (req.method === "GET" && subpath === "") {
     return json(store.listTags());
   }
+
+  // DELETE /tags/:name
+  const nameMatch = subpath.match(/^\/(.+)$/);
+  if (req.method === "DELETE" && nameMatch) {
+    const tagName = decodeURIComponent(nameMatch[1]);
+    const result = store.deleteTag(tagName);
+    return json(result);
+  }
+
   return json({ error: "Method not allowed" }, 405);
 }
 
