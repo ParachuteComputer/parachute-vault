@@ -1,7 +1,4 @@
 import { describe, test, expect } from "bun:test";
-import { mkdirSync, rmSync, readFileSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
 import {
   writeVaultConfig,
   readVaultConfig,
@@ -24,14 +21,6 @@ describe("config", () => {
   });
 
   test("round-trips vault config", () => {
-    const tmpDir = join(tmpdir(), `config-test-${Date.now()}`);
-    mkdirSync(join(tmpDir, "testvault"), { recursive: true });
-
-    // Monkey-patch vaultDir for this test
-    const original = require("./config.ts");
-    const origVaultDir = original.vaultDir;
-    const origVaultConfigPath = original.vaultConfigPath;
-
     const config: VaultConfig = {
       name: "testvault",
       description: "A test vault for testing",
@@ -55,8 +44,6 @@ describe("config", () => {
     expect(loaded!.description).toBe("A test vault for testing");
     expect(loaded!.api_keys.length).toBe(1);
     expect(loaded!.api_keys[0].id).toBe("k_abc123");
-
-    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   test("round-trips tag_schemas in vault config", () => {

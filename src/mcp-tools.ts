@@ -92,23 +92,8 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
         const { vault: _, ...rest } = params;
         const result = tool.execute(rest);
 
-        // Auto-populate metadata defaults when a tag with a schema is applied
-        if (config.tag_schemas && (coreTool.name === "tag-note" || coreTool.name === "batch-tag")) {
-          const tags = rest.tags as string[] | undefined;
-          if (tags) {
-            const noteIds = coreTool.name === "tag-note"
-              ? [rest.id as string]
-              : (rest.note_ids as string[]) ?? [];
-            populateSchemaDefaults(store, noteIds, tags, config.tag_schemas);
-          }
-        }
-
-        // Soft validation: warn about missing schema fields on note-producing tools
-        if (config.tag_schemas && result && typeof result === "object" && "tags" in result) {
-          const warnings = checkTagSchemaWarnings(result as any, config.tag_schemas);
-          if (warnings.length > 0) {
-            (result as any)._schema_warnings = warnings;
-          }
+        if (config.tag_schemas) {
+          applyTagSchemaEffects(coreTool.name, result, rest, store, config.tag_schemas);
         }
 
         return result;
@@ -136,21 +121,17 @@ export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const store = getVaultStore(vaultName);
   const tools = generateMcpTools(store);
 
-  // Wrap tag tools with schema default population for scoped mode
+  // Wrap tools with schema effects (defaults + warnings) for scoped mode
   const config = readVaultConfig(vaultName);
   if (config?.tag_schemas) {
+    const schemas = config.tag_schemas;
     for (const tool of tools) {
-      if (tool.name === "tag-note" || tool.name === "batch-tag") {
+      if (SCHEMA_EFFECT_TOOLS.has(tool.name)) {
         const originalExecute = tool.execute;
+        const toolName = tool.name;
         tool.execute = (params) => {
           const result = originalExecute(params);
-          const tags = params.tags as string[] | undefined;
-          if (tags) {
-            const noteIds = tool.name === "tag-note"
-              ? [params.id as string]
-              : (params.note_ids as string[]) ?? [];
-            populateSchemaDefaults(store, noteIds, tags, config.tag_schemas!);
-          }
+          applyTagSchemaEffects(toolName, result, params, store, schemas);
           return result;
         };
       }
@@ -239,6 +220,69 @@ function addVaultManagementTools(tools: McpToolDef[], defaultVault: string, scop
 
 import type { TagSchema, TagFieldSchema } from "./config.ts";
 import type { Store } from "../core/src/types.ts";
+
+/** Tools that can trigger schema effects (defaults + warnings). */
+const SCHEMA_EFFECT_TOOLS = new Set([
+  "create-note", "create-notes", "tag-note", "batch-tag",
+]);
+
+/**
+ * Unified schema effects: auto-populate defaults + attach warnings.
+ * Handles all tool shapes: note-returning (create-note), array-returning
+ * (create-notes), and non-note-returning (tag-note, batch-tag).
+ */
+function applyTagSchemaEffects(
+  toolName: string,
+  result: unknown,
+  params: Record<string, unknown>,
+  store: Store,
+  schemas: Record<string, TagSchema>,
+): void {
+  if (toolName === "create-note") {
+    // create-note returns a Note with tags — populate defaults + warn
+    const note = result as { id: string; tags?: string[]; metadata?: Record<string, unknown> };
+    if (note.tags) {
+      populateSchemaDefaults(store, [note.id], note.tags, schemas);
+      // Re-read for accurate warnings after defaults are populated
+      const fresh = store.getNote(note.id);
+      if (fresh) {
+        const warnings = checkTagSchemaWarnings(
+          { tags: fresh.tags, metadata: fresh.metadata as Record<string, unknown> | undefined },
+          schemas,
+        );
+        if (warnings.length > 0) (result as any)._schema_warnings = warnings;
+      }
+    }
+  } else if (toolName === "create-notes") {
+    // create-notes returns an array of Notes
+    const notes = result as Array<{ id: string; tags?: string[] }>;
+    for (const note of notes) {
+      if (note.tags) {
+        populateSchemaDefaults(store, [note.id], note.tags, schemas);
+      }
+    }
+  } else if (toolName === "tag-note") {
+    const noteId = params.id as string;
+    const tags = params.tags as string[] | undefined;
+    if (tags) {
+      populateSchemaDefaults(store, [noteId], tags, schemas);
+      const fresh = store.getNote(noteId);
+      if (fresh) {
+        const warnings = checkTagSchemaWarnings(
+          { tags: fresh.tags, metadata: fresh.metadata as Record<string, unknown> | undefined },
+          schemas,
+        );
+        if (warnings.length > 0) (result as any)._schema_warnings = warnings;
+      }
+    }
+  } else if (toolName === "batch-tag") {
+    const noteIds = (params.note_ids as string[]) ?? [];
+    const tags = params.tags as string[] | undefined;
+    if (tags) {
+      populateSchemaDefaults(store, noteIds, tags, schemas);
+    }
+  }
+}
 
 /**
  * Auto-populate metadata defaults for notes when tags with schemas are applied.

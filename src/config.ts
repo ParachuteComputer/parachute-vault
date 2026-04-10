@@ -125,7 +125,7 @@ function serializeVaultConfig(config: VaultConfig): string {
             lines.push(`        description: "${fieldSchema.description}"`);
           }
           if (fieldSchema.enum) {
-            lines.push(`        enum: [${fieldSchema.enum.join(", ")}]`);
+            lines.push(`        enum: [${fieldSchema.enum.map((v) => `"${v}"`).join(", ")}]`);
           }
         }
       }
@@ -252,7 +252,9 @@ function parseTagSchemas(yaml: string): Record<string, TagSchema> | undefined {
       }
       const enumMatch = line.match(/^\s{8}enum:\s*\[([^\]]*)\]/);
       if (enumMatch) {
-        schemas[currentTag].fields![currentField].enum = enumMatch[1].split(",").map((s) => s.trim());
+        schemas[currentTag].fields![currentField].enum = enumMatch[1]
+          .split(",")
+          .map((s) => s.trim().replace(/^"(.*)"$/, "$1"));
       }
     }
   }
