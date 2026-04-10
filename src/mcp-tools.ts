@@ -90,13 +90,26 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
         const vaultTools = generateMcpTools(store);
         const tool = vaultTools.find((t) => t.name === coreTool.name)!;
         const { vault: _, ...rest } = params;
-        return tool.execute(rest);
+        const result = tool.execute(rest);
+
+        // Soft validation: warn about missing schema fields on note-producing tools
+        if (config.tag_schemas && result && typeof result === "object" && "tags" in result) {
+          const warnings = checkTagSchemaWarnings(result as any, config.tag_schemas);
+          if (warnings.length > 0) {
+            (result as any)._schema_warnings = warnings;
+          }
+        }
+
+        return result;
       },
     };
   });
 
   // Vault management tools
   addVaultManagementTools(tools, defaultVault);
+
+  // Tag schema tools
+  addTagSchemaTools(tools, defaultVault, multiVault);
 
   // Semantic search tools (if embeddings configured)
   addSemanticSearchTools(tools, defaultVault, multiVault);
@@ -112,6 +125,7 @@ export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const store = getVaultStore(vaultName);
   const tools = generateMcpTools(store);
   addVaultManagementTools(tools, vaultName, true);
+  addTagSchemaTools(tools, vaultName, false, true);
   addSemanticSearchTools(tools, vaultName, false);
   return tools;
 }
@@ -182,6 +196,84 @@ function addVaultManagementTools(tools: McpToolDef[], defaultVault: string, scop
       config.description = params.description as string;
       writeVaultConfig(config);
       return { updated: true, name, description: config.description };
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tag schema validation (soft)
+// ---------------------------------------------------------------------------
+
+import type { TagSchema } from "./config.ts";
+
+/**
+ * Check a note's tags against tag schemas and return warnings for missing
+ * metadata fields. Purely advisory — never rejects a write.
+ */
+function checkTagSchemaWarnings(
+  note: { tags?: string[]; metadata?: Record<string, unknown> },
+  schemas: Record<string, TagSchema>,
+): string[] {
+  const warnings: string[] = [];
+  if (!note.tags) return warnings;
+
+  for (const tag of note.tags) {
+    const schema = schemas[tag];
+    if (!schema?.fields) continue;
+    const meta = note.metadata ?? {};
+    const missing = Object.keys(schema.fields).filter((f) => !(f in meta));
+    if (missing.length > 0) {
+      warnings.push(`Tag "${tag}" expects metadata fields: ${missing.join(", ")}`);
+    }
+  }
+
+  return warnings;
+}
+
+// ---------------------------------------------------------------------------
+// Tag schema tools
+// ---------------------------------------------------------------------------
+
+function addTagSchemaTools(tools: McpToolDef[], defaultVault: string, multiVault = false, scoped = false) {
+  tools.push({
+    name: "list-tag-schemas",
+    description: "List all tag schemas defined for this vault. Tag schemas describe the expected metadata fields for notes with specific tags.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(scoped ? {} : {
+          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+        }),
+      },
+    },
+    execute: (params) => {
+      const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
+      const config = readVaultConfig(name);
+      if (!config) throw new Error(`Vault "${name}" not found`);
+      return config.tag_schemas ?? {};
+    },
+  });
+
+  tools.push({
+    name: "describe-tag",
+    description: "Get the schema for a specific tag — its description and expected metadata fields. Returns null if no schema is defined for the tag.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(scoped ? {} : {
+          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+        }),
+        tag: { type: "string", description: "Tag name to describe" },
+      },
+      required: ["tag"],
+    },
+    execute: (params) => {
+      const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
+      const config = readVaultConfig(name);
+      if (!config) throw new Error(`Vault "${name}" not found`);
+      const tag = params.tag as string;
+      const schema = config.tag_schemas?.[tag];
+      return schema ?? null;
     },
   });
 }

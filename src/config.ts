@@ -57,11 +57,23 @@ export interface StoredKey {
   last_used_at?: string;
 }
 
+export interface TagFieldSchema {
+  type: string;
+  description?: string;
+  enum?: string[];
+}
+
+export interface TagSchema {
+  description?: string;
+  fields?: Record<string, TagFieldSchema>;
+}
+
 export interface VaultConfig {
   name: string;
   description?: string;
   api_keys: StoredKey[];
   created_at: string;
+  tag_schemas?: Record<string, TagSchema>;
 }
 
 export interface GlobalConfig {
@@ -94,6 +106,29 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push(`    created_at: "${key.created_at}"`);
     if (key.last_used_at) {
       lines.push(`    last_used_at: "${key.last_used_at}"`);
+    }
+  }
+
+  if (config.tag_schemas && Object.keys(config.tag_schemas).length > 0) {
+    lines.push("tag_schemas:");
+    for (const [tag, schema] of Object.entries(config.tag_schemas)) {
+      lines.push(`  ${tag}:`);
+      if (schema.description) {
+        lines.push(`    description: "${schema.description}"`);
+      }
+      if (schema.fields && Object.keys(schema.fields).length > 0) {
+        lines.push("    fields:");
+        for (const [field, fieldSchema] of Object.entries(schema.fields)) {
+          lines.push(`      ${field}:`);
+          lines.push(`        type: ${fieldSchema.type}`);
+          if (fieldSchema.description) {
+            lines.push(`        description: "${fieldSchema.description}"`);
+          }
+          if (fieldSchema.enum) {
+            lines.push(`        enum: [${fieldSchema.enum.join(", ")}]`);
+          }
+        }
+      }
     }
   }
 
@@ -148,7 +183,81 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
     }
   }
 
+  // Parse tag_schemas
+  config.tag_schemas = parseTagSchemas(yaml);
+
   return config;
+}
+
+/**
+ * Parse the tag_schemas section from vault.yaml.
+ * Uses line-by-line indent tracking since the main parser is hand-rolled.
+ */
+function parseTagSchemas(yaml: string): Record<string, TagSchema> | undefined {
+  const startMatch = yaml.match(/^tag_schemas:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const schemas: Record<string, TagSchema> = {};
+  let currentTag: string | null = null;
+  let currentField: string | null = null;
+
+  for (const line of lines) {
+    // Stop at next top-level key (no indent)
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+
+    if (indent === 2) {
+      // Tag name (e.g., "  person:")
+      const tagMatch = line.match(/^\s{2}(\S+):\s*$/);
+      if (tagMatch) {
+        currentTag = tagMatch[1];
+        currentField = null;
+        schemas[currentTag] = {};
+      }
+    } else if (indent === 4 && currentTag) {
+      // Tag-level property (description, fields:)
+      const descMatch = line.match(/^\s{4}description:\s*"?([^"]*)"?\s*$/);
+      if (descMatch) {
+        schemas[currentTag].description = descMatch[1];
+        continue;
+      }
+      const fieldsMatch = line.match(/^\s{4}fields:\s*$/);
+      if (fieldsMatch) {
+        schemas[currentTag].fields = schemas[currentTag].fields ?? {};
+        currentField = null;
+      }
+    } else if (indent === 6 && currentTag && schemas[currentTag].fields !== undefined) {
+      // Field name (e.g., "      first_appeared:")
+      const fieldMatch = line.match(/^\s{6}(\S+):\s*$/);
+      if (fieldMatch) {
+        currentField = fieldMatch[1];
+        schemas[currentTag].fields![currentField] = { type: "string" };
+      }
+    } else if (indent === 8 && currentTag && currentField && schemas[currentTag].fields) {
+      // Field property (type, description, enum)
+      const typeMatch = line.match(/^\s{8}type:\s*(\S+)/);
+      if (typeMatch) {
+        schemas[currentTag].fields![currentField].type = typeMatch[1];
+        continue;
+      }
+      const fdescMatch = line.match(/^\s{8}description:\s*"?([^"]*)"?\s*$/);
+      if (fdescMatch) {
+        schemas[currentTag].fields![currentField].description = fdescMatch[1];
+        continue;
+      }
+      const enumMatch = line.match(/^\s{8}enum:\s*\[([^\]]*)\]/);
+      if (enumMatch) {
+        schemas[currentTag].fields![currentField].enum = enumMatch[1].split(",").map((s) => s.trim());
+      }
+    }
+  }
+
+  return Object.keys(schemas).length > 0 ? schemas : undefined;
 }
 
 // ---------------------------------------------------------------------------
