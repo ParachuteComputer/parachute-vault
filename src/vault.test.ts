@@ -609,12 +609,12 @@ describe("unified MCP wrapper", () => {
     closeAllStores();
   });
 
-  test("soft schema validation warns about missing metadata fields", async () => {
+  test("create-note with schema tag auto-populates defaults and produces no warnings", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
-    const { closeAllStores } = await import("./vault-store.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
-    const vaultName = `schema-warn-${Date.now()}`;
+    const vaultName = `schema-create-${Date.now()}`;
     writeVaultConfig({
       name: vaultName,
       api_keys: [],
@@ -633,20 +633,23 @@ describe("unified MCP wrapper", () => {
 
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
+    const getNote = tools.find((t) => t.name === "get-note")!;
 
-    // Create a note tagged person with no metadata — should get warnings
+    // Create a note tagged person with no metadata — defaults auto-populated, no warnings
     const result = createNote.execute({
       vault: vaultName,
       content: "Alice",
       tags: ["person"],
     }) as any;
     expect(result.content).toBe("Alice");
-    expect(result._schema_warnings).toBeDefined();
-    expect(result._schema_warnings.length).toBe(1);
-    expect(result._schema_warnings[0]).toContain("first_appeared");
-    expect(result._schema_warnings[0]).toContain("relationship");
+    expect(result._schema_warnings).toBeUndefined(); // defaults cover all fields
 
-    // Create with metadata — no warnings
+    // Verify defaults were written
+    const fresh = getNote.execute({ vault: vaultName, id: result.id }) as any;
+    expect(fresh.metadata.first_appeared).toBe("");
+    expect(fresh.metadata.relationship).toBe("");
+
+    // Create with explicit metadata — preserved, no warnings
     const result2 = createNote.execute({
       vault: vaultName,
       content: "Bob",
@@ -654,6 +657,38 @@ describe("unified MCP wrapper", () => {
       metadata: { first_appeared: "2024-01", relationship: "friend" },
     }) as any;
     expect(result2._schema_warnings).toBeUndefined();
+    const fresh2 = getNote.execute({ vault: vaultName, id: result2.id }) as any;
+    expect(fresh2.metadata.first_appeared).toBe("2024-01");
+    expect(fresh2.metadata.relationship).toBe("friend");
+
+    closeAllStores();
+  });
+
+  test("tag-note with schema tag produces warnings for remaining missing fields", async () => {
+    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `schema-tagwarn-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      tag_schemas: {
+        // Schema with no fields — warnings check but defaults don't help
+        empty: { description: "No fields" },
+      },
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const tools = generateUnifiedMcpTools();
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const tagNote = tools.find((t) => t.name === "tag-note")!;
+
+    // tag-note: tag with schema that has no fields → no warnings
+    const note = createNote.execute({ vault: vaultName, content: "Test" }) as any;
+    const tagResult = tagNote.execute({ vault: vaultName, id: note.id, tags: ["empty"] }) as any;
+    expect(tagResult._schema_warnings).toBeUndefined();
 
     closeAllStores();
   });
