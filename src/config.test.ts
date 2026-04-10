@@ -58,4 +58,81 @@ describe("config", () => {
 
     rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  test("round-trips tag_schemas in vault config", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [
+        {
+          id: "k_abc123",
+          label: "default",
+          scope: "write",
+          key_hash: "sha256:fakehash",
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      created_at: "2026-01-01T00:00:00.000Z",
+      tag_schemas: {
+        person: {
+          description: "A person in Aaron's life",
+          fields: {
+            first_appeared: {
+              type: "string",
+              description: "When this person first appeared",
+            },
+            relationship: {
+              type: "string",
+              description: "How they relate to Aaron",
+            },
+          },
+        },
+        project: {
+          description: "A project",
+          fields: {
+            status: {
+              type: "string",
+              enum: ["active", "completed", "abandoned"],
+              description: "Current project status",
+            },
+          },
+        },
+        "summary/monthly": {
+          description: "Monthly summary note",
+        },
+      },
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.tag_schemas).toBeDefined();
+
+    const person = loaded!.tag_schemas!.person;
+    expect(person.description).toBe("A person in Aaron's life");
+    expect(person.fields!.first_appeared.type).toBe("string");
+    expect(person.fields!.first_appeared.description).toBe("When this person first appeared");
+    expect(person.fields!.relationship.type).toBe("string");
+
+    const project = loaded!.tag_schemas!.project;
+    expect(project.fields!.status.enum).toEqual(["active", "completed", "abandoned"]);
+
+    const monthly = loaded!.tag_schemas!["summary/monthly"];
+    expect(monthly.description).toBe("Monthly summary note");
+    expect(monthly.fields).toBeUndefined();
+  });
+
+  test("vault config without tag_schemas loads cleanly", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.tag_schemas).toBeUndefined();
+  });
 });

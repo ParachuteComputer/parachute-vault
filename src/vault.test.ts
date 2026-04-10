@@ -563,6 +563,100 @@ describe("unified MCP wrapper", () => {
 
     closeAllStores();
   });
+
+  test("list-tag-schemas and describe-tag tools work", async () => {
+    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tag-schema-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      tag_schemas: {
+        person: {
+          description: "A person",
+          fields: {
+            name: { type: "string", description: "Full name" },
+          },
+        },
+        project: {
+          description: "A project",
+        },
+      },
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const tools = generateUnifiedMcpTools();
+
+    const listTool = tools.find((t) => t.name === "list-tag-schemas");
+    expect(listTool).toBeTruthy();
+    const schemas = listTool!.execute({ vault: vaultName }) as any;
+    expect(schemas.person).toBeDefined();
+    expect(schemas.person.description).toBe("A person");
+    expect(schemas.project).toBeDefined();
+
+    const describeTool = tools.find((t) => t.name === "describe-tag");
+    expect(describeTool).toBeTruthy();
+    const personSchema = describeTool!.execute({ vault: vaultName, tag: "person" }) as any;
+    expect(personSchema.description).toBe("A person");
+    expect(personSchema.fields.name.type).toBe("string");
+
+    const unknown = describeTool!.execute({ vault: vaultName, tag: "nonexistent" }) as any;
+    expect(unknown).toBeNull();
+
+    closeAllStores();
+  });
+
+  test("soft schema validation warns about missing metadata fields", async () => {
+    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `schema-warn-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      tag_schemas: {
+        person: {
+          description: "A person",
+          fields: {
+            first_appeared: { type: "string", description: "When" },
+            relationship: { type: "string", description: "How" },
+          },
+        },
+      },
+    });
+    writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const tools = generateUnifiedMcpTools();
+    const createNote = tools.find((t) => t.name === "create-note")!;
+
+    // Create a note tagged person with no metadata — should get warnings
+    const result = createNote.execute({
+      vault: vaultName,
+      content: "Alice",
+      tags: ["person"],
+    }) as any;
+    expect(result.content).toBe("Alice");
+    expect(result._schema_warnings).toBeDefined();
+    expect(result._schema_warnings.length).toBe(1);
+    expect(result._schema_warnings[0]).toContain("first_appeared");
+    expect(result._schema_warnings[0]).toContain("relationship");
+
+    // Create with metadata — no warnings
+    const result2 = createNote.execute({
+      vault: vaultName,
+      content: "Bob",
+      tags: ["person"],
+      metadata: { first_appeared: "2024-01", relationship: "friend" },
+    }) as any;
+    expect(result2._schema_warnings).toBeUndefined();
+
+    closeAllStores();
+  });
 });
 
 describe("auth scopes", () => {
