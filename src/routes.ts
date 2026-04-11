@@ -651,8 +651,14 @@ function inlineMarkdown(html: string): string {
   html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
   // Inline code
   html = html.replace(/`(.+?)`/g, "<code>$1</code>");
-  // Links [text](url) — url is already escaped
-  html = html.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+  // Links [text](url) — sanitize href to prevent javascript:/data: XSS
+  html = html.replace(/\[(.+?)\]\((.+?)\)/g, (_match, text, url) => {
+    const decoded = url.replace(/&amp;/g, "&");
+    if (/^(https?:|mailto:|#|\/)/i.test(decoded)) {
+      return `<a href="${url}">${text}</a>`;
+    }
+    return text; // strip unsafe links, keep text
+  });
   return html;
 }
 

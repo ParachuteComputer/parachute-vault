@@ -86,6 +86,37 @@ describe("handlePublicNote", () => {
     expect(html).toContain("&lt;script&gt;");
   });
 
+  it("strips javascript: URI links to prevent XSS", async () => {
+    const store = makeStore({
+      "n6": { content: "[click me](javascript:alert(1))", tags: ["published"] },
+    });
+    const resp = handlePublicNote(store, "n6");
+    const html = await resp.text();
+    expect(html).not.toContain("javascript:");
+    expect(html).toContain("click me");
+    expect(html).not.toContain("<a ");
+  });
+
+  it("strips data: URI links to prevent XSS", async () => {
+    const store = makeStore({
+      "n7": { content: "[click](data:text/html;base64,PHNjcmlwdD4=)", tags: ["published"] },
+    });
+    const resp = handlePublicNote(store, "n7");
+    const html = await resp.text();
+    expect(html).not.toContain("data:");
+    expect(html).toContain("click");
+  });
+
+  it("allows safe http/https/mailto links", async () => {
+    const store = makeStore({
+      "n8": { content: "[site](https://example.com) and [mail](mailto:a@b.com)", tags: ["published"] },
+    });
+    const resp = handlePublicNote(store, "n8");
+    const html = await resp.text();
+    expect(html).toContain('href="https://example.com"');
+    expect(html).toContain('href="mailto:a@b.com"');
+  });
+
   it("supports dark mode via media query", async () => {
     const store = makeStore({
       "n5": { content: "test", tags: ["published"] },
