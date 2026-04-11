@@ -76,10 +76,44 @@ export interface VaultConfig {
   tag_schemas?: Record<string, TagSchema>;
 }
 
+// ---------------------------------------------------------------------------
+// Trigger configuration
+// ---------------------------------------------------------------------------
+
+export interface TriggerWhen {
+  /** Note must have ALL of these tags. */
+  tags?: string[];
+  /** If true, note.content must be non-empty. If false, must be empty. */
+  has_content?: boolean;
+  /** Note.metadata must NOT have any of these keys set (non-null). */
+  missing_metadata?: string[];
+  /** Note.metadata must have ALL of these keys set (non-null). */
+  has_metadata?: string[];
+}
+
+export interface TriggerAction {
+  /** URL to POST the webhook payload to. */
+  webhook: string;
+  /** Timeout in ms for the webhook call. Default 60000. */
+  timeout?: number;
+}
+
+export interface TriggerConfig {
+  /** Human-readable name, also used as the metadata prefix for markers. */
+  name: string;
+  /** Which hook events to listen for. Default ["created", "updated"]. */
+  events?: Array<"created" | "updated">;
+  /** Predicate — all conditions must be true. */
+  when: TriggerWhen;
+  /** What to do when the predicate matches. */
+  action: TriggerAction;
+}
+
 export interface GlobalConfig {
   port: number;
   default_vault?: string;
   api_keys?: StoredKey[];
+  triggers?: TriggerConfig[];
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +297,102 @@ function parseTagSchemas(yaml: string): Record<string, TagSchema> | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Trigger YAML parsing
+// ---------------------------------------------------------------------------
+
+function parseYamlList(val: string): string[] {
+  // Parse "[a, b, c]" → ["a", "b", "c"]
+  const inner = val.replace(/^\[/, "").replace(/\]$/, "");
+  return inner.split(",").map((s) => s.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
+}
+
+function parseTriggers(yaml: string): TriggerConfig[] | undefined {
+  const startMatch = yaml.match(/^triggers:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const triggers: TriggerConfig[] = [];
+  let current: Partial<TriggerConfig> | null = null;
+  // Track which section we're in by the last seen section header
+  let section: "top" | "when" | "action" = "top";
+
+  for (const line of lines) {
+    // Stop at next top-level key
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    // New trigger item: "- name: ..."
+    const nameMatch = trimmed.match(/^-\s+name:\s*(.+)/);
+    if (nameMatch) {
+      if (current?.name) {
+        if (current.action?.webhook) {
+          triggers.push(current as TriggerConfig);
+        } else {
+          console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
+        }
+      }
+      current = { name: nameMatch[1].trim(), when: {}, action: undefined as unknown as TriggerAction };
+      section = "top";
+      continue;
+    }
+
+    if (!current) continue;
+
+    // Section headers — detect by key name regardless of indent
+    if (trimmed === "when:") { section = "when"; continue; }
+    if (trimmed === "action:") { section = "action"; continue; }
+
+    // Top-level trigger field
+    const eventsMatch = trimmed.match(/^events:\s*\[([^\]]*)\]/);
+    if (eventsMatch) {
+      current.events = parseYamlList(eventsMatch[1]) as Array<"created" | "updated">;
+      continue;
+    }
+
+    // When fields
+    if (section === "when") {
+      const tagsMatch = trimmed.match(/^tags:\s*\[([^\]]*)\]/);
+      if (tagsMatch) { current.when!.tags = parseYamlList(tagsMatch[1]); continue; }
+      const hasContentMatch = trimmed.match(/^has_content:\s*(true|false)/);
+      if (hasContentMatch) { current.when!.has_content = hasContentMatch[1] === "true"; continue; }
+      const missingMetaMatch = trimmed.match(/^missing_metadata:\s*\[([^\]]*)\]/);
+      if (missingMetaMatch) { current.when!.missing_metadata = parseYamlList(missingMetaMatch[1]); continue; }
+      const hasMetaMatch = trimmed.match(/^has_metadata:\s*\[([^\]]*)\]/);
+      if (hasMetaMatch) { current.when!.has_metadata = parseYamlList(hasMetaMatch[1]); continue; }
+    }
+
+    // Action fields
+    if (section === "action") {
+      const webhookMatch = trimmed.match(/^webhook:\s*(.+)/);
+      if (webhookMatch) {
+        current.action = { ...(current.action ?? {}), webhook: webhookMatch[1].trim() } as TriggerAction;
+        continue;
+      }
+      const timeoutMatch = trimmed.match(/^timeout:\s*(\d+)/);
+      if (timeoutMatch && current.action) {
+        current.action.timeout = parseInt(timeoutMatch[1], 10);
+        continue;
+      }
+    }
+  }
+
+  // Push the last trigger
+  if (current?.name) {
+    if (current.action?.webhook) {
+      triggers.push(current as TriggerConfig);
+    } else {
+      console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
+    }
+  }
+
+  return triggers.length > 0 ? triggers : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Directory management
 // ---------------------------------------------------------------------------
 
@@ -313,6 +443,9 @@ export function readGlobalConfig(): GlobalConfig {
         }
       }
 
+      // Parse triggers
+      config.triggers = parseTriggers(yaml);
+
       return config;
     }
   } catch {}
@@ -333,6 +466,34 @@ export function writeGlobalConfig(config: GlobalConfig): void {
       lines.push(`    created_at: "${key.created_at}"`);
       if (key.last_used_at) {
         lines.push(`    last_used_at: "${key.last_used_at}"`);
+      }
+    }
+  }
+
+  if (config.triggers && config.triggers.length > 0) {
+    lines.push("triggers:");
+    for (const trigger of config.triggers) {
+      lines.push(`  - name: ${trigger.name}`);
+      if (trigger.events) {
+        lines.push(`    events: [${trigger.events.join(", ")}]`);
+      }
+      lines.push("    when:");
+      if (trigger.when.tags?.length) {
+        lines.push(`      tags: [${trigger.when.tags.join(", ")}]`);
+      }
+      if (trigger.when.has_content !== undefined) {
+        lines.push(`      has_content: ${trigger.when.has_content}`);
+      }
+      if (trigger.when.missing_metadata?.length) {
+        lines.push(`      missing_metadata: [${trigger.when.missing_metadata.join(", ")}]`);
+      }
+      if (trigger.when.has_metadata?.length) {
+        lines.push(`      has_metadata: [${trigger.when.has_metadata.join(", ")}]`);
+      }
+      lines.push("    action:");
+      lines.push(`      webhook: ${trigger.action.webhook}`);
+      if (trigger.action.timeout) {
+        lines.push(`      timeout: ${trigger.action.timeout}`);
       }
     }
   }
@@ -459,38 +620,6 @@ export function loadEnvFile(): void {
     if (process.env[key] === undefined) {
       process.env[key] = val;
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Scribe status
-// ---------------------------------------------------------------------------
-
-export async function getScribeStatus(): Promise<{
-  available: boolean;
-  transcription: string[];
-  cleanup: string[];
-  activeTranscriber: string;
-  activeCleaner: string;
-}> {
-  try {
-    const scribe = await import("@openparachute/scribe");
-    const providers = scribe.availableProviders();
-    return {
-      available: true,
-      transcription: providers.transcription,
-      cleanup: providers.cleanup,
-      activeTranscriber: process.env.TRANSCRIBE_PROVIDER ?? "parakeet-mlx",
-      activeCleaner: process.env.CLEANUP_PROVIDER ?? "none",
-    };
-  } catch {
-    return {
-      available: false,
-      transcription: [],
-      cleanup: [],
-      activeTranscriber: "none",
-      activeCleaner: "none",
-    };
   }
 }
 

@@ -30,7 +30,6 @@ import {
   setEnvVar,
   unsetEnvVar,
   loadEnvFile,
-  getScribeStatus,
   listVaults,
   vaultDir,
   generateApiKey,
@@ -169,54 +168,11 @@ async function cmdInit() {
     envVars.PORT = String(globalConfig.port || DEFAULT_PORT);
   }
 
-  // 5. Interactive setup for transcription + embeddings (first run only)
+  // 5. Interactive setup for embeddings (first run only)
   if (isFirstRun) {
     console.log();
 
-    // --- Transcription ---
-    const wantTranscription = await confirm("Set up transcription (voice memos → text)?");
-    if (wantTranscription) {
-      const provider = await choose("  Transcription provider:", [
-        { label: "Groq", value: "groq", description: "cloud API, fast, cheap (~$0.06/hr)" },
-        ...(isMac ? [{ label: "Parakeet-MLX", value: "parakeet-mlx", description: "local, Mac only, fastest" }] : []),
-        { label: "Whisper", value: "whisper", description: "local, any platform (pip install whisper-ctranslate2)" },
-        { label: "OpenAI", value: "openai", description: "cloud API, reference Whisper" },
-        { label: "Skip", value: "skip", description: "configure later" },
-      ]);
-
-      if (provider !== "skip") {
-        envVars.TRANSCRIBE_PROVIDER = provider;
-
-        if (provider === "groq") {
-          const key = await ask("  GROQ_API_KEY");
-          if (key) envVars.GROQ_API_KEY = key;
-        } else if (provider === "openai") {
-          const key = await ask("  OPENAI_API_KEY");
-          if (key) envVars.OPENAI_API_KEY = key;
-        }
-
-        // Cleanup provider
-        const wantCleanup = await confirm("  Clean up transcriptions with AI? (fix filler words, punctuation)");
-        if (wantCleanup) {
-          const cleaner = await choose("  Cleanup provider:", [
-            { label: "Claude", value: "claude", description: "best quality" },
-            { label: "Groq", value: "groq", description: "fast, uses your Groq key" },
-            { label: "Ollama", value: "ollama", description: "local, requires Ollama running" },
-            { label: "Skip", value: "skip" },
-          ]);
-          if (cleaner !== "skip") {
-            envVars.CLEANUP_PROVIDER = cleaner;
-            if (cleaner === "claude" && !envVars.ANTHROPIC_API_KEY) {
-              const key = await ask("  ANTHROPIC_API_KEY");
-              if (key) envVars.ANTHROPIC_API_KEY = key;
-            }
-          }
-        }
-      }
-    }
-
     // --- Semantic search ---
-    console.log();
     const wantEmbeddings = await confirm("Set up semantic search (find notes by meaning, not just keywords)?");
     if (wantEmbeddings) {
       const provider = await choose("  Embedding provider:", [
@@ -383,17 +339,6 @@ async function cmdConfig(args: string[]) {
       }
     }
 
-    console.log();
-    console.log("Transcription (voice → text):");
-    console.log("  TRANSCRIBE_PROVIDER  — groq, openai, parakeet-mlx (Mac only)");
-    console.log("  GROQ_API_KEY         — for Groq (fast, cheap)");
-    console.log("  OPENAI_API_KEY       — for OpenAI Whisper");
-    console.log();
-    console.log("Cleanup (LLM cleans up transcripts):");
-    console.log("  CLEANUP_PROVIDER     — claude, groq, ollama, openai, gemini, custom, none");
-    console.log("  ANTHROPIC_API_KEY    — for Claude cleanup");
-    console.log("  OLLAMA_MODEL         — Ollama model (default: llama3.1)");
-    console.log("  OLLAMA_URL           — Ollama server URL");
     console.log();
     console.log("Semantic search (find notes by meaning):");
     console.log("  EMBEDDING_PROVIDER   — openai, ollama, none");
@@ -599,7 +544,6 @@ async function cmdStatus() {
   }
   const vaults = listVaults();
   const globalConfig = readGlobalConfig();
-  const scribe = await getScribeStatus();
 
   console.log("Parachute Vault\n");
 
@@ -615,15 +559,15 @@ async function cmdStatus() {
     console.log(`            ${name}${desc}`);
   }
 
-  // Transcription
+  // Triggers
   console.log();
-  if (scribe.available) {
-    console.log(`  Transcription:  ${scribe.activeTranscriber}`);
-    console.log(`  Cleanup:        ${scribe.activeCleaner}`);
-    console.log(`  Providers:      ${scribe.transcription.join(", ")}`);
+  if (globalConfig.triggers?.length) {
+    console.log(`  Triggers:   ${globalConfig.triggers.length}`);
+    for (const t of globalConfig.triggers) {
+      console.log(`              ${t.name} → ${t.action.webhook}`);
+    }
   } else {
-    console.log(`  Transcription:  not available`);
-    console.log(`                  bun add @openparachute/scribe to enable`);
+    console.log(`  Triggers:   none configured`);
   }
 
   // Embeddings

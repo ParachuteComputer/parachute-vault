@@ -11,8 +11,6 @@ import { toNoteIndex } from "../core/src/notes.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
-import type { NarrateModule } from "./tts-hook.ts";
-
 function parseBool(val: string | null, defaultVal: boolean): boolean {
   if (val === null) return defaultVal;
   return val === "true" || val === "1";
@@ -336,8 +334,6 @@ const ALLOWED_EXTENSIONS = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".webp",
 ]);
 
-const AUDIO_EXTENSIONS = new Set([".wav", ".mp3", ".m4a", ".ogg", ".webm"]);
-
 const MIME_TYPES: Record<string, string> = {
   ".wav": "audio/wav",
   ".mp3": "audio/mpeg",
@@ -381,27 +377,12 @@ export async function handleStorage(req: Request, path: string, vault: string): 
 
     const relativePath = `${date}/${filename}`;
     const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
-    const result: Record<string, unknown> = {
+
+    return json({
       path: relativePath,
       size: buffer.length,
       mimeType,
-    };
-
-    // Optional: transcribe audio in the same request
-    const shouldTranscribe = form.get("transcribe");
-    if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
-      const scribe = await getScribe();
-      if (scribe) {
-        try {
-          const audioFile = new File([buffer], file.name, { type: file.type });
-          result.transcription = await scribe.transcribe(audioFile);
-        } catch (err: unknown) {
-          result.transcription_error = err instanceof Error ? err.message : "transcription failed";
-        }
-      }
-    }
-
-    return json(result, 201);
+    }, 201);
   }
 
   // GET /storage/:date/:file
@@ -482,34 +463,9 @@ export async function handleIngest(
   const relativePath = `${date}/${filename}`;
   const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
 
-  // 2. Optionally transcribe (sync=true or transcribe=true)
-  let transcription: string | undefined;
-  let transcriptionError: string | undefined;
-  const shouldTranscribe = form.get("sync") ?? form.get("transcribe");
-  if (shouldTranscribe === "true" && AUDIO_EXTENSIONS.has(ext)) {
-    const scribe = await getScribe();
-    if (scribe) {
-      try {
-        const audioFile = new File([buffer], file.name, { type: file.type });
-        transcription = await scribe.transcribe(audioFile);
-      } catch (err) {
-        transcriptionError = err instanceof Error ? err.message : "transcription failed";
-      }
-    }
-  }
-
-  // 3. Build note content
+  // 2. Build note content
   const clientContent = form.get("content") as string | null;
-  let content: string;
-  if (transcription && clientContent) {
-    content = transcription; // server transcription takes priority, client content preserved in metadata
-  } else if (transcription) {
-    content = transcription;
-  } else if (clientContent) {
-    content = clientContent;
-  } else {
-    content = "";
-  }
+  const content = clientContent ?? "";
 
   // 4. Parse options
   const createdAt = (form.get("createdAt") as string) ?? undefined;
@@ -528,8 +484,6 @@ export async function handleIngest(
     ...metadata,
     source: "voice-memo",
     audio_duration_bytes: buffer.length,
-    ...(clientContent && transcription ? { client_transcription: clientContent } : {}),
-    ...(transcriptionError ? { transcription_error: transcriptionError } : {}),
   };
 
   // 5. Create note
@@ -547,11 +501,7 @@ export async function handleIngest(
     original_filename: file.name,
   });
 
-  return json({
-    note,
-    attachment,
-    transcription: transcription ?? null,
-  }, 201);
+  return json({ note, attachment }, 201);
 }
 
 // ---------------------------------------------------------------------------
@@ -732,171 +682,3 @@ ${rendered}
   });
 }
 
-// ---------------------------------------------------------------------------
-// Transcription (via @openparachute/scribe)
-// ---------------------------------------------------------------------------
-
-let scribeAvailable: boolean | null = null;
-
-async function getScribe() {
-  if (scribeAvailable === false) return null;
-  try {
-    const scribe = await import("@openparachute/scribe");
-    scribeAvailable = true;
-    return scribe;
-  } catch {
-    scribeAvailable = false;
-    return null;
-  }
-}
-
-export async function handleTranscription(req: Request): Promise<Response> {
-  const scribe = await getScribe();
-  if (!scribe) {
-    return json({ error: "Transcription not available — @openparachute/scribe is not installed" }, 501);
-  }
-
-  const form = await req.formData();
-  const file = form.get("file");
-
-  if (!(file instanceof File)) {
-    return json({ error: "missing 'file' field" }, 400);
-  }
-
-  try {
-    const text = await scribe.transcribe(file);
-    return json({ text });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "transcription failed";
-    console.error("Transcription error:", message);
-    return json({ error: message }, 500);
-  }
-}
-
-export async function handleModels(): Promise<Response> {
-  const scribe = await getScribe();
-  if (!scribe) {
-    return json({ data: [] });
-  }
-  const providers = scribe.availableProviders();
-  return json({
-    data: providers.transcription.map((id: string) => ({ id, object: "model" })),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// TTS speech — OpenAI-compatible POST /v1/audio/speech (backed by narrate)
-// ---------------------------------------------------------------------------
-
-let narrateAvailable: boolean | null = null;
-let narrateCached: NarrateModule | null = null;
-
-async function getNarrate(): Promise<NarrateModule | null> {
-  if (narrateAvailable === false) return null;
-  if (narrateCached) return narrateCached;
-  try {
-    const mod = (await import("@openparachute/narrate")) as unknown as NarrateModule;
-    narrateCached = mod;
-    narrateAvailable = true;
-    return mod;
-  } catch {
-    narrateAvailable = false;
-    return null;
-  }
-}
-
-/**
- * Dependencies for `handleTtsSpeech`. Production defaults dynamically
- * import `@openparachute/narrate`; tests inject a stub module to avoid the
- * real provider, subprocess, and ffmpeg.
- */
-export interface TtsSpeechDeps {
-  /** Override the narrate module resolution (for tests). */
-  getNarrate?: () => Promise<NarrateModule | null>;
-}
-
-
-/**
- * POST /v1/audio/speech — OpenAI-compatible text-to-speech.
- *
- * Accepts the OpenAI request shape (`model`, `voice`, `input`,
- * `response_format`). `model` is ignored (the active provider is whatever
- * `@openparachute/narrate` resolves from env at call time). `response_format`
- * accepts `"opus"` / `"mp3"` as aliases and always returns OGG Opus,
- * because the vault unified on that format in #43. Unknown values are
- * rejected with 400 so callers don't silently get the "wrong" format.
- *
- * All heavy lifting (markdown preprocessing, provider resolution, ffmpeg
- * encoding) lives in `@openparachute/narrate`. This handler's job is just
- * request parsing, validation, narrate invocation, and error-to-status
- * mapping.
- */
-export async function handleTtsSpeech(req: Request, deps: TtsSpeechDeps = {}): Promise<Response> {
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return json({ error: "invalid JSON body" }, 400);
-  }
-  if (!body || typeof body !== "object") {
-    return json({ error: "body must be a JSON object" }, 400);
-  }
-  const b = body as Record<string, unknown>;
-
-  if (typeof b.input !== "string" || b.input.length === 0) {
-    return json({ error: "'input' must be a non-empty string" }, 400);
-  }
-  if (b.voice !== undefined && typeof b.voice !== "string") {
-    return json({ error: "'voice' must be a string" }, 400);
-  }
-  if (b.response_format !== undefined) {
-    if (
-      typeof b.response_format !== "string" ||
-      (b.response_format !== "opus" && b.response_format !== "mp3")
-    ) {
-      return json({ error: "'response_format' must be 'opus' or 'mp3'" }, 400);
-    }
-  }
-
-  const resolveNarrate = deps.getNarrate ?? getNarrate;
-  const narrate = await resolveNarrate();
-  if (!narrate) {
-    return json({ error: "TTS not available — @openparachute/narrate is not installed" }, 501);
-  }
-
-  try {
-    const result = await narrate.synthesize(b.input, { voice: b.voice as string | undefined });
-    return new Response(result.audio, {
-      status: 200,
-      headers: {
-        "Content-Type": "audio/ogg",
-        "Content-Length": String(result.audio.length),
-      },
-    });
-  } catch (err) {
-    // Narrate exposes typed error classes on the module surface; we
-    // `instanceof`-check against the resolved module to map them to HTTP
-    // statuses without substring-matching error messages. The fields are
-    // optional on `NarrateModule` so an older narrate without them doesn't
-    // crash the catch block with `instanceof undefined` — we null-check
-    // before each check.
-    if (
-      narrate.NarrateEmptyInputError &&
-      err instanceof narrate.NarrateEmptyInputError
-    ) {
-      return json(
-        { error: "input has no speakable content after markdown preprocessing" },
-        400,
-      );
-    }
-    if (
-      narrate.NarrateNoProviderError &&
-      err instanceof narrate.NarrateNoProviderError
-    ) {
-      return json({ error: "TTS provider not configured" }, 503);
-    }
-    const message = err instanceof Error ? err.message : "TTS synthesis failed";
-    console.error("TTS synthesis error:", message);
-    return json({ error: message }, 500);
-  }
-}

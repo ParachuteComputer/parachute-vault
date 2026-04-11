@@ -6,9 +6,6 @@
  *   GET  /health                           — health check
  *   *    /mcp                              — unified MCP (all vaults, vault param)
  *   *    /vaults/{name}/mcp                — scoped MCP (single vault, no vault param)
- *   POST /v1/audio/transcriptions          — transcription (via scribe)
- *   POST /v1/audio/speech                  — text-to-speech (OpenAI-compatible, OGG Opus)
- *   GET  /v1/models                        — transcription providers
  *   GET  /vaults                           — list vaults
  *   *    /vaults/{name}/api/...            — per-vault REST API
  */
@@ -31,84 +28,23 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech, handlePublicNote } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handlePublicNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
-import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
-import { registerTranscriptionHook, type ScribeModule } from "./transcription-hook.ts";
-import { getVaultNameForStore } from "./vault-store.ts";
-import { assetsDir } from "./routes.ts";
-import type { SqliteStore } from "../core/src/store.ts";
+import { registerTriggers } from "./triggers.ts";
 
-// Features register their note-mutation hooks here. The TTS (#reader →
-// audio) hook is registered if BOTH `@openparachute/narrate` is installed AND
-// a TTS provider is configured in env. Either missing → hook is silently
-// skipped, same shape as how transcription handles optional scribe.
-async function registerHooks(): Promise<void> {
-  let narrate: NarrateModule | null = null;
-  try {
-    narrate = (await import("@openparachute/narrate")) as unknown as NarrateModule;
-  } catch {
-    console.log("[hooks] @openparachute/narrate not installed; skipping tts-reader hook");
+// Register webhook triggers from global config. Replaces the old hardcoded
+// tts-hook and transcription-hook with config-driven webhooks.
+function registerConfiguredTriggers(): void {
+  const config = readGlobalConfig();
+  if (!config.triggers?.length) {
+    console.log("[triggers] no triggers configured in config.yaml");
     return;
   }
-
-  // Narrate is loaded but may still be unusable if no provider is
-  // configured in env. We probe via `getTtsProvider` rather than waiting
-  // for the first note to fail.
-  const narrateWithProbe = narrate as NarrateModule & {
-    getTtsProvider?: (env: Record<string, string | undefined>) => { name: string } | null;
-  };
-  const probedProvider = narrateWithProbe.getTtsProvider?.(process.env) ?? null;
-  if (!probedProvider) {
-    console.log("[hooks] no TTS provider configured in env; skipping tts-reader hook");
-    return;
-  }
-
-  registerTtsHook(defaultHookRegistry, {
-    narrate,
-    voice: process.env.TTS_VOICE,
-    resolveAssetsDir: (store) => {
-      const name = getVaultNameForStore(store as SqliteStore);
-      if (!name) {
-        throw new Error("tts-hook: store is not registered with a vault");
-      }
-      return assetsDir(name);
-    },
-  });
-  console.log(`[hooks] tts-reader hook registered (provider=${probedProvider.name}, via @openparachute/narrate)`);
+  registerTriggers(defaultHookRegistry, config.triggers);
+  console.log(`[triggers] registered ${config.triggers.length} trigger(s)`);
 }
 
-async function registerTranscriptionHooks(): Promise<void> {
-  if (process.env.AUTO_TRANSCRIBE === "false") {
-    console.log("[hooks] AUTO_TRANSCRIBE=false; skipping transcribe-capture hook");
-    return;
-  }
-
-  let scribe: ScribeModule | null = null;
-  try {
-    scribe = (await import("@openparachute/scribe")) as unknown as ScribeModule;
-  } catch {
-    console.log("[hooks] @openparachute/scribe not installed; skipping transcribe-capture hook");
-    return;
-  }
-
-  registerTranscriptionHook(defaultHookRegistry, {
-    scribe,
-    transcribeProvider: process.env.TRANSCRIBE_PROVIDER,
-    cleanupProvider: process.env.CLEANUP_PROVIDER,
-    resolveAssetsDir: (store) => {
-      const name = getVaultNameForStore(store as SqliteStore);
-      if (!name) {
-        throw new Error("transcription-hook: store is not registered with a vault");
-      }
-      return assetsDir(name);
-    },
-  });
-  console.log("[hooks] transcribe-capture hook registered (via @openparachute/scribe)");
-}
-
-await registerHooks();
-await registerTranscriptionHooks();
+registerConfiguredTriggers();
 
 ensureConfigDirSync();
 loadEnvFile();
@@ -150,7 +86,7 @@ const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PO
 const server = Bun.serve({
   port,
   hostname: "0.0.0.0",
-  idleTimeout: 120, // seconds — transcription can take a while
+  idleTimeout: 120, // seconds — webhook triggers can take a while
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -215,17 +151,6 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleUnifiedMcp(req, auth.scope);
   }
 
-  // Transcription
-  if (path === "/v1/audio/transcriptions" && req.method === "POST") {
-    return handleTranscription(req);
-  }
-  if (path === "/v1/audio/speech" && req.method === "POST") {
-    return handleTtsSpeech(req);
-  }
-  if (path === "/v1/models" && req.method === "GET") {
-    return handleModels();
-  }
-
   // Published notes — public, no auth
   const publicMatch = path.match(/^\/public\/([^/]+)$/);
   if (publicMatch && req.method === "GET") {
@@ -233,6 +158,7 @@ async function route(req: Request, path: string): Promise<Response> {
     const store = getVaultStore(defaultVault);
     return handlePublicNote(store, publicMatch[1]);
   }
+
 
   // List vaults
   if (path === "/vaults" && req.method === "GET") {

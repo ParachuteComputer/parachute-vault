@@ -23,12 +23,6 @@
     "@types/bun": "latest"
   },
   "peerDependencies": {
-    "@openparachute/scribe": "^0.1.0",
-    "@openparachute/narrate": "^0.1.0",
     "typescript": "^5"
-  },
-  "peerDependenciesMeta": {
-    "@openparachute/scribe": { "optional": true },
-    "@openparachute/narrate": { "optional": true }
   }
 }

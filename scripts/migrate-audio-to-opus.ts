@@ -2,6 +2,10 @@
 /**
  * scripts/migrate-audio-to-opus.ts
  *
+ * NOTE: This script requires `@openparachute/narrate` which is no longer a
+ * vault dependency (removed in the webhook trigger refactor). If you need to
+ * re-run this migration, install it manually: `bun add @openparachute/narrate`
+ *
  * One-shot migration: convert existing WAV / MP3 audio attachments into
  * OGG Opus in-place. Resolves the second half of issue #43 — the first
  * half (new TTS output encoded as Opus) ships in the tts-provider.ts hook
