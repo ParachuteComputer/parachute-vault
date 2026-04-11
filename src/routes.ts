@@ -555,6 +555,184 @@ export async function handleIngest(
 }
 
 // ---------------------------------------------------------------------------
+// Published notes — public, no-auth HTML rendering
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
+ * Minimal markdown-to-HTML for published notes. Handles:
+ * - Paragraphs (blank-line separated)
+ * - Headers (# through ######)
+ * - Bold (**text**), italic (*text*), inline code (`code`)
+ * - Unordered lists (- item)
+ * - Fenced code blocks (```...```)
+ * - Links [text](url)
+ *
+ * This is intentionally simple — we don't pull in a markdown library.
+ */
+function renderMarkdown(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inCodeBlock = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Fenced code blocks
+    if (line.trimStart().startsWith("```")) {
+      if (inCodeBlock) {
+        out.push("</code></pre>");
+        inCodeBlock = false;
+      } else {
+        out.push("<pre><code>");
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      out.push(escapeHtml(line));
+      continue;
+    }
+
+    const trimmed = line.trim();
+
+    // Empty line
+    if (!trimmed) {
+      out.push("");
+      continue;
+    }
+
+    // Headers
+    const headerMatch = trimmed.match(/^(#{1,6})\s+(.+)/);
+    if (headerMatch) {
+      const level = headerMatch[1].length;
+      out.push(`<h${level}>${inlineMarkdown(escapeHtml(headerMatch[2]))}</h${level}>`);
+      continue;
+    }
+
+    // Unordered list items
+    if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      // Collect consecutive list items
+      const items: string[] = [trimmed.slice(2)];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1].trim();
+        if (next.startsWith("- ") || next.startsWith("* ")) {
+          items.push(next.slice(2));
+          i++;
+        } else break;
+      }
+      out.push("<ul>");
+      for (const item of items) {
+        out.push(`<li>${inlineMarkdown(escapeHtml(item))}</li>`);
+      }
+      out.push("</ul>");
+      continue;
+    }
+
+    // Paragraph
+    out.push(`<p>${inlineMarkdown(escapeHtml(trimmed))}</p>`);
+  }
+
+  if (inCodeBlock) out.push("</code></pre>");
+  return out.join("\n");
+}
+
+function inlineMarkdown(html: string): string {
+  // Bold
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  // Italic
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  // Inline code
+  html = html.replace(/`(.+?)`/g, "<code>$1</code>");
+  // Links [text](url) — sanitize href to prevent javascript:/data: XSS
+  html = html.replace(/\[(.+?)\]\((.+?)\)/g, (_match, text, url) => {
+    const decoded = url.replace(/&amp;/g, "&");
+    if (/^(https?:|mailto:|#|\/)/i.test(decoded)) {
+      return `<a href="${url}">${text}</a>`;
+    }
+    return text; // strip unsafe links, keep text
+  });
+  return html;
+}
+
+function isNotePublished(note: { tags?: string[]; metadata?: unknown }): boolean {
+  if (note.tags?.includes("published")) return true;
+  const meta = note.metadata as Record<string, unknown> | undefined;
+  if (meta?.published === true) return true;
+  return false;
+}
+
+/**
+ * GET /public/:noteId — serve a published note as clean HTML, no auth.
+ */
+export function handlePublicNote(store: Store, noteId: string): Response {
+  const note = store.getNote(noteId);
+  if (!note || !isNotePublished(note)) {
+    return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+  }
+
+  const title = note.path?.split("/").pop()?.replace(/\.[^.]+$/, "") ?? note.id;
+  const rendered = renderMarkdown(note.content);
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  body {
+    max-width: 42rem;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    color: #1a1a1a;
+  }
+  pre {
+    background: #f5f5f5;
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+  }
+  code {
+    font-size: 0.9em;
+    background: #f5f5f5;
+    padding: 0.15em 0.3em;
+    border-radius: 3px;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+  }
+  a { color: #0066cc; }
+  h1, h2, h3, h4, h5, h6 { margin-top: 1.5em; margin-bottom: 0.5em; }
+  ul { padding-left: 1.5em; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1a1a; color: #e0e0e0; }
+    pre, code { background: #2a2a2a; }
+    a { color: #66b3ff; }
+  }
+</style>
+</head>
+<body>
+${rendered}
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Transcription (via @openparachute/scribe)
 // ---------------------------------------------------------------------------
 

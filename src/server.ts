@@ -31,7 +31,7 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech, handlePublicNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
 import { registerTranscriptionHook, type ScribeModule } from "./transcription-hook.ts";
@@ -226,6 +226,14 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleModels();
   }
 
+  // Published notes — public, no auth
+  const publicMatch = path.match(/^\/public\/([^/]+)$/);
+  if (publicMatch && req.method === "GET") {
+    const defaultVault = readGlobalConfig().default_vault ?? "default";
+    const store = getVaultStore(defaultVault);
+    return handlePublicNote(store, publicMatch[1]);
+  }
+
   // List vaults
   if (path === "/vaults" && req.method === "GET") {
     const names = listVaults();
@@ -281,6 +289,13 @@ async function route(req: Request, path: string): Promise<Response> {
       { error: "Vault not found", vault: vaultName },
       { status: 404 },
     );
+  }
+
+  // Published notes — public, no auth (vault-scoped)
+  const vaultPublicMatch = subpath.match(/^\/public\/([^/]+)$/);
+  if (vaultPublicMatch && req.method === "GET") {
+    const store = getVaultStore(vaultName);
+    return handlePublicNote(store, vaultPublicMatch[1]);
   }
 
   // Auth: per-vault key OR global key
