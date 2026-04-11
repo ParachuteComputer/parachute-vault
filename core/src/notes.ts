@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Note, QueryOpts, VaultStats } from "./types.js";
+import type { Note, NoteIndex, QueryOpts, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
 
 let idCounter = 0;
@@ -291,6 +291,39 @@ export function deleteTag(db: Database, name: string): { deleted: boolean; notes
   return { deleted: true, notes_untagged: notesUntagged };
 }
 
+// ---- Lean note index shape ----
+
+/** Max code points in a NoteIndex preview. */
+export const NOTE_INDEX_PREVIEW_LEN = 120;
+
+/**
+ * Convert a full Note into its lean index shape:
+ * drops `content`, adds `byteSize` and a whitespace-collapsed `preview`.
+ * Shared between the `read-notes` MCP tool, HTTP /notes endpoints, and /graph.
+ */
+export function toNoteIndex(note: Note): NoteIndex {
+  const content = note.content ?? "";
+  const byteSize = Buffer.byteLength(content, "utf8");
+  // Collapse whitespace for a readable single-line preview
+  const collapsed = content.replace(/\s+/g, " ").trim();
+  // Iterate by Unicode code points so we don't split surrogate pairs
+  // (e.g. astral-plane emoji) mid-character.
+  const codePoints = Array.from(collapsed);
+  const preview = codePoints.length > NOTE_INDEX_PREVIEW_LEN
+    ? codePoints.slice(0, NOTE_INDEX_PREVIEW_LEN).join("")
+    : collapsed;
+  return {
+    id: note.id,
+    path: note.path,
+    createdAt: note.createdAt,
+    updatedAt: note.updatedAt,
+    tags: note.tags,
+    metadata: note.metadata,
+    byteSize,
+    preview,
+  };
+}
+
 // ---- Vault stats (aggregate situational awareness) ----
 
 /**
@@ -306,7 +339,7 @@ export function getVaultStats(
   const topTagsLimit = opts?.topTagsLimit ?? 20;
 
   const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
-  const total_notes = totalRow.c;
+  const totalNotes = totalRow.c;
 
   const earliestRow = db.prepare(
     "SELECT id, created_at FROM notes ORDER BY created_at ASC, id ASC LIMIT 1",
@@ -333,19 +366,19 @@ export function getVaultStats(
   `).all(topTagsLimit) as { tag: string; count: number }[];
 
   const tagCountRow = db.prepare("SELECT COUNT(DISTINCT tag_name) as c FROM note_tags").get() as { c: number };
-  const tag_count = tagCountRow.c;
+  const tagCount = tagCountRow.c;
 
   return {
-    total_notes,
-    earliest_note: earliestRow
-      ? { id: earliestRow.id, created_at: earliestRow.created_at }
+    totalNotes,
+    earliestNote: earliestRow
+      ? { id: earliestRow.id, createdAt: earliestRow.created_at }
       : null,
-    latest_note: latestRow
-      ? { id: latestRow.id, created_at: latestRow.created_at }
+    latestNote: latestRow
+      ? { id: latestRow.id, createdAt: latestRow.created_at }
       : null,
-    notes_by_month: monthRows,
-    top_tags: topTagRows,
-    tag_count,
+    notesByMonth: monthRows,
+    topTags: topTagRows,
+    tagCount,
   };
 }
 

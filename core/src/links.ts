@@ -39,20 +39,51 @@ export function getLinks(
   noteId: string,
   opts?: { direction?: "outbound" | "inbound" | "both" },
 ): Link[] {
-  const direction = opts?.direction ?? "both";
+  return listLinks(db, { noteId, direction: opts?.direction });
+}
+
+/**
+ * List links with optional filters.
+ * - If `noteId` is provided: restricts to links touching that note
+ *   (respects `direction`: outbound, inbound, or both).
+ * - If `relationship` is provided: restricts to links of that type.
+ * - Without filters: returns every link in the vault.
+ *
+ * Returns bare `Link[]` (no hydration). Callers that need note details
+ * should pair the result with `getNote` / `getNotes`.
+ */
+export function listLinks(
+  db: Database,
+  opts?: {
+    noteId?: string;
+    direction?: "outbound" | "inbound" | "both";
+    relationship?: string;
+  },
+): Link[] {
   const conditions: string[] = [];
   const params: unknown[] = [];
 
-  if (direction === "outbound" || direction === "both") {
-    conditions.push("source_id = ?");
-    params.push(noteId);
-  }
-  if (direction === "inbound" || direction === "both") {
-    conditions.push("target_id = ?");
-    params.push(noteId);
+  if (opts?.noteId) {
+    const direction = opts.direction ?? "both";
+    if (direction === "outbound") {
+      conditions.push("source_id = ?");
+      params.push(opts.noteId);
+    } else if (direction === "inbound") {
+      conditions.push("target_id = ?");
+      params.push(opts.noteId);
+    } else {
+      conditions.push("(source_id = ? OR target_id = ?)");
+      params.push(opts.noteId, opts.noteId);
+    }
   }
 
-  const sql = `SELECT * FROM links WHERE (${conditions.join(" OR ")}) ORDER BY created_at DESC`;
+  if (opts?.relationship) {
+    conditions.push("relationship = ?");
+    params.push(opts.relationship);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const sql = `SELECT * FROM links ${where} ORDER BY created_at DESC`;
   const rows = db.prepare(sql).all(...params) as LinkRow[];
   return rows.map(rowToLink);
 }

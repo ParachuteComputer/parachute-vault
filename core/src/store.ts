@@ -172,6 +172,10 @@ export class SqliteStore implements Store {
     return linkOps.getLinks(this.db, noteId, opts);
   }
 
+  listLinks(opts?: { noteId?: string; direction?: "outbound" | "inbound" | "both"; relationship?: string }): Link[] {
+    return linkOps.listLinks(this.db, opts);
+  }
+
   // ---- Bulk Operations ----
 
   createNotes(inputs: noteOps.BulkNoteInput[]): Note[] {
