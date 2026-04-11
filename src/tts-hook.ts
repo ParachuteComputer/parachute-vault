@@ -4,9 +4,9 @@
  * Vault-specific concerns only: attachment storage, the two-phase marker
  * discipline, and the manual-recovery retry semantics. The actual TTS
  * pipeline (provider resolution, markdown preprocessing, encoding) lives in
- * `parachute-narrate` and is injected into this hook at registration time.
+ * `@openparachute/narrate` and is injected into this hook at registration time.
  *
- * See `parachute-narrate`'s CLAUDE.md for the pipeline; this file documents
+ * See `@openparachute/narrate`'s CLAUDE.md for the pipeline; this file documents
  * the vault-side integration contract.
  *
  * ## Two-phase marker (unchanged from the pre-narrate shape)
@@ -40,7 +40,7 @@ import type { Note, Store } from "../core/src/types.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 
 /**
- * The subset of the `parachute-narrate` module surface the hook actually
+ * The subset of the `@openparachute/narrate` module surface the hook actually
  * uses. Declared here so tests can stub it with a plain object and so this
  * file doesn't need a hard type import on the optional dependency.
  */
@@ -59,14 +59,14 @@ export interface NarrateModule {
   // `err instanceof narrate.NarrateEmptyInputError` so we can distinguish
   // "empty input" from "no provider" without substring-matching error
   // messages. Optional so vault still loads against older narrate builds
-  // that predate parachute-narrate#2 — call sites must null-check before
+  // that predate @openparachute/narrate#2 — call sites must null-check before
   // using them.
   NarrateEmptyInputError?: new (...args: unknown[]) => Error;
   NarrateNoProviderError?: new (...args: unknown[]) => Error;
 }
 
 export interface RegisterTtsHookOptions {
-  /** Injected narrate module (pass the result of `await import("parachute-narrate")`). */
+  /** Injected narrate module (pass the result of `await import("@openparachute/narrate")`). */
   narrate: NarrateModule;
   /** Voice id to pass to the provider (usually env.TTS_VOICE or equivalent). */
   voice?: string;

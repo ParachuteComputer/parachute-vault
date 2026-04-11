@@ -474,7 +474,7 @@ export async function getScribeStatus(): Promise<{
   activeCleaner: string;
 }> {
   try {
-    const scribe = await import("parachute-scribe");
+    const scribe = await import("@openparachute/scribe");
     const providers = scribe.availableProviders();
     return {
       available: true,

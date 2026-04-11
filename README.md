@@ -26,7 +26,7 @@ A server on port 1940 with:
 - **Wikilink auto-linking** — `[[wikilinks]]` in note content automatically create links in the graph
 - **Semantic search** — Vector embeddings via sqlite-vec (configure an embedding provider)
 - **Obsidian import/export** — Bidirectional interop with Obsidian vaults
-- **Transcription** — Whisper-compatible endpoint (with [parachute-scribe](https://github.com/ParachuteComputer/parachute-scribe))
+- **Transcription** — Whisper-compatible endpoint (with [@openparachute/scribe](https://github.com/ParachuteComputer/@openparachute/scribe))
 
 Each vault is its own SQLite database. Run multiple vaults on one server.
 
@@ -68,7 +68,7 @@ parachute vault restart
 
 ### Providers
 
-**Transcription** (requires [parachute-scribe](https://github.com/ParachuteComputer/parachute-scribe)):
+**Transcription** (requires [@openparachute/scribe](https://github.com/ParachuteComputer/@openparachute/scribe)):
 
 | Provider | Type | Notes |
 |----------|------|-------|

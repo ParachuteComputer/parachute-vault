@@ -77,7 +77,7 @@ Use Bun for everything. No Node.js.
 - **Semantic search**: Optional sqlite-vec integration. Embedding providers are configurable (OpenAI, Ollama). Tag/date filters pushed into SQL for efficient filtered search.
 - **Obsidian interop**: Import/export preserves frontmatter, tags, wikilinks, and file paths.
 - **Unified config**: All env vars in `~/.parachute/.env` (or `$PARACHUTE_HOME/.env` in Docker).
-- **Optional transcription**: parachute-scribe is an optional dependency. If installed, vault exposes Whisper-compatible endpoints.
+- **Optional transcription**: `@openparachute/scribe` is an optional dependency. If installed, vault exposes Whisper-compatible endpoints.
 - **Docker-friendly**: `PARACHUTE_HOME` env var overrides data directory. Server auto-creates default vault on first run.
 
 ## Config
@@ -99,7 +99,7 @@ ANTHROPIC_API_KEY=...
 
 - Domain: `parachute.computer`
 - Package ID: `computer.parachute.vault`
-- npm scope: `@parachute/`
+- npm scope: `@openparachute/`
 - Launchd label: `computer.parachute.vault`
 
 ## Running

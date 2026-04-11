@@ -2,7 +2,7 @@
  * Tests for the `#reader` → audio hook (vault-side integration).
  *
  * The TTS pipeline itself (providers, markdown preprocessing, encoding)
- * lives in `parachute-narrate` and has its own tests there. These tests
+ * lives in `@openparachute/narrate` and has its own tests there. These tests
  * stub the narrate module so they cover only what vault owns: the tag
  * predicate, two-phase marker discipline, attachment write, skip-on-empty
  * behavior, and the failure path that leaves notes in `audio_pending_at`.
@@ -34,7 +34,7 @@ async function settle(hooks: HookRegistry): Promise<void> {
 // No-op narrate error classes — the hook never catches typed errors from
 // narrate (it only uses markdownToSpeech + synthesize), but the interface
 // now requires these constructors. Define local shims so the TypeScript
-// shape matches without pulling in parachute-narrate directly.
+// shape matches without pulling in @openparachute/narrate directly.
 class StubNarrateEmptyInputError extends Error {
   constructor(...args: unknown[]) {
     super((args[0] as string | undefined) ?? "empty");
