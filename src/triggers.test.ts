@@ -1,6 +1,8 @@
 import { describe, it, expect } from "bun:test";
-import { buildPredicate } from "./triggers.ts";
+import { buildPredicate, registerTriggers } from "./triggers.ts";
+import { HookRegistry } from "../core/src/hooks.ts";
 import type { Note } from "../core/src/types.ts";
+import type { TriggerConfig } from "./config.ts";
 
 function makeNote(overrides: Partial<Note> = {}): Note {
   return {
@@ -92,5 +94,39 @@ describe("buildPredicate", () => {
     const pred = buildPredicate({ tags: ["reader", "important"] }, "test");
     expect(pred(makeNote({ tags: ["reader"] }))).toBe(false);
     expect(pred(makeNote({ tags: ["reader", "important"] }))).toBe(true);
+  });
+});
+
+describe("registerTriggers", () => {
+  it("skips triggers with invalid webhook URLs", () => {
+    const hooks = new HookRegistry();
+    const errors: string[] = [];
+    const logger = {
+      error: (...args: unknown[]) => errors.push(args.map(String).join(" ")),
+      info: () => {},
+    };
+
+    registerTriggers(hooks, [
+      {
+        name: "bad-url",
+        when: { tags: ["test"] },
+        action: { webhook: "not-a-url" },
+      },
+      {
+        name: "bad-scheme",
+        when: { tags: ["test"] },
+        action: { webhook: "ftp://example.com/hook" },
+      },
+      {
+        name: "good",
+        when: { tags: ["test"] },
+        action: { webhook: "http://localhost:8080/hook" },
+      },
+    ], logger);
+
+    expect(hooks.size).toBe(1); // only "good" registered
+    expect(errors.length).toBe(2);
+    expect(errors[0]).toContain("bad-url");
+    expect(errors[1]).toContain("bad-scheme");
   });
 });

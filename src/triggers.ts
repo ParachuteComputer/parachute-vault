@@ -30,7 +30,7 @@
  */
 
 import type { Note, Store } from "../core/src/types.ts";
-import type { HookRegistry } from "../core/src/hooks.ts";
+import type { HookRegistry, HookEvent } from "../core/src/hooks.ts";
 import type { TriggerConfig, TriggerWhen } from "./config.ts";
 
 const DEFAULT_TIMEOUT = 60_000;
@@ -103,6 +103,18 @@ export function registerTriggers(
   const unregisters: Array<() => void> = [];
 
   for (const trigger of triggers) {
+    // Validate webhook URL at registration time so typos fail fast
+    try {
+      const url = new URL(trigger.action.webhook);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        logger.error(`[triggers] skipping "${trigger.name}": webhook URL must use http or https (got ${url.protocol})`);
+        continue;
+      }
+    } catch {
+      logger.error(`[triggers] skipping "${trigger.name}": invalid webhook URL "${trigger.action.webhook}"`);
+      continue;
+    }
+
     const predicate = buildPredicate(trigger.when, trigger.name);
     const events = trigger.events ?? ["created", "updated"];
     const pendingKey = `${trigger.name}_pending_at`;
@@ -113,7 +125,7 @@ export function registerTriggers(
       name: trigger.name,
       event: events,
       when: predicate,
-      handler: async (note: Note, store: Store) => {
+      handler: async (note: Note, store: Store, hookEvent?: HookEvent) => {
         const existingMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
 
         // Handler-side re-check (same race-window protection as the old hooks)
@@ -144,7 +156,7 @@ export function registerTriggers(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               trigger: trigger.name,
-              event: "note_mutation",
+              event: hookEvent ?? "updated",
               note: {
                 id: note.id,
                 content: note.content,
@@ -174,7 +186,10 @@ export function registerTriggers(
           throw err;
         }
 
-        // Handle skipped result
+        // Handle skipped result. We write `_rendered_at` even for skips so the
+        // predicate won't re-fire on future note edits — a permanently-skippable
+        // note (e.g. code-only content with no speakable text) would otherwise
+        // trigger an infinite webhook loop on every update.
         if (webhookResult.skipped_reason) {
           try {
             store.updateNote(note.id, {

@@ -315,65 +315,64 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
 
   const triggers: TriggerConfig[] = [];
   let current: Partial<TriggerConfig> | null = null;
+  // Track which section we're in by the last seen section header
+  let section: "top" | "when" | "action" = "top";
 
   for (const line of lines) {
     // Stop at next top-level key
     if (line.match(/^\S/) && line.trim().length > 0) break;
     if (line.trim().length === 0) continue;
 
-    const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    const trimmed = line.trim();
 
-    // New trigger item: "  - name: ..."
-    const nameMatch = line.match(/^\s+-\s+name:\s*(.+)/);
+    // New trigger item: "- name: ..."
+    const nameMatch = trimmed.match(/^-\s+name:\s*(.+)/);
     if (nameMatch) {
-      if (current?.name && current.when && current.action) {
-        triggers.push(current as TriggerConfig);
+      if (current?.name) {
+        if (current.action?.webhook) {
+          triggers.push(current as TriggerConfig);
+        } else {
+          console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
+        }
       }
       current = { name: nameMatch[1].trim(), when: {}, action: undefined as unknown as TriggerAction };
+      section = "top";
       continue;
     }
 
     if (!current) continue;
 
-    // Top-level trigger fields (indent 4)
-    if (indent === 4) {
-      const eventsMatch = line.match(/events:\s*\[([^\]]*)\]/);
-      if (eventsMatch) {
-        current.events = parseYamlList(eventsMatch[1]) as Array<"created" | "updated">;
-        continue;
-      }
-      // "when:" and "action:" are section headers — just skip
+    // Section headers — detect by key name regardless of indent
+    if (trimmed === "when:") { section = "when"; continue; }
+    if (trimmed === "action:") { section = "action"; continue; }
+
+    // Top-level trigger field
+    const eventsMatch = trimmed.match(/^events:\s*\[([^\]]*)\]/);
+    if (eventsMatch) {
+      current.events = parseYamlList(eventsMatch[1]) as Array<"created" | "updated">;
       continue;
     }
 
-    // When fields (indent 6)
-    if (indent === 6) {
-      const tagsMatch = line.match(/tags:\s*\[([^\]]*)\]/);
-      if (tagsMatch) {
-        current.when!.tags = parseYamlList(tagsMatch[1]);
-        continue;
-      }
-      const hasContentMatch = line.match(/has_content:\s*(true|false)/);
-      if (hasContentMatch) {
-        current.when!.has_content = hasContentMatch[1] === "true";
-        continue;
-      }
-      const missingMetaMatch = line.match(/missing_metadata:\s*\[([^\]]*)\]/);
-      if (missingMetaMatch) {
-        current.when!.missing_metadata = parseYamlList(missingMetaMatch[1]);
-        continue;
-      }
-      const hasMetaMatch = line.match(/has_metadata:\s*\[([^\]]*)\]/);
-      if (hasMetaMatch) {
-        current.when!.has_metadata = parseYamlList(hasMetaMatch[1]);
-        continue;
-      }
-      const webhookMatch = line.match(/webhook:\s*(.+)/);
+    // When fields
+    if (section === "when") {
+      const tagsMatch = trimmed.match(/^tags:\s*\[([^\]]*)\]/);
+      if (tagsMatch) { current.when!.tags = parseYamlList(tagsMatch[1]); continue; }
+      const hasContentMatch = trimmed.match(/^has_content:\s*(true|false)/);
+      if (hasContentMatch) { current.when!.has_content = hasContentMatch[1] === "true"; continue; }
+      const missingMetaMatch = trimmed.match(/^missing_metadata:\s*\[([^\]]*)\]/);
+      if (missingMetaMatch) { current.when!.missing_metadata = parseYamlList(missingMetaMatch[1]); continue; }
+      const hasMetaMatch = trimmed.match(/^has_metadata:\s*\[([^\]]*)\]/);
+      if (hasMetaMatch) { current.when!.has_metadata = parseYamlList(hasMetaMatch[1]); continue; }
+    }
+
+    // Action fields
+    if (section === "action") {
+      const webhookMatch = trimmed.match(/^webhook:\s*(.+)/);
       if (webhookMatch) {
-        current.action = { webhook: webhookMatch[1].trim() };
+        current.action = { ...(current.action ?? {}), webhook: webhookMatch[1].trim() } as TriggerAction;
         continue;
       }
-      const timeoutMatch = line.match(/timeout:\s*(\d+)/);
+      const timeoutMatch = trimmed.match(/^timeout:\s*(\d+)/);
       if (timeoutMatch && current.action) {
         current.action.timeout = parseInt(timeoutMatch[1], 10);
         continue;
@@ -382,8 +381,12 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
   }
 
   // Push the last trigger
-  if (current?.name && current.when && current.action) {
-    triggers.push(current as TriggerConfig);
+  if (current?.name) {
+    if (current.action?.webhook) {
+      triggers.push(current as TriggerConfig);
+    } else {
+      console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
+    }
   }
 
   return triggers.length > 0 ? triggers : undefined;

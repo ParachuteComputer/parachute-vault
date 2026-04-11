@@ -59,8 +59,8 @@ export interface NoteHook {
    * and return false if so.
    */
   when?: (note: Note) => boolean;
-  /** Handler — runs async, off the request path. */
-  handler: (note: Note, store: Store) => Promise<void> | void;
+  /** Handler — runs async, off the request path. Third arg is the event type. */
+  handler: (note: Note, store: Store, event?: HookEvent) => Promise<void> | void;
   /** Optional label for logs. */
   name?: string;
 }
@@ -204,7 +204,7 @@ export class HookRegistry {
       // handler may have written back in between). If the note was
       // deleted, silently drop.
       const fresh = store.getNote(note.id) ?? note;
-      await hook.handler(fresh, store);
+      await hook.handler(fresh, store, event);
     } catch (err) {
       this.logger.error(
         `[hooks] handler ${hook.name ?? "anonymous"} threw on ${event} ${note.id}:`,
