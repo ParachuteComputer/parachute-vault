@@ -157,22 +157,22 @@ describe("tags", () => {
 describe("vault stats", () => {
   it("handles empty vault gracefully", () => {
     const stats = store.getVaultStats();
-    expect(stats.total_notes).toBe(0);
-    expect(stats.earliest_note).toBeNull();
-    expect(stats.latest_note).toBeNull();
-    expect(stats.notes_by_month).toEqual([]);
-    expect(stats.top_tags).toEqual([]);
-    expect(stats.tag_count).toBe(0);
+    expect(stats.totalNotes).toBe(0);
+    expect(stats.earliestNote).toBeNull();
+    expect(stats.latestNote).toBeNull();
+    expect(stats.notesByMonth).toEqual([]);
+    expect(stats.topTags).toEqual([]);
+    expect(stats.tagCount).toBe(0);
   });
 
-  it("counts total notes and tag_count", () => {
+  it("counts total notes and tagCount", () => {
     store.createNote("A", { tags: ["daily", "voice"] });
     store.createNote("B", { tags: ["daily"] });
     store.createNote("C");
 
     const stats = store.getVaultStats();
-    expect(stats.total_notes).toBe(3);
-    expect(stats.tag_count).toBe(2); // "daily" and "voice"
+    expect(stats.totalNotes).toBe(3);
+    expect(stats.tagCount).toBe(2); // "daily" and "voice"
   });
 
   it("reports earliest and latest notes correctly", () => {
@@ -181,8 +181,8 @@ describe("vault stats", () => {
     store.createNote("newest", { id: "n3", created_at: "2026-03-01T10:00:00.000Z" });
 
     const stats = store.getVaultStats();
-    expect(stats.earliest_note).toEqual({ id: "n1", created_at: "2025-01-15T10:00:00.000Z" });
-    expect(stats.latest_note).toEqual({ id: "n3", created_at: "2026-03-01T10:00:00.000Z" });
+    expect(stats.earliestNote).toEqual({ id: "n1", createdAt: "2025-01-15T10:00:00.000Z" });
+    expect(stats.latestNote).toEqual({ id: "n3", createdAt: "2026-03-01T10:00:00.000Z" });
   });
 
   it("groups notes by month across all present months", () => {
@@ -193,44 +193,44 @@ describe("vault stats", () => {
     store.createNote("e", { created_at: "2026-01-10T10:00:00.000Z" });
 
     const stats = store.getVaultStats();
-    expect(stats.notes_by_month).toEqual([
+    expect(stats.notesByMonth).toEqual([
       { month: "2025-02", count: 1 },
       { month: "2025-03", count: 3 },
       { month: "2026-01", count: 1 },
     ]);
   });
 
-  it("returns top_tags ordered by count desc, capped", () => {
+  it("returns topTags ordered by count desc, capped", () => {
     // Create notes with varying tag frequencies
     for (let i = 0; i < 5; i++) store.createNote(`captured-${i}`, { tags: ["captured"] });
     for (let i = 0; i < 3; i++) store.createNote(`reader-${i}`, { tags: ["reader"] });
     store.createNote("one", { tags: ["rare"] });
 
     const stats = store.getVaultStats();
-    expect(stats.top_tags[0]).toEqual({ tag: "captured", count: 5 });
-    expect(stats.top_tags[1]).toEqual({ tag: "reader", count: 3 });
-    expect(stats.top_tags[2]).toEqual({ tag: "rare", count: 1 });
+    expect(stats.topTags[0]).toEqual({ tag: "captured", count: 5 });
+    expect(stats.topTags[1]).toEqual({ tag: "reader", count: 3 });
+    expect(stats.topTags[2]).toEqual({ tag: "rare", count: 1 });
   });
 
-  it("caps top_tags at the requested limit", () => {
+  it("caps topTags at the requested limit", () => {
     // 25 distinct tags, one per note
     for (let i = 0; i < 25; i++) {
       store.createNote(`n-${i}`, { tags: [`tag-${String(i).padStart(2, "0")}`] });
     }
     const stats = store.getVaultStats({ topTagsLimit: 20 });
-    expect(stats.top_tags).toHaveLength(20);
-    expect(stats.tag_count).toBe(25);
+    expect(stats.topTags).toHaveLength(20);
+    expect(stats.tagCount).toBe(25);
   });
 
   it("response shape is complete", () => {
     store.createNote("hello", { tags: ["a"] });
     const stats = store.getVaultStats();
-    expect(stats).toHaveProperty("total_notes");
-    expect(stats).toHaveProperty("earliest_note");
-    expect(stats).toHaveProperty("latest_note");
-    expect(stats).toHaveProperty("notes_by_month");
-    expect(stats).toHaveProperty("top_tags");
-    expect(stats).toHaveProperty("tag_count");
+    expect(stats).toHaveProperty("totalNotes");
+    expect(stats).toHaveProperty("earliestNote");
+    expect(stats).toHaveProperty("latestNote");
+    expect(stats).toHaveProperty("notesByMonth");
+    expect(stats).toHaveProperty("topTags");
+    expect(stats).toHaveProperty("tagCount");
   });
 
   it("get-vault-stats MCP tool works", () => {
@@ -242,13 +242,13 @@ describe("vault stats", () => {
     expect(tool).toBeTruthy();
 
     const result = tool.execute({}) as any;
-    expect(result.total_notes).toBe(2);
-    expect(result.tag_count).toBe(2);
-    expect(result.top_tags[0].tag).toBe("x");
-    expect(result.top_tags[0].count).toBe(2);
-    expect(result.notes_by_month).toHaveLength(2);
-    expect(result.earliest_note.created_at).toBe("2025-05-01T00:00:00.000Z");
-    expect(result.latest_note.created_at).toBe("2025-06-01T00:00:00.000Z");
+    expect(result.totalNotes).toBe(2);
+    expect(result.tagCount).toBe(2);
+    expect(result.topTags[0].tag).toBe("x");
+    expect(result.topTags[0].count).toBe(2);
+    expect(result.notesByMonth).toHaveLength(2);
+    expect(result.earliestNote.createdAt).toBe("2025-05-01T00:00:00.000Z");
+    expect(result.latestNote.createdAt).toBe("2025-06-01T00:00:00.000Z");
   });
 });
 
@@ -467,7 +467,8 @@ describe("MCP tools", () => {
     expect(names).toContain("delete-tag");
     expect(names).toContain("resolve-wikilink");
     expect(names).toContain("list-unresolved-wikilinks");
-    expect(tools).toHaveLength(21);
+    expect(names).toContain("get-graph");
+    expect(tools).toHaveLength(22);
   });
 
   it("create-note tool works", () => {
@@ -675,7 +676,6 @@ describe("MCP tools", () => {
   it("delete-tag with zero notes removes tag from list", () => {
     store.createNote("Test", { tags: ["ephemeral"] });
     store.untagNote(store.queryNotes({}).find((n) => n.tags?.includes("ephemeral"))!.id, ["ephemeral"]);
-    // Tag exists in tags table but has 0 notes
     const before = store.listTags();
     expect(before.some((t) => t.name === "ephemeral")).toBe(true);
 
@@ -693,17 +693,11 @@ describe("MCP tools", () => {
     const result = store.deleteTag("doomed");
     expect(result).toEqual({ deleted: true, notes_untagged: 2 });
 
-    // Notes still exist
     expect(store.getNote(n1.id)).not.toBeNull();
     expect(store.getNote(n2.id)).not.toBeNull();
-
-    // Tags removed from notes
     expect(store.getNote(n1.id)!.tags).not.toContain("doomed");
     expect(store.getNote(n2.id)!.tags).not.toContain("doomed");
-    // Other tags preserved
     expect(store.getNote(n2.id)!.tags).toContain("keeper");
-
-    // Tag no longer in list
     expect(store.listTags().some((t) => t.name === "doomed")).toBe(false);
   });
 
@@ -769,7 +763,6 @@ describe("MCP tools", () => {
   });
 
   it("list-unresolved-wikilinks: returns unresolved entries", () => {
-    // Create a note with a wikilink to a nonexistent target
     store.createNote("See [[Ghost Note]]", { path: "Source" });
     const tools = generateMcpTools(store);
     const listUnresolved = tools.find((t) => t.name === "list-unresolved-wikilinks")!;
@@ -783,10 +776,88 @@ describe("MCP tools", () => {
   it("list-unresolved-wikilinks: empty when all resolved", () => {
     const tools = generateMcpTools(store);
     const listUnresolved = tools.find((t) => t.name === "list-unresolved-wikilinks")!;
-    // Fresh store with no wikilinks
     const result = listUnresolved.execute({}) as any;
     expect(result.count).toBe(0);
     expect(result.unresolved).toEqual([]);
+  });
+
+  it("get-links returns all links when id is omitted", () => {
+    store.createNote("A", { id: "a" });
+    store.createNote("B", { id: "b" });
+    store.createNote("C", { id: "c" });
+    store.createLink("a", "b", "mentions");
+    store.createLink("b", "c", "cites");
+    const tools = generateMcpTools(db);
+    const getLinks = tools.find((t) => t.name === "get-links")!;
+
+    const all = getLinks.execute({}) as any[];
+    expect(all).toHaveLength(2);
+
+    const cites = getLinks.execute({ relationship: "cites" }) as any[];
+    expect(cites).toHaveLength(1);
+    expect(cites[0].relationship).toBe("cites");
+  });
+
+  it("get-links returns bare Link[] (no hydration)", () => {
+    store.createNote("A", { id: "a", path: "alpha" });
+    store.createNote("B", { id: "b", path: "beta" });
+    store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(db);
+    const getLinks = tools.find((t) => t.name === "get-links")!;
+    const result = getLinks.execute({ id: "a" }) as any[];
+    expect(result[0]).not.toHaveProperty("sourceNote");
+    expect(result[0]).not.toHaveProperty("targetNote");
+    expect(result[0].sourceId).toBe("a");
+    expect(result[0].targetId).toBe("b");
+  });
+
+  it("get-graph returns notes, links, tags, meta with lean notes by default", () => {
+    store.createNote("first", { id: "a", tags: ["proj"] });
+    store.createNote("second", { id: "b", tags: ["proj"] });
+    store.createNote("third", { id: "c", tags: ["other"] });
+    store.createLink("a", "b", "mentions");
+
+    const tools = generateMcpTools(db);
+    const getGraph = tools.find((t) => t.name === "get-graph")!;
+    const graph = getGraph.execute({}) as any;
+
+    expect(graph.notes).toHaveLength(3);
+    expect(graph.links).toHaveLength(1);
+    expect(graph.meta.totalNotes).toBe(3);
+    expect(graph.meta.totalLinks).toBe(1);
+    expect(graph.meta.includeContent).toBe(false);
+    expect(graph.notes[0]).not.toHaveProperty("content");
+    expect(graph.notes[0]).toHaveProperty("byteSize");
+    expect(graph.notes[0]).toHaveProperty("preview");
+  });
+
+  it("get-graph include_content=true returns full notes", () => {
+    store.createNote("body text", { id: "a" });
+    const tools = generateMcpTools(db);
+    const getGraph = tools.find((t) => t.name === "get-graph")!;
+    const graph = getGraph.execute({ include_content: true }) as any;
+    expect(graph.notes[0].content).toBe("body text");
+    expect(graph.meta.includeContent).toBe(true);
+  });
+
+  it("get-graph tag filter restricts notes and links to subgraph", () => {
+    store.createNote("a", { id: "a", tags: ["proj"] });
+    store.createNote("b", { id: "b", tags: ["proj"] });
+    store.createNote("c", { id: "c", tags: ["other"] });
+    store.createLink("a", "b", "mentions");
+    store.createLink("a", "c", "mentions");
+
+    const tools = generateMcpTools(db);
+    const getGraph = tools.find((t) => t.name === "get-graph")!;
+    const graph = getGraph.execute({ tags: ["proj"] }) as any;
+
+    expect(graph.notes).toHaveLength(2);
+    expect(graph.links).toHaveLength(1);
+    expect(graph.links[0].targetId).toBe("b");
+    expect(graph.meta.totalNotes).toBe(3);
+    expect(graph.meta.totalLinks).toBe(2);
+    expect(graph.meta.filteredNotes).toBe(2);
+    expect(graph.meta.filteredLinks).toBe(1);
   });
 
   it("create-note via store triggers wikilink sync", () => {

@@ -7,10 +7,16 @@
 
 import type { Store } from "../core/src/types.ts";
 import { resolveWikilinkDetailed, listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
+import { toNoteIndex } from "../core/src/notes.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
 import type { NarrateModule } from "./tts-hook.ts";
+
+function parseBool(val: string | null, defaultVal: boolean): boolean {
+  if (val === null) return defaultVal;
+  return val === "true" || val === "1";
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,19 +47,26 @@ export async function handleNotes(
   const url = new URL(req.url);
   const method = req.method;
 
-  // GET /notes — Query notes
+  // GET /notes — Query notes.
+  // Default response is the lean index shape (no content). Pass
+  // ?include_content=true to get full notes. Pass ?ids=a,b,c to fetch
+  // specific notes by ID (still honors include_content).
   if (method === "GET" && path === "") {
-    const results = store.queryNotes({
-      tags: parseQueryList(url, "tag"),
-      tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? undefined,
-      excludeTags: parseQueryList(url, "exclude_tag"),
-      dateFrom: parseQuery(url, "date_from") ?? undefined,
-      dateTo: parseQuery(url, "date_to") ?? undefined,
-      sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
-      limit: parseQuery(url, "limit") ? parseInt(parseQuery(url, "limit")!, 10) : undefined,
-      offset: parseQuery(url, "offset") ? parseInt(parseQuery(url, "offset")!, 10) : undefined,
-    });
-    return json(results);
+    const includeContent = parseBool(parseQuery(url, "include_content"), false);
+    const ids = parseQueryList(url, "ids");
+    const fetched = ids
+      ? store.getNotes(ids)
+      : store.queryNotes({
+          tags: parseQueryList(url, "tag"),
+          tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? undefined,
+          excludeTags: parseQueryList(url, "exclude_tag"),
+          dateFrom: parseQuery(url, "date_from") ?? undefined,
+          dateTo: parseQuery(url, "date_to") ?? undefined,
+          sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
+          limit: parseQuery(url, "limit") ? parseInt(parseQuery(url, "limit")!, 10) : undefined,
+          offset: parseQuery(url, "offset") ? parseInt(parseQuery(url, "offset")!, 10) : undefined,
+        });
+    return json(includeContent ? fetched : fetched.map(toNoteIndex));
   }
 
   // POST /notes — Create note
@@ -64,14 +77,14 @@ export async function handleNotes(
       path?: string;
       tags?: string[];
       metadata?: Record<string, unknown>;
-      created_at?: string;
+      createdAt?: string;
     };
     const note = store.createNote(body.content ?? "", {
       id: body.id,
       path: body.path,
       tags: body.tags,
       metadata: body.metadata,
-      created_at: body.created_at,
+      created_at: body.createdAt,
     });
     return json(note, 201);
   }
@@ -84,10 +97,13 @@ export async function handleNotes(
   const subpath = idMatch[2] ?? "";
 
   // GET /notes/:id
+  // Defaults to full content (the point-read case). Pass
+  // ?include_content=false to get the lean index shape.
   if (method === "GET" && subpath === "") {
     const note = store.getNote(noteId);
     if (!note) return json({ error: "Not found" }, 404);
-    return json(note);
+    const includeContent = parseBool(parseQuery(url, "include_content"), true);
+    return json(includeContent ? note : toNoteIndex(note));
   }
 
   // PATCH /notes/:id
@@ -125,22 +141,15 @@ export async function handleNotes(
     return json(store.getNote(noteId));
   }
 
-  // GET /notes/:id/links
-  if (method === "GET" && subpath === "/links") {
-    const direction = parseQuery(url, "direction") as "outbound" | "inbound" | "both" | null;
-    const links = store.getLinks(noteId, { direction: direction ?? "both" });
-    return json(links);
-  }
-
   // POST /notes/:id/attachments
   if (method === "POST" && subpath === "/attachments") {
     const existing = store.getNote(noteId);
     if (!existing) return json({ error: "Not found" }, 404);
-    const body = await req.json() as { path: string; mime_type: string };
-    if (!body.path || !body.mime_type) {
-      return json({ error: "path and mime_type are required" }, 400);
+    const body = await req.json() as { path: string; mimeType: string };
+    if (!body.path || !body.mimeType) {
+      return json({ error: "path and mimeType are required" }, 400);
     }
-    const attachment = store.addAttachment(noteId, body.path, body.mime_type);
+    const attachment = store.addAttachment(noteId, body.path, body.mimeType);
     return json(attachment, 201);
   }
 
@@ -181,30 +190,99 @@ export async function handleLinks(
   req: Request,
   store: Store,
 ): Promise<Response> {
+  // GET /links — list edges.
+  // Filters: ?note_id (only links touching this note), ?direction
+  // (outbound|inbound|both, only meaningful with note_id), ?relationship.
+  // Returns bare Link[], no hydration. Pair with GET /notes?ids=... if you
+  // need the connected notes' details.
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    const noteId = parseQuery(url, "note_id") ?? undefined;
+    const direction = (parseQuery(url, "direction") as "outbound" | "inbound" | "both" | null) ?? undefined;
+    const relationship = parseQuery(url, "relationship") ?? undefined;
+    return json(store.listLinks({ noteId, direction: direction ?? undefined, relationship }));
+  }
+
   if (req.method === "POST") {
     const body = await req.json() as {
-      source_id: string;
-      target_id: string;
+      sourceId: string;
+      targetId: string;
       relationship: string;
+      metadata?: Record<string, unknown>;
     };
-    if (!body.source_id || !body.target_id || !body.relationship) {
-      return json({ error: "source_id, target_id, and relationship are required" }, 400);
+    if (!body.sourceId || !body.targetId || !body.relationship) {
+      return json({ error: "sourceId, targetId, and relationship are required" }, 400);
     }
-    const link = store.createLink(body.source_id, body.target_id, body.relationship);
+    const link = store.createLink(body.sourceId, body.targetId, body.relationship, body.metadata);
     return json(link, 201);
   }
 
   if (req.method === "DELETE") {
     const body = await req.json() as {
-      source_id: string;
-      target_id: string;
+      sourceId: string;
+      targetId: string;
       relationship: string;
     };
-    store.deleteLink(body.source_id, body.target_id, body.relationship);
+    store.deleteLink(body.sourceId, body.targetId, body.relationship);
     return json({ deleted: true });
   }
 
+  // GET handled in the new polymorphic path below
   return json({ error: "Method not allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
+// Graph
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /graph — one-shot knowledge graph payload.
+ *
+ * Returns { notes, links, tags, meta }. Lean notes by default (NoteIndex),
+ * include_content=true fattens them. Optional tag filter restricts notes
+ * to a subgraph; links are filtered to edges between notes in the subset.
+ */
+export function handleGraph(req: Request, store: Store): Response {
+  if (req.method !== "GET") {
+    return json({ error: "Method not allowed" }, 405);
+  }
+  const url = new URL(req.url);
+  const tags = parseQueryList(url, "tag");
+  const tagMatch = (parseQuery(url, "tag_match") as "all" | "any") ?? undefined;
+  const excludeTags = parseQueryList(url, "exclude_tag");
+  const includeContent = parseBool(parseQuery(url, "include_content"), false);
+
+  const hasTagFilter = !!(tags?.length || excludeTags?.length);
+  const filteredNotes = store.queryNotes({
+    tags,
+    tagMatch,
+    excludeTags,
+    limit: 1_000_000,
+  });
+  const outNotes = includeContent ? filteredNotes : filteredNotes.map(toNoteIndex);
+
+  const allLinks = store.listLinks();
+  const outLinks = hasTagFilter
+    ? (() => {
+        const ids = new Set(filteredNotes.map((n) => n.id));
+        return allLinks.filter((l) => ids.has(l.sourceId) && ids.has(l.targetId));
+      })()
+    : allLinks;
+
+  const stats = store.getVaultStats({ topTagsLimit: 1_000_000 });
+
+  return json({
+    notes: outNotes,
+    links: outLinks,
+    tags: store.listTags(),
+    meta: {
+      totalNotes: stats.totalNotes,
+      totalLinks: allLinks.length,
+      filteredNotes: outNotes.length,
+      filteredLinks: outLinks.length,
+      includeContent,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +384,7 @@ export async function handleStorage(req: Request, path: string, vault: string): 
     const result: Record<string, unknown> = {
       path: relativePath,
       size: buffer.length,
-      mime_type: mimeType,
+      mimeType,
     };
 
     // Optional: transcribe audio in the same request
@@ -365,7 +443,7 @@ export async function handleStorage(req: Request, path: string, vault: string): 
  * Multipart form:
  *   file          — audio file (required)
  *   content       — note text (optional, e.g., client transcription or user notes)
- *   created_at    — when the note was taken, ISO-8601 (optional, defaults to now)
+ *   createdAt     — when the note was taken, ISO-8601 (optional, defaults to now)
  *   tags          — comma-separated tags (optional)
  *   path          — note path (optional)
  *   metadata      — JSON string of note metadata (optional)
@@ -434,7 +512,7 @@ export async function handleIngest(
   }
 
   // 4. Parse options
-  const createdAt = (form.get("created_at") as string) ?? undefined;
+  const createdAt = (form.get("createdAt") as string) ?? undefined;
   const tagsStr = form.get("tags") as string | null;
   const tags = tagsStr ? tagsStr.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
   const path = (form.get("path") as string) ?? undefined;

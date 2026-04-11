@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
+import { handleNotes, handleLinks, handleGraph } from "./routes.ts";
 
 let db: Database;
 let store: BunStore;
@@ -468,9 +469,9 @@ describe("deeper link queries", () => {
 });
 
 describe("MCP tools", () => {
-  test("generates all 21 core tools", () => {
+  test("generates all 22 core tools", () => {
     const tools = generateMcpTools(db);
-    expect(tools.length).toBe(21);
+    expect(tools.length).toBe(22);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("get-note");
@@ -482,6 +483,7 @@ describe("MCP tools", () => {
     expect(names).toContain("find-path");
     expect(names).toContain("list-tags");
     expect(names).toContain("get-vault-stats");
+    expect(names).toContain("get-graph");
   });
 
   test("get-note tool works by id", () => {
@@ -556,10 +558,10 @@ describe("unified MCP wrapper", () => {
     // Routed explicitly via the vault param, mirroring how a multi-vault
     // client targets a specific vault.
     const result = statsTool!.execute({ vault: vaultName }) as any;
-    expect(result.total_notes).toBe(2);
-    expect(result.tag_count).toBe(2);
-    expect(result.top_tags[0].tag).toBe("x");
-    expect(result.top_tags[0].count).toBe(2);
+    expect(result.totalNotes).toBe(2);
+    expect(result.tagCount).toBe(2);
+    expect(result.topTags[0].tag).toBe("x");
+    expect(result.topTags[0].count).toBe(2);
 
     closeAllStores();
   });
@@ -851,6 +853,198 @@ describe("auth scopes", () => {
     expect(isMethodAllowed("PATCH", "read")).toBe(false);
     expect(isMethodAllowed("DELETE", "read")).toBe(false);
   });
+
+  test("get-graph is a read tool", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("get-graph", "read")).toBe(true);
+  });
+});
+
+// ---- HTTP route handlers ----
+
+const BASE = "http://localhost/api";
+
+function mkReq(method: string, path: string, body?: unknown): Request {
+  const init: RequestInit = { method };
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+    init.headers = { "Content-Type": "application/json" };
+  }
+  return new Request(`${BASE}${path}`, init);
+}
+
+describe("HTTP /notes", () => {
+  test("GET /notes defaults to lean index (no content field)", async () => {
+    store.createNote("one content", { path: "a", tags: ["t"] });
+    store.createNote("two content", { path: "b", tags: ["t"] });
+    const res = await handleNotes(mkReq("GET", "/notes"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    expect(body[0]).not.toHaveProperty("content");
+    expect(body[0]).toHaveProperty("byteSize");
+    expect(body[0]).toHaveProperty("preview");
+  });
+
+  test("GET /notes?include_content=true returns full notes", async () => {
+    store.createNote("full body", { path: "a" });
+    const res = await handleNotes(mkReq("GET", "/notes?include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body[0].content).toBe("full body");
+  });
+
+  test("GET /notes?ids=a,b bulk fetch", async () => {
+    const n1 = store.createNote("one", { id: "id-1" });
+    const n2 = store.createNote("two", { id: "id-2" });
+    store.createNote("three", { id: "id-3" });
+    const res = await handleNotes(mkReq("GET", "/notes?ids=id-1,id-2"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    const ids = body.map((n) => n.id).sort();
+    expect(ids).toEqual(["id-1", "id-2"]);
+  });
+
+  test("GET /notes/:id defaults to full content", async () => {
+    const n = store.createNote("hello", { id: "x" });
+    const res = await handleNotes(mkReq("GET", "/notes/x"), store, "/x");
+    const body = await res.json() as any;
+    expect(body.content).toBe("hello");
+  });
+
+  test("GET /notes/:id?include_content=false returns lean shape", async () => {
+    store.createNote("hello", { id: "x" });
+    const res = await handleNotes(mkReq("GET", "/notes/x?include_content=false"), store, "/x");
+    const body = await res.json() as any;
+    expect(body).not.toHaveProperty("content");
+    expect(body.byteSize).toBe(5);
+    expect(body.preview).toBe("hello");
+  });
+
+  test("POST /notes accepts createdAt (camelCase) in body", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "hi", createdAt: "2025-01-01T00:00:00.000Z" }),
+      store,
+      "",
+    );
+    const body = await res.json() as any;
+    expect(body.createdAt).toBe("2025-01-01T00:00:00.000Z");
+  });
+
+  test("POST /notes/:id/attachments accepts mimeType (camelCase) in body", async () => {
+    const n = store.createNote("x", { id: "x" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes/x/attachments", { path: "files/a.png", mimeType: "image/png" }),
+      store,
+      "/x/attachments",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.mimeType).toBe("image/png");
+  });
+});
+
+describe("HTTP /links (polymorphic)", () => {
+  test("GET /links returns all edges", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    store.createNote("c", { id: "c" });
+    store.createLink("a", "b", "mentions");
+    store.createLink("b", "c", "cites");
+    const res = await handleLinks(mkReq("GET", "/links"), store);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+  });
+
+  test("GET /links?note_id=a restricts to links touching a", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    store.createNote("c", { id: "c" });
+    store.createLink("a", "b", "mentions");
+    store.createLink("b", "c", "cites");
+    const res = await handleLinks(mkReq("GET", "/links?note_id=a"), store);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].sourceId).toBe("a");
+  });
+
+  test("GET /links?relationship=cites filters by type", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    store.createLink("a", "b", "mentions");
+    store.createLink("a", "b", "cites");
+    const res = await handleLinks(mkReq("GET", "/links?relationship=cites"), store);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].relationship).toBe("cites");
+  });
+
+  test("POST /links accepts sourceId/targetId (camelCase) in body", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    const res = await handleLinks(
+      mkReq("POST", "/links", { sourceId: "a", targetId: "b", relationship: "cites" }),
+      store,
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.sourceId).toBe("a");
+    expect(body.targetId).toBe("b");
+  });
+
+  test("POST /links rejects snake_case body fields", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    const res = await handleLinks(
+      mkReq("POST", "/links", { source_id: "a", target_id: "b", relationship: "cites" }),
+      store,
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("HTTP /graph", () => {
+  test("returns notes, links, tags, meta", async () => {
+    store.createNote("a", { id: "a", tags: ["proj"] });
+    store.createNote("b", { id: "b", tags: ["proj"] });
+    store.createNote("c", { id: "c", tags: ["other"] });
+    store.createLink("a", "b", "mentions");
+    const res = await handleGraph(mkReq("GET", "/graph"), store);
+    const body = await res.json() as any;
+    expect(body.notes).toHaveLength(3);
+    expect(body.links).toHaveLength(1);
+    expect(body.tags.length).toBeGreaterThan(0);
+    expect(body.meta.totalNotes).toBe(3);
+    expect(body.meta.totalLinks).toBe(1);
+    expect(body.meta.includeContent).toBe(false);
+    // Lean by default
+    expect(body.notes[0]).not.toHaveProperty("content");
+    expect(body.notes[0]).toHaveProperty("byteSize");
+  });
+
+  test("?include_content=true returns full note content", async () => {
+    store.createNote("has body", { id: "a" });
+    const res = await handleGraph(mkReq("GET", "/graph?include_content=true"), store);
+    const body = await res.json() as any;
+    expect(body.notes[0].content).toBe("has body");
+    expect(body.meta.includeContent).toBe(true);
+  });
+
+  test("?tag=proj filters notes and links to the subgraph", async () => {
+    store.createNote("a", { id: "a", tags: ["proj"] });
+    store.createNote("b", { id: "b", tags: ["proj"] });
+    store.createNote("c", { id: "c", tags: ["other"] });
+    store.createLink("a", "b", "mentions"); // inside subgraph
+    store.createLink("a", "c", "mentions"); // crosses subgraph boundary
+    const res = await handleGraph(mkReq("GET", "/graph?tag=proj"), store);
+    const body = await res.json() as any;
+    expect(body.notes).toHaveLength(2);
+    expect(body.links).toHaveLength(1);
+    expect(body.links[0].sourceId).toBe("a");
+    expect(body.links[0].targetId).toBe("b");
+    expect(body.meta.totalNotes).toBe(3);
+    expect(body.meta.totalLinks).toBe(2);
+    expect(body.meta.filteredNotes).toBe(2);
+    expect(body.meta.filteredLinks).toBe(1);
+  });
 });
 
 describe("stateless MCP transport", () => {
@@ -891,7 +1085,7 @@ describe("stateless MCP transport", () => {
     const body = await res.json() as any;
     expect(body.result).toBeDefined();
     const content = JSON.parse(body.result.content[0].text);
-    expect(content.total_notes).toBe(1);
+    expect(content.totalNotes).toBe(1);
 
     closeAllStores();
   });

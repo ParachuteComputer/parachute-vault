@@ -31,7 +31,7 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleTranscription, handleModels, handleTtsSpeech } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTtsHook, type NarrateModule } from "./tts-hook.ts";
 import { registerTranscriptionHook, type ScribeModule } from "./transcription-hook.ts";
@@ -257,6 +257,7 @@ async function route(req: Request, path: string): Promise<Response> {
     if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/links") return handleLinks(req, store);
+    if (apiPath === "/graph") return handleGraph(req, store);
     if (apiPath === "/search") return handleSearch(req, store);
     if (apiPath === "/resolve-wikilink") return handleResolveWikilink(req, store);
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
@@ -291,6 +292,22 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleScopedMcp(req, vaultName, auth.scope);
   }
 
+  // Bare /vaults/{name} — single-vault root. Returns name, description,
+  // createdAt, and stats. One round trip for a viz landing page.
+  if (subpath === "" || subpath === "/") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    const store = getVaultStore(vaultName);
+    const stats = store.getVaultStats();
+    return Response.json({
+      name: vaultName,
+      description: vaultConfig.description,
+      createdAt: vaultConfig.created_at,
+      stats,
+    });
+  }
+
   // REST API — enforce read-only scope
   if (!isMethodAllowed(req.method, auth.scope)) {
     return Response.json(
@@ -315,6 +332,9 @@ async function route(req: Request, path: string): Promise<Response> {
   }
   if (apiPath === "/links") {
     return handleLinks(req, store);
+  }
+  if (apiPath === "/graph") {
+    return handleGraph(req, store);
   }
   if (apiPath === "/search") {
     return handleSearch(req, store);

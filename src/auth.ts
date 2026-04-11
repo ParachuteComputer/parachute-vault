@@ -27,6 +27,7 @@ const READ_TOOLS = new Set([
   "read-notes",
   "search-notes",
   "get-links",
+  "get-graph",
   "traverse-links",
   "find-path",
   "list-tags",

@@ -35,12 +35,12 @@ export interface Attachment {
 // ---- Vault Stats ----
 
 export interface VaultStats {
-  total_notes: number;
-  earliest_note: { id: string; created_at: string } | null;
-  latest_note: { id: string; created_at: string } | null;
-  notes_by_month: { month: string; count: number }[];
-  top_tags: { tag: string; count: number }[];
-  tag_count: number;
+  totalNotes: number;
+  earliestNote: { id: string; createdAt: string } | null;
+  latestNote: { id: string; createdAt: string } | null;
+  notesByMonth: { month: string; count: number }[];
+  topTags: { tag: string; count: number }[];
+  tagCount: number;
 }
 
 // ---- Query Options ----
@@ -66,6 +66,21 @@ export interface NoteSummary {
   createdAt: string;
   updatedAt?: string;
   tags?: string[];
+}
+
+/**
+ * Lean note index entry — summary + byteSize + single-line preview.
+ * Used by read-notes (index mode), GET /notes (list default), and /graph.
+ */
+export interface NoteIndex {
+  id: string;
+  path?: string;
+  createdAt: string;
+  updatedAt?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  byteSize: number;
+  preview: string;
 }
 
 /** Link with hydrated note summaries. */
@@ -100,6 +115,7 @@ export interface Store {
   createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Link;
   deleteLink(sourceId: string, targetId: string, relationship: string): void;
   getLinks(noteId: string, opts?: { direction?: "outbound" | "inbound" | "both" }): Link[];
+  listLinks(opts?: { noteId?: string; direction?: "outbound" | "inbound" | "both"; relationship?: string }): Link[];
 
   // Bulk operations
   createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Note[];

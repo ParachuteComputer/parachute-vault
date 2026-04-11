@@ -151,29 +151,7 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
           offset: params.offset as number | undefined,
         });
         if (params.include_content === false) {
-          const PREVIEW_LEN = 120;
-          return results.map((note) => {
-            const content = note.content ?? "";
-            const byteSize = Buffer.byteLength(content, "utf8");
-            // Collapse whitespace for a readable single-line preview
-            const collapsed = content.replace(/\s+/g, " ").trim();
-            // Iterate by Unicode code points so we don't split surrogate pairs
-            // (e.g. astral-plane emoji) mid-character.
-            const codePoints = Array.from(collapsed);
-            const preview = codePoints.length > PREVIEW_LEN
-              ? codePoints.slice(0, PREVIEW_LEN).join("")
-              : collapsed;
-            return {
-              id: note.id,
-              path: note.path,
-              createdAt: note.createdAt,
-              updatedAt: note.updatedAt,
-              tags: note.tags,
-              metadata: note.metadata,
-              byteSize,
-              preview,
-            };
-          });
+          return results.map(notes.toNoteIndex);
         }
         return results;
       },
@@ -272,39 +250,20 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
     },
     {
       name: "get-links",
-      description: "Get links for a note. Returns connected notes with their path, tags, and metadata. Use include_content to also get note content.",
+      description: "List links in the vault. Returns bare link edges ({sourceId, targetId, relationship, metadata, createdAt}) — no hydration. Omit `id` to list every link (optionally filtered by `relationship`). Pass `id` to get links touching that note (with `direction`: outbound, inbound, both). Pair with get-note when you need the connected notes' content.",
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID" },
-          direction: { type: "string", enum: ["outbound", "inbound", "both"], default: "both" },
-          include_content: { type: "boolean", description: "Include full note content in results (default false)" },
+          id: { type: "string", description: "Note ID. If omitted, returns all links in the vault." },
+          direction: { type: "string", enum: ["outbound", "inbound", "both"], default: "both", description: "Only meaningful when `id` is provided." },
+          relationship: { type: "string", description: "Filter to links with this relationship type." },
         },
-        required: ["id"],
       },
-      execute: (params) => {
-        const hydrated = links.getLinksHydrated(db, params.id as string, {
-          direction: params.direction as "outbound" | "inbound" | "both" | undefined,
-        });
-        if (params.include_content) {
-          // Fetch full notes for content
-          const noteIds = new Set<string>();
-          for (const link of hydrated) {
-            noteIds.add(link.sourceId);
-            noteIds.add(link.targetId);
-          }
-          const fullNotes = new Map<string, any>();
-          for (const note of notes.getNotes(db, [...noteIds])) {
-            fullNotes.set(note.id, note);
-          }
-          return hydrated.map((link) => ({
-            ...link,
-            sourceNote: fullNotes.get(link.sourceId) ?? link.sourceNote,
-            targetNote: fullNotes.get(link.targetId) ?? link.targetNote,
-          }));
-        }
-        return hydrated;
-      },
+      execute: (params) => links.listLinks(db, {
+        noteId: params.id as string | undefined,
+        direction: params.direction as "outbound" | "inbound" | "both" | undefined,
+        relationship: params.relationship as string | undefined,
+      }),
     },
     {
       name: "list-tags",
@@ -325,6 +284,55 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
       execute: (params) => {
         const fn = store ? store.deleteTag.bind(store) : (name: string) => notes.deleteTag(db, name);
         return fn(params.tag as string);
+      },
+    },
+    {
+      name: "get-graph",
+      description: "Get the whole vault as a graph in one call: {notes, links, tags, meta}. Default returns lean note indexes (id, path, tags, createdAt, updatedAt, metadata, byteSize, preview) — no content. Pass include_content: true to include full content on each note. Optional tag filter (tags + tag_match + exclude_tags) restricts notes to a subgraph; links are filtered to edges between notes in the subgraph. Useful for rendering visualizations, exports, or bird's-eye analysis.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tags: { type: "array", items: { type: "string" }, description: "Optional: only include notes with these tags" },
+          tag_match: { type: "string", enum: ["all", "any"], description: "How to match tags (default: all)" },
+          exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
+          include_content: { type: "boolean", description: "Include full note content instead of the lean index shape (default false)" },
+        },
+      },
+      execute: (params) => {
+        const hasTagFilter = (params.tags as string[] | undefined)?.length
+          || (params.exclude_tags as string[] | undefined)?.length;
+        const filteredNotes = notes.queryNotes(db, {
+          tags: params.tags as string[] | undefined,
+          tagMatch: params.tag_match as "all" | "any" | undefined,
+          excludeTags: params.exclude_tags as string[] | undefined,
+          limit: 1_000_000,
+        });
+        const includeContent = params.include_content === true;
+        const outNotes = includeContent ? filteredNotes : filteredNotes.map(notes.toNoteIndex);
+
+        // Links: if no tag filter, return all links in the vault.
+        // Otherwise, only edges between notes in the filtered set.
+        let outLinks = links.listLinks(db);
+        if (hasTagFilter) {
+          const ids = new Set(filteredNotes.map((n) => n.id));
+          outLinks = outLinks.filter((l) => ids.has(l.sourceId) && ids.has(l.targetId));
+        }
+
+        const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
+        const linkRow = db.prepare("SELECT COUNT(*) as c FROM links").get() as { c: number };
+
+        return {
+          notes: outNotes,
+          links: outLinks,
+          tags: notes.listTags(db),
+          meta: {
+            totalNotes: totalRow.c,
+            totalLinks: linkRow.c,
+            filteredNotes: outNotes.length,
+            filteredLinks: outLinks.length,
+            includeContent,
+          },
+        };
       },
     },
     {
