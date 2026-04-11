@@ -1,7 +1,7 @@
 /**
  * Tests for the `#capture` → transcription hook (vault-side integration).
  *
- * The transcription pipeline itself lives in `parachute-scribe`. These tests
+ * The transcription pipeline itself lives in `@openparachute/scribe`. These tests
  * stub the scribe module so they cover only what vault owns: the tag
  * predicate, two-phase marker discipline, content writeback, skip-on-empty
  * behavior, and the failure path that leaves notes in `transcript_pending_at`.

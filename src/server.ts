@@ -40,15 +40,15 @@ import { assetsDir } from "./routes.ts";
 import type { SqliteStore } from "../core/src/store.ts";
 
 // Features register their note-mutation hooks here. The TTS (#reader →
-// audio) hook is registered if BOTH `parachute-narrate` is installed AND
+// audio) hook is registered if BOTH `@openparachute/narrate` is installed AND
 // a TTS provider is configured in env. Either missing → hook is silently
 // skipped, same shape as how transcription handles optional scribe.
 async function registerHooks(): Promise<void> {
   let narrate: NarrateModule | null = null;
   try {
-    narrate = (await import("parachute-narrate")) as unknown as NarrateModule;
+    narrate = (await import("@openparachute/narrate")) as unknown as NarrateModule;
   } catch {
-    console.log("[hooks] parachute-narrate not installed; skipping tts-reader hook");
+    console.log("[hooks] @openparachute/narrate not installed; skipping tts-reader hook");
     return;
   }
 
@@ -75,7 +75,7 @@ async function registerHooks(): Promise<void> {
       return assetsDir(name);
     },
   });
-  console.log(`[hooks] tts-reader hook registered (provider=${probedProvider.name}, via parachute-narrate)`);
+  console.log(`[hooks] tts-reader hook registered (provider=${probedProvider.name}, via @openparachute/narrate)`);
 }
 
 async function registerTranscriptionHooks(): Promise<void> {
@@ -86,9 +86,9 @@ async function registerTranscriptionHooks(): Promise<void> {
 
   let scribe: ScribeModule | null = null;
   try {
-    scribe = (await import("parachute-scribe")) as unknown as ScribeModule;
+    scribe = (await import("@openparachute/scribe")) as unknown as ScribeModule;
   } catch {
-    console.log("[hooks] parachute-scribe not installed; skipping transcribe-capture hook");
+    console.log("[hooks] @openparachute/scribe not installed; skipping transcribe-capture hook");
     return;
   }
 
@@ -104,7 +104,7 @@ async function registerTranscriptionHooks(): Promise<void> {
       return assetsDir(name);
     },
   });
-  console.log("[hooks] transcribe-capture hook registered (via parachute-scribe)");
+  console.log("[hooks] transcribe-capture hook registered (via @openparachute/scribe)");
 }
 
 await registerHooks();

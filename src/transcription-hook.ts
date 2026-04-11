@@ -3,7 +3,7 @@
  *
  * Mirrors the shape of `tts-hook.ts`. When a note tagged `#capture` arrives
  * with an audio attachment and empty content, we transcribe the audio via
- * `parachute-scribe` and write the transcript into `note.content`.
+ * `@openparachute/scribe` and write the transcript into `note.content`.
  *
  * ## Two-phase marker
  *
@@ -28,7 +28,7 @@ import type { Note, Store } from "../core/src/types.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 
 /**
- * The subset of the `parachute-scribe` module surface the hook uses.
+ * The subset of the `@openparachute/scribe` module surface the hook uses.
  * Declared here so tests can stub it with a plain object.
  */
 export interface ScribeModule {
@@ -36,7 +36,7 @@ export interface ScribeModule {
 }
 
 export interface RegisterTranscriptionHookOptions {
-  /** Injected scribe module (pass the result of `await import("parachute-scribe")`). */
+  /** Injected scribe module (pass the result of `await import("@openparachute/scribe")`). */
   scribe: ScribeModule;
   /**
    * Resolve the vault assets directory for a given store. Called once per

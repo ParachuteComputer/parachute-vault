@@ -1,7 +1,7 @@
 /**
  * Tests for POST /v1/audio/speech — the OpenAI-compatible TTS endpoint.
  *
- * Injects a stub `parachute-narrate` module so the real provider /
+ * Injects a stub `@openparachute/narrate` module so the real provider /
  * subprocess / ffmpeg never run. Production resolves narrate via dynamic
  * import (mirroring `getScribe`); tests pass a stub via `deps.getNarrate`.
  */
@@ -11,7 +11,7 @@ import { handleTtsSpeech } from "./routes.ts";
 import type { NarrateModule } from "./tts-hook.ts";
 
 // Local stand-ins for narrate's typed error classes. Tests don't import
-// from parachute-narrate directly — they stub the whole module — so we
+// from @openparachute/narrate directly — they stub the whole module — so we
 // mint local subclasses that `instanceof` correctly against themselves.
 class StubNarrateEmptyInputError extends Error {
   constructor(...args: unknown[]) {
@@ -207,7 +207,7 @@ describe("handleTtsSpeech", () => {
     expect(res.status).toBe(501);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe(
-      "TTS not available — parachute-narrate is not installed",
+      "TTS not available — @openparachute/narrate is not installed",
     );
   });
 

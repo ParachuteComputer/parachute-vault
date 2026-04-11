@@ -555,7 +555,7 @@ export async function handleIngest(
 }
 
 // ---------------------------------------------------------------------------
-// Transcription (via parachute-scribe)
+// Transcription (via @openparachute/scribe)
 // ---------------------------------------------------------------------------
 
 let scribeAvailable: boolean | null = null;
@@ -563,7 +563,7 @@ let scribeAvailable: boolean | null = null;
 async function getScribe() {
   if (scribeAvailable === false) return null;
   try {
-    const scribe = await import("parachute-scribe");
+    const scribe = await import("@openparachute/scribe");
     scribeAvailable = true;
     return scribe;
   } catch {
@@ -575,7 +575,7 @@ async function getScribe() {
 export async function handleTranscription(req: Request): Promise<Response> {
   const scribe = await getScribe();
   if (!scribe) {
-    return json({ error: "Transcription not available — parachute-scribe is not installed" }, 501);
+    return json({ error: "Transcription not available — @openparachute/scribe is not installed" }, 501);
   }
 
   const form = await req.formData();
@@ -617,7 +617,7 @@ async function getNarrate(): Promise<NarrateModule | null> {
   if (narrateAvailable === false) return null;
   if (narrateCached) return narrateCached;
   try {
-    const mod = (await import("parachute-narrate")) as unknown as NarrateModule;
+    const mod = (await import("@openparachute/narrate")) as unknown as NarrateModule;
     narrateCached = mod;
     narrateAvailable = true;
     return mod;
@@ -629,7 +629,7 @@ async function getNarrate(): Promise<NarrateModule | null> {
 
 /**
  * Dependencies for `handleTtsSpeech`. Production defaults dynamically
- * import `parachute-narrate`; tests inject a stub module to avoid the
+ * import `@openparachute/narrate`; tests inject a stub module to avoid the
  * real provider, subprocess, and ffmpeg.
  */
 export interface TtsSpeechDeps {
@@ -643,13 +643,13 @@ export interface TtsSpeechDeps {
  *
  * Accepts the OpenAI request shape (`model`, `voice`, `input`,
  * `response_format`). `model` is ignored (the active provider is whatever
- * `parachute-narrate` resolves from env at call time). `response_format`
+ * `@openparachute/narrate` resolves from env at call time). `response_format`
  * accepts `"opus"` / `"mp3"` as aliases and always returns OGG Opus,
  * because the vault unified on that format in #43. Unknown values are
  * rejected with 400 so callers don't silently get the "wrong" format.
  *
  * All heavy lifting (markdown preprocessing, provider resolution, ffmpeg
- * encoding) lives in `parachute-narrate`. This handler's job is just
+ * encoding) lives in `@openparachute/narrate`. This handler's job is just
  * request parsing, validation, narrate invocation, and error-to-status
  * mapping.
  */
@@ -683,7 +683,7 @@ export async function handleTtsSpeech(req: Request, deps: TtsSpeechDeps = {}): P
   const resolveNarrate = deps.getNarrate ?? getNarrate;
   const narrate = await resolveNarrate();
   if (!narrate) {
-    return json({ error: "TTS not available — parachute-narrate is not installed" }, 501);
+    return json({ error: "TTS not available — @openparachute/narrate is not installed" }, 501);
   }
 
   try {

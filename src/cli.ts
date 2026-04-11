@@ -623,7 +623,7 @@ async function cmdStatus() {
     console.log(`  Providers:      ${scribe.transcription.join(", ")}`);
   } else {
     console.log(`  Transcription:  not available`);
-    console.log(`                  bun add parachute-scribe to enable`);
+    console.log(`                  bun add @openparachute/scribe to enable`);
   }
 
   // Embeddings

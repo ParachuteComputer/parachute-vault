@@ -47,7 +47,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, statSync, unlinkSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
-import { encodeOggOpus } from "parachute-narrate";
+import { encodeOggOpus } from "@openparachute/narrate";
 import { readFileSync, writeFileSync } from "fs";
 
 // ---------------------------------------------------------------------------

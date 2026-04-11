@@ -1,5 +1,5 @@
 {
-  "name": "@parachute/core",
+  "name": "@openparachute/core",
   "version": "0.1.0",
   "description": "Parachute Vault core — schema, store, graph operations, MCP tools",
   "type": "module",

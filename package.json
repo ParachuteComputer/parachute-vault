@@ -1,5 +1,5 @@
 {
-  "name": "@parachute/vault",
+  "name": "@openparachute/vault",
   "version": "0.1.0",
   "description": "Agent-native knowledge graph. Notes, tags, links over MCP.",
   "module": "src/cli.ts",
@@ -23,6 +23,12 @@
     "@types/bun": "latest"
   },
   "peerDependencies": {
+    "@openparachute/scribe": "^0.1.0",
+    "@openparachute/narrate": "^0.1.0",
     "typescript": "^5"
+  },
+  "peerDependenciesMeta": {
+    "@openparachute/scribe": { "optional": true },
+    "@openparachute/narrate": { "optional": true }
   }
 }
