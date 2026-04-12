@@ -192,7 +192,7 @@ export async function handleTagSchemas(req: Request, store: Store, subpath = "")
     return json(store.listTagSchemas());
   }
 
-  const tagMatch = subpath.match(/^\/(.+)$/);
+  const tagMatch = subpath.match(/^\/([^/]+)$/);
   if (!tagMatch) return json({ error: "Not found" }, 404);
   const tagName = decodeURIComponent(tagMatch[1]);
 

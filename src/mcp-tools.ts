@@ -439,9 +439,10 @@ function addTagSchemaTools(tools: McpToolDef[], defaultVault: string, multiVault
       const store = resolveStore(params);
       const tag = params.tag as string;
       const existing = store.getTagSchema(tag);
-      const mergedFields = { ...existing?.fields, ...(params.fields as any) };
+      if (!existing) throw new Error(`No schema defined for tag "${tag}". Use create-tag-schema to create one.`);
+      const mergedFields = { ...existing.fields, ...(params.fields as any) };
       return store.upsertTagSchema(tag, {
-        description: (params.description as string | undefined) ?? existing?.description,
+        description: (params.description as string | undefined) ?? existing.description,
         fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
       });
     },

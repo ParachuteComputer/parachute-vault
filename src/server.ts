@@ -68,19 +68,23 @@ if (listVaults().length === 0) {
 }
 
 // Migrate tag schemas from vault.yaml → DB for each vault.
-// Runs once per vault on first startup after the v6 schema upgrade.
+// Only inserts schemas that don't already exist in the DB (safe across restarts).
 for (const vaultName of listVaults()) {
   const vaultConfig = readVaultConfig(vaultName);
   if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
     const store = getVaultStore(vaultName);
-    const existingSchemas = store.listTagSchemas();
-    if (existingSchemas.length === 0) {
-      let migrated = 0;
-      for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
+    const existingTags = new Set(store.listTagSchemas().map((s) => s.tag));
+    let migrated = 0;
+    for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
+      if (!existingTags.has(tag)) {
         store.upsertTagSchema(tag, schema);
         migrated++;
       }
+    }
+    if (migrated > 0) {
       console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
+    } else {
+      console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
     }
   }
 }
