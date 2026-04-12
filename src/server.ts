@@ -192,10 +192,12 @@ async function route(req: Request, path: string): Promise<Response> {
     });
   }
 
-  // Backward compat: /public/:noteId → /view/:noteId
+  // Backward compat: /public/:noteId → /view/:noteId (preserving query params)
   const publicMatch = path.match(/^\/public\/([^/]+)$/);
   if (publicMatch && req.method === "GET") {
-    return Response.redirect(new URL(`/view/${publicMatch[1]}`, req.url).toString(), 301);
+    const dest = new URL(`/view/${publicMatch[1]}`, req.url);
+    dest.search = new URL(req.url).search;
+    return Response.redirect(dest.toString(), 301);
   }
 
 
@@ -259,7 +261,9 @@ async function route(req: Request, path: string): Promise<Response> {
   // Backward compat: /vaults/{name}/public/:noteId → /view/:noteId
   const vaultPublicMatch = subpath.match(/^\/public\/([^/]+)$/);
   if (vaultPublicMatch && req.method === "GET") {
-    return Response.redirect(new URL(`/vaults/${vaultName}/view/${vaultPublicMatch[1]}`, req.url).toString(), 301);
+    const dest = new URL(`/vaults/${vaultName}/view/${vaultPublicMatch[1]}`, req.url);
+    dest.search = new URL(req.url).search;
+    return Response.redirect(dest.toString(), 301);
   }
 
   // View endpoint — serves notes as HTML (auth-aware, vault-scoped)

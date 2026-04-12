@@ -1,6 +1,35 @@
 import { describe, it, expect } from "bun:test";
 import { handleViewNote } from "./routes.ts";
 
+// Redirect URL builder — mirrors the logic in server.ts
+function buildRedirectUrl(reqUrl: string, noteId: string, prefix = ""): string {
+  const dest = new URL(`${prefix}/view/${noteId}`, reqUrl);
+  dest.search = new URL(reqUrl).search;
+  return dest.toString();
+}
+
+describe("/public → /view redirect", () => {
+  it("preserves query params including ?key=", () => {
+    const url = buildRedirectUrl("http://localhost:1940/public/abc?key=pvk_secret", "abc");
+    expect(url).toBe("http://localhost:1940/view/abc?key=pvk_secret");
+  });
+
+  it("works without query params", () => {
+    const url = buildRedirectUrl("http://localhost:1940/public/abc", "abc");
+    expect(url).toBe("http://localhost:1940/view/abc");
+  });
+
+  it("preserves multiple query params", () => {
+    const url = buildRedirectUrl("http://localhost:1940/public/abc?key=pvk_x&format=html", "abc");
+    expect(url).toBe("http://localhost:1940/view/abc?key=pvk_x&format=html");
+  });
+
+  it("works for vault-scoped paths", () => {
+    const url = buildRedirectUrl("http://localhost:1940/vaults/work/public/abc?key=pvk_x", "abc", "/vaults/work");
+    expect(url).toBe("http://localhost:1940/vaults/work/view/abc?key=pvk_x");
+  });
+});
+
 // Minimal Store stub — only getNote is needed
 function makeStore(notes: Record<string, { content: string; tags?: string[]; metadata?: Record<string, unknown>; path?: string }>) {
   return {
