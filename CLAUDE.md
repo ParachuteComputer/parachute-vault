@@ -7,7 +7,8 @@ Agent-native knowledge graph. Notes, tags, links over MCP. Self-hosted, one comm
 ```
 parachute vault init     →  ~/.parachute/ (config, .env, daemon, MCP)
 parachute vault create   →  new vault (SQLite DB + vault.yaml + API key)
-parachute vault config   →  manage env vars (API keys, providers)
+parachute vault config   →  manage env vars (PORT, etc.)
+parachute vault keys     →  list / create / revoke API keys
 
 CLI  →  Bun server (port 1940)  →  multiple vaults (each its own SQLite DB)
                                          ↑

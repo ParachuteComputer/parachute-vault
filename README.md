@@ -53,6 +53,14 @@ parachute vault import ~/Obsidian/Work --vault work    # import into a specific 
 parachute vault import <path> --dry-run                # preview without importing
 parachute vault export ./output --vault work           # export a specific vault
 
+# API keys
+parachute vault keys                       # list all keys
+parachute vault keys create                # new global key (all vaults)
+parachute vault keys create --vault work   # new key for one vault
+parachute vault keys create --read-only    # read-only key
+parachute vault keys create --label mobile # label for identification
+parachute vault keys revoke <key-id>       # revoke a key by ID
+
 # Config
 parachute vault config                     # show all options
 parachute vault config set KEY value       # set a config value
@@ -245,7 +253,20 @@ Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp
 
 ### Key management
 
-Keys are SHA-256 hashed at rest. Per-vault keys grant access to one vault. Global keys (in `config.yaml`) grant access to all vaults and the unified `/mcp` endpoint.
+```bash
+parachute vault keys                       # list all keys (shows ID, label, scope, last used)
+parachute vault keys create                # new global key
+parachute vault keys create --vault work   # new per-vault key
+parachute vault keys create --read-only    # read-only key (GET only, no mutations)
+parachute vault keys create --label phone  # custom label for identification
+parachute vault keys revoke <key-id>       # revoke by ID (shown in `keys` output)
+```
+
+Keys are shown once at creation — save them immediately. Keys are SHA-256 hashed at rest and cannot be recovered.
+
+**Per-vault keys** (stored in `vault.yaml`) grant access to one vault's API and `/vaults/{name}/mcp` endpoint. Use for single-purpose integrations (e.g., a mobile app that only writes to one vault).
+
+**Global keys** (stored in `config.yaml`) grant access to all vaults and the unified `/mcp` endpoint. Use for AI agents that work across vaults or for admin access. `vault init` creates a global key automatically.
 
 ### Public endpoints
 
