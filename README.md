@@ -172,7 +172,52 @@ Metadata is a JSON column. Vaults start blank — no predefined tags or schema.
 
 ## Auth
 
-API keys per vault (SHA-256 hashed). Localhost bypasses auth. Remote requests need `Authorization: Bearer pvk_...` or `X-API-Key: pvk_...`.
+**All API and MCP requests require a valid API key.** No exceptions — localhost gets no special treatment.
+
+`vault init` generates an API key automatically and configures Claude Code's MCP with it.
+
+### Passing the key
+
+```bash
+# Header (preferred)
+curl -H "Authorization: Bearer pvk_..." http://localhost:1940/api/notes
+
+# Alternative header
+curl -H "X-API-Key: pvk_..." http://localhost:1940/api/notes
+
+# Query param (for /view endpoint only — convenient for browsers)
+curl http://localhost:1940/view/noteId?key=pvk_...
+```
+
+### Claude Desktop
+
+Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp`, Header: `Authorization: Bearer pvk_...`
+
+### Claude Code
+
+`vault init` auto-configures `~/.claude.json`. To set manually:
+
+```json
+{
+  "mcpServers": {
+    "parachute-vault": {
+      "type": "http",
+      "url": "http://127.0.0.1:1940/mcp",
+      "headers": { "Authorization": "Bearer pvk_..." }
+    }
+  }
+}
+```
+
+### Key management
+
+Keys are SHA-256 hashed at rest. Per-vault keys grant access to one vault. Global keys (in `config.yaml`) grant access to all vaults and the unified `/mcp` endpoint.
+
+### Public endpoints
+
+Only two endpoints work without auth:
+- `GET /health` — returns `{ status: "ok" }` (no sensitive data)
+- `GET /view/:noteId` — serves published notes only (returns 404 for unpublished)
 
 ## Deployment
 

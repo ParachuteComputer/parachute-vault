@@ -187,17 +187,21 @@ async function cmdInit() {
   }
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
-  // 7. Install MCP for Claude Code
-  installMcpConfig();
+  // 7. Install MCP for Claude Code (with API key for auth)
+  const mcpKey = globalApiKey ?? apiKey;
+  installMcpConfig(mcpKey);
   console.log(`  MCP server added to ~/.claude.json`);
 
   // 8. Summary
   console.log("\n---");
+  const port = globalConfig.port || DEFAULT_PORT;
   if (globalApiKey) {
-    console.log(`\nGlobal API key: ${globalApiKey}`);
-    console.log("  Grants access to all vaults (for unified /mcp endpoint).");
+    console.log(`\nYour API key: ${globalApiKey}`);
+    console.log("  Use this in Claude Desktop, curl, or any client.");
+    console.log("  Pass via: Authorization: Bearer <key>");
+    console.log("  Or via:   X-API-Key: <key>");
   }
-  if (apiKey) {
+  if (apiKey && apiKey !== globalApiKey) {
     console.log(`\nVault API key (default): ${apiKey}`);
     console.log("  Grants access to the 'default' vault only.");
   }
@@ -206,14 +210,17 @@ async function cmdInit() {
   }
 
   console.log(`\nConfig:   ${CONFIG_DIR}`);
-  console.log(`Server:   http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
+  console.log(`Server:   http://0.0.0.0:${port}`);
+
+  console.log(`\nUsage examples:`);
+  console.log(`  curl http://localhost:${port}/health`);
+  if (mcpKey) {
+    console.log(`  curl -H "Authorization: Bearer ${mcpKey}" http://localhost:${port}/api/notes`);
+  }
 
   console.log(`\nNext steps:`);
   console.log(`  parachute vault status            check everything is running`);
   console.log(`  parachute vault config             view/edit configuration`);
-  if (!isMac) {
-    console.log(`  cloudflared tunnel --url http://localhost:${globalConfig.port || DEFAULT_PORT}    expose via HTTPS`);
-  }
 }
 
 function cmdCreate(args: string[]) {
@@ -748,7 +755,7 @@ function createVault(name: string): string {
   return fullKey;
 }
 
-function installMcpConfig() {
+function installMcpConfig(apiKey?: string) {
   const claudeJsonPath = resolve(homedir(), ".claude.json");
   let config: any = {};
   if (existsSync(claudeJsonPath)) {
@@ -769,11 +776,15 @@ function installMcpConfig() {
     }
   }
 
-  // Single HTTP MCP entry
-  config.mcpServers["parachute-vault"] = {
+  // Single HTTP MCP entry with API key for auth
+  const mcpEntry: Record<string, unknown> = {
     type: "http",
     url: `http://127.0.0.1:${port}/mcp`,
   };
+  if (apiKey) {
+    mcpEntry.headers = { Authorization: `Bearer ${apiKey}` };
+  }
+  config.mcpServers["parachute-vault"] = mcpEntry;
 
   writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
 }

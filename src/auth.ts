@@ -9,11 +9,11 @@
  *   - scope: "write" — full access (default)
  *   - scope: "read"  — read-only (blocked from create/update/delete operations)
  *
- * Localhost bypasses auth for both.
+ * ALL requests require a valid API key. No localhost bypass.
  */
 
-import { readVaultConfig, readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
-import type { VaultConfig, GlobalConfig, StoredKey, KeyScope } from "./config.ts";
+import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
+import type { VaultConfig, StoredKey, KeyScope } from "./config.ts";
 
 /** Result of a successful auth check. */
 export interface AuthResult {
@@ -65,28 +65,6 @@ export function extractApiKey(req: Request): string | null {
 }
 
 /**
- * Per-request socket address set by the server before routing.
- * Bun's server.requestIP() returns the actual TCP peer address,
- * which cannot be spoofed (unlike X-Forwarded-For).
- */
-let _currentSocketAddress: string | null = null;
-
-export function setSocketAddress(addr: string): void {
-  _currentSocketAddress = addr;
-}
-
-const LOCALHOST_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
-
-/** Check if a request originates from localhost using the actual socket address. */
-export function isLocalhost(_req: Request): boolean {
-  if (_currentSocketAddress) {
-    return LOCALHOST_ADDRS.has(_currentSocketAddress);
-  }
-  // Fallback: no socket address available (e.g. tests). Conservative: deny.
-  return false;
-}
-
-/**
  * Validate a key against a list of stored keys.
  * Returns the matched key or null.
  */
@@ -103,15 +81,11 @@ function validateKey(keys: StoredKey[], providedKey: string): StoredKey | null {
 /**
  * Authenticate for a specific vault.
  * Accepts per-vault keys OR global keys.
- * Returns null (allowed) or error Response.
- * Sets x-key-scope header on success for downstream use.
  */
 export function authenticateVaultRequest(
   req: Request,
   vaultConfig: VaultConfig,
 ): { error: Response } | { scope: KeyScope } {
-  if (isLocalhost(req)) return { scope: "write" };
-
   const key = extractApiKey(req);
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
@@ -144,8 +118,6 @@ export function authenticateVaultRequest(
 export function authenticateGlobalRequest(
   req: Request,
 ): { error: Response } | { scope: KeyScope } {
-  if (isLocalhost(req)) return { scope: "write" };
-
   const key = extractApiKey(req);
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };

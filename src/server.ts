@@ -11,7 +11,7 @@
  */
 
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
-import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, extractApiKey, isLocalhost, setSocketAddress } from "./auth.ts";
+import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, extractApiKey } from "./auth.ts";
 import type { VaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
@@ -89,12 +89,6 @@ const server = Bun.serve({
     }
 
     try {
-      // Inject actual remote IP so auth can verify localhost claims
-      const socketAddr = server.requestIP(req);
-      if (socketAddr) {
-        setSocketAddress(socketAddr.address);
-      }
-
       const start = Date.now();
       const response = await route(req, path);
       const ms = Date.now() - start;
@@ -137,8 +131,6 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
  * requests still get public notes.
  */
 function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null): boolean {
-  if (isLocalhost(req)) return true;
-
   // Check query param first (convenient for browsers)
   const url = new URL(req.url);
   const queryKey = url.searchParams.get("key");
