@@ -10,26 +10,12 @@
  *   *    /vaults/{name}/api/...            — per-vault REST API
  */
 
-// If embeddings are configured, swap to Homebrew SQLite on macOS (must happen before any DB opens)
-import { existsSync, readFileSync } from "fs";
-import { resolve, join } from "path";
-import { homedir } from "os";
-const _configDir = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
-const _envPath = resolve(_configDir, ".env");
-if (existsSync(_envPath)) {
-  const _envContent = readFileSync(_envPath, "utf-8");
-  if (/EMBEDDING_PROVIDER\s*=/.test(_envContent) && !/EMBEDDING_PROVIDER\s*=\s*none/i.test(_envContent)) {
-    const { useHomebrewSQLiteIfNeeded } = require("../core/src/embeddings.ts");
-    useHomebrewSQLiteIfNeeded();
-  }
-}
-
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, extractApiKey, isLocalhost } from "./auth.ts";
 import type { VaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleViewNote } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 
@@ -237,7 +223,6 @@ async function route(req: Request, path: string): Promise<Response> {
     if (apiPath === "/resolve-wikilink") return handleResolveWikilink(req, store);
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
     if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
-    if (apiPath === "/ingest") return handleIngest(req, store, defaultVault);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
   }
 
@@ -341,9 +326,6 @@ async function route(req: Request, path: string): Promise<Response> {
   }
   if (apiPath.startsWith("/storage")) {
     return handleStorage(req, apiPath.slice(8), vaultName);
-  }
-  if (apiPath === "/ingest") {
-    return handleIngest(req, store, vaultName);
   }
   if (apiPath === "/health") {
     return Response.json({ status: "ok", vault: vaultName });

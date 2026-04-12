@@ -40,7 +40,7 @@
  *
  * **3. Shutdown drain is a hard cut.** `drain()` on SIGINT/SIGTERM
  * waits for in-flight handlers, but the server wraps it in a 5-second
- * Promise.race. Long-running handlers (large TTS jobs, embeddings) may
+ * Promise.race. Long-running handlers (webhook triggers) may
  * get killed mid-run. Handlers must not write the marker before the
  * work is durably committed, so restart reconciliation works.
  */

@@ -60,7 +60,7 @@ import { readFileSync, writeFileSync } from "fs";
 // server startup side effects.
 // ---------------------------------------------------------------------------
 
-// Read PARACHUTE_HOME lazily so tests (and any embedder) can override it
+// Read PARACHUTE_HOME lazily so tests can override it
 // via process.env after the module has loaded.
 function configDir(): string {
   return process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
