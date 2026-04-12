@@ -13,7 +13,7 @@ bun install
 bun src/cli.ts vault init
 ```
 
-`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP. It walks you through transcription and semantic search setup interactively.
+`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP. It walks you through semantic search setup interactively.
 
 For remote access from Claude Desktop or mobile apps, see [Deployment](#deployment) below.
 
@@ -26,7 +26,8 @@ A server on port 1940 with:
 - **Wikilink auto-linking** — `[[wikilinks]]` in note content automatically create links in the graph
 - **Semantic search** — Vector embeddings via sqlite-vec (configure an embedding provider)
 - **Obsidian import/export** — Bidirectional interop with Obsidian vaults
-- **Transcription** — Whisper-compatible endpoint (with [@openparachute/scribe](https://github.com/ParachuteComputer/@openparachute/scribe))
+- **Webhook triggers** — Config-driven webhooks that fire on note mutations matching tag/metadata predicates
+- **View endpoint** — Serve notes as clean HTML pages (public or authenticated)
 
 Each vault is its own SQLite database. Run multiple vaults on one server.
 
@@ -59,23 +60,12 @@ parachute vault restart                    # apply changes
 All config lives in `~/.parachute/.env`. `vault init` walks you through setup. To change later:
 
 ```bash
-parachute vault config set TRANSCRIBE_PROVIDER groq
-parachute vault config set GROQ_API_KEY gsk_...
 parachute vault config set EMBEDDING_PROVIDER openai
 parachute vault config set OPENAI_API_KEY sk-...
 parachute vault restart
 ```
 
 ### Providers
-
-**Transcription** (requires [@openparachute/scribe](https://github.com/ParachuteComputer/@openparachute/scribe)):
-
-| Provider | Type | Notes |
-|----------|------|-------|
-| `groq` | Cloud | Fast, cheap (~$0.06/hr of audio) |
-| `whisper` | Local | Any platform. `pip install whisper-ctranslate2` |
-| `parakeet-mlx` | Local | Mac only. Fastest. |
-| `openai` | Cloud | Reference Whisper API |
 
 **Embeddings** (semantic search):
 
@@ -91,7 +81,7 @@ parachute vault restart
 **Links**: `create-link`, `delete-link`, `get-links`
 **Bulk**: `create-notes`, `batch-tag`, `batch-untag`
 **Graph**: `traverse-links`, `find-path`
-**Vault**: `list-vaults`, `get-vault-description`, `update-vault-description`
+**Vault**: `list-vaults`, `get-vault-description`, `update-vault-description`, `get-vault-stats`
 **Semantic** (when configured): `semantic-search`, `embed-notes`
 
 ### Vault descriptions
@@ -132,6 +122,42 @@ Imports: frontmatter → metadata, `#tags` → tags table, `[[wikilinks]]` → l
 
 Note paths work like Obsidian file paths (`Projects/Parachute/README`). Normalized, unique, case-insensitive resolution. Renaming a note's path updates `[[wikilinks]]` in other notes.
 
+### Webhook triggers
+
+Declarative config-driven webhooks that fire when a note mutation matches a predicate. Configured in `~/.parachute/config.yaml`:
+
+```yaml
+triggers:
+  - name: tts_reader
+    events: [created, updated]
+    when:
+      tags: [reader]
+      has_content: true
+      missing_metadata: [audio_rendered_at]
+    action:
+      webhook: http://localhost:8090/tts
+      timeout: 120000
+```
+
+**Predicate fields**: `tags` (all must match), `has_content` (true/false), `missing_metadata` (keys that must be absent), `has_metadata` (keys that must be present).
+
+**Two-phase markers**: On match, the trigger sets `<name>_pending_at` metadata before calling the webhook, then replaces it with `<name>_rendered_at` on success. This prevents re-entry and concurrent runs.
+
+**Webhook contract**: POST `{ trigger, event, note: { id, content, path, tags, metadata, attachments } }`. Response: `{ content?, metadata?, attachments?, skipped_reason? }`.
+
+### View endpoint
+
+Serve notes as clean HTML pages at `/view/:noteId`:
+
+- **Without auth**: only serves notes tagged `published` (or with `metadata.published: true`). Returns 404 for unpublished notes.
+- **With auth**: serves any note. Pass API key via `Authorization: Bearer pvk_...` header or `?key=pvk_...` query param.
+- **Custom tag**: set `published_tag` in vault.yaml to use a different tag name (default: `published`).
+
+```yaml
+# ~/.parachute/vaults/default/vault.yaml
+published_tag: public
+```
+
 ## REST API
 
 ```
@@ -139,14 +165,19 @@ GET/POST       /api/notes              query or create notes
 GET/PATCH/DEL  /api/notes/:id          read, update, delete
 POST/DEL       /api/notes/:id/tags     tag/untag
 GET            /api/tags               list tags
+DELETE         /api/tags/:name         delete a tag from all notes
 POST/DEL       /api/links              create/delete links
 GET            /api/search?q=...       full-text search
-POST           /api/ingest             upload audio + create note
+GET            /api/resolve-wikilink?title=...  resolve a wikilink title to note
+GET            /api/unresolved-wikilinks        list unresolved wikilinks
+POST           /api/ingest             upload file + create note
+GET            /api/graph              full knowledge graph
 POST           /mcp                    MCP endpoint
+GET            /view/:noteId           render note as HTML (public or auth)
 GET            /health                 health check
 ```
 
-Per-vault routes at `/vaults/{name}/api/...` and `/vaults/{name}/mcp`.
+Per-vault routes at `/vaults/{name}/api/...`, `/vaults/{name}/mcp`, and `/vaults/{name}/view/:noteId`.
 
 ## Data model
 

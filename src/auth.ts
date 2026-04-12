@@ -64,7 +64,15 @@ export function extractApiKey(req: Request): string | null {
   return req.headers.get("x-api-key");
 }
 
-/** Check if a request originates from localhost. */
+/**
+ * Check if a request originates from localhost.
+ *
+ * Trust model: this assumes a trusted network (no untrusted reverse proxy).
+ * The X-Forwarded-For header is spoofable — any external caller behind a proxy
+ * that doesn't strip/overwrite it can fake localhost. This is acceptable for
+ * local dev and trusted-network deployments. For public-facing deployments behind
+ * a reverse proxy, a proper trusted-proxy configuration is needed (see #67).
+ */
 export function isLocalhost(req: Request): boolean {
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) {

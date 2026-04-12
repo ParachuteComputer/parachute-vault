@@ -612,19 +612,35 @@ function inlineMarkdown(html: string): string {
   return html;
 }
 
-function isNotePublished(note: { tags?: string[]; metadata?: unknown }): boolean {
-  if (note.tags?.includes("published")) return true;
+/**
+ * Check if a note is published. A note is published if:
+ * 1. It has the configured published tag (default: "published"), OR
+ * 2. It has metadata.published === true (always honored regardless of custom tag)
+ */
+function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishedTag: string = "published"): boolean {
+  if (note.tags?.includes(publishedTag)) return true;
   const meta = note.metadata as Record<string, unknown> | undefined;
   if (meta?.published === true) return true;
   return false;
 }
 
 /**
- * GET /public/:noteId — serve a published note as clean HTML, no auth.
+ * GET /view/:noteId — serve a note as clean HTML.
+ *
+ * Without auth: only serves notes marked as published (via tag or metadata).
+ * With auth: serves any note in the vault.
  */
-export function handlePublicNote(store: Store, noteId: string): Response {
+export function handleViewNote(
+  store: Store,
+  noteId: string,
+  options: { authenticated?: boolean; publishedTag?: string } = {},
+): Response {
+  const { authenticated = false, publishedTag = "published" } = options;
   const note = store.getNote(noteId);
-  if (!note || !isNotePublished(note)) {
+  if (!note) {
+    return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+  }
+  if (!authenticated && !isNotePublished(note, publishedTag)) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
 

@@ -74,6 +74,8 @@ export interface VaultConfig {
   api_keys: StoredKey[];
   created_at: string;
   tag_schemas?: Record<string, TagSchema>;
+  /** Tag name that marks a note as publicly viewable. Default: "published". */
+  published_tag?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +132,9 @@ function serializeVaultConfig(config: VaultConfig): string {
     }
   }
   lines.push(`created_at: "${config.created_at}"`);
+  if (config.published_tag) {
+    lines.push(`published_tag: ${config.published_tag}`);
+  }
 
   lines.push("api_keys:");
   for (const key of config.api_keys) {
@@ -181,6 +186,9 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
 
   const createdMatch = yaml.match(/^created_at:\s*"?([^"\n]+)"?/m);
   if (createdMatch) config.created_at = createdMatch[1];
+
+  const pubTagMatch = yaml.match(/^published_tag:\s*(\S+)/m);
+  if (pubTagMatch) config.published_tag = pubTagMatch[1];
 
   // Parse description (block scalar)
   const descMatch = yaml.match(/^description:\s*\|\s*\n((?:\s{2}.+\n?)+)/m);
