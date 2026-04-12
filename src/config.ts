@@ -93,11 +93,39 @@ export interface TriggerWhen {
   has_metadata?: string[];
 }
 
+/**
+ * How the trigger sends data to the webhook.
+ *
+ * - `"json"` (default): POST `{ trigger, event, note }` as JSON. Response is
+ *   the standard webhook response `{ content?, metadata?, attachments? }`.
+ * - `"attachment"`: Read the first audio attachment from the vault assets dir,
+ *   POST it as multipart/form-data (`file` field). Response is `{ text }`.
+ *   Used for Whisper-compatible transcription services.
+ * - `"content"`: POST `{ model?, voice?, input: note.content }` as JSON.
+ *   Response is binary audio bytes. Used for OpenAI-compatible TTS services.
+ */
+export type TriggerSendMode = "json" | "attachment" | "content";
+
+/**
+ * How the trigger interprets the webhook response.
+ *
+ * - `"json"` (default): Standard webhook response with optional content,
+ *   metadata, and attachments fields.
+ * - `"content"`: Response body is `{ text }`. Written to note.content.
+ * - `"attachment"`: Response body is raw binary audio. Written to the vault
+ *   assets dir and recorded as an attachment on the note.
+ */
+export type TriggerResponseMode = "json" | "content" | "attachment";
+
 export interface TriggerAction {
   /** URL to POST the webhook payload to. */
   webhook: string;
   /** Timeout in ms for the webhook call. Default 60000. */
   timeout?: number;
+  /** How to send data to the webhook. Default "json". */
+  send?: TriggerSendMode;
+  /** How to interpret the response. Default "json". */
+  response?: TriggerResponseMode;
 }
 
 export interface TriggerConfig {
@@ -385,6 +413,16 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
         current.action.timeout = parseInt(timeoutMatch[1], 10);
         continue;
       }
+      const sendMatch = trimmed.match(/^send:\s*(\S+)/);
+      if (sendMatch && current.action) {
+        current.action.send = sendMatch[1] as TriggerAction["send"];
+        continue;
+      }
+      const responseMatch = trimmed.match(/^response:\s*(\S+)/);
+      if (responseMatch && current.action) {
+        current.action.response = responseMatch[1] as TriggerAction["response"];
+        continue;
+      }
     }
   }
 
@@ -500,6 +538,12 @@ export function writeGlobalConfig(config: GlobalConfig): void {
       }
       lines.push("    action:");
       lines.push(`      webhook: ${trigger.action.webhook}`);
+      if (trigger.action.send && trigger.action.send !== "json") {
+        lines.push(`      send: ${trigger.action.send}`);
+      }
+      if (trigger.action.response && trigger.action.response !== "json") {
+        lines.push(`      response: ${trigger.action.response}`);
+      }
       if (trigger.action.timeout) {
         lines.push(`      timeout: ${trigger.action.timeout}`);
       }

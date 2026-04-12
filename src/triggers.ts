@@ -3,8 +3,8 @@
  *
  * Replaces the hardcoded tts-hook and transcription-hook with a declarative
  * config-driven approach. Each trigger defines a predicate (tags, content,
- * metadata) and an action (webhook URL). When a note mutation matches, the
- * trigger fires a webhook and applies the response to the note.
+ * metadata) and an action (webhook URL + send/response modes). When a note
+ * mutation matches, the trigger fires a webhook and applies the response.
  *
  * ## Two-phase marker discipline (inherited from the old hooks)
  *
@@ -15,23 +15,27 @@
  *      webhook response (content, metadata, attachments).
  *   3. On failure: leave `_pending_at` set. Manual recovery required.
  *
- * ## Webhook contract
+ * ## Send modes
  *
- *   Request: POST to action.webhook
- *     Content-Type: application/json
- *     Body: { trigger, event, note: { id, content, tags, metadata, attachments } }
+ *   - `json` (default): POST `{ trigger, event, note }` as JSON.
+ *   - `attachment`: Read the first audio attachment, POST as multipart/form-data.
+ *   - `content`: POST `{ input: note.content }` as JSON (OpenAI TTS shape).
  *
- *   Response: 200 with JSON body (fields are all optional):
- *     { content?, metadata?, attachments?: [{ path, mimeType, meta? }] }
+ * ## Response modes
  *
- *   Non-200 responses are treated as failures (note stays in pending state).
- *   Empty 200 response (or `{}`) means "success, no updates needed" — the
- *   note still gets marked as rendered.
+ *   - `json` (default): Standard `{ content?, metadata?, attachments? }`.
+ *   - `content`: Response is `{ text }`. Written to note.content.
+ *   - `attachment`: Response is raw binary audio. Saved to assets + attachment.
  */
 
-import type { Note, Store } from "../core/src/types.ts";
+import { join, normalize } from "path";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
+import crypto from "node:crypto";
+import type { Note, Store, Attachment } from "../core/src/types.ts";
 import type { HookRegistry, HookEvent } from "../core/src/hooks.ts";
 import type { TriggerConfig, TriggerWhen } from "./config.ts";
+import { getVaultNameForStore } from "./vault-store.ts";
+import { assetsDir } from "./routes.ts";
 
 const DEFAULT_TIMEOUT = 60_000;
 
@@ -91,6 +95,182 @@ export function buildPredicate(when: TriggerWhen, triggerName: string): (note: N
   };
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch helpers — one per send mode
+// ---------------------------------------------------------------------------
+
+const AUDIO_MIME_TYPES = new Set(["audio/wav", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/webm"]);
+
+/** Resolve the assets directory for a store. */
+function resolveAssetsDir(store: Store): string {
+  const vaultName = getVaultNameForStore(store as never);
+  return assetsDir(vaultName ?? "default");
+}
+
+/** Find the first audio attachment for a note and return its absolute path. */
+function findAudioAttachment(
+  attachments: Attachment[],
+  assetsRoot: string,
+): { attachment: Attachment; filePath: string } | null {
+  for (const att of attachments) {
+    if (!AUDIO_MIME_TYPES.has(att.mimeType)) continue;
+    const filePath = normalize(join(assetsRoot, att.path));
+    if (filePath.startsWith(normalize(assetsRoot)) && existsSync(filePath)) {
+      return { attachment: att, filePath };
+    }
+  }
+  return null;
+}
+
+/** Save binary audio to the assets dir, return relative path + MIME. */
+function saveAudioToAssets(
+  assetsRoot: string,
+  audio: Buffer,
+  contentType: string,
+): { relativePath: string; mimeType: string } {
+  const ext = contentType.includes("ogg") ? ".ogg"
+    : contentType.includes("mpeg") ? ".mp3"
+    : contentType.includes("wav") ? ".wav"
+    : contentType.includes("mp4") ? ".m4a"
+    : ".ogg"; // default to ogg
+
+  const date = new Date().toISOString().split("T")[0];
+  const dir = join(assetsRoot, date);
+  mkdirSync(dir, { recursive: true });
+
+  const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+  const filePath = join(dir, filename);
+  writeFileSync(filePath, audio);
+
+  return {
+    relativePath: `${date}/${filename}`,
+    mimeType: contentType || "audio/ogg",
+  };
+}
+
+interface DispatchResult {
+  webhookResult: WebhookResponse;
+}
+
+/** send=json (default): POST the note as JSON, expect standard webhook response. */
+async function dispatchJson(
+  url: string,
+  trigger: TriggerConfig,
+  note: Note,
+  attachments: Attachment[],
+  existingMeta: Record<string, unknown>,
+  hookEvent: HookEvent | undefined,
+  signal: AbortSignal,
+): Promise<DispatchResult> {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      trigger: trigger.name,
+      event: hookEvent ?? "updated",
+      note: {
+        id: note.id,
+        content: note.content,
+        path: note.path,
+        tags: note.tags,
+        metadata: existingMeta,
+        attachments,
+        createdAt: note.createdAt,
+        updatedAt: note.updatedAt,
+      },
+    }),
+    signal,
+  });
+
+  if (!resp.ok) {
+    throw new Error(`webhook returned ${resp.status}: ${await resp.text().catch(() => "")}`);
+  }
+
+  const text = await resp.text();
+  return { webhookResult: text ? JSON.parse(text) : {} };
+}
+
+/**
+ * send=attachment: Read the first audio attachment from the vault assets dir,
+ * POST it as multipart/form-data. Expects `{ text }` response (Whisper shape).
+ */
+async function dispatchAttachment(
+  url: string,
+  note: Note,
+  attachments: Attachment[],
+  store: Store,
+  signal: AbortSignal,
+): Promise<DispatchResult> {
+  const assetsRoot = resolveAssetsDir(store);
+  const audio = findAudioAttachment(attachments, assetsRoot);
+  if (!audio) {
+    return { webhookResult: { skipped_reason: "no audio attachment found" } };
+  }
+
+  const fileBuffer = readFileSync(audio.filePath);
+  const filename = audio.attachment.path.split("/").pop() ?? "audio";
+  const file = new File([fileBuffer], filename, { type: audio.attachment.mimeType });
+
+  const form = new FormData();
+  form.append("file", file);
+
+  const resp = await fetch(url, { method: "POST", body: form, signal });
+  if (!resp.ok) {
+    throw new Error(`webhook returned ${resp.status}: ${await resp.text().catch(() => "")}`);
+  }
+
+  const result = await resp.json() as { text?: string };
+  const webhookResult: WebhookResponse = {};
+  if (result.text) {
+    webhookResult.content = result.text;
+  }
+  return { webhookResult };
+}
+
+/**
+ * send=content: POST `{ input: note.content, model?, voice? }` as JSON
+ * (OpenAI TTS shape). Response is binary audio bytes. Saved as attachment.
+ */
+async function dispatchContent(
+  url: string,
+  note: Note,
+  store: Store,
+  signal: AbortSignal,
+): Promise<DispatchResult> {
+  if (!note.content || !note.content.trim()) {
+    return { webhookResult: { skipped_reason: "note has no content to synthesize" } };
+  }
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input: note.content }),
+    signal,
+  });
+
+  if (!resp.ok) {
+    throw new Error(`webhook returned ${resp.status}: ${await resp.text().catch(() => "")}`);
+  }
+
+  const contentType = resp.headers.get("Content-Type") ?? "audio/ogg";
+  const audioBuffer = Buffer.from(await resp.arrayBuffer());
+  const assetsRoot = resolveAssetsDir(store);
+  const { relativePath, mimeType } = saveAudioToAssets(assetsRoot, audioBuffer, contentType);
+
+  const webhookResult: WebhookResponse = {
+    attachments: [{ path: relativePath, mimeType }],
+    metadata: {
+      ...(resp.headers.get("X-TTS-Provider") ? { tts_provider: resp.headers.get("X-TTS-Provider") } : {}),
+      ...(resp.headers.get("X-TTS-Voice") ? { tts_voice: resp.headers.get("X-TTS-Voice") } : {}),
+    },
+  };
+  return { webhookResult };
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
 /**
  * Register all triggers from config onto a HookRegistry.
  * Returns a cleanup function that unregisters all hooks.
@@ -120,6 +300,8 @@ export function registerTriggers(
     const pendingKey = `${trigger.name}_pending_at`;
     const renderedKey = `${trigger.name}_rendered_at`;
     const timeout = trigger.action.timeout ?? DEFAULT_TIMEOUT;
+    const sendMode = trigger.action.send ?? "json";
+    const responseMode = trigger.action.response ?? "json";
 
     const unregister = hooks.onNote({
       name: trigger.name,
@@ -144,40 +326,28 @@ export function registerTriggers(
           throw err;
         }
 
-        // Fire the webhook
+        // Fire the webhook using the configured send mode
         let webhookResult: WebhookResponse;
         try {
           const attachments = store.getAttachments(note.id);
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), timeout);
 
-          const resp = await fetch(trigger.action.webhook, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              trigger: trigger.name,
-              event: hookEvent ?? "updated",
-              note: {
-                id: note.id,
-                content: note.content,
-                path: note.path,
-                tags: note.tags,
-                metadata: existingMeta,
-                attachments,
-                createdAt: note.createdAt,
-                updatedAt: note.updatedAt,
-              },
-            }),
-            signal: controller.signal,
-          });
-          clearTimeout(timer);
-
-          if (!resp.ok) {
-            throw new Error(`webhook returned ${resp.status}: ${await resp.text().catch(() => "")}`);
+          let result: DispatchResult;
+          switch (sendMode) {
+            case "attachment":
+              result = await dispatchAttachment(trigger.action.webhook, note, attachments, store, controller.signal);
+              break;
+            case "content":
+              result = await dispatchContent(trigger.action.webhook, note, store, controller.signal);
+              break;
+            case "json":
+            default:
+              result = await dispatchJson(trigger.action.webhook, trigger, note, attachments, existingMeta, hookEvent, controller.signal);
+              break;
           }
-
-          const text = await resp.text();
-          webhookResult = text ? JSON.parse(text) : {};
+          clearTimeout(timer);
+          webhookResult = result.webhookResult;
         } catch (err) {
           logger.error(
             `[trigger:${trigger.name}] webhook failed for note ${note.id}; note left in ${pendingKey} state (manual recovery required):`,
@@ -238,7 +408,8 @@ export function registerTriggers(
     });
 
     unregisters.push(unregister);
-    logger.info?.(`[triggers] registered: ${trigger.name} → ${trigger.action.webhook}`);
+    const modeStr = sendMode !== "json" ? ` (send=${sendMode}, response=${responseMode})` : "";
+    logger.info?.(`[triggers] registered: ${trigger.name} → ${trigger.action.webhook}${modeStr}`);
   }
 
   return () => unregisters.forEach((fn) => fn());
