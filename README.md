@@ -108,22 +108,55 @@ Declarative config-driven webhooks that fire when a note mutation matches a pred
 
 ```yaml
 triggers:
-  - name: tts_reader
+  - name: scribe
+    events: [created, updated]
+    when:
+      tags: [voice]
+      has_content: false
+      missing_metadata: [transcribed_at]
+    action:
+      webhook: http://localhost:3200/v1/audio/transcriptions
+      send: attachment
+      timeout: 120000
+
+  - name: narrate
     events: [created, updated]
     when:
       tags: [reader]
       has_content: true
       missing_metadata: [audio_rendered_at]
     action:
-      webhook: http://localhost:8090/tts
-      timeout: 120000
+      webhook: http://localhost:3100/v1/audio/speech
+      send: content
 ```
 
 **Predicate fields**: `tags` (all must match), `has_content` (true/false), `missing_metadata` (keys that must be absent), `has_metadata` (keys that must be present).
 
 **Two-phase markers**: On match, the trigger sets `<name>_pending_at` metadata before calling the webhook, then replaces it with `<name>_rendered_at` on success. This prevents re-entry and concurrent runs.
 
-**Webhook contract**: POST `{ trigger, event, note: { id, content, path, tags, metadata, attachments } }`. Response: `{ content?, metadata?, attachments?, skipped_reason? }`.
+#### Send modes
+
+| Mode | Request format | Response format | Use case |
+|---|---|---|---|
+| `json` (default) | POST `{ trigger, event, note }` as JSON | `{ content?, metadata?, attachments?, skipped_reason? }` | General-purpose webhooks |
+| `attachment` | POST first audio attachment as multipart/form-data (Whisper API format) | `{ text }` — written to note.content | Transcription (e.g., scribe on :3200) |
+| `content` | POST `{ input: note.content, model, voice }` as JSON (OpenAI TTS format) | Binary audio — saved as attachment | Text-to-speech (e.g., narrate on :3100) |
+
+**Example flow — voice note transcription:**
+1. Daily app uploads audio via `POST /api/storage/upload`, creates note tagged `voice` with no content
+2. Trigger `scribe` matches (tag=voice, has_content=false, missing transcribed_at)
+3. Vault reads the audio file from its assets dir, POSTs it to scribe as multipart/form-data
+4. Scribe returns `{ text: "transcribed text..." }`
+5. Vault writes text to note.content and sets `scribe_rendered_at` metadata
+
+**Example flow — text-to-speech:**
+1. A note tagged `reader` is created with text content
+2. Trigger `narrate` matches (tag=reader, has_content=true, missing audio_rendered_at)
+3. Vault POSTs `{ input: note.content }` to narrate
+4. Narrate returns audio bytes
+5. Vault saves the audio as an attachment and sets `narrate_rendered_at` metadata
+
+Webhook servers (scribe, narrate) are stateless — they don't need vault's API key.
 
 ### View endpoint
 
@@ -219,6 +252,23 @@ Keys are SHA-256 hashed at rest. Per-vault keys grant access to one vault. Globa
 Only two endpoints work without auth:
 - `GET /health` — returns `{ status: "ok" }` (no sensitive data)
 - `GET /view/:noteId` — serves published notes only (returns 404 for unpublished)
+
+## Network security
+
+Vault runs HTTP on localhost. This is intentional — TLS is handled by the access layer. **Never expose port 1940 directly to the internet without TLS.**
+
+All API and MCP requests require an API key. There is no localhost bypass.
+
+For remote access, always use a TLS-terminating proxy:
+
+| Access path | API key security | Safe? |
+|---|---|---|
+| localhost (same machine) | Never leaves machine | Yes |
+| Tailnet (Tailscale VPN) | WireGuard encrypted | Yes |
+| Tailscale Funnel (public HTTPS) | HTTPS at edge, WireGuard to machine | Yes |
+| Cloudflare Tunnel (public HTTPS) | HTTPS at edge, local socket to machine | Yes |
+| Direct LAN IP (no TLS) | Plaintext on WiFi | Avoid |
+| Direct internet (no TLS) | Plaintext on internet | Never do this |
 
 ## Deployment
 
