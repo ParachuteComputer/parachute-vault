@@ -56,7 +56,7 @@ describe("handleViewNote", () => {
     expect(resp.status).toBe(404);
   });
 
-  it("returns 404 for note without published tag (unauthenticated)", () => {
+  it("returns 404 for note without publish tag (unauthenticated)", () => {
     const store = makeStore({
       "n1": { content: "hello", tags: ["other"] },
     });
@@ -64,9 +64,9 @@ describe("handleViewNote", () => {
     expect(resp.status).toBe(404);
   });
 
-  it("serves note with published tag as HTML", async () => {
+  it("serves note with publish tag as HTML", async () => {
     const store = makeStore({
-      "n1": { content: "# Hello\n\nWorld", tags: ["published"], path: "Blog/My Post.md" },
+      "n1": { content: "# Hello\n\nWorld", tags: ["publish"], path: "Blog/My Post.md" },
     });
     const resp = handleViewNote(store, "n1");
     expect(resp.status).toBe(200);
@@ -92,7 +92,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n3": {
         content: "**bold** and *italic* and `code`\n\n- item 1\n- item 2\n\n```\ncode block\n```\n\n[link](https://example.com)",
-        tags: ["published"],
+        tags: ["publish"],
       },
     });
     const resp = handleViewNote(store, "n3");
@@ -107,7 +107,7 @@ describe("handleViewNote", () => {
 
   it("escapes HTML in note content", async () => {
     const store = makeStore({
-      "n4": { content: "<script>alert('xss')</script>", tags: ["published"] },
+      "n4": { content: "<script>alert('xss')</script>", tags: ["publish"] },
     });
     const resp = handleViewNote(store, "n4");
     const html = await resp.text();
@@ -117,7 +117,7 @@ describe("handleViewNote", () => {
 
   it("strips javascript: URI links to prevent XSS", async () => {
     const store = makeStore({
-      "n6": { content: "[click me](javascript:alert(1))", tags: ["published"] },
+      "n6": { content: "[click me](javascript:alert(1))", tags: ["publish"] },
     });
     const resp = handleViewNote(store, "n6");
     const html = await resp.text();
@@ -128,7 +128,7 @@ describe("handleViewNote", () => {
 
   it("strips data: URI links to prevent XSS", async () => {
     const store = makeStore({
-      "n7": { content: "[click](data:text/html;base64,PHNjcmlwdD4=)", tags: ["published"] },
+      "n7": { content: "[click](data:text/html;base64,PHNjcmlwdD4=)", tags: ["publish"] },
     });
     const resp = handleViewNote(store, "n7");
     const html = await resp.text();
@@ -138,7 +138,7 @@ describe("handleViewNote", () => {
 
   it("allows safe http/https/mailto links", async () => {
     const store = makeStore({
-      "n8": { content: "[site](https://example.com) and [mail](mailto:a@b.com)", tags: ["published"] },
+      "n8": { content: "[site](https://example.com) and [mail](mailto:a@b.com)", tags: ["publish"] },
     });
     const resp = handleViewNote(store, "n8");
     const html = await resp.text();
@@ -148,11 +148,22 @@ describe("handleViewNote", () => {
 
   it("supports dark mode via media query", async () => {
     const store = makeStore({
-      "n5": { content: "test", tags: ["published"] },
+      "n5": { content: "test", tags: ["publish"] },
     });
     const resp = handleViewNote(store, "n5");
     const html = await resp.text();
     expect(html).toContain("prefers-color-scheme: dark");
+  });
+
+  // CSP header
+  it("includes Content-Security-Policy header", () => {
+    const store = makeStore({
+      "n1": { content: "test", tags: ["publish"] },
+    });
+    const resp = handleViewNote(store, "n1");
+    const csp = resp.headers.get("Content-Security-Policy");
+    expect(csp).toContain("script-src 'none'");
+    expect(csp).toContain("default-src 'self'");
   });
 
   // Auth-aware behavior
@@ -187,7 +198,7 @@ describe("handleViewNote", () => {
 
   it("rejects note with default tag when custom tag is configured", () => {
     const store = makeStore({
-      "n1": { content: "content", tags: ["published"] },
+      "n1": { content: "content", tags: ["publish"] },
     });
     const resp = handleViewNote(store, "n1", { publishedTag: "public" });
     expect(resp.status).toBe(404);
