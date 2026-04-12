@@ -36,6 +36,8 @@ const READ_TOOLS = new Set([
   "get-vault-stats",
   "resolve-wikilink",
   "list-unresolved-wikilinks",
+  "list-tag-schemas",
+  "describe-tag",
 ]);
 
 /** Check if a tool call is allowed for a given scope. */

@@ -127,6 +127,13 @@ export interface Store {
   traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): { noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[];
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): { path: string[]; relationships: string[] } | null;
 
+  // Tag schemas
+  listTagSchemas(): { tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }[];
+  getTagSchema(tag: string): { tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> } | null;
+  upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }): { tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> };
+  deleteTagSchema(tag: string): boolean;
+  getTagSchemaMap(): Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>;
+
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Attachment;
   getAttachments(noteId: string): Attachment[];

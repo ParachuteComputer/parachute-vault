@@ -82,8 +82,9 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
         const { vault: _, ...rest } = params;
         const result = tool.execute(rest);
 
-        if (config.tag_schemas) {
-          applyTagSchemaEffects(coreTool.name, result, rest, store, config.tag_schemas);
+        const schemas = store.getTagSchemaMap();
+        if (Object.keys(schemas).length > 0) {
+          applyTagSchemaEffects(coreTool.name, result, rest, store, schemas);
         }
 
         return result;
@@ -109,19 +110,18 @@ export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
   const tools = generateMcpTools(store);
 
   // Wrap tools with schema effects (defaults + warnings) for scoped mode
-  const config = readVaultConfig(vaultName);
-  if (config?.tag_schemas) {
-    const schemas = config.tag_schemas;
-    for (const tool of tools) {
-      if (SCHEMA_EFFECT_TOOLS.has(tool.name)) {
-        const originalExecute = tool.execute;
-        const toolName = tool.name;
-        tool.execute = (params) => {
-          const result = originalExecute(params);
+  for (const tool of tools) {
+    if (SCHEMA_EFFECT_TOOLS.has(tool.name)) {
+      const originalExecute = tool.execute;
+      const toolName = tool.name;
+      tool.execute = (params) => {
+        const result = originalExecute(params);
+        const schemas = store.getTagSchemaMap();
+        if (Object.keys(schemas).length > 0) {
           applyTagSchemaEffects(toolName, result, params, store, schemas);
-          return result;
-        };
-      }
+        }
+        return result;
+      };
     }
   }
 
@@ -204,8 +204,10 @@ function addVaultManagementTools(tools: McpToolDef[], defaultVault: string, scop
 // Tag schema validation (soft)
 // ---------------------------------------------------------------------------
 
-import type { TagSchema, TagFieldSchema } from "./config.ts";
+import type { TagFieldSchema } from "../core/src/tag-schemas.ts";
 import type { Store } from "../core/src/types.ts";
+
+type TagSchema = { description?: string; fields?: Record<string, TagFieldSchema> };
 
 /** Tools that can trigger schema effects (defaults + warnings). */
 const SCHEMA_EFFECT_TOOLS = new Set([
@@ -350,23 +352,20 @@ function checkTagSchemaWarnings(
 // ---------------------------------------------------------------------------
 
 function addTagSchemaTools(tools: McpToolDef[], defaultVault: string, multiVault = false, scoped = false) {
+  const vaultProp = scoped ? {} : {
+    vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
+  };
+
+  function resolveStore(params: Record<string, unknown>) {
+    const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
+    return getVaultStore(name);
+  }
+
   tools.push({
     name: "list-tag-schemas",
     description: "List all tag schemas defined for this vault. Tag schemas describe the expected metadata fields for notes with specific tags.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ...(scoped ? {} : {
-          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
-        }),
-      },
-    },
-    execute: (params) => {
-      const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
-      const config = readVaultConfig(name);
-      if (!config) throw new Error(`Vault "${name}" not found`);
-      return config.tag_schemas ?? {};
-    },
+    inputSchema: { type: "object", properties: { ...vaultProp } },
+    execute: (params) => resolveStore(params).listTagSchemas(),
   });
 
   tools.push({
@@ -374,21 +373,91 @@ function addTagSchemaTools(tools: McpToolDef[], defaultVault: string, multiVault
     description: "Get the schema for a specific tag — its description and expected metadata fields. Returns null if no schema is defined for the tag.",
     inputSchema: {
       type: "object",
+      properties: { ...vaultProp, tag: { type: "string", description: "Tag name to describe" } },
+      required: ["tag"],
+    },
+    execute: (params) => resolveStore(params).getTagSchema(params.tag as string),
+  });
+
+  tools.push({
+    name: "create-tag-schema",
+    description: "Create or replace a tag's schema. Defines what metadata fields notes with this tag should have. Fields get auto-populated with defaults when the tag is applied to a note.",
+    inputSchema: {
+      type: "object",
       properties: {
-        ...(scoped ? {} : {
-          vault: { type: "string", description: `Vault name (default: "${defaultVault}")` },
-        }),
-        tag: { type: "string", description: "Tag name to describe" },
+        ...vaultProp,
+        tag: { type: "string", description: "Tag name" },
+        description: { type: "string", description: "Human-readable description of what this tag means" },
+        fields: {
+          type: "object",
+          description: 'Metadata fields. Each key maps to { type, description?, enum? }. Example: { "status": { "type": "string", "enum": ["active", "archived"] } }',
+          additionalProperties: {
+            type: "object",
+            properties: {
+              type: { type: "string", description: "Field type: string, boolean, integer" },
+              description: { type: "string", description: "What this field means" },
+              enum: { type: "array", items: { type: "string" }, description: "Allowed values (first is the default)" },
+            },
+            required: ["type"],
+          },
+        },
+      },
+      required: ["tag"],
+    },
+    execute: (params) => resolveStore(params).upsertTagSchema(
+      params.tag as string,
+      { description: params.description as string | undefined, fields: params.fields as any },
+    ),
+  });
+
+  tools.push({
+    name: "update-tag-schema",
+    description: "Update an existing tag schema. Merges provided fields with existing ones. Pass description to update it, fields to add/replace field definitions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...vaultProp,
+        tag: { type: "string", description: "Tag name" },
+        description: { type: "string", description: "Updated description" },
+        fields: {
+          type: "object",
+          description: "Fields to add or update (merged with existing)",
+          additionalProperties: {
+            type: "object",
+            properties: {
+              type: { type: "string" },
+              description: { type: "string" },
+              enum: { type: "array", items: { type: "string" } },
+            },
+            required: ["type"],
+          },
+        },
       },
       required: ["tag"],
     },
     execute: (params) => {
-      const name = scoped ? defaultVault : ((params.vault as string) ?? defaultVault);
-      const config = readVaultConfig(name);
-      if (!config) throw new Error(`Vault "${name}" not found`);
+      const store = resolveStore(params);
       const tag = params.tag as string;
-      const schema = config.tag_schemas?.[tag];
-      return schema ?? null;
+      const existing = store.getTagSchema(tag);
+      const mergedFields = { ...existing?.fields, ...(params.fields as any) };
+      return store.upsertTagSchema(tag, {
+        description: (params.description as string | undefined) ?? existing?.description,
+        fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
+      });
+    },
+  });
+
+  tools.push({
+    name: "delete-tag-schema",
+    description: "Remove a tag's schema. Does not delete the tag itself or remove it from notes — only removes the metadata schema definition.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vaultProp, tag: { type: "string", description: "Tag name" } },
+      required: ["tag"],
+    },
+    execute: (params) => {
+      const deleted = resolveStore(params).deleteTagSchema(params.tag as string);
+      return { deleted };
     },
   });
 }
