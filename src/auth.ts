@@ -65,21 +65,25 @@ export function extractApiKey(req: Request): string | null {
 }
 
 /**
- * Check if a request originates from localhost.
- *
- * Trust model: this assumes a trusted network (no untrusted reverse proxy).
- * The X-Forwarded-For header is spoofable — any external caller behind a proxy
- * that doesn't strip/overwrite it can fake localhost. This is acceptable for
- * local dev and trusted-network deployments. For public-facing deployments behind
- * a reverse proxy, a proper trusted-proxy configuration is needed (see #67).
+ * Per-request socket address set by the server before routing.
+ * Bun's server.requestIP() returns the actual TCP peer address,
+ * which cannot be spoofed (unlike X-Forwarded-For).
  */
-export function isLocalhost(req: Request): boolean {
-  const forwarded = req.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0].trim();
-    return first === "127.0.0.1" || first === "::1" || first === "::ffff:127.0.0.1";
+let _currentSocketAddress: string | null = null;
+
+export function setSocketAddress(addr: string): void {
+  _currentSocketAddress = addr;
+}
+
+const LOCALHOST_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
+/** Check if a request originates from localhost using the actual socket address. */
+export function isLocalhost(_req: Request): boolean {
+  if (_currentSocketAddress) {
+    return LOCALHOST_ADDRS.has(_currentSocketAddress);
   }
-  return true;
+  // Fallback: no socket address available (e.g. tests). Conservative: deny.
+  return false;
 }
 
 /**

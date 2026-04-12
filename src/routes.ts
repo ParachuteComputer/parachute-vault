@@ -370,7 +370,7 @@ export async function handleStorage(req: Request, path: string, vault: string): 
     const dir = join(assets, date);
     mkdirSync(dir, { recursive: true });
 
-    const filename = `${Date.now()}-${file.name}`;
+    const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
     const filePath = join(dir, filename);
     const buffer = Buffer.from(await file.arrayBuffer());
     writeFileSync(filePath, buffer);
@@ -604,7 +604,10 @@ ${rendered}
 
   return new Response(html, {
     status: 200,
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy": "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'",
+    },
   });
 }
 
