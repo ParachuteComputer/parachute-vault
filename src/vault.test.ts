@@ -569,41 +569,41 @@ describe("unified MCP wrapper", () => {
   test("list-tag-schemas and describe-tag tools work", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
-    const { closeAllStores } = await import("./vault-store.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
     const vaultName = `tag-schema-${Date.now()}`;
     writeVaultConfig({
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
-      tag_schemas: {
-        person: {
-          description: "A person",
-          fields: {
-            name: { type: "string", description: "Full name" },
-          },
-        },
-        project: {
-          description: "A project",
-        },
-      },
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    // Insert schemas into DB
+    const store = getVaultStore(vaultName);
+    store.upsertTagSchema("person", {
+      description: "A person",
+      fields: { name: { type: "string", description: "Full name" } },
+    });
+    store.upsertTagSchema("project", { description: "A project" });
 
     const tools = generateUnifiedMcpTools();
 
     const listTool = tools.find((t) => t.name === "list-tag-schemas");
     expect(listTool).toBeTruthy();
-    const schemas = listTool!.execute({ vault: vaultName }) as any;
-    expect(schemas.person).toBeDefined();
-    expect(schemas.person.description).toBe("A person");
-    expect(schemas.project).toBeDefined();
+    const schemas = listTool!.execute({ vault: vaultName }) as any[];
+    expect(schemas.length).toBe(2);
+    const personSchema = schemas.find((s: any) => s.tag === "person");
+    expect(personSchema).toBeDefined();
+    expect(personSchema.description).toBe("A person");
+    const projectSchema = schemas.find((s: any) => s.tag === "project");
+    expect(projectSchema).toBeDefined();
 
     const describeTool = tools.find((t) => t.name === "describe-tag");
     expect(describeTool).toBeTruthy();
-    const personSchema = describeTool!.execute({ vault: vaultName, tag: "person" }) as any;
-    expect(personSchema.description).toBe("A person");
-    expect(personSchema.fields.name.type).toBe("string");
+    const described = describeTool!.execute({ vault: vaultName, tag: "person" }) as any;
+    expect(described.description).toBe("A person");
+    expect(described.fields.name.type).toBe("string");
 
     const unknown = describeTool!.execute({ vault: vaultName, tag: "nonexistent" }) as any;
     expect(unknown).toBeNull();
@@ -621,17 +621,17 @@ describe("unified MCP wrapper", () => {
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
-      tag_schemas: {
-        person: {
-          description: "A person",
-          fields: {
-            first_appeared: { type: "string", description: "When" },
-            relationship: { type: "string", description: "How" },
-          },
-        },
-      },
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const store = getVaultStore(vaultName);
+    store.upsertTagSchema("person", {
+      description: "A person",
+      fields: {
+        first_appeared: { type: "string", description: "When" },
+        relationship: { type: "string", description: "How" },
+      },
+    });
 
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
@@ -676,12 +676,12 @@ describe("unified MCP wrapper", () => {
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
-      tag_schemas: {
-        // Schema with no fields — warnings check but defaults don't help
-        empty: { description: "No fields" },
-      },
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const { getVaultStore } = await import("./vault-store.ts");
+    const store = getVaultStore(vaultName);
+    store.upsertTagSchema("empty", { description: "No fields" });
 
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
@@ -705,27 +705,25 @@ describe("unified MCP wrapper", () => {
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
-      tag_schemas: {
-        person: {
-          description: "A person",
-          fields: {
-            first_appeared: { type: "string", description: "When" },
-            relationship: { type: "string", description: "How" },
-          },
-        },
-        project: {
-          description: "A project",
-          fields: {
-            status: { type: "string", enum: ["active", "completed", "abandoned"], description: "Status" },
-            active: { type: "boolean", description: "Is active" },
-            priority: { type: "integer", description: "Priority level" },
-          },
-        },
-      },
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
+    vaultStore.upsertTagSchema("person", {
+      description: "A person",
+      fields: {
+        first_appeared: { type: "string", description: "When" },
+        relationship: { type: "string", description: "How" },
+      },
+    });
+    vaultStore.upsertTagSchema("project", {
+      description: "A project",
+      fields: {
+        status: { type: "string", enum: ["active", "completed", "abandoned"], description: "Status" },
+        active: { type: "boolean", description: "Is active" },
+        priority: { type: "integer", description: "Priority level" },
+      },
+    });
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
     const tagNote = tools.find((t) => t.name === "tag-note")!;
@@ -785,14 +783,14 @@ describe("unified MCP wrapper", () => {
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
-      tag_schemas: {
-        person: {
-          description: "A person",
-          fields: { name: { type: "string" } },
-        },
-      },
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
+
+    const vaultStore = getVaultStore(vaultName);
+    vaultStore.upsertTagSchema("person", {
+      description: "A person",
+      fields: { name: { type: "string" } },
+    });
 
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
@@ -822,11 +820,16 @@ describe("auth scopes", () => {
     expect(isToolAllowed("list-tags", "read")).toBe(true);
     expect(isToolAllowed("get-vault-stats", "read")).toBe(true);
     expect(isToolAllowed("list-vaults", "read")).toBe(true);
+    expect(isToolAllowed("list-tag-schemas", "read")).toBe(true);
+    expect(isToolAllowed("describe-tag", "read")).toBe(true);
   });
 
   test("read scope blocks write tools", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("create-note", "read")).toBe(false);
+    expect(isToolAllowed("create-tag-schema", "read")).toBe(false);
+    expect(isToolAllowed("update-tag-schema", "read")).toBe(false);
+    expect(isToolAllowed("delete-tag-schema", "read")).toBe(false);
     expect(isToolAllowed("update-note", "read")).toBe(false);
     expect(isToolAllowed("delete-note", "read")).toBe(false);
     expect(isToolAllowed("tag-note", "read")).toBe(false);

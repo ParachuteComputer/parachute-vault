@@ -15,7 +15,7 @@ import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, e
 import type { VaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
+import { handleNotes, handleTags, handleTagSchemas, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 
@@ -64,6 +64,28 @@ if (listVaults().length === 0) {
     }
     writeGlobalConfig(globalConfig);
     console.log(`Auto-created default vault (API key: ${fullKey})`);
+  }
+}
+
+// Migrate tag schemas from vault.yaml → DB for each vault.
+// Only inserts schemas that don't already exist in the DB (safe across restarts).
+for (const vaultName of listVaults()) {
+  const vaultConfig = readVaultConfig(vaultName);
+  if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
+    const store = getVaultStore(vaultName);
+    const existingTags = new Set(store.listTagSchemas().map((s) => s.tag));
+    let migrated = 0;
+    for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
+      if (!existingTags.has(tag)) {
+        store.upsertTagSchema(tag, schema);
+        migrated++;
+      }
+    }
+    if (migrated > 0) {
+      console.log(`[migration] migrated ${migrated} tag schema(s) from vault.yaml to DB for vault "${vaultName}"`);
+    } else {
+      console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
+    }
   }
 }
 
@@ -220,6 +242,7 @@ async function route(req: Request, path: string): Promise<Response> {
     const store = getVaultStore(defaultVault);
     const apiPath = path.slice(4); // strip "/api"
     if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
+    if (apiPath.startsWith("/tag-schemas")) return handleTagSchemas(req, store, apiPath.slice(12));
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/links") return handleLinks(req, store);
     if (apiPath === "/graph") return handleGraph(req, store);
@@ -309,6 +332,9 @@ async function route(req: Request, path: string): Promise<Response> {
 
   if (apiPath.startsWith("/notes")) {
     return handleNotes(req, store, apiPath.slice(6));
+  }
+  if (apiPath.startsWith("/tag-schemas")) {
+    return handleTagSchemas(req, store, apiPath.slice(12));
   }
   if (apiPath.startsWith("/tags")) {
     return handleTags(req, store, apiPath.slice(5));

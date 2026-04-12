@@ -3,6 +3,7 @@ import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
+import * as tagSchemaOps from "./tag-schemas.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { normalizePath, pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
@@ -205,6 +206,28 @@ export class SqliteStore implements Store {
 
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }) {
     return linkOps.findPath(this.db, sourceId, targetId, opts);
+  }
+
+  // ---- Tag Schemas ----
+
+  listTagSchemas() {
+    return tagSchemaOps.listTagSchemas(this.db);
+  }
+
+  getTagSchema(tag: string) {
+    return tagSchemaOps.getTagSchema(this.db, tag);
+  }
+
+  upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, tagSchemaOps.TagFieldSchema> }) {
+    return tagSchemaOps.upsertTagSchema(this.db, tag, schema);
+  }
+
+  deleteTagSchema(tag: string) {
+    return tagSchemaOps.deleteTagSchema(this.db, tag);
+  }
+
+  getTagSchemaMap() {
+    return tagSchemaOps.getTagSchemaMap(this.db);
   }
 
   // ---- Batch Wikilink Sync ----

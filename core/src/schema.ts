@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS links (
   metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL,
   UNIQUE(source_id, target_id, relationship)
+);
+
+-- Tag schemas: optional metadata schema per tag
+CREATE TABLE IF NOT EXISTS tag_schemas (
+  tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
+  description TEXT,
+  fields TEXT -- JSON: { "field_name": { "type": "string", "description": "..." }, ... }
 );
 
 -- Schema version tracking
@@ -103,6 +110,10 @@ export function initSchema(db: Database): void {
 
   // Migrate v4 → v5: unique path constraint
   migrateToV5(db);
+
+  // Migrate v5 → v6: tag_schemas table (created by SCHEMA_SQL above,
+  // this just ensures the table exists for databases created before v6)
+  migrateToV6(db);
 
   // Record schema version
   db.prepare("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(
@@ -171,6 +182,19 @@ function migrateToV5(db: Database): void {
   // Drop the old non-unique partial index and create a unique one
   db.exec("DROP INDEX IF EXISTS idx_notes_path");
   db.exec("CREATE UNIQUE INDEX idx_notes_path_unique ON notes(path) WHERE path IS NOT NULL");
+}
+
+/**
+ * Migrate v5 → v6: create tag_schemas table.
+ * The table is already in SCHEMA_SQL so it's created for new vaults.
+ * This migration handles existing vaults that were created before v6.
+ */
+function migrateToV6(db: Database): void {
+  // SCHEMA_SQL already creates the table via CREATE TABLE IF NOT EXISTS,
+  // so this is a no-op for new vaults. For existing vaults where SCHEMA_SQL
+  // ran above, the table now exists. Nothing extra needed here — the
+  // vault.yaml → DB migration happens at the server level (see server.ts),
+  // not at the core schema level, because core doesn't know about config files.
 }
 
 function hasTable(db: Database, name: string): boolean {

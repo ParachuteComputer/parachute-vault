@@ -183,6 +183,43 @@ export function handleTags(req: Request, store: Store, subpath = ""): Response {
 }
 
 // ---------------------------------------------------------------------------
+// Tag Schemas
+// ---------------------------------------------------------------------------
+
+export async function handleTagSchemas(req: Request, store: Store, subpath = ""): Promise<Response> {
+  // GET /tag-schemas — list all
+  if (req.method === "GET" && subpath === "") {
+    return json(store.listTagSchemas());
+  }
+
+  const tagMatch = subpath.match(/^\/([^/]+)$/);
+  if (!tagMatch) return json({ error: "Not found" }, 404);
+  const tagName = decodeURIComponent(tagMatch[1]);
+
+  // GET /tag-schemas/:tag
+  if (req.method === "GET") {
+    const schema = store.getTagSchema(tagName);
+    if (!schema) return json({ error: "No schema for tag" }, 404);
+    return json(schema);
+  }
+
+  // PUT /tag-schemas/:tag — create or update
+  if (req.method === "PUT") {
+    const body = await req.json() as { description?: string; fields?: Record<string, unknown> };
+    const schema = store.upsertTagSchema(tagName, body as any);
+    return json(schema);
+  }
+
+  // DELETE /tag-schemas/:tag
+  if (req.method === "DELETE") {
+    const deleted = store.deleteTagSchema(tagName);
+    return json({ deleted });
+  }
+
+  return json({ error: "Method not allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
 // Links
 // ---------------------------------------------------------------------------
 
