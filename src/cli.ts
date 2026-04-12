@@ -168,29 +168,8 @@ async function cmdInit() {
     envVars.PORT = String(globalConfig.port || DEFAULT_PORT);
   }
 
-  // 5. Interactive setup for embeddings (first run only)
+  // 5. Write env file (first run only)
   if (isFirstRun) {
-    console.log();
-
-    // --- Semantic search ---
-    const wantEmbeddings = await confirm("Set up semantic search (find notes by meaning, not just keywords)?");
-    if (wantEmbeddings) {
-      const provider = await choose("  Embedding provider:", [
-        { label: "OpenAI", value: "openai", description: "text-embedding-3-small, cheap (~$0.02/M tokens)" },
-        { label: "Ollama", value: "ollama", description: "local, requires Ollama running" },
-        { label: "Skip", value: "skip", description: "configure later" },
-      ]);
-
-      if (provider !== "skip") {
-        envVars.EMBEDDING_PROVIDER = provider;
-        if (provider === "openai" && !envVars.OPENAI_API_KEY) {
-          const key = await ask("  OPENAI_API_KEY");
-          if (key) envVars.OPENAI_API_KEY = key;
-        }
-      }
-    }
-
-    // Write env file
     writeEnvFile(envVars);
     console.log();
   }
@@ -339,17 +318,6 @@ async function cmdConfig(args: string[]) {
       }
     }
 
-    console.log();
-    console.log("Semantic search (find notes by meaning):");
-    console.log("  EMBEDDING_PROVIDER   — openai, ollama, none");
-    console.log("  EMBEDDING_MODEL      — model name (default: text-embedding-3-small)");
-    console.log("  OPENAI_API_KEY       — for OpenAI embeddings");
-    console.log("  OLLAMA_BASE_URL      — Ollama server (default: http://localhost:11434)");
-    console.log();
-    console.log("Example:");
-    console.log("  parachute vault config set EMBEDDING_PROVIDER openai");
-    console.log("  parachute vault config set OPENAI_API_KEY sk-...");
-    console.log("  parachute vault restart");
     return;
   }
 
@@ -568,17 +536,6 @@ async function cmdStatus() {
     }
   } else {
     console.log(`  Triggers:   none configured`);
-  }
-
-  // Embeddings
-  const env = readEnvFile();
-  const embedProvider = env.EMBEDDING_PROVIDER;
-  if (embedProvider && embedProvider !== "none") {
-    const model = env.EMBEDDING_MODEL ?? "text-embedding-3-small";
-    console.log(`  Embeddings:     ${embedProvider}/${model}`);
-  } else {
-    console.log(`  Embeddings:     not configured`);
-    console.log(`                  vault config set EMBEDDING_PROVIDER openai`);
   }
 
   // Quick health check if daemon is running

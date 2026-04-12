@@ -296,27 +296,11 @@ If you only need the stats, call `GET /vaults/{name}` and read `.stats`.
 #### `POST /storage/upload`
 Multipart form:
 - `file` — required, audio/image, ≤100MB
-- `transcribe=true` — optional, transcribe audio server-side
 
-Returns `{path, size, mimeType, transcription?}`.
+Returns `{path, size, mimeType}`.
 
 #### `GET /storage/{date}/{filename}`
 Serves the uploaded file.
-
-### Ingest (voice note one-shot)
-
-#### `POST /ingest`
-Multipart form that uploads audio, optionally transcribes, and creates a note
-with the audio attached — all in one request.
-
-- `file` — required
-- `content` — optional note body (e.g. client-side transcription)
-- `createdAt` — ISO-8601, optional (defaults to now)
-- `tags` — comma-separated
-- `path`, `id`, `metadata` (JSON string) — optional
-- `sync=true` or `transcribe=true` — transcribe server-side before responding
-
-Returns `{note, attachment, transcription}`.
 
 ## CORS
 

@@ -1,6 +1,6 @@
 # Parachute Vault
 
-A self-hosted knowledge graph for AI agents. Notes, tags, links, and semantic search — exposed over MCP. Any AI gets a personal knowledge vault in one command.
+A self-hosted knowledge graph for AI agents. Notes, tags, links — exposed over MCP. Any AI gets a personal knowledge vault in one command.
 
 ## Quick start
 
@@ -13,7 +13,7 @@ bun install
 bun src/cli.ts vault init
 ```
 
-`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP. It walks you through semantic search setup interactively.
+`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP.
 
 For remote access from Claude Desktop or mobile apps, see [Deployment](#deployment) below.
 
@@ -21,10 +21,9 @@ For remote access from Claude Desktop or mobile apps, see [Deployment](#deployme
 
 A server on port 1940 with:
 
-- **MCP** — 20 tools for AI agents (notes, search, tags, links, graph traversal, semantic search)
+- **MCP** — 18 tools for AI agents (notes, search, tags, links, graph traversal)
 - **REST API** — Full CRUD for notes, tags, links, full-text search
 - **Wikilink auto-linking** — `[[wikilinks]]` in note content automatically create links in the graph
-- **Semantic search** — Vector embeddings via sqlite-vec (configure an embedding provider)
 - **Obsidian import/export** — Bidirectional interop with Obsidian vaults
 - **Webhook triggers** — Config-driven webhooks that fire on note mutations matching tag/metadata predicates
 - **View endpoint** — Serve notes as clean HTML pages (public or authenticated)
@@ -55,25 +54,6 @@ parachute vault config set KEY value       # set a config value
 parachute vault restart                    # apply changes
 ```
 
-## Configuration
-
-All config lives in `~/.parachute/.env`. `vault init` walks you through setup. To change later:
-
-```bash
-parachute vault config set EMBEDDING_PROVIDER openai
-parachute vault config set OPENAI_API_KEY sk-...
-parachute vault restart
-```
-
-### Providers
-
-**Embeddings** (semantic search):
-
-| Provider | Type | Notes |
-|----------|------|-------|
-| `openai` | Cloud | `text-embedding-3-small`. Cheap (~$0.02/M tokens) |
-| `ollama` | Local | `nomic-embed-text`. Requires Ollama running |
-
 ## MCP tools
 
 **Notes**: `get-note`, `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`
@@ -82,7 +62,6 @@ parachute vault restart
 **Bulk**: `create-notes`, `batch-tag`, `batch-untag`
 **Graph**: `traverse-links`, `find-path`
 **Vault**: `list-vaults`, `get-vault-description`, `update-vault-description`, `get-vault-stats`
-**Semantic** (when configured): `semantic-search`, `embed-notes`
 
 ### Vault descriptions
 
@@ -103,10 +82,6 @@ Sent as the MCP server instruction at session start.
 ### Wikilink auto-linking
 
 `[[wikilinks]]` in note content automatically create links in the graph. Supports aliases (`[[Name|display]]`), anchors (`[[Note#Section]]`), and embeds (`![[Image]]`). Unresolved links auto-resolve when the target note is created later.
-
-### Semantic search
-
-With an embedding provider configured, `semantic-search` finds conceptually related notes even without exact keyword matches. Supports tag and date filters.
 
 ### Obsidian import/export
 
@@ -170,7 +145,7 @@ POST/DEL       /api/links              create/delete links
 GET            /api/search?q=...       full-text search
 GET            /api/resolve-wikilink?title=...  resolve a wikilink title to note
 GET            /api/unresolved-wikilinks        list unresolved wikilinks
-POST           /api/ingest             upload file + create note
+POST           /api/storage/upload     upload file (audio/image)
 GET            /api/graph              full knowledge graph
 POST           /mcp                    MCP endpoint
 GET            /view/:noteId           render note as HTML (public or auth)

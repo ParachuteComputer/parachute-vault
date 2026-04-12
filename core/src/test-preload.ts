@@ -1,7 +1,3 @@
-// Preload for tests: enable sqlite-vec on macOS before any Database opens
-import { useHomebrewSQLiteIfNeeded } from "./embeddings.js";
-useHomebrewSQLiteIfNeeded();
-
 // Isolate PARACHUTE_HOME so tests never touch the real ~/.parachute directory.
 // This must run before any `./config.ts` import resolves CONFIG_DIR.
 import { mkdtempSync } from "fs";
