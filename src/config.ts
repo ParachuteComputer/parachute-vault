@@ -106,17 +106,6 @@ export interface TriggerWhen {
  */
 export type TriggerSendMode = "json" | "attachment" | "content";
 
-/**
- * How the trigger interprets the webhook response.
- *
- * - `"json"` (default): Standard webhook response with optional content,
- *   metadata, and attachments fields.
- * - `"content"`: Response body is `{ text }`. Written to note.content.
- * - `"attachment"`: Response body is raw binary audio. Written to the vault
- *   assets dir and recorded as an attachment on the note.
- */
-export type TriggerResponseMode = "json" | "content" | "attachment";
-
 export interface TriggerAction {
   /** URL to POST the webhook payload to. */
   webhook: string;
@@ -124,8 +113,6 @@ export interface TriggerAction {
   timeout?: number;
   /** How to send data to the webhook. Default "json". */
   send?: TriggerSendMode;
-  /** How to interpret the response. Default "json". */
-  response?: TriggerResponseMode;
 }
 
 export interface TriggerConfig {
@@ -418,11 +405,6 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
         current.action.send = sendMatch[1] as TriggerAction["send"];
         continue;
       }
-      const responseMatch = trimmed.match(/^response:\s*(\S+)/);
-      if (responseMatch && current.action) {
-        current.action.response = responseMatch[1] as TriggerAction["response"];
-        continue;
-      }
     }
   }
 
@@ -540,9 +522,6 @@ export function writeGlobalConfig(config: GlobalConfig): void {
       lines.push(`      webhook: ${trigger.action.webhook}`);
       if (trigger.action.send && trigger.action.send !== "json") {
         lines.push(`      send: ${trigger.action.send}`);
-      }
-      if (trigger.action.response && trigger.action.response !== "json") {
-        lines.push(`      response: ${trigger.action.response}`);
       }
       if (trigger.action.timeout) {
         lines.push(`      timeout: ${trigger.action.timeout}`);

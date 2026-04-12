@@ -18,14 +18,11 @@
  * ## Send modes
  *
  *   - `json` (default): POST `{ trigger, event, note }` as JSON.
+ *     Response: `{ content?, metadata?, attachments? }`.
  *   - `attachment`: Read the first audio attachment, POST as multipart/form-data.
+ *     Response: `{ text }` (Whisper API shape). Written to note.content.
  *   - `content`: POST `{ input: note.content }` as JSON (OpenAI TTS shape).
- *
- * ## Response modes
- *
- *   - `json` (default): Standard `{ content?, metadata?, attachments? }`.
- *   - `content`: Response is `{ text }`. Written to note.content.
- *   - `attachment`: Response is raw binary audio. Saved to assets + attachment.
+ *     Response: binary audio bytes. Saved to assets + attachment.
  */
 
 import { join, normalize } from "path";
@@ -301,7 +298,6 @@ export function registerTriggers(
     const renderedKey = `${trigger.name}_rendered_at`;
     const timeout = trigger.action.timeout ?? DEFAULT_TIMEOUT;
     const sendMode = trigger.action.send ?? "json";
-    const responseMode = trigger.action.response ?? "json";
 
     const unregister = hooks.onNote({
       name: trigger.name,
@@ -328,11 +324,10 @@ export function registerTriggers(
 
         // Fire the webhook using the configured send mode
         let webhookResult: WebhookResponse;
+        const attachments = store.getAttachments(note.id);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
         try {
-          const attachments = store.getAttachments(note.id);
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeout);
-
           let result: DispatchResult;
           switch (sendMode) {
             case "attachment":
@@ -346,7 +341,6 @@ export function registerTriggers(
               result = await dispatchJson(trigger.action.webhook, trigger, note, attachments, existingMeta, hookEvent, controller.signal);
               break;
           }
-          clearTimeout(timer);
           webhookResult = result.webhookResult;
         } catch (err) {
           logger.error(
@@ -354,6 +348,8 @@ export function registerTriggers(
             err,
           );
           throw err;
+        } finally {
+          clearTimeout(timer);
         }
 
         // Handle skipped result. We write `_rendered_at` even for skips so the
@@ -408,7 +404,7 @@ export function registerTriggers(
     });
 
     unregisters.push(unregister);
-    const modeStr = sendMode !== "json" ? ` (send=${sendMode}, response=${responseMode})` : "";
+    const modeStr = sendMode !== "json" ? ` (send=${sendMode})` : "";
     logger.info?.(`[triggers] registered: ${trigger.name} → ${trigger.action.webhook}${modeStr}`);
   }
 

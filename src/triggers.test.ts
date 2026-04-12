@@ -211,7 +211,6 @@ describe("registerTriggers — dispatch modes", () => {
       action: {
         webhook: `http://127.0.0.1:${webhookPort}/transcribe`,
         send: "attachment",
-        response: "content",
       },
     }], { error: () => {}, info: () => {} });
 
@@ -262,7 +261,6 @@ describe("registerTriggers — dispatch modes", () => {
       action: {
         webhook: `http://127.0.0.1:${webhookPort}/speech`,
         send: "content",
-        response: "attachment",
       },
     }], { error: () => {}, info: () => {} });
 
@@ -383,12 +381,12 @@ describe("registerTriggers — validation", () => {
       {
         name: "tts",
         when: { tags: ["reader"] },
-        action: { webhook: "http://localhost:3100/v1/audio/speech", send: "content", response: "attachment" },
+        action: { webhook: "http://localhost:3100/v1/audio/speech", send: "content" },
       },
       {
         name: "transcribe",
         when: { tags: ["capture"] },
-        action: { webhook: "http://localhost:3200/v1/audio/transcriptions", send: "attachment", response: "content" },
+        action: { webhook: "http://localhost:3200/v1/audio/transcriptions", send: "attachment" },
       },
     ], logger);
 
