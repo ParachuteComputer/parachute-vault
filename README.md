@@ -7,6 +7,10 @@ A self-hosted knowledge graph for AI agents. Notes, tags, links — exposed over
 Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
 
 ```bash
+# Install from GitHub
+bun add github:ParachuteComputer/parachute-vault
+
+# Or clone and install
 git clone https://github.com/ParachuteComputer/parachute-vault
 cd parachute-vault
 bun install
@@ -126,7 +130,7 @@ Serve notes as clean HTML pages at `/view/:noteId`:
 
 - **Without auth**: only serves notes tagged `published` (or with `metadata.published: true`). Returns 404 for unpublished notes.
 - **With auth**: serves any note. Pass API key via `Authorization: Bearer pvk_...` header or `?key=pvk_...` query param.
-- **Custom tag**: set `published_tag` in vault.yaml to use a different tag name (default: `published`).
+- **Custom tag**: set `published_tag` in vault.yaml to use a different tag name (default: `publish`).
 
 ```yaml
 # ~/.parachute/vaults/default/vault.yaml
