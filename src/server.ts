@@ -25,10 +25,11 @@ if (existsSync(_envPath)) {
 }
 
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
-import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed } from "./auth.ts";
+import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, extractApiKey, isLocalhost } from "./auth.ts";
+import type { VaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handlePublicNote } from "./routes.ts";
+import { handleNotes, handleTags, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleIngest, handleViewNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 
@@ -138,6 +139,30 @@ async function shutdown(signal: string): Promise<void> {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
+/**
+ * Check if a /view request has a valid API key (header or ?key= query param).
+ * Returns true if authenticated, false if not. Never rejects — unauthenticated
+ * requests still get public notes.
+ */
+function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null): boolean {
+  if (isLocalhost(req)) return true;
+
+  // Check query param first (convenient for browsers)
+  const url = new URL(req.url);
+  const queryKey = url.searchParams.get("key");
+  const headerKey = extractApiKey(req);
+  const key = queryKey ?? headerKey;
+  if (!key || !vaultConfig) return false;
+
+  const auth = authenticateVaultRequest(
+    queryKey && !headerKey
+      ? new Request(req.url, { headers: { ...Object.fromEntries(req.headers), "x-api-key": key } })
+      : req,
+    vaultConfig,
+  );
+  return !("error" in auth);
+}
+
 async function route(req: Request, path: string): Promise<Response> {
   // Health check
   if (path === "/health") {
@@ -151,12 +176,17 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleUnifiedMcp(req, auth.scope);
   }
 
-  // Published notes — public, no auth
-  const publicMatch = path.match(/^\/public\/([^/]+)$/);
-  if (publicMatch && req.method === "GET") {
+  // View endpoint — serves notes as HTML (auth-aware)
+  const viewMatch = path.match(/^\/view\/([^/]+)$/);
+  if (viewMatch && req.method === "GET") {
     const defaultVault = readGlobalConfig().default_vault ?? "default";
+    const vaultConfig = readVaultConfig(defaultVault);
     const store = getVaultStore(defaultVault);
-    return handlePublicNote(store, publicMatch[1]);
+    const authenticated = isViewAuthenticated(req, vaultConfig);
+    return handleViewNote(store, viewMatch[1], {
+      authenticated,
+      publishedTag: vaultConfig?.published_tag,
+    });
   }
 
 
@@ -217,11 +247,15 @@ async function route(req: Request, path: string): Promise<Response> {
     );
   }
 
-  // Published notes — public, no auth (vault-scoped)
-  const vaultPublicMatch = subpath.match(/^\/public\/([^/]+)$/);
-  if (vaultPublicMatch && req.method === "GET") {
+  // View endpoint — serves notes as HTML (auth-aware, vault-scoped)
+  const vaultViewMatch = subpath.match(/^\/view\/([^/]+)$/);
+  if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
-    return handlePublicNote(store, vaultPublicMatch[1]);
+    const authenticated = isViewAuthenticated(req, vaultConfig);
+    return handleViewNote(store, vaultViewMatch[1], {
+      authenticated,
+      publishedTag: vaultConfig.published_tag,
+    });
   }
 
   // Auth: per-vault key OR global key
