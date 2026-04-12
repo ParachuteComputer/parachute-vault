@@ -148,6 +148,12 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
+  // Exact path match (case-insensitive)
+  if (opts.path) {
+    conditions.push("n.path = ? COLLATE NOCASE");
+    params.push(opts.path);
+  }
+
   // Path prefix
   if (opts.pathPrefix) {
     conditions.push("n.path LIKE ?");

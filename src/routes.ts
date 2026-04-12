@@ -58,6 +58,8 @@ export async function handleNotes(
           tags: parseQueryList(url, "tag"),
           tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? undefined,
           excludeTags: parseQueryList(url, "exclude_tag"),
+          path: parseQuery(url, "path") ?? undefined,
+          pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
           dateFrom: parseQuery(url, "date_from") ?? undefined,
           dateTo: parseQuery(url, "date_to") ?? undefined,
           sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
