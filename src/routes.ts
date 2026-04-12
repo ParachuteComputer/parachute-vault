@@ -614,10 +614,10 @@ function inlineMarkdown(html: string): string {
 
 /**
  * Check if a note is published. A note is published if:
- * 1. It has the configured published tag (default: "published"), OR
+ * 1. It has the configured published tag (default: "publish"), OR
  * 2. It has metadata.published === true (always honored regardless of custom tag)
  */
-function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishedTag: string = "published"): boolean {
+function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishedTag: string = "publish"): boolean {
   if (note.tags?.includes(publishedTag)) return true;
   const meta = note.metadata as Record<string, unknown> | undefined;
   if (meta?.published === true) return true;
