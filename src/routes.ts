@@ -545,7 +545,7 @@ export function handleViewNote(
   noteId: string,
   options: { authenticated?: boolean; publishedTag?: string } = {},
 ): Response {
-  const { authenticated = false, publishedTag = "published" } = options;
+  const { authenticated = false, publishedTag = "publish" } = options;
   const note = store.getNote(noteId);
   if (!note) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
