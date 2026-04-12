@@ -7,17 +7,18 @@ A self-hosted knowledge graph for AI agents. Notes, tags, links — exposed over
 Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
 
 ```bash
-# Install from GitHub
-bun add github:ParachuteComputer/parachute-vault
+# Install globally (registers the `parachute` CLI)
+bun add -g github:ParachuteComputer/parachute-vault
+parachute vault init
 
-# Or clone and install
+# Or clone and run directly
 git clone https://github.com/ParachuteComputer/parachute-vault
 cd parachute-vault
 bun install
 bun src/cli.ts vault init
 ```
 
-`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP.
+`vault init` creates a vault, generates an API key, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP — all in one command. Your API key is printed once at init; save it for connecting from other tools.
 
 For remote access from Claude Desktop or mobile apps, see [Deployment](#deployment) below.
 
