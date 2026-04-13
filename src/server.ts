@@ -12,7 +12,9 @@
 
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, extractApiKey } from "./auth.ts";
+import type { AuthResult } from "./auth.ts";
 import type { VaultConfig } from "./config.ts";
+import { migrateVaultKeys } from "./token-store.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
@@ -89,6 +91,24 @@ for (const vaultName of listVaults()) {
   }
 }
 
+// Migrate existing API keys from config.yaml → per-vault token tables (idempotent)
+{
+  const globalCfg = readGlobalConfig();
+  for (const vaultName of listVaults()) {
+    try {
+      const vc = readVaultConfig(vaultName);
+      if (!vc) continue;
+      const store = getVaultStore(vaultName);
+      const migrated = migrateVaultKeys(store.db, vc.api_keys, globalCfg.api_keys);
+      if (migrated > 0) {
+        console.log(`[tokens] migrated ${migrated} API key(s) into vault "${vaultName}"`);
+      }
+    } catch (err) {
+      console.error(`[tokens] migration error for vault "${vaultName}":`, err);
+    }
+  }
+}
+
 const globalConfig = readGlobalConfig();
 const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PORT;
 
@@ -152,7 +172,7 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
  * Returns true if authenticated, false if not. Never rejects — unauthenticated
  * requests still get public notes.
  */
-function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null): boolean {
+function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null, vaultDb?: import("bun:sqlite").Database): boolean {
   // Check query param first (convenient for browsers)
   const url = new URL(req.url);
   const queryKey = url.searchParams.get("key");
@@ -165,6 +185,7 @@ function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null): boo
       ? new Request(req.url, { headers: { ...Object.fromEntries(req.headers), "x-api-key": key } })
       : req,
     vaultConfig,
+    vaultDb,
   );
   return !("error" in auth);
 }
@@ -183,7 +204,7 @@ async function route(req: Request, path: string): Promise<Response> {
   if (path === "/mcp" || path.startsWith("/mcp/")) {
     const auth = authenticateGlobalRequest(req);
     if ("error" in auth) return auth.error;
-    return handleUnifiedMcp(req, auth.scope);
+    return handleUnifiedMcp(req, auth);
   }
 
   // View endpoint — serves notes as HTML (auth-aware, supports ID or path)
@@ -195,7 +216,7 @@ async function route(req: Request, path: string): Promise<Response> {
       return Response.json({ error: "Default vault not found" }, { status: 404 });
     }
     const store = getVaultStore(defaultVault);
-    const authenticated = isViewAuthenticated(req, vaultConfig);
+    const authenticated = isViewAuthenticated(req, vaultConfig, store.db);
     return handleViewNote(store, decodeURIComponent(viewMatch[1]), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
@@ -234,22 +255,22 @@ async function route(req: Request, path: string): Promise<Response> {
     if (!vaultConfig) {
       return Response.json({ error: "Default vault not found" }, { status: 404 });
     }
-    const auth = authenticateVaultRequest(req, vaultConfig);
-    if ("error" in auth) return auth.error;
-    if (!isMethodAllowed(req.method, auth.scope)) {
-      return Response.json({ error: "Forbidden", message: "Read-only API key" }, { status: 403 });
-    }
     const store = getVaultStore(defaultVault);
+    const auth = authenticateVaultRequest(req, vaultConfig, store.db);
+    if ("error" in auth) return auth.error;
+    if (!isMethodAllowed(req.method, auth.permission)) {
+      return Response.json({ error: "Forbidden", message: "Insufficient permissions" }, { status: 403 });
+    }
     const apiPath = path.slice(4); // strip "/api"
-    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
-    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
-    if (apiPath === "/find-path") return handleFindPath(req, store);
+    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), auth);
+    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), auth);
+    if (apiPath === "/find-path") return handleFindPath(req, store, auth);
     if (apiPath === "/vault") return handleVault(req, store, vaultConfig, (desc) => {
       vaultConfig.description = desc;
       writeVaultConfig(vaultConfig);
     });
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
-    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
+    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault, auth, store);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
   }
 
@@ -282,7 +303,7 @@ async function route(req: Request, path: string): Promise<Response> {
   const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
-    const authenticated = isViewAuthenticated(req, vaultConfig);
+    const authenticated = isViewAuthenticated(req, vaultConfig, store.db);
     return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
@@ -290,12 +311,13 @@ async function route(req: Request, path: string): Promise<Response> {
   }
 
   // Auth: per-vault key OR global key
-  const auth = authenticateVaultRequest(req, vaultConfig);
+  const store = getVaultStore(vaultName);
+  const auth = authenticateVaultRequest(req, vaultConfig, store.db);
   if ("error" in auth) return auth.error;
 
   // Per-vault scoped MCP
   if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
-    return handleScopedMcp(req, vaultName, auth.scope);
+    return handleScopedMcp(req, vaultName, auth);
   }
 
   // Bare /vaults/{name} — single-vault root. Returns name, description,
@@ -304,7 +326,6 @@ async function route(req: Request, path: string): Promise<Response> {
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    const store = getVaultStore(vaultName);
     const stats = store.getVaultStats();
     return Response.json({
       name: vaultName,
@@ -314,15 +335,14 @@ async function route(req: Request, path: string): Promise<Response> {
     });
   }
 
-  // REST API — enforce read-only scope
-  if (!isMethodAllowed(req.method, auth.scope)) {
+  // REST API — enforce permission level
+  if (!isMethodAllowed(req.method, auth.permission)) {
     return Response.json(
-      { error: "Forbidden", message: "Read-only API key cannot perform write operations" },
+      { error: "Forbidden", message: "Insufficient permissions" },
       { status: 403 },
     );
   }
 
-  const store = getVaultStore(vaultName);
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
@@ -331,13 +351,13 @@ async function route(req: Request, path: string): Promise<Response> {
   const apiPath = apiMatch[1] ?? "";
 
   if (apiPath.startsWith("/notes")) {
-    return handleNotes(req, store, apiPath.slice(6));
+    return handleNotes(req, store, apiPath.slice(6), auth);
   }
   if (apiPath.startsWith("/tags")) {
-    return handleTags(req, store, apiPath.slice(5));
+    return handleTags(req, store, apiPath.slice(5), auth);
   }
   if (apiPath === "/find-path") {
-    return handleFindPath(req, store);
+    return handleFindPath(req, store, auth);
   }
   if (apiPath === "/vault") {
     return handleVault(req, store, vaultConfig, (desc) => {
@@ -349,7 +369,7 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleUnresolvedWikilinks(req, store);
   }
   if (apiPath.startsWith("/storage")) {
-    return handleStorage(req, apiPath.slice(8), vaultName);
+    return handleStorage(req, apiPath.slice(8), vaultName, auth, store);
   }
   if (apiPath === "/health") {
     return Response.json({ status: "ok", vault: vaultName });
