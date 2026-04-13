@@ -15,7 +15,7 @@ import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, e
 import type { VaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleTagSchemas, handleLinks, handleGraph, handleSearch, handleResolveWikilink, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 
@@ -186,8 +186,8 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleUnifiedMcp(req, auth.scope);
   }
 
-  // View endpoint — serves notes as HTML (auth-aware)
-  const viewMatch = path.match(/^\/view\/([^/]+)$/);
+  // View endpoint — serves notes as HTML (auth-aware, supports ID or path)
+  const viewMatch = path.match(/^\/view\/(.+)$/);
   if (viewMatch && req.method === "GET") {
     const defaultVault = readGlobalConfig().default_vault ?? "default";
     const vaultConfig = readVaultConfig(defaultVault);
@@ -196,7 +196,7 @@ async function route(req: Request, path: string): Promise<Response> {
     }
     const store = getVaultStore(defaultVault);
     const authenticated = isViewAuthenticated(req, vaultConfig);
-    return handleViewNote(store, viewMatch[1], {
+    return handleViewNote(store, decodeURIComponent(viewMatch[1]), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
     });
@@ -242,12 +242,12 @@ async function route(req: Request, path: string): Promise<Response> {
     const store = getVaultStore(defaultVault);
     const apiPath = path.slice(4); // strip "/api"
     if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
-    if (apiPath.startsWith("/tag-schemas")) return handleTagSchemas(req, store, apiPath.slice(12));
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
-    if (apiPath === "/links") return handleLinks(req, store);
-    if (apiPath === "/graph") return handleGraph(req, store);
-    if (apiPath === "/search") return handleSearch(req, store);
-    if (apiPath === "/resolve-wikilink") return handleResolveWikilink(req, store);
+    if (apiPath === "/find-path") return handleFindPath(req, store);
+    if (apiPath === "/vault") return handleVault(req, store, vaultConfig, (desc) => {
+      vaultConfig.description = desc;
+      writeVaultConfig(vaultConfig);
+    });
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
     if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
@@ -278,12 +278,12 @@ async function route(req: Request, path: string): Promise<Response> {
     return Response.redirect(dest.toString(), 301);
   }
 
-  // View endpoint — serves notes as HTML (auth-aware, vault-scoped)
-  const vaultViewMatch = subpath.match(/^\/view\/([^/]+)$/);
+  // View endpoint — serves notes as HTML (auth-aware, vault-scoped, supports ID or path)
+  const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
     const authenticated = isViewAuthenticated(req, vaultConfig);
-    return handleViewNote(store, vaultViewMatch[1], {
+    return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
     });
@@ -333,23 +333,17 @@ async function route(req: Request, path: string): Promise<Response> {
   if (apiPath.startsWith("/notes")) {
     return handleNotes(req, store, apiPath.slice(6));
   }
-  if (apiPath.startsWith("/tag-schemas")) {
-    return handleTagSchemas(req, store, apiPath.slice(12));
-  }
   if (apiPath.startsWith("/tags")) {
     return handleTags(req, store, apiPath.slice(5));
   }
-  if (apiPath === "/links") {
-    return handleLinks(req, store);
+  if (apiPath === "/find-path") {
+    return handleFindPath(req, store);
   }
-  if (apiPath === "/graph") {
-    return handleGraph(req, store);
-  }
-  if (apiPath === "/search") {
-    return handleSearch(req, store);
-  }
-  if (apiPath === "/resolve-wikilink") {
-    return handleResolveWikilink(req, store);
+  if (apiPath === "/vault") {
+    return handleVault(req, store, vaultConfig, (desc) => {
+      vaultConfig.description = desc;
+      writeVaultConfig(vaultConfig);
+    });
   }
   if (apiPath === "/unresolved-wikilinks") {
     return handleUnresolvedWikilinks(req, store);

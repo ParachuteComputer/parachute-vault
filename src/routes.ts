@@ -1,20 +1,24 @@
 /**
  * REST API route handlers for the multi-vault server.
  *
+ * Mirrors the 9 MCP tools:
+ *   /api/notes          — query-notes, create-note, update-note, delete-note
+ *   /api/tags           — list-tags, update-tag, delete-tag
+ *   /api/find-path      — find-path
+ *   /api/vault          — vault-info
+ *
  * Each handler receives a Store instance (already resolved for the vault)
  * and the Request, and returns a Response.
  */
 
-import type { Store } from "../core/src/types.ts";
-import { resolveWikilinkDetailed, listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
+import type { Store, Note } from "../core/src/types.ts";
+import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { toNoteIndex } from "../core/src/notes.ts";
+import * as linkOps from "../core/src/links.ts";
+import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
-function parseBool(val: string | null, defaultVal: boolean): boolean {
-  if (val === null) return defaultVal;
-  return val === "true" || val === "1";
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -22,6 +26,11 @@ function parseBool(val: string | null, defaultVal: boolean): boolean {
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
+}
+
+function parseBool(val: string | null, defaultVal: boolean): boolean {
+  if (val === null) return defaultVal;
+  return val === "true" || val === "1";
 }
 
 function parseQuery(url: URL, key: string): string | null {
@@ -33,323 +42,405 @@ function parseQueryList(url: URL, key: string): string[] | undefined {
   return val ? val.split(",") : undefined;
 }
 
+function parseInt10(val: string | null): number | undefined {
+  if (!val) return undefined;
+  const n = parseInt(val, 10);
+  return isNaN(n) ? undefined : n;
+}
+
+/**
+ * Resolve a note by ID or path. Tries ID first, then case-insensitive path.
+ */
+function resolveNote(store: Store, idOrPath: string): Note | null {
+  const byId = store.getNote(idOrPath);
+  if (byId) return byId;
+  return store.getNoteByPath(idOrPath);
+}
+
+function requireNote(store: Store, idOrPath: string): Note {
+  const note = resolveNote(store, idOrPath);
+  if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
+  return note;
+}
+
+class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotFoundError";
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Notes
+// Notes — GET/POST/PATCH/DELETE /api/notes[/:idOrPath]
 // ---------------------------------------------------------------------------
 
 export async function handleNotes(
   req: Request,
   store: Store,
-  path: string,
+  subpath: string,
 ): Promise<Response> {
   const url = new URL(req.url);
   const method = req.method;
+  const db = (store as any).db;
 
-  // GET /notes — Query notes.
-  // Default response is the lean index shape (no content). Pass
-  // ?include_content=true to get full notes. Pass ?ids=a,b,c to fetch
-  // specific notes by ID (still honors include_content).
-  if (method === "GET" && path === "") {
-    const includeContent = parseBool(parseQuery(url, "include_content"), false);
-    const ids = parseQueryList(url, "ids");
-    const fetched = ids
-      ? store.getNotes(ids)
-      : store.queryNotes({
-          tags: parseQueryList(url, "tag"),
-          tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? undefined,
-          excludeTags: parseQueryList(url, "exclude_tag"),
-          path: parseQuery(url, "path") ?? undefined,
-          pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
-          dateFrom: parseQuery(url, "date_from") ?? undefined,
-          dateTo: parseQuery(url, "date_to") ?? undefined,
-          sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
-          limit: parseQuery(url, "limit") ? parseInt(parseQuery(url, "limit")!, 10) : undefined,
-          offset: parseQuery(url, "offset") ? parseInt(parseQuery(url, "offset")!, 10) : undefined,
+  // ---- Collection routes (no ID in path) ----
+  if (subpath === "") {
+    // GET /notes — query (all filters as query params)
+    if (method === "GET") {
+      const id = parseQuery(url, "id");
+      const search = parseQuery(url, "search");
+
+      // Single note by id/path
+      if (id) {
+        const note = resolveNote(store, id);
+        if (!note) return json({ error: "Note not found", id }, 404);
+        const includeContent = parseBool(parseQuery(url, "include_content"), true);
+        const result: any = includeContent ? { ...note } : toNoteIndex(note);
+        if (parseBool(parseQuery(url, "include_links"), false)) {
+          result.links = linkOps.getLinksHydrated(db, note.id);
+        }
+        if (parseBool(parseQuery(url, "include_attachments"), false)) {
+          result.attachments = store.getAttachments(note.id);
+        }
+        return json(result);
+      }
+
+      // Full-text search
+      if (search) {
+        const tags = parseQueryList(url, "tag");
+        const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
+        const results = store.searchNotes(search, { tags, limit });
+        const includeContent = parseBool(parseQuery(url, "include_content"), false);
+        return json(includeContent ? results : results.map(toNoteIndex));
+      }
+
+      // Structured query
+      const tags = parseQueryList(url, "tag");
+      const results = store.queryNotes({
+        tags,
+        tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+        excludeTags: parseQueryList(url, "exclude_tag"),
+        path: parseQuery(url, "path") ?? undefined,
+        pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+        metadata: undefined, // metadata filter not practical in query params
+        dateFrom: parseQuery(url, "date_from") ?? undefined,
+        dateTo: parseQuery(url, "date_to") ?? undefined,
+        sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
+        limit: parseInt10(parseQuery(url, "limit")) ?? 50,
+        offset: parseInt10(parseQuery(url, "offset")),
+      });
+
+      const includeContent = parseBool(parseQuery(url, "include_content"), false);
+      const output = includeContent ? results : results.map(toNoteIndex);
+
+      if (parseBool(parseQuery(url, "include_links"), false) || parseBool(parseQuery(url, "include_attachments"), false)) {
+        const includeLinks = parseBool(parseQuery(url, "include_links"), false);
+        const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
+        return json(output.map((n: any) => {
+          const enriched = { ...n };
+          if (includeLinks) enriched.links = linkOps.getLinksHydrated(db, n.id);
+          if (includeAttachments) enriched.attachments = store.getAttachments(n.id);
+          return enriched;
+        }));
+      }
+
+      return json(output);
+    }
+
+    // POST /notes — create (single or batch)
+    if (method === "POST") {
+      const body = await req.json() as any;
+      const items: any[] = body.notes ?? [body];
+
+      const created: Note[] = [];
+      for (const item of items) {
+        const note = store.createNote(item.content ?? "", {
+          id: item.id,
+          path: item.path,
+          tags: item.tags,
+          metadata: item.metadata,
+          created_at: item.createdAt ?? item.created_at,
         });
-    return json(includeContent ? fetched : fetched.map(toNoteIndex));
+
+        // Create explicit links
+        if (item.links) {
+          for (const link of item.links as { target: string; relationship: string }[]) {
+            const target = resolveNote(store, link.target);
+            if (target) store.createLink(note.id, target.id, link.relationship);
+          }
+        }
+
+        created.push(store.getNote(note.id) ?? note);
+      }
+
+      // Apply tag schema defaults
+      for (const note of created) {
+        if (note.tags?.length) {
+          applySchemaDefaults(store, db, [note.id], note.tags);
+        }
+      }
+
+      return json(body.notes ? created : created[0], 201);
+    }
+
+    return json({ error: "Method not allowed" }, 405);
   }
 
-  // POST /notes — Create note
-  if (method === "POST" && path === "") {
-    const body = await req.json() as {
-      content: string;
-      id?: string;
-      path?: string;
-      tags?: string[];
-      metadata?: Record<string, unknown>;
-      createdAt?: string;
-    };
-    const note = store.createNote(body.content ?? "", {
-      id: body.id,
-      path: body.path,
-      tags: body.tags,
-      metadata: body.metadata,
-      created_at: body.createdAt,
-    });
-    return json(note, 201);
-  }
-
-  // Routes with note ID
-  const idMatch = path.match(/^\/([^/]+)(\/.*)?$/);
+  // ---- Note-level routes (/notes/:idOrPath[/attachments]) ----
+  const idMatch = subpath.match(/^\/([^/]+)(\/.*)?$/);
   if (!idMatch) return json({ error: "Not found" }, 404);
 
-  const noteId = idMatch[1];
-  const subpath = idMatch[2] ?? "";
+  const idOrPath = decodeURIComponent(idMatch[1]);
+  const sub = idMatch[2] ?? "";
 
-  // GET /notes/:id
-  // Defaults to full content (the point-read case). Pass
-  // ?include_content=false to get the lean index shape.
-  if (method === "GET" && subpath === "") {
-    const note = store.getNote(noteId);
+  // Attachments sub-routes (keep as-is — Daily needs them)
+  if (sub === "/attachments") {
+    if (method === "POST") {
+      const note = resolveNote(store, idOrPath);
+      if (!note) return json({ error: "Not found" }, 404);
+      const body = await req.json() as { path: string; mimeType: string };
+      if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
+      return json(store.addAttachment(note.id, body.path, body.mimeType), 201);
+    }
+    if (method === "GET") {
+      const note = resolveNote(store, idOrPath);
+      if (!note) return json({ error: "Not found" }, 404);
+      return json(store.getAttachments(note.id));
+    }
+    return json({ error: "Method not allowed" }, 405);
+  }
+
+  if (sub !== "") return json({ error: "Not found" }, 404);
+
+  // GET /notes/:idOrPath — single note
+  if (method === "GET") {
+    const note = resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
-    return json(includeContent ? note : toNoteIndex(note));
-  }
-
-  // PATCH /notes/:id
-  if (method === "PATCH" && subpath === "") {
-    const existing = store.getNote(noteId);
-    if (!existing) return json({ error: "Not found" }, 404);
-    const body = await req.json() as { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string };
-    const updated = store.updateNote(noteId, { content: body.content, path: body.path, metadata: body.metadata, created_at: body.created_at });
-    return json(updated);
-  }
-
-  // DELETE /notes/:id
-  if (method === "DELETE" && subpath === "") {
-    const existing = store.getNote(noteId);
-    if (!existing) return json({ error: "Not found" }, 404);
-    store.deleteNote(noteId);
-    return json({ deleted: true });
-  }
-
-  // POST /notes/:id/tags
-  if (method === "POST" && subpath === "/tags") {
-    const existing = store.getNote(noteId);
-    if (!existing) return json({ error: "Not found" }, 404);
-    const body = await req.json() as { tags: string[] };
-    store.tagNote(noteId, body.tags);
-    return json(store.getNote(noteId));
-  }
-
-  // DELETE /notes/:id/tags
-  if (method === "DELETE" && subpath === "/tags") {
-    const existing = store.getNote(noteId);
-    if (!existing) return json({ error: "Not found" }, 404);
-    const body = await req.json() as { tags: string[] };
-    store.untagNote(noteId, body.tags);
-    return json(store.getNote(noteId));
-  }
-
-  // POST /notes/:id/attachments
-  if (method === "POST" && subpath === "/attachments") {
-    const existing = store.getNote(noteId);
-    if (!existing) return json({ error: "Not found" }, 404);
-    const body = await req.json() as { path: string; mimeType: string };
-    if (!body.path || !body.mimeType) {
-      return json({ error: "path and mimeType are required" }, 400);
+    const result: any = includeContent ? { ...note } : toNoteIndex(note);
+    if (parseBool(parseQuery(url, "include_links"), false)) {
+      result.links = linkOps.getLinksHydrated(db, note.id);
     }
-    const attachment = store.addAttachment(noteId, body.path, body.mimeType);
-    return json(attachment, 201);
-  }
-
-  // GET /notes/:id/attachments
-  if (method === "GET" && subpath === "/attachments") {
-    const attachments = store.getAttachments(noteId);
-    return json(attachments);
-  }
-
-  return json({ error: "Not found" }, 404);
-}
-
-// ---------------------------------------------------------------------------
-// Tags
-// ---------------------------------------------------------------------------
-
-export function handleTags(req: Request, store: Store, subpath = ""): Response {
-  if (req.method === "GET" && subpath === "") {
-    return json(store.listTags());
-  }
-
-  // DELETE /tags/:name
-  const nameMatch = subpath.match(/^\/(.+)$/);
-  if (req.method === "DELETE" && nameMatch) {
-    const tagName = decodeURIComponent(nameMatch[1]);
-    const result = store.deleteTag(tagName);
+    if (parseBool(parseQuery(url, "include_attachments"), false)) {
+      result.attachments = store.getAttachments(note.id);
+    }
     return json(result);
   }
 
+  // PATCH /notes/:idOrPath — update (content, path, metadata, tags, links)
+  if (method === "PATCH") {
+    try {
+      const note = requireNote(store, idOrPath);
+      const body = await req.json() as any;
+
+      // Remove links first (before content update for bracket removal)
+      const linksRemove = body.links?.remove as { target: string; relationship: string }[] | undefined;
+      let contentOverride = body.content as string | undefined;
+      if (linksRemove) {
+        for (const link of linksRemove) {
+          const target = resolveNote(store, link.target);
+          if (target) {
+            store.deleteLink(note.id, target.id, link.relationship);
+            if (link.relationship === "wikilink" && target.path) {
+              const current = contentOverride ?? note.content;
+              const cleaned = removeWikilinkBrackets(current, target.path);
+              if (cleaned !== current) contentOverride = cleaned;
+            }
+          }
+        }
+      }
+
+      // Core update
+      const updates: any = {};
+      if (contentOverride !== undefined) updates.content = contentOverride;
+      if (body.path !== undefined) updates.path = body.path;
+      if (body.metadata !== undefined) {
+        const existing = (note.metadata as Record<string, unknown>) ?? {};
+        updates.metadata = { ...existing, ...body.metadata };
+      }
+      if (body.created_at !== undefined || body.createdAt !== undefined) {
+        updates.created_at = body.created_at ?? body.createdAt;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        store.updateNote(note.id, updates);
+      }
+
+      // Tags
+      if (body.tags?.add?.length) {
+        store.tagNote(note.id, body.tags.add);
+        applySchemaDefaults(store, db, [note.id], body.tags.add);
+      }
+      if (body.tags?.remove?.length) {
+        store.untagNote(note.id, body.tags.remove);
+      }
+
+      // Add links
+      if (body.links?.add) {
+        for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
+          const target = resolveNote(store, link.target);
+          if (target) store.createLink(note.id, target.id, link.relationship, link.metadata);
+        }
+      }
+
+      return json(store.getNote(note.id));
+    } catch (e: any) {
+      if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+      throw e;
+    }
+  }
+
+  // DELETE /notes/:idOrPath
+  if (method === "DELETE") {
+    const note = resolveNote(store, idOrPath);
+    if (!note) return json({ error: "Not found" }, 404);
+    store.deleteNote(note.id);
+    return json({ deleted: true, id: note.id });
+  }
+
   return json({ error: "Method not allowed" }, 405);
 }
 
 // ---------------------------------------------------------------------------
-// Tag Schemas
+// Tags — GET/PUT/DELETE /api/tags[/:name]
 // ---------------------------------------------------------------------------
 
-export async function handleTagSchemas(req: Request, store: Store, subpath = ""): Promise<Response> {
-  // GET /tag-schemas — list all
+export async function handleTags(req: Request, store: Store, subpath = ""): Promise<Response> {
+  const url = new URL(req.url);
+  const db = (store as any).db;
+
+  // GET /tags — list all, or get single tag detail
   if (req.method === "GET" && subpath === "") {
-    return json(store.listTagSchemas());
+    const singleTag = parseQuery(url, "tag");
+
+    if (singleTag) {
+      const allTags = store.listTags();
+      const found = allTags.find((t) => t.name === singleTag);
+      const schema = store.getTagSchema(singleTag);
+      return json({
+        name: singleTag,
+        count: found?.count ?? 0,
+        description: schema?.description ?? null,
+        fields: schema?.fields ?? null,
+      });
+    }
+
+    const tags = store.listTags();
+    if (parseBool(parseQuery(url, "include_schema"), false)) {
+      const schemas = store.getTagSchemaMap();
+      return json(tags.map((t) => ({
+        ...t,
+        description: schemas[t.name]?.description ?? null,
+        fields: schemas[t.name]?.fields ?? null,
+      })));
+    }
+    return json(tags);
   }
 
-  const tagMatch = subpath.match(/^\/([^/]+)$/);
-  if (!tagMatch) return json({ error: "Not found" }, 404);
-  const tagName = decodeURIComponent(tagMatch[1]);
+  // Routes with tag name
+  const nameMatch = subpath.match(/^\/([^/]+)$/);
+  if (!nameMatch) return json({ error: "Not found" }, 404);
+  const tagName = decodeURIComponent(nameMatch[1]);
 
-  // GET /tag-schemas/:tag
+  // GET /tags/:name — single tag detail
   if (req.method === "GET") {
+    const allTags = store.listTags();
+    const found = allTags.find((t) => t.name === tagName);
     const schema = store.getTagSchema(tagName);
-    if (!schema) return json({ error: "No schema for tag" }, 404);
-    return json(schema);
+    return json({
+      name: tagName,
+      count: found?.count ?? 0,
+      description: schema?.description ?? null,
+      fields: schema?.fields ?? null,
+    });
   }
 
-  // PUT /tag-schemas/:tag — create or update
+  // PUT /tags/:name — upsert tag schema (description + fields)
   if (req.method === "PUT") {
     const body = await req.json() as { description?: string; fields?: Record<string, unknown> };
-    const schema = store.upsertTagSchema(tagName, body as any);
+    const existing = store.getTagSchema(tagName);
+    const mergedFields = { ...existing?.fields, ...(body.fields as any) };
+    const schema = store.upsertTagSchema(tagName, {
+      description: body.description ?? existing?.description,
+      fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
+    });
     return json(schema);
   }
 
-  // DELETE /tag-schemas/:tag
+  // DELETE /tags/:name — delete tag + schema from all notes
   if (req.method === "DELETE") {
-    const deleted = store.deleteTagSchema(tagName);
-    return json({ deleted });
+    store.deleteTagSchema(tagName);
+    return json(store.deleteTag(tagName));
   }
 
   return json({ error: "Method not allowed" }, 405);
 }
 
 // ---------------------------------------------------------------------------
-// Links
+// Find-path — GET /api/find-path?source=...&target=...
 // ---------------------------------------------------------------------------
 
-export async function handleLinks(
+export function handleFindPath(req: Request, store: Store): Response {
+  if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+
+  const url = new URL(req.url);
+  const source = parseQuery(url, "source");
+  const target = parseQuery(url, "target");
+  if (!source || !target) return json({ error: "source and target parameters are required" }, 400);
+
+  const db = (store as any).db;
+  try {
+    const sourceNote = requireNote(store, source);
+    const targetNote = requireNote(store, target);
+    const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
+    const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth });
+    return json(result);
+  } catch (e: any) {
+    if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vault info — GET/PATCH /api/vault
+// ---------------------------------------------------------------------------
+
+export async function handleVault(
   req: Request,
   store: Store,
+  vaultConfig: { name: string; description?: string },
+  updateDescription?: (description: string) => void,
 ): Promise<Response> {
-  // GET /links — list edges.
-  // Filters: ?note_id (only links touching this note), ?direction
-  // (outbound|inbound|both, only meaningful with note_id), ?relationship.
-  // Returns bare Link[], no hydration. Pair with GET /notes?ids=... if you
-  // need the connected notes' details.
+  const url = new URL(req.url);
+
   if (req.method === "GET") {
-    const url = new URL(req.url);
-    const noteId = parseQuery(url, "note_id") ?? undefined;
-    const direction = (parseQuery(url, "direction") as "outbound" | "inbound" | "both" | null) ?? undefined;
-    const relationship = parseQuery(url, "relationship") ?? undefined;
-    return json(store.listLinks({ noteId, direction: direction ?? undefined, relationship }));
-  }
-
-  if (req.method === "POST") {
-    const body = await req.json() as {
-      sourceId: string;
-      targetId: string;
-      relationship: string;
-      metadata?: Record<string, unknown>;
+    const result: any = {
+      name: vaultConfig.name,
+      description: vaultConfig.description ?? null,
     };
-    if (!body.sourceId || !body.targetId || !body.relationship) {
-      return json({ error: "sourceId, targetId, and relationship are required" }, 400);
+    if (parseBool(parseQuery(url, "include_stats"), false)) {
+      result.stats = store.getVaultStats();
     }
-    const link = store.createLink(body.sourceId, body.targetId, body.relationship, body.metadata);
-    return json(link, 201);
+    return json(result);
   }
 
-  if (req.method === "DELETE") {
-    const body = await req.json() as {
-      sourceId: string;
-      targetId: string;
-      relationship: string;
-    };
-    store.deleteLink(body.sourceId, body.targetId, body.relationship);
-    return json({ deleted: true });
+  if (req.method === "PATCH") {
+    const body = await req.json() as { description?: string };
+    if (body.description !== undefined && updateDescription) {
+      updateDescription(body.description);
+    }
+    return json({
+      name: vaultConfig.name,
+      description: body.description ?? vaultConfig.description ?? null,
+    });
   }
 
-  // GET handled in the new polymorphic path below
   return json({ error: "Method not allowed" }, 405);
 }
 
 // ---------------------------------------------------------------------------
-// Graph
+// Unresolved wikilinks — REST-only (admin/maintenance)
 // ---------------------------------------------------------------------------
-
-/**
- * GET /graph — one-shot knowledge graph payload.
- *
- * Returns { notes, links, tags, meta }. Lean notes by default (NoteIndex),
- * include_content=true fattens them. Optional tag filter restricts notes
- * to a subgraph; links are filtered to edges between notes in the subset.
- */
-export function handleGraph(req: Request, store: Store): Response {
-  if (req.method !== "GET") {
-    return json({ error: "Method not allowed" }, 405);
-  }
-  const url = new URL(req.url);
-  const tags = parseQueryList(url, "tag");
-  const tagMatch = (parseQuery(url, "tag_match") as "all" | "any") ?? undefined;
-  const excludeTags = parseQueryList(url, "exclude_tag");
-  const includeContent = parseBool(parseQuery(url, "include_content"), false);
-
-  const hasTagFilter = !!(tags?.length || excludeTags?.length);
-  const filteredNotes = store.queryNotes({
-    tags,
-    tagMatch,
-    excludeTags,
-    limit: 1_000_000,
-  });
-  const outNotes = includeContent ? filteredNotes : filteredNotes.map(toNoteIndex);
-
-  const allLinks = store.listLinks();
-  const outLinks = hasTagFilter
-    ? (() => {
-        const ids = new Set(filteredNotes.map((n) => n.id));
-        return allLinks.filter((l) => ids.has(l.sourceId) && ids.has(l.targetId));
-      })()
-    : allLinks;
-
-  const stats = store.getVaultStats({ topTagsLimit: 1_000_000 });
-
-  return json({
-    notes: outNotes,
-    links: outLinks,
-    tags: store.listTags(),
-    meta: {
-      totalNotes: stats.totalNotes,
-      totalLinks: allLinks.length,
-      filteredNotes: outNotes.length,
-      filteredLinks: outLinks.length,
-      includeContent,
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
-
-export function handleSearch(req: Request, store: Store): Response {
-  const url = new URL(req.url);
-  const query = url.searchParams.get("q");
-  if (!query) return json({ error: "q parameter is required" }, 400);
-
-  const tags = parseQueryList(url, "tag");
-  const limitStr = url.searchParams.get("limit");
-  const limit = limitStr ? parseInt(limitStr, 10) : undefined;
-
-  const results = store.searchNotes(query, { tags, limit });
-  return json(results);
-}
-
-// ---------------------------------------------------------------------------
-// Wikilinks
-// ---------------------------------------------------------------------------
-
-export function handleResolveWikilink(req: Request, store: Store): Response {
-  const url = new URL(req.url);
-  const target = url.searchParams.get("target");
-  if (!target) return json({ error: "target parameter is required" }, 400);
-  const db = (store as any).db;
-  return json(resolveWikilinkDetailed(db, target));
-}
 
 export function handleUnresolvedWikilinks(req: Request, store: Store): Response {
   const url = new URL(req.url);
@@ -357,100 +448,6 @@ export function handleUnresolvedWikilinks(req: Request, store: Store): Response 
   const limit = limitStr ? parseInt(limitStr, 10) : 50;
   const db = (store as any).db;
   return json(listUnresolvedWikilinks(db, limit));
-}
-
-// ---------------------------------------------------------------------------
-// Storage (file upload/serve)
-// ---------------------------------------------------------------------------
-
-export function assetsDir(vault: string): string {
-  return process.env.ASSETS_DIR ?? join(vaultDir(vault), "assets");
-}
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
-
-const ALLOWED_EXTENSIONS = new Set([
-  ".wav", ".mp3", ".m4a", ".ogg", ".webm",
-  ".png", ".jpg", ".jpeg", ".gif", ".webp",
-]);
-
-const MIME_TYPES: Record<string, string> = {
-  ".wav": "audio/wav",
-  ".mp3": "audio/mpeg",
-  ".m4a": "audio/mp4",
-  ".ogg": "audio/ogg",
-  ".webm": "audio/webm",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-};
-
-export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
-  const assets = assetsDir(vault);
-
-  // POST /storage/upload
-  if (req.method === "POST" && path === "/upload") {
-    const form = await req.formData();
-    const file = form.get("file");
-    if (!(file instanceof File)) {
-      return json({ error: "file is required" }, 400);
-    }
-    if (file.size > MAX_UPLOAD_BYTES) {
-      return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
-    }
-    const ext = extname(file.name).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) {
-      return json({ error: `File type ${ext} not allowed` }, 400);
-    }
-
-    // Store the file
-    const date = new Date().toISOString().split("T")[0];
-    const dir = join(assets, date);
-    mkdirSync(dir, { recursive: true });
-
-    const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
-    const filePath = join(dir, filename);
-    const buffer = Buffer.from(await file.arrayBuffer());
-    writeFileSync(filePath, buffer);
-
-    const relativePath = `${date}/${filename}`;
-    const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
-
-    return json({
-      path: relativePath,
-      size: buffer.length,
-      mimeType,
-    }, 201);
-  }
-
-  // GET /storage/:date/:file
-  const fileMatch = path.match(/^\/([^/]+)\/(.+)$/);
-  if (req.method === "GET" && fileMatch) {
-    const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
-    const filePath = normalize(join(assets, reqPath));
-
-    if (!filePath.startsWith(normalize(assets))) {
-      return json({ error: "Invalid path" }, 403);
-    }
-    if (!existsSync(filePath)) {
-      return json({ error: "Not found" }, 404);
-    }
-
-    const stat = statSync(filePath);
-    const ext = extname(filePath).toLowerCase();
-    const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
-    const fileBuffer = readFileSync(filePath);
-
-    return new Response(fileBuffer, {
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": String(stat.size),
-      },
-    });
-  }
-
-  return json({ error: "Not found" }, 404);
 }
 
 // ---------------------------------------------------------------------------
@@ -465,17 +462,6 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-/**
- * Minimal markdown-to-HTML for published notes. Handles:
- * - Paragraphs (blank-line separated)
- * - Headers (# through ######)
- * - Bold (**text**), italic (*text*), inline code (`code`)
- * - Unordered lists (- item)
- * - Fenced code blocks (```...```)
- * - Links [text](url)
- *
- * This is intentionally simple — we don't pull in a markdown library.
- */
 function renderMarkdown(md: string): string {
   const lines = md.split("\n");
   const out: string[] = [];
@@ -484,7 +470,6 @@ function renderMarkdown(md: string): string {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // Fenced code blocks
     if (line.trimStart().startsWith("```")) {
       if (inCodeBlock) {
         out.push("</code></pre>");
@@ -502,13 +487,11 @@ function renderMarkdown(md: string): string {
 
     const trimmed = line.trim();
 
-    // Empty line
     if (!trimmed) {
       out.push("");
       continue;
     }
 
-    // Headers
     const headerMatch = trimmed.match(/^(#{1,6})\s+(.+)/);
     if (headerMatch) {
       const level = headerMatch[1].length;
@@ -516,9 +499,7 @@ function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Unordered list items
     if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
-      // Collect consecutive list items
       const items: string[] = [trimmed.slice(2)];
       while (i + 1 < lines.length) {
         const next = lines[i + 1].trim();
@@ -535,7 +516,6 @@ function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Paragraph
     out.push(`<p>${inlineMarkdown(escapeHtml(trimmed))}</p>`);
   }
 
@@ -544,28 +524,19 @@ function renderMarkdown(md: string): string {
 }
 
 function inlineMarkdown(html: string): string {
-  // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  // Italic
   html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-  // Inline code
   html = html.replace(/`(.+?)`/g, "<code>$1</code>");
-  // Links [text](url) — sanitize href to prevent javascript:/data: XSS
   html = html.replace(/\[(.+?)\]\((.+?)\)/g, (_match, text, url) => {
     const decoded = url.replace(/&amp;/g, "&");
     if (/^(https?:|mailto:|#|\/)/i.test(decoded)) {
       return `<a href="${url}">${text}</a>`;
     }
-    return text; // strip unsafe links, keep text
+    return text;
   });
   return html;
 }
 
-/**
- * Check if a note is published. A note is published if:
- * 1. It has the configured published tag (default: "publish"), OR
- * 2. It has metadata.published === true (always honored regardless of custom tag)
- */
 function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishedTag: string = "publish"): boolean {
   if (note.tags?.includes(publishedTag)) return true;
   const meta = note.metadata as Record<string, unknown> | undefined;
@@ -574,18 +545,16 @@ function isNotePublished(note: { tags?: string[]; metadata?: unknown }, publishe
 }
 
 /**
- * GET /view/:noteId — serve a note as clean HTML.
- *
- * Without auth: only serves notes marked as published (via tag or metadata).
- * With auth: serves any note in the vault.
+ * GET /view/:idOrPath — serve a note as clean HTML.
+ * Supports ID or path resolution.
  */
 export function handleViewNote(
   store: Store,
-  noteId: string,
+  idOrPath: string,
   options: { authenticated?: boolean; publishedTag?: string } = {},
 ): Response {
   const { authenticated = false, publishedTag = "publish" } = options;
-  const note = store.getNote(noteId);
+  const note = resolveNote(store, idOrPath);
   if (!note) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }
@@ -650,3 +619,141 @@ ${rendered}
   });
 }
 
+// ---------------------------------------------------------------------------
+// Storage (file upload/serve) — kept as-is, Daily needs it
+// ---------------------------------------------------------------------------
+
+export function assetsDir(vault: string): string {
+  return process.env.ASSETS_DIR ?? join(vaultDir(vault), "assets");
+}
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
+
+const ALLOWED_EXTENSIONS = new Set([
+  ".wav", ".mp3", ".m4a", ".ogg", ".webm",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp",
+]);
+
+const MIME_TYPES: Record<string, string> = {
+  ".wav": "audio/wav",
+  ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4",
+  ".ogg": "audio/ogg",
+  ".webm": "audio/webm",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+};
+
+export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
+  const assets = assetsDir(vault);
+
+  if (req.method === "POST" && path === "/upload") {
+    const form = await req.formData();
+    const file = form.get("file");
+    if (!(file instanceof File)) {
+      return json({ error: "file is required" }, 400);
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
+    }
+    const ext = extname(file.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      return json({ error: `File type ${ext} not allowed` }, 400);
+    }
+
+    const date = new Date().toISOString().split("T")[0];
+    const dir = join(assets, date);
+    mkdirSync(dir, { recursive: true });
+
+    const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
+    const filePath = join(dir, filename);
+    const buffer = Buffer.from(await file.arrayBuffer());
+    writeFileSync(filePath, buffer);
+
+    const relativePath = `${date}/${filename}`;
+    const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+
+    return json({ path: relativePath, size: buffer.length, mimeType }, 201);
+  }
+
+  const fileMatch = path.match(/^\/([^/]+)\/(.+)$/);
+  if (req.method === "GET" && fileMatch) {
+    const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
+    const filePath = normalize(join(assets, reqPath));
+
+    if (!filePath.startsWith(normalize(assets))) {
+      return json({ error: "Invalid path" }, 403);
+    }
+    if (!existsSync(filePath)) {
+      return json({ error: "Not found" }, 404);
+    }
+
+    const stat = statSync(filePath);
+    const ext = extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+    const fileBuffer = readFileSync(filePath);
+
+    return new Response(fileBuffer, {
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(stat.size),
+      },
+    });
+  }
+
+  return json({ error: "Not found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Tag schema defaults — same logic as core/src/mcp.ts applySchemaDefaults
+// ---------------------------------------------------------------------------
+
+function applySchemaDefaults(store: Store, db: any, noteIds: string[], tags: string[]): void {
+  const schemas = tagSchemaOps.getTagSchemaMap(db);
+  if (Object.keys(schemas).length === 0) return;
+
+  const defaults: Record<string, unknown> = {};
+  for (const tag of tags) {
+    const schema = schemas[tag];
+    if (!schema?.fields) continue;
+    for (const [field, fieldSchema] of Object.entries(schema.fields)) {
+      if (!(field in defaults)) {
+        defaults[field] = defaultForField(fieldSchema);
+      }
+    }
+  }
+  if (Object.keys(defaults).length === 0) return;
+
+  for (const noteId of noteIds) {
+    const note = store.getNote(noteId);
+    if (!note) continue;
+    const existing = (note.metadata as Record<string, unknown>) ?? {};
+    const missing: Record<string, unknown> = {};
+    for (const [field, value] of Object.entries(defaults)) {
+      if (!(field in existing)) missing[field] = value;
+    }
+    if (Object.keys(missing).length === 0) continue;
+    store.updateNote(noteId, {
+      metadata: { ...existing, ...missing },
+      skipUpdatedAt: true,
+    });
+  }
+}
+
+function defaultForField(field: { type: string; enum?: string[] }): unknown {
+  if (field.enum && field.enum.length > 0) return field.enum[0];
+  switch (field.type) {
+    case "boolean": return false;
+    case "integer": return 0;
+    default: return "";
+  }
+}
+
+function removeWikilinkBrackets(content: string, targetPath: string): string {
+  const escaped = targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  content = content.replace(new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"), "$1");
+  content = content.replace(new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"), `${targetPath}$1`);
+  return content;
+}

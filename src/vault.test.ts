@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
-import { handleNotes, handleLinks, handleGraph } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
 
 let db: Database;
 let store: BunStore;
@@ -814,15 +814,12 @@ describe("HTTP /notes", () => {
     expect(body[0].content).toBe("full body");
   });
 
-  test("GET /notes?ids=a,b bulk fetch", async () => {
-    const n1 = store.createNote("one", { id: "id-1" });
-    const n2 = store.createNote("two", { id: "id-2" });
-    store.createNote("three", { id: "id-3" });
-    const res = await handleNotes(mkReq("GET", "/notes?ids=id-1,id-2"), store, "");
+  test("GET /notes?search=fox full-text search", async () => {
+    store.createNote("The quick brown fox");
+    store.createNote("A lazy dog");
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox"), store, "");
     const body = await res.json() as any[];
-    expect(body).toHaveLength(2);
-    const ids = body.map((n) => n.id).sort();
-    expect(ids).toEqual(["id-1", "id-2"]);
+    expect(body).toHaveLength(1);
   });
 
   test("GET /notes/:id defaults to full content", async () => {
@@ -864,108 +861,142 @@ describe("HTTP /notes", () => {
   });
 });
 
-describe("HTTP /links (polymorphic)", () => {
-  test("GET /links returns all edges", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    store.createNote("c", { id: "c" });
-    store.createLink("a", "b", "mentions");
-    store.createLink("b", "c", "cites");
-    const res = await handleLinks(mkReq("GET", "/links"), store);
-    const body = await res.json() as any[];
-    expect(body).toHaveLength(2);
-  });
-
-  test("GET /links?note_id=a restricts to links touching a", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    store.createNote("c", { id: "c" });
-    store.createLink("a", "b", "mentions");
-    store.createLink("b", "c", "cites");
-    const res = await handleLinks(mkReq("GET", "/links?note_id=a"), store);
-    const body = await res.json() as any[];
-    expect(body).toHaveLength(1);
-    expect(body[0].sourceId).toBe("a");
-  });
-
-  test("GET /links?relationship=cites filters by type", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    store.createLink("a", "b", "mentions");
-    store.createLink("a", "b", "cites");
-    const res = await handleLinks(mkReq("GET", "/links?relationship=cites"), store);
-    const body = await res.json() as any[];
-    expect(body).toHaveLength(1);
-    expect(body[0].relationship).toBe("cites");
-  });
-
-  test("POST /links accepts sourceId/targetId (camelCase) in body", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    const res = await handleLinks(
-      mkReq("POST", "/links", { sourceId: "a", targetId: "b", relationship: "cites" }),
+describe("HTTP PATCH /notes/:idOrPath (update)", () => {
+  test("PATCH updates content and merges metadata", async () => {
+    const note = store.createNote("original", { id: "x", metadata: { a: 1 } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "updated", metadata: { b: 2 } }),
       store,
+      "/x",
     );
-    expect(res.status).toBe(201);
     const body = await res.json() as any;
-    expect(body.sourceId).toBe("a");
-    expect(body.targetId).toBe("b");
+    expect(body.content).toBe("updated");
+    expect(body.metadata).toEqual({ a: 1, b: 2 });
   });
 
-  test("POST /links rejects snake_case body fields", async () => {
+  test("PATCH adds/removes tags", async () => {
+    store.createNote("x", { id: "x", tags: ["old"] });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { tags: { add: ["new"], remove: ["old"] } }),
+      store,
+      "/x",
+    );
+    const body = await res.json() as any;
+    expect(body.tags).toContain("new");
+    expect(body.tags).not.toContain("old");
+  });
+
+  test("PATCH adds/removes links", async () => {
     store.createNote("a", { id: "a" });
     store.createNote("b", { id: "b" });
-    const res = await handleLinks(
-      mkReq("POST", "/links", { source_id: "a", target_id: "b", relationship: "cites" }),
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "b", relationship: "mentions" }] } }),
       store,
+      "/a",
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    const links = store.getLinks("a", { direction: "outbound" });
+    expect(links).toHaveLength(1);
+
+    // Remove
+    await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { remove: [{ target: "b", relationship: "mentions" }] } }),
+      store,
+      "/a",
+    );
+    expect(store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
+  });
+
+  test("PATCH resolves note by path", async () => {
+    store.createNote("x", { path: "Projects/README" });
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${encodeURIComponent("Projects/README")}`, { content: "updated" }),
+      store,
+      `/${encodeURIComponent("Projects/README")}`,
+    );
+    const body = await res.json() as any;
+    expect(body.content).toBe("updated");
+  });
+
+  test("DELETE resolves note by path", async () => {
+    store.createNote("x", { path: "Temp/note" });
+    const res = await handleNotes(
+      mkReq("DELETE", `/notes/${encodeURIComponent("Temp/note")}`),
+      store,
+      `/${encodeURIComponent("Temp/note")}`,
+    );
+    const body = await res.json() as any;
+    expect(body.deleted).toBe(true);
+    expect(store.getNoteByPath("Temp/note")).toBeNull();
   });
 });
 
-describe("HTTP /graph", () => {
-  test("returns notes, links, tags, meta", async () => {
-    store.createNote("a", { id: "a", tags: ["proj"] });
-    store.createNote("b", { id: "b", tags: ["proj"] });
-    store.createNote("c", { id: "c", tags: ["other"] });
+describe("HTTP /tags", () => {
+  test("GET /tags lists all tags", async () => {
+    store.createNote("A", { tags: ["daily"] });
+    store.createNote("B", { tags: ["daily", "pinned"] });
+    const res = await handleTags(mkReq("GET", "/tags"), store);
+    const body = await res.json() as any[];
+    const daily = body.find((t: any) => t.name === "daily");
+    expect(daily.count).toBe(2);
+  });
+
+  test("GET /tags?tag=name returns single tag detail with schema", async () => {
+    store.createNote("A", { tags: ["person"] });
+    store.upsertTagSchema("person", { description: "A person", fields: { name: { type: "string" } } });
+    const res = await handleTags(mkReq("GET", "/tags?tag=person"), store);
+    const body = await res.json() as any;
+    expect(body.name).toBe("person");
+    expect(body.count).toBe(1);
+    expect(body.description).toBe("A person");
+    expect(body.fields.name.type).toBe("string");
+  });
+
+  test("PUT /tags/:name upserts schema", async () => {
+    const res = await handleTags(
+      mkReq("PUT", "/tags/person", { description: "A person", fields: { name: { type: "string" } } }),
+      store,
+      "/person",
+    );
+    const body = await res.json() as any;
+    expect(body.tag).toBe("person");
+    expect(body.description).toBe("A person");
+  });
+
+  test("DELETE /tags/:name removes tag and schema", async () => {
+    store.createNote("A", { tags: ["doomed"] });
+    store.upsertTagSchema("doomed", { description: "will be deleted" });
+    const res = await handleTags(mkReq("DELETE", "/tags/doomed"), store, "/doomed");
+    const body = await res.json() as any;
+    expect(body.deleted).toBe(true);
+    expect(store.listTags().some((t) => t.name === "doomed")).toBe(false);
+  });
+});
+
+describe("HTTP /find-path", () => {
+  test("finds path between two notes", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    store.createNote("c", { id: "c" });
     store.createLink("a", "b", "mentions");
-    const res = await handleGraph(mkReq("GET", "/graph"), store);
+    store.createLink("b", "c", "related-to");
+    const res = handleFindPath(mkReq("GET", "/find-path?source=a&target=c"), store);
     const body = await res.json() as any;
-    expect(body.notes).toHaveLength(3);
-    expect(body.links).toHaveLength(1);
-    expect(body.tags.length).toBeGreaterThan(0);
-    expect(body.meta.totalNotes).toBe(3);
-    expect(body.meta.totalLinks).toBe(1);
-    expect(body.meta.includeContent).toBe(false);
-    // Lean by default
-    expect(body.notes[0]).not.toHaveProperty("content");
-    expect(body.notes[0]).toHaveProperty("byteSize");
+    expect(body.path).toEqual(["a", "b", "c"]);
+    expect(body.relationships).toEqual(["mentions", "related-to"]);
   });
 
-  test("?include_content=true returns full note content", async () => {
-    store.createNote("has body", { id: "a" });
-    const res = await handleGraph(mkReq("GET", "/graph?include_content=true"), store);
+  test("returns null when no path exists", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    const res = handleFindPath(mkReq("GET", "/find-path?source=a&target=b"), store);
     const body = await res.json() as any;
-    expect(body.notes[0].content).toBe("has body");
-    expect(body.meta.includeContent).toBe(true);
+    expect(body).toBeNull();
   });
 
-  test("?tag=proj filters notes and links to the subgraph", async () => {
-    store.createNote("a", { id: "a", tags: ["proj"] });
-    store.createNote("b", { id: "b", tags: ["proj"] });
-    store.createNote("c", { id: "c", tags: ["other"] });
-    store.createLink("a", "b", "mentions"); // inside subgraph
-    store.createLink("a", "c", "mentions"); // crosses subgraph boundary
-    const res = await handleGraph(mkReq("GET", "/graph?tag=proj"), store);
-    const body = await res.json() as any;
-    expect(body.notes).toHaveLength(2);
-    expect(body.links).toHaveLength(1);
-    expect(body.links[0].sourceId).toBe("a");
-    expect(body.links[0].targetId).toBe("b");
-    expect(body.meta.totalNotes).toBe(3);
-    expect(body.meta.totalLinks).toBe(2);
-    expect(body.meta.filteredNotes).toBe(2);
-    expect(body.meta.filteredLinks).toBe(1);
+  test("requires source and target params", async () => {
+    const res = handleFindPath(mkReq("GET", "/find-path?source=a"), store);
+    expect(res.status).toBe(400);
   });
 });
 
