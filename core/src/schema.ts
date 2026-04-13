@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -63,6 +63,27 @@ CREATE TABLE IF NOT EXISTS tokens (
   expires_at TEXT,
   created_at TEXT NOT NULL,
   last_used_at TEXT
+);
+
+-- OAuth: registered clients (Dynamic Client Registration)
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id TEXT PRIMARY KEY,
+  client_name TEXT,
+  redirect_uris TEXT,
+  created_at TEXT NOT NULL
+);
+
+-- OAuth: authorization codes (single-use, short-lived)
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  code_challenge_method TEXT NOT NULL DEFAULT 'S256',
+  scope TEXT NOT NULL DEFAULT 'full',
+  redirect_uri TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
 );
 
 -- Schema version tracking
@@ -130,6 +151,10 @@ export function initSchema(db: Database): void {
   // Migrate v6 → v7: tokens table (created by SCHEMA_SQL above,
   // this just ensures the table exists for databases created before v7)
   migrateToV7(db);
+
+  // Migrate v7 → v8: OAuth tables (created by SCHEMA_SQL above,
+  // this just ensures the tables exist for databases created before v8)
+  migrateToV8(db);
 
   // Record schema version
   db.prepare("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(
@@ -222,6 +247,11 @@ function migrateToV7(db: Database): void {
   // SCHEMA_SQL already creates the table via CREATE TABLE IF NOT EXISTS,
   // so this is a no-op for new vaults. For existing vaults where SCHEMA_SQL
   // ran above, the table now exists. Nothing extra needed here.
+}
+
+function migrateToV8(db: Database): void {
+  // SCHEMA_SQL already creates oauth_clients and oauth_codes via
+  // CREATE TABLE IF NOT EXISTS. Nothing extra needed here.
 }
 
 function hasTable(db: Database, name: string): boolean {
