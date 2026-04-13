@@ -173,20 +173,11 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
  * requests still get public notes.
  */
 function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null, vaultDb?: import("bun:sqlite").Database): boolean {
-  // Check query param first (convenient for browsers)
-  const url = new URL(req.url);
-  const queryKey = url.searchParams.get("key");
-  const headerKey = extractApiKey(req);
-  const key = queryKey ?? headerKey;
-  if (!key || !vaultConfig) return false;
-
-  const auth = authenticateVaultRequest(
-    queryKey && !headerKey
-      ? new Request(req.url, { headers: { ...Object.fromEntries(req.headers), "x-api-key": key } })
-      : req,
-    vaultConfig,
-    vaultDb,
-  );
+  if (!vaultConfig) return false;
+  // extractApiKey now checks headers AND ?key= query param
+  const key = extractApiKey(req);
+  if (!key) return false;
+  const auth = authenticateVaultRequest(req, vaultConfig, vaultDb);
   return !("error" in auth);
 }
 
