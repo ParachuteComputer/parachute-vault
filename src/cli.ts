@@ -393,7 +393,7 @@ function cmdTokens(args: string[]) {
     }
 
     if (!anyTokens) {
-      console.log("No tokens found. Create one: parachute vault tokens create --vault <name>");
+      console.log("No tokens found. Create one: parachute vault tokens create");
     }
     return;
   }
@@ -402,12 +402,7 @@ function cmdTokens(args: string[]) {
   //   [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
-    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
-    if (!vaultName) {
-      console.error("--vault is required. Tokens are per-vault.");
-      console.error("Usage: parachute vault tokens create --vault <name> [--read] [--label <label>]");
-      process.exit(1);
-    }
+    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : (readGlobalConfig().default_vault || "default");
 
     const vc = readVaultConfig(vaultName);
     if (!vc) {
@@ -466,11 +461,7 @@ function cmdTokens(args: string[]) {
     }
 
     const vaultFlag = args.indexOf("--vault");
-    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
-    if (!vaultName) {
-      console.error("--vault is required. Tokens are per-vault.");
-      process.exit(1);
-    }
+    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : (readGlobalConfig().default_vault || "default");
 
     const vc = readVaultConfig(vaultName);
     if (!vc) {
