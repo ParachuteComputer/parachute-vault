@@ -5,8 +5,12 @@
  * the vault schema as of v7). All functions take a Database parameter — the
  * vault's own DB connection.
  *
- * Tokens support three permission levels (admin/write/read) and optional
- * scope filtering by tag or path prefix.
+ * Two permission levels:
+ *   - "full"  — unrestricted access (CRUD, delete, token management)
+ *   - "read"  — query-only (no mutations)
+ *
+ * Legacy "admin" and "write" values in the DB are normalized to "full" at
+ * read time for backward compatibility.
  */
 
 import { Database } from "bun:sqlite";
@@ -17,7 +21,16 @@ import { hashKey } from "./config.ts";
 // Types
 // ---------------------------------------------------------------------------
 
-export type TokenPermission = "admin" | "write" | "read";
+export type TokenPermission = "full" | "read";
+
+/**
+ * Normalize legacy permission values ("admin", "write") to the current
+ * two-tier model. Existing DB rows may contain the old values.
+ */
+export function normalizePermission(p: string): TokenPermission {
+  if (p === "read") return "read";
+  return "full"; // "admin", "write", or anything else → full
+}
 
 export interface Token {
   token_hash: string;
@@ -61,7 +74,7 @@ export function createToken(
 ): Token {
   const tokenHash = hashKey(fullToken);
   const now = new Date().toISOString();
-  const permission = opts.permission ?? "admin";
+  const permission = opts.permission ?? "full";
 
   db.prepare(`
     INSERT INTO tokens (token_hash, label, permission, scope_tag, scope_path_prefix, expires_at, created_at)
@@ -103,7 +116,7 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
-    permission: TokenPermission;
+    permission: string;
     expires_at: string | null;
   } | null;
 
@@ -118,7 +131,7 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   db.prepare("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
     .run(new Date().toISOString(), row.token_hash);
 
-  return { permission: row.permission };
+  return { permission: normalizePermission(row.permission) };
 }
 
 /**
@@ -134,6 +147,7 @@ export function listTokens(db: Database): (Token & { id: string })[] {
 
   return rows.map((r) => ({
     ...r,
+    permission: normalizePermission(r.permission),
     // Derive a short display ID from the hash (first 12 chars after "sha256:")
     id: `t_${r.token_hash.slice(7, 19)}`,
   }));
@@ -176,7 +190,7 @@ export function revokeToken(db: Database, idOrHash: string): boolean {
  *
  * Imports:
  * - Per-vault keys from vault.yaml (direct match)
- * - Global keys from config.yaml (they become admin tokens in every vault)
+ * - Global keys from config.yaml (they become full-access tokens in every vault)
  */
 export function migrateVaultKeys(
   db: Database,
@@ -195,7 +209,7 @@ export function migrateVaultKeys(
       `).run(
         key.key_hash,
         key.label,
-        key.scope === "read" ? "read" : "admin",
+        key.scope === "read" ? "read" : "full",
         key.created_at,
         key.last_used_at ?? null,
       );
@@ -203,7 +217,7 @@ export function migrateVaultKeys(
     }
   }
 
-  // Import global keys as admin tokens
+  // Import global keys as full-access tokens
   if (globalKeys) {
     for (const key of globalKeys) {
       const exists = db.prepare("SELECT 1 FROM tokens WHERE token_hash = ?").get(key.key_hash);
@@ -214,7 +228,7 @@ export function migrateVaultKeys(
         `).run(
           key.key_hash,
           key.label,
-          "admin",
+          "full",
           key.created_at,
           key.last_used_at ?? null,
         );

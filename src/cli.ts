@@ -543,14 +543,14 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // parachute vault tokens create --vault <name> [--permission admin|write|read]
+  // parachute vault tokens create --vault <name> [--permission full|read]
   //   [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
     const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
     if (!vaultName) {
       console.error("--vault is required. Tokens are per-vault.");
-      console.error("Usage: parachute vault tokens create --vault <name> [--permission admin|write|read]");
+      console.error("Usage: parachute vault tokens create --vault <name> [--permission full|read]");
       process.exit(1);
     }
 
@@ -561,9 +561,11 @@ function cmdTokens(args: string[]) {
     }
 
     const permFlag = args.indexOf("--permission");
-    const permission = (permFlag !== -1 ? args[permFlag + 1] : "admin") as TokenPermission;
-    if (!["admin", "write", "read"].includes(permission)) {
-      console.error(`Invalid permission: ${permission}. Must be admin, write, or read.`);
+    const rawPerm = permFlag !== -1 ? args[permFlag + 1] : "full";
+    // Accept legacy values for backward compat
+    const permission: TokenPermission = rawPerm === "read" ? "read" : "full";
+    if (!["full", "read", "admin", "write"].includes(rawPerm)) {
+      console.error(`Invalid permission: ${rawPerm}. Must be full or read.`);
       process.exit(1);
     }
 
@@ -992,10 +994,8 @@ Keys (legacy):
 
 Tokens (recommended):
   parachute vault tokens                   List all tokens (all vaults)
-  parachute vault tokens create --vault <name>     Create an admin token
+  parachute vault tokens create --vault <name>     Create a full-access token
   parachute vault tokens create --vault <name> --permission read  Read-only token
-  parachute vault tokens create --vault <name> --scope-tag publish  Tag-scoped
-  parachute vault tokens create --vault <name> --scope-path-prefix Projects/
   parachute vault tokens create --vault <name> --expires 30d  Expiring token
   parachute vault tokens revoke <token-id> --vault <name>  Revoke a token
 

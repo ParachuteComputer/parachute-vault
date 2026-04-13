@@ -26,13 +26,13 @@ afterEach(() => {
 });
 
 describe("token CRUD", () => {
-  test("create and resolve a token", () => {
+  test("create and resolve a full-access token", () => {
     const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "test-token", permission: "admin" });
+    createToken(db, fullToken, { label: "test-token", permission: "full" });
 
     const resolved = resolveToken(db, fullToken);
     expect(resolved).not.toBeNull();
-    expect(resolved!.permission).toBe("admin");
+    expect(resolved!.permission).toBe("full");
   });
 
   test("token with read permission", () => {
@@ -46,22 +46,40 @@ describe("token CRUD", () => {
     expect(resolved!.permission).toBe("read");
   });
 
-  test("token with write permission", () => {
+  test("default permission is full", () => {
     const { fullToken } = generateToken();
-    createToken(db, fullToken, {
-      label: "writer",
-      permission: "write",
-    });
+    createToken(db, fullToken, { label: "default-perm" });
 
     const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("write");
+    expect(resolved!.permission).toBe("full");
+  });
+
+  test("legacy admin permission normalizes to full", () => {
+    const { fullToken } = generateToken();
+    // Simulate a legacy token by writing "admin" directly to DB
+    const hash = require("./config.ts").hashKey(fullToken);
+    db.prepare("INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)")
+      .run(hash, "legacy-admin", "admin", new Date().toISOString());
+
+    const resolved = resolveToken(db, fullToken);
+    expect(resolved!.permission).toBe("full");
+  });
+
+  test("legacy write permission normalizes to full", () => {
+    const { fullToken } = generateToken();
+    const hash = require("./config.ts").hashKey(fullToken);
+    db.prepare("INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)")
+      .run(hash, "legacy-write", "write", new Date().toISOString());
+
+    const resolved = resolveToken(db, fullToken);
+    expect(resolved!.permission).toBe("full");
   });
 
   test("expired token is rejected", () => {
     const { fullToken } = generateToken();
     createToken(db, fullToken, {
       label: "expired",
-      permission: "admin",
+      permission: "full",
       expires_at: "2020-01-01T00:00:00.000Z", // in the past
     });
 
@@ -91,7 +109,7 @@ describe("token CRUD", () => {
   test("list tokens shows all tokens", () => {
     const { fullToken: t1 } = generateToken();
     const { fullToken: t2 } = generateToken();
-    createToken(db, t1, { label: "first", permission: "admin" });
+    createToken(db, t1, { label: "first", permission: "full" });
     createToken(db, t2, { label: "second", permission: "read" });
 
     const tokens = listTokens(db);
