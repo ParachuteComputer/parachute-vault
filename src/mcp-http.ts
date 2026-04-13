@@ -27,25 +27,25 @@ import {
 import { generateUnifiedMcpTools, generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import { isToolAllowed } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
-import type { KeyScope } from "./config.ts";
+import type { TokenPermission } from "./token-store.ts";
 
 /** Handle unified MCP at /mcp (all vaults). */
-export async function handleUnifiedMcp(req: Request, scope: KeyScope): Promise<Response> {
+export async function handleUnifiedMcp(req: Request, permission: TokenPermission): Promise<Response> {
   const instruction = getServerInstruction();
-  return handleMcp(req, () => generateUnifiedMcpTools(), "parachute-vault", scope, instruction);
+  return handleMcp(req, () => generateUnifiedMcpTools(), "parachute-vault", permission, instruction);
 }
 
 /** Handle scoped MCP at /vaults/{name}/mcp (single vault). */
-export async function handleScopedMcp(req: Request, vaultName: string, scope: KeyScope): Promise<Response> {
+export async function handleScopedMcp(req: Request, vaultName: string, permission: TokenPermission): Promise<Response> {
   const instruction = getServerInstruction(vaultName);
-  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, scope, instruction);
+  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, permission, instruction);
 }
 
 async function handleMcp(
   req: Request,
   getTools: () => McpToolDef[],
   serverName: string,
-  scope: KeyScope,
+  permission: TokenPermission,
   instruction: string,
 ): Promise<Response> {
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -64,7 +64,7 @@ async function handleMcp(
   const mcpTools = getTools();
 
   // For read-only keys, only list readable tools
-  const visibleTools = scope === "read"
+  const visibleTools = permission === "read"
     ? mcpTools.filter((t) => isToolAllowed(t.name, "read"))
     : mcpTools;
 
@@ -79,9 +79,9 @@ async function handleMcp(
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    if (!isToolAllowed(name, scope)) {
+    if (!isToolAllowed(name, permission)) {
       return {
-        content: [{ type: "text" as const, text: `Forbidden: read-only key cannot call ${name}` }],
+        content: [{ type: "text" as const, text: `Forbidden: insufficient permissions to call ${name}` }],
         isError: true,
       };
     }

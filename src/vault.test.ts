@@ -746,8 +746,8 @@ describe("unified MCP wrapper", () => {
   });
 });
 
-describe("auth scopes", () => {
-  test("read scope allows read tools", () => {
+describe("auth permissions", () => {
+  test("read permission allows read tools", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("query-notes", "read")).toBe(true);
     expect(isToolAllowed("list-tags", "read")).toBe(true);
@@ -756,7 +756,7 @@ describe("auth scopes", () => {
     expect(isToolAllowed("list-vaults", "read")).toBe(true);
   });
 
-  test("read scope blocks write tools", () => {
+  test("read permission blocks write and admin tools", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("create-note", "read")).toBe(false);
     expect(isToolAllowed("update-note", "read")).toBe(false);
@@ -765,20 +765,47 @@ describe("auth scopes", () => {
     expect(isToolAllowed("delete-tag", "read")).toBe(false);
   });
 
-  test("write scope allows everything", () => {
+  test("write permission allows read + write tools but not admin-only", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("create-note", "write")).toBe(true);
-    expect(isToolAllowed("delete-note", "write")).toBe(true);
+    expect(isToolAllowed("update-note", "write")).toBe(true);
+    expect(isToolAllowed("update-tag", "write")).toBe(true);
     expect(isToolAllowed("query-notes", "write")).toBe(true);
+    // delete-note and delete-tag are admin-only
+    expect(isToolAllowed("delete-note", "write")).toBe(false);
+    expect(isToolAllowed("delete-tag", "write")).toBe(false);
   });
 
-  test("read scope allows GET but not POST/PATCH/DELETE", () => {
+  test("admin permission allows everything", () => {
+    const { isToolAllowed } = require("./auth.ts");
+    expect(isToolAllowed("create-note", "admin")).toBe(true);
+    expect(isToolAllowed("delete-note", "admin")).toBe(true);
+    expect(isToolAllowed("delete-tag", "admin")).toBe(true);
+    expect(isToolAllowed("query-notes", "admin")).toBe(true);
+  });
+
+  test("read permission allows GET but not POST/PATCH/DELETE", () => {
     const { isMethodAllowed } = require("./auth.ts");
     expect(isMethodAllowed("GET", "read")).toBe(true);
     expect(isMethodAllowed("HEAD", "read")).toBe(true);
     expect(isMethodAllowed("POST", "read")).toBe(false);
     expect(isMethodAllowed("PATCH", "read")).toBe(false);
     expect(isMethodAllowed("DELETE", "read")).toBe(false);
+  });
+
+  test("write permission allows GET/POST/PATCH but not DELETE", () => {
+    const { isMethodAllowed } = require("./auth.ts");
+    expect(isMethodAllowed("GET", "write")).toBe(true);
+    expect(isMethodAllowed("POST", "write")).toBe(true);
+    expect(isMethodAllowed("PATCH", "write")).toBe(true);
+    expect(isMethodAllowed("DELETE", "write")).toBe(false);
+  });
+
+  test("admin permission allows all methods", () => {
+    const { isMethodAllowed } = require("./auth.ts");
+    expect(isMethodAllowed("GET", "admin")).toBe(true);
+    expect(isMethodAllowed("POST", "admin")).toBe(true);
+    expect(isMethodAllowed("DELETE", "admin")).toBe(true);
   });
 });
 
@@ -1203,5 +1230,71 @@ describe("stateless MCP transport", () => {
     expect(body.result.capabilities.tools).toBeDefined();
 
     closeAllStores();
+  });
+});
+
+// ---- Scope filtering ----
+
+describe("scope filtering in handleNotes", () => {
+  test("tag-scoped token only sees notes with that tag", async () => {
+    store.createNote("public note", { path: "pub", tags: ["publish"] });
+    store.createNote("private note", { path: "priv", tags: ["daily"] });
+    store.createNote("both", { path: "both", tags: ["publish", "daily"] });
+
+    const auth = { permission: "read" as const, scope_tag: "publish", scope_path_prefix: null };
+    const res = await handleNotes(mkReq("GET", "/notes?include_content=true"), store, "", auth);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    expect(body.every((n: any) => n.tags.includes("publish"))).toBe(true);
+  });
+
+  test("path-scoped token only sees notes under that prefix", async () => {
+    store.createNote("proj note", { path: "Projects/foo" });
+    store.createNote("blog note", { path: "Blog/bar" });
+    store.createNote("nested", { path: "Projects/sub/deep" });
+
+    const auth = { permission: "read" as const, scope_tag: null, scope_path_prefix: "Projects/" };
+    const res = await handleNotes(mkReq("GET", "/notes?include_content=true"), store, "", auth);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    expect(body.every((n: any) => n.path.startsWith("Projects/"))).toBe(true);
+  });
+
+  test("scoped token cannot access single note outside scope", async () => {
+    const note = store.createNote("secret", { path: "Secret/stuff", tags: ["private"] });
+
+    const auth = { permission: "read" as const, scope_tag: "publish", scope_path_prefix: null };
+    const res = await handleNotes(mkReq("GET", `/notes/${note.id}`), store, `/${note.id}`, auth);
+    expect(res.status).toBe(404);
+  });
+
+  test("scoped token can access single note within scope", async () => {
+    const note = store.createNote("public", { path: "Blog/post", tags: ["publish"] });
+
+    const auth = { permission: "read" as const, scope_tag: "publish", scope_path_prefix: null };
+    const res = await handleNotes(mkReq("GET", `/notes/${note.id}`), store, `/${note.id}`, auth);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.content).toBe("public");
+  });
+
+  test("no auth means no scope filtering (backward compat)", async () => {
+    store.createNote("a", { path: "x" });
+    store.createNote("b", { path: "y" });
+
+    const res = await handleNotes(mkReq("GET", "/notes"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+  });
+
+  test("search respects tag scope", async () => {
+    store.createNote("matching published fox", { path: "a", tags: ["publish"] });
+    store.createNote("matching private fox", { path: "b", tags: ["private"] });
+
+    const auth = { permission: "read" as const, scope_tag: "publish", scope_path_prefix: null };
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox&include_content=true"), store, "", auth);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].tags).toContain("publish");
   });
 });

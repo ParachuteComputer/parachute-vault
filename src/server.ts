@@ -12,7 +12,9 @@
 
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest, isMethodAllowed, extractApiKey } from "./auth.ts";
+import type { AuthResult } from "./auth.ts";
 import type { VaultConfig } from "./config.ts";
+import { getTokenDb, migrateExistingKeys } from "./token-store.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
@@ -87,6 +89,17 @@ for (const vaultName of listVaults()) {
       console.log(`[migration] vault "${vaultName}" has tag_schemas in vault.yaml (already in DB — vault.yaml section can be removed)`);
     }
   }
+}
+
+// Migrate existing API keys from config.yaml → tokens.db (idempotent)
+try {
+  const tokenDb = getTokenDb();
+  const migrated = migrateExistingKeys(tokenDb);
+  if (migrated > 0) {
+    console.log(`[tokens] migrated ${migrated} API key(s) from config.yaml to tokens.db`);
+  }
+} catch (err) {
+  console.error("[tokens] migration error:", err);
 }
 
 const globalConfig = readGlobalConfig();
@@ -183,7 +196,7 @@ async function route(req: Request, path: string): Promise<Response> {
   if (path === "/mcp" || path.startsWith("/mcp/")) {
     const auth = authenticateGlobalRequest(req);
     if ("error" in auth) return auth.error;
-    return handleUnifiedMcp(req, auth.scope);
+    return handleUnifiedMcp(req, auth.permission);
   }
 
   // View endpoint — serves notes as HTML (auth-aware, supports ID or path)
@@ -236,12 +249,12 @@ async function route(req: Request, path: string): Promise<Response> {
     }
     const auth = authenticateVaultRequest(req, vaultConfig);
     if ("error" in auth) return auth.error;
-    if (!isMethodAllowed(req.method, auth.scope)) {
-      return Response.json({ error: "Forbidden", message: "Read-only API key" }, { status: 403 });
+    if (!isMethodAllowed(req.method, auth.permission)) {
+      return Response.json({ error: "Forbidden", message: "Insufficient permissions" }, { status: 403 });
     }
     const store = getVaultStore(defaultVault);
     const apiPath = path.slice(4); // strip "/api"
-    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
+    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), auth);
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/find-path") return handleFindPath(req, store);
     if (apiPath === "/vault") return handleVault(req, store, vaultConfig, (desc) => {
@@ -295,7 +308,7 @@ async function route(req: Request, path: string): Promise<Response> {
 
   // Per-vault scoped MCP
   if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
-    return handleScopedMcp(req, vaultName, auth.scope);
+    return handleScopedMcp(req, vaultName, auth.permission);
   }
 
   // Bare /vaults/{name} — single-vault root. Returns name, description,
@@ -314,10 +327,10 @@ async function route(req: Request, path: string): Promise<Response> {
     });
   }
 
-  // REST API — enforce read-only scope
-  if (!isMethodAllowed(req.method, auth.scope)) {
+  // REST API — enforce permission level
+  if (!isMethodAllowed(req.method, auth.permission)) {
     return Response.json(
-      { error: "Forbidden", message: "Read-only API key cannot perform write operations" },
+      { error: "Forbidden", message: "Insufficient permissions" },
       { status: 403 },
     );
   }
@@ -331,7 +344,7 @@ async function route(req: Request, path: string): Promise<Response> {
   const apiPath = apiMatch[1] ?? "";
 
   if (apiPath.startsWith("/notes")) {
-    return handleNotes(req, store, apiPath.slice(6));
+    return handleNotes(req, store, apiPath.slice(6), auth);
   }
   if (apiPath.startsWith("/tags")) {
     return handleTags(req, store, apiPath.slice(5));
