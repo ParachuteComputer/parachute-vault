@@ -15,11 +15,12 @@
  * tokens are per-vault and the unified endpoint spans all vaults.
  */
 
-import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
+import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey, listVaults, readVaultConfig } from "./config.ts";
 import type { VaultConfig, StoredKey } from "./config.ts";
 import { resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import type { Database } from "bun:sqlite";
+import { getVaultStore } from "./vault-store.ts";
 
 /** Result of a successful auth check. */
 export interface AuthResult {
@@ -128,8 +129,9 @@ export function authenticateVaultRequest(
 
 /**
  * Authenticate for the unified /mcp endpoint.
- * Uses only legacy global config.yaml keys — tokens are per-vault and the
- * unified endpoint spans all vaults.
+ * Checks legacy global config.yaml keys first, then falls back to checking
+ * each vault's token DB. This allows OAuth-minted pvt_ tokens to work on
+ * the unified endpoint.
  */
 export function authenticateGlobalRequest(
   req: Request,
@@ -146,6 +148,21 @@ export function authenticateGlobalRequest(
     if (matched) {
       try { writeGlobalConfig(globalConfig); } catch {}
       return { permission: matched.scope === "read" ? "read" : "full" };
+    }
+  }
+
+  // Fall through to vault token DBs — check each vault for the token.
+  // This enables OAuth-minted pvt_ tokens and CLI-created tokens to
+  // authenticate against the unified /mcp endpoint.
+  for (const vaultName of listVaults()) {
+    try {
+      const store = getVaultStore(vaultName);
+      const resolved = resolveToken(store.db, key);
+      if (resolved) {
+        return { permission: resolved.permission };
+      }
+    } catch {
+      // Skip vaults that can't be opened
     }
   }
 
