@@ -12,6 +12,7 @@
  */
 
 import type { Store, Note } from "../core/src/types.ts";
+import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { toNoteIndex } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
@@ -469,6 +470,18 @@ export async function handleVault(
   }
 
   return json({ error: "Method not allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
+// Unresolved wikilinks — REST-only (admin/maintenance)
+// ---------------------------------------------------------------------------
+
+export function handleUnresolvedWikilinks(req: Request, store: Store): Response {
+  const url = new URL(req.url);
+  const limitStr = url.searchParams.get("limit");
+  const limit = limitStr ? parseInt(limitStr, 10) : 50;
+  const db = (store as any).db;
+  return Response.json(listUnresolvedWikilinks(db, limit));
 }
 
 // ---------------------------------------------------------------------------

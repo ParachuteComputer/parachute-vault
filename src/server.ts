@@ -17,7 +17,7 @@ import type { VaultConfig } from "./config.ts";
 import { migrateVaultKeys } from "./token-store.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
-import { handleNotes, handleTags, handleFindPath, handleVault, handleStorage, handleViewNote } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 
@@ -269,6 +269,7 @@ async function route(req: Request, path: string): Promise<Response> {
       vaultConfig.description = desc;
       writeVaultConfig(vaultConfig);
     });
+    if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
     if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
   }
@@ -363,6 +364,9 @@ async function route(req: Request, path: string): Promise<Response> {
       vaultConfig.description = desc;
       writeVaultConfig(vaultConfig);
     });
+  }
+  if (apiPath === "/unresolved-wikilinks") {
+    return handleUnresolvedWikilinks(req, store);
   }
   if (apiPath.startsWith("/storage")) {
     return handleStorage(req, apiPath.slice(8), vaultName);
