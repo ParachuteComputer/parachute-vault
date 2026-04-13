@@ -11,6 +11,7 @@ import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
+import { extractApiKey } from "./auth.ts";
 
 let db: Database;
 let store: BunStore;
@@ -1272,6 +1273,53 @@ describe("stateless MCP transport", () => {
     expect(body.result.capabilities.tools).toBeDefined();
 
     closeAllStores();
+  });
+});
+
+describe("extractApiKey", () => {
+  test("extracts from Authorization: Bearer header", () => {
+    const req = new Request("http://localhost/api/notes", {
+      headers: { Authorization: "Bearer pvt_abc123" },
+    });
+    expect(extractApiKey(req)).toBe("pvt_abc123");
+  });
+
+  test("extracts from X-API-Key header", () => {
+    const req = new Request("http://localhost/api/notes", {
+      headers: { "X-API-Key": "pvk_xyz789" },
+    });
+    expect(extractApiKey(req)).toBe("pvk_xyz789");
+  });
+
+  test("extracts from ?key= query parameter", () => {
+    const req = new Request("http://localhost/mcp?key=pvt_querykey");
+    expect(extractApiKey(req)).toBe("pvt_querykey");
+  });
+
+  test("prefers Authorization header over query param", () => {
+    const req = new Request("http://localhost/mcp?key=pvt_query", {
+      headers: { Authorization: "Bearer pvt_header" },
+    });
+    expect(extractApiKey(req)).toBe("pvt_header");
+  });
+
+  test("prefers X-API-Key header over query param", () => {
+    const req = new Request("http://localhost/mcp?key=pvt_query", {
+      headers: { "X-API-Key": "pvk_header" },
+    });
+    expect(extractApiKey(req)).toBe("pvk_header");
+  });
+
+  test("prefers Authorization header over X-API-Key header", () => {
+    const req = new Request("http://localhost/api/notes", {
+      headers: { Authorization: "Bearer pvt_bearer", "X-API-Key": "pvk_xapi" },
+    });
+    expect(extractApiKey(req)).toBe("pvt_bearer");
+  });
+
+  test("returns null when no key provided", () => {
+    const req = new Request("http://localhost/api/notes");
+    expect(extractApiKey(req)).toBeNull();
   });
 });
 

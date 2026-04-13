@@ -62,14 +62,19 @@ export function isMethodAllowed(method: string, permission: TokenPermission): bo
 }
 
 /**
- * Extract API key/token from request headers.
+ * Extract API key/token from request.
+ * Priority: Authorization header → X-API-Key header → ?key= query param.
  */
 export function extractApiKey(req: Request): string | null {
   const authHeader = req.headers.get("authorization");
   if (authHeader?.startsWith("Bearer ")) {
     return authHeader.slice(7);
   }
-  return req.headers.get("x-api-key");
+  const xApiKey = req.headers.get("x-api-key");
+  if (xApiKey) return xApiKey;
+  // Query param fallback — enables URL-only auth for MCP clients (e.g. Claude Web)
+  const url = new URL(req.url);
+  return url.searchParams.get("key");
 }
 
 /**
