@@ -208,7 +208,7 @@ async function route(req: Request, path: string): Promise<Response> {
         return handleAuthorizeGet(req, store.db, vaultConfig.name);
       }
       if (req.method === "POST") {
-        return handleAuthorizePost(req, store.db);
+        return handleAuthorizePost(req, store.db, vaultConfig.name);
       }
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
@@ -342,14 +342,14 @@ async function route(req: Request, path: string): Promise<Response> {
     if (subpath === "/oauth/register") return handleRegister(req, store.db);
     if (subpath === "/oauth/authorize") {
       if (req.method === "GET") return handleAuthorizeGet(req, store.db, vaultConfig.name);
-      if (req.method === "POST") return handleAuthorizePost(req, store.db);
+      if (req.method === "POST") return handleAuthorizePost(req, store.db, vaultConfig.name);
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
     if (subpath === "/oauth/token") return handleToken(req, store.db);
   }
 
   // Vault-scoped discovery endpoints
-  if (subpath === "/.well-known/oauth-protected-resource") return handleProtectedResource(req);
+  if (subpath === "/.well-known/oauth-protected-resource") return handleProtectedResource(req, `/vaults/${vaultName}/mcp`);
   if (subpath === "/.well-known/oauth-authorization-server") return handleAuthorizationServer(req);
 
   // Auth: per-vault key OR global key
