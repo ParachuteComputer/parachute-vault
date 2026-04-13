@@ -748,7 +748,7 @@ describe("unified MCP wrapper", () => {
 });
 
 describe("auth permissions", () => {
-  test("read permission allows read tools", () => {
+  test("read permission allows read-only tools", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("query-notes", "read")).toBe(true);
     expect(isToolAllowed("list-tags", "read")).toBe(true);
@@ -757,7 +757,7 @@ describe("auth permissions", () => {
     expect(isToolAllowed("list-vaults", "read")).toBe(true);
   });
 
-  test("read permission blocks write and admin tools", () => {
+  test("read permission blocks mutation tools", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("create-note", "read")).toBe(false);
     expect(isToolAllowed("update-note", "read")).toBe(false);
@@ -766,23 +766,14 @@ describe("auth permissions", () => {
     expect(isToolAllowed("delete-tag", "read")).toBe(false);
   });
 
-  test("write permission allows read + write tools but not admin-only", () => {
+  test("full permission allows all tools", () => {
     const { isToolAllowed } = require("./auth.ts");
-    expect(isToolAllowed("create-note", "write")).toBe(true);
-    expect(isToolAllowed("update-note", "write")).toBe(true);
-    expect(isToolAllowed("update-tag", "write")).toBe(true);
-    expect(isToolAllowed("query-notes", "write")).toBe(true);
-    // delete-note and delete-tag are admin-only
-    expect(isToolAllowed("delete-note", "write")).toBe(false);
-    expect(isToolAllowed("delete-tag", "write")).toBe(false);
-  });
-
-  test("admin permission allows everything", () => {
-    const { isToolAllowed } = require("./auth.ts");
-    expect(isToolAllowed("create-note", "admin")).toBe(true);
-    expect(isToolAllowed("delete-note", "admin")).toBe(true);
-    expect(isToolAllowed("delete-tag", "admin")).toBe(true);
-    expect(isToolAllowed("query-notes", "admin")).toBe(true);
+    expect(isToolAllowed("create-note", "full")).toBe(true);
+    expect(isToolAllowed("update-note", "full")).toBe(true);
+    expect(isToolAllowed("delete-note", "full")).toBe(true);
+    expect(isToolAllowed("update-tag", "full")).toBe(true);
+    expect(isToolAllowed("delete-tag", "full")).toBe(true);
+    expect(isToolAllowed("query-notes", "full")).toBe(true);
   });
 
   test("read permission allows GET but not POST/PATCH/DELETE", () => {
@@ -794,19 +785,12 @@ describe("auth permissions", () => {
     expect(isMethodAllowed("DELETE", "read")).toBe(false);
   });
 
-  test("write permission allows GET/POST/PATCH but not DELETE", () => {
+  test("full permission allows all methods", () => {
     const { isMethodAllowed } = require("./auth.ts");
-    expect(isMethodAllowed("GET", "write")).toBe(true);
-    expect(isMethodAllowed("POST", "write")).toBe(true);
-    expect(isMethodAllowed("PATCH", "write")).toBe(true);
-    expect(isMethodAllowed("DELETE", "write")).toBe(false);
-  });
-
-  test("admin permission allows all methods", () => {
-    const { isMethodAllowed } = require("./auth.ts");
-    expect(isMethodAllowed("GET", "admin")).toBe(true);
-    expect(isMethodAllowed("POST", "admin")).toBe(true);
-    expect(isMethodAllowed("DELETE", "admin")).toBe(true);
+    expect(isMethodAllowed("GET", "full")).toBe(true);
+    expect(isMethodAllowed("POST", "full")).toBe(true);
+    expect(isMethodAllowed("PATCH", "full")).toBe(true);
+    expect(isMethodAllowed("DELETE", "full")).toBe(true);
   });
 });
 

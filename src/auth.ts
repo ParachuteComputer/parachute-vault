@@ -1,15 +1,15 @@
 /**
  * Authentication and authorization for the vault server.
  *
- * Token-based auth with three permission levels:
- *   - "admin" — full access (CRUD + delete + token management)
- *   - "write" — read + create/update notes
- *   - "read"  — read-only (query, list, find-path, vault-info)
+ * Token-based auth with two permission levels:
+ *   - "full" — unrestricted access (CRUD + delete + token management)
+ *   - "read" — read-only (query, list, find-path, vault-info)
  *
  * Tokens live in each vault's SQLite database (tokens table, schema v7).
  *
  * Backward compatibility: config.yaml API keys are still checked as a fallback.
- * Those keys resolve as admin tokens.
+ * Those keys resolve as full-access tokens. Legacy "admin" and "write" values
+ * in the DB are normalized to "full" at read time.
  *
  * The unified /mcp endpoint uses only legacy global config.yaml keys, since
  * tokens are per-vault and the unified endpoint spans all vaults.
@@ -26,7 +26,7 @@ export interface AuthResult {
   permission: TokenPermission;
 }
 
-/** Read-only tools (allowed for "read" permission). */
+/** Read-only tools (the only tools allowed for "read" permission). */
 const READ_TOOLS = new Set([
   "query-notes",
   "list-tags",
@@ -35,29 +35,18 @@ const READ_TOOLS = new Set([
   "list-vaults",
 ]);
 
-/** Write tools (allowed for "write" and "admin" permission). */
-const WRITE_TOOLS = new Set([
-  "create-note",
-  "update-note",
-  "update-tag",
-]);
-
 /** Check if a tool call is allowed for a given permission level. */
 export function isToolAllowed(toolName: string, permission: TokenPermission): boolean {
-  if (permission === "admin") return true;
-  if (permission === "write") return READ_TOOLS.has(toolName) || WRITE_TOOLS.has(toolName);
+  if (permission === "full") return true;
   return READ_TOOLS.has(toolName);
 }
 
 /** Read-only HTTP methods. */
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-/** Write HTTP methods (not DELETE). */
-const WRITE_METHODS = new Set(["POST", "PATCH", "PUT"]);
 
 /** Check if an HTTP method is allowed for a given permission level. */
 export function isMethodAllowed(method: string, permission: TokenPermission): boolean {
-  if (permission === "admin") return true;
-  if (permission === "write") return READ_METHODS.has(method) || WRITE_METHODS.has(method);
+  if (permission === "full") return true;
   return READ_METHODS.has(method);
 }
 
@@ -121,7 +110,7 @@ export function authenticateVaultRequest(
   const vaultKey = validateKey(vaultConfig.api_keys, key);
   if (vaultKey) {
     try { writeVaultConfig(vaultConfig); } catch {}
-    return { permission: vaultKey.scope === "read" ? "read" : "admin" };
+    return { permission: vaultKey.scope === "read" ? "read" : "full" };
   }
 
   // Legacy: check global keys from config.yaml
@@ -130,7 +119,7 @@ export function authenticateVaultRequest(
     const globalKey = validateKey(globalConfig.api_keys, key);
     if (globalKey) {
       try { writeGlobalConfig(globalConfig); } catch {}
-      return { permission: globalKey.scope === "read" ? "read" : "admin" };
+      return { permission: globalKey.scope === "read" ? "read" : "full" };
     }
   }
 
@@ -156,7 +145,7 @@ export function authenticateGlobalRequest(
     const matched = validateKey(globalConfig.api_keys, key);
     if (matched) {
       try { writeGlobalConfig(globalConfig); } catch {}
-      return { permission: matched.scope === "read" ? "read" : "admin" };
+      return { permission: matched.scope === "read" ? "read" : "full" };
     }
   }
 

@@ -60,11 +60,10 @@ parachute vault keys create --vault work   # new key for one vault
 parachute vault keys create --read-only    # read-only key
 parachute vault keys revoke <key-id>       # revoke a key by ID
 
-# Tokens (per-vault, with permission tiers)
+# Tokens (per-vault)
 parachute vault tokens                     # list all tokens
-parachute vault tokens create --vault work                    # new admin token
+parachute vault tokens create --vault work                    # new full-access token
 parachute vault tokens create --vault work --permission read  # read-only token
-parachute vault tokens create --vault work --permission write # write token (no delete)
 parachute vault tokens create --vault work --expires 30d      # token with expiry
 parachute vault tokens create --vault work --label mobile     # labeled token
 parachute vault tokens revoke <token-id> --vault work         # revoke a token
@@ -259,23 +258,22 @@ Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp
 
 ### Key management
 
-**Tokens** (recommended) — per-vault, with three permission tiers:
+**Tokens** (recommended) — per-vault, two permission levels:
 
 | Permission | Can do |
 |---|---|
-| `admin` | Everything (CRUD + delete + token management) |
-| `write` | Read + create/update notes, tags |
+| `full` | Everything (CRUD + delete + token management) |
 | `read` | Query, list, find-path, vault-info only |
 
 ```bash
 parachute vault tokens                                        # list all tokens
-parachute vault tokens create --vault work                    # admin token
+parachute vault tokens create --vault work                    # full-access token
 parachute vault tokens create --vault work --permission read  # read-only
 parachute vault tokens create --vault work --expires 30d      # with expiry
 parachute vault tokens revoke <token-id> --vault work         # revoke
 ```
 
-**Legacy API keys** — global or per-vault, stored in config.yaml/vault.yaml. Still work as admin tokens. `vault init` creates one automatically.
+**Legacy API keys** — global or per-vault, stored in config.yaml/vault.yaml. Still work as full-access tokens. `vault init` creates one automatically.
 
 ```bash
 parachute vault keys                       # list legacy keys
