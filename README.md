@@ -53,17 +53,10 @@ parachute vault import ~/Obsidian/Work --vault work    # import into a specific 
 parachute vault import <path> --dry-run                # preview without importing
 parachute vault export ./output --vault work           # export a specific vault
 
-# API keys (legacy)
-parachute vault keys                       # list all keys
-parachute vault keys create                # new global key (all vaults)
-parachute vault keys create --vault work   # new key for one vault
-parachute vault keys create --read-only    # read-only key
-parachute vault keys revoke <key-id>       # revoke a key by ID
-
-# Tokens (per-vault)
+# Tokens
 parachute vault tokens                     # list all tokens
 parachute vault tokens create --vault work                    # new full-access token
-parachute vault tokens create --vault work --permission read  # read-only token
+parachute vault tokens create --vault work --read             # read-only token
 parachute vault tokens create --vault work --expires 30d      # token with expiry
 parachute vault tokens create --vault work --label mobile     # labeled token
 parachute vault tokens revoke <token-id> --vault work         # revoke a token
@@ -256,9 +249,9 @@ Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp
 }
 ```
 
-### Key management
+### Token management
 
-**Tokens** (recommended) — per-vault, two permission levels:
+Per-vault tokens with two permission levels:
 
 | Permission | Can do |
 |---|---|
@@ -268,21 +261,15 @@ Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp
 ```bash
 parachute vault tokens                                        # list all tokens
 parachute vault tokens create --vault work                    # full-access token
-parachute vault tokens create --vault work --permission read  # read-only
+parachute vault tokens create --vault work --read             # read-only
 parachute vault tokens create --vault work --expires 30d      # with expiry
+parachute vault tokens create --vault work --label phone      # labeled token
 parachute vault tokens revoke <token-id> --vault work         # revoke
 ```
 
-**Legacy API keys** — global or per-vault, stored in config.yaml/vault.yaml. Still work as full-access tokens. `vault init` creates one automatically.
+Tokens are shown once at creation — save them immediately. SHA-256 hashed at rest.
 
-```bash
-parachute vault keys                       # list legacy keys
-parachute vault keys create                # new global key
-parachute vault keys create --vault work   # new per-vault key
-parachute vault keys create --label phone  # labeled key
-```
-
-All keys are shown once at creation — save them immediately. SHA-256 hashed at rest.
+Legacy API keys (`pvk_...`) from config.yaml still work at runtime but the `vault keys` CLI commands have been removed. Use `vault tokens` for all new keys.
 
 ### Public endpoints
 

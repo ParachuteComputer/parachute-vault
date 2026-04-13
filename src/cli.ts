@@ -38,6 +38,8 @@ import {
   CONFIG_DIR,
   ASSETS_DIR,
   ENV_PATH,
+  LOG_PATH,
+  ERR_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
@@ -90,14 +92,14 @@ switch (command) {
   case "config":
     await cmdConfig(cmdArgs);
     break;
-  case "keys":
-    cmdKeys(cmdArgs);
-    break;
   case "tokens":
     cmdTokens(cmdArgs);
     break;
   case "serve":
     await cmdServe();
+    break;
+  case "logs":
+    await cmdLogs();
     break;
   case "status":
     await cmdStatus();
@@ -378,132 +380,6 @@ async function cmdConfig(args: string[]) {
   process.exit(1);
 }
 
-function cmdKeys(args: string[]) {
-  const subcmd = args[0];
-
-  // parachute vault keys — list all keys
-  if (!subcmd || subcmd === "list") {
-    const globalConfig = readGlobalConfig();
-    const vaults = listVaults();
-
-    // Global keys
-    const globalKeys = globalConfig.api_keys ?? [];
-    if (globalKeys.length > 0) {
-      console.log("Global keys (access all vaults):");
-      for (const key of globalKeys) {
-        const scope = key.scope === "read" ? " [read-only]" : "";
-        const lastUsed = key.last_used_at ? ` (last used: ${key.last_used_at})` : "";
-        console.log(`  ${key.id}  ${key.label}${scope}${lastUsed}`);
-      }
-      console.log();
-    }
-
-    // Per-vault keys
-    for (const name of vaults) {
-      const config = readVaultConfig(name);
-      if (!config || config.api_keys.length === 0) continue;
-      console.log(`Vault "${name}" keys:`);
-      for (const key of config.api_keys) {
-        const scope = key.scope === "read" ? " [read-only]" : "";
-        const lastUsed = key.last_used_at ? ` (last used: ${key.last_used_at})` : "";
-        console.log(`  ${key.id}  ${key.label}${scope}${lastUsed}`);
-      }
-      console.log();
-    }
-
-    if (globalKeys.length === 0 && vaults.every((v) => (readVaultConfig(v)?.api_keys.length ?? 0) === 0)) {
-      console.log("No keys found. Create one: parachute vault keys create");
-    }
-    return;
-  }
-
-  // parachute vault keys create [--vault <name>] [--read-only] [--label <label>]
-  if (subcmd === "create") {
-    const vaultFlag = args.indexOf("--vault");
-    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : undefined;
-    const readOnly = args.includes("--read-only");
-    const labelFlag = args.indexOf("--label");
-    const label = labelFlag !== -1 ? args[labelFlag + 1] : "default";
-
-    const { fullKey, keyId } = generateApiKey();
-    const stored: import("./config.ts").StoredKey = {
-      id: keyId,
-      label: label ?? "default",
-      scope: readOnly ? "read" : "write",
-      key_hash: hashKey(fullKey),
-      created_at: new Date().toISOString(),
-    };
-
-    if (vaultName) {
-      // Per-vault key
-      const config = readVaultConfig(vaultName);
-      if (!config) {
-        console.error(`Vault "${vaultName}" not found.`);
-        process.exit(1);
-      }
-      config.api_keys.push(stored);
-      writeVaultConfig(config);
-      console.log(`Created ${readOnly ? "read-only " : ""}key for vault "${vaultName}":`);
-    } else {
-      // Global key
-      const globalConfig = readGlobalConfig();
-      if (!globalConfig.api_keys) globalConfig.api_keys = [];
-      globalConfig.api_keys.push(stored);
-      writeGlobalConfig(globalConfig);
-      console.log(`Created ${readOnly ? "read-only " : ""}global key:`);
-    }
-
-    console.log(`  ID:    ${keyId}`);
-    console.log(`  Key:   ${fullKey}`);
-    console.log(`  Scope: ${readOnly ? "read" : "write"}`);
-    console.log(`  Label: ${label}`);
-    console.log();
-    console.log("Save this key — it will not be shown again.");
-    return;
-  }
-
-  // parachute vault keys revoke <key-id>
-  if (subcmd === "revoke") {
-    const keyId = args[1];
-    if (!keyId) {
-      console.error("Usage: parachute vault keys revoke <key-id>");
-      process.exit(1);
-    }
-
-    // Check global keys
-    const globalConfig = readGlobalConfig();
-    if (globalConfig.api_keys) {
-      const idx = globalConfig.api_keys.findIndex((k) => k.id === keyId);
-      if (idx !== -1) {
-        const removed = globalConfig.api_keys.splice(idx, 1)[0];
-        writeGlobalConfig(globalConfig);
-        console.log(`Revoked global key: ${keyId} (${removed.label})`);
-        return;
-      }
-    }
-
-    // Check per-vault keys
-    for (const name of listVaults()) {
-      const config = readVaultConfig(name);
-      if (!config) continue;
-      const idx = config.api_keys.findIndex((k) => k.id === keyId);
-      if (idx !== -1) {
-        const removed = config.api_keys.splice(idx, 1)[0];
-        writeVaultConfig(config);
-        console.log(`Revoked key from vault "${name}": ${keyId} (${removed.label})`);
-        return;
-      }
-    }
-
-    console.error(`Key "${keyId}" not found.`);
-    process.exit(1);
-  }
-
-  console.error(`Unknown keys command: ${subcmd}`);
-  console.error("Usage: parachute vault keys [create | revoke <id>]");
-  process.exit(1);
-}
-
 // ---------------------------------------------------------------------------
 // Tokens — parachute vault tokens [create | list | revoke]
 // ---------------------------------------------------------------------------
@@ -550,7 +426,7 @@ function cmdTokens(args: string[]) {
     const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
     if (!vaultName) {
       console.error("--vault is required. Tokens are per-vault.");
-      console.error("Usage: parachute vault tokens create --vault <name> [--permission full|read]");
+      console.error("Usage: parachute vault tokens create --vault <name> [--read] [--label <label>]");
       process.exit(1);
     }
 
@@ -560,9 +436,10 @@ function cmdTokens(args: string[]) {
       process.exit(1);
     }
 
+    // --read shorthand or --permission full|read
+    const isReadShorthand = args.includes("--read");
     const permFlag = args.indexOf("--permission");
-    const rawPerm = permFlag !== -1 ? args[permFlag + 1] : "full";
-    // Accept legacy values for backward compat
+    const rawPerm = isReadShorthand ? "read" : (permFlag !== -1 ? args[permFlag + 1] : "full");
     const permission: TokenPermission = rawPerm === "read" ? "read" : "full";
     if (!["full", "read", "admin", "write"].includes(rawPerm)) {
       console.error(`Invalid permission: ${rawPerm}. Must be full or read.`);
@@ -656,6 +533,14 @@ function parseDuration(dur: string): string | null {
 
 async function cmdServe() {
   await import("./server.ts");
+}
+
+async function cmdLogs() {
+  const proc = Bun.spawn(["tail", "-f", LOG_PATH, ERR_PATH], {
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  await proc.exited;
 }
 
 async function cmdRestart() {
@@ -987,15 +872,11 @@ Vaults:
   parachute vault remove <name> [--yes]    Remove a vault
   parachute vault mcp-install              Add vault MCP to Claude
 
-Keys (legacy):
-  parachute vault keys                     List all API keys
-  parachute vault keys create              Create a global key
-  parachute vault keys revoke <key-id>     Revoke a key
-
-Tokens (recommended):
-  parachute vault tokens                   List all tokens (all vaults)
-  parachute vault tokens create --vault <name>     Create a full-access token
-  parachute vault tokens create --vault <name> --permission read  Read-only token
+Tokens:
+  parachute vault tokens                          List all tokens
+  parachute vault tokens create --vault <name>    Create a token (default: full access)
+  parachute vault tokens create --vault <name> --read   Read-only token
+  parachute vault tokens create --vault <name> --label x   Set a label
   parachute vault tokens create --vault <name> --expires 30d  Expiring token
   parachute vault tokens revoke <token-id> --vault <name>  Revoke a token
 
@@ -1011,6 +892,7 @@ Import/Export:
 
 Server:
   parachute vault serve                    Run server (foreground)
+  parachute vault logs                     Stream server logs
   parachute vault restart                  Restart the daemon
 `);
 }
