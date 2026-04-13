@@ -15,7 +15,7 @@
 
 import crypto from "node:crypto";
 import type { Database } from "bun:sqlite";
-import { generateToken, createToken } from "./token-store.ts";
+import { generateToken, createToken, resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 
 // ---------------------------------------------------------------------------
@@ -179,7 +179,7 @@ export function handleAuthorizeGet(req: Request, db: Database, vaultName: string
   });
 }
 
-export async function handleAuthorizePost(req: Request, db: Database): Promise<Response> {
+export async function handleAuthorizePost(req: Request, db: Database, vaultName?: string): Promise<Response> {
   let form: FormData;
   try {
     form = await req.formData();
@@ -225,6 +225,23 @@ export async function handleAuthorizePost(req: Request, db: Database): Promise<R
   if (action === "deny") {
     redirect.searchParams.set("error", "access_denied");
     return Response.redirect(redirect.toString(), 302);
+  }
+
+  // Verify vault owner identity via token
+  const ownerToken = form.get("owner_token") as string;
+  if (!ownerToken) {
+    return renderConsentWithError(db, vaultName || "vault", {
+      clientId, redirectUri, codeChallenge, codeChallengeMethod, scope, state,
+      error: "Vault token is required.",
+    });
+  }
+
+  const resolved = resolveToken(db, ownerToken);
+  if (!resolved) {
+    return renderConsentWithError(db, vaultName || "vault", {
+      clientId, redirectUri, codeChallenge, codeChallengeMethod, scope, state,
+      error: "Invalid vault token.",
+    });
   }
 
   // Generate auth code
@@ -347,6 +364,46 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
 }
 
 // ---------------------------------------------------------------------------
+// Consent page re-render with error
+// ---------------------------------------------------------------------------
+
+function renderConsentWithError(
+  db: Database,
+  vaultName: string,
+  params: {
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+    codeChallengeMethod: string;
+    scope: string;
+    state: string;
+    error: string;
+  },
+): Response {
+  const client = db.prepare("SELECT client_name FROM oauth_clients WHERE client_id = ?")
+    .get(params.clientId) as { client_name: string } | null;
+  const clientName = client?.client_name || "Unknown Client";
+  const normalizedScope: TokenPermission = params.scope === "read" ? "read" : "full";
+
+  const html = renderConsentPage({
+    vaultName,
+    clientName,
+    scope: normalizedScope,
+    clientId: params.clientId,
+    redirectUri: params.redirectUri,
+    codeChallenge: params.codeChallenge,
+    codeChallengeMethod: params.codeChallengeMethod,
+    state: params.state,
+    error: params.error,
+  });
+
+  return new Response(html, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Consent page HTML
 // ---------------------------------------------------------------------------
 
@@ -359,6 +416,7 @@ interface ConsentParams {
   codeChallenge: string;
   codeChallengeMethod: string;
   state: string;
+  error?: string;
 }
 
 function renderConsentPage(p: ConsentParams): string {
@@ -397,6 +455,29 @@ function renderConsentPage(p: ConsentParams): string {
   }
   .scope-label { font-weight: 600; }
   .scope-desc { font-size: 0.9rem; color: #666; }
+  .token-field {
+    margin-top: 1rem;
+  }
+  .token-field label {
+    display: block;
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+  }
+  .token-field input {
+    width: 100%;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    font-family: monospace;
+    box-sizing: border-box;
+  }
+  .error-msg {
+    color: #cc3333;
+    font-size: 0.9rem;
+    margin-top: 0.5rem;
+  }
   .buttons {
     display: flex;
     gap: 0.75rem;
@@ -424,6 +505,8 @@ function renderConsentPage(p: ConsentParams): string {
     .scope { background: #2a2a2a; }
     .scope-desc { color: #999; }
     .client { color: #66b3ff; }
+    .token-field input { background: #2a2a2a; color: #e0e0e0; border-color: #444; }
+    .error-msg { color: #ff6666; }
     button { background: #2a2a2a; color: #e0e0e0; border-color: #444; }
     button[value="authorize"] { background: #0066cc; color: #fff; border-color: #0066cc; }
     button[value="deny"]:hover { background: #333; }
@@ -445,6 +528,11 @@ function renderConsentPage(p: ConsentParams): string {
     <input type="hidden" name="code_challenge_method" value="${escapeHtml(p.codeChallengeMethod)}">
     <input type="hidden" name="scope" value="${escapeHtml(p.scope)}">
     <input type="hidden" name="state" value="${escapeHtml(p.state)}">
+    <div class="token-field">
+      <label for="owner_token">Enter your vault token to authorize</label>
+      <input type="password" id="owner_token" name="owner_token" placeholder="pvt_..." required autocomplete="off">
+      ${p.error ? `<div class="error-msg">${escapeHtml(p.error)}</div>` : ""}
+    </div>
     <div class="buttons">
       <button type="submit" name="action" value="deny">Deny</button>
       <button type="submit" name="action" value="authorize">Authorize</button>

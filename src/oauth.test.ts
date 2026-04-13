@@ -6,7 +6,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import { initSchema } from "../core/src/schema.ts";
-import { resolveToken } from "./token-store.ts";
+import { generateToken, createToken, resolveToken } from "./token-store.ts";
 import {
   handleProtectedResource,
   handleAuthorizationServer,
@@ -42,6 +42,13 @@ function generatePkce(): { codeVerifier: string; codeChallenge: string } {
   return { codeVerifier, codeChallenge };
 }
 
+/** Create a valid owner token in the DB and return the raw token string. */
+function createOwnerToken(): string {
+  const { fullToken } = generateToken();
+  createToken(db, fullToken, { label: "owner", permission: "full" });
+  return fullToken;
+}
+
 /** Register a client and return the client_id. */
 async function registerClient(name = "Test Client", redirectUris = ["https://example.com/callback"]): Promise<string> {
   const req = makeRequest("https://vault.test/oauth/register", {
@@ -56,12 +63,13 @@ async function registerClient(name = "Test Client", redirectUris = ["https://exa
 
 /** Run the full OAuth flow and return the access_token. */
 async function fullOAuthFlow(opts?: { scope?: string }): Promise<string> {
+  const ownerToken = createOwnerToken();
   const clientId = await registerClient();
   const { codeVerifier, codeChallenge } = generatePkce();
   const redirectUri = "https://example.com/callback";
   const scope = opts?.scope || "full";
 
-  // POST authorize (simulate user clicking Authorize)
+  // POST authorize (simulate user clicking Authorize with valid owner token)
   const authReq = makeRequest("https://vault.test/oauth/authorize", {
     method: "POST",
     body: new URLSearchParams({
@@ -72,6 +80,7 @@ async function fullOAuthFlow(opts?: { scope?: string }): Promise<string> {
       code_challenge_method: "S256",
       scope,
       state: "test-state",
+      owner_token: ownerToken,
     }),
   });
   const authRes = await handleAuthorizePost(authReq, db);
@@ -233,6 +242,7 @@ describe("OAuth authorization", () => {
   });
 
   test("POST authorize (approve) redirects with code", async () => {
+    const ownerToken = createOwnerToken();
     const clientId = await registerClient();
     const { codeChallenge } = generatePkce();
 
@@ -246,6 +256,7 @@ describe("OAuth authorization", () => {
         code_challenge_method: "S256",
         scope: "full",
         state: "mystate",
+        owner_token: ownerToken,
       }),
     });
     const res = await handleAuthorizePost(req, db);
@@ -310,6 +321,48 @@ describe("OAuth authorization", () => {
     const res = await handleAuthorizePost(req, db);
     expect(res.status).toBe(400);
   });
+
+  test("POST authorize rejects missing owner token", async () => {
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const req = makeRequest("https://vault.test/oauth/authorize", {
+      method: "POST",
+      body: new URLSearchParams({
+        action: "authorize",
+        client_id: clientId,
+        redirect_uri: "https://example.com/callback",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
+        scope: "full",
+      }),
+    });
+    const res = await handleAuthorizePost(req, db, "default");
+    // Should re-render consent page with error, not redirect
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Vault token is required");
+  });
+
+  test("POST authorize rejects invalid owner token", async () => {
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const req = makeRequest("https://vault.test/oauth/authorize", {
+      method: "POST",
+      body: new URLSearchParams({
+        action: "authorize",
+        client_id: clientId,
+        redirect_uri: "https://example.com/callback",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
+        scope: "full",
+        owner_token: "pvt_invalid_token_value",
+      }),
+    });
+    const res = await handleAuthorizePost(req, db, "default");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Invalid vault token");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -353,6 +406,7 @@ describe("OAuth token exchange", () => {
   });
 
   test("rejects wrong PKCE verifier", async () => {
+    const ownerToken = createOwnerToken();
     const clientId = await registerClient();
     const { codeChallenge } = generatePkce();
     const redirectUri = "https://example.com/callback";
@@ -367,6 +421,7 @@ describe("OAuth token exchange", () => {
         code_challenge: codeChallenge,
         code_challenge_method: "S256",
         scope: "full",
+        owner_token: ownerToken,
       }),
     });
     const authRes = await handleAuthorizePost(authReq, db);
@@ -392,6 +447,7 @@ describe("OAuth token exchange", () => {
   });
 
   test("rejects already-used code", async () => {
+    const ownerToken = createOwnerToken();
     const clientId = await registerClient();
     const { codeVerifier, codeChallenge } = generatePkce();
     const redirectUri = "https://example.com/callback";
@@ -406,6 +462,7 @@ describe("OAuth token exchange", () => {
         code_challenge: codeChallenge,
         code_challenge_method: "S256",
         scope: "full",
+        owner_token: ownerToken,
       }),
     });
     const authRes = await handleAuthorizePost(authReq, db);
@@ -476,6 +533,7 @@ describe("OAuth token exchange", () => {
   });
 
   test("rejects mismatched client_id", async () => {
+    const ownerToken = createOwnerToken();
     const clientId = await registerClient();
     const otherClientId = await registerClient("Other Client");
     const { codeVerifier, codeChallenge } = generatePkce();
@@ -492,6 +550,7 @@ describe("OAuth token exchange", () => {
           code_challenge: codeChallenge,
           code_challenge_method: "S256",
           scope: "full",
+          owner_token: ownerToken,
         }),
       }),
       db,
