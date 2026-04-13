@@ -21,5 +21,10 @@
   },
   "peerDependencies": {
     "typescript": "^5"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ParachuteComputer/parachute-vault.git"
+  },
+  "license": "AGPL-3.0"
 }
