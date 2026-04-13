@@ -53,13 +53,21 @@ parachute vault import ~/Obsidian/Work --vault work    # import into a specific 
 parachute vault import <path> --dry-run                # preview without importing
 parachute vault export ./output --vault work           # export a specific vault
 
-# API keys
+# API keys (legacy)
 parachute vault keys                       # list all keys
 parachute vault keys create                # new global key (all vaults)
 parachute vault keys create --vault work   # new key for one vault
 parachute vault keys create --read-only    # read-only key
-parachute vault keys create --label mobile # label for identification
 parachute vault keys revoke <key-id>       # revoke a key by ID
+
+# Tokens (per-vault, with permission tiers)
+parachute vault tokens                     # list all tokens
+parachute vault tokens create --vault work                    # new admin token
+parachute vault tokens create --vault work --permission read  # read-only token
+parachute vault tokens create --vault work --permission write # write token (no delete)
+parachute vault tokens create --vault work --expires 30d      # token with expiry
+parachute vault tokens create --vault work --label mobile     # labeled token
+parachute vault tokens revoke <token-id> --vault work         # revoke a token
 
 # Config
 parachute vault config                     # show all options
@@ -180,23 +188,21 @@ published_tag: public
 ## REST API
 
 ```
-GET/POST       /api/notes              query or create notes
-GET/PATCH/DEL  /api/notes/:id          read, update, delete
-POST/DEL       /api/notes/:id/tags     tag/untag
-GET            /api/tags               list tags
-DELETE         /api/tags/:name         delete a tag from all notes
-POST/DEL       /api/links              create/delete links
-GET            /api/search?q=...       full-text search
-GET            /api/resolve-wikilink?title=...  resolve a wikilink title to note
-GET            /api/unresolved-wikilinks        list unresolved wikilinks
-POST           /api/storage/upload     upload file (audio/image)
-GET            /api/graph              full knowledge graph
-POST           /mcp                    MCP endpoint
-GET            /view/:noteId           render note as HTML (public or auth)
-GET            /health                 health check
+GET/POST       /api/notes                         query or create notes
+GET/PATCH/DEL  /api/notes/:idOrPath                read, update, delete a single note
+GET/POST       /api/notes/:id/attachments          list or add attachments
+GET            /api/tags                           list tags (?include_schema=true for schemas)
+GET/PUT/DEL    /api/tags/:name                     get, update, or delete a tag
+GET            /api/find-path?source=...&target=...  shortest path between two notes
+GET/PATCH      /api/vault                          vault info (get or update description)
+POST           /api/storage/upload                 upload file (audio/image)
+GET            /api/storage/:path                  download file
+POST           /mcp                                MCP endpoint (unified, all vaults)
+GET            /view/:idOrPath                     render note as HTML (public or auth)
+GET            /health                             health check
 ```
 
-Per-vault routes at `/vaults/{name}/api/...`, `/vaults/{name}/mcp`, and `/vaults/{name}/view/:noteId`.
+Per-vault routes at `/vaults/{name}/api/...`, `/vaults/{name}/mcp`, and `/vaults/{name}/view/:idOrPath`.
 
 ## Data model
 
@@ -218,15 +224,17 @@ Metadata is a JSON column. Vaults start blank — no predefined tags or schema.
 
 ### Passing the key
 
+Both legacy API keys (`pvk_...`) and scoped tokens (`pvt_...`) work interchangeably:
+
 ```bash
 # Header (preferred)
-curl -H "Authorization: Bearer pvk_..." http://localhost:1940/api/notes
+curl -H "Authorization: Bearer pvt_..." http://localhost:1940/api/notes
 
 # Alternative header
-curl -H "X-API-Key: pvk_..." http://localhost:1940/api/notes
+curl -H "X-API-Key: pvt_..." http://localhost:1940/api/notes
 
 # Query param (for /view endpoint only — convenient for browsers)
-curl http://localhost:1940/view/noteId?key=pvk_...
+curl http://localhost:1940/view/noteId?key=pvt_...
 ```
 
 ### Claude Desktop
@@ -251,20 +259,32 @@ Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp
 
 ### Key management
 
+**Tokens** (recommended) — per-vault, with three permission tiers:
+
+| Permission | Can do |
+|---|---|
+| `admin` | Everything (CRUD + delete + token management) |
+| `write` | Read + create/update notes, tags |
+| `read` | Query, list, find-path, vault-info only |
+
 ```bash
-parachute vault keys                       # list all keys (shows ID, label, scope, last used)
-parachute vault keys create                # new global key
-parachute vault keys create --vault work   # new per-vault key
-parachute vault keys create --read-only    # read-only key (GET only, no mutations)
-parachute vault keys create --label phone  # custom label for identification
-parachute vault keys revoke <key-id>       # revoke by ID (shown in `keys` output)
+parachute vault tokens                                        # list all tokens
+parachute vault tokens create --vault work                    # admin token
+parachute vault tokens create --vault work --permission read  # read-only
+parachute vault tokens create --vault work --expires 30d      # with expiry
+parachute vault tokens revoke <token-id> --vault work         # revoke
 ```
 
-Keys are shown once at creation — save them immediately. Keys are SHA-256 hashed at rest and cannot be recovered.
+**Legacy API keys** — global or per-vault, stored in config.yaml/vault.yaml. Still work as admin tokens. `vault init` creates one automatically.
 
-**Per-vault keys** (stored in `vault.yaml`) grant access to one vault's API and `/vaults/{name}/mcp` endpoint. Use for single-purpose integrations (e.g., a mobile app that only writes to one vault).
+```bash
+parachute vault keys                       # list legacy keys
+parachute vault keys create                # new global key
+parachute vault keys create --vault work   # new per-vault key
+parachute vault keys create --label phone  # labeled key
+```
 
-**Global keys** (stored in `config.yaml`) grant access to all vaults and the unified `/mcp` endpoint. Use for AI agents that work across vaults or for admin access. `vault init` creates a global key automatically.
+All keys are shown once at creation — save them immediately. SHA-256 hashed at rest.
 
 ### Public endpoints
 

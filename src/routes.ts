@@ -19,7 +19,6 @@ import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
-import type { AuthResult } from "./auth.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -58,33 +57,6 @@ function resolveNote(store: Store, idOrPath: string): Note | null {
   return store.getNoteByPath(idOrPath);
 }
 
-/**
- * Check if a note passes the token's scope filter.
- * Returns true if the note is within scope, false if it should be hidden.
- */
-function noteInScope(note: Note, auth?: AuthResult): boolean {
-  if (!auth) return true;
-  if (auth.scope_tag) {
-    if (!note.tags?.includes(auth.scope_tag)) return false;
-  }
-  if (auth.scope_path_prefix) {
-    if (!note.path) return false;
-    if (!note.path.startsWith(auth.scope_path_prefix)) return false;
-  }
-  return true;
-}
-
-/**
- * Resolve a note by ID or path, respecting token scope.
- * Returns null if the note exists but is outside the token's scope.
- */
-function resolveNoteScoped(store: Store, idOrPath: string, auth?: AuthResult): Note | null {
-  const note = resolveNote(store, idOrPath);
-  if (!note) return null;
-  if (!noteInScope(note, auth)) return null;
-  return note;
-}
-
 function requireNote(store: Store, idOrPath: string): Note {
   const note = resolveNote(store, idOrPath);
   if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
@@ -106,7 +78,6 @@ export async function handleNotes(
   req: Request,
   store: Store,
   subpath: string,
-  auth?: AuthResult,
 ): Promise<Response> {
   const url = new URL(req.url);
   const method = req.method;
@@ -121,7 +92,7 @@ export async function handleNotes(
 
       // Single note by id/path
       if (id) {
-        const note = resolveNoteScoped(store, id, auth);
+        const note = resolveNote(store, id);
         if (!note) return json({ error: "Note not found", id }, 404);
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
         const result: any = includeContent ? { ...note } : toNoteIndex(note);
@@ -137,35 +108,20 @@ export async function handleNotes(
       // Full-text search
       if (search) {
         const searchTags = parseQueryList(url, "tag");
-        // Merge scope_tag into search tags
-        const mergedSearchTags = auth?.scope_tag
-          ? [...(searchTags ?? []), auth.scope_tag]
-          : searchTags;
         const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
-        let results = store.searchNotes(search, { tags: mergedSearchTags, limit });
-        // Apply path prefix scope
-        if (auth?.scope_path_prefix) {
-          results = results.filter((n) => n.path?.startsWith(auth.scope_path_prefix!));
-        }
+        const results = store.searchNotes(search, { tags: searchTags, limit });
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         return json(includeContent ? results : results.map(toNoteIndex));
       }
 
-      // Structured query — merge token scope into query constraints
+      // Structured query
       const tags = parseQueryList(url, "tag");
-      const scopedTags = auth?.scope_tag ? [...(tags ?? []), auth.scope_tag] : tags;
-      const requestedPathPrefix = parseQuery(url, "path_prefix") ?? undefined;
-      const scopedPathPrefix = auth?.scope_path_prefix
-        ? (requestedPathPrefix
-          ? (requestedPathPrefix.startsWith(auth.scope_path_prefix) ? requestedPathPrefix : auth.scope_path_prefix)
-          : auth.scope_path_prefix)
-        : requestedPathPrefix;
       let results: Note[] = store.queryNotes({
-        tags: scopedTags,
-        tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (scopedTags && scopedTags.length > 1 ? "any" : undefined),
+        tags,
+        tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
         excludeTags: parseQueryList(url, "exclude_tag"),
         path: parseQuery(url, "path") ?? undefined,
-        pathPrefix: scopedPathPrefix,
+        pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
         metadata: undefined, // metadata filter not practical in query params
         dateFrom: parseQuery(url, "date_from") ?? undefined,
         dateTo: parseQuery(url, "date_to") ?? undefined,
@@ -270,14 +226,14 @@ export async function handleNotes(
   // Attachments sub-routes (keep as-is — Daily needs them)
   if (sub === "/attachments") {
     if (method === "POST") {
-      const note = resolveNoteScoped(store, idOrPath, auth);
+      const note = resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
       const body = await req.json() as { path: string; mimeType: string };
       if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
       return json(store.addAttachment(note.id, body.path, body.mimeType), 201);
     }
     if (method === "GET") {
-      const note = resolveNoteScoped(store, idOrPath, auth);
+      const note = resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
       return json(store.getAttachments(note.id));
     }
@@ -288,7 +244,7 @@ export async function handleNotes(
 
   // GET /notes/:idOrPath — single note
   if (method === "GET") {
-    const note = resolveNoteScoped(store, idOrPath, auth);
+    const note = resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
     const result: any = includeContent ? { ...note } : toNoteIndex(note);
@@ -304,7 +260,7 @@ export async function handleNotes(
   // PATCH /notes/:idOrPath — update (content, path, metadata, tags, links)
   if (method === "PATCH") {
     try {
-      const note = resolveNoteScoped(store, idOrPath, auth);
+      const note = resolveNote(store, idOrPath);
       if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
       const body = await req.json() as any;
 
@@ -367,7 +323,7 @@ export async function handleNotes(
 
   // DELETE /notes/:idOrPath — admin only (enforced at server level)
   if (method === "DELETE") {
-    const note = resolveNoteScoped(store, idOrPath, auth);
+    const note = resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
     store.deleteNote(note.id);
     return json({ deleted: true, id: note.id });
@@ -380,7 +336,7 @@ export async function handleNotes(
 // Tags — GET/PUT/DELETE /api/tags[/:name]
 // ---------------------------------------------------------------------------
 
-export async function handleTags(req: Request, store: Store, subpath = "", auth?: AuthResult): Promise<Response> {
+export async function handleTags(req: Request, store: Store, subpath = ""): Promise<Response> {
   const url = new URL(req.url);
   const db = (store as any).db;
 
@@ -389,10 +345,6 @@ export async function handleTags(req: Request, store: Store, subpath = "", auth?
     const singleTag = parseQuery(url, "tag");
 
     if (singleTag) {
-      // If scoped by tag, only allow querying the scope tag
-      if (auth?.scope_tag && singleTag !== auth.scope_tag) {
-        return json({ error: "Tag not found" }, 404);
-      }
       const allTags = store.listTags();
       const found = allTags.find((t) => t.name === singleTag);
       const schema = store.getTagSchema(singleTag);
@@ -404,11 +356,7 @@ export async function handleTags(req: Request, store: Store, subpath = "", auth?
       });
     }
 
-    let tags = store.listTags();
-    // If scoped by tag, only show the scope tag
-    if (auth?.scope_tag) {
-      tags = tags.filter((t) => t.name === auth.scope_tag);
-    }
+    const tags = store.listTags();
     if (parseBool(parseQuery(url, "include_schema"), false)) {
       const schemas = store.getTagSchemaMap();
       return json(tags.map((t) => ({
@@ -463,7 +411,7 @@ export async function handleTags(req: Request, store: Store, subpath = "", auth?
 // Find-path — GET /api/find-path?source=...&target=...
 // ---------------------------------------------------------------------------
 
-export function handleFindPath(req: Request, store: Store, auth?: AuthResult): Response {
+export function handleFindPath(req: Request, store: Store): Response {
   if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
 
   const url = new URL(req.url);
@@ -473,21 +421,13 @@ export function handleFindPath(req: Request, store: Store, auth?: AuthResult): R
 
   const db = (store as any).db;
   try {
-    const sourceNote = resolveNoteScoped(store, source, auth);
+    const sourceNote = resolveNote(store, source);
     if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
-    const targetNote = resolveNoteScoped(store, target, auth);
+    const targetNote = resolveNote(store, target);
     if (!targetNote) return json({ error: `Note not found: "${target}"` }, 404);
     const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
 
-    // Build a node filter so BFS only traverses in-scope notes
-    const nodeFilter = (auth?.scope_tag || auth?.scope_path_prefix)
-      ? (noteId: string) => {
-          const note = store.getNote(noteId);
-          return note ? noteInScope(note, auth) : false;
-        }
-      : undefined;
-
-    const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth, nodeFilter });
+    const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth });
     return json(result);
   } catch (e: any) {
     if (e instanceof NotFoundError) return json({ error: e.message }, 404);
@@ -541,7 +481,7 @@ export function handleUnresolvedWikilinks(req: Request, store: Store): Response 
   const limitStr = url.searchParams.get("limit");
   const limit = limitStr ? parseInt(limitStr, 10) : 50;
   const db = (store as any).db;
-  return json(listUnresolvedWikilinks(db, limit));
+  return Response.json(listUnresolvedWikilinks(db, limit));
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +680,7 @@ const MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-export async function handleStorage(req: Request, path: string, vault: string, auth?: AuthResult, store?: Store): Promise<Response> {
+export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
   const assets = assetsDir(vault);
 
   if (req.method === "POST" && path === "/upload") {
@@ -782,22 +722,6 @@ export async function handleStorage(req: Request, path: string, vault: string, a
     }
     if (!existsSync(filePath)) {
       return json({ error: "Not found" }, 404);
-    }
-
-    // Scope check: verify the attachment belongs to a note the token can see
-    if (store && (auth?.scope_tag || auth?.scope_path_prefix)) {
-      const db = (store as any).db;
-      const attachment = db.prepare(
-        "SELECT note_id FROM attachments WHERE path = ?",
-      ).get(reqPath) as { note_id: string } | null;
-      if (attachment) {
-        const note = store.getNote(attachment.note_id);
-        if (!note || !noteInScope(note, auth)) {
-          return json({ error: "Not found" }, 404);
-        }
-      }
-      // If no attachment record found, the file exists on disk but isn't tracked —
-      // allow access (it's a raw storage file, not linked to any note)
     }
 
     const stat = statSync(filePath);

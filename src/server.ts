@@ -262,15 +262,15 @@ async function route(req: Request, path: string): Promise<Response> {
       return Response.json({ error: "Forbidden", message: "Insufficient permissions" }, { status: 403 });
     }
     const apiPath = path.slice(4); // strip "/api"
-    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), auth);
-    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), auth);
-    if (apiPath === "/find-path") return handleFindPath(req, store, auth);
+    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
+    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
+    if (apiPath === "/find-path") return handleFindPath(req, store);
     if (apiPath === "/vault") return handleVault(req, store, vaultConfig, (desc) => {
       vaultConfig.description = desc;
       writeVaultConfig(vaultConfig);
     });
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
-    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault, auth, store);
+    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
   }
 
@@ -351,13 +351,13 @@ async function route(req: Request, path: string): Promise<Response> {
   const apiPath = apiMatch[1] ?? "";
 
   if (apiPath.startsWith("/notes")) {
-    return handleNotes(req, store, apiPath.slice(6), auth);
+    return handleNotes(req, store, apiPath.slice(6));
   }
   if (apiPath.startsWith("/tags")) {
-    return handleTags(req, store, apiPath.slice(5), auth);
+    return handleTags(req, store, apiPath.slice(5));
   }
   if (apiPath === "/find-path") {
-    return handleFindPath(req, store, auth);
+    return handleFindPath(req, store);
   }
   if (apiPath === "/vault") {
     return handleVault(req, store, vaultConfig, (desc) => {
@@ -369,7 +369,7 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleUnresolvedWikilinks(req, store);
   }
   if (apiPath.startsWith("/storage")) {
-    return handleStorage(req, apiPath.slice(8), vaultName, auth, store);
+    return handleStorage(req, apiPath.slice(8), vaultName);
   }
   if (apiPath === "/health") {
     return Response.json({ status: "ok", vault: vaultName });
