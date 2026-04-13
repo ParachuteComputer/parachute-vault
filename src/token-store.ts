@@ -143,6 +143,9 @@ export function createToken(
  * Updates last_used_at on successful resolution.
  */
 export function resolveToken(db: Database, providedToken: string): ResolvedToken | null {
+  // Hash-then-lookup: the SQL = comparison on SHA-256 output is not timing-safe,
+  // but this is acceptable — the attacker would need to guess a valid SHA-256
+  // preimage, which is computationally infeasible regardless of timing leaks.
   const candidateHash = hashKey(providedToken);
 
   const row = db.prepare(`
@@ -196,18 +199,23 @@ export function listTokens(db: Database): (Token & { id: string })[] {
 
 /**
  * Revoke (delete) a token by its display ID or full hash.
- * Returns true if a token was deleted.
+ * Returns true if exactly one token was deleted.
+ * If a display ID prefix matches multiple tokens, returns false (ambiguous).
  */
 export function revokeToken(db: Database, idOrHash: string): boolean {
   // Try matching by display ID prefix
   if (idOrHash.startsWith("t_")) {
     const hashPrefix = idOrHash.slice(2);
-    const row = db.prepare(
+    const rows = db.prepare(
       "SELECT token_hash FROM tokens WHERE token_hash LIKE ?"
-    ).get(`sha256:${hashPrefix}%`) as { token_hash: string } | null;
-    if (row) {
-      db.prepare("DELETE FROM tokens WHERE token_hash = ?").run(row.token_hash);
+    ).all(`sha256:${hashPrefix}%`) as { token_hash: string }[];
+    if (rows.length === 1) {
+      db.prepare("DELETE FROM tokens WHERE token_hash = ?").run(rows[0].token_hash);
       return true;
+    }
+    if (rows.length > 1) {
+      // Ambiguous prefix — refuse to revoke
+      return false;
     }
   }
 

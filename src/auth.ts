@@ -171,16 +171,23 @@ export function authenticateGlobalRequest(
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
 
-  // Try token DB (global tokens only — vault=NULL)
+  // Try token DB — only accept global tokens (vault=NULL) for the unified endpoint
   try {
     const db = getTokenDb();
     const resolved = resolveToken(db, key);
-    if (resolved && resolved.vault === null) {
-      return {
-        permission: resolved.permission,
-        scope_tag: resolved.scope_tag,
-        scope_path_prefix: resolved.scope_path_prefix,
-      };
+    if (resolved) {
+      if (resolved.vault === null) {
+        return {
+          permission: resolved.permission,
+          scope_tag: resolved.scope_tag,
+          scope_path_prefix: resolved.scope_path_prefix,
+        };
+      }
+      // Valid token but vault-scoped — not allowed on the global endpoint
+      return { error: Response.json(
+        { error: "Forbidden", message: `This token is scoped to vault "${resolved.vault}" and cannot access the unified endpoint` },
+        { status: 403 },
+      ) };
     }
   } catch {}
 
