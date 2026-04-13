@@ -7,17 +7,16 @@
  *   - "read"  — read-only (query, list, find-path, vault-info)
  *
  * Tokens live in each vault's SQLite database (tokens table, schema v7).
- * They can be scoped by tag or path prefix to restrict which notes are visible.
  *
  * Backward compatibility: config.yaml API keys are still checked as a fallback.
- * Those keys resolve as admin tokens with no scope.
+ * Those keys resolve as admin tokens.
  *
  * The unified /mcp endpoint uses only legacy global config.yaml keys, since
  * tokens are per-vault and the unified endpoint spans all vaults.
  */
 
 import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
-import type { VaultConfig, StoredKey, KeyScope } from "./config.ts";
+import type { VaultConfig, StoredKey } from "./config.ts";
 import { resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import type { Database } from "bun:sqlite";
@@ -25,8 +24,6 @@ import type { Database } from "bun:sqlite";
 /** Result of a successful auth check. */
 export interface AuthResult {
   permission: TokenPermission;
-  scope_tag: string | null;
-  scope_path_prefix: string | null;
 }
 
 /** Read-only tools (allowed for "read" permission). */
@@ -108,11 +105,7 @@ export function authenticateVaultRequest(
     try {
       const resolved = resolveToken(vaultDb, key);
       if (resolved) {
-        return {
-          permission: resolved.permission,
-          scope_tag: resolved.scope_tag,
-          scope_path_prefix: resolved.scope_path_prefix,
-        };
+        return { permission: resolved.permission };
       }
     } catch {
       // Token table might not exist yet — fall through to legacy auth
@@ -123,11 +116,7 @@ export function authenticateVaultRequest(
   const vaultKey = validateKey(vaultConfig.api_keys, key);
   if (vaultKey) {
     try { writeVaultConfig(vaultConfig); } catch {}
-    return {
-      permission: vaultKey.scope === "read" ? "read" : "admin",
-      scope_tag: null,
-      scope_path_prefix: null,
-    };
+    return { permission: vaultKey.scope === "read" ? "read" : "admin" };
   }
 
   // Legacy: check global keys from config.yaml
@@ -136,11 +125,7 @@ export function authenticateVaultRequest(
     const globalKey = validateKey(globalConfig.api_keys, key);
     if (globalKey) {
       try { writeGlobalConfig(globalConfig); } catch {}
-      return {
-        permission: globalKey.scope === "read" ? "read" : "admin",
-        scope_tag: null,
-        scope_path_prefix: null,
-      };
+      return { permission: globalKey.scope === "read" ? "read" : "admin" };
     }
   }
 
@@ -166,11 +151,7 @@ export function authenticateGlobalRequest(
     const matched = validateKey(globalConfig.api_keys, key);
     if (matched) {
       try { writeGlobalConfig(globalConfig); } catch {}
-      return {
-        permission: matched.scope === "read" ? "read" : "admin",
-        scope_tag: null,
-        scope_path_prefix: null,
-      };
+      return { permission: matched.scope === "read" ? "read" : "admin" };
     }
   }
 

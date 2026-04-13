@@ -530,10 +530,9 @@ function cmdTokens(args: string[]) {
 
       console.log(`Vault "${vaultName}" tokens:`);
       for (const t of tokens) {
-        const scope = formatScope(t);
         const expiry = t.expires_at ? ` (expires: ${t.expires_at})` : "";
         const lastUsed = t.last_used_at ? ` (last used: ${t.last_used_at})` : "";
-        console.log(`  ${t.id}  ${t.label}  [${t.permission}]${scope}${expiry}${lastUsed}`);
+        console.log(`  ${t.id}  ${t.label}  [${t.permission}]${expiry}${lastUsed}`);
       }
       console.log();
     }
@@ -545,7 +544,7 @@ function cmdTokens(args: string[]) {
   }
 
   // parachute vault tokens create --vault <name> [--permission admin|write|read]
-  //   [--scope-tag <tag>] [--scope-path-prefix <prefix>] [--expires <duration>] [--label <label>]
+  //   [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
     const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
@@ -568,12 +567,6 @@ function cmdTokens(args: string[]) {
       process.exit(1);
     }
 
-    const scopeTagFlag = args.indexOf("--scope-tag");
-    const scopeTag = scopeTagFlag !== -1 ? args[scopeTagFlag + 1] : null;
-
-    const scopePathFlag = args.indexOf("--scope-path-prefix");
-    const scopePath = scopePathFlag !== -1 ? args[scopePathFlag + 1] : null;
-
     const expiresFlag = args.indexOf("--expires");
     let expiresAt: string | null = null;
     if (expiresFlag !== -1) {
@@ -593,16 +586,12 @@ function cmdTokens(args: string[]) {
     createToken(store.db, fullToken, {
       label,
       permission,
-      scope_tag: scopeTag,
-      scope_path_prefix: scopePath,
       expires_at: expiresAt,
     });
 
     console.log(`Created token for vault "${vaultName}":`);
     console.log(`  Token:      ${fullToken}`);
     console.log(`  Permission: ${permission}`);
-    if (scopeTag) console.log(`  Scope tag:  ${scopeTag}`);
-    if (scopePath) console.log(`  Scope path: ${scopePath}`);
     if (expiresAt) console.log(`  Expires:    ${expiresAt}`);
     console.log(`  Label:      ${label}`);
     console.log();
@@ -644,13 +633,6 @@ function cmdTokens(args: string[]) {
   console.error(`Unknown tokens command: ${subcmd}`);
   console.error("Usage: parachute vault tokens [create | list | revoke <id>]");
   process.exit(1);
-}
-
-function formatScope(t: { scope_tag: string | null; scope_path_prefix: string | null }): string {
-  const parts: string[] = [];
-  if (t.scope_tag) parts.push(`tag:${t.scope_tag}`);
-  if (t.scope_path_prefix) parts.push(`path:${t.scope_path_prefix}`);
-  return parts.length > 0 ? ` {${parts.join(", ")}}` : "";
 }
 
 function parseDuration(dur: string): string | null {

@@ -23,7 +23,9 @@ export interface Token {
   token_hash: string;
   label: string;
   permission: TokenPermission;
+  /** @deprecated Scope columns exist in DB but are not enforced at runtime. */
   scope_tag: string | null;
+  /** @deprecated Scope columns exist in DB but are not enforced at runtime. */
   scope_path_prefix: string | null;
   expires_at: string | null;
   created_at: string;
@@ -32,8 +34,6 @@ export interface Token {
 
 export interface ResolvedToken {
   permission: TokenPermission;
-  scope_tag: string | null;
-  scope_path_prefix: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +52,9 @@ export function createToken(
   opts: {
     label: string;
     permission?: TokenPermission;
+    /** @deprecated Written to DB but not enforced at runtime. */
     scope_tag?: string | null;
+    /** @deprecated Written to DB but not enforced at runtime. */
     scope_path_prefix?: string | null;
     expires_at?: string | null;
   },
@@ -97,13 +99,11 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const candidateHash = hashKey(providedToken);
 
   const row = db.prepare(`
-    SELECT token_hash, permission, scope_tag, scope_path_prefix, expires_at
+    SELECT token_hash, permission, expires_at
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
     permission: TokenPermission;
-    scope_tag: string | null;
-    scope_path_prefix: string | null;
     expires_at: string | null;
   } | null;
 
@@ -118,11 +118,7 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   db.prepare("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
     .run(new Date().toISOString(), row.token_hash);
 
-  return {
-    permission: row.permission,
-    scope_tag: row.scope_tag,
-    scope_path_prefix: row.scope_path_prefix,
-  };
+  return { permission: row.permission };
 }
 
 /**

@@ -267,10 +267,9 @@ export function findPath(
   db: Database,
   sourceId: string,
   targetId: string,
-  opts?: { max_depth?: number; nodeFilter?: (noteId: string) => boolean },
+  opts?: { max_depth?: number },
 ): { path: string[]; relationships: string[] } | null {
   const maxDepth = opts?.max_depth ?? 5;
-  const nodeFilter = opts?.nodeFilter;
 
   if (sourceId === targetId) {
     return { path: [sourceId], relationships: [] };
@@ -301,8 +300,6 @@ export function findPath(
 
       for (const neighbor of neighbors) {
         if (visited.has(neighbor.id)) continue;
-        // Skip nodes that don't pass the filter (e.g. out-of-scope notes)
-        if (nodeFilter && !nodeFilter(neighbor.id)) continue;
         visited.set(neighbor.id, { parent: currentId, relationship: neighbor.rel });
         nextFrontier.push(neighbor.id);
 

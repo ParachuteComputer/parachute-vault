@@ -33,34 +33,28 @@ describe("token CRUD", () => {
     const resolved = resolveToken(db, fullToken);
     expect(resolved).not.toBeNull();
     expect(resolved!.permission).toBe("admin");
-    expect(resolved!.scope_tag).toBeNull();
-    expect(resolved!.scope_path_prefix).toBeNull();
   });
 
-  test("token with tag scope", () => {
+  test("token with read permission", () => {
     const { fullToken } = generateToken();
     createToken(db, fullToken, {
-      label: "publish-reader",
+      label: "reader",
       permission: "read",
-      scope_tag: "publish",
     });
 
     const resolved = resolveToken(db, fullToken);
     expect(resolved!.permission).toBe("read");
-    expect(resolved!.scope_tag).toBe("publish");
   });
 
-  test("token with path prefix scope", () => {
+  test("token with write permission", () => {
     const { fullToken } = generateToken();
     createToken(db, fullToken, {
-      label: "projects-writer",
+      label: "writer",
       permission: "write",
-      scope_path_prefix: "Projects/",
     });
 
     const resolved = resolveToken(db, fullToken);
     expect(resolved!.permission).toBe("write");
-    expect(resolved!.scope_path_prefix).toBe("Projects/");
   });
 
   test("expired token is rejected", () => {
@@ -160,19 +154,3 @@ describe("token generation", () => {
   });
 });
 
-describe("token with combined scopes", () => {
-  test("token with both tag and path prefix scope", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, {
-      label: "double-scoped",
-      permission: "write",
-      scope_tag: "publish",
-      scope_path_prefix: "Blog/",
-    });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("write");
-    expect(resolved!.scope_tag).toBe("publish");
-    expect(resolved!.scope_path_prefix).toBe("Blog/");
-  });
-});
