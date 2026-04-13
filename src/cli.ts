@@ -38,6 +38,8 @@ import {
   CONFIG_DIR,
   ASSETS_DIR,
   ENV_PATH,
+  LOG_PATH,
+  ERR_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
@@ -95,6 +97,9 @@ switch (command) {
     break;
   case "serve":
     await cmdServe();
+    break;
+  case "logs":
+    await cmdLogs();
     break;
   case "status":
     await cmdStatus();
@@ -530,6 +535,14 @@ async function cmdServe() {
   await import("./server.ts");
 }
 
+async function cmdLogs() {
+  const proc = Bun.spawn(["tail", "-f", LOG_PATH, ERR_PATH], {
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  await proc.exited;
+}
+
 async function cmdRestart() {
   console.log("Restarting daemon...");
   if (process.platform === "darwin") {
@@ -879,6 +892,7 @@ Import/Export:
 
 Server:
   parachute vault serve                    Run server (foreground)
+  parachute vault logs                     Stream server logs
   parachute vault restart                  Restart the daemon
 `);
 }
