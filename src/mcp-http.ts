@@ -29,6 +29,10 @@ import { isToolAllowed } from "./auth.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import type { TokenPermission } from "./token-store.ts";
+import * as linkOps from "../core/src/links.ts";
+import * as noteOps from "../core/src/notes.ts";
+import { getVaultStore } from "./vault-store.ts";
+import { readGlobalConfig } from "./config.ts";
 
 /** Handle unified MCP at /mcp (all vaults). */
 export async function handleUnifiedMcp(req: Request, auth: AuthResult): Promise<Response> {
@@ -97,7 +101,15 @@ async function handleMcp(
     }
     try {
       const scopedArgs = applyScopeToArgs(name, (args ?? {}) as Record<string, unknown>, auth);
-      let result = tool.execute(scopedArgs);
+      let result: unknown;
+
+      // find-path needs special handling: BFS must be scope-constrained
+      if (name === "find-path" && (auth.scope_tag || auth.scope_path_prefix)) {
+        result = executeScopedFindPath(scopedArgs, auth);
+      } else {
+        result = tool.execute(scopedArgs);
+      }
+
       result = applyScopeToResult(name, result, auth);
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -211,4 +223,43 @@ function noteInScope(
     if (!note.path || !note.path.startsWith(auth.scope_path_prefix)) return false;
   }
   return true;
+}
+
+/**
+ * Execute find-path with scope-constrained BFS.
+ * Resolves the vault from args, builds a nodeFilter from auth scope,
+ * and delegates to linkOps.findPath with the filter.
+ */
+function executeScopedFindPath(
+  args: Record<string, unknown>,
+  auth: AuthResult,
+): unknown {
+  const vaultName = (args.vault as string) ?? readGlobalConfig().default_vault ?? "default";
+  const store = getVaultStore(vaultName);
+  const db = store.db;
+
+  const sourceIdOrPath = args.source as string;
+  const targetIdOrPath = args.target as string;
+  if (!sourceIdOrPath || !targetIdOrPath) {
+    throw new Error("source and target are required");
+  }
+
+  // Resolve source and target, checking scope
+  const sourceNote = noteOps.getNote(db, sourceIdOrPath) ?? noteOps.getNoteByPath(db, sourceIdOrPath);
+  if (!sourceNote) throw new Error(`Note not found: "${sourceIdOrPath}"`);
+  if (!noteInScope(sourceNote, auth)) throw new Error(`Note not found: "${sourceIdOrPath}"`);
+
+  const targetNote = noteOps.getNote(db, targetIdOrPath) ?? noteOps.getNoteByPath(db, targetIdOrPath);
+  if (!targetNote) throw new Error(`Note not found: "${targetIdOrPath}"`);
+  if (!noteInScope(targetNote, auth)) throw new Error(`Note not found: "${targetIdOrPath}"`);
+
+  const maxDepth = Math.min((args.max_depth as number) ?? 5, 10);
+
+  // BFS only through in-scope notes
+  const nodeFilter = (noteId: string) => {
+    const note = noteOps.getNote(db, noteId);
+    return note ? noteInScope(note, auth) : false;
+  };
+
+  return linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth, nodeFilter });
 }

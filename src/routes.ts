@@ -478,7 +478,16 @@ export function handleFindPath(req: Request, store: Store, auth?: AuthResult): R
     const targetNote = resolveNoteScoped(store, target, auth);
     if (!targetNote) return json({ error: `Note not found: "${target}"` }, 404);
     const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
-    const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth });
+
+    // Build a node filter so BFS only traverses in-scope notes
+    const nodeFilter = (auth?.scope_tag || auth?.scope_path_prefix)
+      ? (noteId: string) => {
+          const note = store.getNote(noteId);
+          return note ? noteInScope(note, auth) : false;
+        }
+      : undefined;
+
+    const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth, nodeFilter });
     return json(result);
   } catch (e: any) {
     if (e instanceof NotFoundError) return json({ error: e.message }, 404);
@@ -731,7 +740,7 @@ const MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
+export async function handleStorage(req: Request, path: string, vault: string, auth?: AuthResult, store?: Store): Promise<Response> {
   const assets = assetsDir(vault);
 
   if (req.method === "POST" && path === "/upload") {
@@ -773,6 +782,22 @@ export async function handleStorage(req: Request, path: string, vault: string): 
     }
     if (!existsSync(filePath)) {
       return json({ error: "Not found" }, 404);
+    }
+
+    // Scope check: verify the attachment belongs to a note the token can see
+    if (store && (auth?.scope_tag || auth?.scope_path_prefix)) {
+      const db = (store as any).db;
+      const attachment = db.prepare(
+        "SELECT note_id FROM attachments WHERE path = ?",
+      ).get(reqPath) as { note_id: string } | null;
+      if (attachment) {
+        const note = store.getNote(attachment.note_id);
+        if (!note || !noteInScope(note, auth)) {
+          return json({ error: "Not found" }, 404);
+        }
+      }
+      // If no attachment record found, the file exists on disk but isn't tracked —
+      // allow access (it's a raw storage file, not linked to any note)
     }
 
     const stat = statSync(filePath);
