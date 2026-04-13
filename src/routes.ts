@@ -380,7 +380,7 @@ export async function handleNotes(
 // Tags — GET/PUT/DELETE /api/tags[/:name]
 // ---------------------------------------------------------------------------
 
-export async function handleTags(req: Request, store: Store, subpath = ""): Promise<Response> {
+export async function handleTags(req: Request, store: Store, subpath = "", auth?: AuthResult): Promise<Response> {
   const url = new URL(req.url);
   const db = (store as any).db;
 
@@ -389,6 +389,10 @@ export async function handleTags(req: Request, store: Store, subpath = ""): Prom
     const singleTag = parseQuery(url, "tag");
 
     if (singleTag) {
+      // If scoped by tag, only allow querying the scope tag
+      if (auth?.scope_tag && singleTag !== auth.scope_tag) {
+        return json({ error: "Tag not found" }, 404);
+      }
       const allTags = store.listTags();
       const found = allTags.find((t) => t.name === singleTag);
       const schema = store.getTagSchema(singleTag);
@@ -400,7 +404,11 @@ export async function handleTags(req: Request, store: Store, subpath = ""): Prom
       });
     }
 
-    const tags = store.listTags();
+    let tags = store.listTags();
+    // If scoped by tag, only show the scope tag
+    if (auth?.scope_tag) {
+      tags = tags.filter((t) => t.name === auth.scope_tag);
+    }
     if (parseBool(parseQuery(url, "include_schema"), false)) {
       const schemas = store.getTagSchemaMap();
       return json(tags.map((t) => ({
@@ -455,7 +463,7 @@ export async function handleTags(req: Request, store: Store, subpath = ""): Prom
 // Find-path — GET /api/find-path?source=...&target=...
 // ---------------------------------------------------------------------------
 
-export function handleFindPath(req: Request, store: Store): Response {
+export function handleFindPath(req: Request, store: Store, auth?: AuthResult): Response {
   if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
 
   const url = new URL(req.url);
@@ -465,8 +473,10 @@ export function handleFindPath(req: Request, store: Store): Response {
 
   const db = (store as any).db;
   try {
-    const sourceNote = requireNote(store, source);
-    const targetNote = requireNote(store, target);
+    const sourceNote = resolveNoteScoped(store, source, auth);
+    if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
+    const targetNote = resolveNoteScoped(store, target, auth);
+    if (!targetNote) return json({ error: `Note not found: "${target}"` }, 404);
     const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
     const result = linkOps.findPath(db, sourceNote.id, targetNote.id, { max_depth: maxDepth });
     return json(result);

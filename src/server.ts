@@ -204,7 +204,7 @@ async function route(req: Request, path: string): Promise<Response> {
   if (path === "/mcp" || path.startsWith("/mcp/")) {
     const auth = authenticateGlobalRequest(req);
     if ("error" in auth) return auth.error;
-    return handleUnifiedMcp(req, auth.permission);
+    return handleUnifiedMcp(req, auth);
   }
 
   // View endpoint — serves notes as HTML (auth-aware, supports ID or path)
@@ -263,8 +263,8 @@ async function route(req: Request, path: string): Promise<Response> {
     }
     const apiPath = path.slice(4); // strip "/api"
     if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), auth);
-    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
-    if (apiPath === "/find-path") return handleFindPath(req, store);
+    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), auth);
+    if (apiPath === "/find-path") return handleFindPath(req, store, auth);
     if (apiPath === "/vault") return handleVault(req, store, vaultConfig, (desc) => {
       vaultConfig.description = desc;
       writeVaultConfig(vaultConfig);
@@ -317,7 +317,7 @@ async function route(req: Request, path: string): Promise<Response> {
 
   // Per-vault scoped MCP
   if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
-    return handleScopedMcp(req, vaultName, auth.permission);
+    return handleScopedMcp(req, vaultName, auth);
   }
 
   // Bare /vaults/{name} — single-vault root. Returns name, description,
@@ -354,10 +354,10 @@ async function route(req: Request, path: string): Promise<Response> {
     return handleNotes(req, store, apiPath.slice(6), auth);
   }
   if (apiPath.startsWith("/tags")) {
-    return handleTags(req, store, apiPath.slice(5));
+    return handleTags(req, store, apiPath.slice(5), auth);
   }
   if (apiPath === "/find-path") {
-    return handleFindPath(req, store);
+    return handleFindPath(req, store, auth);
   }
   if (apiPath === "/vault") {
     return handleVault(req, store, vaultConfig, (desc) => {

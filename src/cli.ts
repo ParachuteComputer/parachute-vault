@@ -167,10 +167,14 @@ async function cmdInit() {
 
   // 2b. Migrate existing keys into per-vault token tables
   for (const v of listVaults()) {
-    const vc = readVaultConfig(v);
-    if (!vc) continue;
-    const store = getVaultStore(v);
-    migrateVaultKeys(store.db, vc.api_keys, globalConfig.api_keys);
+    try {
+      const vc = readVaultConfig(v);
+      if (!vc) continue;
+      const store = getVaultStore(v);
+      migrateVaultKeys(store.db, vc.api_keys, globalConfig.api_keys);
+    } catch (err) {
+      console.error(`  Warning: could not migrate keys for vault "${v}":`, err);
+    }
   }
 
   // 3. Ensure assets directory exists
