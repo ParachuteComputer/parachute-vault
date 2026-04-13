@@ -32,8 +32,6 @@ import {
   loadEnvFile,
   listVaults,
   vaultDir,
-  generateApiKey,
-  hashKey,
   DEFAULT_PORT,
   CONFIG_DIR,
   ASSETS_DIR,
@@ -148,26 +146,14 @@ async function cmdInit() {
     console.log(`Found ${vaults.length} existing vault(s)`);
   }
 
-  // 2. Write global config + global API key
+  // 2. Write global config
   const globalConfig = readGlobalConfig();
   if (!globalConfig.default_vault) {
     globalConfig.default_vault = "default";
   }
-  let globalApiKey: string | undefined;
-  if (!globalConfig.api_keys || globalConfig.api_keys.length === 0) {
-    const { fullKey, keyId } = generateApiKey();
-    globalConfig.api_keys = [{
-      id: keyId,
-      label: "default",
-      scope: "write",
-      key_hash: hashKey(fullKey),
-      created_at: new Date().toISOString(),
-    }];
-    globalApiKey = fullKey;
-  }
   writeGlobalConfig(globalConfig);
 
-  // 2b. Migrate existing keys into per-vault token tables
+  // 2b. Migrate existing legacy keys into per-vault token tables
   for (const v of listVaults()) {
     try {
       const vc = readVaultConfig(v);
@@ -207,26 +193,19 @@ async function cmdInit() {
   }
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
-  // 7. Install MCP for Claude Code (with API key for auth)
-  const mcpKey = globalApiKey ?? apiKey;
-  installMcpConfig(mcpKey);
+  // 7. Install MCP for Claude Code (with token for auth)
+  installMcpConfig(apiKey);
   console.log(`  MCP server added to ~/.claude.json`);
 
   // 8. Summary
   console.log("\n---");
   const port = globalConfig.port || DEFAULT_PORT;
-  if (globalApiKey) {
-    console.log(`\nYour API key: ${globalApiKey}`);
+  if (apiKey) {
+    console.log(`\nYour API token: ${apiKey}`);
     console.log("  Use this in Claude Desktop, curl, or any client.");
-    console.log("  Pass via: Authorization: Bearer <key>");
-    console.log("  Or via:   X-API-Key: <key>");
-  }
-  if (apiKey && apiKey !== globalApiKey) {
-    console.log(`\nVault API key (default): ${apiKey}`);
-    console.log("  Grants access to the 'default' vault only.");
-  }
-  if (globalApiKey || apiKey) {
-    console.log("\nSave these — they will not be shown again.");
+    console.log("  Pass via: Authorization: Bearer <token>");
+    console.log("  Or via:   X-API-Key: <token>");
+    console.log("\nSave this — it will not be shown again.");
   }
 
   console.log(`\nConfig:   ${CONFIG_DIR}`);
@@ -234,8 +213,8 @@ async function cmdInit() {
 
   console.log(`\nUsage examples:`);
   console.log(`  curl http://localhost:${port}/health`);
-  if (mcpKey) {
-    console.log(`  curl -H "Authorization: Bearer ${mcpKey}" http://localhost:${port}/api/notes`);
+  if (apiKey) {
+    console.log(`  curl -H "Authorization: Bearer ${apiKey}" http://localhost:${port}/api/notes`);
   }
 
   console.log(`\nNext steps:`);
@@ -266,7 +245,7 @@ function cmdCreate(args: string[]) {
 
   console.log(`Vault "${name}" created.`);
   console.log(`  Path: ${vaultDir(name)}`);
-  console.log(`  API key: ${key}`);
+  console.log(`  API token: ${key}`);
   console.log(`  Save this — it will not be shown again.`);
   console.log();
   console.log(`To add MCP to Claude: parachute vault mcp-install ${name}`);
@@ -790,22 +769,18 @@ async function cmdExport(args: string[]) {
 // ---------------------------------------------------------------------------
 
 function createVault(name: string): string {
-  const { fullKey, keyId } = generateApiKey();
   const config: VaultConfig = {
     name,
-    api_keys: [
-      {
-        id: keyId,
-        label: "default",
-        scope: "write",
-        key_hash: hashKey(fullKey),
-        created_at: new Date().toISOString(),
-      },
-    ],
+    api_keys: [],
     created_at: new Date().toISOString(),
   };
   writeVaultConfig(config);
-  return fullKey;
+
+  // Create a pvt_ token in the vault's DB
+  const store = getVaultStore(name);
+  const { fullToken } = generateToken();
+  createToken(store.db, fullToken, { label: "default", permission: "full" });
+  return fullToken;
 }
 
 function installMcpConfig(apiKey?: string) {
@@ -829,10 +804,11 @@ function installMcpConfig(apiKey?: string) {
     }
   }
 
-  // Single HTTP MCP entry with API key for auth
+  // Single HTTP MCP entry — use per-vault endpoint so pvt_ tokens work
+  const defaultVault = globalConfig.default_vault || "default";
   const mcpEntry: Record<string, unknown> = {
     type: "http",
-    url: `http://127.0.0.1:${port}/mcp`,
+    url: `http://127.0.0.1:${port}/vaults/${defaultVault}/mcp`,
   };
   if (apiKey) {
     mcpEntry.headers = { Authorization: `Bearer ${apiKey}` };
