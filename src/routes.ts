@@ -49,6 +49,41 @@ function parseInt10(val: string | null): number | undefined {
 }
 
 /**
+ * Parse include_metadata query param.
+ * - absent/null → undefined (all metadata, default)
+ * - "true"/"1" → true (all metadata)
+ * - "false"/"0" → false (no metadata)
+ * - "summary,status" → ["summary", "status"] (field filter)
+ */
+function parseIncludeMetadata(url: URL): boolean | string[] | undefined {
+  const val = url.searchParams.get("include_metadata");
+  if (val === null) return undefined;
+  if (val === "true" || val === "1") return true;
+  if (val === "false" || val === "0") return false;
+  return val.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Filter metadata on a note/index result.
+ * - true / undefined → return as-is
+ * - false → strip metadata
+ * - string[] → return only those keys
+ */
+function applyMetadataFilter(obj: any, includeMetadata: boolean | string[] | undefined): any {
+  if (includeMetadata === undefined || includeMetadata === true) return obj;
+  if (includeMetadata === false) {
+    const { metadata, ...rest } = obj;
+    return rest;
+  }
+  if (!obj.metadata) return obj;
+  const fields = includeMetadata as string[];
+  const filtered = Object.fromEntries(
+    Object.entries(obj.metadata).filter(([k]) => fields.includes(k)),
+  );
+  return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
+}
+
+/**
  * Resolve a note by ID or path. Tries ID first, then case-insensitive path.
  */
 function resolveNote(store: Store, idOrPath: string): Note | null {
@@ -95,7 +130,8 @@ export async function handleNotes(
         const note = resolveNote(store, id);
         if (!note) return json({ error: "Note not found", id }, 404);
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
-        const result: any = includeContent ? { ...note } : toNoteIndex(note);
+        let result: any = includeContent ? { ...note } : toNoteIndex(note);
+        result = applyMetadataFilter(result, parseIncludeMetadata(url));
         if (parseBool(parseQuery(url, "include_links"), false)) {
           result.links = linkOps.getLinksHydrated(db, note.id);
         }
@@ -111,7 +147,12 @@ export async function handleNotes(
         const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
         const results = store.searchNotes(search, { tags: searchTags, limit });
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
-        return json(includeContent ? results : results.map(toNoteIndex));
+        const inclMeta = parseIncludeMetadata(url);
+        let output = includeContent ? results : results.map(toNoteIndex);
+        if (inclMeta !== undefined && inclMeta !== true) {
+          output = output.map((n: any) => applyMetadataFilter(n, inclMeta));
+        }
+        return json(output);
       }
 
       // Structured query
@@ -145,7 +186,11 @@ export async function handleNotes(
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
-      const output = includeContent ? results : results.map(toNoteIndex);
+      const inclMeta = parseIncludeMetadata(url);
+      let output: any[] = includeContent ? results : results.map(toNoteIndex);
+      if (inclMeta !== undefined && inclMeta !== true) {
+        output = output.map((n: any) => applyMetadataFilter(n, inclMeta));
+      }
 
       // Graph format — reshape into { nodes, edges }
       if (parseQuery(url, "format") === "graph") {
@@ -247,7 +292,8 @@ export async function handleNotes(
     const note = resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
-    const result: any = includeContent ? { ...note } : toNoteIndex(note);
+    let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    result = applyMetadataFilter(result, parseIncludeMetadata(url));
     if (parseBool(parseQuery(url, "include_links"), false)) {
       result.links = linkOps.getLinksHydrated(db, note.id);
     }

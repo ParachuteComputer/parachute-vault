@@ -111,6 +111,13 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           limit: { type: "number", description: "Max results (default 50)" },
           offset: { type: "number", description: "Pagination offset (default 0)" },
           include_content: { type: "boolean", description: "Include note content (default: true for single, false for list)" },
+          include_metadata: {
+            oneOf: [
+              { type: "boolean" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Control metadata in response: true (all, default), false (none), or array of field names to include",
+          },
           include_links: { type: "boolean", description: "Include inbound + outbound links per note (default: false)" },
           include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
         },
@@ -121,7 +128,8 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           const note = resolveNote(db, params.id as string);
           if (!note) return { error: "Note not found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
-          const result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
+          let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
+          result = applyMetadataFilter(result, params.include_metadata as boolean | string[] | undefined);
           if (params.include_links) {
             result.links = linkOps.getLinksHydrated(db, note.id);
           }
@@ -179,7 +187,13 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 
         // --- Format output ---
         const includeContent = params.include_content === true; // default false for list
-        const output = includeContent ? results : results.map(noteOps.toNoteIndex);
+        const includeMetadata = params.include_metadata as boolean | string[] | undefined;
+        let output = includeContent ? results : results.map(noteOps.toNoteIndex);
+
+        // --- Apply metadata filtering ---
+        if (includeMetadata !== undefined && includeMetadata !== true) {
+          output = output.map((n: any) => applyMetadataFilter(n, includeMetadata));
+        }
 
         // --- Hydrate links/attachments per note if requested ---
         if (params.include_links || params.include_attachments) {
@@ -653,4 +667,25 @@ function normalizeTags(tag: unknown): string[] | undefined {
   if (!tag) return undefined;
   if (Array.isArray(tag)) return tag;
   return [tag as string];
+}
+
+/**
+ * Filter metadata on a note/index result based on include_metadata param.
+ * - true / undefined → return as-is (all metadata)
+ * - false → strip metadata entirely
+ * - string[] → return only those keys
+ */
+function applyMetadataFilter(obj: any, includeMetadata: boolean | string[] | undefined): any {
+  if (includeMetadata === undefined || includeMetadata === true) return obj;
+  if (includeMetadata === false) {
+    const { metadata, ...rest } = obj;
+    return rest;
+  }
+  // Array of field names
+  if (!obj.metadata) return obj;
+  const fields = includeMetadata as string[];
+  const filtered = Object.fromEntries(
+    Object.entries(obj.metadata).filter(([k]) => fields.includes(k)),
+  );
+  return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
 }

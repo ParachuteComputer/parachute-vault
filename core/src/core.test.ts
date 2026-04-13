@@ -705,6 +705,65 @@ describe("MCP tools", () => {
     expect(result.links).toHaveLength(1);
   });
 
+  it("query-notes include_metadata: true returns all metadata (single)", () => {
+    store.createNote("Body", { metadata: { summary: "short", status: "draft", priority: 1 } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: store.queryNotes({})[0].id, include_metadata: true }) as any;
+    expect(result.metadata).toEqual({ summary: "short", status: "draft", priority: 1 });
+  });
+
+  it("query-notes include_metadata: false strips metadata (single)", () => {
+    store.createNote("Body", { metadata: { summary: "short", status: "draft" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: store.queryNotes({})[0].id, include_metadata: false }) as any;
+    expect(result.metadata).toBeUndefined();
+    expect(result.content).toBe("Body"); // other fields unaffected
+  });
+
+  it("query-notes include_metadata: string[] returns only specified fields (single)", () => {
+    store.createNote("Body", { metadata: { summary: "short", status: "draft", priority: 1 } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: store.queryNotes({})[0].id, include_metadata: ["summary"] }) as any;
+    expect(result.metadata).toEqual({ summary: "short" });
+  });
+
+  it("query-notes include_metadata: false strips metadata (list)", () => {
+    store.createNote("A", { tags: ["meta-test"], metadata: { summary: "a" } });
+    store.createNote("B", { tags: ["meta-test"], metadata: { summary: "b" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: "meta-test", include_metadata: false }) as any[];
+    expect(result).toHaveLength(2);
+    for (const n of result) {
+      expect(n.metadata).toBeUndefined();
+    }
+  });
+
+  it("query-notes include_metadata: string[] filters fields (list)", () => {
+    store.createNote("A", { tags: ["meta-filter"], metadata: { summary: "a", status: "ok", extra: true } });
+    store.createNote("B", { tags: ["meta-filter"], metadata: { summary: "b", extra: false } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: "meta-filter", include_metadata: ["summary", "status"] }) as any[];
+    expect(result).toHaveLength(2);
+    const a = result.find((n: any) => n.metadata?.summary === "a");
+    const b = result.find((n: any) => n.metadata?.summary === "b");
+    expect(a.metadata).toEqual({ summary: "a", status: "ok" });
+    expect(b.metadata).toEqual({ summary: "b" }); // status absent → omitted
+  });
+
+  it("query-notes include_metadata: string[] with no matching fields returns undefined metadata", () => {
+    store.createNote("A", { tags: ["no-match-meta"], metadata: { summary: "a" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: "no-match-meta", include_metadata: ["nonexistent"] }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].metadata).toBeUndefined();
+  });
+
   it("query-notes near param scopes results to graph neighborhood", () => {
     store.createNote("Center", { id: "center" });
     store.createNote("Near", { id: "near", tags: ["t"] });
