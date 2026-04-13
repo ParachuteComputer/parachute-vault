@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
-import type { Store } from "./types.js";
-import * as notes from "./notes.js";
-import * as links from "./links.js";
-import { resolveWikilinkDetailed, listUnresolvedWikilinks } from "./wikilinks.js";
+import type { Store, Note } from "./types.js";
+import * as noteOps from "./notes.js";
+import * as linkOps from "./links.js";
+import * as tagSchemaOps from "./tag-schemas.js";
 
 export interface McpToolDef {
   name: string;
@@ -11,269 +11,530 @@ export interface McpToolDef {
   execute: (params: Record<string, unknown>) => unknown;
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /**
- * Generate MCP tools for a vault.
- *
- * Accepts a Store so that create/update/delete operations go through
- * the store's hooks (wikilink sync, path normalization, etc.).
- * Read-only operations use the db directly for efficiency.
+ * Resolve a note identifier — tries ID first, then case-insensitive path match.
+ * Works everywhere a note reference is accepted.
  */
-export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
-  // Support both Store and raw Database for backwards compat (tests)
-  const store: Store | null = 'createNote' in storeOrDb ? storeOrDb as Store : null;
-  const db: Database = store ? (store as any).db : storeOrDb as Database;
+function resolveNote(db: Database, idOrPath: string): Note | null {
+  // Try ID match first (fast, indexed)
+  const byId = noteOps.getNote(db, idOrPath);
+  if (byId) return byId;
+  // Fallback to path match
+  return noteOps.getNoteByPath(db, idOrPath);
+}
+
+function requireNote(db: Database, idOrPath: string): Note {
+  const note = resolveNote(db, idOrPath);
+  if (!note) throw new Error(`Note not found: "${idOrPath}"`);
+  return note;
+}
+
+/**
+ * Remove [[wikilink]] brackets from note content for a specific target.
+ * Handles [[Target]], [[Target|alias]], [[Target#section]].
+ */
+function removeWikilinkBrackets(content: string, targetPath: string): string {
+  // Match [[TargetPath...]] with optional alias/anchor, replace with display text
+  const escaped = targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // [[Target|alias]] → alias
+  content = content.replace(
+    new RegExp(`\\[\\[${escaped}\\|([^\\]]+)\\]\\]`, "gi"),
+    "$1",
+  );
+  // [[Target#section]] → Target#section (just remove brackets)
+  content = content.replace(
+    new RegExp(`\\[\\[${escaped}(#[^\\]]+)?\\]\\]`, "gi"),
+    `${targetPath}$1`,
+  );
+  return content;
+}
+
+// ---------------------------------------------------------------------------
+// Tool generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate the 9 consolidated MCP tools for a vault.
+ */
+export function generateMcpTools(store: Store): McpToolDef[] {
+  const db: Database = (store as any).db;
+
   return [
+
+    // =====================================================================
+    // 1. query-notes — the universal read tool
+    // =====================================================================
     {
-      name: "get-note",
-      description: "Get a note by ID or path. Use this to look up a specific note when you have its ID (e.g., from link results) or its path (e.g., 'Projects/Parachute/README').",
+      name: "query-notes",
+      description: `Query notes. Returns notes matching the given filters.
+
+- **Single note**: pass \`id\` (accepts note ID or path, e.g., "Projects/README")
+- **Filter**: pass \`tag\`, \`path\`, \`path_prefix\`, \`search\`, \`metadata\`, date range
+- **Graph neighborhood**: pass \`near\` to scope results to notes within N hops of an anchor note
+- **No filters**: returns all notes (paginated)
+
+Defaults: include_content=true for single note, false for lists. include_links=false. tag_match="any".`,
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID" },
-          path: { type: "string", description: "Note path (e.g., 'Projects/Parachute/README')" },
-          ids: { type: "array", items: { type: "string" }, description: "Multiple note IDs to fetch at once" },
-        },
-      },
-      execute: (params) => {
-        if (params.ids) {
-          return notes.getNotes(db, params.ids as string[]);
-        }
-        if (params.path) {
-          const note = notes.getNoteByPath(db, params.path as string);
-          if (!note) return { error: "Note not found", path: params.path };
-          return note;
-        }
-        if (params.id) {
-          const note = notes.getNote(db, params.id as string);
-          if (!note) return { error: "Note not found", id: params.id };
-          return note;
-        }
-        return { error: "Provide id, path, or ids" };
-      },
-    },
-    {
-      name: "create-note",
-      description: `Create a new note with optional tags, path, and metadata. Path works like a filesystem (e.g., 'Projects/Parachute/README'). Metadata is a JSON object for structured properties (e.g., { "status": "draft", "priority": "high" }).`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          content: { type: "string", description: "Note content (markdown)" },
-          tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
-          path: { type: "string", description: "Optional path/name (e.g., 'Grocery List', 'Blog/My Post')" },
-          metadata: { type: "object", description: "Structured metadata (e.g., { status: 'draft', priority: 'high' })" },
-          created_at: { type: "string", description: "ISO-8601 timestamp (defaults to now). Use when the note was taken at a different time than when it's being created." },
-        },
-        required: ["content"],
-      },
-      execute: (params) => {
-        const fn = store ? store.createNote.bind(store) : (c: string, o?: any) => notes.createNote(db, c, o);
-        return fn(params.content as string, {
-          tags: params.tags as string[] | undefined,
-          path: params.path as string | undefined,
-          metadata: params.metadata as Record<string, unknown> | undefined,
-          created_at: params.created_at as string | undefined,
-        });
-      },
-    },
-    {
-      name: "update-note",
-      description: "Update a note's content, path, metadata, or created_at.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Note ID" },
-          content: { type: "string", description: "New content" },
-          path: { type: "string", description: "New path/name" },
-          metadata: { type: "object", description: "New metadata (replaces existing)" },
-          created_at: { type: "string", description: "New created_at timestamp (ISO 8601)" },
-        },
-        required: ["id"],
-      },
-      execute: (params) => {
-        const fn = store ? store.updateNote.bind(store) : (id: string, u: any) => notes.updateNote(db, id, u);
-        return fn(params.id as string, {
-          content: params.content as string | undefined,
-          path: params.path as string | undefined,
-          metadata: params.metadata as Record<string, unknown> | undefined,
-          created_at: params.created_at as string | undefined,
-        });
-      },
-    },
-    {
-      name: "delete-note",
-      description: "Permanently delete a note and all its tags and links.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Note ID" },
-        },
-        required: ["id"],
-      },
-      execute: (params) => {
-        if (store) {
-          store.deleteNote(params.id as string);
-        } else {
-          notes.deleteNote(db, params.id as string);
-        }
-        return { deleted: true };
-      },
-    },
-    {
-      name: "read-notes",
-      description: `Read notes, filtered by tags, path prefix, metadata, and/or date range. Use path_prefix to browse like a filesystem. Use metadata to filter by structured properties (e.g., { "status": "in-progress" }). Set include_content: false to get a lightweight index (metadata + preview + byteSize) instead of full content — useful for planning batched reads over large date ranges.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          tags: { type: "array", items: { type: "string" }, description: "Filter by tags" },
-          tag_match: { type: "string", enum: ["all", "any"], description: "How to match tags: 'all' = must have ALL (default), 'any' = must have ANY" },
+          id: { type: "string", description: "Get one note by ID or path" },
+          tag: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Filter by tag(s)",
+          },
+          tag_match: { type: "string", enum: ["any", "all"], description: "How to match multiple tags: 'any' (OR, default) or 'all' (AND)" },
           exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
-          path_prefix: { type: "string", description: "Filter by path prefix (e.g., 'Projects/Parachute')" },
+          path: { type: "string", description: "Exact path match (case-insensitive)" },
+          path_prefix: { type: "string", description: "Path prefix match (e.g., 'Projects/')" },
+          search: { type: "string", description: "Full-text search query" },
           metadata: { type: "object", description: "Filter by metadata values (exact match per key)" },
           date_from: { type: "string", description: "Start date (ISO, inclusive)" },
-          date_to: { type: "string", description: "End date (ISO, exclusive — use the day after your range)" },
+          date_to: { type: "string", description: "End date (ISO, exclusive)" },
+          near: {
+            type: "object",
+            properties: {
+              note_id: { type: "string", description: "Anchor note ID or path" },
+              depth: { type: "number", description: "Max hops from anchor (default 2, max 5)" },
+              relationship: { type: "string", description: "Only follow links with this relationship" },
+            },
+            required: ["note_id"],
+            description: "Scope results to notes within N hops of an anchor note",
+          },
           sort: { type: "string", enum: ["asc", "desc"], description: "Sort by created_at" },
-          limit: { type: "number", description: "Max results (default 100)" },
-          offset: { type: "number", description: "Skip this many results (for pagination, default 0)" },
-          include_content: { type: "boolean", description: "Include full note content (default true). Set false for an index-mode response: each note becomes { id, path, createdAt, updatedAt, tags, metadata, byteSize, preview } with no content field." },
+          limit: { type: "number", description: "Max results (default 50)" },
+          offset: { type: "number", description: "Pagination offset (default 0)" },
+          include_content: { type: "boolean", description: "Include note content (default: true for single, false for list)" },
+          include_links: { type: "boolean", description: "Include inbound + outbound links per note (default: false)" },
+          include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
         },
       },
       execute: (params) => {
-        const results = notes.queryNotes(db, {
-          tags: params.tags as string[] | undefined,
-          tagMatch: params.tag_match as "all" | "any" | undefined,
-          excludeTags: params.exclude_tags as string[] | undefined,
-          pathPrefix: params.path_prefix as string | undefined,
-          metadata: params.metadata as Record<string, unknown> | undefined,
-          dateFrom: params.date_from as string | undefined,
-          dateTo: params.date_to as string | undefined,
-          sort: params.sort as "asc" | "desc" | undefined,
-          limit: params.limit as number | undefined,
-          offset: params.offset as number | undefined,
-        });
-        if (params.include_content === false) {
-          return results.map(notes.toNoteIndex);
+        // --- Single note by ID/path ---
+        if (params.id) {
+          const note = resolveNote(db, params.id as string);
+          if (!note) return { error: "Note not found", id: params.id };
+          const includeContent = params.include_content !== false; // default true for single
+          const result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
+          if (params.include_links) {
+            result.links = linkOps.getLinksHydrated(db, note.id);
+          }
+          if (params.include_attachments) {
+            result.attachments = store.getAttachments(note.id);
+          }
+          return result;
         }
-        return results;
+
+        // --- Build near-scope (graph-filtered set of allowed IDs) ---
+        let nearScope: Set<string> | null = null;
+        if (params.near) {
+          const near = params.near as { note_id: string; depth?: number; relationship?: string };
+          const anchor = resolveNote(db, near.note_id);
+          if (!anchor) return { error: "Anchor note not found", note_id: near.note_id };
+          const depth = Math.min(near.depth ?? 2, 5);
+          const traversed = linkOps.traverseLinks(db, anchor.id, {
+            max_depth: depth,
+            relationship: near.relationship,
+          });
+          nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
+        }
+
+        // --- Full-text search ---
+        let results: Note[];
+        if (params.search) {
+          // Normalize tag param
+          const tags = normalizeTags(params.tag);
+          results = noteOps.searchNotes(db, params.search as string, {
+            tags,
+            limit: (params.limit as number) ?? 50,
+          });
+        } else {
+          // --- Structured query ---
+          const tags = normalizeTags(params.tag);
+          results = noteOps.queryNotes(db, {
+            tags,
+            tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+            excludeTags: params.exclude_tags as string[] | undefined,
+            path: params.path as string | undefined,
+            pathPrefix: params.path_prefix as string | undefined,
+            metadata: params.metadata as Record<string, unknown> | undefined,
+            dateFrom: params.date_from as string | undefined,
+            dateTo: params.date_to as string | undefined,
+            sort: params.sort as "asc" | "desc" | undefined,
+            limit: (params.limit as number) ?? 50,
+            offset: params.offset as number | undefined,
+          });
+        }
+
+        // --- Apply near-scope filter ---
+        if (nearScope) {
+          results = results.filter((n) => nearScope!.has(n.id));
+        }
+
+        // --- Format output ---
+        const includeContent = params.include_content === true; // default false for list
+        const output = includeContent ? results : results.map(noteOps.toNoteIndex);
+
+        // --- Hydrate links/attachments per note if requested ---
+        if (params.include_links || params.include_attachments) {
+          return output.map((n: any) => {
+            const enriched = { ...n };
+            if (params.include_links) enriched.links = linkOps.getLinksHydrated(db, n.id);
+            if (params.include_attachments) enriched.attachments = store.getAttachments(n.id);
+            return enriched;
+          });
+        }
+
+        return output;
       },
     },
+
+    // =====================================================================
+    // 2. create-note — single or batch
+    // =====================================================================
     {
-      name: "search-notes",
-      description: "Full-text search across all notes.",
+      name: "create-note",
+      description: `Create one or more notes. Pass a single note's fields directly, or pass a \`notes\` array for batch creation. Each note accepts content, path, metadata, tags, links, and created_at.`,
       inputSchema: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search query" },
-          tags: { type: "array", items: { type: "string" }, description: "Optional tag filter" },
-          limit: { type: "number", default: 20 },
+          // Single note fields
+          content: { type: "string", description: "Note content (markdown). Wikilinks like [[Target]] auto-resolve." },
+          path: { type: "string", description: "Note path (e.g., 'Projects/README')" },
+          metadata: { type: "object", description: "Metadata fields" },
+          tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
+          links: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                target: { type: "string", description: "Target note ID or path" },
+                relationship: { type: "string", description: "Relationship type (e.g., mentions, related-to)" },
+              },
+              required: ["target", "relationship"],
+            },
+            description: "Links to create from this note",
+          },
+          created_at: { type: "string", description: "ISO timestamp (defaults to now)" },
+          // Batch
+          notes: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                content: { type: "string" },
+                path: { type: "string" },
+                metadata: { type: "object" },
+                tags: { type: "array", items: { type: "string" } },
+                links: { type: "array" },
+                created_at: { type: "string" },
+              },
+              required: ["content"],
+            },
+            description: "Array of notes for batch creation",
+          },
         },
-        required: ["query"],
-      },
-      execute: (params) => notes.searchNotes(db, params.query as string, {
-        tags: params.tags as string[] | undefined,
-        limit: params.limit as number | undefined,
-      }),
-    },
-    {
-      name: "tag-note",
-      description: "Add tags to a note. Tags are created automatically if they don't exist.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Note ID" },
-          tags: { type: "array", items: { type: "string" }, description: "Tags to add" },
-        },
-        required: ["id", "tags"],
       },
       execute: (params) => {
-        notes.tagNote(db, params.id as string, params.tags as string[]);
-        return { tagged: true };
+        const batch = params.notes as any[] | undefined;
+        const items = batch ?? [params];
+
+        const created: Note[] = [];
+        for (const item of items) {
+          const note = store.createNote(item.content as string ?? "", {
+            path: item.path as string | undefined,
+            tags: item.tags as string[] | undefined,
+            metadata: item.metadata as Record<string, unknown> | undefined,
+            created_at: item.created_at as string | undefined,
+          });
+
+          // Create explicit links (not wikilinks — those are automatic)
+          if (item.links) {
+            for (const link of item.links as { target: string; relationship: string }[]) {
+              const target = resolveNote(db, link.target);
+              if (target) {
+                store.createLink(note.id, target.id, link.relationship);
+              }
+            }
+          }
+
+          created.push(noteOps.getNote(db, note.id) ?? note);
+        }
+
+        // Apply tag schema effects
+        for (const note of created) {
+          if (note.tags && note.tags.length > 0) {
+            applySchemaDefaults(store, db, [note.id], note.tags);
+          }
+        }
+
+        return batch ? created : created[0];
       },
     },
+
+    // =====================================================================
+    // 3. update-note — single or batch, absorbs tag/untag + link add/remove
+    // =====================================================================
     {
-      name: "untag-note",
-      description: "Remove tags from a note.",
+      name: "update-note",
+      description: `Update one or more notes. Accepts ID or path. Supports content, path, metadata updates plus tag and link mutations.
+
+- \`tags: { add: ["x"], remove: ["y"] }\` — add/remove tags
+- \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
+- When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
+- For batch: pass a \`notes\` array, each with an \`id\` field.`,
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID" },
-          tags: { type: "array", items: { type: "string" }, description: "Tags to remove" },
+          id: { type: "string", description: "Note ID or path" },
+          content: { type: "string", description: "New content" },
+          path: { type: "string", description: "New path" },
+          metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
+          created_at: { type: "string", description: "New created_at timestamp" },
+          tags: {
+            type: "object",
+            properties: {
+              add: { type: "array", items: { type: "string" } },
+              remove: { type: "array", items: { type: "string" } },
+            },
+            description: "Tags to add/remove",
+          },
+          links: {
+            type: "object",
+            properties: {
+              add: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    target: { type: "string", description: "Target note ID or path" },
+                    relationship: { type: "string" },
+                  },
+                  required: ["target", "relationship"],
+                },
+              },
+              remove: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    target: { type: "string", description: "Target note ID or path" },
+                    relationship: { type: "string" },
+                  },
+                  required: ["target", "relationship"],
+                },
+              },
+            },
+            description: "Links to add/remove",
+          },
+          // Batch
+          notes: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                content: { type: "string" },
+                path: { type: "string" },
+                metadata: { type: "object" },
+                created_at: { type: "string" },
+                tags: { type: "object" },
+                links: { type: "object" },
+              },
+              required: ["id"],
+            },
+            description: "Array of note updates for batch",
+          },
         },
-        required: ["id", "tags"],
       },
       execute: (params) => {
-        notes.untagNote(db, params.id as string, params.tags as string[]);
-        return { untagged: true };
+        const batch = params.notes as any[] | undefined;
+        const items = batch ?? [params];
+
+        const updated: Note[] = [];
+        for (const item of items) {
+          const note = requireNote(db, item.id as string);
+          let contentOverride = item.content as string | undefined;
+
+          // --- Remove links (before content update, so bracket removal applies) ---
+          const linksRemove = (item.links as any)?.remove as { target: string; relationship: string }[] | undefined;
+          if (linksRemove) {
+            for (const link of linksRemove) {
+              const target = resolveNote(db, link.target);
+              if (target) {
+                store.deleteLink(note.id, target.id, link.relationship);
+                // Remove [[brackets]] from content if this was a wikilink
+                if (link.relationship === "wikilink" && target.path) {
+                  const currentContent = contentOverride ?? note.content;
+                  const cleaned = removeWikilinkBrackets(currentContent, target.path);
+                  if (cleaned !== currentContent) {
+                    contentOverride = cleaned;
+                  }
+                }
+              }
+            }
+          }
+
+          // --- Core update (content, path, metadata, created_at) ---
+          const updates: any = {};
+          if (contentOverride !== undefined) updates.content = contentOverride;
+          if (item.path !== undefined) updates.path = item.path;
+          if (item.metadata !== undefined) {
+            // Merge metadata (don't replace wholesale)
+            const existing = (note.metadata as Record<string, unknown>) ?? {};
+            updates.metadata = { ...existing, ...(item.metadata as Record<string, unknown>) };
+          }
+          if (item.created_at !== undefined) updates.created_at = item.created_at;
+
+          let result: Note;
+          if (Object.keys(updates).length > 0) {
+            result = store.updateNote(note.id, updates);
+          } else {
+            result = note;
+          }
+
+          // --- Tags ---
+          const tagsOp = item.tags as { add?: string[]; remove?: string[] } | undefined;
+          if (tagsOp?.add?.length) {
+            store.tagNote(note.id, tagsOp.add);
+            applySchemaDefaults(store, db, [note.id], tagsOp.add);
+          }
+          if (tagsOp?.remove?.length) {
+            store.untagNote(note.id, tagsOp.remove);
+          }
+
+          // --- Add links ---
+          const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+          if (linksAdd) {
+            for (const link of linksAdd) {
+              const target = resolveNote(db, link.target);
+              if (target) {
+                store.createLink(note.id, target.id, link.relationship, link.metadata);
+              }
+            }
+          }
+
+          // Re-read for final state
+          updated.push(noteOps.getNote(db, note.id) ?? result);
+        }
+
+        return batch ? updated : updated[0];
       },
     },
+
+    // =====================================================================
+    // 4. delete-note
+    // =====================================================================
     {
-      name: "create-link",
-      description: "Create a directed link between two notes (e.g., mentions, quotes, related-to). Optional metadata for context (e.g., { confidence: 0.9, context: 'mentioned in meeting' }).",
+      name: "delete-note",
+      description: "Permanently delete a note and all its tags and links. Accepts ID or path.",
       inputSchema: {
         type: "object",
         properties: {
-          source_id: { type: "string", description: "Source note ID" },
-          target_id: { type: "string", description: "Target note ID" },
-          relationship: { type: "string", description: "Relationship type (e.g., mentions, related-to)" },
-          metadata: { type: "object", description: "Optional link metadata" },
+          id: { type: "string", description: "Note ID or path" },
         },
-        required: ["source_id", "target_id", "relationship"],
-      },
-      execute: (params) => links.createLink(
-        db,
-        params.source_id as string,
-        params.target_id as string,
-        params.relationship as string,
-        params.metadata as Record<string, unknown> | undefined,
-      ),
-    },
-    {
-      name: "delete-link",
-      description: "Delete a link between two notes.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          source_id: { type: "string", description: "Source note ID" },
-          target_id: { type: "string", description: "Target note ID" },
-          relationship: { type: "string", description: "Relationship type" },
-        },
-        required: ["source_id", "target_id", "relationship"],
+        required: ["id"],
       },
       execute: (params) => {
-        links.deleteLink(
-          db,
-          params.source_id as string,
-          params.target_id as string,
-          params.relationship as string,
-        );
-        return { deleted: true };
+        const note = requireNote(db, params.id as string);
+        store.deleteNote(note.id);
+        return { deleted: true, id: note.id };
       },
     },
-    {
-      name: "get-links",
-      description: "List links in the vault. Returns bare link edges ({sourceId, targetId, relationship, metadata, createdAt}) — no hydration. Omit `id` to list every link (optionally filtered by `relationship`). Pass `id` to get links touching that note (with `direction`: outbound, inbound, both). Pair with get-note when you need the connected notes' content.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Note ID. If omitted, returns all links in the vault." },
-          direction: { type: "string", enum: ["outbound", "inbound", "both"], default: "both", description: "Only meaningful when `id` is provided." },
-          relationship: { type: "string", description: "Filter to links with this relationship type." },
-        },
-      },
-      execute: (params) => links.listLinks(db, {
-        noteId: params.id as string | undefined,
-        direction: params.direction as "outbound" | "inbound" | "both" | undefined,
-        relationship: params.relationship as string | undefined,
-      }),
-    },
+
+    // =====================================================================
+    // 5. list-tags — with optional single-tag detail + schema
+    // =====================================================================
     {
       name: "list-tags",
-      description: "List all tags with usage counts.",
-      inputSchema: { type: "object", properties: {} },
-      execute: () => notes.listTags(db),
+      description: `List tags with usage counts. Pass \`tag\` to get a single tag's details including its schema (description + fields). Pass \`include_schema: true\` to include schemas for all tags.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "Get details for a single tag" },
+          include_schema: { type: "boolean", description: "Include schema (description + fields) for each tag (default: false)" },
+        },
+      },
+      execute: (params) => {
+        const singleTag = params.tag as string | undefined;
+
+        if (singleTag) {
+          // Single tag detail
+          const allTags = noteOps.listTags(db);
+          const found = allTags.find((t) => t.name === singleTag);
+          const schema = tagSchemaOps.getTagSchema(db, singleTag);
+          return {
+            name: singleTag,
+            count: found?.count ?? 0,
+            description: schema?.description ?? null,
+            fields: schema?.fields ?? null,
+          };
+        }
+
+        // All tags
+        const tags = noteOps.listTags(db);
+        if (params.include_schema) {
+          const schemas = tagSchemaOps.getTagSchemaMap(db);
+          return tags.map((t) => ({
+            ...t,
+            description: schemas[t.name]?.description ?? null,
+            fields: schemas[t.name]?.fields ?? null,
+          }));
+        }
+        return tags;
+      },
     },
+
+    // =====================================================================
+    // 6. update-tag — create/update tag description + schema fields
+    // =====================================================================
+    {
+      name: "update-tag",
+      description: "Create or update a tag's description and schema fields. If the tag doesn't exist, it's created. Fields are merged — new keys are added, existing keys are replaced.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "Tag name" },
+          description: { type: "string", description: "Human-readable description of what this tag means" },
+          fields: {
+            type: "object",
+            description: 'Metadata fields notes with this tag should have. E.g., { "status": { "type": "string", "enum": ["active", "archived"] } }',
+            additionalProperties: {
+              type: "object",
+              properties: {
+                type: { type: "string", description: "Field type: string, boolean, integer" },
+                description: { type: "string" },
+                enum: { type: "array", items: { type: "string" }, description: "Allowed values (first is default)" },
+              },
+              required: ["type"],
+            },
+          },
+        },
+        required: ["tag"],
+      },
+      execute: (params) => {
+        const tag = params.tag as string;
+        const existing = tagSchemaOps.getTagSchema(db, tag);
+        const mergedFields = { ...existing?.fields, ...(params.fields as any) };
+        return tagSchemaOps.upsertTagSchema(db, tag, {
+          description: (params.description as string | undefined) ?? existing?.description,
+          fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
+        });
+      },
+    },
+
+    // =====================================================================
+    // 7. delete-tag — delete tag + schema from all notes
+    // =====================================================================
     {
       name: "delete-tag",
-      description: "Delete a tag and remove it from all notes. Notes themselves are NOT deleted — just untagged. Use this to clean up unused or obsolete tags.",
+      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged.",
       inputSchema: {
         type: "object",
         properties: {
@@ -282,192 +543,114 @@ export function generateMcpTools(storeOrDb: Store | Database): McpToolDef[] {
         required: ["tag"],
       },
       execute: (params) => {
-        const fn = store ? store.deleteTag.bind(store) : (name: string) => notes.deleteTag(db, name);
-        return fn(params.tag as string);
-      },
-    },
-    {
-      name: "get-graph",
-      description: "Get the whole vault as a graph in one call: {notes, links, tags, meta}. Default returns lean note indexes (id, path, tags, createdAt, updatedAt, metadata, byteSize, preview) — no content. Pass include_content: true to include full content on each note. Optional tag filter (tags + tag_match + exclude_tags) restricts notes to a subgraph; links are filtered to edges between notes in the subgraph. Useful for rendering visualizations, exports, or bird's-eye analysis.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          tags: { type: "array", items: { type: "string" }, description: "Optional: only include notes with these tags" },
-          tag_match: { type: "string", enum: ["all", "any"], description: "How to match tags (default: all)" },
-          exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
-          include_content: { type: "boolean", description: "Include full note content instead of the lean index shape (default false)" },
-        },
-      },
-      execute: (params) => {
-        const hasTagFilter = (params.tags as string[] | undefined)?.length
-          || (params.exclude_tags as string[] | undefined)?.length;
-        const filteredNotes = notes.queryNotes(db, {
-          tags: params.tags as string[] | undefined,
-          tagMatch: params.tag_match as "all" | "any" | undefined,
-          excludeTags: params.exclude_tags as string[] | undefined,
-          limit: 1_000_000,
-        });
-        const includeContent = params.include_content === true;
-        const outNotes = includeContent ? filteredNotes : filteredNotes.map(notes.toNoteIndex);
-
-        // Links: if no tag filter, return all links in the vault.
-        // Otherwise, only edges between notes in the filtered set.
-        let outLinks = links.listLinks(db);
-        if (hasTagFilter) {
-          const ids = new Set(filteredNotes.map((n) => n.id));
-          outLinks = outLinks.filter((l) => ids.has(l.sourceId) && ids.has(l.targetId));
-        }
-
-        const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
-        const linkRow = db.prepare("SELECT COUNT(*) as c FROM links").get() as { c: number };
-
-        return {
-          notes: outNotes,
-          links: outLinks,
-          tags: notes.listTags(db),
-          meta: {
-            totalNotes: totalRow.c,
-            totalLinks: linkRow.c,
-            filteredNotes: outNotes.length,
-            filteredLinks: outLinks.length,
-            includeContent,
-          },
-        };
-      },
-    },
-    {
-      name: "get-vault-stats",
-      description: "Get a birds-eye view of the vault: total note count, earliest/latest note, note distribution by month, top tags, and tag count. Read-only, cheap aggregation. Call once at the start of a session to orient before doing vault-wide work (monthly summaries, reviews, trend tracking). For filtered queries use read-notes; for a full tag list use list-tags.",
-      inputSchema: { type: "object", properties: {} },
-      execute: () => notes.getVaultStats(db),
-    },
-
-    // ---- Bulk Operations ----
-
-    {
-      name: "create-notes",
-      description: `Create multiple notes in one call. Much more efficient than calling create-note repeatedly. Each note accepts the same fields as create-note: content (required), path, tags, metadata, and created_at (ISO timestamp; supports backdating for imports).`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          notes: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                content: { type: "string", description: "Note content (markdown)" },
-                tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
-                path: { type: "string", description: "Optional path/name" },
-                metadata: { type: "object", description: "Optional metadata object (JSON-serializable)" },
-                created_at: { type: "string", description: "Optional ISO timestamp; defaults to now if omitted" },
-              },
-              required: ["content"],
-            },
-            description: "Array of notes to create",
-          },
-        },
-        required: ["notes"],
-      },
-      execute: (params) => notes.createNotes(db, params.notes as any[]),
-    },
-    {
-      name: "batch-tag",
-      description: "Add tags to multiple notes at once. More efficient than tagging one at a time.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          note_ids: { type: "array", items: { type: "string" }, description: "Note IDs to tag" },
-          tags: { type: "array", items: { type: "string" }, description: "Tags to add" },
-        },
-        required: ["note_ids", "tags"],
-      },
-      execute: (params) => {
-        const count = notes.batchTag(db, params.note_ids as string[], params.tags as string[]);
-        return { tagged: true, count };
-      },
-    },
-    {
-      name: "batch-untag",
-      description: "Remove tags from multiple notes at once.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          note_ids: { type: "array", items: { type: "string" }, description: "Note IDs to untag" },
-          tags: { type: "array", items: { type: "string" }, description: "Tags to remove" },
-        },
-        required: ["note_ids", "tags"],
-      },
-      execute: (params) => {
-        const count = notes.batchUntag(db, params.note_ids as string[], params.tags as string[]);
-        return { untagged: true, count };
+        const tag = params.tag as string;
+        // Delete schema first (FK cascade would handle it, but be explicit)
+        tagSchemaOps.deleteTagSchema(db, tag);
+        return store.deleteTag(tag);
       },
     },
 
-    // ---- Deeper Link Queries ----
-
-    {
-      name: "traverse-links",
-      description: "Traverse the link graph from a note. Returns all notes reachable within N hops, with their path, tags, and metadata. Useful for exploring knowledge clusters.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Starting note ID" },
-          max_depth: { type: "number", description: "Maximum hops to traverse (default 2, max 5)" },
-          relationship: { type: "string", description: "Optional: only follow links with this relationship type" },
-        },
-        required: ["id"],
-      },
-      execute: (params) => links.traverseLinks(db, params.id as string, {
-        max_depth: Math.min((params.max_depth as number) ?? 2, 5),
-        relationship: params.relationship as string | undefined,
-      }),
-    },
+    // =====================================================================
+    // 8. find-path — BFS between two notes
+    // =====================================================================
     {
       name: "find-path",
-      description: "Find the shortest path between two notes in the link graph. Returns the chain of note IDs and relationships connecting them, or null if no path exists.",
+      description: "Find the shortest path between two notes in the link graph. Accepts IDs or paths. Returns the chain of note IDs and relationships, or null if no path exists.",
       inputSchema: {
         type: "object",
         properties: {
-          source_id: { type: "string", description: "Starting note ID" },
-          target_id: { type: "string", description: "Target note ID" },
-          max_depth: { type: "number", description: "Maximum path length to search (default 5)" },
+          source: { type: "string", description: "Starting note ID or path" },
+          target: { type: "string", description: "Destination note ID or path" },
+          max_depth: { type: "number", description: "Max path length (default 5)" },
         },
-        required: ["source_id", "target_id"],
+        required: ["source", "target"],
       },
-      execute: (params) => links.findPath(
-        db,
-        params.source_id as string,
-        params.target_id as string,
-        { max_depth: Math.min((params.max_depth as number) ?? 5, 10) },
-      ),
+      execute: (params) => {
+        const source = requireNote(db, params.source as string);
+        const target = requireNote(db, params.target as string);
+        return linkOps.findPath(db, source.id, target.id, {
+          max_depth: Math.min((params.max_depth as number) ?? 5, 10),
+        });
+      },
     },
 
-    // ---- Wikilink Tools ----
-
+    // =====================================================================
+    // 9. vault-info — get/update vault description + stats
+    // =====================================================================
     {
-      name: "resolve-wikilink",
-      description: "Resolve a [[wikilink]] target to a note. Returns the matched note (resolved), multiple candidates (ambiguous), or empty (unresolved). Uses the same resolution logic as vault's write-time wikilink sync.",
+      name: "vault-info",
+      description: "Get vault description and optionally stats (note/tag/link counts, distribution). Pass `description` to update the vault description (changes how AI agents behave in future sessions).",
       inputSchema: {
         type: "object",
         properties: {
-          target: { type: "string", description: "Wikilink target (e.g., 'Mickey', 'Projects/Atlas')" },
-        },
-        required: ["target"],
-      },
-      execute: (params) => resolveWikilinkDetailed(db, params.target as string),
-    },
-    {
-      name: "list-unresolved-wikilinks",
-      description: "List wikilinks that couldn't be resolved to any note. Useful for graph health audits and finding broken links.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "Max results (default 50)" },
+          include_stats: { type: "boolean", description: "Include note count, tag count, distribution by month (default: false)" },
+          description: { type: "string", description: "If provided, updates the vault description" },
         },
       },
-      execute: (params) => listUnresolvedWikilinks(db, (params.limit as number) ?? 50),
+      // execute is overridden in mcp-tools.ts where vault config is available
+      execute: () => {
+        // This is a placeholder — vault-info needs access to vault config,
+        // which is only available in the server layer (mcp-tools.ts).
+        return { error: "vault-info must be configured by the server layer" };
+      },
     },
 
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Tag schema effects — auto-populate defaults when tags are applied
+// ---------------------------------------------------------------------------
+
+function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): void {
+  const schemas = tagSchemaOps.getTagSchemaMap(db);
+  if (Object.keys(schemas).length === 0) return;
+
+  const defaults: Record<string, unknown> = {};
+  for (const tag of tags) {
+    const schema = schemas[tag];
+    if (!schema?.fields) continue;
+    for (const [field, fieldSchema] of Object.entries(schema.fields)) {
+      if (!(field in defaults)) {
+        defaults[field] = defaultForField(fieldSchema);
+      }
+    }
+  }
+  if (Object.keys(defaults).length === 0) return;
+
+  for (const noteId of noteIds) {
+    const note = noteOps.getNote(db, noteId);
+    if (!note) continue;
+    const existing = (note.metadata as Record<string, unknown>) ?? {};
+    const missing: Record<string, unknown> = {};
+    for (const [field, value] of Object.entries(defaults)) {
+      if (!(field in existing)) {
+        missing[field] = value;
+      }
+    }
+    if (Object.keys(missing).length === 0) continue;
+    store.updateNote(noteId, {
+      metadata: { ...existing, ...missing },
+      skipUpdatedAt: true,
+    });
+  }
+}
+
+function defaultForField(field: { type: string; enum?: string[] }): unknown {
+  if (field.enum && field.enum.length > 0) return field.enum[0];
+  switch (field.type) {
+    case "boolean": return false;
+    case "integer": return 0;
+    default: return "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function normalizeTags(tag: unknown): string[] | undefined {
+  if (!tag) return undefined;
+  if (Array.isArray(tag)) return tag;
+  return [tag as string];
+}

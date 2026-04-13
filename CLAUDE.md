@@ -36,7 +36,8 @@ attachments (id, note_id, path, mime_type, metadata, created_at)
 links       (source_id, target_id, relationship, metadata, created_at)
 ```
 
-Additional tables (created on demand):
+Additional tables:
+- `tag_schemas` — tag description + metadata field definitions (JSON)
 - `unresolved_wikilinks` — pending wikilink resolution
 - `schema_version` — migration tracking
 
@@ -44,15 +45,15 @@ Metadata is a JSON column on notes, links, and attachments. Queryable via `json_
 
 Path is unique (when set), normalized (no .md, no trailing slashes), and used for wikilink resolution.
 
-### MCP Tools (20+)
+### MCP Tools (9)
 
-Core: `get-note`, `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`, `tag-note`, `untag-note`, `create-link`, `delete-link`, `get-links`, `list-tags`
+Notes: `query-notes` (single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata merge), `delete-note`
 
-Bulk: `create-notes`, `batch-tag`, `batch-untag`
+Tags: `list-tags` (with optional schema detail), `update-tag` (upsert schema), `delete-tag`
 
-Graph: `traverse-links`, `find-path`
+Graph: `find-path` (BFS shortest path)
 
-Vault: `list-vaults`, `get-vault-description`, `update-vault-description`
+Vault: `vault-info` (get/update description + stats)
 
 
 ## Bun-native

@@ -233,22 +233,18 @@ describe("vault stats", () => {
     expect(stats).toHaveProperty("tagCount");
   });
 
-  it("get-vault-stats MCP tool works", () => {
+  it("getVaultStats returns correct stats", () => {
     store.createNote("one", { tags: ["x"], created_at: "2025-05-01T00:00:00.000Z" });
     store.createNote("two", { tags: ["x", "y"], created_at: "2025-06-01T00:00:00.000Z" });
 
-    const tools = generateMcpTools(db);
-    const tool = tools.find((t) => t.name === "get-vault-stats")!;
-    expect(tool).toBeTruthy();
-
-    const result = tool.execute({}) as any;
+    const result = store.getVaultStats();
     expect(result.totalNotes).toBe(2);
     expect(result.tagCount).toBe(2);
     expect(result.topTags[0].tag).toBe("x");
     expect(result.topTags[0].count).toBe(2);
     expect(result.notesByMonth).toHaveLength(2);
-    expect(result.earliestNote.createdAt).toBe("2025-05-01T00:00:00.000Z");
-    expect(result.latestNote.createdAt).toBe("2025-06-01T00:00:00.000Z");
+    expect(result.earliestNote!.createdAt).toBe("2025-05-01T00:00:00.000Z");
+    expect(result.latestNote!.createdAt).toBe("2025-06-01T00:00:00.000Z");
   });
 });
 
@@ -442,46 +438,59 @@ describe("attachments", () => {
 // ---- MCP Tools ----
 
 describe("MCP tools", () => {
-  it("generates all expected tools", () => {
-    const tools = generateMcpTools(db);
+  it("generates all 9 consolidated tools", () => {
+    const tools = generateMcpTools(store);
     const names = tools.map((t) => t.name);
 
+    expect(names).toContain("query-notes");
     expect(names).toContain("create-note");
     expect(names).toContain("update-note");
     expect(names).toContain("delete-note");
-    expect(names).toContain("read-notes");
-    expect(names).toContain("search-notes");
-    expect(names).toContain("tag-note");
-    expect(names).toContain("untag-note");
-    expect(names).toContain("create-link");
-    expect(names).toContain("delete-link");
-    expect(names).toContain("get-links");
     expect(names).toContain("list-tags");
-    expect(names).toContain("create-notes");
-    expect(names).toContain("batch-tag");
-    expect(names).toContain("batch-untag");
-    expect(names).toContain("traverse-links");
-    expect(names).toContain("find-path");
-    expect(names).toContain("get-note");
-    expect(names).toContain("get-vault-stats");
+    expect(names).toContain("update-tag");
     expect(names).toContain("delete-tag");
-    expect(names).toContain("resolve-wikilink");
-    expect(names).toContain("list-unresolved-wikilinks");
-    expect(names).toContain("get-graph");
-    expect(tools).toHaveLength(22);
+    expect(names).toContain("find-path");
+    expect(names).toContain("vault-info");
+    expect(tools).toHaveLength(9);
   });
 
   it("create-note tool works", () => {
-    const tools = generateMcpTools(db);
+    const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const result = createNote.execute({ content: "Hello", tags: ["daily"] }) as any;
     expect(result.content).toBe("Hello");
     expect(result.tags).toContain("daily");
   });
 
+  it("create-note batch mode works", () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = createNote.execute({
+      notes: [
+        { content: "A", tags: ["daily"] },
+        { content: "B", tags: ["doc"] },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(2);
+    expect(result[0].tags).toContain("daily");
+    expect(result[1].tags).toContain("doc");
+  });
+
+  it("create-note with links resolves targets by path", () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    store.createNote("Target", { path: "People/Alice" });
+    const result = createNote.execute({
+      content: "Links to Alice",
+      links: [{ target: "People/Alice", relationship: "mentions" }],
+    }) as any;
+    const links = store.getLinks(result.id, { direction: "outbound" });
+    expect(links.some((l) => l.relationship === "mentions")).toBe(true);
+  });
+
   it("update-note tool updates created_at", () => {
     const note = store.createNote("Test");
-    const tools = generateMcpTools(db);
+    const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
     const newDate = "2025-03-01T00:00:00.000Z";
     const result = updateNote.execute({ id: note.id, created_at: newDate }) as any;
@@ -489,188 +498,234 @@ describe("MCP tools", () => {
     expect(result.content).toBe("Test");
   });
 
-  it("update-note tool updates metadata", () => {
-    const note = store.createNote("Test");
-    const tools = generateMcpTools(db);
+  it("update-note tool merges metadata", () => {
+    const note = store.createNote("Test", { metadata: { existing: "value" } });
+    const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
-    const meta = { importance: "high" };
-    const result = updateNote.execute({ id: note.id, metadata: meta }) as any;
-    expect(result.metadata).toEqual(meta);
+    const result = updateNote.execute({ id: note.id, metadata: { importance: "high" } }) as any;
+    expect(result.metadata).toEqual({ existing: "value", importance: "high" });
   });
 
-  it("read-notes tool works", () => {
+  it("update-note tags add/remove works", () => {
+    const note = store.createNote("Test");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Add tags
+    updateNote.execute({ id: note.id, tags: { add: ["pinned", "daily"] } });
+    expect(store.getNote(note.id)!.tags).toContain("pinned");
+    expect(store.getNote(note.id)!.tags).toContain("daily");
+
+    // Remove tags
+    updateNote.execute({ id: note.id, tags: { remove: ["pinned"] } });
+    expect(store.getNote(note.id)!.tags).not.toContain("pinned");
+    expect(store.getNote(note.id)!.tags).toContain("daily");
+  });
+
+  it("update-note links add/remove works", () => {
+    store.createNote("A", { id: "a" });
+    store.createNote("B", { id: "b" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Add link
+    updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] } });
+    expect(store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
+
+    // Remove link
+    updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] } });
+    expect(store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
+  });
+
+  it("update-note removes wikilink brackets when removing wikilink-type link", () => {
+    store.createNote("Target", { id: "target", path: "People/Alice" });
+    const source = store.createNote("See [[People/Alice]] for details", { id: "source" });
+    store.createLink("source", "target", "wikilink");
+
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = updateNote.execute({
+      id: "source",
+      links: { remove: [{ target: "target", relationship: "wikilink" }] },
+    }) as any;
+    expect(result.content).toBe("See People/Alice for details");
+  });
+
+  it("update-note batch mode works", () => {
+    const a = store.createNote("A", { id: "a" });
+    const b = store.createNote("B", { id: "b" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = updateNote.execute({
+      notes: [
+        { id: "a", content: "A updated" },
+        { id: "b", tags: { add: ["pinned"] } },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(2);
+    expect(result[0].content).toBe("A updated");
+    expect(store.getNote("b")!.tags).toContain("pinned");
+  });
+
+  it("update-note resolves note by path", () => {
+    store.createNote("Test", { path: "Projects/README" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = updateNote.execute({ id: "Projects/README", content: "Updated" }) as any;
+    expect(result.content).toBe("Updated");
+  });
+
+  it("query-notes single note by id", () => {
+    const note = store.createNote("Hello", { path: "test/note" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: note.id }) as any;
+    expect(result.content).toBe("Hello");
+    expect(result.path).toBe("test/note");
+  });
+
+  it("query-notes single note by path", () => {
+    store.createNote("By Path", { path: "Projects/README" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: "Projects/README" }) as any;
+    expect(result.content).toBe("By Path");
+  });
+
+  it("query-notes by tag", () => {
     store.createNote("Test", { tags: ["daily"] });
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
-    const result = readNotes.execute({ tags: ["daily"] }) as any[];
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: ["daily"] }) as any[];
     expect(result).toHaveLength(1);
   });
 
-  it("read-notes defaults to including content (backwards compatible)", () => {
-    store.createNote("Full body content here", { tags: ["daily"] });
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
-    const result = readNotes.execute({ tags: ["daily"] }) as any[];
-    expect(result).toHaveLength(1);
-    expect(result[0].content).toBe("Full body content here");
-    expect(result[0].byteSize).toBeUndefined();
-    expect(result[0].preview).toBeUndefined();
-  });
-
-  it("read-notes with include_content: true returns full content", () => {
-    store.createNote("Explicit include", { tags: ["daily"] });
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
-    const result = readNotes.execute({ tags: ["daily"], include_content: true }) as any[];
-    expect(result).toHaveLength(1);
-    expect(result[0].content).toBe("Explicit include");
-  });
-
-  it("read-notes with include_content: false returns index metadata without content", () => {
-    const content = "This is the note body that should not come back in index mode.";
-    store.createNote(content, { tags: ["daily"], path: "Notes/index-test", metadata: { status: "draft" } });
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
-    const result = readNotes.execute({ tags: ["daily"], include_content: false }) as any[];
+  it("query-notes list defaults to no content (index mode)", () => {
+    const content = "This is the note body.";
+    store.createNote(content, { tags: ["daily"], path: "Notes/test", metadata: { status: "draft" } });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: ["daily"] }) as any[];
     expect(result).toHaveLength(1);
     const entry = result[0];
     expect(entry.content).toBeUndefined();
     expect(entry.id).toBeTruthy();
-    expect(entry.path).toBe("Notes/index-test");
-    expect(entry.createdAt).toBeTruthy();
-    expect(entry.tags).toContain("daily");
-    expect(entry.metadata).toEqual({ status: "draft" });
+    expect(entry.path).toBe("Notes/test");
     expect(entry.byteSize).toBe(Buffer.byteLength(content, "utf8"));
-    expect(entry.preview).toBe(content);
   });
 
-  it("read-notes index mode truncates preview and counts utf-8 bytes", () => {
-    // Multi-byte chars: each "✨" is 3 bytes in utf-8
+  it("query-notes list with include_content: true returns full content", () => {
+    store.createNote("Full body", { tags: ["daily"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: ["daily"], include_content: true }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("Full body");
+  });
+
+  it("query-notes index mode truncates preview and counts utf-8 bytes", () => {
     const longContent = "line one\nline two has\tlots    of   whitespace\n" + "x".repeat(300) + " ✨✨✨";
     store.createNote(longContent, { tags: ["long"] });
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
-    const result = readNotes.execute({ tags: ["long"], include_content: false }) as any[];
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: ["long"] }) as any[];
     expect(result).toHaveLength(1);
     const entry = result[0];
     expect(entry.byteSize).toBe(Buffer.byteLength(longContent, "utf8"));
-    expect(entry.byteSize).toBeGreaterThan(longContent.length); // multi-byte chars
+    expect(entry.byteSize).toBeGreaterThan(longContent.length);
     expect(entry.preview.length).toBeLessThanOrEqual(120);
-    expect(entry.preview.includes("\n")).toBe(false); // whitespace collapsed
+    expect(entry.preview.includes("\n")).toBe(false);
   });
 
-  it("read-notes index mode preview does not split astral-plane surrogate pairs", () => {
-    // "😀" is U+1F600 — outside the BMP, encoded as a UTF-16 surrogate pair.
-    // A naive .slice(0, 120) would cut on code unit 120, landing mid-pair
-    // and producing a lone surrogate. Iterating by code points avoids this.
+  it("query-notes index mode does not split astral-plane surrogate pairs", () => {
     const emoji = "😀";
     const longContent = emoji.repeat(130);
     store.createNote(longContent, { tags: ["astral"] });
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
-    const result = readNotes.execute({ tags: ["astral"], include_content: false }) as any[];
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: ["astral"] }) as any[];
     expect(result).toHaveLength(1);
     const preview = result[0].preview as string;
-
-    // Must be truncated to at most 120 code points (not code units).
     const codePoints = Array.from(preview);
     expect(codePoints.length).toBeLessThanOrEqual(120);
-
-    // Every code point should be the full emoji — no lone surrogates.
     for (const cp of codePoints) {
       expect(cp).toBe(emoji);
     }
-
-    // No unpaired surrogates anywhere in the string.
-    for (let i = 0; i < preview.length; i++) {
-      const code = preview.charCodeAt(i);
-      if (code >= 0xd800 && code <= 0xdbff) {
-        // high surrogate — must be followed by a low surrogate
-        const next = preview.charCodeAt(i + 1);
-        expect(next >= 0xdc00 && next <= 0xdfff).toBe(true);
-        i++;
-      } else {
-        // must not be a lone low surrogate
-        expect(code >= 0xdc00 && code <= 0xdfff).toBe(false);
-      }
-    }
   });
 
-  it("read-notes index mode honors existing filters (date range, path_prefix, limit, offset)", () => {
+  it("query-notes honors filters (date range, path_prefix, limit, offset)", () => {
     store.createNote("A", { tags: ["keep"], path: "Projects/a", created_at: "2025-03-05T00:00:00.000Z" });
     store.createNote("B", { tags: ["keep"], path: "Projects/b", created_at: "2025-03-10T00:00:00.000Z" });
     store.createNote("C", { tags: ["keep"], path: "Other/c",    created_at: "2025-03-15T00:00:00.000Z" });
     store.createNote("D", { tags: ["keep"], path: "Projects/d", created_at: "2025-04-02T00:00:00.000Z" });
 
-    const tools = generateMcpTools(db);
-    const readNotes = tools.find((t) => t.name === "read-notes")!;
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
 
     // date range filter
-    const inMarch = readNotes.execute({
+    const inMarch = query.execute({
       date_from: "2025-03-01",
       date_to: "2025-04-01",
       sort: "asc",
-      include_content: false,
     }) as any[];
     expect(inMarch).toHaveLength(3);
     expect(inMarch.every((n) => n.content === undefined)).toBe(true);
-    expect(inMarch.every((n) => typeof n.byteSize === "number")).toBe(true);
 
     // path_prefix filter
-    const projects = readNotes.execute({
-      path_prefix: "Projects",
-      include_content: false,
-    }) as any[];
+    const projects = query.execute({ path_prefix: "Projects" }) as any[];
     expect(projects).toHaveLength(3);
     expect(projects.every((n) => n.path!.startsWith("Projects"))).toBe(true);
 
     // limit + offset
-    const page = readNotes.execute({
+    const page = query.execute({
       path_prefix: "Projects",
       sort: "asc",
       limit: 2,
       offset: 1,
-      include_content: false,
     }) as any[];
     expect(page).toHaveLength(2);
   });
 
-  it("search-notes tool works", () => {
+  it("query-notes full-text search works", () => {
     store.createNote("Flagstaff trail");
-    const tools = generateMcpTools(db);
-    const searchNotes = tools.find((t) => t.name === "search-notes")!;
-    const result = searchNotes.execute({ query: "Flagstaff" }) as any[];
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ search: "Flagstaff" }) as any[];
     expect(result).toHaveLength(1);
   });
 
-  it("tag/untag tools work", () => {
-    const note = store.createNote("Test");
-    const tools = generateMcpTools(db);
-
-    const tagTool = tools.find((t) => t.name === "tag-note")!;
-    tagTool.execute({ id: note.id, tags: ["pinned"] });
-    expect(store.getNote(note.id)!.tags).toContain("pinned");
-
-    const untagTool = tools.find((t) => t.name === "untag-note")!;
-    untagTool.execute({ id: note.id, tags: ["pinned"] });
-    expect(store.getNote(note.id)!.tags).not.toContain("pinned");
+  it("query-notes with include_links enriches results", () => {
+    store.createNote("A", { id: "a", path: "alpha" });
+    store.createNote("B", { id: "b", path: "beta" });
+    store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: "a", include_links: true }) as any;
+    expect(result.links).toBeDefined();
+    expect(result.links).toHaveLength(1);
   });
 
-  it("link tools work", () => {
-    store.createNote("A", { id: "a" });
-    store.createNote("B", { id: "b" });
-    const tools = generateMcpTools(db);
+  it("query-notes near param scopes results to graph neighborhood", () => {
+    store.createNote("Center", { id: "center" });
+    store.createNote("Near", { id: "near", tags: ["t"] });
+    store.createNote("Far", { id: "far", tags: ["t"] });
+    store.createLink("center", "near", "mentions");
+    // "far" is not linked to "center"
 
-    const createLink = tools.find((t) => t.name === "create-link")!;
-    createLink.execute({ source_id: "a", target_id: "b", relationship: "mentions" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ tag: "t", near: { note_id: "center", depth: 1 } }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("near");
+  });
 
-    const getLinks = tools.find((t) => t.name === "get-links")!;
-    const links = getLinks.execute({ id: "a" }) as any[];
-    expect(links).toHaveLength(1);
-
-    const deleteLink = tools.find((t) => t.name === "delete-link")!;
-    deleteLink.execute({ source_id: "a", target_id: "b", relationship: "mentions" });
-    expect((getLinks.execute({ id: "a" }) as any[]).length).toBe(0);
+  it("delete-note accepts path", () => {
+    store.createNote("To delete", { path: "Temp/note" });
+    const tools = generateMcpTools(store);
+    const deleteTool = tools.find((t) => t.name === "delete-note")!;
+    const result = deleteTool.execute({ id: "Temp/note" }) as any;
+    expect(result.deleted).toBe(true);
+    expect(store.getNoteByPath("Temp/note")).toBeNull();
   });
 
   it("delete-tag with zero notes removes tag from list", () => {
@@ -707,7 +762,7 @@ describe("MCP tools", () => {
   });
 
   it("delete-tag MCP tool works", () => {
-    const tools = generateMcpTools(db);
+    const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
     createNote.execute({ content: "Test", tags: ["mcp-tag"] });
 
@@ -721,158 +776,106 @@ describe("MCP tools", () => {
     expect(tags.some((t: any) => t.name === "mcp-tag")).toBe(false);
   });
 
-  it("resolve-wikilink: exact match", () => {
-    store.createNote("Mickey doc", { path: "People/Mickey Myers" });
+  it("list-tags single tag detail with schema", () => {
+    store.createNote("Test", { tags: ["person"] });
+    store.upsertTagSchema("person", {
+      description: "A person",
+      fields: { name: { type: "string" } },
+    });
     const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "People/Mickey Myers" }) as any;
-    expect(result.resolved).toBe(true);
-    expect(result.path).toBe("People/Mickey Myers");
-    expect(result.note_id).toBeTruthy();
-    expect(result.candidates).toEqual([]);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const result = listTags.execute({ tag: "person" }) as any;
+    expect(result.name).toBe("person");
+    expect(result.count).toBe(1);
+    expect(result.description).toBe("A person");
+    expect(result.fields.name.type).toBe("string");
   });
 
-  it("resolve-wikilink: basename match", () => {
-    store.createNote("Mickey doc", { path: "People/Mickey" });
+  it("list-tags include_schema returns schemas for all tags", () => {
+    store.createNote("A", { tags: ["person"] });
+    store.createNote("B", { tags: ["project"] });
+    store.upsertTagSchema("person", { description: "A person" });
     const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "Mickey" }) as any;
-    expect(result.resolved).toBe(true);
-    expect(result.path).toBe("People/Mickey");
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const result = listTags.execute({ include_schema: true }) as any[];
+    const person = result.find((t: any) => t.name === "person");
+    expect(person.description).toBe("A person");
+    const project = result.find((t: any) => t.name === "project");
+    expect(project.description).toBeNull();
   });
 
-  it("resolve-wikilink: ambiguous — multiple basename matches", () => {
-    store.createNote("Atlas person", { path: "People/Atlas" });
-    store.createNote("Atlas project", { path: "Projects/Atlas" });
+  it("update-tag creates schema if not exists", () => {
     const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "Atlas" }) as any;
-    expect(result.resolved).toBe(false);
-    expect(result.ambiguous).toBe(true);
-    expect(result.candidates).toHaveLength(2);
-    expect(result.candidates.map((c: any) => c.path).sort()).toEqual(["People/Atlas", "Projects/Atlas"]);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { name: { type: "string" } },
+    }) as any;
+    expect(result.tag).toBe("person");
+    expect(result.description).toBe("A person");
   });
 
-  it("resolve-wikilink: no match", () => {
+  it("update-tag merges fields with existing", () => {
+    store.upsertTagSchema("person", {
+      description: "A person",
+      fields: { name: { type: "string" } },
+    });
     const tools = generateMcpTools(store);
-    const resolve = tools.find((t) => t.name === "resolve-wikilink")!;
-    const result = resolve.execute({ target: "Nonexistent" }) as any;
-    expect(result.resolved).toBe(false);
-    expect(result.ambiguous).toBe(false);
-    expect(result.candidates).toEqual([]);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = updateTag.execute({
+      tag: "person",
+      fields: { age: { type: "integer" } },
+    }) as any;
+    expect(result.fields.name.type).toBe("string");
+    expect(result.fields.age.type).toBe("integer");
   });
 
-  it("list-unresolved-wikilinks: returns unresolved entries", () => {
-    store.createNote("See [[Ghost Note]]", { path: "Source" });
-    const tools = generateMcpTools(store);
-    const listUnresolved = tools.find((t) => t.name === "list-unresolved-wikilinks")!;
-    const result = listUnresolved.execute({}) as any;
-    expect(result.count).toBeGreaterThanOrEqual(1);
-    const ghost = result.unresolved.find((u: any) => u.target_path === "Ghost Note");
-    expect(ghost).toBeTruthy();
-    expect(ghost.source_path).toBe("Source");
-  });
-
-  it("list-unresolved-wikilinks: empty when all resolved", () => {
-    const tools = generateMcpTools(store);
-    const listUnresolved = tools.find((t) => t.name === "list-unresolved-wikilinks")!;
-    const result = listUnresolved.execute({}) as any;
-    expect(result.count).toBe(0);
-    expect(result.unresolved).toEqual([]);
-  });
-
-  it("get-links returns all links when id is omitted", () => {
-    store.createNote("A", { id: "a" });
+  it("find-path works with ID/path resolution", () => {
+    store.createNote("A", { id: "a", path: "People/Alice" });
     store.createNote("B", { id: "b" });
-    store.createNote("C", { id: "c" });
+    store.createNote("C", { id: "c", path: "Projects/X" });
     store.createLink("a", "b", "mentions");
-    store.createLink("b", "c", "cites");
-    const tools = generateMcpTools(db);
-    const getLinks = tools.find((t) => t.name === "get-links")!;
+    store.createLink("b", "c", "related-to");
 
-    const all = getLinks.execute({}) as any[];
-    expect(all).toHaveLength(2);
-
-    const cites = getLinks.execute({ relationship: "cites" }) as any[];
-    expect(cites).toHaveLength(1);
-    expect(cites[0].relationship).toBe("cites");
-  });
-
-  it("get-links returns bare Link[] (no hydration)", () => {
-    store.createNote("A", { id: "a", path: "alpha" });
-    store.createNote("B", { id: "b", path: "beta" });
-    store.createLink("a", "b", "mentions");
-    const tools = generateMcpTools(db);
-    const getLinks = tools.find((t) => t.name === "get-links")!;
-    const result = getLinks.execute({ id: "a" }) as any[];
-    expect(result[0]).not.toHaveProperty("sourceNote");
-    expect(result[0]).not.toHaveProperty("targetNote");
-    expect(result[0].sourceId).toBe("a");
-    expect(result[0].targetId).toBe("b");
-  });
-
-  it("get-graph returns notes, links, tags, meta with lean notes by default", () => {
-    store.createNote("first", { id: "a", tags: ["proj"] });
-    store.createNote("second", { id: "b", tags: ["proj"] });
-    store.createNote("third", { id: "c", tags: ["other"] });
-    store.createLink("a", "b", "mentions");
-
-    const tools = generateMcpTools(db);
-    const getGraph = tools.find((t) => t.name === "get-graph")!;
-    const graph = getGraph.execute({}) as any;
-
-    expect(graph.notes).toHaveLength(3);
-    expect(graph.links).toHaveLength(1);
-    expect(graph.meta.totalNotes).toBe(3);
-    expect(graph.meta.totalLinks).toBe(1);
-    expect(graph.meta.includeContent).toBe(false);
-    expect(graph.notes[0]).not.toHaveProperty("content");
-    expect(graph.notes[0]).toHaveProperty("byteSize");
-    expect(graph.notes[0]).toHaveProperty("preview");
-  });
-
-  it("get-graph include_content=true returns full notes", () => {
-    store.createNote("body text", { id: "a" });
-    const tools = generateMcpTools(db);
-    const getGraph = tools.find((t) => t.name === "get-graph")!;
-    const graph = getGraph.execute({ include_content: true }) as any;
-    expect(graph.notes[0].content).toBe("body text");
-    expect(graph.meta.includeContent).toBe(true);
-  });
-
-  it("get-graph tag filter restricts notes and links to subgraph", () => {
-    store.createNote("a", { id: "a", tags: ["proj"] });
-    store.createNote("b", { id: "b", tags: ["proj"] });
-    store.createNote("c", { id: "c", tags: ["other"] });
-    store.createLink("a", "b", "mentions");
-    store.createLink("a", "c", "mentions");
-
-    const tools = generateMcpTools(db);
-    const getGraph = tools.find((t) => t.name === "get-graph")!;
-    const graph = getGraph.execute({ tags: ["proj"] }) as any;
-
-    expect(graph.notes).toHaveLength(2);
-    expect(graph.links).toHaveLength(1);
-    expect(graph.links[0].targetId).toBe("b");
-    expect(graph.meta.totalNotes).toBe(3);
-    expect(graph.meta.totalLinks).toBe(2);
-    expect(graph.meta.filteredNotes).toBe(2);
-    expect(graph.meta.filteredLinks).toBe(1);
+    const tools = generateMcpTools(store);
+    const findPath = tools.find((t) => t.name === "find-path")!;
+    const result = findPath.execute({ source: "People/Alice", target: "Projects/X" }) as any;
+    expect(result).not.toBeNull();
+    expect(result.path).toEqual(["a", "b", "c"]);
+    expect(result.relationships).toEqual(["mentions", "related-to"]);
   });
 
   it("create-note via store triggers wikilink sync", () => {
-    // When MCP tools are generated with a Store, wikilinks should auto-sync
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
 
-    // Create target note first
     store.createNote("Target", { path: "Target Note" });
-
-    // Create source via MCP tool with a wikilink
     const source = createNote.execute({ content: "See [[Target Note]]" }) as any;
 
-    // Wikilink should have been resolved into a link
     const links = store.getLinks(source.id, { direction: "outbound" });
     expect(links.some((l) => l.relationship === "wikilink")).toBe(true);
+  });
+
+  it("create-note with schema tag auto-populates defaults", () => {
+    store.upsertTagSchema("person", {
+      description: "A person",
+      fields: {
+        first_appeared: { type: "string" },
+        active: { type: "boolean" },
+        priority: { type: "integer" },
+        status: { type: "string", enum: ["active", "archived"] },
+      },
+    });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = createNote.execute({ content: "Alice", tags: ["person"] }) as any;
+    const fresh = query.execute({ id: result.id }) as any;
+    expect(fresh.metadata.first_appeared).toBe("");
+    expect(fresh.metadata.active).toBe(false);
+    expect(fresh.metadata.priority).toBe(0);
+    expect(fresh.metadata.status).toBe("active");
   });
 });

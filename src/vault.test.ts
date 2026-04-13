@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
-import { handleNotes, handleLinks, handleGraph } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
 
 let db: Database;
 let store: BunStore;
@@ -469,62 +469,51 @@ describe("deeper link queries", () => {
 });
 
 describe("MCP tools", () => {
-  test("generates all 22 core tools", () => {
-    const tools = generateMcpTools(db);
-    expect(tools.length).toBe(22);
+  test("generates all 9 core tools", () => {
+    const tools = generateMcpTools(store);
+    expect(tools.length).toBe(9);
 
     const names = tools.map((t) => t.name);
-    expect(names).toContain("get-note");
+    expect(names).toContain("query-notes");
     expect(names).toContain("create-note");
-    expect(names).toContain("create-notes");
-    expect(names).toContain("batch-tag");
-    expect(names).toContain("batch-untag");
-    expect(names).toContain("traverse-links");
-    expect(names).toContain("find-path");
+    expect(names).toContain("update-note");
+    expect(names).toContain("delete-note");
     expect(names).toContain("list-tags");
-    expect(names).toContain("get-vault-stats");
-    expect(names).toContain("get-graph");
+    expect(names).toContain("update-tag");
+    expect(names).toContain("delete-tag");
+    expect(names).toContain("find-path");
+    expect(names).toContain("vault-info");
   });
 
-  test("get-note tool works by id", () => {
-    const tools = generateMcpTools(db);
+  test("query-notes by id works", () => {
+    const tools = generateMcpTools(store);
     const note = store.createNote("By ID", { path: "test/note" });
 
-    const getTool = tools.find((t) => t.name === "get-note")!;
-    const result = getTool.execute({ id: note.id }) as any;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: note.id }) as any;
     expect(result.content).toBe("By ID");
     expect(result.path).toBe("test/note");
   });
 
-  test("get-note tool works by path", () => {
-    const tools = generateMcpTools(db);
+  test("query-notes by path works", () => {
+    const tools = generateMcpTools(store);
     store.createNote("By Path", { path: "Projects/README" });
 
-    const getTool = tools.find((t) => t.name === "get-note")!;
-    const result = getTool.execute({ path: "Projects/README" }) as any;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = query.execute({ id: "Projects/README" }) as any;
     expect(result.content).toBe("By Path");
   });
 
-  test("get-note tool fetches multiple by ids", () => {
-    const tools = generateMcpTools(db);
-    const a = store.createNote("A");
-    const b = store.createNote("B");
-
-    const getTool = tools.find((t) => t.name === "get-note")!;
-    const result = getTool.execute({ ids: [a.id, b.id] }) as any[];
-    expect(result.length).toBe(2);
-  });
-
   test("create-note tool works via execute", () => {
-    const tools = generateMcpTools(db);
+    const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const result = createNote.execute({ content: "MCP note", tags: ["daily"] }) as any;
     expect(result.content).toBe("MCP note");
     expect(result.tags).toContain("daily");
   });
 
-  test("every tool has vault param in unified wrapper schema", () => {
-    const tools = generateMcpTools(db);
+  test("every tool has inputSchema and execute", () => {
+    const tools = generateMcpTools(store);
     for (const tool of tools) {
       expect(tool.inputSchema).toBeDefined();
       expect(tool.execute).toBeFunction();
@@ -533,40 +522,38 @@ describe("MCP tools", () => {
 });
 
 describe("unified MCP wrapper", () => {
-  test("routes get-vault-stats through vault param", async () => {
+  test("vault-info routes through vault param", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
-    // Seed a unique vault on disk under the preload-provided PARACHUTE_HOME.
     const vaultName = `unified-stats-${Date.now()}`;
     writeVaultConfig({
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
+      description: "Test vault",
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
-    // Populate the vault with notes/tags the stats tool should observe.
     const vaultStore = getVaultStore(vaultName);
     vaultStore.createNote("alpha", { tags: ["x", "y"] });
     vaultStore.createNote("beta", { tags: ["x"] });
 
     const tools = generateUnifiedMcpTools();
-    const statsTool = tools.find((t) => t.name === "get-vault-stats");
-    expect(statsTool).toBeTruthy();
-    // Routed explicitly via the vault param, mirroring how a multi-vault
-    // client targets a specific vault.
-    const result = statsTool!.execute({ vault: vaultName }) as any;
-    expect(result.totalNotes).toBe(2);
-    expect(result.tagCount).toBe(2);
-    expect(result.topTags[0].tag).toBe("x");
-    expect(result.topTags[0].count).toBe(2);
+    const vaultInfo = tools.find((t) => t.name === "vault-info");
+    expect(vaultInfo).toBeTruthy();
+
+    const result = vaultInfo!.execute({ vault: vaultName, include_stats: true }) as any;
+    expect(result.name).toBe(vaultName);
+    expect(result.description).toBe("Test vault");
+    expect(result.stats.totalNotes).toBe(2);
+    expect(result.stats.tagCount).toBe(2);
 
     closeAllStores();
   });
 
-  test("list-tag-schemas and describe-tag tools work", async () => {
+  test("list-tags with schema works through unified wrapper", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
@@ -579,39 +566,27 @@ describe("unified MCP wrapper", () => {
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
-    // Insert schemas into DB
-    const store = getVaultStore(vaultName);
-    store.upsertTagSchema("person", {
+    const vaultStore = getVaultStore(vaultName);
+    vaultStore.createNote("A", { tags: ["person"] });
+    vaultStore.upsertTagSchema("person", {
       description: "A person",
       fields: { name: { type: "string", description: "Full name" } },
     });
-    store.upsertTagSchema("project", { description: "A project" });
 
     const tools = generateUnifiedMcpTools();
 
-    const listTool = tools.find((t) => t.name === "list-tag-schemas");
-    expect(listTool).toBeTruthy();
-    const schemas = listTool!.execute({ vault: vaultName }) as any[];
-    expect(schemas.length).toBe(2);
-    const personSchema = schemas.find((s: any) => s.tag === "person");
-    expect(personSchema).toBeDefined();
-    expect(personSchema.description).toBe("A person");
-    const projectSchema = schemas.find((s: any) => s.tag === "project");
-    expect(projectSchema).toBeDefined();
-
-    const describeTool = tools.find((t) => t.name === "describe-tag");
-    expect(describeTool).toBeTruthy();
-    const described = describeTool!.execute({ vault: vaultName, tag: "person" }) as any;
-    expect(described.description).toBe("A person");
-    expect(described.fields.name.type).toBe("string");
-
-    const unknown = describeTool!.execute({ vault: vaultName, tag: "nonexistent" }) as any;
-    expect(unknown).toBeNull();
+    // list-tags with tag param for single tag detail
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const detail = listTags.execute({ vault: vaultName, tag: "person" }) as any;
+    expect(detail.name).toBe("person");
+    expect(detail.count).toBe(1);
+    expect(detail.description).toBe("A person");
+    expect(detail.fields.name.type).toBe("string");
 
     closeAllStores();
   });
 
-  test("create-note with schema tag auto-populates defaults and produces no warnings", async () => {
+  test("create-note with schema tag auto-populates defaults", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
@@ -624,8 +599,8 @@ describe("unified MCP wrapper", () => {
     });
     writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
-    const store = getVaultStore(vaultName);
-    store.upsertTagSchema("person", {
+    const vaultStore = getVaultStore(vaultName);
+    vaultStore.upsertTagSchema("person", {
       description: "A person",
       fields: {
         first_appeared: { type: "string", description: "When" },
@@ -635,67 +610,36 @@ describe("unified MCP wrapper", () => {
 
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
-    const getNote = tools.find((t) => t.name === "get-note")!;
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
-    // Create a note tagged person with no metadata — defaults auto-populated, no warnings
+    // Create a note tagged person with no metadata — defaults auto-populated
     const result = createNote.execute({
       vault: vaultName,
       content: "Alice",
       tags: ["person"],
     }) as any;
     expect(result.content).toBe("Alice");
-    expect(result._schema_warnings).toBeUndefined(); // defaults cover all fields
 
     // Verify defaults were written
-    const fresh = getNote.execute({ vault: vaultName, id: result.id }) as any;
+    const fresh = queryNotes.execute({ vault: vaultName, id: result.id }) as any;
     expect(fresh.metadata.first_appeared).toBe("");
     expect(fresh.metadata.relationship).toBe("");
 
-    // Create with explicit metadata — preserved, no warnings
+    // Create with explicit metadata — preserved
     const result2 = createNote.execute({
       vault: vaultName,
       content: "Bob",
       tags: ["person"],
       metadata: { first_appeared: "2024-01", relationship: "friend" },
     }) as any;
-    expect(result2._schema_warnings).toBeUndefined();
-    const fresh2 = getNote.execute({ vault: vaultName, id: result2.id }) as any;
+    const fresh2 = queryNotes.execute({ vault: vaultName, id: result2.id }) as any;
     expect(fresh2.metadata.first_appeared).toBe("2024-01");
     expect(fresh2.metadata.relationship).toBe("friend");
 
     closeAllStores();
   });
 
-  test("tag-note with schema tag produces warnings for remaining missing fields", async () => {
-    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
-    const { closeAllStores } = await import("./vault-store.ts");
-
-    const vaultName = `schema-tagwarn-${Date.now()}`;
-    writeVaultConfig({
-      name: vaultName,
-      api_keys: [],
-      created_at: new Date().toISOString(),
-    });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
-
-    const { getVaultStore } = await import("./vault-store.ts");
-    const store = getVaultStore(vaultName);
-    store.upsertTagSchema("empty", { description: "No fields" });
-
-    const tools = generateUnifiedMcpTools();
-    const createNote = tools.find((t) => t.name === "create-note")!;
-    const tagNote = tools.find((t) => t.name === "tag-note")!;
-
-    // tag-note: tag with schema that has no fields → no warnings
-    const note = createNote.execute({ vault: vaultName, content: "Test" }) as any;
-    const tagResult = tagNote.execute({ vault: vaultName, id: note.id, tags: ["empty"] }) as any;
-    expect(tagResult._schema_warnings).toBeUndefined();
-
-    closeAllStores();
-  });
-
-  test("tag-note auto-populates metadata defaults from tag schema", async () => {
+  test("update-note tags.add with schema auto-populates defaults", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
@@ -726,13 +670,13 @@ describe("unified MCP wrapper", () => {
     });
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
-    const tagNote = tools.find((t) => t.name === "tag-note")!;
-    const getNote = tools.find((t) => t.name === "get-note")!;
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
-    // Create a note, then tag it with #person
+    // Create a note, then add #person tag via update-note
     const note = createNote.execute({ vault: vaultName, content: "Alice" }) as any;
-    tagNote.execute({ vault: vaultName, id: note.id, tags: ["person"] });
-    const after = getNote.execute({ vault: vaultName, id: note.id }) as any;
+    updateNote.execute({ vault: vaultName, id: note.id, tags: { add: ["person"] } });
+    const after = queryNotes.execute({ vault: vaultName, id: note.id }) as any;
     expect(after.metadata.first_appeared).toBe("");
     expect(after.metadata.relationship).toBe("");
 
@@ -742,29 +686,23 @@ describe("unified MCP wrapper", () => {
       content: "Bob",
       metadata: { first_appeared: "2023-11" },
     }) as any;
-    tagNote.execute({ vault: vaultName, id: note2.id, tags: ["person"] });
-    const after2 = getNote.execute({ vault: vaultName, id: note2.id }) as any;
+    updateNote.execute({ vault: vaultName, id: note2.id, tags: { add: ["person"] } });
+    const after2 = queryNotes.execute({ vault: vaultName, id: note2.id }) as any;
     expect(after2.metadata.first_appeared).toBe("2023-11"); // preserved
     expect(after2.metadata.relationship).toBe(""); // added
 
-    // Tag with no schema — no metadata changes
-    const note3 = createNote.execute({ vault: vaultName, content: "No schema" }) as any;
-    tagNote.execute({ vault: vaultName, id: note3.id, tags: ["random"] });
-    const after3 = getNote.execute({ vault: vaultName, id: note3.id }) as any;
-    expect(after3.metadata).toBeUndefined();
-
     // Tag with #project — enum defaults to first value, boolean to false, integer to 0
     const note4 = createNote.execute({ vault: vaultName, content: "My Project" }) as any;
-    tagNote.execute({ vault: vaultName, id: note4.id, tags: ["project"] });
-    const after4 = getNote.execute({ vault: vaultName, id: note4.id }) as any;
+    updateNote.execute({ vault: vaultName, id: note4.id, tags: { add: ["project"] } });
+    const after4 = queryNotes.execute({ vault: vaultName, id: note4.id }) as any;
     expect(after4.metadata.status).toBe("active");
     expect(after4.metadata.active).toBe(false);
     expect(after4.metadata.priority).toBe(0);
 
     // Multiple schema tags at once — all defaults merged
     const note5 = createNote.execute({ vault: vaultName, content: "Multi" }) as any;
-    tagNote.execute({ vault: vaultName, id: note5.id, tags: ["person", "project"] });
-    const after5 = getNote.execute({ vault: vaultName, id: note5.id }) as any;
+    updateNote.execute({ vault: vaultName, id: note5.id, tags: { add: ["person", "project"] } });
+    const after5 = queryNotes.execute({ vault: vaultName, id: note5.id }) as any;
     expect(after5.metadata.first_appeared).toBe("");
     expect(after5.metadata.relationship).toBe("");
     expect(after5.metadata.status).toBe("active");
@@ -773,7 +711,7 @@ describe("unified MCP wrapper", () => {
     close();
   });
 
-  test("tag-note auto-populate does not bump updatedAt", async () => {
+  test("update-note tags.add auto-populate does not bump updatedAt", async () => {
     const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
@@ -794,13 +732,13 @@ describe("unified MCP wrapper", () => {
 
     const tools = generateUnifiedMcpTools();
     const createNote = tools.find((t) => t.name === "create-note")!;
-    const tagNote = tools.find((t) => t.name === "tag-note")!;
-    const getNote = tools.find((t) => t.name === "get-note")!;
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
     const note = createNote.execute({ vault: vaultName, content: "Test" }) as any;
     const originalUpdatedAt = note.updatedAt;
-    tagNote.execute({ vault: vaultName, id: note.id, tags: ["person"] });
-    const after = getNote.execute({ vault: vaultName, id: note.id }) as any;
+    updateNote.execute({ vault: vaultName, id: note.id, tags: { add: ["person"] } });
+    const after = queryNotes.execute({ vault: vaultName, id: note.id }) as any;
     expect(after.updatedAt).toBe(originalUpdatedAt);
     expect(after.metadata.name).toBe("");
 
@@ -811,41 +749,27 @@ describe("unified MCP wrapper", () => {
 describe("auth scopes", () => {
   test("read scope allows read tools", () => {
     const { isToolAllowed } = require("./auth.ts");
-    expect(isToolAllowed("get-note", "read")).toBe(true);
-    expect(isToolAllowed("read-notes", "read")).toBe(true);
-    expect(isToolAllowed("search-notes", "read")).toBe(true);
-    expect(isToolAllowed("get-links", "read")).toBe(true);
-    expect(isToolAllowed("traverse-links", "read")).toBe(true);
-    expect(isToolAllowed("find-path", "read")).toBe(true);
+    expect(isToolAllowed("query-notes", "read")).toBe(true);
     expect(isToolAllowed("list-tags", "read")).toBe(true);
-    expect(isToolAllowed("get-vault-stats", "read")).toBe(true);
+    expect(isToolAllowed("find-path", "read")).toBe(true);
+    expect(isToolAllowed("vault-info", "read")).toBe(true);
     expect(isToolAllowed("list-vaults", "read")).toBe(true);
-    expect(isToolAllowed("list-tag-schemas", "read")).toBe(true);
-    expect(isToolAllowed("describe-tag", "read")).toBe(true);
   });
 
   test("read scope blocks write tools", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("create-note", "read")).toBe(false);
-    expect(isToolAllowed("create-tag-schema", "read")).toBe(false);
-    expect(isToolAllowed("update-tag-schema", "read")).toBe(false);
-    expect(isToolAllowed("delete-tag-schema", "read")).toBe(false);
     expect(isToolAllowed("update-note", "read")).toBe(false);
     expect(isToolAllowed("delete-note", "read")).toBe(false);
-    expect(isToolAllowed("tag-note", "read")).toBe(false);
-    expect(isToolAllowed("untag-note", "read")).toBe(false);
-    expect(isToolAllowed("create-link", "read")).toBe(false);
-    expect(isToolAllowed("delete-link", "read")).toBe(false);
-    expect(isToolAllowed("create-notes", "read")).toBe(false);
-    expect(isToolAllowed("batch-tag", "read")).toBe(false);
-    expect(isToolAllowed("batch-untag", "read")).toBe(false);
+    expect(isToolAllowed("update-tag", "read")).toBe(false);
+    expect(isToolAllowed("delete-tag", "read")).toBe(false);
   });
 
   test("write scope allows everything", () => {
     const { isToolAllowed } = require("./auth.ts");
     expect(isToolAllowed("create-note", "write")).toBe(true);
     expect(isToolAllowed("delete-note", "write")).toBe(true);
-    expect(isToolAllowed("get-note", "write")).toBe(true);
+    expect(isToolAllowed("query-notes", "write")).toBe(true);
   });
 
   test("read scope allows GET but not POST/PATCH/DELETE", () => {
@@ -855,11 +779,6 @@ describe("auth scopes", () => {
     expect(isMethodAllowed("POST", "read")).toBe(false);
     expect(isMethodAllowed("PATCH", "read")).toBe(false);
     expect(isMethodAllowed("DELETE", "read")).toBe(false);
-  });
-
-  test("get-graph is a read tool", () => {
-    const { isToolAllowed } = require("./auth.ts");
-    expect(isToolAllowed("get-graph", "read")).toBe(true);
   });
 });
 
@@ -895,15 +814,12 @@ describe("HTTP /notes", () => {
     expect(body[0].content).toBe("full body");
   });
 
-  test("GET /notes?ids=a,b bulk fetch", async () => {
-    const n1 = store.createNote("one", { id: "id-1" });
-    const n2 = store.createNote("two", { id: "id-2" });
-    store.createNote("three", { id: "id-3" });
-    const res = await handleNotes(mkReq("GET", "/notes?ids=id-1,id-2"), store, "");
+  test("GET /notes?search=fox full-text search", async () => {
+    store.createNote("The quick brown fox");
+    store.createNote("A lazy dog");
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox"), store, "");
     const body = await res.json() as any[];
-    expect(body).toHaveLength(2);
-    const ids = body.map((n) => n.id).sort();
-    expect(ids).toEqual(["id-1", "id-2"]);
+    expect(body).toHaveLength(1);
   });
 
   test("GET /notes/:id defaults to full content", async () => {
@@ -945,108 +861,142 @@ describe("HTTP /notes", () => {
   });
 });
 
-describe("HTTP /links (polymorphic)", () => {
-  test("GET /links returns all edges", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    store.createNote("c", { id: "c" });
-    store.createLink("a", "b", "mentions");
-    store.createLink("b", "c", "cites");
-    const res = await handleLinks(mkReq("GET", "/links"), store);
-    const body = await res.json() as any[];
-    expect(body).toHaveLength(2);
-  });
-
-  test("GET /links?note_id=a restricts to links touching a", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    store.createNote("c", { id: "c" });
-    store.createLink("a", "b", "mentions");
-    store.createLink("b", "c", "cites");
-    const res = await handleLinks(mkReq("GET", "/links?note_id=a"), store);
-    const body = await res.json() as any[];
-    expect(body).toHaveLength(1);
-    expect(body[0].sourceId).toBe("a");
-  });
-
-  test("GET /links?relationship=cites filters by type", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    store.createLink("a", "b", "mentions");
-    store.createLink("a", "b", "cites");
-    const res = await handleLinks(mkReq("GET", "/links?relationship=cites"), store);
-    const body = await res.json() as any[];
-    expect(body).toHaveLength(1);
-    expect(body[0].relationship).toBe("cites");
-  });
-
-  test("POST /links accepts sourceId/targetId (camelCase) in body", async () => {
-    store.createNote("a", { id: "a" });
-    store.createNote("b", { id: "b" });
-    const res = await handleLinks(
-      mkReq("POST", "/links", { sourceId: "a", targetId: "b", relationship: "cites" }),
+describe("HTTP PATCH /notes/:idOrPath (update)", () => {
+  test("PATCH updates content and merges metadata", async () => {
+    const note = store.createNote("original", { id: "x", metadata: { a: 1 } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "updated", metadata: { b: 2 } }),
       store,
+      "/x",
     );
-    expect(res.status).toBe(201);
     const body = await res.json() as any;
-    expect(body.sourceId).toBe("a");
-    expect(body.targetId).toBe("b");
+    expect(body.content).toBe("updated");
+    expect(body.metadata).toEqual({ a: 1, b: 2 });
   });
 
-  test("POST /links rejects snake_case body fields", async () => {
+  test("PATCH adds/removes tags", async () => {
+    store.createNote("x", { id: "x", tags: ["old"] });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { tags: { add: ["new"], remove: ["old"] } }),
+      store,
+      "/x",
+    );
+    const body = await res.json() as any;
+    expect(body.tags).toContain("new");
+    expect(body.tags).not.toContain("old");
+  });
+
+  test("PATCH adds/removes links", async () => {
     store.createNote("a", { id: "a" });
     store.createNote("b", { id: "b" });
-    const res = await handleLinks(
-      mkReq("POST", "/links", { source_id: "a", target_id: "b", relationship: "cites" }),
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "b", relationship: "mentions" }] } }),
       store,
+      "/a",
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    const links = store.getLinks("a", { direction: "outbound" });
+    expect(links).toHaveLength(1);
+
+    // Remove
+    await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { remove: [{ target: "b", relationship: "mentions" }] } }),
+      store,
+      "/a",
+    );
+    expect(store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
+  });
+
+  test("PATCH resolves note by path", async () => {
+    store.createNote("x", { path: "Projects/README" });
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${encodeURIComponent("Projects/README")}`, { content: "updated" }),
+      store,
+      `/${encodeURIComponent("Projects/README")}`,
+    );
+    const body = await res.json() as any;
+    expect(body.content).toBe("updated");
+  });
+
+  test("DELETE resolves note by path", async () => {
+    store.createNote("x", { path: "Temp/note" });
+    const res = await handleNotes(
+      mkReq("DELETE", `/notes/${encodeURIComponent("Temp/note")}`),
+      store,
+      `/${encodeURIComponent("Temp/note")}`,
+    );
+    const body = await res.json() as any;
+    expect(body.deleted).toBe(true);
+    expect(store.getNoteByPath("Temp/note")).toBeNull();
   });
 });
 
-describe("HTTP /graph", () => {
-  test("returns notes, links, tags, meta", async () => {
-    store.createNote("a", { id: "a", tags: ["proj"] });
-    store.createNote("b", { id: "b", tags: ["proj"] });
-    store.createNote("c", { id: "c", tags: ["other"] });
+describe("HTTP /tags", () => {
+  test("GET /tags lists all tags", async () => {
+    store.createNote("A", { tags: ["daily"] });
+    store.createNote("B", { tags: ["daily", "pinned"] });
+    const res = await handleTags(mkReq("GET", "/tags"), store);
+    const body = await res.json() as any[];
+    const daily = body.find((t: any) => t.name === "daily");
+    expect(daily.count).toBe(2);
+  });
+
+  test("GET /tags?tag=name returns single tag detail with schema", async () => {
+    store.createNote("A", { tags: ["person"] });
+    store.upsertTagSchema("person", { description: "A person", fields: { name: { type: "string" } } });
+    const res = await handleTags(mkReq("GET", "/tags?tag=person"), store);
+    const body = await res.json() as any;
+    expect(body.name).toBe("person");
+    expect(body.count).toBe(1);
+    expect(body.description).toBe("A person");
+    expect(body.fields.name.type).toBe("string");
+  });
+
+  test("PUT /tags/:name upserts schema", async () => {
+    const res = await handleTags(
+      mkReq("PUT", "/tags/person", { description: "A person", fields: { name: { type: "string" } } }),
+      store,
+      "/person",
+    );
+    const body = await res.json() as any;
+    expect(body.tag).toBe("person");
+    expect(body.description).toBe("A person");
+  });
+
+  test("DELETE /tags/:name removes tag and schema", async () => {
+    store.createNote("A", { tags: ["doomed"] });
+    store.upsertTagSchema("doomed", { description: "will be deleted" });
+    const res = await handleTags(mkReq("DELETE", "/tags/doomed"), store, "/doomed");
+    const body = await res.json() as any;
+    expect(body.deleted).toBe(true);
+    expect(store.listTags().some((t) => t.name === "doomed")).toBe(false);
+  });
+});
+
+describe("HTTP /find-path", () => {
+  test("finds path between two notes", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    store.createNote("c", { id: "c" });
     store.createLink("a", "b", "mentions");
-    const res = await handleGraph(mkReq("GET", "/graph"), store);
+    store.createLink("b", "c", "related-to");
+    const res = handleFindPath(mkReq("GET", "/find-path?source=a&target=c"), store);
     const body = await res.json() as any;
-    expect(body.notes).toHaveLength(3);
-    expect(body.links).toHaveLength(1);
-    expect(body.tags.length).toBeGreaterThan(0);
-    expect(body.meta.totalNotes).toBe(3);
-    expect(body.meta.totalLinks).toBe(1);
-    expect(body.meta.includeContent).toBe(false);
-    // Lean by default
-    expect(body.notes[0]).not.toHaveProperty("content");
-    expect(body.notes[0]).toHaveProperty("byteSize");
+    expect(body.path).toEqual(["a", "b", "c"]);
+    expect(body.relationships).toEqual(["mentions", "related-to"]);
   });
 
-  test("?include_content=true returns full note content", async () => {
-    store.createNote("has body", { id: "a" });
-    const res = await handleGraph(mkReq("GET", "/graph?include_content=true"), store);
+  test("returns null when no path exists", async () => {
+    store.createNote("a", { id: "a" });
+    store.createNote("b", { id: "b" });
+    const res = handleFindPath(mkReq("GET", "/find-path?source=a&target=b"), store);
     const body = await res.json() as any;
-    expect(body.notes[0].content).toBe("has body");
-    expect(body.meta.includeContent).toBe(true);
+    expect(body).toBeNull();
   });
 
-  test("?tag=proj filters notes and links to the subgraph", async () => {
-    store.createNote("a", { id: "a", tags: ["proj"] });
-    store.createNote("b", { id: "b", tags: ["proj"] });
-    store.createNote("c", { id: "c", tags: ["other"] });
-    store.createLink("a", "b", "mentions"); // inside subgraph
-    store.createLink("a", "c", "mentions"); // crosses subgraph boundary
-    const res = await handleGraph(mkReq("GET", "/graph?tag=proj"), store);
-    const body = await res.json() as any;
-    expect(body.notes).toHaveLength(2);
-    expect(body.links).toHaveLength(1);
-    expect(body.links[0].sourceId).toBe("a");
-    expect(body.links[0].targetId).toBe("b");
-    expect(body.meta.totalNotes).toBe(3);
-    expect(body.meta.totalLinks).toBe(2);
-    expect(body.meta.filteredNotes).toBe(2);
-    expect(body.meta.filteredLinks).toBe(1);
+  test("requires source and target params", async () => {
+    const res = handleFindPath(mkReq("GET", "/find-path?source=a"), store);
+    expect(res.status).toBe(400);
   });
 });
 
@@ -1078,7 +1028,7 @@ describe("stateless MCP transport", () => {
         jsonrpc: "2.0",
         id: 1,
         method: "tools/call",
-        params: { name: "get-vault-stats", arguments: { vault: vaultName } },
+        params: { name: "vault-info", arguments: { vault: vaultName, include_stats: true } },
       }),
     });
 
@@ -1088,7 +1038,7 @@ describe("stateless MCP transport", () => {
     const body = await res.json() as any;
     expect(body.result).toBeDefined();
     const content = JSON.parse(body.result.content[0].text);
-    expect(content.totalNotes).toBe(1);
+    expect(content.stats.totalNotes).toBe(1);
 
     closeAllStores();
   });
@@ -1128,7 +1078,7 @@ describe("stateless MCP transport", () => {
     expect(body.result.tools.length).toBeGreaterThan(0);
     const toolNames = body.result.tools.map((t: any) => t.name);
     expect(toolNames).toContain("create-note");
-    expect(toolNames).toContain("get-vault-stats");
+    expect(toolNames).toContain("vault-info");
 
     closeAllStores();
   });

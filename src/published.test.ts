@@ -46,6 +46,14 @@ function makeStore(notes: Record<string, { content: string; tags?: string[]; met
         updatedAt: "2025-01-01T00:00:00Z",
       };
     },
+    getNoteByPath(path: string) {
+      for (const [id, n] of Object.entries(notes)) {
+        if (n.path?.toLowerCase() === path.toLowerCase()) {
+          return this.getNote(id);
+        }
+      }
+      return null;
+    },
   } as any;
 }
 
