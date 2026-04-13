@@ -67,14 +67,12 @@ parachute vault config set KEY value       # set a config value
 parachute vault restart                    # apply changes
 ```
 
-## MCP tools
+## MCP tools (9)
 
-**Notes**: `get-note`, `create-note`, `update-note`, `delete-note`, `read-notes`, `search-notes`
-**Tags**: `tag-note`, `untag-note`, `list-tags`
-**Links**: `create-link`, `delete-link`, `get-links`
-**Bulk**: `create-notes`, `batch-tag`, `batch-untag`
-**Graph**: `traverse-links`, `find-path`
-**Vault**: `list-vaults`, `get-vault-description`, `update-vault-description`, `get-vault-stats`
+**Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note`
+**Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`
+**Graph**: `find-path` (BFS between two notes)
+**Vault**: `vault-info` (get/update description + stats)
 
 ### Vault descriptions
 

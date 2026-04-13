@@ -23,21 +23,11 @@ export interface AuthResult {
 
 /** Read-only tools (allowed for scope: "read"). */
 const READ_TOOLS = new Set([
-  "get-note",
-  "read-notes",
-  "search-notes",
-  "get-links",
-  "get-graph",
-  "traverse-links",
-  "find-path",
+  "query-notes",
   "list-tags",
+  "find-path",
+  "vault-info",
   "list-vaults",
-  "get-vault-description",
-  "get-vault-stats",
-  "resolve-wikilink",
-  "list-unresolved-wikilinks",
-  "list-tag-schemas",
-  "describe-tag",
 ]);
 
 /** Check if a tool call is allowed for a given scope. */
