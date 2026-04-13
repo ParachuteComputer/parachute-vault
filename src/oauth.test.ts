@@ -259,13 +259,15 @@ describe("OAuth authorization", () => {
 
   test("POST authorize (deny) redirects with error", async () => {
     const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
     const req = makeRequest("https://vault.test/oauth/authorize", {
       method: "POST",
       body: new URLSearchParams({
         action: "deny",
         client_id: clientId,
         redirect_uri: "https://example.com/callback",
-        code_challenge: "x",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
         state: "s",
       }),
     });
@@ -273,6 +275,40 @@ describe("OAuth authorization", () => {
     expect(res.status).toBe(302);
     const location = new URL(res.headers.get("location")!);
     expect(location.searchParams.get("error")).toBe("access_denied");
+  });
+
+  test("POST authorize rejects unregistered redirect_uri (prevents open redirect)", async () => {
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const req = makeRequest("https://vault.test/oauth/authorize", {
+      method: "POST",
+      body: new URLSearchParams({
+        action: "deny",
+        client_id: clientId,
+        redirect_uri: "https://evil.com/steal",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
+      }),
+    });
+    const res = await handleAuthorizePost(req, db);
+    // Should NOT redirect — returns 400 instead
+    expect(res.status).toBe(400);
+  });
+
+  test("POST authorize rejects unknown client_id", async () => {
+    const { codeChallenge } = generatePkce();
+    const req = makeRequest("https://vault.test/oauth/authorize", {
+      method: "POST",
+      body: new URLSearchParams({
+        action: "authorize",
+        client_id: "nonexistent",
+        redirect_uri: "https://evil.com/steal",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
+      }),
+    });
+    const res = await handleAuthorizePost(req, db);
+    expect(res.status).toBe(400);
   });
 });
 
@@ -307,6 +343,7 @@ describe("OAuth token exchange", () => {
         code: "bogus",
         code_verifier: "whatever",
         client_id: clientId,
+        redirect_uri: "https://example.com/callback",
       }).toString(),
     });
     const res = await handleToken(req, db);
@@ -499,6 +536,26 @@ describe("OAuth token exchange", () => {
     const token = await fullOAuthFlow();
     // fullOAuthFlow uses form-encoded. Let's also test JSON for token endpoint
     expect(token.startsWith("pvt_")).toBe(true);
+  });
+
+  test("rejects missing redirect_uri", async () => {
+    const clientId = await registerClient();
+    const res = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: "some-code",
+          code_verifier: "some-verifier",
+          client_id: clientId,
+        }).toString(),
+      }),
+      db,
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_request");
   });
 
   test("rejects non-POST", async () => {

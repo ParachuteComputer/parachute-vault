@@ -199,6 +199,25 @@ export async function handleAuthorizePost(req: Request, db: Database): Promise<R
     return Response.json({ error: "invalid_request" }, { status: 400 });
   }
 
+  // Validate client and redirect_uri BEFORE constructing any redirect.
+  // This prevents open-redirect attacks via crafted redirect_uri values.
+  const client = db.prepare("SELECT redirect_uris FROM oauth_clients WHERE client_id = ?")
+    .get(clientId) as { redirect_uris: string } | null;
+
+  if (!client) {
+    return Response.json({ error: "invalid_request", error_description: "Unknown client" }, { status: 400 });
+  }
+
+  const registeredUris: string[] = JSON.parse(client.redirect_uris);
+  if (!registeredUris.includes(redirectUri)) {
+    return Response.json({ error: "invalid_request", error_description: "redirect_uri mismatch" }, { status: 400 });
+  }
+
+  // Only S256 is supported
+  if (codeChallengeMethod !== "S256") {
+    return Response.json({ error: "invalid_request", error_description: "Only S256 code challenge method is supported" }, { status: 400 });
+  }
+
   const redirect = new URL(redirectUri);
   if (state) redirect.searchParams.set("state", state);
 
@@ -206,20 +225,6 @@ export async function handleAuthorizePost(req: Request, db: Database): Promise<R
   if (action === "deny") {
     redirect.searchParams.set("error", "access_denied");
     return Response.redirect(redirect.toString(), 302);
-  }
-
-  // Validate client
-  const client = db.prepare("SELECT redirect_uris FROM oauth_clients WHERE client_id = ?")
-    .get(clientId) as { redirect_uris: string } | null;
-
-  if (!client) {
-    redirect.searchParams.set("error", "invalid_request");
-    return Response.redirect(redirect.toString(), 302);
-  }
-
-  const registeredUris: string[] = JSON.parse(client.redirect_uris);
-  if (!registeredUris.includes(redirectUri)) {
-    return Response.json({ error: "invalid_request", error_description: "redirect_uri mismatch" }, { status: 400 });
   }
 
   // Generate auth code
@@ -270,7 +275,7 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
   const clientId = params.get("client_id");
   const redirectUri = params.get("redirect_uri");
 
-  if (!code || !codeVerifier || !clientId) {
+  if (!code || !codeVerifier || !clientId || !redirectUri) {
     return Response.json({ error: "invalid_request", error_description: "Missing required parameters" }, { status: 400 });
   }
 
@@ -308,8 +313,8 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
     return Response.json({ error: "invalid_grant", error_description: "client_id mismatch" }, { status: 400 });
   }
 
-  // Validate redirect_uri matches (if provided)
-  if (redirectUri && authCode.redirect_uri !== redirectUri) {
+  // Validate redirect_uri matches
+  if (authCode.redirect_uri !== redirectUri) {
     return Response.json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, { status: 400 });
   }
 
