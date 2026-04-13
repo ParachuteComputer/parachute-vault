@@ -6,19 +6,21 @@
  *   - "write" — read + create/update notes
  *   - "read"  — read-only (query, list, find-path, vault-info)
  *
- * Tokens can be scoped:
- *   - vault: NULL (global) or a specific vault name
- *   - scope_tag: filter results to notes with that tag
- *   - scope_path_prefix: filter results to notes under that path
+ * Tokens live in each vault's SQLite database (tokens table, schema v7).
+ * They can be scoped by tag or path prefix to restrict which notes are visible.
  *
- * Backward compatibility: still checks config.yaml API keys as a fallback.
+ * Backward compatibility: config.yaml API keys are still checked as a fallback.
  * Those keys resolve as admin tokens with no scope.
+ *
+ * The unified /mcp endpoint uses only legacy global config.yaml keys, since
+ * tokens are per-vault and the unified endpoint spans all vaults.
  */
 
 import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
 import type { VaultConfig, StoredKey, KeyScope } from "./config.ts";
-import { getTokenDb, resolveToken } from "./token-store.ts";
-import type { TokenPermission, ResolvedToken } from "./token-store.ts";
+import { resolveToken } from "./token-store.ts";
+import type { TokenPermission } from "./token-store.ts";
+import type { Database } from "bun:sqlite";
 
 /** Result of a successful auth check. */
 export interface AuthResult {
@@ -49,7 +51,6 @@ export function isToolAllowed(toolName: string, permission: TokenPermission): bo
   if (permission === "write") return READ_TOOLS.has(toolName) || WRITE_TOOLS.has(toolName);
   return READ_TOOLS.has(toolName);
 }
-
 
 /** Read-only HTTP methods. */
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -89,49 +90,36 @@ function validateKey(keys: StoredKey[], providedKey: string): StoredKey | null {
 }
 
 /**
- * Try resolving a token from the tokens DB.
- */
-function tryTokenAuth(providedKey: string, vaultName?: string): AuthResult | null {
-  try {
-    const db = getTokenDb();
-    const resolved = resolveToken(db, providedKey);
-    if (!resolved) return null;
-
-    // Check vault scope: global tokens (vault=NULL) can access any vault,
-    // vault-scoped tokens can only access their vault
-    if (resolved.vault !== null && vaultName !== undefined && resolved.vault !== vaultName) {
-      return null;
-    }
-
-    return {
-      permission: resolved.permission,
-      scope_tag: resolved.scope_tag,
-      scope_path_prefix: resolved.scope_path_prefix,
-    };
-  } catch {
-    // Token DB not available — fall through to legacy auth
-    return null;
-  }
-}
-
-/**
  * Authenticate for a specific vault.
- * Tries token DB first, then falls back to legacy YAML keys.
+ * Checks the vault's token DB first, then falls back to legacy YAML keys.
  */
 export function authenticateVaultRequest(
   req: Request,
   vaultConfig: VaultConfig,
+  vaultDb?: Database,
 ): { error: Response } | AuthResult {
   const key = extractApiKey(req);
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
 
-  // Try token DB first
-  const tokenAuth = tryTokenAuth(key, vaultConfig.name);
-  if (tokenAuth) return tokenAuth;
+  // Try vault's token DB first
+  if (vaultDb) {
+    try {
+      const resolved = resolveToken(vaultDb, key);
+      if (resolved) {
+        return {
+          permission: resolved.permission,
+          scope_tag: resolved.scope_tag,
+          scope_path_prefix: resolved.scope_path_prefix,
+        };
+      }
+    } catch {
+      // Token table might not exist yet — fall through to legacy auth
+    }
+  }
 
-  // Legacy: check per-vault keys
+  // Legacy: check per-vault keys from vault.yaml
   const vaultKey = validateKey(vaultConfig.api_keys, key);
   if (vaultKey) {
     try { writeVaultConfig(vaultConfig); } catch {}
@@ -142,7 +130,7 @@ export function authenticateVaultRequest(
     };
   }
 
-  // Legacy: check global keys
+  // Legacy: check global keys from config.yaml
   const globalConfig = readGlobalConfig();
   if (globalConfig.api_keys) {
     const globalKey = validateKey(globalConfig.api_keys, key);
@@ -161,7 +149,8 @@ export function authenticateVaultRequest(
 
 /**
  * Authenticate for the unified /mcp endpoint.
- * Tries token DB first (global tokens only), then falls back to legacy global keys.
+ * Uses only legacy global config.yaml keys — tokens are per-vault and the
+ * unified endpoint spans all vaults.
  */
 export function authenticateGlobalRequest(
   req: Request,
@@ -171,28 +160,7 @@ export function authenticateGlobalRequest(
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
 
-  // Try token DB — only accept global tokens (vault=NULL) for the unified endpoint
-  try {
-    const db = getTokenDb();
-    const resolved = resolveToken(db, key);
-    if (resolved) {
-      if (resolved.vault === null) {
-        return {
-          permission: resolved.permission,
-          scope_tag: resolved.scope_tag,
-          scope_path_prefix: resolved.scope_path_prefix,
-        };
-      }
-      // Valid token but vault-scoped — not allowed on the global endpoint
-      return { error: Response.json(
-        { error: "Forbidden", message: `This token is scoped to vault "${resolved.vault}" and cannot access the unified endpoint` },
-        { status: 403 },
-      ) };
-    }
-  } catch {}
-
-
-  // Legacy: check global keys
+  // Legacy: check global keys from config.yaml
   const globalConfig = readGlobalConfig();
   if (globalConfig.api_keys) {
     const matched = validateKey(globalConfig.api_keys, key);

@@ -1,37 +1,28 @@
 /**
  * Tests for the token store — scoped tokens with permissions.
+ * Tokens now live inside each vault's SQLite database (schema v7).
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, rmSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
+import { initSchema } from "../core/src/schema.ts";
 import {
-  setTokenDb,
-  closeTokenDb,
   generateToken,
   createToken,
   resolveToken,
   listTokens,
   revokeToken,
 } from "./token-store.ts";
-import { hashKey } from "./config.ts";
 
 let db: Database;
-let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = join(tmpdir(), `token-test-${Date.now()}`);
-  mkdirSync(tmpDir, { recursive: true });
-  db = new Database(join(tmpDir, "tokens.db"));
-  setTokenDb(db);
+  db = new Database(":memory:");
+  initSchema(db);
 });
 
 afterEach(() => {
-  closeTokenDb();
   db.close();
-  rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe("token CRUD", () => {
@@ -42,22 +33,8 @@ describe("token CRUD", () => {
     const resolved = resolveToken(db, fullToken);
     expect(resolved).not.toBeNull();
     expect(resolved!.permission).toBe("admin");
-    expect(resolved!.vault).toBeNull();
     expect(resolved!.scope_tag).toBeNull();
     expect(resolved!.scope_path_prefix).toBeNull();
-  });
-
-  test("token with vault scope", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, {
-      label: "vault-scoped",
-      permission: "write",
-      vault: "my-vault",
-    });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("write");
-    expect(resolved!.vault).toBe("my-vault");
   });
 
   test("token with tag scope", () => {
@@ -121,7 +98,7 @@ describe("token CRUD", () => {
     const { fullToken: t1 } = generateToken();
     const { fullToken: t2 } = generateToken();
     createToken(db, t1, { label: "first", permission: "admin" });
-    createToken(db, t2, { label: "second", permission: "read", vault: "test" });
+    createToken(db, t2, { label: "second", permission: "read" });
 
     const tokens = listTokens(db);
     expect(tokens.length).toBe(2);
@@ -189,14 +166,12 @@ describe("token with combined scopes", () => {
     createToken(db, fullToken, {
       label: "double-scoped",
       permission: "write",
-      vault: "default",
       scope_tag: "publish",
       scope_path_prefix: "Blog/",
     });
 
     const resolved = resolveToken(db, fullToken);
     expect(resolved!.permission).toBe("write");
-    expect(resolved!.vault).toBe("default");
     expect(resolved!.scope_tag).toBe("publish");
     expect(resolved!.scope_path_prefix).toBe("Blog/");
   });

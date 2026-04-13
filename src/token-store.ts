@@ -1,16 +1,17 @@
 /**
- * Token store — centralized token management backed by ~/.parachute/tokens.db.
+ * Token operations for per-vault token management.
  *
- * Replaces the YAML-based API key storage with a SQLite tokens table.
+ * Tokens live in each vault's SQLite database (the `tokens` table is part of
+ * the vault schema as of v7). All functions take a Database parameter — the
+ * vault's own DB connection.
+ *
  * Tokens support three permission levels (admin/write/read) and optional
  * scope filtering by tag or path prefix.
  */
 
 import { Database } from "bun:sqlite";
-import { join } from "path";
-import { mkdirSync } from "fs";
 import crypto from "node:crypto";
-import { CONFIG_DIR, readGlobalConfig, readVaultConfig, listVaults, hashKey, verifyKey } from "./config.ts";
+import { hashKey } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,7 +23,6 @@ export interface Token {
   token_hash: string;
   label: string;
   permission: TokenPermission;
-  vault: string | null; // NULL = global (all vaults)
   scope_tag: string | null;
   scope_path_prefix: string | null;
   expires_at: string | null;
@@ -32,57 +32,8 @@ export interface Token {
 
 export interface ResolvedToken {
   permission: TokenPermission;
-  vault: string | null;
   scope_tag: string | null;
   scope_path_prefix: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
-
-const TOKEN_SCHEMA = `
-CREATE TABLE IF NOT EXISTS tokens (
-  token_hash TEXT PRIMARY KEY,
-  label TEXT NOT NULL,
-  permission TEXT NOT NULL DEFAULT 'admin',
-  vault TEXT,
-  scope_tag TEXT,
-  scope_path_prefix TEXT,
-  expires_at TEXT,
-  created_at TEXT NOT NULL,
-  last_used_at TEXT
-);
-`;
-
-// ---------------------------------------------------------------------------
-// Database singleton
-// ---------------------------------------------------------------------------
-
-let _db: Database | null = null;
-
-export function getTokenDb(): Database {
-  if (_db) return _db;
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  const dbPath = join(CONFIG_DIR, "tokens.db");
-  _db = new Database(dbPath);
-  _db.exec("PRAGMA journal_mode = WAL");
-  _db.exec(TOKEN_SCHEMA);
-  return _db;
-}
-
-/** Close the token DB (for testing). */
-export function closeTokenDb(): void {
-  if (_db) {
-    _db.close();
-    _db = null;
-  }
-}
-
-/** Override the token DB (for testing). */
-export function setTokenDb(db: Database): void {
-  _db = db;
-  db.exec(TOKEN_SCHEMA);
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +52,6 @@ export function createToken(
   opts: {
     label: string;
     permission?: TokenPermission;
-    vault?: string | null;
     scope_tag?: string | null;
     scope_path_prefix?: string | null;
     expires_at?: string | null;
@@ -112,13 +62,12 @@ export function createToken(
   const permission = opts.permission ?? "admin";
 
   db.prepare(`
-    INSERT INTO tokens (token_hash, label, permission, vault, scope_tag, scope_path_prefix, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tokens (token_hash, label, permission, scope_tag, scope_path_prefix, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     tokenHash,
     opts.label,
     permission,
-    opts.vault ?? null,
     opts.scope_tag ?? null,
     opts.scope_path_prefix ?? null,
     opts.expires_at ?? null,
@@ -129,7 +78,6 @@ export function createToken(
     token_hash: tokenHash,
     label: opts.label,
     permission,
-    vault: opts.vault ?? null,
     scope_tag: opts.scope_tag ?? null,
     scope_path_prefix: opts.scope_path_prefix ?? null,
     expires_at: opts.expires_at ?? null,
@@ -149,12 +97,11 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const candidateHash = hashKey(providedToken);
 
   const row = db.prepare(`
-    SELECT token_hash, permission, vault, scope_tag, scope_path_prefix, expires_at
+    SELECT token_hash, permission, scope_tag, scope_path_prefix, expires_at
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
     permission: TokenPermission;
-    vault: string | null;
     scope_tag: string | null;
     scope_path_prefix: string | null;
     expires_at: string | null;
@@ -167,13 +114,12 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
     return null;
   }
 
-  // Update last_used_at (fire-and-forget — don't block the request)
+  // Update last_used_at
   db.prepare("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
     .run(new Date().toISOString(), row.token_hash);
 
   return {
     permission: row.permission,
-    vault: row.vault,
     scope_tag: row.scope_tag,
     scope_path_prefix: row.scope_path_prefix,
   };
@@ -185,7 +131,7 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
  */
 export function listTokens(db: Database): (Token & { id: string })[] {
   const rows = db.prepare(`
-    SELECT token_hash, label, permission, vault, scope_tag, scope_path_prefix,
+    SELECT token_hash, label, permission, scope_tag, scope_path_prefix,
            expires_at, created_at, last_used_at
     FROM tokens ORDER BY created_at DESC
   `).all() as Token[];
@@ -225,57 +171,54 @@ export function revokeToken(db: Database, idOrHash: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Migration: import existing API keys from config.yaml
+// Migration: import existing API keys from config.yaml into a vault's DB
 // ---------------------------------------------------------------------------
 
 /**
- * Import existing API keys from config.yaml files into the tokens DB.
+ * Import existing API keys for a specific vault from config.yaml into its DB.
  * Idempotent — skips keys whose hash already exists.
+ *
+ * Imports:
+ * - Per-vault keys from vault.yaml (direct match)
+ * - Global keys from config.yaml (they become admin tokens in every vault)
  */
-export function migrateExistingKeys(db: Database): number {
+export function migrateVaultKeys(
+  db: Database,
+  vaultKeys: { key_hash: string; label: string; scope?: string; created_at: string; last_used_at?: string }[],
+  globalKeys?: { key_hash: string; label: string; scope?: string; created_at: string; last_used_at?: string }[],
+): number {
   let migrated = 0;
 
-  // Import global keys
-  const globalConfig = readGlobalConfig();
-  if (globalConfig.api_keys) {
-    for (const key of globalConfig.api_keys) {
-      const exists = db.prepare(
-        "SELECT 1 FROM tokens WHERE token_hash = ?"
-      ).get(key.key_hash);
-      if (!exists) {
-        db.prepare(`
-          INSERT INTO tokens (token_hash, label, permission, vault, created_at, last_used_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
-          key.key_hash,
-          key.label,
-          "admin", // existing keys become admin tokens
-          null,    // global scope
-          key.created_at,
-          key.last_used_at ?? null,
-        );
-        migrated++;
-      }
+  // Import per-vault keys
+  for (const key of vaultKeys) {
+    const exists = db.prepare("SELECT 1 FROM tokens WHERE token_hash = ?").get(key.key_hash);
+    if (!exists) {
+      db.prepare(`
+        INSERT INTO tokens (token_hash, label, permission, created_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        key.key_hash,
+        key.label,
+        key.scope === "read" ? "read" : "admin",
+        key.created_at,
+        key.last_used_at ?? null,
+      );
+      migrated++;
     }
   }
 
-  // Import per-vault keys
-  for (const vaultName of listVaults()) {
-    const vaultConfig = readVaultConfig(vaultName);
-    if (!vaultConfig) continue;
-    for (const key of vaultConfig.api_keys) {
-      const exists = db.prepare(
-        "SELECT 1 FROM tokens WHERE token_hash = ?"
-      ).get(key.key_hash);
+  // Import global keys as admin tokens
+  if (globalKeys) {
+    for (const key of globalKeys) {
+      const exists = db.prepare("SELECT 1 FROM tokens WHERE token_hash = ?").get(key.key_hash);
       if (!exists) {
         db.prepare(`
-          INSERT INTO tokens (token_hash, label, permission, vault, created_at, last_used_at)
-          VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO tokens (token_hash, label, permission, created_at, last_used_at)
+          VALUES (?, ?, ?, ?, ?)
         `).run(
           key.key_hash,
           key.label,
-          key.scope === "read" ? "read" : "admin",
-          vaultName,
+          "admin",
           key.created_at,
           key.last_used_at ?? null,
         );

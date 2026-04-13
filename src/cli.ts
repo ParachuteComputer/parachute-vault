@@ -43,8 +43,9 @@ import type { VaultConfig } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import { installSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
 import { confirm, ask, choose } from "./prompt.ts";
-import { getTokenDb, generateToken, createToken, listTokens, revokeToken, migrateExistingKeys } from "./token-store.ts";
+import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
+import { getVaultStore } from "./vault-store.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -164,14 +165,12 @@ async function cmdInit() {
   }
   writeGlobalConfig(globalConfig);
 
-  // 2b. Migrate existing keys to token DB + create initial token if needed
-  const tokenDb = getTokenDb();
-  migrateExistingKeys(tokenDb);
-  const existingTokens = listTokens(tokenDb);
-  if (existingTokens.length === 0 && globalApiKey) {
-    // The migration above should have caught the key we just created,
-    // but as a safety net, also create a token explicitly
-    createToken(tokenDb, globalApiKey, { label: "default", permission: "admin" });
+  // 2b. Migrate existing keys into per-vault token tables
+  for (const v of listVaults()) {
+    const vc = readVaultConfig(v);
+    if (!vc) continue;
+    const store = getVaultStore(v);
+    migrateVaultKeys(store.db, vc.api_keys, globalConfig.api_keys);
   }
 
   // 3. Ensure assets directory exists
@@ -508,30 +507,25 @@ function cmdKeys(args: string[]) {
 function cmdTokens(args: string[]) {
   const subcmd = args[0];
 
-  // Ensure token DB exists and has migrated keys
-  const db = getTokenDb();
-  migrateExistingKeys(db);
-
-  // parachute vault tokens — list all tokens
+  // parachute vault tokens — list all tokens (across all vaults)
   if (!subcmd || subcmd === "list") {
-    const tokens = listTokens(db);
-    if (tokens.length === 0) {
-      console.log("No tokens found. Create one: parachute vault tokens create");
-      return;
-    }
+    const vaults = listVaults();
+    let anyTokens = false;
 
-    // Group by vault scope
-    const global = tokens.filter((t) => !t.vault);
-    const byVault = new Map<string, typeof tokens>();
-    for (const t of tokens.filter((t) => t.vault)) {
-      const list = byVault.get(t.vault!) ?? [];
-      list.push(t);
-      byVault.set(t.vault!, list);
-    }
+    for (const vaultName of vaults) {
+      const vc = readVaultConfig(vaultName);
+      if (!vc) continue;
+      const store = getVaultStore(vaultName);
+      // Ensure legacy keys are migrated
+      const globalCfg = readGlobalConfig();
+      migrateVaultKeys(store.db, vc.api_keys, globalCfg.api_keys);
 
-    if (global.length > 0) {
-      console.log("Global tokens (access all vaults):");
-      for (const t of global) {
+      const tokens = listTokens(store.db);
+      if (tokens.length === 0) continue;
+      anyTokens = true;
+
+      console.log(`Vault "${vaultName}" tokens:`);
+      for (const t of tokens) {
         const scope = formatScope(t);
         const expiry = t.expires_at ? ` (expires: ${t.expires_at})` : "";
         const lastUsed = t.last_used_at ? ` (last used: ${t.last_used_at})` : "";
@@ -540,31 +534,35 @@ function cmdTokens(args: string[]) {
       console.log();
     }
 
-    for (const [vault, vaultTokens] of byVault) {
-      console.log(`Vault "${vault}" tokens:`);
-      for (const t of vaultTokens) {
-        const scope = formatScope(t);
-        const expiry = t.expires_at ? ` (expires: ${t.expires_at})` : "";
-        const lastUsed = t.last_used_at ? ` (last used: ${t.last_used_at})` : "";
-        console.log(`  ${t.id}  ${t.label}  [${t.permission}]${scope}${expiry}${lastUsed}`);
-      }
-      console.log();
+    if (!anyTokens) {
+      console.log("No tokens found. Create one: parachute vault tokens create --vault <name>");
     }
     return;
   }
 
-  // parachute vault tokens create [--permission admin|write|read] [--vault <name>]
+  // parachute vault tokens create --vault <name> [--permission admin|write|read]
   //   [--scope-tag <tag>] [--scope-path-prefix <prefix>] [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
+    const vaultFlag = args.indexOf("--vault");
+    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
+    if (!vaultName) {
+      console.error("--vault is required. Tokens are per-vault.");
+      console.error("Usage: parachute vault tokens create --vault <name> [--permission admin|write|read]");
+      process.exit(1);
+    }
+
+    const vc = readVaultConfig(vaultName);
+    if (!vc) {
+      console.error(`Vault "${vaultName}" not found.`);
+      process.exit(1);
+    }
+
     const permFlag = args.indexOf("--permission");
     const permission = (permFlag !== -1 ? args[permFlag + 1] : "admin") as TokenPermission;
     if (!["admin", "write", "read"].includes(permission)) {
       console.error(`Invalid permission: ${permission}. Must be admin, write, or read.`);
       process.exit(1);
     }
-
-    const vaultFlag = args.indexOf("--vault");
-    const vault = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
 
     const scopeTagFlag = args.indexOf("--scope-tag");
     const scopeTag = scopeTagFlag !== -1 ? args[scopeTagFlag + 1] : null;
@@ -586,20 +584,19 @@ function cmdTokens(args: string[]) {
     const labelFlag = args.indexOf("--label");
     const label = labelFlag !== -1 ? args[labelFlag + 1] : "default";
 
-    const { fullToken, tokenHash } = generateToken();
-    createToken(db, fullToken, {
+    const store = getVaultStore(vaultName);
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
       label,
       permission,
-      vault,
       scope_tag: scopeTag,
       scope_path_prefix: scopePath,
       expires_at: expiresAt,
     });
 
-    console.log(`Created token:`);
+    console.log(`Created token for vault "${vaultName}":`);
     console.log(`  Token:      ${fullToken}`);
     console.log(`  Permission: ${permission}`);
-    console.log(`  Vault:      ${vault ?? "all (global)"}`);
     if (scopeTag) console.log(`  Scope tag:  ${scopeTag}`);
     if (scopePath) console.log(`  Scope path: ${scopePath}`);
     if (expiresAt) console.log(`  Expires:    ${expiresAt}`);
@@ -609,18 +606,32 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // parachute vault tokens revoke <token-id>
+  // parachute vault tokens revoke <token-id> --vault <name>
   if (subcmd === "revoke") {
     const tokenId = args[1];
     if (!tokenId) {
-      console.error("Usage: parachute vault tokens revoke <token-id>");
+      console.error("Usage: parachute vault tokens revoke <token-id> --vault <name>");
       process.exit(1);
     }
 
-    if (revokeToken(db, tokenId)) {
+    const vaultFlag = args.indexOf("--vault");
+    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
+    if (!vaultName) {
+      console.error("--vault is required. Tokens are per-vault.");
+      process.exit(1);
+    }
+
+    const vc = readVaultConfig(vaultName);
+    if (!vc) {
+      console.error(`Vault "${vaultName}" not found.`);
+      process.exit(1);
+    }
+
+    const store = getVaultStore(vaultName);
+    if (revokeToken(store.db, tokenId)) {
       console.log(`Revoked token: ${tokenId}`);
     } else {
-      console.error(`Token "${tokenId}" not found.`);
+      console.error(`Token "${tokenId}" not found in vault "${vaultName}".`);
       process.exit(1);
     }
     return;
@@ -994,14 +1005,13 @@ Keys (legacy):
   parachute vault keys revoke <key-id>     Revoke a key
 
 Tokens (recommended):
-  parachute vault tokens                   List all tokens
-  parachute vault tokens create            Create an admin token
-  parachute vault tokens create --permission read  Read-only token
-  parachute vault tokens create --vault work       Vault-scoped token
-  parachute vault tokens create --scope-tag publish  Tag-scoped token
-  parachute vault tokens create --scope-path-prefix Projects/  Path-scoped token
-  parachute vault tokens create --expires 30d      Expiring token
-  parachute vault tokens revoke <token-id> Revoke a token
+  parachute vault tokens                   List all tokens (all vaults)
+  parachute vault tokens create --vault <name>     Create an admin token
+  parachute vault tokens create --vault <name> --permission read  Read-only token
+  parachute vault tokens create --vault <name> --scope-tag publish  Tag-scoped
+  parachute vault tokens create --vault <name> --scope-path-prefix Projects/
+  parachute vault tokens create --vault <name> --expires 30d  Expiring token
+  parachute vault tokens revoke <token-id> --vault <name>  Revoke a token
 
 Config:
   parachute vault config                   Show current configuration
