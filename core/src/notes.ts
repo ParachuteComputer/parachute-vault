@@ -305,7 +305,7 @@ export const NOTE_INDEX_PREVIEW_LEN = 120;
 /**
  * Convert a full Note into its lean index shape:
  * drops `content`, adds `byteSize` and a whitespace-collapsed `preview`.
- * Shared between the `read-notes` MCP tool, HTTP /notes endpoints, and /graph.
+ * Shared between the `query-notes` MCP tool, HTTP /notes endpoints, and /graph.
  */
 export function toNoteIndex(note: Note): NoteIndex {
   const content = note.content ?? "";

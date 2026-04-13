@@ -6,6 +6,9 @@
  * row was rewritten, the .ogg file exists, and the original was unlinked.
  *
  * Uses the real ffmpeg binary (matches src/audio-encoding.test.ts).
+ *
+ * Requires `@openparachute/narrate` which is not a vault dependency.
+ * Install manually (`bun add @openparachute/narrate`) to run these tests.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -14,7 +17,17 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { SCHEMA_SQL } from "../core/src/schema.ts";
-import { runMigration } from "./migrate-audio-to-opus.ts";
+
+// @openparachute/narrate is not a vault dependency — dynamically import
+// so the test file can at least be parsed without the optional package.
+let runMigration: typeof import("./migrate-audio-to-opus.ts").runMigration;
+let hasDep = false;
+try {
+  ({ runMigration } = await import("./migrate-audio-to-opus.ts"));
+  hasDep = true;
+} catch {
+  // dependency missing — tests will be skipped below
+}
 
 function buildSilentWav(samples: number): Buffer {
   const sampleRate = 8000;
@@ -127,7 +140,7 @@ function seedVaultWithWav(vaultName: string): SeedResult {
   };
 }
 
-describe("migrate-audio-to-opus", () => {
+describe.skipIf(!hasDep)("migrate-audio-to-opus", () => {
   test("dry-run reports candidates without touching anything", async () => {
     const seed = seedVaultWithWav("default");
 

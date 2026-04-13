@@ -26,7 +26,7 @@ For remote access from Claude Desktop or mobile apps, see [Deployment](#deployme
 
 A server on port 1940 with:
 
-- **MCP** — 18 tools for AI agents (notes, search, tags, links, graph traversal)
+- **MCP** — 9 tools for AI agents (notes, tags, graph, vault info)
 - **REST API** — Full CRUD for notes, tags, links, full-text search
 - **Wikilink auto-linking** — `[[wikilinks]]` in note content automatically create links in the graph
 - **Obsidian import/export** — Bidirectional interop with Obsidian vaults
