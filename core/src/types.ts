@@ -71,7 +71,7 @@ export interface NoteSummary {
 
 /**
  * Lean note index entry — summary + byteSize + single-line preview.
- * Used by read-notes (index mode), GET /notes (list default), and /graph.
+ * Used by query-notes (index mode), GET /notes (list default), and /graph.
  */
 export interface NoteIndex {
   id: string;
