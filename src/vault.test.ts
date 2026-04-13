@@ -861,6 +861,86 @@ describe("HTTP /notes", () => {
   });
 });
 
+describe("HTTP GET /notes?format=graph", () => {
+  test("returns nodes and edges for linked notes", async () => {
+    const a = store.createNote("A", { id: "a", path: "People/Alice", tags: ["person"] });
+    const b = store.createNote("B", { id: "b", path: "People/Bob", tags: ["person"] });
+    const c = store.createNote("C", { id: "c", path: "Projects/X" });
+    store.createLink("a", "b", "knows");
+    store.createLink("a", "c", "works-on");
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?format=graph&include_links=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any;
+    expect(body.nodes).toHaveLength(3);
+    expect(body.edges).toHaveLength(2);
+    // Nodes have id, path, tags
+    const alice = body.nodes.find((n: any) => n.id === "a");
+    expect(alice.path).toBe("People/Alice");
+    expect(alice.tags).toEqual(["person"]);
+    // Edges have source, target, relationship
+    expect(body.edges).toContainEqual({ source: "a", target: "b", relationship: "knows" });
+    expect(body.edges).toContainEqual({ source: "a", target: "c", relationship: "works-on" });
+  });
+
+  test("returns empty edges when include_links is not set", async () => {
+    store.createNote("A", { id: "a" });
+    store.createNote("B", { id: "b" });
+    store.createLink("a", "b", "ref");
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?format=graph"),
+      store,
+      "",
+    );
+    const body = await res.json() as any;
+    expect(body.nodes).toHaveLength(2);
+    expect(body.edges).toHaveLength(0);
+  });
+
+  test("composes with near param for subgraph", async () => {
+    const a = store.createNote("A", { id: "a", path: "People/Mickey" });
+    const b = store.createNote("B", { id: "b" });
+    const c = store.createNote("C", { id: "c" });
+    const d = store.createNote("D", { id: "d" }); // not connected
+    store.createLink("a", "b", "knows");
+    store.createLink("b", "c", "knows");
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?format=graph&include_links=true&near[note_id]=People/Mickey&near[depth]=2"),
+      store,
+      "",
+    );
+    const body = await res.json() as any;
+    // a, b, c are within 2 hops; d is not
+    expect(body.nodes).toHaveLength(3);
+    expect(body.nodes.map((n: any) => n.id).sort()).toEqual(["a", "b", "c"]);
+    expect(body.edges).toHaveLength(2);
+  });
+
+  test("near with depth=1 limits subgraph", async () => {
+    const a = store.createNote("A", { id: "a" });
+    const b = store.createNote("B", { id: "b" });
+    const c = store.createNote("C", { id: "c" });
+    store.createLink("a", "b", "ref");
+    store.createLink("b", "c", "ref");
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?format=graph&include_links=true&near[note_id]=a&near[depth]=1"),
+      store,
+      "",
+    );
+    const body = await res.json() as any;
+    // Only a and b within 1 hop
+    expect(body.nodes).toHaveLength(2);
+    expect(body.edges).toHaveLength(1);
+    expect(body.edges[0]).toEqual({ source: "a", target: "b", relationship: "ref" });
+  });
+});
+
 describe("HTTP PATCH /notes/:idOrPath (update)", () => {
   test("PATCH updates content and merges metadata", async () => {
     const note = store.createNote("original", { id: "x", metadata: { a: 1 } });

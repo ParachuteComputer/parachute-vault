@@ -116,7 +116,7 @@ export async function handleNotes(
 
       // Structured query
       const tags = parseQueryList(url, "tag");
-      const results = store.queryNotes({
+      let results: Note[] = store.queryNotes({
         tags,
         tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
         excludeTags: parseQueryList(url, "exclude_tag"),
@@ -130,12 +130,42 @@ export async function handleNotes(
         offset: parseInt10(parseQuery(url, "offset")),
       });
 
+      // Near-scope filter (graph neighborhood)
+      const nearNoteId = parseQuery(url, "near[note_id]");
+      if (nearNoteId) {
+        const anchor = resolveNote(store, nearNoteId);
+        if (!anchor) return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
+        const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
+        const relationship = parseQuery(url, "near[relationship]") ?? undefined;
+        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship });
+        const nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
+        results = results.filter((n) => nearScope.has(n.id));
+      }
+
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
+      const includeLinks = parseBool(parseQuery(url, "include_links"), false);
+      const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const output = includeContent ? results : results.map(toNoteIndex);
 
-      if (parseBool(parseQuery(url, "include_links"), false) || parseBool(parseQuery(url, "include_attachments"), false)) {
-        const includeLinks = parseBool(parseQuery(url, "include_links"), false);
-        const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
+      // Graph format — reshape into { nodes, edges }
+      if (parseQuery(url, "format") === "graph") {
+        const resultIds = new Set(results.map((n) => n.id));
+        const nodes = output.map((n: any) => ({ id: n.id, path: n.path ?? null, tags: n.tags ?? [] }));
+        const edges: { source: string; target: string; relationship: string }[] = [];
+        if (includeLinks) {
+          for (const n of results) {
+            for (const link of linkOps.getLinksHydrated(db, n.id)) {
+              // Only include edges where source is this note and target is in the result set
+              if (link.sourceId === n.id && resultIds.has(link.targetId)) {
+                edges.push({ source: link.sourceId, target: link.targetId, relationship: link.relationship });
+              }
+            }
+          }
+        }
+        return json({ nodes, edges });
+      }
+
+      if (includeLinks || includeAttachments) {
         return json(output.map((n: any) => {
           const enriched = { ...n };
           if (includeLinks) enriched.links = linkOps.getLinksHydrated(db, n.id);
