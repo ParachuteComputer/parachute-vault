@@ -20,6 +20,7 @@ import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks, handleStorage, handleViewNote } from "./routes.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
+import { handleProtectedResource, handleAuthorizationServer, handleRegister, handleAuthorizeGet, handleAuthorizePost, handleToken } from "./oauth.ts";
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -182,6 +183,40 @@ function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null, vaul
 }
 
 async function route(req: Request, path: string): Promise<Response> {
+  // OAuth discovery endpoints (no auth required)
+  if (path === "/.well-known/oauth-protected-resource") {
+    return handleProtectedResource(req);
+  }
+  if (path === "/.well-known/oauth-authorization-server") {
+    return handleAuthorizationServer(req);
+  }
+
+  // OAuth flow endpoints (no auth — these ARE the auth)
+  if (path === "/oauth/register" || path === "/oauth/authorize" || path === "/oauth/token") {
+    const defaultVault = readGlobalConfig().default_vault ?? "default";
+    const vaultConfig = readVaultConfig(defaultVault);
+    if (!vaultConfig) {
+      return Response.json({ error: "server_error", error_description: "Default vault not configured" }, { status: 500 });
+    }
+    const store = getVaultStore(defaultVault);
+
+    if (path === "/oauth/register") {
+      return handleRegister(req, store.db);
+    }
+    if (path === "/oauth/authorize") {
+      if (req.method === "GET") {
+        return handleAuthorizeGet(req, store.db, vaultConfig.name);
+      }
+      if (req.method === "POST") {
+        return handleAuthorizePost(req, store.db);
+      }
+      return Response.json({ error: "method_not_allowed" }, { status: 405 });
+    }
+    if (path === "/oauth/token") {
+      return handleToken(req, store.db);
+    }
+  }
+
   // Health check — vault names only for authenticated requests
   if (path === "/health") {
     const auth = authenticateGlobalRequest(req);
@@ -300,6 +335,22 @@ async function route(req: Request, path: string): Promise<Response> {
       publishedTag: vaultConfig.published_tag,
     });
   }
+
+  // Vault-scoped OAuth endpoints (no auth — these ARE the auth)
+  if (subpath === "/oauth/register" || subpath === "/oauth/authorize" || subpath === "/oauth/token") {
+    const store = getVaultStore(vaultName);
+    if (subpath === "/oauth/register") return handleRegister(req, store.db);
+    if (subpath === "/oauth/authorize") {
+      if (req.method === "GET") return handleAuthorizeGet(req, store.db, vaultConfig.name);
+      if (req.method === "POST") return handleAuthorizePost(req, store.db);
+      return Response.json({ error: "method_not_allowed" }, { status: 405 });
+    }
+    if (subpath === "/oauth/token") return handleToken(req, store.db);
+  }
+
+  // Vault-scoped discovery endpoints
+  if (subpath === "/.well-known/oauth-protected-resource") return handleProtectedResource(req);
+  if (subpath === "/.well-known/oauth-authorization-server") return handleAuthorizationServer(req);
 
   // Auth: per-vault key OR global key
   const store = getVaultStore(vaultName);
