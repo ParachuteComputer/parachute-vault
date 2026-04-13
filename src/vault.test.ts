@@ -849,6 +849,14 @@ describe("HTTP /notes", () => {
     expect(body).toHaveLength(1);
   });
 
+  test("GET /notes?search=fox&include_metadata=false strips metadata from search results", async () => {
+    store.createNote("The quick brown fox", { metadata: { summary: "animal" } });
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox&include_metadata=false"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].metadata).toBeUndefined();
+  });
+
   test("GET /notes/:id defaults to full content", async () => {
     const n = store.createNote("hello", { id: "x" });
     const res = await handleNotes(mkReq("GET", "/notes/x"), store, "/x");
@@ -863,6 +871,40 @@ describe("HTTP /notes", () => {
     expect(body).not.toHaveProperty("content");
     expect(body.byteSize).toBe(5);
     expect(body.preview).toBe("hello");
+  });
+
+  test("GET /notes?include_metadata=false strips metadata from list", async () => {
+    store.createNote("a", { tags: ["m"], metadata: { summary: "hello", status: "ok" } });
+    store.createNote("b", { tags: ["m"], metadata: { summary: "world" } });
+    const res = await handleNotes(mkReq("GET", "/notes?tag=m&include_metadata=false"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    for (const n of body) {
+      expect(n.metadata).toBeUndefined();
+    }
+  });
+
+  test("GET /notes?include_metadata=summary,status returns only those fields", async () => {
+    store.createNote("a", { tags: ["mf"], metadata: { summary: "hello", status: "ok", extra: true } });
+    const res = await handleNotes(mkReq("GET", "/notes?tag=mf&include_metadata=summary,status"), store, "");
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].metadata).toEqual({ summary: "hello", status: "ok" });
+  });
+
+  test("GET /notes/:id?include_metadata=false strips metadata from single note", async () => {
+    store.createNote("hello", { id: "xm", metadata: { summary: "s" } });
+    const res = await handleNotes(mkReq("GET", "/notes/xm?include_metadata=false"), store, "/xm");
+    const body = await res.json() as any;
+    expect(body.metadata).toBeUndefined();
+    expect(body.content).toBe("hello");
+  });
+
+  test("GET /notes/:id?include_metadata=summary returns only specified fields", async () => {
+    store.createNote("hello", { id: "xm2", metadata: { summary: "s", status: "draft" } });
+    const res = await handleNotes(mkReq("GET", "/notes/xm2?include_metadata=summary"), store, "/xm2");
+    const body = await res.json() as any;
+    expect(body.metadata).toEqual({ summary: "s" });
   });
 
   test("POST /notes accepts createdAt (camelCase) in body", async () => {

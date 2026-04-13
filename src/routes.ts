@@ -13,7 +13,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex } from "../core/src/notes.ts";
+import { toNoteIndex, filterMetadata } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { join, extname, normalize } from "path";
@@ -47,6 +47,24 @@ function parseInt10(val: string | null): number | undefined {
   const n = parseInt(val, 10);
   return isNaN(n) ? undefined : n;
 }
+
+/**
+ * Parse include_metadata query param.
+ * - absent/null → undefined (all metadata, default)
+ * - "true"/"1" → true (all metadata)
+ * - "false"/"0" → false (no metadata)
+ * - "summary,status" → ["summary", "status"] (field filter)
+ */
+function parseIncludeMetadata(url: URL): boolean | string[] | undefined {
+  const val = url.searchParams.get("include_metadata");
+  if (val === null) return undefined;
+  if (val === "true" || val === "1") return true;
+  if (val === "false" || val === "0") return false;
+  const fields = val.split(",").map((s) => s.trim()).filter(Boolean);
+  if (fields.length === 0) return undefined; // empty string → treat as default (all)
+  return fields;
+}
+
 
 /**
  * Resolve a note by ID or path. Tries ID first, then case-insensitive path.
@@ -95,7 +113,8 @@ export async function handleNotes(
         const note = resolveNote(store, id);
         if (!note) return json({ error: "Note not found", id }, 404);
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
-        const result: any = includeContent ? { ...note } : toNoteIndex(note);
+        let result: any = includeContent ? { ...note } : toNoteIndex(note);
+        result = filterMetadata(result, parseIncludeMetadata(url));
         if (parseBool(parseQuery(url, "include_links"), false)) {
           result.links = linkOps.getLinksHydrated(db, note.id);
         }
@@ -111,7 +130,12 @@ export async function handleNotes(
         const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
         const results = store.searchNotes(search, { tags: searchTags, limit });
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
-        return json(includeContent ? results : results.map(toNoteIndex));
+        const inclMeta = parseIncludeMetadata(url);
+        let output = includeContent ? results : results.map(toNoteIndex);
+        if (inclMeta !== undefined && inclMeta !== true) {
+          output = output.map((n: any) => filterMetadata(n, inclMeta));
+        }
+        return json(output);
       }
 
       // Structured query
@@ -145,7 +169,11 @@ export async function handleNotes(
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
-      const output = includeContent ? results : results.map(toNoteIndex);
+      const inclMeta = parseIncludeMetadata(url);
+      let output: any[] = includeContent ? results : results.map(toNoteIndex);
+      if (inclMeta !== undefined && inclMeta !== true) {
+        output = output.map((n: any) => filterMetadata(n, inclMeta));
+      }
 
       // Graph format — reshape into { nodes, edges }
       if (parseQuery(url, "format") === "graph") {
@@ -247,7 +275,8 @@ export async function handleNotes(
     const note = resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
-    const result: any = includeContent ? { ...note } : toNoteIndex(note);
+    let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    result = filterMetadata(result, parseIncludeMetadata(url));
     if (parseBool(parseQuery(url, "include_links"), false)) {
       result.links = linkOps.getLinksHydrated(db, note.id);
     }
