@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
+import { filterMetadata } from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 
@@ -129,7 +130,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           if (!note) return { error: "Note not found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
           let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
-          result = applyMetadataFilter(result, params.include_metadata as boolean | string[] | undefined);
+          result = filterMetadata(result, params.include_metadata as boolean | string[] | undefined);
           if (params.include_links) {
             result.links = linkOps.getLinksHydrated(db, note.id);
           }
@@ -192,7 +193,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 
         // --- Apply metadata filtering ---
         if (includeMetadata !== undefined && includeMetadata !== true) {
-          output = output.map((n: any) => applyMetadataFilter(n, includeMetadata));
+          output = output.map((n: any) => filterMetadata(n, includeMetadata));
         }
 
         // --- Hydrate links/attachments per note if requested ---
@@ -669,23 +670,3 @@ function normalizeTags(tag: unknown): string[] | undefined {
   return [tag as string];
 }
 
-/**
- * Filter metadata on a note/index result based on include_metadata param.
- * - true / undefined → return as-is (all metadata)
- * - false → strip metadata entirely
- * - string[] → return only those keys
- */
-function applyMetadataFilter(obj: any, includeMetadata: boolean | string[] | undefined): any {
-  if (includeMetadata === undefined || includeMetadata === true) return obj;
-  if (includeMetadata === false) {
-    const { metadata, ...rest } = obj;
-    return rest;
-  }
-  // Array of field names
-  if (!obj.metadata) return obj;
-  const fields = includeMetadata as string[];
-  const filtered = Object.fromEntries(
-    Object.entries(obj.metadata).filter(([k]) => fields.includes(k)),
-  );
-  return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
-}

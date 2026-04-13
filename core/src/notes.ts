@@ -330,6 +330,29 @@ export function toNoteIndex(note: Note): NoteIndex {
   };
 }
 
+// ---- Metadata field filtering ----
+
+/**
+ * Filter metadata on a note/index result based on an include_metadata param.
+ * - true / undefined → return as-is (all metadata)
+ * - false → strip metadata entirely
+ * - string[] → return only those keys (empty array = no filtering)
+ */
+export function filterMetadata(obj: any, includeMetadata: boolean | string[] | undefined): any {
+  if (includeMetadata === undefined || includeMetadata === true) return obj;
+  if (includeMetadata === false) {
+    const { metadata, ...rest } = obj;
+    return rest;
+  }
+  // Array of field names — empty array means no filtering (treat as "all")
+  const fields = includeMetadata as string[];
+  if (fields.length === 0 || !obj.metadata) return obj;
+  const filtered = Object.fromEntries(
+    Object.entries(obj.metadata).filter(([k]) => fields.includes(k)),
+  );
+  return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
+}
+
 // ---- Vault stats (aggregate situational awareness) ----
 
 /**

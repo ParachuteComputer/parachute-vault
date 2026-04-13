@@ -13,7 +13,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex } from "../core/src/notes.ts";
+import { toNoteIndex, filterMetadata } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { join, extname, normalize } from "path";
@@ -60,28 +60,11 @@ function parseIncludeMetadata(url: URL): boolean | string[] | undefined {
   if (val === null) return undefined;
   if (val === "true" || val === "1") return true;
   if (val === "false" || val === "0") return false;
-  return val.split(",").map((s) => s.trim()).filter(Boolean);
+  const fields = val.split(",").map((s) => s.trim()).filter(Boolean);
+  if (fields.length === 0) return undefined; // empty string → treat as default (all)
+  return fields;
 }
 
-/**
- * Filter metadata on a note/index result.
- * - true / undefined → return as-is
- * - false → strip metadata
- * - string[] → return only those keys
- */
-function applyMetadataFilter(obj: any, includeMetadata: boolean | string[] | undefined): any {
-  if (includeMetadata === undefined || includeMetadata === true) return obj;
-  if (includeMetadata === false) {
-    const { metadata, ...rest } = obj;
-    return rest;
-  }
-  if (!obj.metadata) return obj;
-  const fields = includeMetadata as string[];
-  const filtered = Object.fromEntries(
-    Object.entries(obj.metadata).filter(([k]) => fields.includes(k)),
-  );
-  return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
-}
 
 /**
  * Resolve a note by ID or path. Tries ID first, then case-insensitive path.
@@ -131,7 +114,7 @@ export async function handleNotes(
         if (!note) return json({ error: "Note not found", id }, 404);
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
         let result: any = includeContent ? { ...note } : toNoteIndex(note);
-        result = applyMetadataFilter(result, parseIncludeMetadata(url));
+        result = filterMetadata(result, parseIncludeMetadata(url));
         if (parseBool(parseQuery(url, "include_links"), false)) {
           result.links = linkOps.getLinksHydrated(db, note.id);
         }
@@ -150,7 +133,7 @@ export async function handleNotes(
         const inclMeta = parseIncludeMetadata(url);
         let output = includeContent ? results : results.map(toNoteIndex);
         if (inclMeta !== undefined && inclMeta !== true) {
-          output = output.map((n: any) => applyMetadataFilter(n, inclMeta));
+          output = output.map((n: any) => filterMetadata(n, inclMeta));
         }
         return json(output);
       }
@@ -189,7 +172,7 @@ export async function handleNotes(
       const inclMeta = parseIncludeMetadata(url);
       let output: any[] = includeContent ? results : results.map(toNoteIndex);
       if (inclMeta !== undefined && inclMeta !== true) {
-        output = output.map((n: any) => applyMetadataFilter(n, inclMeta));
+        output = output.map((n: any) => filterMetadata(n, inclMeta));
       }
 
       // Graph format — reshape into { nodes, edges }
@@ -293,7 +276,7 @@ export async function handleNotes(
     if (!note) return json({ error: "Not found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
-    result = applyMetadataFilter(result, parseIncludeMetadata(url));
+    result = filterMetadata(result, parseIncludeMetadata(url));
     if (parseBool(parseQuery(url, "include_links"), false)) {
       result.links = linkOps.getLinksHydrated(db, note.id);
     }
