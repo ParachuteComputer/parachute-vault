@@ -77,7 +77,7 @@ describe("BunStore", async () => {
       metadata: { audio_pending_at: "2026-04-09T10:00:00.000Z" },
       skipUpdatedAt: true,
     });
-    let fetched = await store.getNote(note.id)!;
+    let fetched = (await store.getNote(note.id))!;
     expect(fetched.updatedAt).toBeUndefined();
     expect((fetched.metadata as { audio_pending_at?: string } | undefined)?.audio_pending_at).toBe(
       "2026-04-09T10:00:00.000Z",
@@ -86,7 +86,7 @@ describe("BunStore", async () => {
     // Now a real user edit bumps it.
     await new Promise((r) => setTimeout(r, 5));
     await store.updateNote(note.id, { content: "User edit" });
-    fetched = await store.getNote(note.id)!;
+    fetched = (await store.getNote(note.id))!;
     const userTs = fetched.updatedAt;
     expect(userTs).toBeTruthy();
 
@@ -99,7 +99,7 @@ describe("BunStore", async () => {
       },
       skipUpdatedAt: true,
     });
-    fetched = await store.getNote(note.id)!;
+    fetched = (await store.getNote(note.id))!;
     expect(fetched.updatedAt).toBe(userTs!);
     expect((fetched.metadata as { audio_rendered_at?: string } | undefined)?.audio_rendered_at).toBe(
       "2026-04-09T10:05:00.000Z",
@@ -142,11 +142,11 @@ describe("BunStore", async () => {
   test("tags and untags notes", async () => {
     const note = await store.createNote("Taggable");
     await store.tagNote(note.id, ["important"]);
-    let fetched = await store.getNote(note.id)!;
+    let fetched = (await store.getNote(note.id))!;
     expect(fetched.tags).toContain("important");
 
     await store.untagNote(note.id, ["important"]);
-    fetched = await store.getNote(note.id)!;
+    fetched = (await store.getNote(note.id))!;
     expect(fetched.tags).not.toContain("important");
   });
 

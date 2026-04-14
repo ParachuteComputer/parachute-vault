@@ -155,7 +155,7 @@ describe("rename cascading", async () => {
     await store.updateNote(target.id, { path: "New Name" });
 
     // Source content should be updated
-    const updatedSource = await store.getNote(source.id)!;
+    const updatedSource = (await store.getNote(source.id))!;
     expect(updatedSource.content).toBe("See [[New Name]] for details.");
 
     // Link should still work
@@ -170,7 +170,7 @@ describe("rename cascading", async () => {
 
     await store.updateNote(target.id, { path: "New" });
 
-    const updated = await store.getNote(source.id)!;
+    const updated = (await store.getNote(source.id))!;
     expect(updated.content).toBe("See [[New|click here]] for info.");
   });
 
@@ -180,7 +180,7 @@ describe("rename cascading", async () => {
 
     await store.updateNote(target.id, { path: "New" });
 
-    const updated = await store.getNote(source.id)!;
+    const updated = (await store.getNote(source.id))!;
     expect(updated.content).toBe("See [[New#Section]].");
   });
 
@@ -191,7 +191,7 @@ describe("rename cascading", async () => {
 
     await store.updateNote((await store.getNoteByPath("Old"))!.id, { path: "New" });
 
-    const updated = await store.getNote(source.id)!;
+    const updated = (await store.getNote(source.id))!;
     expect(updated.content).toBe("See [[Other]] and [[New]].");
   });
 });

@@ -135,7 +135,7 @@ describe("HookRegistry", async () => {
     // marker is now set. So exactly one call.
     expect(handlerCalls).toBe(1);
 
-    const refreshed = await store.getNote(note.id)!;
+    const refreshed = (await store.getNote(note.id))!;
     expect(refreshed.metadata?.processed_at).toBeTruthy();
   });
 

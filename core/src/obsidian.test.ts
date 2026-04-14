@@ -338,10 +338,10 @@ Hello world.`);
     expect(notes).toHaveLength(1);
 
     // Import into vault
-    const note = await store.createNote(notes[0].content, {
-      path: notes[0].path,
-      tags: notes[0].tags,
-      metadata: notes[0].frontmatter,
+    const note = await store.createNote(notes[0]!.content, {
+      path: notes[0]!.path,
+      tags: notes[0]!.tags,
+      metadata: notes[0]!.frontmatter,
     });
 
     expect(note.content).toBe("Hello world.");
@@ -372,8 +372,8 @@ Hello world.`);
     }
 
     // Check that A links to B
-    const noteA = await store.getNoteByPath("A")!;
-    const noteB = await store.getNoteByPath("B")!;
+    const noteA = (await store.getNoteByPath("A"))!;
+    const noteB = (await store.getNoteByPath("B"))!;
     const links = await store.getLinks(noteA.id, { direction: "outbound" });
     expect(links.some((l) => l.targetId === noteB.id && l.relationship === "wikilink")).toBe(true);
   });

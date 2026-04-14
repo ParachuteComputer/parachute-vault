@@ -709,7 +709,7 @@ describe("MCP tools", async () => {
     await store.createNote("Body", { metadata: { summary: "short", status: "draft", priority: 1 } });
     const tools = generateMcpTools(store);
     const query = tools.find((t) => t.name === "query-notes")!;
-    const result = await query.execute({ id: (await store.queryNotes({}))[0].id, include_metadata: true }) as any;
+    const result = await query.execute({ id: (await store.queryNotes({}))[0]!.id, include_metadata: true }) as any;
     expect(result.metadata).toEqual({ summary: "short", status: "draft", priority: 1 });
   });
 
@@ -717,7 +717,7 @@ describe("MCP tools", async () => {
     await store.createNote("Body", { metadata: { summary: "short", status: "draft" } });
     const tools = generateMcpTools(store);
     const query = tools.find((t) => t.name === "query-notes")!;
-    const result = await query.execute({ id: (await store.queryNotes({}))[0].id, include_metadata: false }) as any;
+    const result = await query.execute({ id: (await store.queryNotes({}))[0]!.id, include_metadata: false }) as any;
     expect(result.metadata).toBeUndefined();
     expect(result.content).toBe("Body"); // other fields unaffected
   });
@@ -726,7 +726,7 @@ describe("MCP tools", async () => {
     await store.createNote("Body", { metadata: { summary: "short", status: "draft", priority: 1 } });
     const tools = generateMcpTools(store);
     const query = tools.find((t) => t.name === "query-notes")!;
-    const result = await query.execute({ id: (await store.queryNotes({}))[0].id, include_metadata: ["summary"] }) as any;
+    const result = await query.execute({ id: (await store.queryNotes({}))[0]!.id, include_metadata: ["summary"] }) as any;
     expect(result.metadata).toEqual({ summary: "short" });
   });
 
