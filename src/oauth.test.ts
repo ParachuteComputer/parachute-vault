@@ -15,6 +15,7 @@ import {
   handleAuthorizePost,
   handleToken,
 } from "./oauth.ts";
+import * as OTPAuth from "otpauth";
 
 let db: Database;
 
@@ -996,5 +997,205 @@ describe("OAuth consent — scope selection", () => {
     expect(html).toContain('value="read"');
     // The requested scope should be pre-checked
     expect(html).toMatch(/value="full"\s+checked/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2FA (TOTP) on consent
+// ---------------------------------------------------------------------------
+
+describe("OAuth consent — 2FA (TOTP)", () => {
+  async function hashPassword(pw: string): Promise<string> {
+    return await Bun.password.hash(pw, { algorithm: "bcrypt", cost: 4 });
+  }
+
+  function makeTotp(secretBase32: string) {
+    return new OTPAuth.TOTP({
+      issuer: "Parachute Vault",
+      label: "owner",
+      algorithm: "SHA1",
+      digits: 6,
+      period: 30,
+      secret: OTPAuth.Secret.fromBase32(secretBase32),
+    });
+  }
+
+  test("GET renders TOTP field when 2FA enrolled", async () => {
+    const passwordHash = await hashPassword("correcthorsebatterystaple");
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const url = new URL("https://vault.test/oauth/authorize");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", "https://example.com/callback");
+    url.searchParams.set("code_challenge", codeChallenge);
+    url.searchParams.set("response_type", "code");
+
+    const res = handleAuthorizeGet(makeRequest(url.toString()), db, "default", passwordHash, true);
+    const html = await res.text();
+    expect(html).toContain('name="totp_code"');
+    expect(html).toContain('name="backup_code"');
+  });
+
+  test("GET omits TOTP field when 2FA not enrolled", async () => {
+    const passwordHash = await hashPassword("correcthorsebatterystaple");
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const url = new URL("https://vault.test/oauth/authorize");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", "https://example.com/callback");
+    url.searchParams.set("code_challenge", codeChallenge);
+    url.searchParams.set("response_type", "code");
+
+    const res = handleAuthorizeGet(makeRequest(url.toString()), db, "default", passwordHash, false);
+    const html = await res.text();
+    expect(html).not.toContain('name="totp_code"');
+  });
+
+  test("POST accepts valid TOTP + password and mints a token", async () => {
+    const password = "correcthorsebatterystaple";
+    const passwordHash = await hashPassword(password);
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const code = makeTotp(secret).generate();
+
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          state: "",
+          password,
+          totp_code: code,
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, totpSecret: secret },
+    );
+    expect(res.status).toBe(302);
+    const authCode = new URL(res.headers.get("location")!).searchParams.get("code")!;
+    expect(authCode).toBeTruthy();
+
+    // Exchange works end-to-end
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: authCode,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = await tokenRes.json();
+    expect(body.access_token).toBeTruthy();
+  });
+
+  test("POST rejects wrong TOTP with re-rendered consent (no code issued)", async () => {
+    const password = "correcthorsebatterystaple";
+    const passwordHash = await hashPassword(password);
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          state: "",
+          password,
+          totp_code: "000000",
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, totpSecret: secret },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Invalid authenticator code");
+    // No auth code was created
+    const rows = db.prepare("SELECT COUNT(*) as n FROM oauth_codes").get() as { n: number };
+    expect(rows.n).toBe(0);
+  });
+
+  test("POST rejects missing TOTP when 2FA enrolled", async () => {
+    const password = "correcthorsebatterystaple";
+    const passwordHash = await hashPassword(password);
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          state: "",
+          password,
+          // no totp_code, no backup_code
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, totpSecret: secret },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Enter a 6-digit code");
+  });
+
+  test("POST rejects TOTP when password itself is wrong (TOTP not consulted)", async () => {
+    const passwordHash = await hashPassword("correcthorsebatterystaple");
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const validCode = makeTotp(secret).generate();
+
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          state: "",
+          password: "wrongwrongwrong",
+          totp_code: validCode,
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, totpSecret: secret },
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Incorrect password");
   });
 });

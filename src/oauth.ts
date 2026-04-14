@@ -18,6 +18,7 @@ import type { Database } from "bun:sqlite";
 import { generateToken, createToken, resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import { verifyOwnerPassword, authorizeRateLimit, type RateLimiter } from "./owner-auth.ts";
+import { verifyTotpCode, verifyAndConsumeBackupCode } from "./two-factor.ts";
 
 /** Options for handleAuthorizePost. */
 export interface AuthorizePostOptions {
@@ -30,6 +31,11 @@ export interface AuthorizePostOptions {
    * auth (vault token in the consent form).
    */
   ownerPasswordHash?: string | null;
+  /**
+   * Base32-encoded TOTP secret. When set, consent additionally requires a
+   * `totp_code` (6-digit) or `backup_code` form field.
+   */
+  totpSecret?: string | null;
   /** Override for testing; defaults to the module singleton. */
   rateLimiter?: RateLimiter;
 }
@@ -134,6 +140,7 @@ export function handleAuthorizeGet(
   db: Database,
   vaultName: string,
   ownerPasswordHash?: string | null,
+  totpEnrolled = false,
 ): Response {
   const url = new URL(req.url);
   const clientId = url.searchParams.get("client_id");
@@ -194,6 +201,7 @@ export function handleAuthorizeGet(
     codeChallengeMethod,
     state,
     passwordMode: typeof ownerPasswordHash === "string" && ownerPasswordHash.length > 0,
+    totpEnrolled,
   });
 
   return new Response(html, {
@@ -207,7 +215,8 @@ export async function handleAuthorizePost(
   db: Database,
   opts: AuthorizePostOptions = {},
 ): Promise<Response> {
-  const { vaultName, clientIp, ownerPasswordHash, rateLimiter = authorizeRateLimit } = opts;
+  const { vaultName, clientIp, ownerPasswordHash, totpSecret, rateLimiter = authorizeRateLimit } = opts;
+  const totpEnrolled = typeof totpSecret === "string" && totpSecret.length > 0;
 
   let form: FormData;
   try {
@@ -307,9 +316,34 @@ export async function handleAuthorizePost(
     if (clientIp) rateLimiter.recordFailure(clientIp);
     return renderConsentWithError(db, vaultName || "vault", {
       clientId, redirectUri, codeChallenge, codeChallengeMethod,
-      requestedScope, selectedScope, state, passwordMode,
+      requestedScope, selectedScope, state, passwordMode, totpEnrolled,
       error: errorMsg,
     });
+  }
+
+  // 2FA check — password passed, now verify TOTP or backup code.
+  if (totpEnrolled) {
+    const totpCode = ((form.get("totp_code") as string | null) ?? "").trim();
+    const backupCode = ((form.get("backup_code") as string | null) ?? "").trim();
+    let twoFaOk = false;
+    let twoFaError = "";
+    if (totpCode) {
+      twoFaOk = verifyTotpCode(totpSecret!, totpCode);
+      if (!twoFaOk) twoFaError = "Invalid authenticator code.";
+    } else if (backupCode) {
+      twoFaOk = await verifyAndConsumeBackupCode(backupCode);
+      if (!twoFaOk) twoFaError = "Invalid or already-used backup code.";
+    } else {
+      twoFaError = "Enter a 6-digit code from your authenticator app, or a backup code.";
+    }
+    if (!twoFaOk) {
+      if (clientIp) rateLimiter.recordFailure(clientIp);
+      return renderConsentWithError(db, vaultName || "vault", {
+        clientId, redirectUri, codeChallenge, codeChallengeMethod,
+        requestedScope, selectedScope, state, passwordMode, totpEnrolled,
+        error: twoFaError,
+      });
+    }
   }
 
   if (clientIp) rateLimiter.recordSuccess(clientIp);
@@ -449,6 +483,7 @@ function renderConsentWithError(
     selectedScope: string;
     state: string;
     passwordMode: boolean;
+    totpEnrolled: boolean;
     error: string;
   },
 ): Response {
@@ -469,6 +504,7 @@ function renderConsentWithError(
     codeChallengeMethod: params.codeChallengeMethod,
     state: params.state,
     passwordMode: params.passwordMode,
+    totpEnrolled: params.totpEnrolled,
     error: params.error,
   });
 
@@ -496,6 +532,8 @@ interface ConsentParams {
   state: string;
   /** When true, render a password field; when false, render a vault-token field (legacy). */
   passwordMode: boolean;
+  /** When true, additionally render TOTP + backup-code fields. */
+  totpEnrolled?: boolean;
   error?: string;
 }
 
@@ -639,6 +677,14 @@ function renderConsentPage(p: ConsentParams): string {
       </label>
     </div>
     ${credentialField}
+    ${p.totpEnrolled ? `<div class="cred-field">
+      <label for="totp_code">Authenticator code</label>
+      <input type="text" id="totp_code" name="totp_code" placeholder="6-digit code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="6">
+    </div>
+    <div class="cred-field">
+      <label for="backup_code">Or a backup code</label>
+      <input type="text" id="backup_code" name="backup_code" placeholder="single-use backup code" autocomplete="off">
+    </div>` : ""}
     ${p.error ? `<div class="error-msg">${escapeHtml(p.error)}</div>` : ""}
     <div class="buttons">
       <button type="submit" name="action" value="deny">Deny</button>

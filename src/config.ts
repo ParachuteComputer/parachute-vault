@@ -133,6 +133,10 @@ export interface GlobalConfig {
   triggers?: TriggerConfig[];
   /** Bcrypt hash of the vault owner's password for OAuth consent. */
   owner_password_hash?: string;
+  /** Base32-encoded TOTP secret for 2FA on OAuth consent. */
+  totp_secret?: string;
+  /** Bcrypt hashes of single-use backup codes for 2FA recovery. */
+  backup_codes?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -447,11 +451,30 @@ export function readGlobalConfig(): GlobalConfig {
       const portMatch = yaml.match(/^port:\s*(\d+)/m);
       const defaultVaultMatch = yaml.match(/^default_vault:\s*(\S+)/m);
       const passwordHashMatch = yaml.match(/^owner_password_hash:\s*"([^"]+)"/m);
+      const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
       const config: GlobalConfig = {
         port: portMatch ? parseInt(portMatch[1], 10) : DEFAULT_PORT,
         default_vault: defaultVaultMatch?.[1],
         owner_password_hash: passwordHashMatch?.[1],
+        totp_secret: totpSecretMatch?.[1],
       };
+
+      // Parse backup_codes: a YAML list of quoted bcrypt hashes under
+      //   backup_codes:
+      //     - "hash1"
+      //     - "hash2"
+      const backupStart = yaml.match(/^backup_codes:\s*$/m);
+      if (backupStart) {
+        const after = yaml.slice((backupStart.index ?? 0) + backupStart[0].length);
+        const lines = after.split("\n");
+        const codes: string[] = [];
+        for (const line of lines) {
+          if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+          const m = line.match(/^\s+-\s+"([^"]+)"/);
+          if (m) codes.push(m[1]);
+        }
+        if (codes.length > 0) config.backup_codes = codes;
+      }
 
       // Parse global api_keys
       const keyBlocks = yaml.split(/\n\s+-\s+id:\s+/).slice(1);
@@ -490,6 +513,15 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
+  }
+  if (config.totp_secret) {
+    lines.push(`totp_secret: "${config.totp_secret}"`);
+  }
+  if (config.backup_codes && config.backup_codes.length > 0) {
+    lines.push("backup_codes:");
+    for (const hash of config.backup_codes) {
+      lines.push(`  - "${hash}"`);
+    }
   }
 
   if (config.api_keys && config.api_keys.length > 0) {

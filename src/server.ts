@@ -215,15 +215,19 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
       return handleRegister(req, store.db);
     }
     if (path === "/oauth/authorize") {
-      const ownerPasswordHash = readGlobalConfig().owner_password_hash ?? null;
+      const gc = readGlobalConfig();
+      const ownerPasswordHash = gc.owner_password_hash ?? null;
+      const totpSecret = gc.totp_secret ?? null;
+      const totpEnrolled = typeof totpSecret === "string" && totpSecret.length > 0;
       if (req.method === "GET") {
-        return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash);
+        return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash, totpEnrolled);
       }
       if (req.method === "POST") {
         return handleAuthorizePost(req, store.db, {
           vaultName: vaultConfig.name,
           clientIp,
           ownerPasswordHash,
+          totpSecret,
         });
       }
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
@@ -357,12 +361,16 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
     const store = getVaultStore(vaultName);
     if (subpath === "/oauth/register") return handleRegister(req, store.db);
     if (subpath === "/oauth/authorize") {
-      const ownerPasswordHash = readGlobalConfig().owner_password_hash ?? null;
-      if (req.method === "GET") return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash);
+      const gc = readGlobalConfig();
+      const ownerPasswordHash = gc.owner_password_hash ?? null;
+      const totpSecret = gc.totp_secret ?? null;
+      const totpEnrolled = typeof totpSecret === "string" && totpSecret.length > 0;
+      if (req.method === "GET") return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash, totpEnrolled);
       if (req.method === "POST") return handleAuthorizePost(req, store.db, {
         vaultName: vaultConfig.name,
         clientIp,
         ownerPasswordHash,
+        totpSecret,
       });
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
