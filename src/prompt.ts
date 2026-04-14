@@ -1,22 +1,34 @@
 /**
  * Simple interactive prompts for CLI setup.
+ *
+ * Uses `node:readline/promises` for input so the interface is explicitly
+ * closed after each prompt. The older `for await (const line of console)`
+ * pattern held stdin open across prompts and in Bun sometimes caused
+ * subsequent `console.log` writes to appear swallowed.
  */
+import { createInterface } from "node:readline/promises";
+
+async function readLine(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await rl.question(prompt);
+  } finally {
+    rl.close();
+  }
+}
 
 /**
  * Ask a yes/no question. Returns true for yes.
  */
 export async function confirm(question: string, defaultYes = true): Promise<boolean> {
   const hint = defaultYes ? "[Y/n]" : "[y/N]";
-  process.stdout.write(`${question} ${hint} `);
-
-  for await (const line of console) {
-    const answer = line.trim().toLowerCase();
+  // Loop in case the user types something non-yes/no.
+  while (true) {
+    const answer = (await readLine(`${question} ${hint} `)).trim().toLowerCase();
     if (answer === "") return defaultYes;
     if (answer === "y" || answer === "yes") return true;
     if (answer === "n" || answer === "no") return false;
-    process.stdout.write(`  Please answer y or n: `);
   }
-  return defaultYes;
 }
 
 /**
@@ -24,13 +36,8 @@ export async function confirm(question: string, defaultYes = true): Promise<bool
  */
 export async function ask(question: string, defaultValue = ""): Promise<string> {
   const hint = defaultValue ? ` (${defaultValue})` : "";
-  process.stdout.write(`${question}${hint}: `);
-
-  for await (const line of console) {
-    const answer = line.trim();
-    return answer || defaultValue;
-  }
-  return defaultValue;
+  const answer = (await readLine(`${question}${hint}: `)).trim();
+  return answer || defaultValue;
 }
 
 /**
