@@ -131,9 +131,13 @@ const server = Bun.serve({
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // Derive client IP. Prefer X-Forwarded-For (trusting first hop for
-    // reverse-proxy deployments), fall back to the direct socket IP.
-    const forwardedFor = req.headers.get("x-forwarded-for");
+    // Derive client IP. Default: socket IP only (safe for direct-internet
+    // deployments). If TRUST_PROXY=1 is set, honor X-Forwarded-For — use
+    // this only when a reverse proxy (Cloudflare Tunnel, nginx, etc.) is
+    // terminating the connection, otherwise attackers can spoof the header
+    // to evade per-IP rate limiting.
+    const trustProxy = process.env.TRUST_PROXY === "1" || process.env.TRUST_PROXY === "true";
+    const forwardedFor = trustProxy ? req.headers.get("x-forwarded-for") : null;
     const clientIp = forwardedFor
       ? forwardedFor.split(",")[0].trim()
       : server.requestIP(req)?.address;

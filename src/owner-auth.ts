@@ -20,9 +20,11 @@ const MIN_PASSWORD_LENGTH = 12;
 // Password storage
 // ---------------------------------------------------------------------------
 
-/** Read the stored bcrypt hash, or null if none set. */
+/** Read the stored bcrypt hash, or null if none set (or set to empty string). */
 export function getOwnerPasswordHash(): string | null {
-  return readGlobalConfig().owner_password_hash ?? null;
+  const hash = readGlobalConfig().owner_password_hash;
+  if (typeof hash !== "string" || hash.length === 0) return null;
+  return hash;
 }
 
 /** Whether a password has been set. */
