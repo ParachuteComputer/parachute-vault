@@ -1,9 +1,9 @@
-import { Database } from "bun:sqlite";
+import type { SqlDb } from "./sql-db.js";
 import type { Link, NoteSummary, HydratedLink } from "./types.js";
 import { getNoteTags } from "./notes.js";
 
 export function createLink(
-  db: Database,
+  db: SqlDb,
   sourceId: string,
   targetId: string,
   relationship: string,
@@ -24,7 +24,7 @@ export function createLink(
 }
 
 export function deleteLink(
-  db: Database,
+  db: SqlDb,
   sourceId: string,
   targetId: string,
   relationship: string,
@@ -35,7 +35,7 @@ export function deleteLink(
 }
 
 export function getLinks(
-  db: Database,
+  db: SqlDb,
   noteId: string,
   opts?: { direction?: "outbound" | "inbound" | "both" },
 ): Link[] {
@@ -53,7 +53,7 @@ export function getLinks(
  * should pair the result with `getNote` / `getNotes`.
  */
 export function listLinks(
-  db: Database,
+  db: SqlDb,
   opts?: {
     noteId?: string;
     direction?: "outbound" | "inbound" | "both";
@@ -103,7 +103,7 @@ function parseMetadata(raw: string | null): Record<string, unknown> | undefined 
   try { return JSON.parse(raw); } catch { return undefined; }
 }
 
-function getNoteSummary(db: Database, noteId: string): NoteSummary | undefined {
+function getNoteSummary(db: SqlDb, noteId: string): NoteSummary | undefined {
   const row = db.prepare(
     "SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id = ?",
   ).get(noteId) as SummaryRow | undefined;
@@ -118,7 +118,7 @@ function getNoteSummary(db: Database, noteId: string): NoteSummary | undefined {
   };
 }
 
-function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSummary> {
+function getNoteSummaries(db: SqlDb, noteIds: string[]): Map<string, NoteSummary> {
   const map = new Map<string, NoteSummary>();
   if (noteIds.length === 0) return map;
   const placeholders = noteIds.map(() => "?").join(", ");
@@ -143,7 +143,7 @@ function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSumm
  * Always includes note path/tags. Optionally includes content.
  */
 export function getLinksHydrated(
-  db: Database,
+  db: SqlDb,
   noteId: string,
   opts?: { direction?: "outbound" | "inbound" | "both"; include_content?: boolean },
 ): HydratedLink[] {
@@ -180,7 +180,7 @@ export interface TraversalNode {
  * Returns all reachable notes with their depth and how they were reached.
  */
 export function traverseLinks(
-  db: Database,
+  db: SqlDb,
   noteId: string,
   opts?: { max_depth?: number; relationship?: string },
 ): TraversalNode[] {
@@ -264,7 +264,7 @@ export function traverseLinks(
  * Returns the sequence of note IDs from source to target, or null if no path exists.
  */
 export function findPath(
-  db: Database,
+  db: SqlDb,
   sourceId: string,
   targetId: string,
   opts?: { max_depth?: number },

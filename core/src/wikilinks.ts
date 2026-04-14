@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { SqlDb } from "./sql-db.js";
 import * as linkOps from "./links.js";
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ function stripCode(content: string): string {
  *    (e.g., "README" matches "Projects/Parachute/README")
  *    Only if there's exactly one match (ambiguous = unresolved)
  */
-export function resolveWikilink(db: Database, target: string): string | null {
+export function resolveWikilink(db: SqlDb, target: string): string | null {
   // 1. Exact match (case-insensitive)
   const exact = db.prepare(
     "SELECT id FROM notes WHERE path = ? COLLATE NOCASE",
@@ -151,7 +151,7 @@ export interface WikilinkResolution {
 /**
  * Resolve a wikilink target with full detail — single match, ambiguous, or unresolved.
  */
-export function resolveWikilinkDetailed(db: Database, target: string): WikilinkResolution {
+export function resolveWikilinkDetailed(db: SqlDb, target: string): WikilinkResolution {
   // 1. Exact match (case-insensitive)
   const exact = db.prepare(
     "SELECT id, path FROM notes WHERE path = ? COLLATE NOCASE",
@@ -195,7 +195,7 @@ export interface UnresolvedWikilink {
 /**
  * List unresolved wikilinks across the vault.
  */
-export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved: UnresolvedWikilink[]; count: number } {
+export function listUnresolvedWikilinks(db: SqlDb, limit = 50): { unresolved: UnresolvedWikilink[]; count: number } {
   let total: number;
   let rows: { source_id: string; target_path: string }[];
   try {
@@ -240,7 +240,7 @@ const WIKILINK_REL = "wikilink";
  * Returns counts of changes made.
  */
 export function syncWikilinks(
-  db: Database,
+  db: SqlDb,
   noteId: string,
   content: string,
 ): { added: number; removed: number; unresolved: string[] } {
@@ -320,7 +320,7 @@ export function syncWikilinks(
  * Ensure the unresolved_wikilinks table exists.
  * Called lazily — only when we actually have unresolved links.
  */
-export function ensureUnresolvedTable(db: Database): void {
+export function ensureUnresolvedTable(db: SqlDb): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS unresolved_wikilinks (
       source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
@@ -334,7 +334,7 @@ export function ensureUnresolvedTable(db: Database): void {
  * Update unresolved wikilinks for a note.
  */
 function syncUnresolvedWikilinks(
-  db: Database,
+  db: SqlDb,
   noteId: string,
   unresolvedPaths: string[],
 ): void {
@@ -367,7 +367,7 @@ function syncUnresolvedWikilinks(
  * Returns the number of links resolved.
  */
 export function resolveUnresolvedWikilinks(
-  db: Database,
+  db: SqlDb,
   notePath: string,
   noteId: string,
 ): number {

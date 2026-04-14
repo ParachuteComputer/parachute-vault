@@ -6,6 +6,7 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { initSchema } from "../core/src/schema.ts";
+import { BunSqliteAdapter } from "../core/src/sql-db.ts";
 import {
   generateToken,
   createToken,
@@ -18,7 +19,7 @@ let db: Database;
 
 beforeEach(() => {
   db = new Database(":memory:");
-  initSchema(db);
+  initSchema(new BunSqliteAdapter(db));
 });
 
 afterEach(() => {

@@ -113,31 +113,31 @@ More text
 describe("resolveWikilink", async () => {
   it("resolves exact path match", async () => {
     await store.createNote("Target note", { path: "My Note" });
-    const id = resolveWikilink(db, "My Note");
+    const id = resolveWikilink(store.sqlDb, "My Note");
     expect(id).toBeTruthy();
   });
 
   it("resolves case-insensitively", async () => {
     const note = await store.createNote("Target", { path: "My Note" });
-    const id = resolveWikilink(db, "my note");
+    const id = resolveWikilink(store.sqlDb, "my note");
     expect(id).toBe(note.id);
   });
 
   it("resolves basename match", async () => {
     const note = await store.createNote("Deep note", { path: "Projects/Parachute/README" });
-    const id = resolveWikilink(db, "README");
+    const id = resolveWikilink(store.sqlDb, "README");
     expect(id).toBe(note.id);
   });
 
   it("returns null for ambiguous basename", async () => {
     await store.createNote("A", { path: "Folder1/README" });
     await store.createNote("B", { path: "Folder2/README" });
-    const id = resolveWikilink(db, "README");
+    const id = resolveWikilink(store.sqlDb, "README");
     expect(id).toBeNull();
   });
 
   it("returns null for unresolvable target", () => {
-    const id = resolveWikilink(db, "Nonexistent Note");
+    const id = resolveWikilink(store.sqlDb, "Nonexistent Note");
     expect(id).toBeNull();
   });
 });

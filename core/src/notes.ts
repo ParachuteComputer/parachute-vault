@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { SqlDb } from "./sql-db.js";
 import type { Note, NoteIndex, QueryOpts, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
 
@@ -21,7 +21,7 @@ export function generateId(): string {
 }
 
 export function createNote(
-  db: Database,
+  db: SqlDb,
   content: string,
   opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string },
 ): Note {
@@ -41,7 +41,7 @@ export function createNote(
   return getNote(db, id)!;
 }
 
-export function getNote(db: Database, id: string): Note | null {
+export function getNote(db: SqlDb, id: string): Note | null {
   const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | undefined;
   if (!row) return null;
 
@@ -50,7 +50,7 @@ export function getNote(db: Database, id: string): Note | null {
   return note;
 }
 
-export function getNoteByPath(db: Database, path: string): Note | null {
+export function getNoteByPath(db: SqlDb, path: string): Note | null {
   const row = db.prepare("SELECT * FROM notes WHERE path = ?").get(path) as NoteRow | undefined;
   if (!row) return null;
 
@@ -59,7 +59,7 @@ export function getNoteByPath(db: Database, path: string): Note | null {
   return note;
 }
 
-export function getNotes(db: Database, ids: string[]): Note[] {
+export function getNotes(db: SqlDb, ids: string[]): Note[] {
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(", ");
   const rows = db.prepare(
@@ -73,7 +73,7 @@ export function getNotes(db: Database, ids: string[]): Note[] {
 }
 
 export function updateNote(
-  db: Database,
+  db: SqlDb,
   id: string,
   updates: { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean },
 ): Note {
@@ -115,11 +115,11 @@ export function updateNote(
   return getNote(db, id)!;
 }
 
-export function deleteNote(db: Database, id: string): void {
+export function deleteNote(db: SqlDb, id: string): void {
   db.prepare("DELETE FROM notes WHERE id = ?").run(id);
 }
 
-export function queryNotes(db: Database, opts: QueryOpts): Note[] {
+export function queryNotes(db: SqlDb, opts: QueryOpts): Note[] {
   const conditions: string[] = [];
   const params: unknown[] = [];
   const joins: string[] = [];
@@ -202,7 +202,7 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
 }
 
 export function searchNotes(
-  db: Database,
+  db: SqlDb,
   query: string,
   opts?: { tags?: string[]; limit?: number },
 ): Note[] {
@@ -249,7 +249,7 @@ export function searchNotes(
 
 // ---- Tag Operations ----
 
-export function tagNote(db: Database, noteId: string, tags: string[]): void {
+export function tagNote(db: SqlDb, noteId: string, tags: string[]): void {
   const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
   const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
 
@@ -259,21 +259,21 @@ export function tagNote(db: Database, noteId: string, tags: string[]): void {
   }
 }
 
-export function untagNote(db: Database, noteId: string, tags: string[]): void {
+export function untagNote(db: SqlDb, noteId: string, tags: string[]): void {
   const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
   for (const tag of tags) {
     stmt.run(noteId, tag);
   }
 }
 
-export function getNoteTags(db: Database, noteId: string): string[] {
+export function getNoteTags(db: SqlDb, noteId: string): string[] {
   const rows = db.prepare(
     "SELECT tag_name FROM note_tags WHERE note_id = ? ORDER BY tag_name",
   ).all(noteId) as { tag_name: string }[];
   return rows.map((r) => r.tag_name);
 }
 
-export function listTags(db: Database): { name: string; count: number }[] {
+export function listTags(db: SqlDb): { name: string; count: number }[] {
   const rows = db.prepare(`
     SELECT t.name, COUNT(nt.note_id) as count
     FROM tags t
@@ -284,7 +284,7 @@ export function listTags(db: Database): { name: string; count: number }[] {
   return rows;
 }
 
-export function deleteTag(db: Database, name: string): { deleted: boolean; notes_untagged: number } {
+export function deleteTag(db: SqlDb, name: string): { deleted: boolean; notes_untagged: number } {
   const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(name);
   if (!exists) return { deleted: false, notes_untagged: 0 };
 
@@ -362,7 +362,7 @@ export function filterMetadata(obj: any, includeMetadata: boolean | string[] | u
  * Safe to call on large vaults. Read-only.
  */
 export function getVaultStats(
-  db: Database,
+  db: SqlDb,
   opts?: { topTagsLimit?: number },
 ): VaultStats {
   const topTagsLimit = opts?.topTagsLimit ?? 20;
@@ -422,11 +422,9 @@ export interface BulkNoteInput {
   created_at?: string;
 }
 
-export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
-  const results: Note[] = [];
-
-  db.exec("BEGIN");
-  try {
+export function createNotes(db: SqlDb, inputs: BulkNoteInput[]): Note[] {
+  return db.transaction(() => {
+    const results: Note[] = [];
     for (const input of inputs) {
       results.push(
         createNote(db, input.content, {
@@ -438,22 +436,15 @@ export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
         }),
       );
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-
-  return results;
+    return results;
+  });
 }
 
-export function batchTag(db: Database, noteIds: string[], tags: string[]): number {
-  const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
-  const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
-  let count = 0;
-
-  db.exec("BEGIN");
-  try {
+export function batchTag(db: SqlDb, noteIds: string[], tags: string[]): number {
+  return db.transaction(() => {
+    const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
+    const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
+    let count = 0;
     for (const tag of tags) {
       insertTag.run(tag);
     }
@@ -463,34 +454,22 @@ export function batchTag(db: Database, noteIds: string[], tags: string[]): numbe
         count++;
       }
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-
-  return count;
+    return count;
+  });
 }
 
-export function batchUntag(db: Database, noteIds: string[], tags: string[]): number {
-  const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
-  let count = 0;
-
-  db.exec("BEGIN");
-  try {
+export function batchUntag(db: SqlDb, noteIds: string[], tags: string[]): number {
+  return db.transaction(() => {
+    const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
+    let count = 0;
     for (const noteId of noteIds) {
       for (const tag of tags) {
         stmt.run(noteId, tag);
         count++;
       }
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-
-  return count;
+    return count;
+  });
 }
 
 // ---- Internal ----

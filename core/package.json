@@ -3,5 +3,22 @@
   "version": "0.1.0",
   "description": "Parachute Vault core — schema, store, graph operations, MCP tools",
   "type": "module",
-  "private": true
+  "private": true,
+  "exports": {
+    ".": "./src/store.ts",
+    "./do": "./src/store-do.ts",
+    "./types": "./src/types.ts",
+    "./sql-db": "./src/sql-db.ts",
+    "./schema": "./src/schema.ts",
+    "./mcp": "./src/mcp.ts",
+    "./hooks": "./src/hooks.ts"
+  },
+  "peerDependencies": {
+    "@cloudflare/workers-types": "*"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    }
+  }
 }

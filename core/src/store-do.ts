@@ -1,5 +1,21 @@
-import { Database } from "bun:sqlite";
+/**
+ * Cloudflare Durable Objects SQLite-backed `Store` implementation.
+ *
+ * Consumes `ctx.storage.sql` (and `ctx.storage.transactionSync`) via a
+ * minimal adapter, so all of the ops helpers in `notes.ts`, `links.ts`,
+ * `wikilinks.ts`, `schema.ts`, and `tag-schemas.ts` run unchanged on both
+ * bun:sqlite and DO SQLite.
+ *
+ * Import this file from Workers code only — it has no `bun:sqlite` runtime
+ * dependency. Self-hosted code paths should import `./store.js` instead.
+ *
+ * Attachments are not yet supported on this store; the methods throw. R2
+ * integration is tracked separately.
+ */
+
 import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
+import type { SqlDb, SqlStatement, SqlRunResult } from "./sql-db.js";
+import { splitSqlStatements } from "./sql-db.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
@@ -7,21 +23,90 @@ import * as tagSchemaOps from "./tag-schemas.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
-import { BunSqliteAdapter, type SqlDb } from "./sql-db.js";
 
-/**
- * bun:sqlite-backed Store implementation. Internally everything is
- * synchronous; the public Store API is async so the same interface
- * can back an async runtime (e.g. Cloudflare Durable Objects SQLite).
- */
-export class BunSqliteStore implements Store {
+// ---------------------------------------------------------------------------
+// Minimal structural types for the DO storage surface we use.
+//
+// We deliberately avoid depending on `@cloudflare/workers-types` at compile
+// time so the package ships without pulling that type graph into self-hosted
+// builds. Callers that have the real types can pass `ctx.storage` directly —
+// it structurally satisfies this interface.
+// ---------------------------------------------------------------------------
+
+export interface DoSqlCursor<T = Record<string, unknown>> {
+  toArray(): T[];
+  readonly rowsWritten: number;
+}
+
+export interface DoSqlStorage {
+  exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): DoSqlCursor<T>;
+}
+
+export interface DoDurableObjectStorage {
+  readonly sql: DoSqlStorage;
+  transactionSync<T>(closure: () => T): T;
+}
+
+// ---------------------------------------------------------------------------
+// DoSqliteAdapter — wraps `ctx.storage` into the shared `SqlDb` interface.
+// ---------------------------------------------------------------------------
+
+class DoSqlStatement implements SqlStatement {
+  constructor(private readonly sql: DoSqlStorage, private readonly query: string) {}
+
+  get<T = unknown>(...params: unknown[]): T | undefined {
+    const rows = this.sql.exec<T>(this.query, ...params).toArray();
+    return rows.length > 0 ? rows[0] : undefined;
+  }
+
+  all<T = unknown>(...params: unknown[]): T[] {
+    return this.sql.exec<T>(this.query, ...params).toArray();
+  }
+
+  run(...params: unknown[]): SqlRunResult {
+    const cursor = this.sql.exec(this.query, ...params);
+    // Force execution by materializing (DO cursors are lazy).
+    cursor.toArray();
+    return { changes: cursor.rowsWritten, lastInsertRowid: 0 };
+  }
+}
+
+export class DoSqliteAdapter implements SqlDb {
+  constructor(public readonly storage: DoDurableObjectStorage) {}
+
+  prepare(sql: string): SqlStatement {
+    return new DoSqlStatement(this.storage.sql, sql);
+  }
+
+  /**
+   * Execute one or more statements. Multi-statement SQL is split by
+   * `splitSqlStatements` since DO's `sql.exec` only accepts a single
+   * statement per call. `PRAGMA` statements are skipped — DO SQLite doesn't
+   * support them and the WAL/foreign-keys pragmas our schema uses aren't
+   * meaningful on DO storage (which is already transactional).
+   */
+  exec(sql: string): void {
+    for (const stmt of splitSqlStatements(sql)) {
+      if (/^\s*PRAGMA\b/i.test(stmt)) continue;
+      this.storage.sql.exec(stmt);
+    }
+  }
+
+  transaction<T>(fn: () => T): T {
+    return this.storage.transactionSync(fn);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DoSqliteStore
+// ---------------------------------------------------------------------------
+
+export class DoSqliteStore implements Store {
   public readonly hooks: HookRegistry;
-  /** Adapter that satisfies the shared `SqlDb` contract. Used internally and
-   *  by external code that wants to call the ops helpers directly. */
   public readonly sqlDb: SqlDb;
 
-  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
-    this.sqlDb = new BunSqliteAdapter(db);
+  constructor(storage: DoDurableObjectStorage, opts?: { hooks?: HookRegistry }) {
+    this.sqlDb = new DoSqliteAdapter(storage);
     initSchema(this.sqlDb);
     this.hooks = opts?.hooks ?? new HookRegistry();
   }
@@ -30,17 +115,9 @@ export class BunSqliteStore implements Store {
 
   async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
     const note = noteOps.createNote(this.sqlDb, content, opts);
-
-    if (content) {
-      syncWikilinks(this.sqlDb, note.id, content);
-    }
-
-    if (note.path) {
-      resolveUnresolvedWikilinks(this.sqlDb, note.path, note.id);
-    }
-
+    if (content) syncWikilinks(this.sqlDb, note.id, content);
+    if (note.path) resolveUnresolvedWikilinks(this.sqlDb, note.path, note.id);
     this.hooks.dispatch("created", note, this);
-
     return note;
   }
 
@@ -77,14 +154,9 @@ export class BunSqliteStore implements Store {
     }
 
     this.hooks.dispatch("updated", note, this);
-
     return note;
   }
 
-  /**
-   * When a note is renamed, update [[wikilinks]] in other notes that referenced the old path.
-   * Matches both full path and basename references.
-   */
   private cascadeRename(oldPath: string, newPath: string): void {
     const oldTitle = pathTitle(oldPath);
     const newTitle = pathTitle(newPath);
@@ -92,7 +164,7 @@ export class BunSqliteStore implements Store {
     const candidates = this.sqlDb.prepare(`
       SELECT id, content FROM notes
       WHERE content LIKE ? OR content LIKE ?
-    `).all(`%[[${oldPath}%`, `%[[${oldTitle}%`) as { id: string; content: string }[];
+    `).all<{ id: string; content: string }>(`%[[${oldPath}%`, `%[[${oldTitle}%`);
 
     for (const row of candidates) {
       let updated = row.content;
@@ -170,13 +242,11 @@ export class BunSqliteStore implements Store {
     return linkOps.listLinks(this.sqlDb, opts);
   }
 
-  // ---- Bulk Operations ----
+  // ---- Bulk ----
 
   async createNotes(inputs: noteOps.BulkNoteInput[]): Promise<Note[]> {
     const notes = noteOps.createNotes(this.sqlDb, inputs);
-    for (const note of notes) {
-      this.hooks.dispatch("created", note, this);
-    }
+    for (const note of notes) this.hooks.dispatch("created", note, this);
     return notes;
   }
 
@@ -188,7 +258,7 @@ export class BunSqliteStore implements Store {
     return noteOps.batchUntag(this.sqlDb, noteIds, tags);
   }
 
-  // ---- Deeper Link Queries ----
+  // ---- Graph ----
 
   async traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }) {
     return linkOps.traverseLinks(this.sqlDb, noteId, opts);
@@ -220,78 +290,18 @@ export class BunSqliteStore implements Store {
     return tagSchemaOps.getTagSchemaMap(this.sqlDb);
   }
 
-  // ---- Batch Wikilink Sync ----
-
-  /**
-   * Create a note without triggering wikilink sync.
-   * Use this during bulk imports, then call syncAllWikilinks() after.
-   */
-  async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
-    return noteOps.createNote(this.sqlDb, content, opts);
-  }
-
-  /**
-   * Sync wikilinks for all notes in the vault.
-   * Efficient for bulk imports — call once after importing all notes.
-   */
-  async syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }> {
-    const allNotes = noteOps.queryNotes(this.sqlDb, { limit: 1000000 });
-    let synced = 0;
-    let totalAdded = 0;
-    let totalRemoved = 0;
-
-    for (const note of allNotes) {
-      if (!note.content) continue;
-      const result = syncWikilinks(this.sqlDb, note.id, note.content);
-      if (result.added > 0 || result.removed > 0) {
-        synced++;
-        totalAdded += result.added;
-        totalRemoved += result.removed;
-      }
-    }
-
-    return { synced, totalAdded, totalRemoved };
-  }
-
   // ---- Attachments ----
+  // R2 integration is tracked in a follow-up PR. Self-hosted filesystem
+  // attachments are not portable to Workers, so these throw for now.
 
-  async addAttachment(noteId: string, filePath: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment> {
-    const id = noteOps.generateId();
-    const now = new Date().toISOString();
-    const metadataJson = metadata ? JSON.stringify(metadata) : "{}";
-    this.sqlDb.prepare(
-      "INSERT INTO attachments (id, note_id, path, mime_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(id, noteId, filePath, mimeType, metadataJson, now);
-
-    return { id, noteId, path: filePath, mimeType, metadata, createdAt: now };
+  async addAttachment(_noteId: string, _filePath: string, _mimeType: string, _metadata?: Record<string, unknown>): Promise<Attachment> {
+    throw new Error("attachments are not yet supported on DoSqliteStore");
   }
 
-  async getAttachments(noteId: string): Promise<Attachment[]> {
-    const rows = this.sqlDb.prepare(
-      "SELECT * FROM attachments WHERE note_id = ? ORDER BY created_at",
-    ).all(noteId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string }[];
-
-    return rows.map((r) => {
-      let metadata: Record<string, unknown> | undefined;
-      if (r.metadata && r.metadata !== "{}") {
-        try { metadata = JSON.parse(r.metadata); } catch {}
-      }
-      return {
-        id: r.id,
-        noteId: r.note_id,
-        path: r.path,
-        mimeType: r.mime_type,
-        metadata,
-        createdAt: r.created_at,
-      };
-    });
+  async getAttachments(_noteId: string): Promise<Attachment[]> {
+    throw new Error("attachments are not yet supported on DoSqliteStore");
   }
 }
-
-/** @deprecated Renamed to `BunSqliteStore` to make the runtime split explicit. Kept as an alias for backward compatibility. */
-export const SqliteStore = BunSqliteStore;
-/** @deprecated Renamed to `BunSqliteStore`. */
-export type SqliteStore = BunSqliteStore;
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

@@ -6,7 +6,7 @@
  * and soft warnings on create/tag operations.
  */
 
-import { Database } from "bun:sqlite";
+import type { SqlDb } from "./sql-db.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,19 +36,19 @@ interface TagSchemaRow {
 // ---------------------------------------------------------------------------
 
 /** List all tag schemas. */
-export function listTagSchemas(db: Database): TagSchema[] {
+export function listTagSchemas(db: SqlDb): TagSchema[] {
   const rows = db.prepare("SELECT * FROM tag_schemas ORDER BY tag_name").all() as TagSchemaRow[];
   return rows.map(rowToSchema);
 }
 
 /** Get a single tag's schema, or null if none defined. */
-export function getTagSchema(db: Database, tag: string): TagSchema | null {
+export function getTagSchema(db: SqlDb, tag: string): TagSchema | null {
   const row = db.prepare("SELECT * FROM tag_schemas WHERE tag_name = ?").get(tag) as TagSchemaRow | undefined;
   return row ? rowToSchema(row) : null;
 }
 
 /** Get all schemas as a lookup map (tag → schema). Used by schema effects. */
-export function getTagSchemaMap(db: Database): Record<string, { description?: string; fields?: Record<string, TagFieldSchema> }> {
+export function getTagSchemaMap(db: SqlDb): Record<string, { description?: string; fields?: Record<string, TagFieldSchema> }> {
   const schemas = listTagSchemas(db);
   const map: Record<string, { description?: string; fields?: Record<string, TagFieldSchema> }> = {};
   for (const s of schemas) {
@@ -62,7 +62,7 @@ export function getTagSchemaMap(db: Database): Record<string, { description?: st
  * Ensures the tag exists in the tags table first.
  */
 export function upsertTagSchema(
-  db: Database,
+  db: SqlDb,
   tag: string,
   schema: { description?: string; fields?: Record<string, TagFieldSchema> },
 ): TagSchema {
@@ -82,7 +82,7 @@ export function upsertTagSchema(
 }
 
 /** Delete a tag's schema. Returns true if a schema was deleted. */
-export function deleteTagSchema(db: Database, tag: string): boolean {
+export function deleteTagSchema(db: SqlDb, tag: string): boolean {
   const result = db.prepare("DELETE FROM tag_schemas WHERE tag_name = ?").run(tag);
   return result.changes > 0;
 }

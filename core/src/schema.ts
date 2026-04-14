@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { SqlDb } from "./sql-db.js";
 import { normalizePath } from "./paths.js";
 
 export const SCHEMA_VERSION = 8;
@@ -126,7 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
 /**
  * Initialize database schema. Idempotent — safe to call on every startup.
  */
-export function initSchema(db: Database): void {
+export function initSchema(db: SqlDb): void {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
@@ -163,7 +163,7 @@ export function initSchema(db: Database): void {
   );
 }
 
-function hasColumn(db: Database, table: string, column: string): boolean {
+function hasColumn(db: SqlDb, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   return rows.some((r) => r.name === column);
 }
@@ -171,7 +171,7 @@ function hasColumn(db: Database, table: string, column: string): boolean {
 /**
  * Migrate v3 → v4: add metadata JSON columns to notes and links.
  */
-function migrateToV4(db: Database): void {
+function migrateToV4(db: SqlDb): void {
   if (hasTable(db, "notes") && !hasColumn(db, "notes", "metadata")) {
     db.exec("ALTER TABLE notes ADD COLUMN metadata TEXT DEFAULT '{}'");
   }
@@ -186,7 +186,7 @@ function migrateToV4(db: Database): void {
 /**
  * Migrate v4 → v5: add UNIQUE constraint on path, normalize existing paths.
  */
-function migrateToV5(db: Database): void {
+function migrateToV5(db: SqlDb): void {
   if (!hasTable(db, "notes")) return;
 
   // Check if the unique index already exists
@@ -230,7 +230,7 @@ function migrateToV5(db: Database): void {
  * The table is already in SCHEMA_SQL so it's created for new vaults.
  * This migration handles existing vaults that were created before v6.
  */
-function migrateToV6(db: Database): void {
+function migrateToV6(db: SqlDb): void {
   // SCHEMA_SQL already creates the table via CREATE TABLE IF NOT EXISTS,
   // so this is a no-op for new vaults. For existing vaults where SCHEMA_SQL
   // ran above, the table now exists. Nothing extra needed here — the
@@ -243,18 +243,18 @@ function migrateToV6(db: Database): void {
  * The table is already in SCHEMA_SQL so it's created for new vaults.
  * This migration handles existing vaults that were created before v7.
  */
-function migrateToV7(db: Database): void {
+function migrateToV7(db: SqlDb): void {
   // SCHEMA_SQL already creates the table via CREATE TABLE IF NOT EXISTS,
   // so this is a no-op for new vaults. For existing vaults where SCHEMA_SQL
   // ran above, the table now exists. Nothing extra needed here.
 }
 
-function migrateToV8(db: Database): void {
+function migrateToV8(db: SqlDb): void {
   // SCHEMA_SQL already creates oauth_clients and oauth_codes via
   // CREATE TABLE IF NOT EXISTS. Nothing extra needed here.
 }
 
-function hasTable(db: Database, name: string): boolean {
+function hasTable(db: SqlDb, name: string): boolean {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name);
   return !!row;
 }
@@ -262,7 +262,7 @@ function hasTable(db: Database, name: string): boolean {
 /**
  * Migrate from v2 (things/thing_tags/edges/tools) to v3 (notes/note_tags/links).
  */
-function migrateFromV2(db: Database): void {
+function migrateFromV2(db: SqlDb): void {
   const alreadyMigrated = hasTable(db, "notes");
   if (alreadyMigrated) return;
 

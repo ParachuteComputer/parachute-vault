@@ -99,7 +99,7 @@ export async function handleNotes(
 ): Promise<Response> {
   const url = new URL(req.url);
   const method = req.method;
-  const db = (store as any).db;
+  const db = (store as any).sqlDb;
 
   // ---- Collection routes (no ID in path) ----
   if (subpath === "") {
@@ -449,7 +449,7 @@ export async function handleFindPath(req: Request, store: Store): Promise<Respon
   const target = parseQuery(url, "target");
   if (!source || !target) return json({ error: "source and target parameters are required" }, 400);
 
-  const db = (store as any).db;
+  const db = (store as any).sqlDb;
   try {
     const sourceNote = await resolveNote(store, source);
     if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
@@ -510,7 +510,7 @@ export function handleUnresolvedWikilinks(req: Request, store: Store): Response 
   const url = new URL(req.url);
   const limitStr = url.searchParams.get("limit");
   const limit = limitStr ? parseInt(limitStr, 10) : 50;
-  const db = (store as any).db;
+  const db = (store as any).sqlDb;
   return Response.json(listUnresolvedWikilinks(db, limit));
 }
 

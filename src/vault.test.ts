@@ -282,7 +282,7 @@ describe("metadata", async () => {
     const b = await store.createNote("B", { metadata: { type: "task" } });
     await store.createLink(a.id, b.id, "contains");
 
-    const links = getLinksHydrated(db, a.id);
+    const links = getLinksHydrated(store.sqlDb, a.id);
     expect(links[0].sourceNote?.metadata?.type).toBe("project");
     expect(links[0].targetNote?.metadata?.type).toBe("task");
   });
@@ -452,7 +452,7 @@ describe("deeper link queries", async () => {
     const b = await store.createNote("Note B", { path: "b" });
     await store.createLink(a.id, b.id, "related-to");
 
-    const result = getLinksHydrated(db, a.id);
+    const result = getLinksHydrated(store.sqlDb, a.id);
     expect(result.length).toBe(1);
     expect(result[0].targetNote?.path).toBe("b");
     expect(result[0].sourceNote?.path).toBe("a");

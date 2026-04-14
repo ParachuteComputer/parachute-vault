@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { SqlDb } from "./sql-db.js";
 import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata } from "./notes.js";
@@ -20,7 +20,7 @@ export interface McpToolDef {
  * Resolve a note identifier — tries ID first, then case-insensitive path match.
  * Works everywhere a note reference is accepted.
  */
-function resolveNote(db: Database, idOrPath: string): Note | null {
+function resolveNote(db: SqlDb, idOrPath: string): Note | null {
   // Try ID match first (fast, indexed)
   const byId = noteOps.getNote(db, idOrPath);
   if (byId) return byId;
@@ -28,7 +28,7 @@ function resolveNote(db: Database, idOrPath: string): Note | null {
   return noteOps.getNoteByPath(db, idOrPath);
 }
 
-function requireNote(db: Database, idOrPath: string): Note {
+function requireNote(db: SqlDb, idOrPath: string): Note {
   const note = resolveNote(db, idOrPath);
   if (!note) throw new Error(`Note not found: "${idOrPath}"`);
   return note;
@@ -62,7 +62,7 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
  * Generate the 9 consolidated MCP tools for a vault.
  */
 export function generateMcpTools(store: Store): McpToolDef[] {
-  const db: Database = (store as any).db;
+  const db: SqlDb = (store as any).sqlDb;
 
   return [
 
@@ -619,7 +619,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 // Tag schema effects — auto-populate defaults when tags are applied
 // ---------------------------------------------------------------------------
 
-async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<void> {
+async function applySchemaDefaults(store: Store, db: SqlDb, noteIds: string[], tags: string[]): Promise<void> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
   if (Object.keys(schemas).length === 0) return;
 
