@@ -67,6 +67,12 @@ class DoSqlStatement implements SqlStatement {
     const cursor = this.sql.exec(this.query, ...params);
     // Force execution by materializing (DO cursors are lazy).
     cursor.toArray();
+    // `rowsWritten` is best-effort and not identical to bun:sqlite's
+    // `.changes` — on DO it can include rows written by triggers. Today
+    // only `deleteTagSchema` inspects `.changes` (`> 0`), which is fine
+    // either way. Don't count on exact row counts downstream.
+    // `lastInsertRowid` is always 0 because every table in our schema
+    // uses a TEXT PRIMARY KEY; nothing in core reads it.
     return { changes: cursor.rowsWritten, lastInsertRowid: 0 };
   }
 }

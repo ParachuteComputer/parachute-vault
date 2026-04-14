@@ -65,6 +65,9 @@ class BunSqlStatement implements SqlStatement {
 // END;` blocks, so a naive split on `;` would break them apart. This splitter
 // tracks `BEGIN`/`END` depth and quoted strings/line comments to produce a
 // clean list of top-level statements.
+//
+// Intentionally does NOT handle `/* block comments */` — our schema doesn't
+// use them. Add that if we ever introduce schema SQL that does.
 // ---------------------------------------------------------------------------
 
 export function splitSqlStatements(sql: string): string[] {
