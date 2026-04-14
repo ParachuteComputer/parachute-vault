@@ -313,7 +313,7 @@ export function registerTriggers(
 
         // Phase 1: claim
         try {
-          store.updateNote(note.id, {
+          await store.updateNote(note.id, {
             metadata: { ...existingMeta, [pendingKey]: pendingAt },
             skipUpdatedAt: true,
           });
@@ -324,7 +324,7 @@ export function registerTriggers(
 
         // Fire the webhook using the configured send mode
         let webhookResult: WebhookResponse;
-        const attachments = store.getAttachments(note.id);
+        const attachments = await store.getAttachments(note.id);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
         try {
@@ -358,7 +358,7 @@ export function registerTriggers(
         // trigger an infinite webhook loop on every update.
         if (webhookResult.skipped_reason) {
           try {
-            store.updateNote(note.id, {
+            await store.updateNote(note.id, {
               metadata: {
                 ...existingMeta,
                 [pendingKey]: undefined,
@@ -378,16 +378,16 @@ export function registerTriggers(
           // Add attachments first
           if (webhookResult.attachments?.length) {
             for (const att of webhookResult.attachments) {
-              store.addAttachment(note.id, att.path, att.mimeType, att.meta);
+              await store.addAttachment(note.id, att.path, att.mimeType, att.meta);
             }
           }
 
           // Read fresh metadata to avoid clobbering concurrent edits
-          const fresh = store.getNote(note.id);
+          const fresh = await store.getNote(note.id);
           const freshMeta = (fresh?.metadata as Record<string, unknown> | undefined) ?? existingMeta;
           const { [pendingKey]: _drop, ...restMeta } = freshMeta;
 
-          store.updateNote(note.id, {
+          await store.updateNote(note.id, {
             ...(webhookResult.content !== undefined ? { content: webhookResult.content } : {}),
             metadata: {
               ...restMeta,
