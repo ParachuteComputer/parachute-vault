@@ -51,7 +51,19 @@ import {
   setOwnerPassword,
   clearOwnerPassword,
   validatePasswordStrength,
+  getOwnerPasswordHash,
+  verifyOwnerPassword,
 } from "./owner-auth.ts";
+import {
+  enrollTotp,
+  disableTotp,
+  hasTotpEnrolled,
+  regenerateBackupCodes,
+  getBackupCodeCount,
+  verifyTotpCode,
+  verifyAndConsumeBackupCode,
+  getTotpSecret,
+} from "./two-factor.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -101,6 +113,9 @@ switch (command) {
     break;
   case "set-password":
     await cmdSetPassword(cmdArgs);
+    break;
+  case "2fa":
+    await cmd2fa(cmdArgs);
     break;
   case "serve":
     await cmdServe();
@@ -274,7 +289,13 @@ async function cmdSetPassword(args: string[]) {
       console.log("No owner password is set.");
       return;
     }
-    const ok = await confirm("Remove the owner password? OAuth consent will fall back to vault-token auth.", false);
+    const twoFaNote = hasTotpEnrolled()
+      ? " Note: 2FA management operations will require your authenticator app or a backup code instead."
+      : "";
+    const ok = await confirm(
+      `Remove the owner password? OAuth consent will fall back to vault-token auth.${twoFaNote}`,
+      false,
+    );
     if (!ok) {
       console.log("Cancelled.");
       return;
@@ -288,6 +309,174 @@ async function cmdSetPassword(args: string[]) {
     ? "Change owner password"
     : "Set owner password";
   await promptForOwnerPassword(purpose);
+}
+
+// ---------------------------------------------------------------------------
+// 2FA — parachute vault 2fa [enroll | disable | backup-codes | status]
+// ---------------------------------------------------------------------------
+
+async function confirmOwnerPassword(purpose: string): Promise<boolean> {
+  const hash = getOwnerPasswordHash();
+  if (!hash) {
+    console.error("No owner password is set. Run: parachute vault set-password");
+    return false;
+  }
+  console.log(purpose);
+  const pw = await askPassword("  Current password");
+  if (!pw) {
+    console.log("  Cancelled.");
+    return false;
+  }
+  const ok = await verifyOwnerPassword(pw, hash);
+  if (!ok) {
+    console.error("  Incorrect password.");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Confirm ownership for 2FA-management commands. Prefers the password when
+ * one is set; otherwise falls back to a TOTP or backup code so the owner
+ * isn't locked out if they cleared the password while 2FA was still enrolled.
+ */
+async function confirmForTwoFactor(purpose: string): Promise<boolean> {
+  if (hasOwnerPassword()) {
+    return confirmOwnerPassword(purpose);
+  }
+  // Fallback path: no password, must prove via current TOTP or backup code.
+  const secret = getTotpSecret();
+  if (!secret) {
+    console.error("2FA is not enabled.");
+    return false;
+  }
+  console.log(purpose);
+  console.log("  (No owner password set — confirm with an authenticator code or a backup code.)");
+  const totp = (await ask("  Authenticator code (blank to use a backup code)")).trim();
+  if (totp) {
+    if (verifyTotpCode(secret, totp)) return true;
+    console.error("  Invalid authenticator code.");
+    return false;
+  }
+  console.log("  This will consume one of your backup codes.");
+  const backup = (await ask("  Backup code")).trim();
+  if (!backup) {
+    console.log("  Cancelled.");
+    return false;
+  }
+  const ok = await verifyAndConsumeBackupCode(backup);
+  if (!ok) {
+    console.error("  Invalid or already-used backup code.");
+    return false;
+  }
+  console.log("  (Backup code consumed.)");
+  return true;
+}
+
+async function cmd2fa(args: string[]) {
+  const sub = args[0] ?? "status";
+
+  if (sub === "status") {
+    if (hasTotpEnrolled()) {
+      console.log(`2FA: enabled (${getBackupCodeCount()} backup code(s) remaining)`);
+    } else {
+      console.log("2FA: not enabled");
+      console.log("  Enable with: parachute vault 2fa enroll");
+    }
+    return;
+  }
+
+  if (sub === "enroll") {
+    if (!hasOwnerPassword()) {
+      console.error("Set an owner password first: parachute vault set-password");
+      process.exit(1);
+    }
+    if (hasTotpEnrolled()) {
+      const ok = await confirm("2FA is already enabled. Re-enroll (invalidates existing authenticator + backup codes)?", false);
+      if (!ok) {
+        console.log("Cancelled.");
+        return;
+      }
+    }
+    if (!(await confirmOwnerPassword("Confirm your owner password to enroll 2FA:"))) {
+      process.exit(1);
+    }
+
+    const result = await enrollTotp();
+    // qrcode-terminal ships no types; shape: { generate(text, {small}, cb) }.
+    const qrcode = (await import("qrcode-terminal")).default as {
+      generate: (text: string, opts: { small: boolean }, cb: (q: string) => void) => void;
+    };
+
+    console.log("\nScan this QR code with your authenticator app:\n");
+    await new Promise<void>((resolve) => {
+      qrcode.generate(result.otpauthUrl, { small: true }, (q: string) => {
+        console.log(q);
+        resolve();
+      });
+    });
+    console.log(`Or enter this secret manually:\n  ${result.secret}\n`);
+
+    // Confirmation step: require a code from the newly-enrolled app before
+    // we consider enrollment final. Protects against the user scanning wrong
+    // and locking themselves out.
+    let confirmed = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const entered = (await ask("Enter the 6-digit code from your authenticator to confirm")).trim();
+      // markUsed=false — don't consume the code here; the user may need it
+      // again immediately for the consent page.
+      if (verifyTotpCode(result.secret, entered, false)) {
+        confirmed = true;
+        break;
+      }
+      console.log(`  Incorrect code. (${2 - attempt} attempt(s) left)`);
+    }
+    if (!confirmed) {
+      console.error("Enrollment failed — rolling back. Re-run `parachute vault 2fa enroll` to try again.");
+      disableTotp();
+      process.exit(1);
+    }
+
+    console.log("\nBackup codes (single-use; store somewhere safe — they are NOT retrievable):");
+    for (const code of result.backupCodes) {
+      console.log(`  ${code}`);
+    }
+    console.log("\n2FA is now active for OAuth consent on this vault.");
+    return;
+  }
+
+  if (sub === "disable") {
+    if (!hasTotpEnrolled()) {
+      console.log("2FA is not enabled.");
+      return;
+    }
+    if (!(await confirmForTwoFactor("Confirm ownership to disable 2FA:"))) {
+      process.exit(1);
+    }
+    disableTotp();
+    console.log("2FA disabled. Backup codes cleared.");
+    return;
+  }
+
+  if (sub === "backup-codes") {
+    if (!hasTotpEnrolled()) {
+      console.error("2FA is not enabled. Run: parachute vault 2fa enroll");
+      process.exit(1);
+    }
+    if (!(await confirmForTwoFactor("Confirm ownership to regenerate backup codes:"))) {
+      process.exit(1);
+    }
+    const codes = await regenerateBackupCodes();
+    console.log("\nNew backup codes (previous codes are now invalid):");
+    for (const code of codes) {
+      console.log(`  ${code}`);
+    }
+    return;
+  }
+
+  console.error(`Unknown 2fa command: ${sub}`);
+  console.error("Usage: parachute vault 2fa [status | enroll | disable | backup-codes]");
+  process.exit(1);
 }
 
 function cmdCreate(args: string[]) {
@@ -919,6 +1108,10 @@ Tokens:
 OAuth:
   parachute vault set-password             Set/change the owner password (for consent page)
   parachute vault set-password --clear     Remove the owner password
+  parachute vault 2fa status               Show 2FA state
+  parachute vault 2fa enroll               Enable TOTP 2FA (QR + backup codes)
+  parachute vault 2fa disable              Disable 2FA (requires password)
+  parachute vault 2fa backup-codes         Regenerate backup codes
 
 Config:
   parachute vault config                   Show current configuration
