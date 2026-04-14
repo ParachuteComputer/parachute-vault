@@ -34,6 +34,60 @@ export async function ask(question: string, defaultValue = ""): Promise<string> 
 }
 
 /**
+ * Ask for a password with masked input (shows "*" per character).
+ * Falls back to plain echo if stdin isn't a TTY (e.g. piped input in CI).
+ */
+export async function askPassword(question: string): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY || typeof stdin.setRawMode !== "function") {
+    return ask(question);
+  }
+
+  process.stdout.write(`${question}: `);
+
+  return new Promise<string>((resolve) => {
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+
+    let buf = "";
+    const onData = (data: string) => {
+      for (const ch of data) {
+        // Enter — done
+        if (ch === "\r" || ch === "\n") {
+          stdin.setRawMode(false);
+          stdin.pause();
+          stdin.removeListener("data", onData);
+          process.stdout.write("\n");
+          resolve(buf);
+          return;
+        }
+        // Ctrl-C — abort
+        if (ch === "\u0003") {
+          stdin.setRawMode(false);
+          process.stdout.write("\n");
+          process.exit(130);
+        }
+        // Backspace / DEL
+        if (ch === "\u0008" || ch === "\u007f") {
+          if (buf.length > 0) {
+            buf = buf.slice(0, -1);
+            process.stdout.write("\b \b");
+          }
+          continue;
+        }
+        // Printable
+        if (ch >= " ") {
+          buf += ch;
+          process.stdout.write("*");
+        }
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
+/**
  * Ask user to pick from options. Returns the chosen value.
  */
 export async function choose(question: string, options: { label: string; value: string; description?: string }[]): Promise<string> {
