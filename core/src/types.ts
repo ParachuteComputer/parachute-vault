@@ -94,47 +94,47 @@ export interface HydratedLink extends Link {
 
 export interface Store {
   // Notes
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Note;
-  getNote(id: string): Note | null;
-  getNoteByPath(path: string): Note | null;
-  getNotes(ids: string[]): Note[];
-  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean }): Note;
-  deleteNote(id: string): void;
-  queryNotes(opts: QueryOpts): Note[];
-  searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Note[];
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note>;
+  getNote(id: string): Promise<Note | null>;
+  getNoteByPath(path: string): Promise<Note | null>;
+  getNotes(ids: string[]): Promise<Note[]>;
+  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean }): Promise<Note>;
+  deleteNote(id: string): Promise<void>;
+  queryNotes(opts: QueryOpts): Promise<Note[]>;
+  searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]>;
 
   // Tags
-  tagNote(noteId: string, tags: string[]): void;
-  untagNote(noteId: string, tags: string[]): void;
-  listTags(): { name: string; count: number }[];
-  deleteTag(name: string): { deleted: boolean; notes_untagged: number };
+  tagNote(noteId: string, tags: string[]): Promise<void>;
+  untagNote(noteId: string, tags: string[]): Promise<void>;
+  listTags(): Promise<{ name: string; count: number }[]>;
+  deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
 
   // Vault stats (aggregate, read-only)
-  getVaultStats(opts?: { topTagsLimit?: number }): VaultStats;
+  getVaultStats(opts?: { topTagsLimit?: number }): Promise<VaultStats>;
 
   // Links
-  createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Link;
-  deleteLink(sourceId: string, targetId: string, relationship: string): void;
-  getLinks(noteId: string, opts?: { direction?: "outbound" | "inbound" | "both" }): Link[];
-  listLinks(opts?: { noteId?: string; direction?: "outbound" | "inbound" | "both"; relationship?: string }): Link[];
+  createLink(sourceId: string, targetId: string, relationship: string, metadata?: Record<string, unknown>): Promise<Link>;
+  deleteLink(sourceId: string, targetId: string, relationship: string): Promise<void>;
+  getLinks(noteId: string, opts?: { direction?: "outbound" | "inbound" | "both" }): Promise<Link[]>;
+  listLinks(opts?: { noteId?: string; direction?: "outbound" | "inbound" | "both"; relationship?: string }): Promise<Link[]>;
 
   // Bulk operations
-  createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Note[];
-  batchTag(noteIds: string[], tags: string[]): number;
-  batchUntag(noteIds: string[], tags: string[]): number;
+  createNotes(inputs: { content: string; id?: string; path?: string; tags?: string[] }[]): Promise<Note[]>;
+  batchTag(noteIds: string[], tags: string[]): Promise<number>;
+  batchUntag(noteIds: string[], tags: string[]): Promise<number>;
 
   // Deeper link queries
-  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): { noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[];
-  findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): { path: string[]; relationships: string[] } | null;
+  traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
+  findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): Promise<{ path: string[]; relationships: string[] } | null>;
 
   // Tag schemas
-  listTagSchemas(): { tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }[];
-  getTagSchema(tag: string): { tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> } | null;
-  upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }): { tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> };
-  deleteTagSchema(tag: string): boolean;
-  getTagSchemaMap(): Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>;
+  listTagSchemas(): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }[]>;
+  getTagSchema(tag: string): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> } | null>;
+  upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>;
+  deleteTagSchema(tag: string): Promise<boolean>;
+  getTagSchemaMap(): Promise<Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>>;
 
   // Attachments
-  addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Attachment;
-  getAttachments(noteId: string): Attachment[];
+  addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
+  getAttachments(noteId: string): Promise<Attachment[]>;
 }

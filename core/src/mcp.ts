@@ -9,7 +9,7 @@ export interface McpToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  execute: (params: Record<string, unknown>) => unknown;
+  execute: (params: Record<string, unknown>) => unknown | Promise<unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
         },
       },
-      execute: (params) => {
+      execute: async (params) => {
         // --- Single note by ID/path ---
         if (params.id) {
           const note = resolveNote(db, params.id as string);
@@ -135,7 +135,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
             result.links = linkOps.getLinksHydrated(db, note.id);
           }
           if (params.include_attachments) {
-            result.attachments = store.getAttachments(note.id);
+            result.attachments = await store.getAttachments(note.id);
           }
           return result;
         }
@@ -198,12 +198,14 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 
         // --- Hydrate links/attachments per note if requested ---
         if (params.include_links || params.include_attachments) {
-          return output.map((n: any) => {
-            const enriched = { ...n };
+          const enrichedOut: any[] = [];
+          for (const n of output as any[]) {
+            const enriched: any = { ...n };
             if (params.include_links) enriched.links = linkOps.getLinksHydrated(db, n.id);
-            if (params.include_attachments) enriched.attachments = store.getAttachments(n.id);
-            return enriched;
-          });
+            if (params.include_attachments) enriched.attachments = await store.getAttachments(n.id);
+            enrichedOut.push(enriched);
+          }
+          return enrichedOut;
         }
 
         return output;
@@ -256,13 +258,13 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           },
         },
       },
-      execute: (params) => {
+      execute: async (params) => {
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
 
         const created: Note[] = [];
         for (const item of items) {
-          const note = store.createNote(item.content as string ?? "", {
+          const note = await store.createNote(item.content as string ?? "", {
             path: item.path as string | undefined,
             tags: item.tags as string[] | undefined,
             metadata: item.metadata as Record<string, unknown> | undefined,
@@ -274,7 +276,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
             for (const link of item.links as { target: string; relationship: string }[]) {
               const target = resolveNote(db, link.target);
               if (target) {
-                store.createLink(note.id, target.id, link.relationship);
+                await store.createLink(note.id, target.id, link.relationship);
               }
             }
           }
@@ -285,7 +287,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
         // Apply tag schema effects
         for (const note of created) {
           if (note.tags && note.tags.length > 0) {
-            applySchemaDefaults(store, db, [note.id], note.tags);
+            await applySchemaDefaults(store, db, [note.id], note.tags);
           }
         }
 
@@ -368,7 +370,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           },
         },
       },
-      execute: (params) => {
+      execute: async (params) => {
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
 
@@ -383,7 +385,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
             for (const link of linksRemove) {
               const target = resolveNote(db, link.target);
               if (target) {
-                store.deleteLink(note.id, target.id, link.relationship);
+                await store.deleteLink(note.id, target.id, link.relationship);
                 // Remove [[brackets]] from content if this was a wikilink
                 if (link.relationship === "wikilink" && target.path) {
                   const currentContent = contentOverride ?? note.content;
@@ -409,7 +411,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 
           let result: Note;
           if (Object.keys(updates).length > 0) {
-            result = store.updateNote(note.id, updates);
+            result = await store.updateNote(note.id, updates);
           } else {
             result = note;
           }
@@ -417,11 +419,11 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           // --- Tags ---
           const tagsOp = item.tags as { add?: string[]; remove?: string[] } | undefined;
           if (tagsOp?.add?.length) {
-            store.tagNote(note.id, tagsOp.add);
-            applySchemaDefaults(store, db, [note.id], tagsOp.add);
+            await store.tagNote(note.id, tagsOp.add);
+            await applySchemaDefaults(store, db, [note.id], tagsOp.add);
           }
           if (tagsOp?.remove?.length) {
-            store.untagNote(note.id, tagsOp.remove);
+            await store.untagNote(note.id, tagsOp.remove);
           }
 
           // --- Add links ---
@@ -430,7 +432,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
             for (const link of linksAdd) {
               const target = resolveNote(db, link.target);
               if (target) {
-                store.createLink(note.id, target.id, link.relationship, link.metadata);
+                await store.createLink(note.id, target.id, link.relationship, link.metadata);
               }
             }
           }
@@ -456,9 +458,9 @@ Defaults: include_content=true for single note, false for lists. include_links=f
         },
         required: ["id"],
       },
-      execute: (params) => {
+      execute: async (params) => {
         const note = requireNote(db, params.id as string);
-        store.deleteNote(note.id);
+        await store.deleteNote(note.id);
         return { deleted: true, id: note.id };
       },
     },
@@ -557,11 +559,11 @@ Defaults: include_content=true for single note, false for lists. include_links=f
         },
         required: ["tag"],
       },
-      execute: (params) => {
+      execute: async (params) => {
         const tag = params.tag as string;
         // Delete schema first (FK cascade would handle it, but be explicit)
         tagSchemaOps.deleteTagSchema(db, tag);
-        return store.deleteTag(tag);
+        return await store.deleteTag(tag);
       },
     },
 
@@ -617,7 +619,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 // Tag schema effects — auto-populate defaults when tags are applied
 // ---------------------------------------------------------------------------
 
-function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): void {
+async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<void> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
   if (Object.keys(schemas).length === 0) return;
 
@@ -644,7 +646,7 @@ function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags
       }
     }
     if (Object.keys(missing).length === 0) continue;
-    store.updateNote(noteId, {
+    await store.updateNote(noteId, {
       metadata: { ...existing, ...missing },
       skipUpdatedAt: true,
     });

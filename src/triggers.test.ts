@@ -97,13 +97,13 @@ describe("buildPredicate", () => {
   });
 });
 
-describe("registerTriggers — dispatch modes", () => {
+describe("registerTriggers — dispatch modes", async () => {
   let webhookServer: ReturnType<typeof Bun.serve>;
   let webhookPort: number;
   let lastRequest: { method: string; url: string; headers: Headers; body: unknown; formData?: FormData } | null = null;
   let webhookHandler: (req: Request) => Response | Promise<Response>;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     webhookHandler = () => Response.json({});
     webhookServer = Bun.serve({
       hostname: "127.0.0.1",
@@ -224,7 +224,7 @@ describe("registerTriggers — dispatch modes", () => {
     expect((file as File).name).toBe("recording.wav");
 
     // Verify note content was updated
-    const updated = store.getNote("n2");
+    const updated = await store.getNote("n2");
     expect(updated?.content).toBe("transcribed content");
 
     // Cleanup
@@ -272,12 +272,12 @@ describe("registerTriggers — dispatch modes", () => {
     expect(body.input).toBe("Hello world");
 
     // Verify attachment was created
-    const attachments = store.getAttachments("n3");
+    const attachments = await store.getAttachments("n3");
     expect(attachments.length).toBe(1);
     expect(attachments[0].mimeType).toBe("audio/ogg");
 
     // Verify metadata includes provider info
-    const updated = store.getNote("n3");
+    const updated = await store.getNote("n3");
     const meta = updated?.metadata as Record<string, unknown>;
     expect(meta.tts_provider).toBe("kokoro");
     expect(meta.tts_voice).toBe("af_heart");
@@ -307,7 +307,7 @@ describe("registerTriggers — dispatch modes", () => {
     await hooks.dispatch("created", note, store);
     await new Promise(r => setTimeout(r, 50));
 
-    const updated = store.getNote("n4");
+    const updated = await store.getNote("n4");
     const meta = updated?.metadata as Record<string, unknown>;
     expect(meta.skip_test_skipped_reason).toBe("no audio attachment found");
   });
@@ -330,7 +330,7 @@ describe("registerTriggers — dispatch modes", () => {
     await hooks.dispatch("created", note, store);
     await new Promise(r => setTimeout(r, 50));
 
-    const updated = store.getNote("n5");
+    const updated = await store.getNote("n5");
     const meta = updated?.metadata as Record<string, unknown>;
     expect(meta.empty_test_skipped_reason).toBe("note has no content to synthesize");
   });

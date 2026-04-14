@@ -66,7 +66,7 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
       name: coreTool.name,
       description,
       inputSchema,
-      execute: (params) => {
+      execute: async (params) => {
         const vaultName = (params.vault as string) ?? defaultVault;
         const config = readVaultConfig(vaultName);
         if (!config) {
@@ -76,7 +76,7 @@ export function generateUnifiedMcpTools(): McpToolDef[] {
         const vaultTools = generateMcpTools(store);
         const tool = vaultTools.find((t) => t.name === coreTool.name)!;
         const { vault: _, ...rest } = params;
-        return tool.execute(rest);
+        return await tool.execute(rest);
       },
     };
   });
@@ -129,7 +129,7 @@ function overrideVaultInfo(tools: McpToolDef[], defaultVault: string): void {
   const vaultInfo = tools.find((t) => t.name === "vault-info");
   if (!vaultInfo) return;
 
-  vaultInfo.execute = (params) => {
+  vaultInfo.execute = async (params) => {
     const vaultName = (params.vault as string) ?? defaultVault;
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
@@ -147,7 +147,7 @@ function overrideVaultInfo(tools: McpToolDef[], defaultVault: string): void {
 
     if (params.include_stats) {
       const store = getVaultStore(vaultName);
-      result.stats = store.getVaultStats();
+      result.stats = await store.getVaultStats();
     }
 
     return result;

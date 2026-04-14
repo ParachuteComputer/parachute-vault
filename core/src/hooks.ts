@@ -203,7 +203,7 @@ export class HookRegistry {
       // Re-read the note so the handler sees the latest state (another
       // handler may have written back in between). If the note was
       // deleted, silently drop.
-      const fresh = store.getNote(note.id) ?? note;
+      const fresh = (await store.getNote(note.id)) ?? note;
       await hook.handler(fresh, store, event);
     } catch (err) {
       this.logger.error(

@@ -76,11 +76,11 @@ for (const vaultName of listVaults()) {
   const vaultConfig = readVaultConfig(vaultName);
   if (vaultConfig?.tag_schemas && Object.keys(vaultConfig.tag_schemas).length > 0) {
     const store = getVaultStore(vaultName);
-    const existingTags = new Set(store.listTagSchemas().map((s) => s.tag));
+    const existingTags = new Set((await store.listTagSchemas()).map((s) => s.tag));
     let migrated = 0;
     for (const [tag, schema] of Object.entries(vaultConfig.tag_schemas)) {
       if (!existingTags.has(tag)) {
-        store.upsertTagSchema(tag, schema);
+        await store.upsertTagSchema(tag, schema);
         migrated++;
       }
     }
@@ -397,7 +397,7 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    const stats = store.getVaultStats();
+    const stats = await store.getVaultStats();
     return Response.json({
       name: vaultName,
       description: vaultConfig.description,

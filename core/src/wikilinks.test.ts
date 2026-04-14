@@ -110,28 +110,28 @@ More text
 // Resolution
 // ---------------------------------------------------------------------------
 
-describe("resolveWikilink", () => {
-  it("resolves exact path match", () => {
-    store.createNote("Target note", { path: "My Note" });
+describe("resolveWikilink", async () => {
+  it("resolves exact path match", async () => {
+    await store.createNote("Target note", { path: "My Note" });
     const id = resolveWikilink(db, "My Note");
     expect(id).toBeTruthy();
   });
 
-  it("resolves case-insensitively", () => {
-    const note = store.createNote("Target", { path: "My Note" });
+  it("resolves case-insensitively", async () => {
+    const note = await store.createNote("Target", { path: "My Note" });
     const id = resolveWikilink(db, "my note");
     expect(id).toBe(note.id);
   });
 
-  it("resolves basename match", () => {
-    const note = store.createNote("Deep note", { path: "Projects/Parachute/README" });
+  it("resolves basename match", async () => {
+    const note = await store.createNote("Deep note", { path: "Projects/Parachute/README" });
     const id = resolveWikilink(db, "README");
     expect(id).toBe(note.id);
   });
 
-  it("returns null for ambiguous basename", () => {
-    store.createNote("A", { path: "Folder1/README" });
-    store.createNote("B", { path: "Folder2/README" });
+  it("returns null for ambiguous basename", async () => {
+    await store.createNote("A", { path: "Folder1/README" });
+    await store.createNote("B", { path: "Folder2/README" });
     const id = resolveWikilink(db, "README");
     expect(id).toBeNull();
   });
@@ -146,21 +146,21 @@ describe("resolveWikilink", () => {
 // Sync
 // ---------------------------------------------------------------------------
 
-describe("syncWikilinks", () => {
-  it("creates links for resolved wikilinks", () => {
-    const target = store.createNote("Target", { path: "Target Note" });
-    const source = store.createNote("See [[Target Note]]");
+describe("syncWikilinks", async () => {
+  it("creates links for resolved wikilinks", async () => {
+    const target = await store.createNote("Target", { path: "Target Note" });
+    const source = await store.createNote("See [[Target Note]]");
 
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].targetId).toBe(target.id);
     expect(links[0].relationship).toBe("wikilink");
   });
 
-  it("tracks unresolved wikilinks", () => {
-    const source = store.createNote("See [[Missing Note]]");
+  it("tracks unresolved wikilinks", async () => {
+    const source = await store.createNote("See [[Missing Note]]");
 
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(0);
 
     // Check unresolved table
@@ -171,85 +171,85 @@ describe("syncWikilinks", () => {
     expect(unresolved[0].target_path).toBe("Missing Note");
   });
 
-  it("resolves pending wikilinks when target note is created", () => {
-    const source = store.createNote("See [[Future Note]]");
+  it("resolves pending wikilinks when target note is created", async () => {
+    const source = await store.createNote("See [[Future Note]]");
 
     // No link yet
-    expect(store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
 
     // Create the target note
-    const target = store.createNote("I exist now", { path: "Future Note" });
+    const target = await store.createNote("I exist now", { path: "Future Note" });
 
     // Link should now exist
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].targetId).toBe(target.id);
   });
 
-  it("removes links when wikilinks are removed from content", () => {
-    const target = store.createNote("Target", { path: "Target" });
-    const source = store.createNote("See [[Target]]");
+  it("removes links when wikilinks are removed from content", async () => {
+    const target = await store.createNote("Target", { path: "Target" });
+    const source = await store.createNote("See [[Target]]");
 
-    expect(store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
 
     // Update content to remove the wikilink
-    store.updateNote(source.id, { content: "No more links here." });
+    await store.updateNote(source.id, { content: "No more links here." });
 
-    expect(store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
   });
 
-  it("adds new links when wikilinks are added to content", () => {
-    const a = store.createNote("A", { path: "Note A" });
-    const b = store.createNote("B", { path: "Note B" });
-    const source = store.createNote("See [[Note A]]");
+  it("adds new links when wikilinks are added to content", async () => {
+    const a = await store.createNote("A", { path: "Note A" });
+    const b = await store.createNote("B", { path: "Note B" });
+    const source = await store.createNote("See [[Note A]]");
 
-    expect(store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
 
     // Update to add another link
-    store.updateNote(source.id, { content: "See [[Note A]] and [[Note B]]" });
+    await store.updateNote(source.id, { content: "See [[Note A]] and [[Note B]]" });
 
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(2);
   });
 
-  it("does not create self-links", () => {
-    const note = store.createNote("I link to [[Myself]]", { path: "Myself" });
-    const links = store.getLinks(note.id, { direction: "outbound" });
+  it("does not create self-links", async () => {
+    const note = await store.createNote("I link to [[Myself]]", { path: "Myself" });
+    const links = await store.getLinks(note.id, { direction: "outbound" });
     expect(links.filter((l) => l.relationship === "wikilink")).toHaveLength(0);
   });
 
-  it("deduplicates multiple mentions of same target", () => {
-    const target = store.createNote("Target", { path: "Target" });
-    const source = store.createNote("See [[Target]] and again [[Target]]");
+  it("deduplicates multiple mentions of same target", async () => {
+    const target = await store.createNote("Target", { path: "Target" });
+    const source = await store.createNote("See [[Target]] and again [[Target]]");
 
-    const links = store.getLinks(source.id, { direction: "outbound" })
+    const links = (await store.getLinks(source.id, { direction: "outbound" }))
       .filter((l) => l.relationship === "wikilink");
     expect(links).toHaveLength(1);
   });
 
-  it("preserves non-wikilink links", () => {
-    const a = store.createNote("A", { id: "a", path: "Note A" });
-    const b = store.createNote("B", { id: "b", path: "Note B" });
+  it("preserves non-wikilink links", async () => {
+    const a = await store.createNote("A", { id: "a", path: "Note A" });
+    const b = await store.createNote("B", { id: "b", path: "Note B" });
 
     // Manual semantic link
-    store.createLink("a", "b", "related-to");
+    await store.createLink("a", "b", "related-to");
 
     // Create note with wikilink to B
-    const source = store.createNote("See [[Note B]]", { id: "source" });
+    const source = await store.createNote("See [[Note B]]", { id: "source" });
 
     // Update content to remove wikilink
-    store.updateNote("source", { content: "No links" });
+    await store.updateNote("source", { content: "No links" });
 
     // Semantic link between a and b should still exist
-    const links = store.getLinks("a", { direction: "outbound" });
+    const links = await store.getLinks("a", { direction: "outbound" });
     expect(links.some((l) => l.relationship === "related-to")).toBe(true);
   });
 
-  it("stores display text and anchor in link metadata", () => {
-    const target = store.createNote("Target", { path: "Target" });
-    const source = store.createNote("See [[Target#Introduction|intro]]");
+  it("stores display text and anchor in link metadata", async () => {
+    const target = await store.createNote("Target", { path: "Target" });
+    const source = await store.createNote("See [[Target#Introduction|intro]]");
 
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].metadata?.display).toBe("intro");
     expect(links[0].metadata?.anchor).toBe("Introduction");
@@ -260,17 +260,17 @@ describe("syncWikilinks", () => {
 // Integration with path changes
 // ---------------------------------------------------------------------------
 
-describe("path-based resolution", () => {
-  it("resolves pending links when a note gets a path", () => {
-    const source = store.createNote("See [[Named Note]]");
-    expect(store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+describe("path-based resolution", async () => {
+  it("resolves pending links when a note gets a path", async () => {
+    const source = await store.createNote("See [[Named Note]]");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
 
     // Create a note without a path, then give it one
-    const target = store.createNote("Unnamed");
-    store.updateNote(target.id, { path: "Named Note" });
+    const target = await store.createNote("Unnamed");
+    await store.updateNote(target.id, { path: "Named Note" });
 
     // The pending link should be resolved
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].targetId).toBe(target.id);
   });

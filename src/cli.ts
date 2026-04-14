@@ -930,7 +930,7 @@ async function cmdImport(args: string[]) {
 
   for (const note of notes) {
     // Skip if a note with this path already exists
-    const existing = store.getNoteByPath(note.path);
+    const existing = await store.getNoteByPath(note.path);
     if (existing) {
       skipped++;
       continue;
@@ -939,7 +939,7 @@ async function cmdImport(args: string[]) {
     // Build metadata from frontmatter (excluding tags, already extracted)
     const metadata = Object.keys(note.frontmatter).length > 0 ? note.frontmatter : undefined;
 
-    store.createNoteRaw(note.content, {
+    await store.createNoteRaw(note.content, {
       path: note.path,
       tags: note.tags.length > 0 ? note.tags : undefined,
       metadata: metadata as Record<string, unknown>,
@@ -952,7 +952,7 @@ async function cmdImport(args: string[]) {
   if (skipped > 0) console.log(`Skipped ${skipped} notes (path already exists)`);
 
   if (imported > 0) {
-    const linkResult = store.syncAllWikilinks();
+    const linkResult = await store.syncAllWikilinks();
     console.log(`Resolved ${linkResult.totalAdded} wikilinks across ${linkResult.synced} notes.`);
   }
 }
@@ -992,7 +992,7 @@ async function cmdExport(args: string[]) {
   const { getVaultStore } = await import("./vault-store.ts");
 
   const store = getVaultStore(vaultName);
-  const notes = store.queryNotes({ limit: 100000, sort: "asc" });
+  const notes = await store.queryNotes({ limit: 100000, sort: "asc" });
 
   console.log(`Exporting ${notes.length} notes from vault "${vaultName}" to ${fullPath}`);
   mkdir(fullPath, { recursive: true });

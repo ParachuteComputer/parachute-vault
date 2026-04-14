@@ -95,7 +95,7 @@ async function handleMcp(
       };
     }
     try {
-      const result = tool.execute((args ?? {}) as Record<string, unknown>);
+      const result = await tool.execute((args ?? {}) as Record<string, unknown>);
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };

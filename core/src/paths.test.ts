@@ -76,37 +76,37 @@ describe("hasInvalidChars", () => {
 // Path uniqueness
 // ---------------------------------------------------------------------------
 
-describe("path uniqueness", () => {
+describe("path uniqueness", async () => {
   let store: SqliteStore;
 
   beforeEach(() => {
     store = new SqliteStore(new Database(":memory:"));
   });
 
-  it("allows multiple notes without paths", () => {
-    store.createNote("A");
-    store.createNote("B");
+  it("allows multiple notes without paths", async () => {
+    await store.createNote("A");
+    await store.createNote("B");
     // Both should exist
-    const notes = store.queryNotes({ limit: 10 });
+    const notes = await store.queryNotes({ limit: 10 });
     expect(notes).toHaveLength(2);
   });
 
-  it("rejects duplicate paths", () => {
-    store.createNote("A", { path: "My Note" });
-    expect(() => store.createNote("B", { path: "My Note" })).toThrow();
+  it("rejects duplicate paths", async () => {
+    await store.createNote("A", { path: "My Note" });
+    expect(async () => await store.createNote("B", { path: "My Note" })).toThrow();
   });
 
-  it("normalizes before checking uniqueness", () => {
-    store.createNote("A", { path: "My Note.md" });
+  it("normalizes before checking uniqueness", async () => {
+    await store.createNote("A", { path: "My Note.md" });
     // "My Note.md" normalizes to "My Note" — should conflict
-    expect(() => store.createNote("B", { path: "My Note" })).toThrow();
+    expect(async () => await store.createNote("B", { path: "My Note" })).toThrow();
   });
 
-  it("allows different paths", () => {
-    store.createNote("A", { path: "Note A" });
-    store.createNote("B", { path: "Note B" });
-    expect(store.getNoteByPath("Note A")).toBeTruthy();
-    expect(store.getNoteByPath("Note B")).toBeTruthy();
+  it("allows different paths", async () => {
+    await store.createNote("A", { path: "Note A" });
+    await store.createNote("B", { path: "Note B" });
+    expect(await store.getNoteByPath("Note A")).toBeTruthy();
+    expect(await store.getNoteByPath("Note B")).toBeTruthy();
   });
 });
 
@@ -114,21 +114,21 @@ describe("path uniqueness", () => {
 // Path normalization in store operations
 // ---------------------------------------------------------------------------
 
-describe("path normalization in store", () => {
+describe("path normalization in store", async () => {
   let store: SqliteStore;
 
   beforeEach(() => {
     store = new SqliteStore(new Database(":memory:"));
   });
 
-  it("normalizes path on create", () => {
-    const note = store.createNote("Test", { path: "  Projects//README.md  " });
+  it("normalizes path on create", async () => {
+    const note = await store.createNote("Test", { path: "  Projects//README.md  " });
     expect(note.path).toBe("Projects/README");
   });
 
-  it("normalizes path on update", () => {
-    const note = store.createNote("Test", { path: "Old Path" });
-    const updated = store.updateNote(note.id, { path: "New Path.md" });
+  it("normalizes path on update", async () => {
+    const note = await store.createNote("Test", { path: "Old Path" });
+    const updated = await store.updateNote(note.id, { path: "New Path.md" });
     expect(updated.path).toBe("New Path");
   });
 });
@@ -137,61 +137,61 @@ describe("path normalization in store", () => {
 // Rename cascading
 // ---------------------------------------------------------------------------
 
-describe("rename cascading", () => {
+describe("rename cascading", async () => {
   let store: SqliteStore;
 
   beforeEach(() => {
     store = new SqliteStore(new Database(":memory:"));
   });
 
-  it("updates wikilinks in other notes when path changes", () => {
-    const target = store.createNote("I am the target", { path: "Old Name" });
-    const source = store.createNote("See [[Old Name]] for details.");
+  it("updates wikilinks in other notes when path changes", async () => {
+    const target = await store.createNote("I am the target", { path: "Old Name" });
+    const source = await store.createNote("See [[Old Name]] for details.");
 
     // Verify link exists
-    expect(store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
 
     // Rename the target
-    store.updateNote(target.id, { path: "New Name" });
+    await store.updateNote(target.id, { path: "New Name" });
 
     // Source content should be updated
-    const updatedSource = store.getNote(source.id)!;
+    const updatedSource = (await store.getNote(source.id))!;
     expect(updatedSource.content).toBe("See [[New Name]] for details.");
 
     // Link should still work
-    const links = store.getLinks(source.id, { direction: "outbound" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].targetId).toBe(target.id);
   });
 
-  it("updates aliased wikilinks", () => {
-    const target = store.createNote("Target", { path: "Old" });
-    const source = store.createNote("See [[Old|click here]] for info.");
+  it("updates aliased wikilinks", async () => {
+    const target = await store.createNote("Target", { path: "Old" });
+    const source = await store.createNote("See [[Old|click here]] for info.");
 
-    store.updateNote(target.id, { path: "New" });
+    await store.updateNote(target.id, { path: "New" });
 
-    const updated = store.getNote(source.id)!;
+    const updated = (await store.getNote(source.id))!;
     expect(updated.content).toBe("See [[New|click here]] for info.");
   });
 
-  it("updates wikilinks with anchors", () => {
-    const target = store.createNote("Target", { path: "Old" });
-    const source = store.createNote("See [[Old#Section]].");
+  it("updates wikilinks with anchors", async () => {
+    const target = await store.createNote("Target", { path: "Old" });
+    const source = await store.createNote("See [[Old#Section]].");
 
-    store.updateNote(target.id, { path: "New" });
+    await store.updateNote(target.id, { path: "New" });
 
-    const updated = store.getNote(source.id)!;
+    const updated = (await store.getNote(source.id))!;
     expect(updated.content).toBe("See [[New#Section]].");
   });
 
-  it("does not update unrelated wikilinks", () => {
-    store.createNote("Target", { path: "Old" });
-    const other = store.createNote("Other", { path: "Other" });
-    const source = store.createNote("See [[Other]] and [[Old]].");
+  it("does not update unrelated wikilinks", async () => {
+    await store.createNote("Target", { path: "Old" });
+    const other = await store.createNote("Other", { path: "Other" });
+    const source = await store.createNote("See [[Other]] and [[Old]].");
 
-    store.updateNote(store.getNoteByPath("Old")!.id, { path: "New" });
+    await store.updateNote((await store.getNoteByPath("Old"))!.id, { path: "New" });
 
-    const updated = store.getNote(source.id)!;
+    const updated = (await store.getNote(source.id))!;
     expect(updated.content).toBe("See [[Other]] and [[New]].");
   });
 });
