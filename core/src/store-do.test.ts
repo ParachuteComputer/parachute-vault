@@ -190,8 +190,63 @@ describe("DoSqliteStore", () => {
     expect(s?.fields?.name?.type).toBe("string");
   });
 
-  it("throws on attachment methods (not yet supported)", async () => {
-    expect(store.addAttachment("n", "/tmp/x", "image/png")).rejects.toThrow(/attachments/);
-    expect(store.getAttachments("n")).rejects.toThrow(/attachments/);
+  it("creates and reads attachment metadata (DB-only)", async () => {
+    const n = await store.createNote("with attachment");
+    const att = await store.addAttachment(n.id, "2026-04-14/audio.wav", "audio/wav", { duration: 12 });
+    expect(att.path).toBe("2026-04-14/audio.wav");
+    expect(att.mimeType).toBe("audio/wav");
+
+    const atts = await store.getAttachments(n.id);
+    expect(atts).toHaveLength(1);
+    expect(atts[0]!.metadata).toEqual({ duration: 12 });
+  });
+
+  it("throws on blob I/O when no BlobStore is wired", async () => {
+    expect(store.putBlob("k", new Uint8Array([1]))).rejects.toThrow(/BlobStore/);
+    expect(store.getBlob("k")).rejects.toThrow(/BlobStore/);
+    expect(store.deleteBlob("k")).rejects.toThrow(/BlobStore/);
+  });
+
+  it("routes blob I/O through the provided BlobStore", async () => {
+    const db = new (await import("bun:sqlite")).Database(":memory:");
+    const mem = new Map<string, { bytes: Uint8Array; mimeType?: string }>();
+    const blobStore = {
+      async put(key: string, data: Uint8Array | ArrayBuffer | Blob, opts?: { mimeType?: string }) {
+        const bytes = data instanceof Uint8Array ? data
+          : data instanceof ArrayBuffer ? new Uint8Array(data)
+          : new Uint8Array(await (data as Blob).arrayBuffer());
+        mem.set(key, { bytes, mimeType: opts?.mimeType });
+      },
+      async get(key: string) {
+        const v = mem.get(key);
+        if (!v) return null;
+        return {
+          body: new ReadableStream<Uint8Array>({ start(c) { c.enqueue(v.bytes); c.close(); } }),
+          mimeType: v.mimeType,
+          size: v.bytes.byteLength,
+        };
+      },
+      async delete(key: string) { mem.delete(key); },
+    };
+    const s = new DoSqliteStore(mockStorage(db), { blobStore });
+    await s.putBlob("a/b.bin", new Uint8Array([1, 2, 3]), { mimeType: "application/octet-stream" });
+    const got = await s.getBlob("a/b.bin");
+    expect(got).not.toBeNull();
+    expect(got!.size).toBe(3);
+    expect(got!.mimeType).toBe("application/octet-stream");
+    await s.deleteBlob("a/b.bin");
+    expect(await s.getBlob("a/b.bin")).toBeNull();
+  });
+
+  it("propagates BlobStore.put/delete rejections (not swallowed by async wrapper)", async () => {
+    const db = new (await import("bun:sqlite")).Database(":memory:");
+    const blobStore = {
+      async put() { throw new Error("put failed"); },
+      async get() { return null; },
+      async delete() { throw new Error("delete failed"); },
+    };
+    const s = new DoSqliteStore(mockStorage(db), { blobStore });
+    expect(s.putBlob("k", new Uint8Array([1]))).rejects.toThrow(/put failed/);
+    expect(s.deleteBlob("k")).rejects.toThrow(/delete failed/);
   });
 });

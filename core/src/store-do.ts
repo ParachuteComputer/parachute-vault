@@ -23,6 +23,8 @@ import * as tagSchemaOps from "./tag-schemas.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
+import * as attachmentOps from "./attachments.js";
+import type { BlobStore } from "./blob-store.js";
 
 // ---------------------------------------------------------------------------
 // Minimal structural types for the DO storage surface we use.
@@ -110,11 +112,13 @@ export class DoSqliteAdapter implements SqlDb {
 export class DoSqliteStore implements Store {
   public readonly hooks: HookRegistry;
   public readonly sqlDb: SqlDb;
+  public readonly blobStore?: BlobStore;
 
-  constructor(storage: DoDurableObjectStorage, opts?: { hooks?: HookRegistry }) {
+  constructor(storage: DoDurableObjectStorage, opts?: { hooks?: HookRegistry; blobStore?: BlobStore }) {
     this.sqlDb = new DoSqliteAdapter(storage);
     initSchema(this.sqlDb);
     this.hooks = opts?.hooks ?? new HookRegistry();
+    this.blobStore = opts?.blobStore;
   }
 
   // ---- Notes ----
@@ -297,15 +301,32 @@ export class DoSqliteStore implements Store {
   }
 
   // ---- Attachments ----
-  // R2 integration is tracked in a follow-up PR. Self-hosted filesystem
-  // attachments are not portable to Workers, so these throw for now.
 
-  async addAttachment(_noteId: string, _filePath: string, _mimeType: string, _metadata?: Record<string, unknown>): Promise<Attachment> {
-    throw new Error("attachments are not yet supported on DoSqliteStore");
+  async addAttachment(noteId: string, filePath: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment> {
+    return attachmentOps.addAttachment(this.sqlDb, noteId, filePath, mimeType, metadata);
   }
 
-  async getAttachments(_noteId: string): Promise<Attachment[]> {
-    throw new Error("attachments are not yet supported on DoSqliteStore");
+  async getAttachments(noteId: string): Promise<Attachment[]> {
+    return attachmentOps.getAttachments(this.sqlDb, noteId);
+  }
+
+  // ---- Blob I/O ----
+
+  async putBlob(key: string, data: ArrayBuffer | Uint8Array | Blob, opts?: { mimeType?: string }): Promise<void> {
+    await this.requireBlobStore().put(key, data, opts);
+  }
+
+  async getBlob(key: string) {
+    return this.requireBlobStore().get(key);
+  }
+
+  async deleteBlob(key: string): Promise<void> {
+    await this.requireBlobStore().delete(key);
+  }
+
+  private requireBlobStore(): BlobStore {
+    if (!this.blobStore) throw new Error("DoSqliteStore was constructed without a BlobStore");
+    return this.blobStore;
   }
 }
 

@@ -137,4 +137,11 @@ export interface Store {
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
   getAttachments(noteId: string): Promise<Attachment[]>;
+
+  // Blob (binary payload) I/O. Throws if the store was constructed without a
+  // BlobStore. Key format is opaque to the interface — callers (e.g. the
+  // /storage route) decide the naming scheme.
+  putBlob(key: string, data: ArrayBuffer | Uint8Array | Blob, opts?: { mimeType?: string }): Promise<void>;
+  getBlob(key: string): Promise<{ body: ReadableStream<Uint8Array>; mimeType?: string; size?: number } | null>;
+  deleteBlob(key: string): Promise<void>;
 }

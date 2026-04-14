@@ -433,6 +433,24 @@ describe("attachments", async () => {
     const attachments = await store.getAttachments(note.id);
     expect(attachments).toHaveLength(0);
   });
+
+  it("blob I/O throws when no BlobStore is wired", async () => {
+    expect(store.putBlob("k", new Uint8Array([1]))).rejects.toThrow(/BlobStore/);
+    expect(store.getBlob("k")).rejects.toThrow(/BlobStore/);
+    expect(store.deleteBlob("k")).rejects.toThrow(/BlobStore/);
+  });
+
+  it("blob I/O propagates BlobStore rejections (not swallowed)", async () => {
+    const db2 = new Database(":memory:");
+    const blobStore = {
+      async put() { throw new Error("put failed"); },
+      async get() { return null; },
+      async delete() { throw new Error("delete failed"); },
+    };
+    const s = new SqliteStore(db2, { blobStore });
+    expect(s.putBlob("k", new Uint8Array([1]))).rejects.toThrow(/put failed/);
+    expect(s.deleteBlob("k")).rejects.toThrow(/delete failed/);
+  });
 });
 
 // ---- MCP Tools ----

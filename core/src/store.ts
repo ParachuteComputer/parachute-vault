@@ -8,6 +8,8 @@ import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
 import { BunSqliteAdapter, type SqlDb } from "./sql-db.js";
+import * as attachmentOps from "./attachments.js";
+import type { BlobStore } from "./blob-store.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -19,11 +21,13 @@ export class BunSqliteStore implements Store {
   /** Adapter that satisfies the shared `SqlDb` contract. Used internally and
    *  by external code that wants to call the ops helpers directly. */
   public readonly sqlDb: SqlDb;
+  public readonly blobStore?: BlobStore;
 
-  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
+  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry; blobStore?: BlobStore }) {
     this.sqlDb = new BunSqliteAdapter(db);
     initSchema(this.sqlDb);
     this.hooks = opts?.hooks ?? new HookRegistry();
+    this.blobStore = opts?.blobStore;
   }
 
   // ---- Notes ----
@@ -256,35 +260,30 @@ export class BunSqliteStore implements Store {
   // ---- Attachments ----
 
   async addAttachment(noteId: string, filePath: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment> {
-    const id = noteOps.generateId();
-    const now = new Date().toISOString();
-    const metadataJson = metadata ? JSON.stringify(metadata) : "{}";
-    this.sqlDb.prepare(
-      "INSERT INTO attachments (id, note_id, path, mime_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(id, noteId, filePath, mimeType, metadataJson, now);
-
-    return { id, noteId, path: filePath, mimeType, metadata, createdAt: now };
+    return attachmentOps.addAttachment(this.sqlDb, noteId, filePath, mimeType, metadata);
   }
 
   async getAttachments(noteId: string): Promise<Attachment[]> {
-    const rows = this.sqlDb.prepare(
-      "SELECT * FROM attachments WHERE note_id = ? ORDER BY created_at",
-    ).all(noteId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string }[];
+    return attachmentOps.getAttachments(this.sqlDb, noteId);
+  }
 
-    return rows.map((r) => {
-      let metadata: Record<string, unknown> | undefined;
-      if (r.metadata && r.metadata !== "{}") {
-        try { metadata = JSON.parse(r.metadata); } catch {}
-      }
-      return {
-        id: r.id,
-        noteId: r.note_id,
-        path: r.path,
-        mimeType: r.mime_type,
-        metadata,
-        createdAt: r.created_at,
-      };
-    });
+  // ---- Blob I/O ----
+
+  async putBlob(key: string, data: ArrayBuffer | Uint8Array | Blob, opts?: { mimeType?: string }): Promise<void> {
+    await this.requireBlobStore().put(key, data, opts);
+  }
+
+  async getBlob(key: string) {
+    return this.requireBlobStore().get(key);
+  }
+
+  async deleteBlob(key: string): Promise<void> {
+    await this.requireBlobStore().delete(key);
+  }
+
+  private requireBlobStore(): BlobStore {
+    if (!this.blobStore) throw new Error("BunSqliteStore was constructed without a BlobStore");
+    return this.blobStore;
   }
 }
 

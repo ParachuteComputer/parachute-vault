@@ -7,7 +7,9 @@
 
 import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
+import { FsBlobStore } from "../core/src/blob-fs.ts";
 import { openVaultDb } from "./db.ts";
+import { assetsDir } from "./routes.ts";
 
 export { SqliteStore as BunStore };
 export { defaultHookRegistry };
@@ -26,7 +28,10 @@ export function getVaultStore(name: string): SqliteStore {
     const db = openVaultDb(name);
     // Share the process-wide hook registry so features can register
     // handlers once at startup and have them fire for every vault.
-    store = new SqliteStore(db, { hooks: defaultHookRegistry });
+    store = new SqliteStore(db, {
+      hooks: defaultHookRegistry,
+      blobStore: new FsBlobStore(assetsDir(name)),
+    });
     stores.set(name, store);
     storeToVault.set(store, name);
   }

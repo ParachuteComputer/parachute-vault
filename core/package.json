@@ -11,7 +11,10 @@
     "./sql-db": "./src/sql-db.ts",
     "./schema": "./src/schema.ts",
     "./mcp": "./src/mcp.ts",
-    "./hooks": "./src/hooks.ts"
+    "./hooks": "./src/hooks.ts",
+    "./blob-store": "./src/blob-store.ts",
+    "./blob-fs": "./src/blob-fs.ts",
+    "./blob-r2": "./src/blob-r2.ts"
   },
   "peerDependencies": {
     "@cloudflare/workers-types": "*"

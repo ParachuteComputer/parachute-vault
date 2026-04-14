@@ -16,8 +16,7 @@ import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { toNoteIndex, filterMetadata } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
-import { join, extname, normalize } from "path";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { join, extname } from "path";
 import { vaultDir } from "./config.ts";
 
 // ---------------------------------------------------------------------------
@@ -710,9 +709,7 @@ const MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
-  const assets = assetsDir(vault);
-
+export async function handleStorage(req: Request, path: string, store: Store): Promise<Response> {
   if (req.method === "POST" && path === "/upload") {
     const form = await req.formData();
     const file = form.get("file");
@@ -728,43 +725,36 @@ export async function handleStorage(req: Request, path: string, vault: string): 
     }
 
     const date = new Date().toISOString().split("T")[0];
-    const dir = join(assets, date);
-    mkdirSync(dir, { recursive: true });
-
     const filename = `${Date.now()}-${crypto.randomUUID()}${ext}`;
-    const filePath = join(dir, filename);
-    const buffer = Buffer.from(await file.arrayBuffer());
-    writeFileSync(filePath, buffer);
-
-    const relativePath = `${date}/${filename}`;
+    const key = `${date}/${filename}`;
     const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await store.putBlob(key, bytes, { mimeType });
 
-    return json({ path: relativePath, size: buffer.length, mimeType }, 201);
+    return json({ path: key, size: bytes.byteLength, mimeType }, 201);
   }
 
   const fileMatch = path.match(/^\/([^/]+)\/(.+)$/);
   if (req.method === "GET" && fileMatch) {
-    const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
-    const filePath = normalize(join(assets, reqPath));
-
-    if (!filePath.startsWith(normalize(assets))) {
-      return json({ error: "Invalid path" }, 403);
+    const key = `${fileMatch[1]}/${fileMatch[2]}`;
+    let obj;
+    try {
+      obj = await store.getBlob(key);
+    } catch (err: any) {
+      // FsBlobStore throws on `..` escape; surface as 403.
+      if (err?.message?.includes("escapes root") || err?.message?.includes("Invalid blob key")) {
+        return json({ error: "Invalid path" }, 403);
+      }
+      throw err;
     }
-    if (!existsSync(filePath)) {
-      return json({ error: "Not found" }, 404);
-    }
+    if (!obj) return json({ error: "Not found" }, 404);
 
-    const stat = statSync(filePath);
-    const ext = extname(filePath).toLowerCase();
-    const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
-    const fileBuffer = readFileSync(filePath);
+    const ext = extname(key).toLowerCase();
+    const contentType = obj.mimeType ?? MIME_TYPES[ext] ?? "application/octet-stream";
+    const headers: Record<string, string> = { "Content-Type": contentType };
+    if (obj.size !== undefined) headers["Content-Length"] = String(obj.size);
 
-    return new Response(fileBuffer, {
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": String(stat.size),
-      },
-    });
+    return new Response(obj.body, { headers });
   }
 
   return json({ error: "Not found" }, 404);

@@ -316,7 +316,7 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
       writeVaultConfig(vaultConfig);
     });
     if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
-    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
+    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), store);
     if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
   }
 
@@ -440,7 +440,7 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
     return handleUnresolvedWikilinks(req, store);
   }
   if (apiPath.startsWith("/storage")) {
-    return handleStorage(req, apiPath.slice(8), vaultName);
+    return handleStorage(req, apiPath.slice(8), store);
   }
   if (apiPath === "/health") {
     return Response.json({ status: "ok", vault: vaultName });
