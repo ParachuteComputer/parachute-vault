@@ -8,7 +8,7 @@ Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
 
 ```bash
 # Install globally (registers the `parachute` CLI)
-bun add -g github:ParachuteComputer/parachute-vault
+bun add -g @openparachute/vault
 parachute vault init
 
 # Or clone and run directly
