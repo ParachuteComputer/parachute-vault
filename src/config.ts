@@ -131,6 +131,8 @@ export interface GlobalConfig {
   default_vault?: string;
   api_keys?: StoredKey[];
   triggers?: TriggerConfig[];
+  /** Bcrypt hash of the vault owner's password for OAuth consent. */
+  owner_password_hash?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,9 +446,11 @@ export function readGlobalConfig(): GlobalConfig {
       const yaml = readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
       const portMatch = yaml.match(/^port:\s*(\d+)/m);
       const defaultVaultMatch = yaml.match(/^default_vault:\s*(\S+)/m);
+      const passwordHashMatch = yaml.match(/^owner_password_hash:\s*"([^"]+)"/m);
       const config: GlobalConfig = {
         port: portMatch ? parseInt(portMatch[1], 10) : DEFAULT_PORT,
         default_vault: defaultVaultMatch?.[1],
+        owner_password_hash: passwordHashMatch?.[1],
       };
 
       // Parse global api_keys
@@ -484,6 +488,9 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   ensureConfigDirSync();
   const lines = [`port: ${config.port}`];
   if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
+  if (config.owner_password_hash) {
+    lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
+  }
 
   if (config.api_keys && config.api_keys.length > 0) {
     lines.push("api_keys:");

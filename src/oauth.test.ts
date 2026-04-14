@@ -343,7 +343,7 @@ describe("OAuth authorization", () => {
         scope: "full",
       }),
     });
-    const res = await handleAuthorizePost(req, db, "default");
+    const res = await handleAuthorizePost(req, db, { vaultName: "default" });
     // Should re-render consent page with error, not redirect
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -365,7 +365,7 @@ describe("OAuth authorization", () => {
         owner_token: "pvt_invalid_token_value",
       }),
     });
-    const res = await handleAuthorizePost(req, db, "default");
+    const res = await handleAuthorizePost(req, db, { vaultName: "default" });
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("Invalid vault token");
@@ -630,5 +630,371 @@ describe("OAuth token exchange", () => {
       db,
     );
     expect(res.status).toBe(405);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Password-based owner auth
+// ---------------------------------------------------------------------------
+
+describe("OAuth consent — password mode", () => {
+  // Use bcrypt cost 4 in tests to keep them fast
+  async function hashPassword(pw: string): Promise<string> {
+    return await Bun.password.hash(pw, { algorithm: "bcrypt", cost: 4 });
+  }
+
+  test("GET renders password field when password is set", async () => {
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const url = new URL("https://vault.test/oauth/authorize");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", "https://example.com/callback");
+    url.searchParams.set("code_challenge", codeChallenge);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", "full");
+    const res = handleAuthorizeGet(makeRequest(url.toString()), db, "default", "$2a$fake");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('name="password"');
+    expect(html).not.toContain('name="owner_token"');
+  });
+
+  test("GET renders owner_token field when no password is set", async () => {
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const url = new URL("https://vault.test/oauth/authorize");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", "https://example.com/callback");
+    url.searchParams.set("code_challenge", codeChallenge);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", "full");
+    const res = handleAuthorizeGet(makeRequest(url.toString()), db, "default", null);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('name="owner_token"');
+    expect(html).not.toContain('name="password"');
+  });
+
+  test("POST accepts correct password and mints a token", async () => {
+    const password = "correcthorsebatterystaple";
+    const passwordHash = await hashPassword(password);
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          password,
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash },
+    );
+
+    expect(authRes.status).toBe(302);
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+    expect(code).toBeTruthy();
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+    );
+    const body = await tokenRes.json();
+    expect(body.access_token.startsWith("pvt_")).toBe(true);
+  });
+
+  test("POST rejects wrong password with re-rendered consent", async () => {
+    const passwordHash = await hashPassword("correcthorsebatterystaple");
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          password: "wrongpassword",
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash },
+    );
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Incorrect password");
+    // Should render password field, not owner_token
+    expect(html).toContain('name="password"');
+  });
+
+  test("POST rejects missing password in password mode", async () => {
+    const passwordHash = await hashPassword("correcthorsebatterystaple");
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash },
+    );
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Password is required");
+  });
+
+  test("owner_token is ignored when password is configured", async () => {
+    const passwordHash = await hashPassword("correcthorsebatterystaple");
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+
+    // In password mode, providing a valid owner_token is insufficient —
+    // only the password is accepted.
+    const res = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+          // no password
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash },
+    );
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Password is required");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+describe("OAuth consent — rate limiting", () => {
+  test("locks out an IP after threshold failures", async () => {
+    const { RateLimiter } = await import("./owner-auth.ts");
+    const limiter = new RateLimiter(3, 60_000, 60_000); // 3 fails = lock
+    const passwordHash = await Bun.password.hash("correcthorsebatterystaple", {
+      algorithm: "bcrypt",
+      cost: 4,
+    });
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const clientIp = "192.0.2.42";
+
+    const makeAttempt = () => handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          password: "wrongwrongwrong",
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, clientIp, rateLimiter: limiter },
+    );
+
+    // First 3 attempts: 200 with "Incorrect password"
+    for (let i = 0; i < 3; i++) {
+      const res = await makeAttempt();
+      expect(res.status).toBe(200);
+    }
+    // 4th attempt should be locked out with 429
+    const res = await makeAttempt();
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBeTruthy();
+  });
+
+  test("successful auth clears the failure counter", async () => {
+    const { RateLimiter } = await import("./owner-auth.ts");
+    const limiter = new RateLimiter(3, 60_000, 60_000);
+    const password = "correcthorsebatterystaple";
+    const passwordHash = await Bun.password.hash(password, { algorithm: "bcrypt", cost: 4 });
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const clientIp = "192.0.2.43";
+
+    const attempt = (pw: string) => handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          password: pw,
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, clientIp, rateLimiter: limiter },
+    );
+
+    await attempt("wrong1");
+    await attempt("wrong2");
+    const good = await attempt(password);
+    expect(good.status).toBe(302);
+
+    // Counter reset — we can still do more wrong attempts without lockout
+    const r1 = await attempt("wrong3");
+    expect(r1.status).toBe(200);
+    const r2 = await attempt("wrong4");
+    expect(r2.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope selection
+// ---------------------------------------------------------------------------
+
+describe("OAuth consent — scope selection", () => {
+  test("user can downgrade from full to read via radio", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",           // requested
+          selected_scope: "read",  // user chose read-only
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+    );
+    expect(authRes.status).toBe(302);
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+    );
+    const body = await tokenRes.json();
+    expect(body.scope).toBe("read");
+  });
+
+  test("defaults selected_scope to requested scope when not provided", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "read",  // requested only, no radio selection
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+    );
+    const body = await tokenRes.json();
+    expect(body.scope).toBe("read");
+  });
+
+  test("consent HTML includes both scope radio buttons", async () => {
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const url = new URL("https://vault.test/oauth/authorize");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", "https://example.com/callback");
+    url.searchParams.set("code_challenge", codeChallenge);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", "full");
+    const res = handleAuthorizeGet(makeRequest(url.toString()), db, "default");
+    const html = await res.text();
+    expect(html).toContain('name="selected_scope"');
+    expect(html).toContain('value="full"');
+    expect(html).toContain('value="read"');
+    // The requested scope should be pre-checked
+    expect(html).toMatch(/value="full"\s+checked/);
   });
 });

@@ -42,10 +42,16 @@ import {
 import type { VaultConfig } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import { installSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
-import { confirm, ask, choose } from "./prompt.ts";
+import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import { getVaultStore } from "./vault-store.ts";
+import {
+  hasOwnerPassword,
+  setOwnerPassword,
+  clearOwnerPassword,
+  validatePasswordStrength,
+} from "./owner-auth.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -92,6 +98,9 @@ switch (command) {
     break;
   case "tokens":
     cmdTokens(cmdArgs);
+    break;
+  case "set-password":
+    await cmdSetPassword(cmdArgs);
     break;
   case "serve":
     await cmdServe();
@@ -180,6 +189,11 @@ async function cmdInit() {
     console.log();
   }
 
+  // 5b. Offer to set an owner password for OAuth consent, unless one is already set.
+  if (!hasOwnerPassword()) {
+    await promptForOwnerPassword("Set an owner password for OAuth consent?");
+  }
+
   // 6. Install daemon (platform-aware)
   console.log("Installing daemon...");
   if (isMac) {
@@ -220,6 +234,60 @@ async function cmdInit() {
   console.log(`\nNext steps:`);
   console.log(`  parachute vault status            check everything is running`);
   console.log(`  parachute vault config             view/edit configuration`);
+}
+
+async function promptForOwnerPassword(purpose: string): Promise<boolean> {
+  console.log(`\n${purpose}`);
+  console.log("  Used on the OAuth consent page to authorize third-party clients");
+  console.log("  (Claude Web, Claude Desktop, etc.) to access this vault.");
+  console.log(`  Minimum 12 characters.\n`);
+
+  while (true) {
+    const pw = await askPassword("  Password (or leave blank to skip)");
+    if (!pw) {
+      console.log("  Skipped — you can set one later with `parachute vault set-password`.");
+      return false;
+    }
+
+    const err = validatePasswordStrength(pw);
+    if (err) {
+      console.log(`  ${err} Try again.`);
+      continue;
+    }
+
+    const confirmPw = await askPassword("  Confirm password");
+    if (pw !== confirmPw) {
+      console.log("  Passwords don't match. Try again.");
+      continue;
+    }
+
+    await setOwnerPassword(pw);
+    console.log("  Password set.");
+    return true;
+  }
+}
+
+async function cmdSetPassword(args: string[]) {
+  const wantsClear = args.includes("--clear") || args.includes("--unset");
+  if (wantsClear) {
+    if (!hasOwnerPassword()) {
+      console.log("No owner password is set.");
+      return;
+    }
+    const ok = await confirm("Remove the owner password? OAuth consent will fall back to vault-token auth.", false);
+    if (!ok) {
+      console.log("Cancelled.");
+      return;
+    }
+    clearOwnerPassword();
+    console.log("Owner password cleared.");
+    return;
+  }
+
+  const purpose = hasOwnerPassword()
+    ? "Change owner password"
+    : "Set owner password";
+  await promptForOwnerPassword(purpose);
 }
 
 function cmdCreate(args: string[]) {
@@ -841,11 +909,16 @@ Vaults:
 
 Tokens:
   parachute vault tokens                          List all tokens
-  parachute vault tokens create --vault <name>    Create a token (default: full access)
-  parachute vault tokens create --vault <name> --read   Read-only token
-  parachute vault tokens create --vault <name> --label x   Set a label
-  parachute vault tokens create --vault <name> --expires 30d  Expiring token
-  parachute vault tokens revoke <token-id> --vault <name>  Revoke a token
+  parachute vault tokens create                   Create a full-access token in the default vault
+  parachute vault tokens create --vault <name>    Create a token in a specific vault
+  parachute vault tokens create --read            Read-only token
+  parachute vault tokens create --label x         Set a label
+  parachute vault tokens create --expires 30d     Expiring token
+  parachute vault tokens revoke <token-id>        Revoke a token (default vault)
+
+OAuth:
+  parachute vault set-password             Set/change the owner password (for consent page)
+  parachute vault set-password --clear     Remove the owner password
 
 Config:
   parachute vault config                   Show current configuration

@@ -117,7 +117,7 @@ const server = Bun.serve({
   port,
   hostname: "0.0.0.0",
   idleTimeout: 120, // seconds — webhook triggers can take a while
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -131,9 +131,20 @@ const server = Bun.serve({
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
+    // Derive client IP. Default: socket IP only (safe for direct-internet
+    // deployments). If TRUST_PROXY=1 is set, honor X-Forwarded-For — use
+    // this only when a reverse proxy (Cloudflare Tunnel, nginx, etc.) is
+    // terminating the connection, otherwise attackers can spoof the header
+    // to evade per-IP rate limiting.
+    const trustProxy = process.env.TRUST_PROXY === "1" || process.env.TRUST_PROXY === "true";
+    const forwardedFor = trustProxy ? req.headers.get("x-forwarded-for") : null;
+    const clientIp = forwardedFor
+      ? forwardedFor.split(",")[0].trim()
+      : server.requestIP(req)?.address;
+
     try {
       const start = Date.now();
-      const response = await route(req, path);
+      const response = await route(req, path, clientIp);
       const ms = Date.now() - start;
       console.log(`${req.method} ${path} ${response.status} ${ms}ms`);
       for (const [k, v] of Object.entries(corsHeaders)) {
@@ -182,7 +193,7 @@ function isViewAuthenticated(req: Request, vaultConfig: VaultConfig | null, vaul
   return !("error" in auth);
 }
 
-async function route(req: Request, path: string): Promise<Response> {
+async function route(req: Request, path: string, clientIp?: string): Promise<Response> {
   // OAuth discovery endpoints (no auth required)
   if (path === "/.well-known/oauth-protected-resource") {
     return handleProtectedResource(req);
@@ -204,11 +215,16 @@ async function route(req: Request, path: string): Promise<Response> {
       return handleRegister(req, store.db);
     }
     if (path === "/oauth/authorize") {
+      const ownerPasswordHash = readGlobalConfig().owner_password_hash ?? null;
       if (req.method === "GET") {
-        return handleAuthorizeGet(req, store.db, vaultConfig.name);
+        return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash);
       }
       if (req.method === "POST") {
-        return handleAuthorizePost(req, store.db, vaultConfig.name);
+        return handleAuthorizePost(req, store.db, {
+          vaultName: vaultConfig.name,
+          clientIp,
+          ownerPasswordHash,
+        });
       }
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
@@ -341,8 +357,13 @@ async function route(req: Request, path: string): Promise<Response> {
     const store = getVaultStore(vaultName);
     if (subpath === "/oauth/register") return handleRegister(req, store.db);
     if (subpath === "/oauth/authorize") {
-      if (req.method === "GET") return handleAuthorizeGet(req, store.db, vaultConfig.name);
-      if (req.method === "POST") return handleAuthorizePost(req, store.db, vaultConfig.name);
+      const ownerPasswordHash = readGlobalConfig().owner_password_hash ?? null;
+      if (req.method === "GET") return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash);
+      if (req.method === "POST") return handleAuthorizePost(req, store.db, {
+        vaultName: vaultConfig.name,
+        clientIp,
+        ownerPasswordHash,
+      });
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
     if (subpath === "/oauth/token") return handleToken(req, store.db);

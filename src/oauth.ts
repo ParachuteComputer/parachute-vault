@@ -17,6 +17,22 @@ import crypto from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { generateToken, createToken, resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
+import { verifyOwnerPassword, authorizeRateLimit, type RateLimiter } from "./owner-auth.ts";
+
+/** Options for handleAuthorizePost. */
+export interface AuthorizePostOptions {
+  vaultName?: string;
+  /** Client IP address (from Bun server.requestIP). If provided, rate limiting is applied. */
+  clientIp?: string;
+  /**
+   * Bcrypt hash of the owner password. When set, the consent form requires a
+   * `password` field. When null/undefined, falls back to legacy `owner_token`
+   * auth (vault token in the consent form).
+   */
+  ownerPasswordHash?: string | null;
+  /** Override for testing; defaults to the module singleton. */
+  rateLimiter?: RateLimiter;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -113,7 +129,12 @@ export async function handleRegister(req: Request, db: Database): Promise<Respon
 // Authorization endpoint
 // ---------------------------------------------------------------------------
 
-export function handleAuthorizeGet(req: Request, db: Database, vaultName: string): Response {
+export function handleAuthorizeGet(
+  req: Request,
+  db: Database,
+  vaultName: string,
+  ownerPasswordHash?: string | null,
+): Response {
   const url = new URL(req.url);
   const clientId = url.searchParams.get("client_id");
   const redirectUri = url.searchParams.get("redirect_uri");
@@ -158,19 +179,21 @@ export function handleAuthorizeGet(req: Request, db: Database, vaultName: string
     });
   }
 
-  // Normalize scope
-  const normalizedScope: TokenPermission = scope === "read" ? "read" : "full";
+  // Normalize requested scope. The user can change it via the radio buttons.
+  const requestedScope: TokenPermission = scope === "read" ? "read" : "full";
 
   // Render consent page
   const html = renderConsentPage({
     vaultName,
     clientName: client.client_name,
-    scope: normalizedScope,
+    requestedScope,
+    selectedScope: requestedScope,
     clientId,
     redirectUri,
     codeChallenge,
     codeChallengeMethod,
     state,
+    passwordMode: typeof ownerPasswordHash === "string" && ownerPasswordHash.length > 0,
   });
 
   return new Response(html, {
@@ -179,7 +202,13 @@ export function handleAuthorizeGet(req: Request, db: Database, vaultName: string
   });
 }
 
-export async function handleAuthorizePost(req: Request, db: Database, vaultName?: string): Promise<Response> {
+export async function handleAuthorizePost(
+  req: Request,
+  db: Database,
+  opts: AuthorizePostOptions = {},
+): Promise<Response> {
+  const { vaultName, clientIp, ownerPasswordHash, rateLimiter = authorizeRateLimit } = opts;
+
   let form: FormData;
   try {
     form = await req.formData();
@@ -192,7 +221,13 @@ export async function handleAuthorizePost(req: Request, db: Database, vaultName?
   const redirectUri = form.get("redirect_uri") as string;
   const codeChallenge = form.get("code_challenge") as string;
   const codeChallengeMethod = form.get("code_challenge_method") as string || "S256";
-  const scope = form.get("scope") as string || "full";
+  // Requested scope (from hidden field, carried from GET) and selected scope
+  // (from radio button on the consent page). Default selected to requested.
+  const requestedScope = form.get("scope") as string || "full";
+  const selectedScopeRaw = form.get("selected_scope") as string | null;
+  const selectedScope = selectedScopeRaw === "read" || selectedScopeRaw === "full"
+    ? selectedScopeRaw
+    : (requestedScope === "read" ? "read" : "full");
   const state = form.get("state") as string || "";
 
   if (!clientId || !redirectUri || !codeChallenge) {
@@ -227,31 +262,66 @@ export async function handleAuthorizePost(req: Request, db: Database, vaultName?
     return Response.redirect(redirect.toString(), 302);
   }
 
-  // Verify vault owner identity via token
-  const ownerToken = form.get("owner_token") as string;
-  if (!ownerToken) {
+  // Rate-limit the owner-auth step. Applied before any credential check so
+  // brute-force attempts are capped regardless of which path (password or
+  // legacy token) is being used.
+  if (clientIp) {
+    const gate = rateLimiter.check(clientIp);
+    if (!gate.allowed) {
+      return new Response(renderErrorPage(
+        `Too many failed attempts. Try again in ${Math.ceil(gate.retryAfterSec / 60)} minute(s).`,
+      ), {
+        status: 429,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Retry-After": String(gate.retryAfterSec),
+        },
+      });
+    }
+  }
+
+  // Verify owner identity — password if configured, else legacy vault token.
+  const passwordMode = typeof ownerPasswordHash === "string" && ownerPasswordHash.length > 0;
+  let ownerOk = false;
+  let errorMsg = "";
+
+  if (passwordMode) {
+    const password = form.get("password") as string;
+    if (!password) {
+      errorMsg = "Password is required.";
+    } else {
+      ownerOk = await verifyOwnerPassword(password, ownerPasswordHash!);
+      if (!ownerOk) errorMsg = "Incorrect password.";
+    }
+  } else {
+    const ownerToken = form.get("owner_token") as string;
+    if (!ownerToken) {
+      errorMsg = "Vault token is required.";
+    } else {
+      ownerOk = resolveToken(db, ownerToken) !== null;
+      if (!ownerOk) errorMsg = "Invalid vault token.";
+    }
+  }
+
+  if (!ownerOk) {
+    if (clientIp) rateLimiter.recordFailure(clientIp);
     return renderConsentWithError(db, vaultName || "vault", {
-      clientId, redirectUri, codeChallenge, codeChallengeMethod, scope, state,
-      error: "Vault token is required.",
+      clientId, redirectUri, codeChallenge, codeChallengeMethod,
+      requestedScope, selectedScope, state, passwordMode,
+      error: errorMsg,
     });
   }
 
-  const resolved = resolveToken(db, ownerToken);
-  if (!resolved) {
-    return renderConsentWithError(db, vaultName || "vault", {
-      clientId, redirectUri, codeChallenge, codeChallengeMethod, scope, state,
-      error: "Invalid vault token.",
-    });
-  }
+  if (clientIp) rateLimiter.recordSuccess(clientIp);
 
-  // Generate auth code
+  // Generate auth code — persist the user-selected scope (not the requested one)
   const code = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes
 
   db.prepare(`
     INSERT INTO oauth_codes (code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(code, clientId, codeChallenge, codeChallengeMethod, scope, redirectUri, expiresAt, new Date().toISOString());
+  `).run(code, clientId, codeChallenge, codeChallengeMethod, selectedScope, redirectUri, expiresAt, new Date().toISOString());
 
   redirect.searchParams.set("code", code);
   return Response.redirect(redirect.toString(), 302);
@@ -375,25 +445,30 @@ function renderConsentWithError(
     redirectUri: string;
     codeChallenge: string;
     codeChallengeMethod: string;
-    scope: string;
+    requestedScope: string;
+    selectedScope: string;
     state: string;
+    passwordMode: boolean;
     error: string;
   },
 ): Response {
   const client = db.prepare("SELECT client_name FROM oauth_clients WHERE client_id = ?")
     .get(params.clientId) as { client_name: string } | null;
   const clientName = client?.client_name || "Unknown Client";
-  const normalizedScope: TokenPermission = params.scope === "read" ? "read" : "full";
+  const requested: TokenPermission = params.requestedScope === "read" ? "read" : "full";
+  const selected: TokenPermission = params.selectedScope === "read" ? "read" : "full";
 
   const html = renderConsentPage({
     vaultName,
     clientName,
-    scope: normalizedScope,
+    requestedScope: requested,
+    selectedScope: selected,
     clientId: params.clientId,
     redirectUri: params.redirectUri,
     codeChallenge: params.codeChallenge,
     codeChallengeMethod: params.codeChallengeMethod,
     state: params.state,
+    passwordMode: params.passwordMode,
     error: params.error,
   });
 
@@ -410,20 +485,33 @@ function renderConsentWithError(
 interface ConsentParams {
   vaultName: string;
   clientName: string;
-  scope: TokenPermission;
+  /** Scope originally requested by the client. */
+  requestedScope: TokenPermission;
+  /** Scope currently selected in the radio buttons (defaults to requested). */
+  selectedScope: TokenPermission;
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
   codeChallengeMethod: string;
   state: string;
+  /** When true, render a password field; when false, render a vault-token field (legacy). */
+  passwordMode: boolean;
   error?: string;
 }
 
 function renderConsentPage(p: ConsentParams): string {
-  const scopeLabel = p.scope === "read" ? "Read-only access" : "Full access";
-  const scopeDesc = p.scope === "read"
-    ? "Query notes, list tags, and view vault info"
-    : "Read, create, update, and delete notes, tags, and links";
+  const fullChecked = p.selectedScope === "full" ? " checked" : "";
+  const readChecked = p.selectedScope === "read" ? " checked" : "";
+
+  const credentialField = p.passwordMode
+    ? `<div class="cred-field">
+      <label for="password">Owner password</label>
+      <input type="password" id="password" name="password" placeholder="Enter your vault password" required autocomplete="current-password">
+    </div>`
+    : `<div class="cred-field">
+      <label for="owner_token">Vault token</label>
+      <input type="password" id="owner_token" name="owner_token" placeholder="pvt_..." required autocomplete="off">
+    </div>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -447,24 +535,34 @@ function renderConsentPage(p: ConsentParams): string {
   }
   h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
   .client { color: #0066cc; font-weight: 600; }
-  .scope {
+  .scope-options {
     background: #f5f5f5;
     border-radius: 4px;
     padding: 0.75rem 1rem;
     margin: 1rem 0;
   }
-  .scope-label { font-weight: 600; }
-  .scope-desc { font-size: 0.9rem; color: #666; }
-  .token-field {
+  .scope-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.3rem 0;
+    cursor: pointer;
+  }
+  .scope-option input[type="radio"] {
+    margin-top: 0.35rem;
+  }
+  .scope-option-label { font-weight: 600; }
+  .scope-option-desc { font-size: 0.85rem; color: #666; }
+  .cred-field {
     margin-top: 1rem;
   }
-  .token-field label {
+  .cred-field label {
     display: block;
     font-size: 0.9rem;
     font-weight: 600;
     margin-bottom: 0.3rem;
   }
-  .token-field input {
+  .cred-field input {
     width: 100%;
     padding: 0.5rem 0.6rem;
     border: 1px solid #ccc;
@@ -476,7 +574,7 @@ function renderConsentPage(p: ConsentParams): string {
   .error-msg {
     color: #cc3333;
     font-size: 0.9rem;
-    margin-top: 0.5rem;
+    margin-top: 0.75rem;
   }
   .buttons {
     display: flex;
@@ -502,10 +600,10 @@ function renderConsentPage(p: ConsentParams): string {
   @media (prefers-color-scheme: dark) {
     body { background: #1a1a1a; color: #e0e0e0; }
     .card { border-color: #333; }
-    .scope { background: #2a2a2a; }
-    .scope-desc { color: #999; }
+    .scope-options { background: #2a2a2a; }
+    .scope-option-desc { color: #999; }
     .client { color: #66b3ff; }
-    .token-field input { background: #2a2a2a; color: #e0e0e0; border-color: #444; }
+    .cred-field input { background: #2a2a2a; color: #e0e0e0; border-color: #444; }
     .error-msg { color: #ff6666; }
     button { background: #2a2a2a; color: #e0e0e0; border-color: #444; }
     button[value="authorize"] { background: #0066cc; color: #fff; border-color: #0066cc; }
@@ -517,22 +615,31 @@ function renderConsentPage(p: ConsentParams): string {
 <div class="card">
   <h1>Authorize access</h1>
   <p><span class="client">${escapeHtml(p.clientName)}</span> wants to access your <strong>${escapeHtml(p.vaultName)}</strong> vault.</p>
-  <div class="scope">
-    <div class="scope-label">${escapeHtml(scopeLabel)}</div>
-    <div class="scope-desc">${escapeHtml(scopeDesc)}</div>
-  </div>
   <form method="POST" action="/oauth/authorize">
     <input type="hidden" name="client_id" value="${escapeHtml(p.clientId)}">
     <input type="hidden" name="redirect_uri" value="${escapeHtml(p.redirectUri)}">
     <input type="hidden" name="code_challenge" value="${escapeHtml(p.codeChallenge)}">
     <input type="hidden" name="code_challenge_method" value="${escapeHtml(p.codeChallengeMethod)}">
-    <input type="hidden" name="scope" value="${escapeHtml(p.scope)}">
+    <input type="hidden" name="scope" value="${escapeHtml(p.requestedScope)}">
     <input type="hidden" name="state" value="${escapeHtml(p.state)}">
-    <div class="token-field">
-      <label for="owner_token">Enter your vault token to authorize</label>
-      <input type="password" id="owner_token" name="owner_token" placeholder="pvt_..." required autocomplete="off">
-      ${p.error ? `<div class="error-msg">${escapeHtml(p.error)}</div>` : ""}
+    <div class="scope-options">
+      <label class="scope-option">
+        <input type="radio" name="selected_scope" value="full"${fullChecked}>
+        <span>
+          <span class="scope-option-label">Full access</span><br>
+          <span class="scope-option-desc">Read, create, update, and delete notes, tags, and links.</span>
+        </span>
+      </label>
+      <label class="scope-option">
+        <input type="radio" name="selected_scope" value="read"${readChecked}>
+        <span>
+          <span class="scope-option-label">Read-only access</span><br>
+          <span class="scope-option-desc">Query notes, list tags, and view vault info.</span>
+        </span>
+      </label>
     </div>
+    ${credentialField}
+    ${p.error ? `<div class="error-msg">${escapeHtml(p.error)}</div>` : ""}
     <div class="buttons">
       <button type="submit" name="action" value="deny">Deny</button>
       <button type="submit" name="action" value="authorize">Authorize</button>
