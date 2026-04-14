@@ -13,6 +13,7 @@
  *   verification, its hash is removed from the list.
  */
 import * as OTPAuth from "otpauth";
+import { createHash } from "node:crypto";
 import { readGlobalConfig, writeGlobalConfig } from "./config.ts";
 
 const BCRYPT_COST = 10;
@@ -117,7 +118,10 @@ export function verifyTotpCode(secretBase32: string, code: string, markUsed = tr
     const now = Date.now();
     gcUsedTotp(now);
     const counter = Math.floor(now / 30_000) + delta;
-    const key = `${secretBase32}:${counter}`;
+    // Hash the secret so the in-memory replay cache never holds the plaintext
+    // TOTP secret as a map key (defense in depth against heap dumps / logs).
+    const secretHash = createHash("sha256").update(secretBase32).digest("hex");
+    const key = `${secretHash}:${counter}`;
     if (usedTotpCounters.has(key)) return false;
     if (markUsed) {
       // Expire the entry a bit after the outer edge of the acceptance window.

@@ -14,7 +14,7 @@
 import { homedir } from "os";
 import { join } from "path";
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "fs";
 import crypto from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -568,7 +568,12 @@ export function writeGlobalConfig(config: GlobalConfig): void {
     }
   }
 
-  writeFileSync(GLOBAL_CONFIG_PATH, lines.join("\n") + "\n");
+  // 0600 — owner read/write only. This file may contain the bcrypt password
+  // hash and plaintext TOTP secret; it must not be world- or group-readable.
+  writeFileSync(GLOBAL_CONFIG_PATH, lines.join("\n") + "\n", { mode: 0o600 });
+  // writeFileSync's `mode` only applies on file creation, so chmod an existing
+  // file explicitly in case it was written by an older version at 0644.
+  try { chmodSync(GLOBAL_CONFIG_PATH, 0o600); } catch {}
 }
 
 // ---------------------------------------------------------------------------

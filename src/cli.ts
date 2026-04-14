@@ -289,7 +289,13 @@ async function cmdSetPassword(args: string[]) {
       console.log("No owner password is set.");
       return;
     }
-    const ok = await confirm("Remove the owner password? OAuth consent will fall back to vault-token auth.", false);
+    const twoFaNote = hasTotpEnrolled()
+      ? " Note: 2FA management operations will require your authenticator app or a backup code instead."
+      : "";
+    const ok = await confirm(
+      `Remove the owner password? OAuth consent will fall back to vault-token auth.${twoFaNote}`,
+      false,
+    );
     if (!ok) {
       console.log("Cancelled.");
       return;
@@ -352,6 +358,7 @@ async function confirmForTwoFactor(purpose: string): Promise<boolean> {
     console.error("  Invalid authenticator code.");
     return false;
   }
+  console.log("  This will consume one of your backup codes.");
   const backup = (await ask("  Backup code")).trim();
   if (!backup) {
     console.log("  Cancelled.");

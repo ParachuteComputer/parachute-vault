@@ -300,7 +300,9 @@ export async function handleAuthorizePost(
       errorMsg = "Password is required.";
     } else {
       ownerOk = await verifyOwnerPassword(password, ownerPasswordHash!);
-      if (!ownerOk) errorMsg = "Incorrect password.";
+      // Keep failure messages uniform across password / TOTP / backup-code so
+      // an attacker can't tell which factor was wrong.
+      if (!ownerOk) errorMsg = "Invalid credentials.";
     }
   } else {
     const ownerToken = form.get("owner_token") as string;
@@ -329,10 +331,10 @@ export async function handleAuthorizePost(
     let twoFaError = "";
     if (totpCode) {
       twoFaOk = verifyTotpCode(totpSecret!, totpCode);
-      if (!twoFaOk) twoFaError = "Invalid authenticator code.";
+      if (!twoFaOk) twoFaError = "Invalid credentials.";
     } else if (backupCode) {
       twoFaOk = await verifyAndConsumeBackupCode(backupCode);
-      if (!twoFaOk) twoFaError = "Invalid or already-used backup code.";
+      if (!twoFaOk) twoFaError = "Invalid credentials.";
     } else {
       twoFaError = "Enter a 6-digit code from your authenticator app, or a backup code.";
     }

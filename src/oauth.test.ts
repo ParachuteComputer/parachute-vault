@@ -746,7 +746,7 @@ describe("OAuth consent — password mode", () => {
 
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Incorrect password");
+    expect(html).toContain("Invalid credentials");
     // Should render password field, not owner_token
     expect(html).toContain('name="password"');
   });
@@ -842,7 +842,7 @@ describe("OAuth consent — rate limiting", () => {
       { ownerPasswordHash: passwordHash, clientIp, rateLimiter: limiter },
     );
 
-    // First 3 attempts: 200 with "Incorrect password"
+    // First 3 attempts: 200 with "Invalid credentials"
     for (let i = 0; i < 3; i++) {
       const res = await makeAttempt();
       expect(res.status).toBe(200);
@@ -889,6 +889,47 @@ describe("OAuth consent — rate limiting", () => {
     expect(r1.status).toBe(200);
     const r2 = await attempt("wrong4");
     expect(r2.status).toBe(200);
+  });
+
+  test("locks out an IP after threshold 2FA failures (valid password, bad TOTP)", async () => {
+    const { RateLimiter } = await import("./owner-auth.ts");
+    const limiter = new RateLimiter(3, 60_000, 60_000); // 3 fails = lock
+    const password = "correcthorsebatterystaple";
+    const passwordHash = await Bun.password.hash(password, { algorithm: "bcrypt", cost: 4 });
+    const secret = new OTPAuth.Secret({ size: 20 }).base32;
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const clientIp = "192.0.2.44";
+
+    const makeAttempt = () => handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: "https://example.com/callback",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          password,
+          totp_code: "000000", // always invalid
+        }),
+      }),
+      db,
+      { ownerPasswordHash: passwordHash, totpSecret: secret, clientIp, rateLimiter: limiter },
+    );
+
+    // First 3 attempts: 200 with the unified "Invalid credentials" error
+    for (let i = 0; i < 3; i++) {
+      const res = await makeAttempt();
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Invalid credentials");
+    }
+    // 4th attempt should be locked out with 429
+    const res = await makeAttempt();
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBeTruthy();
   });
 });
 
@@ -1131,7 +1172,7 @@ describe("OAuth consent — 2FA (TOTP)", () => {
     );
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Invalid authenticator code");
+    expect(html).toContain("Invalid credentials");
     // No auth code was created
     const rows = db.prepare("SELECT COUNT(*) as n FROM oauth_codes").get() as { n: number };
     expect(rows.n).toBe(0);
@@ -1196,6 +1237,6 @@ describe("OAuth consent — 2FA (TOTP)", () => {
     );
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Incorrect password");
+    expect(html).toContain("Invalid credentials");
   });
 });
