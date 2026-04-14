@@ -315,7 +315,7 @@ describe("exportFilePath", () => {
 // Round-trip: import → export
 // ---------------------------------------------------------------------------
 
-describe("round-trip", () => {
+describe("round-trip", async () => {
   const tmpBase = join(tmpdir(), "parachute-test-roundtrip");
   let store: SqliteStore;
 
@@ -325,7 +325,7 @@ describe("round-trip", () => {
     store = new SqliteStore(new Database(":memory:"));
   });
 
-  it("preserves content through import → vault → export", () => {
+  it("preserves content through import → vault → export", async () => {
     // Create source files
     writeFileSync(join(tmpBase, "Note.md"), `---
 tags: [daily]
@@ -338,7 +338,7 @@ Hello world.`);
     expect(notes).toHaveLength(1);
 
     // Import into vault
-    const note = store.createNote(notes[0].content, {
+    const note = await store.createNote(notes[0].content, {
       path: notes[0].path,
       tags: notes[0].tags,
       metadata: notes[0].frontmatter,
@@ -357,7 +357,7 @@ Hello world.`);
     expect(md).toContain("Hello world.");
   });
 
-  it("resolves wikilinks during import", () => {
+  it("resolves wikilinks during import", async () => {
     writeFileSync(join(tmpBase, "A.md"), "See [[B]] for details.");
     writeFileSync(join(tmpBase, "B.md"), "I am note B.");
 
@@ -365,16 +365,16 @@ Hello world.`);
 
     // Import all notes
     for (const n of notes) {
-      store.createNote(n.content, {
+      await store.createNote(n.content, {
         path: n.path,
         tags: n.tags.length > 0 ? n.tags : undefined,
       });
     }
 
     // Check that A links to B
-    const noteA = store.getNoteByPath("A")!;
-    const noteB = store.getNoteByPath("B")!;
-    const links = store.getLinks(noteA.id, { direction: "outbound" });
+    const noteA = await store.getNoteByPath("A")!;
+    const noteB = await store.getNoteByPath("B")!;
+    const links = await store.getLinks(noteA.id, { direction: "outbound" });
     expect(links.some((l) => l.targetId === noteB.id && l.relationship === "wikilink")).toBe(true);
   });
 });

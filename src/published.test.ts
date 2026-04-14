@@ -57,18 +57,18 @@ function makeStore(notes: Record<string, { content: string; tags?: string[]; met
   } as any;
 }
 
-describe("handleViewNote", () => {
-  it("returns 404 for non-existent note", () => {
+describe("handleViewNote", async () => {
+  it("returns 404 for non-existent note", async () => {
     const store = makeStore({});
-    const resp = handleViewNote(store, "missing");
+    const resp = await handleViewNote(store, "missing");
     expect(resp.status).toBe(404);
   });
 
-  it("returns 404 for note without publish tag (unauthenticated)", () => {
+  it("returns 404 for note without publish tag (unauthenticated)", async () => {
     const store = makeStore({
       "n1": { content: "hello", tags: ["other"] },
     });
-    const resp = handleViewNote(store, "n1");
+    const resp = await handleViewNote(store, "n1");
     expect(resp.status).toBe(404);
   });
 
@@ -76,7 +76,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n1": { content: "# Hello\n\nWorld", tags: ["publish"], path: "Blog/My Post.md" },
     });
-    const resp = handleViewNote(store, "n1");
+    const resp = await handleViewNote(store, "n1");
     expect(resp.status).toBe(200);
     expect(resp.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
 
@@ -90,7 +90,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n2": { content: "Content here", metadata: { published: true } },
     });
-    const resp = handleViewNote(store, "n2");
+    const resp = await handleViewNote(store, "n2");
     expect(resp.status).toBe(200);
     const html = await resp.text();
     expect(html).toContain("<p>Content here</p>");
@@ -103,7 +103,7 @@ describe("handleViewNote", () => {
         tags: ["publish"],
       },
     });
-    const resp = handleViewNote(store, "n3");
+    const resp = await handleViewNote(store, "n3");
     const html = await resp.text();
     expect(html).toContain("<strong>bold</strong>");
     expect(html).toContain("<em>italic</em>");
@@ -117,7 +117,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n4": { content: "<script>alert('xss')</script>", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n4");
+    const resp = await handleViewNote(store, "n4");
     const html = await resp.text();
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;");
@@ -127,7 +127,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n6": { content: "[click me](javascript:alert(1))", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n6");
+    const resp = await handleViewNote(store, "n6");
     const html = await resp.text();
     expect(html).not.toContain("javascript:");
     expect(html).toContain("click me");
@@ -138,7 +138,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n7": { content: "[click](data:text/html;base64,PHNjcmlwdD4=)", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n7");
+    const resp = await handleViewNote(store, "n7");
     const html = await resp.text();
     expect(html).not.toContain("data:");
     expect(html).toContain("click");
@@ -148,7 +148,7 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n8": { content: "[site](https://example.com) and [mail](mailto:a@b.com)", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n8");
+    const resp = await handleViewNote(store, "n8");
     const html = await resp.text();
     expect(html).toContain('href="https://example.com"');
     expect(html).toContain('href="mailto:a@b.com"');
@@ -158,17 +158,17 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n5": { content: "test", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n5");
+    const resp = await handleViewNote(store, "n5");
     const html = await resp.text();
     expect(html).toContain("prefers-color-scheme: dark");
   });
 
   // CSP header
-  it("includes Content-Security-Policy header", () => {
+  it("includes Content-Security-Policy header", async () => {
     const store = makeStore({
       "n1": { content: "test", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n1");
+    const resp = await handleViewNote(store, "n1");
     const csp = resp.headers.get("Content-Security-Policy");
     expect(csp).toContain("script-src 'none'");
     expect(csp).toContain("default-src 'self'");
@@ -179,17 +179,17 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "private": { content: "secret stuff", tags: ["internal"] },
     });
-    const resp = handleViewNote(store, "private", { authenticated: true });
+    const resp = await handleViewNote(store, "private", { authenticated: true });
     expect(resp.status).toBe(200);
     const html = await resp.text();
     expect(html).toContain("<p>secret stuff</p>");
   });
 
-  it("returns 404 for unpublished note when not authenticated", () => {
+  it("returns 404 for unpublished note when not authenticated", async () => {
     const store = makeStore({
       "private": { content: "secret stuff", tags: ["internal"] },
     });
-    const resp = handleViewNote(store, "private");
+    const resp = await handleViewNote(store, "private");
     expect(resp.status).toBe(404);
   });
 
@@ -198,17 +198,17 @@ describe("handleViewNote", () => {
     const store = makeStore({
       "n1": { content: "public content", tags: ["public"] },
     });
-    const resp = handleViewNote(store, "n1", { publishedTag: "public" });
+    const resp = await handleViewNote(store, "n1", { publishedTag: "public" });
     expect(resp.status).toBe(200);
     const html = await resp.text();
     expect(html).toContain("<p>public content</p>");
   });
 
-  it("rejects note with default tag when custom tag is configured", () => {
+  it("rejects note with default tag when custom tag is configured", async () => {
     const store = makeStore({
       "n1": { content: "content", tags: ["publish"] },
     });
-    const resp = handleViewNote(store, "n1", { publishedTag: "public" });
+    const resp = await handleViewNote(store, "n1", { publishedTag: "public" });
     expect(resp.status).toBe(404);
   });
 });

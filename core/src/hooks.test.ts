@@ -26,7 +26,7 @@ async function settle(): Promise<void> {
   await hooks.drain();
 }
 
-describe("HookRegistry", () => {
+describe("HookRegistry", async () => {
   it("fires registered hook on createNote", async () => {
     const fired: string[] = [];
     hooks.onNote({
@@ -36,7 +36,7 @@ describe("HookRegistry", () => {
       },
     });
 
-    const note = store.createNote("hello");
+    const note = await store.createNote("hello");
     expect(fired).toEqual([]); // async — not yet
     await settle();
     expect(fired).toEqual([note.id]);
@@ -51,11 +51,11 @@ describe("HookRegistry", () => {
       },
     });
 
-    const note = store.createNote("hello");
+    const note = await store.createNote("hello");
     await settle();
     expect(fired).toEqual([]); // we only subscribed to updated
 
-    store.updateNote(note.id, { content: "world" });
+    await store.updateNote(note.id, { content: "world" });
     await settle();
     expect(fired).toEqual([{ event: "updated", id: note.id }]);
   });
@@ -68,7 +68,7 @@ describe("HookRegistry", () => {
       },
     });
 
-    const notes = store.createNotes([
+    const notes = await store.createNotes([
       { content: "a", id: "a1" },
       { content: "b", id: "b1" },
       { content: "c", id: "c1" },
@@ -87,8 +87,8 @@ describe("HookRegistry", () => {
       },
     });
 
-    const skipped = store.createNote("plain", { tags: ["journal"] });
-    const matched = store.createNote("reader-note", { tags: ["reader"] });
+    const skipped = await store.createNote("plain", { tags: ["journal"] });
+    const matched = await store.createNote("reader-note", { tags: ["reader"] });
     await settle();
 
     expect(fired).toEqual([matched.id]);
@@ -103,14 +103,14 @@ describe("HookRegistry", () => {
       },
     });
 
-    const note = store.createNote("one");
+    const note = await store.createNote("one");
     await settle();
     expect(fired).toEqual([note.id]);
 
     fired.length = 0;
-    store.getNote(note.id);
-    store.getNotes([note.id]);
-    store.queryNotes({});
+    await store.getNote(note.id);
+    await store.getNotes([note.id]);
+    await store.queryNotes({});
     await settle();
     expect(fired).toEqual([]);
   });
@@ -128,14 +128,14 @@ describe("HookRegistry", () => {
       },
     });
 
-    const note = store.createNote("work me");
+    const note = await store.createNote("work me");
     await settle();
     // The handler ran once for "created"; its updateNote triggered an
     // "updated" dispatch, but the predicate excluded it because the
     // marker is now set. So exactly one call.
     expect(handlerCalls).toBe(1);
 
-    const refreshed = store.getNote(note.id)!;
+    const refreshed = await store.getNote(note.id)!;
     expect(refreshed.metadata?.processed_at).toBeTruthy();
   });
 
@@ -155,10 +155,10 @@ describe("HookRegistry", () => {
       },
     });
 
-    const note = localStore.createNote("survive");
+    const note = await localStore.createNote("survive");
     expect(note.id).toBeTruthy();
     // Original mutation still persisted
-    expect(localStore.getNote(note.id)?.content).toBe("survive");
+    expect((await localStore.getNote(note.id))?.content).toBe("survive");
 
     await Promise.resolve();
     await Promise.resolve();
@@ -184,9 +184,9 @@ describe("HookRegistry", () => {
       },
     });
 
-    localStore.createNote("a");
-    localStore.createNote("b");
-    localStore.createNote("c");
+    await localStore.createNote("a");
+    await localStore.createNote("b");
+    await localStore.createNote("c");
 
     // Let dispatch microtasks enqueue tasks and the semaphore start one.
     await Promise.resolve();
@@ -216,12 +216,12 @@ describe("HookRegistry", () => {
       },
     });
 
-    store.createNote("first");
+    await store.createNote("first");
     await settle();
     expect(fired.length).toBe(1);
 
     off();
-    store.createNote("second");
+    await store.createNote("second");
     await settle();
     expect(fired.length).toBe(1);
   });
@@ -231,7 +231,7 @@ describe("HookRegistry", () => {
     hooks.onNote({ name: "one", handler: () => void order.push("one") });
     hooks.onNote({ name: "two", handler: () => void order.push("two") });
 
-    store.createNote("both");
+    await store.createNote("both");
     await settle();
     expect(order.sort()).toEqual(["one", "two"]);
   });
@@ -244,7 +244,7 @@ describe("HookRegistry", () => {
         done = true;
       },
     });
-    store.createNote("slow");
+    await store.createNote("slow");
     // Let dispatch schedule
     await Promise.resolve();
     await Promise.resolve();
@@ -278,7 +278,7 @@ describe("HookRegistry", () => {
       },
     });
 
-    loggingStore.createNote("hi");
+    await loggingStore.createNote("hi");
     await Promise.resolve();
     await Promise.resolve();
     await loggingHooks.drain();
@@ -292,7 +292,7 @@ describe("HookRegistry", () => {
   });
 });
 
-describe("HookRegistry — HOOK_CONCURRENCY env var parsing", () => {
+describe("HookRegistry — HOOK_CONCURRENCY env var parsing", async () => {
   const original = process.env.HOOK_CONCURRENCY;
   const restore = () => {
     if (original === undefined) delete process.env.HOOK_CONCURRENCY;
@@ -344,9 +344,9 @@ describe("HookRegistry — HOOK_CONCURRENCY env var parsing", () => {
       },
     });
 
-    s.createNote("a");
-    s.createNote("b");
-    s.createNote("c");
+    await s.createNote("a");
+    await s.createNote("b");
+    await s.createNote("c");
     await Promise.resolve();
     await Promise.resolve();
     // Release them one at a time and let each drain through the semaphore.
