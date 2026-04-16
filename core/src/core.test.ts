@@ -673,10 +673,14 @@ describe("MCP tools", async () => {
   });
 
   it("update-note is atomic under concurrent if_updated_at — exactly one winner", async () => {
-    // Reproduces the TOCTOU scenario: two callers read the same updated_at
-    // and fire updates in parallel. Exactly one must commit; the other must
-    // get a ConflictError. Both seeing success would silently destroy one
-    // write, which is precisely what if_updated_at exists to prevent.
+    // Fires two updates with the same if_updated_at via `Promise.allSettled`.
+    // bun:sqlite is synchronous, so these interleave at JS microtask
+    // boundaries rather than in true parallel — but that's the production
+    // concurrency model (one node, event-loop scheduling). The guarantee
+    // comes from the atomic conditional UPDATE in notes.ts: exactly one of
+    // the two statements can match `AND updated_at IS ?`. Without that
+    // atomicity both would commit and silently destroy one write — the
+    // scenario if_updated_at exists to prevent.
     const note = await store.createNote("seed");
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;

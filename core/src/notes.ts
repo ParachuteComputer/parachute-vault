@@ -124,6 +124,8 @@ export function updateNote(
     // pre- from post-update state. Without this, two writes landing in the
     // same wall-clock millisecond would produce identical timestamps and
     // let a second OC writer see the first writer's work as "unchanged."
+    // Comparison is lexicographic on ISO 8601 strings — valid because
+    // `.toISOString()` always emits fixed-width UTC (`...Z`).
     if (updates.if_updated_at !== undefined && now <= updates.if_updated_at) {
       now = new Date(new Date(updates.if_updated_at).getTime() + 1).toISOString();
     }
@@ -148,9 +150,11 @@ export function updateNote(
     values.push(updates.created_at);
   }
 
-  // No-op: no SET fields. If a caller still passed `if_updated_at`, we need
-  // to validate the precondition; a conditional UPDATE that sets updated_at
-  // to itself does exactly that atomically without changing any data.
+  // No-op: no SET fields. If a caller still passed `if_updated_at`, we
+  // need to validate the precondition; a conditional UPDATE that sets
+  // updated_at to itself does exactly that atomically — even a no-net-
+  // change UPDATE takes the write lock in WAL mode, so it still serializes
+  // with other writers and `.changes` reflects whether the WHERE matched.
   if (sets.length === 0) {
     if (updates.if_updated_at !== undefined) {
       const probe = db.prepare(

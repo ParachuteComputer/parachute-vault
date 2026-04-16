@@ -358,6 +358,9 @@ export async function handleNotes(
       return json(await store.getNote(note.id));
     } catch (e: any) {
       if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+      // Duck-type on `code` rather than `instanceof ConflictError`: this
+      // error originates in the core package and survives any future
+      // bundling / module-boundary split more robustly than a prototype check.
       if (e && e.code === "CONFLICT") {
         return json(
           {
