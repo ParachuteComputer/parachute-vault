@@ -16,6 +16,13 @@ import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { toNoteIndex, filterMetadata } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
+import {
+  expandContent,
+  DEFAULT_EXPAND_DEPTH,
+  MAX_EXPAND_DEPTH,
+  type ExpandContext,
+  type ExpandMode,
+} from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
@@ -63,6 +70,27 @@ function parseIncludeMetadata(url: URL): boolean | string[] | undefined {
   const fields = val.split(",").map((s) => s.trim()).filter(Boolean);
   if (fields.length === 0) return undefined; // empty string → treat as default (all)
   return fields;
+}
+
+/**
+ * Parse expand_links/expand_depth/expand_mode from query params, returning
+ * an (ExpandContext, depth) pair if expansion is requested, else null.
+ */
+function parseExpandParams(
+  url: URL,
+  db: any,
+): { ctx: ExpandContext; depth: number } | null {
+  if (!parseBool(parseQuery(url, "expand_links"), false)) return null;
+  const modeRaw = parseQuery(url, "expand_mode");
+  const mode: ExpandMode = modeRaw === "summary" ? "summary" : "full";
+  const depth = Math.max(
+    0,
+    Math.min(
+      parseInt10(parseQuery(url, "expand_depth")) ?? DEFAULT_EXPAND_DEPTH,
+      MAX_EXPAND_DEPTH,
+    ),
+  );
+  return { ctx: { db, mode, expanded: new Set() }, depth };
 }
 
 
@@ -114,6 +142,11 @@ export async function handleNotes(
         if (!note) return json({ error: "Note not found", id }, 404);
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
         let result: any = includeContent ? { ...note } : toNoteIndex(note);
+        const expand = parseExpandParams(url, db);
+        if (expand && includeContent && typeof result.content === "string") {
+          expand.ctx.expanded.add(note.id);
+          result.content = expandContent(result.content, expand.ctx, expand.depth);
+        }
         result = filterMetadata(result, parseIncludeMetadata(url));
         if (parseBool(parseQuery(url, "include_links"), false)) {
           result.links = linkOps.getLinksHydrated(db, note.id);
@@ -131,7 +164,16 @@ export async function handleNotes(
         const results = await store.searchNotes(search, { tags: searchTags, limit });
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const inclMeta = parseIncludeMetadata(url);
-        let output = includeContent ? results : results.map(toNoteIndex);
+        let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
+        const expand = parseExpandParams(url, db);
+        if (expand && includeContent) {
+          for (const n of output) expand.ctx.expanded.add(n.id);
+          for (const n of output) {
+            if (typeof n.content === "string") {
+              n.content = expandContent(n.content, expand.ctx, expand.depth);
+            }
+          }
+        }
         if (inclMeta !== undefined && inclMeta !== true) {
           output = output.map((n: any) => filterMetadata(n, inclMeta));
         }
@@ -170,7 +212,16 @@ export async function handleNotes(
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const inclMeta = parseIncludeMetadata(url);
-      let output: any[] = includeContent ? results : results.map(toNoteIndex);
+      let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
+      const expand = parseExpandParams(url, db);
+      if (expand && includeContent) {
+        for (const n of output) expand.ctx.expanded.add(n.id);
+        for (const n of output) {
+          if (typeof n.content === "string") {
+            n.content = expandContent(n.content, expand.ctx, expand.depth);
+          }
+        }
+      }
       if (inclMeta !== undefined && inclMeta !== true) {
         output = output.map((n: any) => filterMetadata(n, inclMeta));
       }
@@ -278,6 +329,11 @@ export async function handleNotes(
     if (!note) return json({ error: "Not found" }, 404);
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    const expand = parseExpandParams(url, db);
+    if (expand && includeContent && typeof result.content === "string") {
+      expand.ctx.expanded.add(note.id);
+      result.content = expandContent(result.content, expand.ctx, expand.depth);
+    }
     result = filterMetadata(result, parseIncludeMetadata(url));
     if (parseBool(parseQuery(url, "include_links"), false)) {
       result.links = linkOps.getLinksHydrated(db, note.id);

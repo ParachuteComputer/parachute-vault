@@ -4,6 +4,13 @@ import * as noteOps from "./notes.js";
 import { filterMetadata } from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
+import {
+  expandContent,
+  DEFAULT_EXPAND_DEPTH,
+  MAX_EXPAND_DEPTH,
+  type ExpandContext,
+  type ExpandMode,
+} from "./expand.js";
 
 export interface McpToolDef {
   name: string;
@@ -78,7 +85,9 @@ export function generateMcpTools(store: Store): McpToolDef[] {
 - **Graph neighborhood**: pass \`near\` to scope results to notes within N hops of an anchor note
 - **No filters**: returns all notes (paginated)
 
-Defaults: include_content=true for single note, false for lists. include_links=false. tag_match="any".`,
+Defaults: include_content=true for single note, false for lists. include_links=false. tag_match="any".
+
+Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -121,15 +130,37 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           },
           include_links: { type: "boolean", description: "Include inbound + outbound links per note (default: false)" },
           include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
+          expand_links: { type: "boolean", description: "Inline [[wikilinks]] in returned content (default: false). Has no effect if content is not included (e.g., default list mode with include_content=false); wikilinks inside fenced or inline code are not expanded." },
+          expand_depth: { type: "number", description: "Recursion depth for link expansion (default 1, max 3). Only meaningful in 'full' mode — 'summary' mode does not recurse." },
+          expand_mode: { type: "string", enum: ["full", "summary"], description: "Expansion rendering: 'full' inlines the linked note's content, 'summary' inlines only metadata.summary. Default: 'full'." },
         },
       },
       execute: async (params) => {
+        // --- Link expansion config (shared across single + list paths) ---
+        const expandLinks = params.expand_links === true;
+        const expandMode = (params.expand_mode as ExpandMode) ?? "full";
+        const expandDepth = Math.max(
+          0,
+          Math.min(
+            (params.expand_depth as number | undefined) ?? DEFAULT_EXPAND_DEPTH,
+            MAX_EXPAND_DEPTH,
+          ),
+        );
+        const expandCtx: ExpandContext | null = expandLinks
+          ? { db, mode: expandMode, expanded: new Set() }
+          : null;
+
         // --- Single note by ID/path ---
         if (params.id) {
           const note = resolveNote(db, params.id as string);
           if (!note) return { error: "Note not found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
           let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
+          if (expandCtx && includeContent && typeof result.content === "string") {
+            // Mark the top-level note as already expanded so it can't recursively inline itself.
+            expandCtx.expanded.add(note.id);
+            result.content = expandContent(result.content, expandCtx, expandDepth);
+          }
           result = filterMetadata(result, params.include_metadata as boolean | string[] | undefined);
           if (params.include_links) {
             result.links = linkOps.getLinksHydrated(db, note.id);
@@ -189,7 +220,18 @@ Defaults: include_content=true for single note, false for lists. include_links=f
         // --- Format output ---
         const includeContent = params.include_content === true; // default false for list
         const includeMetadata = params.include_metadata as boolean | string[] | undefined;
-        let output = includeContent ? results : results.map(noteOps.toNoteIndex);
+        let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(noteOps.toNoteIndex);
+
+        // --- Expand wikilinks inline (only meaningful when content is present) ---
+        if (expandCtx && includeContent) {
+          // Mark all top-level notes as already expanded so they can't inline each other.
+          for (const n of output) expandCtx.expanded.add(n.id);
+          for (const n of output) {
+            if (typeof n.content === "string") {
+              n.content = expandContent(n.content, expandCtx, expandDepth);
+            }
+          }
+        }
 
         // --- Apply metadata filtering ---
         if (includeMetadata !== undefined && includeMetadata !== true) {
