@@ -295,38 +295,26 @@ export async function handleNotes(
       if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
       const body = await req.json() as any;
 
-      // Optimistic concurrency check
-      if (body.if_updated_at !== undefined && note.updatedAt !== body.if_updated_at) {
-        return json(
-          {
-            error: "conflict",
-            message: `note "${note.id}" has been modified since if_updated_at`,
-            note_id: note.id,
-            current_updated_at: note.updatedAt ?? null,
-            expected_updated_at: body.if_updated_at,
-          },
-          409,
-        );
-      }
-
-      // Remove links first (before content update for bracket removal)
-      const linksRemove = body.links?.remove as { target: string; relationship: string }[] | undefined;
+      // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
+      // The actual link deletions happen only after the core UPDATE succeeds,
+      // so a conflict leaves the note untouched.
       let contentOverride = body.content as string | undefined;
+      const linksRemove = body.links?.remove as { target: string; relationship: string }[] | undefined;
+      const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
       if (linksRemove) {
         for (const link of linksRemove) {
           const target = await resolveNote(store, link.target);
-          if (target) {
-            await store.deleteLink(note.id, target.id, link.relationship);
-            if (link.relationship === "wikilink" && target.path) {
-              const current = contentOverride ?? note.content;
-              const cleaned = removeWikilinkBrackets(current, target.path);
-              if (cleaned !== current) contentOverride = cleaned;
-            }
+          if (!target) continue;
+          resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
+          if (link.relationship === "wikilink" && target.path) {
+            const current = contentOverride ?? note.content;
+            const cleaned = removeWikilinkBrackets(current, target.path);
+            if (cleaned !== current) contentOverride = cleaned;
           }
         }
       }
 
-      // Core update
+      // --- Core update (runs the if_updated_at check atomically) ---
       const updates: any = {};
       if (contentOverride !== undefined) updates.content = contentOverride;
       if (body.path !== undefined) updates.path = body.path;
@@ -337,9 +325,17 @@ export async function handleNotes(
       if (body.created_at !== undefined || body.createdAt !== undefined) {
         updates.created_at = body.created_at ?? body.createdAt;
       }
+      if (body.if_updated_at !== undefined) {
+        updates.if_updated_at = body.if_updated_at;
+      }
 
       if (Object.keys(updates).length > 0) {
         await store.updateNote(note.id, updates);
+      }
+
+      // --- Remove links (after core UPDATE; conflict would have thrown already) ---
+      for (const { targetId, relationship } of resolvedLinksToRemove) {
+        await store.deleteLink(note.id, targetId, relationship);
       }
 
       // Tags
@@ -362,6 +358,18 @@ export async function handleNotes(
       return json(await store.getNote(note.id));
     } catch (e: any) {
       if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+      if (e && e.code === "CONFLICT") {
+        return json(
+          {
+            error: "conflict",
+            message: e.message,
+            note_id: e.note_id,
+            current_updated_at: e.current_updated_at ?? null,
+            expected_updated_at: e.expected_updated_at,
+          },
+          409,
+        );
+      }
       throw e;
     }
   }

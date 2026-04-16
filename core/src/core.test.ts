@@ -641,7 +641,7 @@ describe("MCP tools", async () => {
     }
     expect(err).toBeTruthy();
     expect(err.code).toBe("CONFLICT");
-    expect(err.current_updated_at).toBeUndefined();
+    expect(err.current_updated_at).toBeNull();
   });
 
   it("update-note batch aborts on first conflict without touching subsequent items", async () => {
@@ -670,6 +670,72 @@ describe("MCP tools", async () => {
     // a was not modified by this call; b was not touched.
     expect((await store.getNote("a"))!.content).toBe("A bumped");
     expect((await store.getNote("b"))!.content).toBe("B");
+  });
+
+  it("update-note is atomic under concurrent if_updated_at — exactly one winner", async () => {
+    // Reproduces the TOCTOU scenario: two callers read the same updated_at
+    // and fire updates in parallel. Exactly one must commit; the other must
+    // get a ConflictError. Both seeing success would silently destroy one
+    // write, which is precisely what if_updated_at exists to prevent.
+    const note = await store.createNote("seed");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Establish a known updated_at the two callers both read.
+    const seed = await updateNote.execute({ id: note.id, content: "seed-v1" }) as any;
+    expect(seed.updatedAt).toBeTruthy();
+
+    const results = await Promise.allSettled([
+      updateNote.execute({ id: note.id, content: "racer-A", if_updated_at: seed.updatedAt }),
+      updateNote.execute({ id: note.id, content: "racer-B", if_updated_at: seed.updatedAt }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const err = (rejected[0] as PromiseRejectedResult).reason as any;
+    expect(err?.code).toBe("CONFLICT");
+
+    // The winner's content is what ended up persisted.
+    const winner = (fulfilled[0] as PromiseFulfilledResult<any>).value;
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe(winner.content);
+    expect(["racer-A", "racer-B"]).toContain(persisted!.content);
+  });
+
+  it("update-note with links.remove rolls back link deletion when if_updated_at conflicts", async () => {
+    await store.createNote("Target", { id: "target", path: "People/Alice" });
+    const source = await store.createNote("See [[People/Alice]] for details", {
+      id: "source",
+    });
+    await store.createLink("source", "target", "wikilink");
+
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump so a stale if_updated_at conflicts; and capture state after bump.
+    await updateNote.execute({ id: "source", content: "See [[People/Alice]] for details" });
+    const preConflictLinks = await store.getLinks("source", { direction: "outbound" });
+    expect(preConflictLinks).toHaveLength(1);
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: "source",
+        links: { remove: [{ target: "target", relationship: "wikilink" }] },
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+
+    // The link must still exist — if it had been removed before the
+    // conflict check, this would be 0.
+    const postConflictLinks = await store.getLinks("source", { direction: "outbound" });
+    expect(postConflictLinks).toHaveLength(1);
+    expect((await store.getNote("source"))!.content).toBe("See [[People/Alice]] for details");
   });
 
   it("query-notes single note by id", async () => {

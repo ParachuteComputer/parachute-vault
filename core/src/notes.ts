@@ -72,10 +72,45 @@ export function getNotes(db: Database, ids: string[]): Note[] {
   });
 }
 
+/**
+ * Thrown by `updateNote` when an `if_updated_at` precondition does not match
+ * the note's current `updated_at`. The SELECT+check+UPDATE happens as one
+ * atomic conditional UPDATE so two concurrent callers cannot both pass the
+ * check and both commit.
+ */
+export class ConflictError extends Error {
+  code = "CONFLICT" as const;
+  note_id: string;
+  current_updated_at: string | null;
+  expected_updated_at: string;
+
+  constructor(noteId: string, current: string | null, expected: string) {
+    super(
+      `conflict: note "${noteId}" has been modified (current updated_at=${current ?? "null"}, expected=${expected})`,
+    );
+    this.name = "ConflictError";
+    this.note_id = noteId;
+    this.current_updated_at = current;
+    this.expected_updated_at = expected;
+  }
+}
+
 export function updateNote(
   db: Database,
   id: string,
-  updates: { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean },
+  updates: {
+    content?: string;
+    path?: string;
+    metadata?: Record<string, unknown>;
+    created_at?: string;
+    skipUpdatedAt?: boolean;
+    /**
+     * Optimistic concurrency token. When provided, the UPDATE runs with an
+     * additional `AND updated_at IS ?` clause; if no row is affected and the
+     * note still exists, a `ConflictError` is thrown.
+     */
+    if_updated_at?: string;
+  },
 ): Note {
   const sets: string[] = [];
   const values: unknown[] = [];
@@ -83,8 +118,17 @@ export function updateNote(
   // Hooks and other machine-level writers pass `skipUpdatedAt: true` so
   // their metadata markers don't look like user activity. See issue #44.
   if (!updates.skipUpdatedAt) {
+    let now = new Date().toISOString();
+    // OC contract: the new updated_at must be strictly greater than the
+    // caller's if_updated_at so a subsequent OC reader can distinguish
+    // pre- from post-update state. Without this, two writes landing in the
+    // same wall-clock millisecond would produce identical timestamps and
+    // let a second OC writer see the first writer's work as "unchanged."
+    if (updates.if_updated_at !== undefined && now <= updates.if_updated_at) {
+      now = new Date(new Date(updates.if_updated_at).getTime() + 1).toISOString();
+    }
     sets.push("updated_at = ?");
-    values.push(new Date().toISOString());
+    values.push(now);
   }
 
   if (updates.content !== undefined) {
@@ -104,15 +148,45 @@ export function updateNote(
     values.push(updates.created_at);
   }
 
-  // No-op: skipUpdatedAt with no other fields. Avoid generating invalid SQL.
+  // No-op: no SET fields. If a caller still passed `if_updated_at`, we need
+  // to validate the precondition; a conditional UPDATE that sets updated_at
+  // to itself does exactly that atomically without changing any data.
   if (sets.length === 0) {
+    if (updates.if_updated_at !== undefined) {
+      const probe = db.prepare(
+        "UPDATE notes SET updated_at = updated_at WHERE id = ? AND updated_at IS ?",
+      ).run(id, updates.if_updated_at);
+      if (probe.changes === 0) {
+        throwConflictOrMissing(db, id, updates.if_updated_at);
+      }
+    }
     return getNote(db, id)!;
   }
 
   values.push(id);
-  db.prepare(`UPDATE notes SET ${sets.join(", ")} WHERE id = ?`).run(...values);
+  let sql = `UPDATE notes SET ${sets.join(", ")} WHERE id = ?`;
+  if (updates.if_updated_at !== undefined) {
+    sql += " AND updated_at IS ?";
+    values.push(updates.if_updated_at);
+  }
+
+  const res = db.prepare(sql).run(...values);
+
+  if (updates.if_updated_at !== undefined && res.changes === 0) {
+    throwConflictOrMissing(db, id, updates.if_updated_at);
+  }
 
   return getNote(db, id)!;
+}
+
+function throwConflictOrMissing(db: Database, id: string, expected: string): never {
+  const row = db.prepare("SELECT updated_at FROM notes WHERE id = ?").get(id) as
+    | { updated_at: string | null }
+    | undefined;
+  if (!row) {
+    throw new Error(`Note not found: "${id}"`);
+  }
+  throw new ConflictError(id, row.updated_at, expected);
 }
 
 export function deleteNote(db: Database, id: string): void {

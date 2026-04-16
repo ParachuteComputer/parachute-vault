@@ -363,7 +363,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
                 path: { type: "string" },
                 metadata: { type: "object" },
                 created_at: { type: "string" },
-                if_updated_at: { type: "string" },
+                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since." },
                 tags: { type: "object" },
                 links: { type: "object" },
               },
@@ -381,33 +381,29 @@ Defaults: include_content=true for single note, false for lists. include_links=f
         for (const item of items) {
           const note = requireNote(db, item.id as string);
 
-          // --- Optimistic concurrency check ---
-          if (item.if_updated_at !== undefined && note.updatedAt !== item.if_updated_at) {
-            throw new ConflictError(note.id, note.updatedAt, item.if_updated_at as string);
-          }
-
+          // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
+          // We compute the cleaned content so we can do the core UPDATE first
+          // (with if_updated_at atomically) before any link deletions. If the
+          // UPDATE fails on a conflict, nothing has been mutated.
           let contentOverride = item.content as string | undefined;
-
-          // --- Remove links (before content update, so bracket removal applies) ---
           const linksRemove = (item.links as any)?.remove as { target: string; relationship: string }[] | undefined;
+          const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
           if (linksRemove) {
             for (const link of linksRemove) {
               const target = resolveNote(db, link.target);
-              if (target) {
-                await store.deleteLink(note.id, target.id, link.relationship);
-                // Remove [[brackets]] from content if this was a wikilink
-                if (link.relationship === "wikilink" && target.path) {
-                  const currentContent = contentOverride ?? note.content;
-                  const cleaned = removeWikilinkBrackets(currentContent, target.path);
-                  if (cleaned !== currentContent) {
-                    contentOverride = cleaned;
-                  }
+              if (!target) continue;
+              resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
+              if (link.relationship === "wikilink" && target.path) {
+                const currentContent = contentOverride ?? note.content;
+                const cleaned = removeWikilinkBrackets(currentContent, target.path);
+                if (cleaned !== currentContent) {
+                  contentOverride = cleaned;
                 }
               }
             }
           }
 
-          // --- Core update (content, path, metadata, created_at) ---
+          // --- Core update (content, path, metadata, created_at + concurrency check) ---
           const updates: any = {};
           if (contentOverride !== undefined) updates.content = contentOverride;
           if (item.path !== undefined) updates.path = item.path;
@@ -417,12 +413,22 @@ Defaults: include_content=true for single note, false for lists. include_links=f
             updates.metadata = { ...existing, ...(item.metadata as Record<string, unknown>) };
           }
           if (item.created_at !== undefined) updates.created_at = item.created_at;
+          if (item.if_updated_at !== undefined) updates.if_updated_at = item.if_updated_at as string;
 
           let result: Note;
           if (Object.keys(updates).length > 0) {
+            // store.updateNote routes through noteOps.updateNote, which runs
+            // the UPDATE (with optional `AND updated_at IS ?`) atomically and
+            // throws ConflictError on mismatch. No mutations have happened
+            // yet, so a throw here leaves the note untouched.
             result = await store.updateNote(note.id, updates);
           } else {
             result = note;
+          }
+
+          // --- Remove links (after core UPDATE so a conflict leaves them intact) ---
+          for (const { targetId, relationship } of resolvedLinksToRemove) {
+            await store.deleteLink(note.id, targetId, relationship);
           }
 
           // --- Tags ---
@@ -681,24 +687,7 @@ function normalizeTags(tag: unknown): string[] | undefined {
   return [tag as string];
 }
 
-// ---------------------------------------------------------------------------
-// Conflict error — thrown when optimistic concurrency check fails
-// ---------------------------------------------------------------------------
-
-export class ConflictError extends Error {
-  code = "CONFLICT" as const;
-  note_id: string;
-  current_updated_at: string | undefined;
-  expected_updated_at: string;
-
-  constructor(noteId: string, current: string | undefined, expected: string) {
-    super(
-      `conflict: note "${noteId}" has been modified (current updated_at=${current ?? "null"}, expected=${expected})`,
-    );
-    this.name = "ConflictError";
-    this.note_id = noteId;
-    this.current_updated_at = current;
-    this.expected_updated_at = expected;
-  }
-}
+// Re-exported for backward compat; defined in notes.ts alongside the
+// conditional-UPDATE implementation that raises it.
+export { ConflictError } from "./notes.js";
 

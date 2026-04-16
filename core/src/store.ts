@@ -51,7 +51,17 @@ export class BunSqliteStore implements Store {
     return noteOps.getNotes(this.db, ids);
   }
 
-  async updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean }): Promise<Note> {
+  async updateNote(
+    id: string,
+    updates: {
+      content?: string;
+      path?: string;
+      metadata?: Record<string, unknown>;
+      created_at?: string;
+      skipUpdatedAt?: boolean;
+      if_updated_at?: string;
+    },
+  ): Promise<Note> {
     let oldPath: string | undefined;
     if (updates.path !== undefined) {
       const existing = noteOps.getNote(this.db, id);
