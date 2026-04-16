@@ -575,6 +575,103 @@ describe("MCP tools", async () => {
     expect(result.content).toBe("Updated");
   });
 
+  it("update-note accepts if_updated_at when it matches current updated_at", async () => {
+    const note = await store.createNote("First");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const first = await updateNote.execute({ id: note.id, content: "Second" }) as any;
+    expect(first.content).toBe("Second");
+    expect(first.updatedAt).toBeTruthy();
+
+    const second = await updateNote.execute({
+      id: note.id,
+      content: "Third",
+      if_updated_at: first.updatedAt,
+    }) as any;
+    expect(second.content).toBe("Third");
+  });
+
+  it("update-note rejects if_updated_at mismatch with conflict error", async () => {
+    const note = await store.createNote("First");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const after = await updateNote.execute({ id: note.id, content: "Second" }) as any;
+
+    // Simulate a stale client that has the pre-update timestamp (or something else).
+    const staleTimestamp = "2020-01-01T00:00:00.000Z";
+    expect(staleTimestamp).not.toBe(after.updatedAt);
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "Third",
+        if_updated_at: staleTimestamp,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err.code).toBe("CONFLICT");
+    expect(err.note_id).toBe(note.id);
+    expect(err.current_updated_at).toBe(after.updatedAt);
+    expect(err.expected_updated_at).toBe(staleTimestamp);
+
+    // Note unchanged
+    expect((await store.getNote(note.id))!.content).toBe("Second");
+  });
+
+  it("update-note if_updated_at conflicts for a never-updated note when caller expects a value", async () => {
+    const note = await store.createNote("First");
+    expect(note.updatedAt).toBeUndefined();
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "Second",
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err.code).toBe("CONFLICT");
+    expect(err.current_updated_at).toBeUndefined();
+  });
+
+  it("update-note batch aborts on first conflict without touching subsequent items", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump a's updated_at so any stale if_updated_at conflicts.
+    const bumped = await updateNote.execute({ id: "a", content: "A bumped" }) as any;
+    expect(bumped.updatedAt).toBeTruthy();
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        notes: [
+          { id: "a", content: "A new", if_updated_at: "2020-01-01T00:00:00.000Z" },
+          { id: "b", content: "B new" },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+
+    // a was not modified by this call; b was not touched.
+    expect((await store.getNote("a"))!.content).toBe("A bumped");
+    expect((await store.getNote("b"))!.content).toBe("B");
+  });
+
   it("query-notes single note by id", async () => {
     const note = await store.createNote("Hello", { path: "test/note" });
     const tools = generateMcpTools(store);

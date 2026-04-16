@@ -1052,6 +1052,51 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.content).toBe("updated");
   });
 
+  test("PATCH with matching if_updated_at succeeds", async () => {
+    const note = await store.createNote("first", { id: "x" });
+    // First bump — sets updated_at
+    const first = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "second" }),
+      store,
+      "/x",
+    );
+    const firstBody = await first.json() as any;
+    expect(firstBody.updatedAt).toBeTruthy();
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "third", if_updated_at: firstBody.updatedAt }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.content).toBe("third");
+  });
+
+  test("PATCH with stale if_updated_at returns 409 and does not modify note", async () => {
+    await store.createNote("first", { id: "x" });
+    await handleNotes(mkReq("PATCH", "/notes/x", { content: "second" }), store, "/x");
+    const current = await store.getNote("x");
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", {
+        content: "third",
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error).toBe("conflict");
+    expect(body.note_id).toBe("x");
+    expect(body.current_updated_at).toBe(current!.updatedAt);
+    expect(body.expected_updated_at).toBe("2020-01-01T00:00:00.000Z");
+
+    // Unchanged
+    expect((await store.getNote("x"))!.content).toBe("second");
+  });
+
   test("DELETE resolves note by path", async () => {
     await store.createNote("x", { path: "Temp/note" });
     const res = await handleNotes(

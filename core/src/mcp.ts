@@ -305,7 +305,8 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 - \`tags: { add: ["x"], remove: ["y"] }\` — add/remove tags
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
-- For batch: pass a \`notes\` array, each with an \`id\` field.`,
+- For batch: pass a \`notes\` array, each with an \`id\` field.
+- Optimistic concurrency: pass \`if_updated_at\` with the \`updated_at\` value you last read. The update is rejected with a conflict error if the note has changed since. Re-read the note, reconcile, and retry.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -314,6 +315,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
           path: { type: "string", description: "New path" },
           metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
           created_at: { type: "string", description: "New created_at timestamp" },
+          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since." },
           tags: {
             type: "object",
             properties: {
@@ -361,6 +363,7 @@ Defaults: include_content=true for single note, false for lists. include_links=f
                 path: { type: "string" },
                 metadata: { type: "object" },
                 created_at: { type: "string" },
+                if_updated_at: { type: "string" },
                 tags: { type: "object" },
                 links: { type: "object" },
               },
@@ -377,6 +380,12 @@ Defaults: include_content=true for single note, false for lists. include_links=f
         const updated: Note[] = [];
         for (const item of items) {
           const note = requireNote(db, item.id as string);
+
+          // --- Optimistic concurrency check ---
+          if (item.if_updated_at !== undefined && note.updatedAt !== item.if_updated_at) {
+            throw new ConflictError(note.id, note.updatedAt, item.if_updated_at as string);
+          }
+
           let contentOverride = item.content as string | undefined;
 
           // --- Remove links (before content update, so bracket removal applies) ---
@@ -670,5 +679,26 @@ function normalizeTags(tag: unknown): string[] | undefined {
   if (!tag) return undefined;
   if (Array.isArray(tag)) return tag;
   return [tag as string];
+}
+
+// ---------------------------------------------------------------------------
+// Conflict error — thrown when optimistic concurrency check fails
+// ---------------------------------------------------------------------------
+
+export class ConflictError extends Error {
+  code = "CONFLICT" as const;
+  note_id: string;
+  current_updated_at: string | undefined;
+  expected_updated_at: string;
+
+  constructor(noteId: string, current: string | undefined, expected: string) {
+    super(
+      `conflict: note "${noteId}" has been modified (current updated_at=${current ?? "null"}, expected=${expected})`,
+    );
+    this.name = "ConflictError";
+    this.note_id = noteId;
+    this.current_updated_at = current;
+    this.expected_updated_at = expected;
+  }
 }
 

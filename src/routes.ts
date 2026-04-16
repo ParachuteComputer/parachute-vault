@@ -295,6 +295,20 @@ export async function handleNotes(
       if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
       const body = await req.json() as any;
 
+      // Optimistic concurrency check
+      if (body.if_updated_at !== undefined && note.updatedAt !== body.if_updated_at) {
+        return json(
+          {
+            error: "conflict",
+            message: `note "${note.id}" has been modified since if_updated_at`,
+            note_id: note.id,
+            current_updated_at: note.updatedAt ?? null,
+            expected_updated_at: body.if_updated_at,
+          },
+          409,
+        );
+      }
+
       // Remove links first (before content update for bracket removal)
       const linksRemove = body.links?.remove as { target: string; relationship: string }[] | undefined;
       let contentOverride = body.content as string | undefined;
