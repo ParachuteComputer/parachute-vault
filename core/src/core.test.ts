@@ -938,3 +938,232 @@ describe("MCP tools", async () => {
     expect(fresh.metadata.status).toBe("active");
   });
 });
+
+// ---- query-notes link expansion ----
+
+describe("query-notes link expansion", async () => {
+  it("expands a single [[wikilink]] inline in full mode by default", async () => {
+    await store.createNote("# Who I Am\nI teach Taiji.", { path: "Statements/Who" });
+    await store.createNote(
+      "Canon:\nSee [[Statements/Who]] for identity.",
+      { path: "Canon" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Canon",
+      expand_links: true,
+    }) as any;
+
+    expect(result.content).toContain('<expanded path="Statements/Who" mode="full">');
+    expect(result.content).toContain("I teach Taiji.");
+    expect(result.content).toContain("</expanded>");
+  });
+
+  it("summary mode inlines only metadata.summary, not full content", async () => {
+    await store.createNote(
+      "# Long canonical statement\n\n(Many paragraphs of detail follow...)",
+      { path: "Statements/Philosophy", metadata: { summary: "Unforced / wu wei." } },
+    );
+    await store.createNote("Overview: [[Statements/Philosophy]]", { path: "Index" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain('mode="summary"');
+    expect(result.content).toContain("Unforced / wu wei.");
+    expect(result.content).not.toContain("Many paragraphs of detail");
+  });
+
+  it("deduplicates: a linked note expanded once, subsequent references marked", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "First [[Target]], then [[Target]] again.",
+      { path: "Source" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Source",
+      expand_links: true,
+    }) as any;
+
+    // Exactly one <expanded> block.
+    const openCount = (result.content.match(/<expanded /g) ?? []).length;
+    expect(openCount).toBe(1);
+    expect(result.content).toContain("(expanded above)");
+  });
+
+  it("cycle guard: A→B→A does not expand A inside B", async () => {
+    await store.createNote("A body with [[B]] reference.", { path: "A" });
+    await store.createNote("B body with [[A]] reference.", { path: "B" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "A",
+      expand_links: true,
+      expand_depth: 3,
+    }) as any;
+
+    // A appears as the container but should only be expanded once (in the top-level note).
+    // B is expanded inside A; inside B, the [[A]] reference should NOT re-expand A.
+    const expandedOpens = (result.content.match(/<expanded path="(A|B)" mode="full">/g) ?? []).length;
+    expect(expandedOpens).toBe(1); // only B is expanded; A is the top note, never re-expanded
+    expect(result.content).toContain("(expanded above)"); // B's reference to A becomes the marker
+  });
+
+  it("expand_depth=1 (default) expands top-level wikilinks but not nested ones", async () => {
+    await store.createNote("leaf content", { path: "Leaf" });
+    await store.createNote("middle body with [[Leaf]] inside", { path: "Middle" });
+    await store.createNote("root references [[Middle]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Root", expand_links: true }) as any;
+
+    expect(result.content).toContain('<expanded path="Middle"');
+    // Middle's content is inlined, including its raw [[Leaf]] reference — but Leaf is NOT expanded.
+    expect(result.content).toContain("[[Leaf]]");
+    expect(result.content).not.toContain('<expanded path="Leaf"');
+  });
+
+  it("expand_depth=2 recurses one additional level", async () => {
+    await store.createNote("leaf content", { path: "Leaf" });
+    await store.createNote("middle [[Leaf]] inside", { path: "Middle" });
+    await store.createNote("root references [[Middle]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Root",
+      expand_links: true,
+      expand_depth: 2,
+    }) as any;
+
+    expect(result.content).toContain('<expanded path="Middle"');
+    expect(result.content).toContain('<expanded path="Leaf"');
+    expect(result.content).toContain("leaf content");
+  });
+
+  it("expand_depth is clamped to MAX_EXPAND_DEPTH (3)", async () => {
+    await store.createNote("level-4", { path: "L4" });
+    await store.createNote("level-3 [[L4]]", { path: "L3" });
+    await store.createNote("level-2 [[L3]]", { path: "L2" });
+    await store.createNote("level-1 [[L2]]", { path: "L1" });
+    await store.createNote("root [[L1]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    // Request depth=99 — should clamp to 3, so L4 is NOT expanded.
+    const result = await query.execute({
+      id: "Root",
+      expand_links: true,
+      expand_depth: 99,
+    }) as any;
+
+    expect(result.content).toContain('<expanded path="L1"');
+    expect(result.content).toContain('<expanded path="L2"');
+    expect(result.content).toContain('<expanded path="L3"');
+    expect(result.content).not.toContain('<expanded path="L4"');
+    expect(result.content).toContain("[[L4]]"); // raw, beyond clamp
+  });
+
+  it("leaves unresolved [[wikilinks]] unchanged", async () => {
+    await store.createNote("root mentions [[DoesNotExist]]", { path: "Root" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Root", expand_links: true }) as any;
+    expect(result.content).toBe("root mentions [[DoesNotExist]]");
+  });
+
+  it("expand_links: false (default) leaves content untouched", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("before [[Target]] after", { path: "Source" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Source" }) as any;
+    expect(result.content).toBe("before [[Target]] after");
+    expect(result.content).not.toContain("<expanded");
+  });
+
+  it("list queries expand per-note and dedup across the result", async () => {
+    await store.createNote("shared body", { path: "Shared" });
+    await store.createNote(
+      "first note references [[Shared]]",
+      { path: "A", tags: ["list-test"] },
+    );
+    await store.createNote(
+      "second note also references [[Shared]]",
+      { path: "B", tags: ["list-test"] },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      tag: ["list-test"],
+      include_content: true,
+      expand_links: true,
+      sort: "asc",
+    }) as any[];
+
+    expect(result).toHaveLength(2);
+    const expandedBlocks = result
+      .map((n) => (n.content.match(/<expanded /g) ?? []).length)
+      .reduce((a, b) => a + b, 0);
+    expect(expandedBlocks).toBe(1); // shared note expanded exactly once total
+    const withMarker = result.find((n) => n.content.includes("(expanded above)"));
+    expect(withMarker).toBeTruthy();
+  });
+
+  it("self-reference does not expand (note can't inline itself)", async () => {
+    await store.createNote("I reference [[Self]] in my own body.", { path: "Self" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Self", expand_links: true }) as any;
+    expect(result.content).not.toContain("<expanded");
+    expect(result.content).toContain("(expanded above)");
+  });
+
+  it("handles [[Target|alias]] and [[Target#anchor]] wikilink forms", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "See [[Target|the target]] or [[Target#section]].",
+      { path: "Source" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Source", expand_links: true }) as any;
+    // Both references resolve to same target — first expands, second marked.
+    const openCount = (result.content.match(/<expanded /g) ?? []).length;
+    expect(openCount).toBe(1);
+    expect(result.content).toContain("(expanded above)");
+  });
+
+  it("expand_mode=summary with no metadata.summary renders empty body inline", async () => {
+    await store.createNote("unsummarized body", { path: "Plain" });
+    await store.createNote("see [[Plain]]", { path: "Src" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Src",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+    expect(result.content).toContain('mode="summary"');
+    // Summary is empty — we still get the block but with nothing between delimiters.
+    expect(result.content).not.toContain("unsummarized body");
+  });
+});

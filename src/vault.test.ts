@@ -892,6 +892,55 @@ describe("HTTP /notes", async () => {
     expect(body.metadata).toEqual({ summary: "s" });
   });
 
+  test("GET /notes/:id?expand_links=true inlines wikilink content", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("see [[Target]]", { id: "src", path: "Src" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes/src?expand_links=true"),
+      store,
+      "/src",
+    );
+    const body = await res.json() as any;
+    expect(body.content).toContain('<expanded path="Target" mode="full">');
+    expect(body.content).toContain("target body");
+  });
+
+  test("GET /notes/:id?expand_links=true&expand_mode=summary inlines metadata.summary only", async () => {
+    await store.createNote("long body", {
+      path: "T",
+      metadata: { summary: "short" },
+    });
+    await store.createNote("see [[T]]", { id: "sx", path: "Sx" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes/sx?expand_links=true&expand_mode=summary"),
+      store,
+      "/sx",
+    );
+    const body = await res.json() as any;
+    expect(body.content).toContain('mode="summary"');
+    expect(body.content).toContain("short");
+    expect(body.content).not.toContain("long body");
+  });
+
+  test("GET /notes?tag=&include_content=true&expand_links=true expands per-note with cross-note dedup", async () => {
+    await store.createNote("shared body", { path: "Shared" });
+    await store.createNote("first [[Shared]]", { path: "A", tags: ["el"] });
+    await store.createNote("second [[Shared]]", { path: "B", tags: ["el"] });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?tag=el&include_content=true&expand_links=true&sort=asc"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    const expandedBlocks = body
+      .map((n: any) => (n.content.match(/<expanded /g) ?? []).length)
+      .reduce((a: number, b: number) => a + b, 0);
+    expect(expandedBlocks).toBe(1);
+    const withMarker = body.find((n: any) => n.content.includes("(expanded above)"));
+    expect(withMarker).toBeTruthy();
+  });
+
   test("POST /notes accepts createdAt (camelCase) in body", async () => {
     const res = await handleNotes(
       mkReq("POST", "/notes", { content: "hi", createdAt: "2025-01-01T00:00:00.000Z" }),
