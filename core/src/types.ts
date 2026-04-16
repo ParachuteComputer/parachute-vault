@@ -98,7 +98,7 @@ export interface Store {
   getNote(id: string): Promise<Note | null>;
   getNoteByPath(path: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
-  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; skipUpdatedAt?: boolean }): Promise<Note>;
+  updateNote(id: string, updates: { content?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; if_updated_at?: string }): Promise<Note>;
   deleteNote(id: string): Promise<void>;
   queryNotes(opts: QueryOpts): Promise<Note[]>;
   searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]>;
