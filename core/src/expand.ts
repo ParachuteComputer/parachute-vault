@@ -24,7 +24,12 @@ export interface ExpandContext {
   expanded: Set<string>;
 }
 
-/** Matches wikilinks the same way the parser does — but retains positions. */
+/**
+ * Matches wikilinks the same way the parser does — but retains positions.
+ * Embeds (`![[...]]`) are treated as regular links here; the `!` is discarded
+ * in the expansion output. If embed-specific rendering is needed later,
+ * inspect the first capture group.
+ */
 const WIKILINK_RE = /(!?)\[\[([^\[\]\n]+?)\]\]/g;
 
 /**
@@ -34,6 +39,10 @@ const WIKILINK_RE = /(!?)\[\[([^\[\]\n]+?)\]\]/g;
  * `remainingDepth` counts down: when it reaches 0, no further expansion
  * happens. A call with remainingDepth=1 expands top-level wikilinks only;
  * wikilinks inside those expansions are left as-is.
+ *
+ * Wikilinks inside fenced or inline code blocks are left untouched — mirrors
+ * the behavior of `parseWikilinks` in `wikilinks.ts` so the link graph and
+ * the expansion view stay consistent.
  */
 export function expandContent(
   content: string,
@@ -42,7 +51,11 @@ export function expandContent(
 ): string {
   if (remainingDepth <= 0) return content;
 
-  return content.replace(WIKILINK_RE, (match, _bang: string, inner: string) => {
+  const codeSkip = codeRanges(content);
+
+  return content.replace(WIKILINK_RE, (match, _bang: string, inner: string, offset: number) => {
+    if (inCodeRange(offset, codeSkip)) return match;
+
     const target = parseTarget(inner);
     if (!target) return match;
 
@@ -58,6 +71,7 @@ export function expandContent(
     if (!note) return match; // shouldn't happen, but be safe
 
     if (ctx.mode === "summary") {
+      // Summary mode doesn't recurse: depth > 1 has no additional effect.
       return renderSummary(note);
     }
 
@@ -65,6 +79,27 @@ export function expandContent(
     const nested = expandContent(note.content, ctx, remainingDepth - 1);
     return renderFull(note, nested);
   });
+}
+
+function codeRanges(content: string): [number, number][] {
+  const ranges: [number, number][] = [];
+  const fenced = /```[\s\S]*?```/g;
+  let m: RegExpExecArray | null;
+  while ((m = fenced.exec(content)) !== null) {
+    ranges.push([m.index, m.index + m[0].length]);
+  }
+  const inline = /`[^`\n]+`/g;
+  while ((m = inline.exec(content)) !== null) {
+    ranges.push([m.index, m.index + m[0].length]);
+  }
+  return ranges;
+}
+
+function inCodeRange(pos: number, ranges: [number, number][]): boolean {
+  for (const [start, end] of ranges) {
+    if (pos >= start && pos < end) return true;
+  }
+  return false;
 }
 
 function parseTarget(inner: string): string | null {
@@ -97,5 +132,9 @@ function summaryText(note: Note): string {
 }
 
 function escapeAttr(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }

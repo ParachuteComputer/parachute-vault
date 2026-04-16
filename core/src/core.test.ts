@@ -1151,6 +1151,66 @@ describe("query-notes link expansion", async () => {
     expect(result.content).toContain("(expanded above)");
   });
 
+  it("does not expand wikilinks inside fenced code blocks", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "Example code:\n```\n[[Target]]\n```\nAnd a real link: [[Target]].",
+      { path: "Src" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Src", expand_links: true }) as any;
+
+    // The fenced [[Target]] stays verbatim; the real one gets expanded exactly once.
+    const expandedOpens = (result.content.match(/<expanded /g) ?? []).length;
+    expect(expandedOpens).toBe(1);
+    expect(result.content).toContain("```\n[[Target]]\n```");
+  });
+
+  it("does not expand wikilinks inside inline code", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote(
+      "Pass `[[Target]]` to render a link. A real one: [[Target]].",
+      { path: "Src" },
+    );
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({ id: "Src", expand_links: true }) as any;
+    const expandedOpens = (result.content.match(/<expanded /g) ?? []).length;
+    expect(expandedOpens).toBe(1);
+    expect(result.content).toContain("`[[Target]]`");
+  });
+
+  it("expand_depth=0 is a no-op (no expansion performed)", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("see [[Target]]", { path: "Src" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Src",
+      expand_links: true,
+      expand_depth: 0,
+    }) as any;
+    expect(result.content).toBe("see [[Target]]");
+  });
+
+  it("expand_links=true is a silent no-op when include_content=false", async () => {
+    await store.createNote("target body", { path: "Target" });
+    await store.createNote("see [[Target]]", { path: "Src", tags: ["silent"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    // List mode defaults to include_content=false; expansion has nothing to
+    // operate on, so the result is the standard lean/index shape.
+    const result = await query.execute({ tag: ["silent"], expand_links: true }) as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBeUndefined();
+    expect(result[0].preview).toBeTruthy();
+  });
+
   it("expand_mode=summary with no metadata.summary renders empty body inline", async () => {
     await store.createNote("unsummarized body", { path: "Plain" });
     await store.createNote("see [[Plain]]", { path: "Src" });

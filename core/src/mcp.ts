@@ -130,8 +130,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           },
           include_links: { type: "boolean", description: "Include inbound + outbound links per note (default: false)" },
           include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
-          expand_links: { type: "boolean", description: "Inline [[wikilinks]] in returned content (default: false). Requires content to be returned." },
-          expand_depth: { type: "number", description: "Recursion depth for link expansion (default 1, max 3)." },
+          expand_links: { type: "boolean", description: "Inline [[wikilinks]] in returned content (default: false). Has no effect if content is not included (e.g., default list mode with include_content=false); wikilinks inside fenced or inline code are not expanded." },
+          expand_depth: { type: "number", description: "Recursion depth for link expansion (default 1, max 3). Only meaningful in 'full' mode — 'summary' mode does not recurse." },
           expand_mode: { type: "string", enum: ["full", "summary"], description: "Expansion rendering: 'full' inlines the linked note's content, 'summary' inlines only metadata.summary. Default: 'full'." },
         },
       },
@@ -156,12 +156,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           if (!note) return { error: "Note not found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
           let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
-          result = filterMetadata(result, params.include_metadata as boolean | string[] | undefined);
           if (expandCtx && includeContent && typeof result.content === "string") {
             // Mark the top-level note as already expanded so it can't recursively inline itself.
             expandCtx.expanded.add(note.id);
             result.content = expandContent(result.content, expandCtx, expandDepth);
           }
+          result = filterMetadata(result, params.include_metadata as boolean | string[] | undefined);
           if (params.include_links) {
             result.links = linkOps.getLinksHydrated(db, note.id);
           }
