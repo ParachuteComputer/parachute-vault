@@ -45,3 +45,15 @@ export function closeAllStores(): void {
   }
   stores.clear();
 }
+
+/**
+ * Close and clear all cached stores. Intended for test isolation between
+ * runs that use different `PARACHUTE_HOME` directories — without this, the
+ * cache holds handles to DBs whose files no longer exist.
+ */
+export function clearVaultStoreCache(): void {
+  for (const [, store] of stores) {
+    try { store.db.close(); } catch {}
+  }
+  stores.clear();
+}

@@ -63,23 +63,44 @@ function escapeHtml(s: string): string {
 // Discovery endpoints
 // ---------------------------------------------------------------------------
 
-export function handleProtectedResource(req: Request, mcpPath = "/mcp"): Response {
+/**
+ * OAuth 2.0 Protected Resource Metadata (RFC 9728).
+ *
+ * @param mcpPath       — the resource URL (e.g. `/mcp` or `/vaults/X/mcp`).
+ * @param authServerPrefix — path prefix for the authorization server issuer
+ *                           (e.g. `""` for global, `/vaults/X` for scoped).
+ *                           The client discovers the AS metadata at
+ *                           `{base}{prefix}/.well-known/oauth-authorization-server`.
+ */
+export function handleProtectedResource(
+  req: Request,
+  mcpPath = "/mcp",
+  authServerPrefix = "",
+): Response {
   const base = getBaseUrl(req);
   return Response.json({
     resource: `${base}${mcpPath}`,
-    authorization_servers: [base],
+    authorization_servers: [`${base}${authServerPrefix}`],
     scopes_supported: ["full", "read"],
     bearer_methods_supported: ["header"],
   });
 }
 
-export function handleAuthorizationServer(req: Request): Response {
+/**
+ * OAuth 2.0 Authorization Server Metadata (RFC 8414).
+ *
+ * @param vaultName — when provided, returns vault-scoped endpoints
+ *                    (`/vaults/<name>/oauth/*`) and issuer. Tokens minted
+ *                    via these endpoints are scoped to the named vault's DB.
+ */
+export function handleAuthorizationServer(req: Request, vaultName?: string): Response {
   const base = getBaseUrl(req);
+  const prefix = vaultName ? `/vaults/${vaultName}` : "";
   return Response.json({
-    issuer: base,
-    authorization_endpoint: `${base}/oauth/authorize`,
-    token_endpoint: `${base}/oauth/token`,
-    registration_endpoint: `${base}/oauth/register`,
+    issuer: `${base}${prefix}`,
+    authorization_endpoint: `${base}${prefix}/oauth/authorize`,
+    token_endpoint: `${base}${prefix}/oauth/token`,
+    registration_endpoint: `${base}${prefix}/oauth/register`,
     response_types_supported: ["code"],
     code_challenge_methods_supported: ["S256"],
     grant_types_supported: ["authorization_code"],
@@ -367,7 +388,19 @@ export async function handleAuthorizePost(
 // Token endpoint
 // ---------------------------------------------------------------------------
 
-export async function handleToken(req: Request, db: Database): Promise<Response> {
+/**
+ * OAuth 2.1 token endpoint — exchanges an auth code for a vault token.
+ *
+ * @param vaultName — the name of the vault this token is scoped to. Included
+ *                    in the response as `vault: <name>` so the client knows
+ *                    which vault was just connected. The token itself lives
+ *                    in that vault's tokens table.
+ */
+export async function handleToken(
+  req: Request,
+  db: Database,
+  vaultName: string,
+): Promise<Response> {
   if (req.method !== "POST") {
     return Response.json({ error: "method_not_allowed" }, { status: 405 });
   }
@@ -466,6 +499,7 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
     access_token: fullToken,
     token_type: "bearer",
     scope: permission,
+    vault: vaultName,
   });
 }
 

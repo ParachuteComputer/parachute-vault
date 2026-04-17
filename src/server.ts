@@ -233,7 +233,7 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
     if (path === "/oauth/token") {
-      return handleToken(req, store.db);
+      return handleToken(req, store.db, defaultVault);
     }
   }
 
@@ -374,12 +374,19 @@ async function route(req: Request, path: string, clientIp?: string): Promise<Res
       });
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
-    if (subpath === "/oauth/token") return handleToken(req, store.db);
+    if (subpath === "/oauth/token") return handleToken(req, store.db, vaultName);
   }
 
-  // Vault-scoped discovery endpoints
-  if (subpath === "/.well-known/oauth-protected-resource") return handleProtectedResource(req, `/vaults/${vaultName}/mcp`);
-  if (subpath === "/.well-known/oauth-authorization-server") return handleAuthorizationServer(req);
+  // Vault-scoped discovery endpoints. The protected-resource advertises a
+  // vault-scoped authorization server (`${base}/vaults/${name}`), and the
+  // vault-scoped authorization-server metadata returns endpoints scoped to
+  // `/vaults/${name}/oauth/*` so tokens mint against this vault's DB.
+  if (subpath === "/.well-known/oauth-protected-resource") {
+    return handleProtectedResource(req, `/vaults/${vaultName}/mcp`, `/vaults/${vaultName}`);
+  }
+  if (subpath === "/.well-known/oauth-authorization-server") {
+    return handleAuthorizationServer(req, vaultName);
+  }
 
   // Auth: per-vault key OR global key
   const store = getVaultStore(vaultName);
