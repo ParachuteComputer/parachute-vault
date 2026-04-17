@@ -4,6 +4,12 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.2.1] — 2026-04-17
+
+### Fixed
+
+- OAuth discovery now works against Claude Code's MCP SDK (and any other strict RFC 9728 client): 401 responses from the MCP endpoint carry a `WWW-Authenticate: Bearer resource_metadata="…"` header pointing at the scoped or unscoped protected-resource metadata document, matching the URL the client actually hit. Previously, clients with no pointer fell back to probing the root `/.well-known/oauth-protected-resource`, got `resource: <base>/mcp`, and rejected any connection to `/vaults/<name>/mcp` as a resource mismatch.
+
 ## [0.2.0] — 2026-04-17
 
 First tagged public release. Ships the auth, backup, and onboarding surface the project needs for first-wave users.
@@ -77,4 +83,5 @@ First tagged public release. Ships the auth, backup, and onboarding surface the 
 - **`core/src/test-preload.ts`** isolates `PARACHUTE_HOME` for tests so `bun test` never touches a user's real `~/.parachute/`.
 - Test suite at release cut: **538 passing / 0 failing / 3 skipped** across 22 files (541 tests total).
 
+[0.2.1]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.0

@@ -345,3 +345,134 @@ describe("single-vault auto-default", () => {
     expect(res.status).toBe(401); // reached per-vault auth
   });
 });
+
+// ---------------------------------------------------------------------------
+// RFC 9728 WWW-Authenticate challenge on MCP 401.
+//
+// Claude Code's MCP SDK (and any other strict RFC 9728 client) requires the
+// server to emit `WWW-Authenticate: Bearer resource_metadata="..."` on 401
+// so the client knows which protected-resource metadata document applies to
+// the endpoint it just hit. Without it, clients fall back to probing the
+// root `/.well-known/oauth-protected-resource`, get `resource: <base>/mcp`,
+// and reject any connection to `/vaults/<name>/mcp` as a resource mismatch.
+// ---------------------------------------------------------------------------
+
+describe("MCP 401 WWW-Authenticate challenge (RFC 9728)", () => {
+  test("unscoped /mcp 401 carries the root protected-resource pointer", async () => {
+    createVault("journal");
+    const req = new Request("http://localhost:1940/mcp");
+    const res = await route(req, "/mcp");
+    expect(res.status).toBe(401);
+    const header = res.headers.get("WWW-Authenticate");
+    expect(header).toBe(
+      'Bearer resource_metadata="http://localhost:1940/.well-known/oauth-protected-resource"',
+    );
+  });
+
+  test("scoped /vaults/{name}/mcp 401 carries the vault-scoped pointer", async () => {
+    createVault("journal");
+    const req = new Request("http://localhost:1940/vaults/journal/mcp");
+    const res = await route(req, "/vaults/journal/mcp");
+    expect(res.status).toBe(401);
+    const header = res.headers.get("WWW-Authenticate");
+    expect(header).toBe(
+      'Bearer resource_metadata="http://localhost:1940/vaults/journal/.well-known/oauth-protected-resource"',
+    );
+  });
+
+  test("challenge points at the same PRM document the server actually serves", async () => {
+    // Belt-and-braces: whatever we advertise in the header MUST line up with
+    // what `/.well-known/oauth-protected-resource` actually returns. If these
+    // drift, a conforming client will chase the pointer, fetch the PRM, then
+    // reject on resource mismatch anyway. Test both directions.
+    createVault("journal");
+
+    // Scoped: header points at /vaults/journal/.well-known/...
+    const scopedReq = new Request("http://localhost:1940/vaults/journal/mcp");
+    const scopedRes = await route(scopedReq, "/vaults/journal/mcp");
+    const scopedHeader = scopedRes.headers.get("WWW-Authenticate")!;
+    const scopedPrmUrl = scopedHeader.match(/resource_metadata="([^"]+)"/)![1];
+    // Fetch that PRM. Bypass the full URL by extracting the path.
+    const prmPath = new URL(scopedPrmUrl).pathname;
+    const prmRes = await route(new Request(`http://localhost:1940${prmPath}`), prmPath);
+    expect(prmRes.status).toBe(200);
+    const prm = (await prmRes.json()) as { resource: string };
+    expect(prm.resource).toBe("http://localhost:1940/vaults/journal/mcp");
+
+    // Unscoped: header points at root /.well-known/...
+    const unscopedReq = new Request("http://localhost:1940/mcp");
+    const unscopedRes = await route(unscopedReq, "/mcp");
+    const unscopedHeader = unscopedRes.headers.get("WWW-Authenticate")!;
+    const unscopedPrmUrl = unscopedHeader.match(/resource_metadata="([^"]+)"/)![1];
+    const unscopedPrmPath = new URL(unscopedPrmUrl).pathname;
+    const unscopedPrmRes = await route(
+      new Request(`http://localhost:1940${unscopedPrmPath}`),
+      unscopedPrmPath,
+    );
+    expect(unscopedPrmRes.status).toBe(200);
+    const unscopedPrm = (await unscopedPrmRes.json()) as { resource: string };
+    expect(unscopedPrm.resource).toBe("http://localhost:1940/mcp");
+  });
+
+  test("MCP 401 with invalid token still carries the challenge", async () => {
+    // The no-token case is one 401 code path (extractApiKey returns null);
+    // the invalid-token case is another (extractApiKey returns a string but
+    // resolveToken / validateKey all fail). Both must emit the header.
+    createVault("journal");
+    const req = new Request("http://localhost:1940/vaults/journal/mcp", {
+      headers: { Authorization: "Bearer pvt_not-a-real-token" },
+    });
+    const res = await route(req, "/vaults/journal/mcp");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBe(
+      'Bearer resource_metadata="http://localhost:1940/vaults/journal/.well-known/oauth-protected-resource"',
+    );
+  });
+
+  test("non-MCP 401s do NOT carry the challenge (spec is MCP-only)", async () => {
+    // The RFC 9728 challenge header is specific to the MCP resource; plain
+    // REST endpoints are not OAuth resources in the same sense. A spurious
+    // challenge here could confuse non-MCP clients and makes the /api
+    // surface look OAuth-gated when it is not.
+    createVault("journal");
+
+    // /api/notes (unscoped) — 401, no challenge.
+    const unscopedApi = await route(new Request("http://localhost:1940/api/notes"), "/api/notes");
+    expect(unscopedApi.status).toBe(401);
+    expect(unscopedApi.headers.get("WWW-Authenticate")).toBeNull();
+
+    // /vaults/journal/api/notes (scoped) — 401, no challenge. This is the
+    // code path that shares the auth check with the scoped MCP branch, so
+    // if we leak the header here the isScopedMcp gate has regressed.
+    const scopedApi = await route(
+      new Request("http://localhost:1940/vaults/journal/api/notes"),
+      "/vaults/journal/api/notes",
+    );
+    expect(scopedApi.status).toBe(401);
+    expect(scopedApi.headers.get("WWW-Authenticate")).toBeNull();
+
+    // /vaults (authenticated listing) — 401, no challenge.
+    const vaultsList = await route(new Request("http://localhost:1940/vaults"), "/vaults");
+    expect(vaultsList.status).toBe(401);
+    expect(vaultsList.headers.get("WWW-Authenticate")).toBeNull();
+  });
+
+  test("x-forwarded-host and x-forwarded-proto shape the challenge URL", async () => {
+    // Remote deployments behind Cloudflare Tunnel / Tailscale Funnel / any
+    // reverse proxy need the challenge URL to match the external origin,
+    // not the 127.0.0.1:1940 the server actually binds. Parallels how the
+    // /.well-known/* endpoints already honor these headers.
+    createVault("journal");
+    const req = new Request("http://127.0.0.1:1940/vaults/journal/mcp", {
+      headers: {
+        "x-forwarded-host": "vault.example.com",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const res = await route(req, "/vaults/journal/mcp");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBe(
+      'Bearer resource_metadata="https://vault.example.com/vaults/journal/.well-known/oauth-protected-resource"',
+    );
+  });
+});

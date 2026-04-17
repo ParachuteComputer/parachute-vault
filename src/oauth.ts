@@ -44,7 +44,15 @@ export interface AuthorizePostOptions {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function getBaseUrl(req: Request): string {
+/**
+ * Public-facing base URL of the server. Honors `x-forwarded-*` headers so a
+ * Cloudflare Tunnel / Tailscale Funnel / reverse-proxied deployment advertises
+ * the right external origin in discovery documents (RFC 8414, RFC 9728).
+ *
+ * Exported so the router can build `WWW-Authenticate` challenge headers that
+ * point at the same origin as the `/.well-known/*` metadata documents.
+ */
+export function getBaseUrl(req: Request): string {
   const forwardedHost = req.headers.get("x-forwarded-host");
   const forwardedProto = req.headers.get("x-forwarded-proto");
   if (forwardedHost) {
