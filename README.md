@@ -1,10 +1,12 @@
 # Parachute Vault
 
-A self-hosted knowledge graph for AI agents. Notes, tags, links — exposed over MCP. Any AI gets a personal knowledge vault in one command.
+**Parachute Vault is a self-hosted knowledge graph that any AI can read and write, over the open [MCP](https://modelcontextprotocol.io) protocol.** Your notes, tags, links, and attachments live on your machine — in plain SQLite databases under `~/.parachute/`, not in a vendor's cloud.
+
+Works with Claude, ChatGPT, Gemini, or any future MCP-capable AI. Switch tools without losing your knowledge. No vendor lock-in, no re-import step when the next model lands. One command to install; one OAuth consent to connect each AI client.
 
 ## Quick start
 
-Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
+Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`) and macOS 13+ or Linux. No root needed — see [Requirements](#requirements) below for specifics.
 
 ```bash
 # Install globally (registers the `parachute` CLI)
@@ -366,7 +368,7 @@ On Linux, scheduled runs via systemd timers are a follow-up; for now `parachute 
 Serve notes as clean HTML pages at `/view/:noteId`:
 
 - **Without auth**: only serves notes tagged `published` (or with `metadata.published: true`). Returns 404 for unpublished notes.
-- **With auth**: serves any note. Pass API key via `Authorization: Bearer pvk_...` header or `?key=pvk_...` query param.
+- **With auth**: serves any note. Pass your token via `Authorization: Bearer pvt_...` header or `?key=pvt_...` query param.
 - **Custom tag**: set `published_tag` in vault.yaml to use a different tag name (default: `publish`).
 
 ```yaml
@@ -542,7 +544,7 @@ sudo cloudflared service install
 sudo systemctl start cloudflared
 ```
 
-Then in Claude Desktop: Settings → Integrations → Add MCP → `https://vault.yourdomain.com/mcp` with `Authorization: Bearer pvk_...`.
+Then point any client at `https://vault.yourdomain.com/vaults/{name}/mcp` (or `https://vault.yourdomain.com/mcp` for a single-vault deployment). See [Connecting a client → Claude Desktop (OAuth)](#claude-desktop-oauth) — the flow is identical to the local case once the URL is remote; the browser-based OAuth handshake makes the connection without pasting a bearer token.
 
 ### Remote access via Tailscale Funnel
 
@@ -588,9 +590,11 @@ docker compose up -d
 
 ## Requirements
 
-- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`
-- macOS (launchd) or Linux (systemd) for background daemon
-- [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for remote access (optional)
+- **Bun** — `curl -fsSL https://bun.sh/install | bash` ([bun.sh](https://bun.sh)).
+- **macOS 13+** (launchd user agent) **or Linux** (systemd user service; other init systems work if you start the server yourself).
+- **No root / sudo required** — `vault init` writes to your user home (`~/.parachute/`) and registers the daemon in your user scope only. Never touches system paths or global services.
+- **Not supported on Windows natively.** WSL2 hasn't been tested; file an issue if you try it and want it to work.
+- Optional, for remote access: [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) (Cloudflare Tunnel) or [Tailscale](https://tailscale.com) — see [Deployment](#deployment).
 
 ## License
 
