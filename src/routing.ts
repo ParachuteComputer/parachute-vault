@@ -49,7 +49,48 @@ import {
   handleAuthorizeGet,
   handleAuthorizePost,
   handleToken,
+  getBaseUrl,
 } from "./oauth.ts";
+
+/**
+ * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
+ * header pointing at the matching protected-resource metadata document.
+ *
+ * An MCP-capable OAuth client that receives a plain 401 has no structured way
+ * to discover which authorization server to use, and SDKs that follow RFC 9728
+ * (including Claude Code's) default to probing the *root* `/.well-known/oauth-
+ * protected-resource`. That document advertises `resource: <base>/mcp` — which
+ * then fails the SDK's strict resource-URL match when the client is actually
+ * connecting to `/vaults/{name}/mcp`. The `WWW-Authenticate` header tells the
+ * client exactly which metadata document applies to the endpoint it just hit,
+ * closing the mismatch.
+ *
+ * Scoped calls pass `vaultName`; unscoped omits it. Other 401-emitting
+ * endpoints (`/api/*`, `/vaults`, `/health` when authenticated) are not MCP
+ * resources and intentionally do not carry this header.
+ */
+function mcpWwwAuthenticate(req: Request, vaultName?: string): string {
+  const base = getBaseUrl(req);
+  const prefix = vaultName ? `/vaults/${vaultName}` : "";
+  return `Bearer resource_metadata="${base}${prefix}/.well-known/oauth-protected-resource"`;
+}
+
+/**
+ * Clone a 401 Response and attach the `WWW-Authenticate` challenge header.
+ * The auth module returns a fully-baked `Response`, and headers on a consumed
+ * `Response` can't be mutated in place; cloning is the cheap path.
+ */
+async function withMcpChallenge(
+  res: Response,
+  req: Request,
+  vaultName?: string,
+): Promise<Response> {
+  if (res.status !== 401) return res;
+  const body = await res.text();
+  const headers = new Headers(res.headers);
+  headers.set("WWW-Authenticate", mcpWwwAuthenticate(req, vaultName));
+  return new Response(body, { status: 401, headers });
+}
 
 /**
  * Check if a /view request has a valid API key (header or ?key= query param).
@@ -134,7 +175,7 @@ export async function route(
   // Unified MCP (all vaults, global auth)
   if (path === "/mcp" || path.startsWith("/mcp/")) {
     const auth = authenticateGlobalRequest(req);
-    if ("error" in auth) return auth.error;
+    if ("error" in auth) return withMcpChallenge(auth.error, req);
     return handleUnifiedMcp(req, auth);
   }
 
@@ -308,13 +349,20 @@ export async function route(
     return handleAuthorizationServer(req, vaultName);
   }
 
-  // Auth: per-vault key OR global key
+  // Auth: per-vault key OR global key.
+  // The auth check is shared between the scoped MCP branch and the scoped
+  // /api/* branches, so we can't unconditionally attach the MCP-only
+  // WWW-Authenticate challenge here — we pass the challenge back only when
+  // the failing request was actually targeting /vaults/{name}/mcp.
   const store = getVaultStore(vaultName);
   const auth = authenticateVaultRequest(req, vaultConfig, store.db);
-  if ("error" in auth) return auth.error;
+  const isScopedMcp = subpath === "/mcp" || subpath.startsWith("/mcp/");
+  if ("error" in auth) {
+    return isScopedMcp ? withMcpChallenge(auth.error, req, vaultName) : auth.error;
+  }
 
   // Per-vault scoped MCP
-  if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
+  if (isScopedMcp) {
     return handleScopedMcp(req, vaultName, auth);
   }
 
