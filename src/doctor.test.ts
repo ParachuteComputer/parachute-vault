@@ -100,6 +100,53 @@ describe("vault uninstall", () => {
     expect(existsSync(envFile)).toBe(false);
   });
 
+  test("--yes --wipe removes config.yaml and daemon logs alongside vaults + .env", async () => {
+    // Regression: the help text advertised "vaults + .env" but config.yaml,
+    // vault.log, and vault.err were being left behind. `uninstall --wipe`
+    // should fully reset ~/.parachute, or the next `init` picks up stale
+    // state (in particular a stale config.yaml port). Keep this test in
+    // sync with the path list in cmdUninstall and the usage help.
+    const vaultsDir = join(dir, "vaults");
+    const envFile = join(dir, ".env");
+    const configYaml = join(dir, "config.yaml");
+    const logFile = join(dir, "vault.log");
+    const errFile = join(dir, "vault.err");
+    mkdirSync(vaultsDir, { recursive: true });
+    writeFileSync(join(vaultsDir, "marker"), "doomed");
+    writeFileSync(envFile, "PORT=1940\n");
+    writeFileSync(configYaml, "port: 1940\n");
+    writeFileSync(logFile, "some log\n");
+    writeFileSync(errFile, "some err\n");
+
+    const res = runCli(["uninstall", "--yes", "--wipe"], dir);
+    expect(res.exitCode).toBe(0);
+
+    const { existsSync } = await import("fs");
+    expect(existsSync(vaultsDir)).toBe(false);
+    expect(existsSync(envFile)).toBe(false);
+    expect(existsSync(configYaml)).toBe(false);
+    expect(existsSync(logFile)).toBe(false);
+    expect(existsSync(errFile)).toBe(false);
+  });
+
+  test("--yes --wipe prints a destructive-wipe audit line before acting", async () => {
+    // `--yes --wipe` bypasses both interactive confirms. It must not be
+    // silent: a scripted uninstaller should leave one grep-able line in
+    // stdout documenting the destructive run (ISO timestamp + target paths).
+    writeFileSync(join(dir, ".env"), "PORT=1940\n");
+
+    const res = runCli(["uninstall", "--yes", "--wipe"], dir);
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toMatch(/scripted destructive wipe/);
+    // ISO-8601 timestamp shape (year-month-dayTtime). Loose enough to
+    // avoid flaking on sub-second precision differences.
+    expect(res.stdout).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    // Targets should be enumerated by path.
+    expect(res.stdout).toMatch(/vaults/);
+    expect(res.stdout).toMatch(/\.env/);
+    expect(res.stdout).toMatch(/config\.yaml/);
+  });
+
   test("answering 'no' at the prompt does not touch daemon/filesystem", async () => {
     // Set up a fake install: wrapper + pointer in the temp PARACHUTE_HOME.
     const wrapper = join(dir, "start.sh");

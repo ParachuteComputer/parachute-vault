@@ -38,6 +38,7 @@ import {
   ENV_PATH,
   LOG_PATH,
   ERR_PATH,
+  GLOBAL_CONFIG_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
 import { VAULTS_DIR } from "./config.ts";
@@ -929,9 +930,20 @@ async function cmdUninstall(argsList: string[]) {
   console.log("Parachute Vault uninstall\n");
   console.log("This removes the daemon registration and wrapper script.");
   if (wipe) {
-    console.log("`--wipe` will ALSO remove vaults (SQLite DBs) and .env.\n");
+    console.log("`--wipe` will ALSO remove vaults, .env, config.yaml, and daemon logs.\n");
   } else {
     console.log("User data (~/.parachute/vaults, ~/.parachute/.env) is left alone.\n");
+  }
+
+  // Scripted `--yes --wipe` bypasses both interactive confirms. That's the
+  // intended contract for unattended uninstalls, but it should not be
+  // silent — print a single audit line so logs show when a destructive
+  // wipe ran and which paths it targeted. Non-interactive callers won't
+  // miss this; interactive users already see the prompts.
+  if (skipPrompts && wipe) {
+    const ts = new Date().toISOString();
+    const targets = [VAULTS_DIR, ENV_PATH, GLOBAL_CONFIG_PATH, LOG_PATH, ERR_PATH].join(", ");
+    console.log(`[${ts}] scripted destructive wipe: ${targets}`);
   }
 
   if (!skipPrompts) {
@@ -967,14 +979,25 @@ async function cmdUninstall(argsList: string[]) {
   // NO so a distracted Enter-presser can't lose their vault. `--yes`
   // explicitly opts into the destructive path for scripted uninstalls.
   if (wipe) {
+    // Inventory what's actually on disk. Paths that don't exist are a
+    // silent no-op on removal, but we also skip listing them so the
+    // "would be removed" summary doesn't lie to the user.
     const vaultsExist = existsSync(VAULTS_DIR);
     const envExists = existsSync(ENV_PATH);
-    if (!vaultsExist && !envExists) {
+    const configExists = existsSync(GLOBAL_CONFIG_PATH);
+    const logExists = existsSync(LOG_PATH);
+    const errExists = existsSync(ERR_PATH);
+
+    const anyExist = vaultsExist || envExists || configExists || logExists || errExists;
+    if (!anyExist) {
       console.log("No user data to remove.");
     } else {
       console.log("\nUser data that would be removed:");
       if (vaultsExist) console.log(`  ${VAULTS_DIR} (SQLite vaults)`);
       if (envExists) console.log(`  ${ENV_PATH} (.env config + secrets)`);
+      if (configExists) console.log(`  ${GLOBAL_CONFIG_PATH} (global config)`);
+      if (logExists) console.log(`  ${LOG_PATH} (daemon log)`);
+      if (errExists) console.log(`  ${ERR_PATH} (daemon error log)`);
 
       // Default to NO on the wipe confirm — this is the "don't lose a
       // vault to muscle memory" guard. `--yes` is an explicit opt-in to
@@ -986,6 +1009,9 @@ async function cmdUninstall(argsList: string[]) {
       if (doWipe) {
         if (vaultsExist) rmSync(VAULTS_DIR, { recursive: true, force: true });
         if (envExists) rmSync(ENV_PATH, { force: true });
+        if (configExists) rmSync(GLOBAL_CONFIG_PATH, { force: true });
+        if (logExists) rmSync(LOG_PATH, { force: true });
+        if (errExists) rmSync(ERR_PATH, { force: true });
         console.log("User data removed.");
       } else {
         console.log("Kept user data.");
@@ -1356,7 +1382,8 @@ Setup:
   parachute vault status                   Check what's running
   parachute vault doctor                   Diagnose install/config issues
   parachute vault uninstall [--wipe] [--yes]
-                                           Remove daemon + MCP entry; --wipe also removes vaults + .env.
+                                           Remove daemon + MCP entry; --wipe also removes vaults, .env,
+                                           config.yaml, and daemon logs (vault.log, vault.err).
                                            --yes skips prompts (DANGEROUS with --wipe: no confirmation).
   parachute vault url                      Print the local server URL (for scripts)
 
