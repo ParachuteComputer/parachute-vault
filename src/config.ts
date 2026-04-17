@@ -194,19 +194,56 @@ export interface LocalBackupDestination {
 
 export type BackupDestination = LocalBackupDestination;
 
+/**
+ * Tiered (grandfather-father-son) retention policy. After each backup we keep
+ * the union of four tier queries:
+ *
+ *   daily   — the N most recent snapshots (unconditionally).
+ *   weekly  — one snapshot per ISO week, for the N most recent such weeks.
+ *   monthly — one snapshot per calendar month, for the N most recent months.
+ *   yearly  — one snapshot per calendar year; `null` means keep every year
+ *             (never prune by age — the long-tail archive).
+ *
+ * A tier set to 0 is disabled (it contributes no keepers, but the other tiers
+ * still apply). All bucketing uses the local timezone so calendar alignment
+ * matches the user's expectations, not UTC.
+ */
+export interface RetentionPolicy {
+  /** Keep the last N daily snapshots. 0 disables the daily tier. */
+  daily: number;
+  /** Keep the last snapshot from each of the last N ISO weeks. 0 disables. */
+  weekly: number;
+  /** Keep the last snapshot from each of the last N months. 0 disables. */
+  monthly: number;
+  /**
+   * Keep the last snapshot from each of the last N years. `null` or `undefined`
+   * means unbounded — keep one snapshot per year, forever, across the full
+   * history. 0 disables the yearly tier entirely.
+   */
+  yearly: number | null;
+}
+
 export interface BackupConfig {
   /** How often the scheduler fires. "manual" = scheduler is not registered. */
   schedule: BackupSchedule;
-  /** Keep the most recent N snapshots per destination; older are pruned. */
-  retention: number;
+  /** Tiered retention policy — grandfather/father/son. */
+  retention: RetentionPolicy;
   /** Pluggable destinations. Runs in order; a destination error logs + continues. */
   destinations: BackupDestination[];
+}
+
+export function defaultRetentionPolicy(): RetentionPolicy {
+  // Defaults balance "I want to roll back yesterday's accidental delete"
+  // against "my iCloud folder shouldn't blow up in a year." The yearly tier
+  // is unbounded by default — the whole point of the tiered policy is that
+  // one-per-year is cheap forever.
+  return { daily: 7, weekly: 4, monthly: 12, yearly: null };
 }
 
 export function defaultBackupConfig(): BackupConfig {
   return {
     schedule: "manual",
-    retention: 14,
+    retention: defaultRetentionPolicy(),
     destinations: [],
   };
 }
@@ -510,7 +547,11 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
  * Shape:
  *   backup:
  *     schedule: daily
- *     retention: 14
+ *     retention:
+ *       daily: 7
+ *       weekly: 4
+ *       monthly: 12
+ *       yearly: null       # or omit for unbounded; 0 disables the tier
  *     destinations:
  *       - kind: local
  *         path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
@@ -523,9 +564,14 @@ function parseBackup(yaml: string): BackupConfig | undefined {
   const lines = yaml.slice(startIdx).split("\n");
 
   const backup: BackupConfig = defaultBackupConfig();
-  let section: "top" | "destinations" = "top";
+  let section: "top" | "retention" | "destinations" = "top";
   let currentDest: Partial<BackupDestination> & { kind?: string } = {};
   let hasDest = false;
+  // Track whether the user supplied a retention block at all. If they did,
+  // we start from a clean slate (all tiers default 0, yearly null) so that
+  // an explicit partial policy overrides defaults rather than merging with
+  // them — predictable semantics beat magical merging.
+  let retentionSeen = false;
 
   const pushDest = () => {
     if (!hasDest) return;
@@ -547,13 +593,33 @@ function parseBackup(yaml: string): BackupConfig | undefined {
 
     const trimmed = line.trim();
 
-    // Section header: `destinations:` at 2-space indent.
-    if (/^destinations:\s*$/.test(trimmed)) {
-      section = "destinations";
-      continue;
+    // A 2-space-indented line starting a new sub-section closes the previous
+    // section. The only 2-space keys under `backup:` today are `schedule`,
+    // `retention`, and `destinations`, so we key off indent depth here.
+    const indent = line.match(/^ */)?.[0].length ?? 0;
+
+    if (indent === 2) {
+      if (/^retention:\s*$/.test(trimmed)) {
+        section = "retention";
+        retentionSeen = true;
+        // Zero-out tiers so partially specified blocks don't silently merge
+        // with defaults in surprising ways.
+        backup.retention = { daily: 0, weekly: 0, monthly: 0, yearly: 0 };
+        continue;
+      }
+      if (/^destinations:\s*$/.test(trimmed)) {
+        pushDest();
+        section = "destinations";
+        continue;
+      }
+      // Any other 2-space top field terminates the current sub-section.
+      if (section !== "top") {
+        pushDest();
+        section = "top";
+      }
     }
 
-    if (section === "top") {
+    if (section === "top" && indent === 2) {
       const schedMatch = trimmed.match(/^schedule:\s*(\S+)/);
       if (schedMatch) {
         const v = schedMatch[1];
@@ -562,10 +628,25 @@ function parseBackup(yaml: string): BackupConfig | undefined {
         }
         continue;
       }
-      const retMatch = trimmed.match(/^retention:\s*(\d+)/);
-      if (retMatch) {
-        const n = parseInt(retMatch[1], 10);
-        if (Number.isFinite(n) && n >= 1) backup.retention = n;
+    }
+
+    if (section === "retention" && indent === 4) {
+      const tierMatch = trimmed.match(/^(daily|weekly|monthly|yearly):\s*(\S+)/);
+      if (tierMatch) {
+        const tier = tierMatch[1] as keyof RetentionPolicy;
+        const raw = tierMatch[2].trim();
+        // "null" / "~" / "unbounded" all mean "keep every year" for the
+        // yearly tier. For the other tiers they'd be meaningless; we
+        // silently treat them as disabled (0) rather than erroring.
+        if (raw === "null" || raw === "~" || raw === "unbounded") {
+          if (tier === "yearly") backup.retention.yearly = null;
+          // Other tiers stay at 0.
+          continue;
+        }
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n >= 0) {
+          backup.retention[tier] = n as never;
+        }
         continue;
       }
     }
@@ -590,6 +671,11 @@ function parseBackup(yaml: string): BackupConfig | undefined {
   }
   pushDest();
 
+  // If the user left retention out entirely, fall back to the shipped default.
+  if (!retentionSeen) {
+    backup.retention = defaultRetentionPolicy();
+  }
+
   return backup;
 }
 
@@ -597,7 +683,13 @@ function serializeBackup(backup: BackupConfig): string[] {
   const lines: string[] = [];
   lines.push("backup:");
   lines.push(`  schedule: ${backup.schedule}`);
-  lines.push(`  retention: ${backup.retention}`);
+  lines.push("  retention:");
+  lines.push(`    daily: ${backup.retention.daily}`);
+  lines.push(`    weekly: ${backup.retention.weekly}`);
+  lines.push(`    monthly: ${backup.retention.monthly}`);
+  // `null` is serialized as the YAML literal `null` so round-trips preserve
+  // "unbounded." Numbers render as-is, including 0 (disabled).
+  lines.push(`    yearly: ${backup.retention.yearly === null ? "null" : backup.retention.yearly}`);
   if (backup.destinations.length > 0) {
     lines.push("  destinations:");
     for (const dest of backup.destinations) {

@@ -34,12 +34,15 @@ import {
   stageSnapshot,
   assembleTarball,
   pruneRetention,
+  computeKeepSet,
+  listSnapshots,
+  tierTally,
   runBackup,
   readLastBackup,
   nextRunEstimate,
   checkDestinationWritable,
 } from "./backup.ts";
-import type { BackupConfig } from "./config.ts";
+import type { BackupConfig, RetentionPolicy } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -110,43 +113,168 @@ describe("backup — pure helpers", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Retention pruning
+// Tiered retention pruning (grandfather / father / son)
 // ---------------------------------------------------------------------------
 
-describe("backup — retention pruning", () => {
+/**
+ * Touch a synthetic snapshot file with the given Date as its embedded
+ * timestamp. We produce a filename in the exact format runBackup would
+ * produce so the parse/bucket pipeline sees a realistic input.
+ */
+function makeSnapshot(dir: string, d: Date): string {
+  const name = backupFilename(d.toISOString());
+  writeFileSync(join(dir, name), "x");
+  return name;
+}
+
+/** Build a dense sequence of daily snapshots across a UTC date range. */
+function dailySnapshots(dir: string, startUtc: string, days: number): Date[] {
+  const start = new Date(startUtc);
+  const out: Date[] = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(start.getTime() + i * 86400_000);
+    // Fix to 12:00 UTC so every timestamp lands in the middle of the day —
+    // avoids local-midnight edge cases in test assertions.
+    d.setUTCHours(12, 0, 0, 0);
+    makeSnapshot(dir, d);
+    out.push(d);
+  }
+  return out;
+}
+
+/** Full policy: helper so tests read naturally. */
+function policy(p: Partial<RetentionPolicy>): RetentionPolicy {
+  return { daily: 0, weekly: 0, monthly: 0, yearly: 0, ...p };
+}
+
+describe("backup — tiered retention pruning", () => {
   let dir: string;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "backup-prune-")); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  test("keeps the N most recent by filename timestamp", () => {
-    // Create 5 backup files with monotonically later timestamps. The
-    // ISO-with-hyphens format sorts lexicographically, so we can rely on
-    // alphabetical ordering to match chronology.
-    const stamps = [
-      "2026-01-01T00-00-00.000Z",
-      "2026-02-01T00-00-00.000Z",
-      "2026-03-01T00-00-00.000Z",
-      "2026-04-01T00-00-00.000Z",
-      "2026-05-01T00-00-00.000Z",
-    ];
-    for (const s of stamps) {
-      writeFileSync(join(dir, `parachute-backup-${s}.tar.gz`), "x");
-    }
-    const pruned = pruneRetention(dir, 3);
-    expect(pruned).toBe(2);
-    const left = readdirSync(dir).sort();
-    expect(left).toEqual([
-      "parachute-backup-2026-03-01T00-00-00.000Z.tar.gz",
-      "parachute-backup-2026-04-01T00-00-00.000Z.tar.gz",
-      "parachute-backup-2026-05-01T00-00-00.000Z.tar.gz",
-    ]);
+  test("daily tier: keeps last N snapshots unconditionally", () => {
+    // 10 consecutive days, keep daily=3 — the 3 most recent survive.
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 10);
+    const pruned = pruneRetention(dir, policy({ daily: 3 }));
+    expect(pruned).toBe(7);
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+    expect(left.length).toBe(3);
+    // Chronological order: last 3 days are Jan 8, 9, 10.
+    expect(left[0]).toMatch(/2026-01-08T/);
+    expect(left[2]).toMatch(/2026-01-10T/);
   });
 
-  test("no-op when fewer files than retention", () => {
-    writeFileSync(join(dir, `parachute-backup-2026-01-01T00-00-00.000Z.tar.gz`), "x");
-    const pruned = pruneRetention(dir, 14);
+  test("daily: 0 disables tier but other tiers still apply", () => {
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 30);
+    // Only the monthly tier: one snapshot from January kept (the last),
+    // everything else pruned.
+    pruneRetention(dir, policy({ monthly: 1 }));
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+    expect(left.length).toBe(1);
+    expect(left[0]).toMatch(/2026-01-30T/);
+  });
+
+  test("weekly tier: one snapshot per ISO week, N most recent weeks", () => {
+    // 4 weeks of daily snapshots — 28 entries across 4 weeks plus overflow.
+    dailySnapshots(dir, "2026-01-05T00:00:00Z", 28); // Mon Jan 5 → Sun Feb 1
+    // Weekly=2 alone: keep last-of-week for the last 2 ISO weeks only.
+    pruneRetention(dir, policy({ weekly: 2 }));
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+    // 2 survivors: the Sunday of each of the two most recent weeks.
+    expect(left.length).toBe(2);
+  });
+
+  test("monthly tier: last snapshot of each of N months", () => {
+    // One snapshot per day across 3 full months.
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 90);
+    pruneRetention(dir, policy({ monthly: 2 }));
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+    expect(left.length).toBe(2);
+    // Last-of-Feb (Feb 28, 2026 — not leap year) and last-of-Mar (Mar 31).
+    expect(left[0]).toMatch(/2026-02-28T/);
+    expect(left[1]).toMatch(/2026-03-31T/);
+  });
+
+  test("yearly: null means unbounded — keeps last-of-year for every year in history", () => {
+    // One snapshot per year across 5 years. Every year survives because
+    // yearly is null.
+    for (const y of [2022, 2023, 2024, 2025, 2026]) {
+      makeSnapshot(dir, new Date(Date.UTC(y, 5, 15, 12, 0, 0)));
+    }
+    const pruned = pruneRetention(dir, policy({ yearly: null }));
     expect(pruned).toBe(0);
-    expect(readdirSync(dir).length).toBe(1);
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+    expect(left.length).toBe(5);
+  });
+
+  test("sparse data: alternate-day snapshots across 3 years, full policy", () => {
+    // Build roughly 550 snapshots spread every other day across three years.
+    // The union tier selection should degrade gracefully across the gaps.
+    const entries: Date[] = [];
+    for (let y = 2024; y <= 2026; y++) {
+      for (let day = 0; day < 365; day += 2) {
+        const d = new Date(Date.UTC(y, 0, 1 + day, 12, 0, 0));
+        makeSnapshot(dir, d);
+        entries.push(d);
+      }
+    }
+    // The full default-shaped policy with unbounded yearly.
+    pruneRetention(dir, policy({ daily: 7, weekly: 4, monthly: 12, yearly: null }));
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+
+    // Assertions — exact membership:
+    //  - daily: the last 7 entries in the ascending list.
+    //  - weekly: at most 4 weeks; each contributes one keeper.
+    //  - monthly: the 12 most recent calendar months with data.
+    //  - yearly (null): every year with data — 2024, 2025, 2026 → 3 keepers
+    //    (some of which overlap with the monthly/daily tiers; union dedupes).
+    // A loose but informative check: the keep count falls well under the
+    // full 550-ish and comfortably above the bare daily=7.
+    expect(left.length).toBeGreaterThanOrEqual(7);
+    // Union of tiers cannot exceed: 7 daily + 4 weekly + 12 monthly + 3 yearly
+    // = 26 at the absolute upper bound, minus overlap. We just bound it here.
+    expect(left.length).toBeLessThanOrEqual(26);
+
+    // At least one keeper per year — the yearly tier guarantees this.
+    const years = new Set(
+      left.map((n) => n.match(/parachute-backup-(\d{4})-/)?.[1]).filter(Boolean),
+    );
+    expect(years.has("2024")).toBe(true);
+    expect(years.has("2025")).toBe(true);
+    expect(years.has("2026")).toBe(true);
+
+    // The most recent snapshot is always kept (it's in the daily tier).
+    const mostRecent = backupFilename(entries[entries.length - 1].toISOString());
+    expect(left).toContain(mostRecent);
+  });
+
+  test("year-boundary overlap: Dec 31 vs Jan 1 land in different yearly buckets", () => {
+    // Snapshots on two consecutive days straddling the year boundary.
+    // The yearly tier should keep BOTH — one for each year.
+    makeSnapshot(dir, new Date(Date.UTC(2025, 11, 31, 12, 0, 0))); // Dec 31 2025
+    makeSnapshot(dir, new Date(Date.UTC(2026, 0, 1, 12, 0, 0))); // Jan 1 2026
+    pruneRetention(dir, policy({ yearly: null }));
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).sort();
+    expect(left.length).toBe(2);
+  });
+
+  test("end-of-week rollover: Sunday and Monday cross ISO-week boundary", () => {
+    // 2026-01-04 is Sun (ISO week 1), 2026-01-05 is Mon (ISO week 2).
+    // Weekly=2 should keep one from each week. Noon UTC → most timezones
+    // put both on the expected local calendar day.
+    const sun = new Date(Date.UTC(2026, 0, 4, 12, 0, 0));
+    const mon = new Date(Date.UTC(2026, 0, 5, 12, 0, 0));
+    makeSnapshot(dir, sun);
+    makeSnapshot(dir, mon);
+    const keep = computeKeepSet(listSnapshots(dir), policy({ weekly: 2 }));
+    expect(keep.size).toBe(2);
+  });
+
+  test("no-op when every snapshot is kept by some tier", () => {
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 5);
+    const pruned = pruneRetention(dir, policy({ daily: 7 }));
+    expect(pruned).toBe(0);
+    expect(readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).length).toBe(5);
   });
 
   test("ignores non-backup files in the destination directory", () => {
@@ -154,13 +282,49 @@ describe("backup — retention pruning", () => {
     // sync dir. Retention must only touch parachute-backup-*.tar.gz.
     writeFileSync(join(dir, ".DS_Store"), "x");
     writeFileSync(join(dir, "README.md"), "x");
-    writeFileSync(join(dir, "parachute-backup-2026-01-01T00-00-00.000Z.tar.gz"), "x");
-    writeFileSync(join(dir, "parachute-backup-2026-02-01T00-00-00.000Z.tar.gz"), "x");
-    const pruned = pruneRetention(dir, 1);
-    expect(pruned).toBe(1);
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 5);
+    pruneRetention(dir, policy({ daily: 1 }));
     // The non-backup files are untouched.
     expect(existsSync(join(dir, ".DS_Store"))).toBe(true);
     expect(existsSync(join(dir, "README.md"))).toBe(true);
+    // Only 1 backup file survives.
+    expect(readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).length).toBe(1);
+  });
+
+  test("all tiers 0 / null yearly=0: everything pruned", () => {
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 5);
+    const pruned = pruneRetention(dir, policy({}));
+    expect(pruned).toBe(5);
+    expect(readdirSync(dir).filter((n) => n.startsWith("parachute-backup-")).length).toBe(0);
+  });
+
+  test("a snapshot satisfying multiple tiers is kept once, not duplicated", () => {
+    // A single snapshot at year-end/month-end/week-end satisfies all four
+    // tiers. Deletion count is 0, on-disk count stays at 1.
+    makeSnapshot(dir, new Date(Date.UTC(2026, 11, 31, 12, 0, 0)));
+    const pruned = pruneRetention(dir, policy({ daily: 7, weekly: 4, monthly: 12, yearly: null }));
+    expect(pruned).toBe(0);
+    const left = readdirSync(dir).filter((n) => n.startsWith("parachute-backup-"));
+    expect(left.length).toBe(1);
+  });
+});
+
+describe("backup — tierTally", () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "backup-tally-")); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test("reports per-tier contribution counts for `backup status`", () => {
+    dailySnapshots(dir, "2026-01-01T00:00:00Z", 60);
+    const t = tierTally(dir, policy({ daily: 7, weekly: 4, monthly: 2, yearly: null }));
+    expect(t.total).toBe(60);
+    expect(t.daily).toBe(7);
+    // 60 daily snapshots span ~9 ISO weeks; cap at 4.
+    expect(t.weekly).toBe(4);
+    // 60 days straddles Jan + Feb + 1 day into March → monthly cap at 2.
+    expect(t.monthly).toBe(2);
+    // All 60 days are in 2026 → yearly is 1.
+    expect(t.yearly).toBe(1);
   });
 });
 
@@ -309,7 +473,7 @@ describe("backup — runBackup end-to-end", () => {
 
     const cfg: BackupConfig = {
       schedule: "manual",
-      retention: 14,
+      retention: { daily: 7, weekly: 4, monthly: 12, yearly: null },
       destinations: [{ kind: "local", path: destDir }],
     };
 
@@ -353,11 +517,13 @@ describe("backup — runBackup end-to-end", () => {
     expect(last!.destinations[0].path).toBe(join(destDir, expectedName));
   });
 
-  test("retention pruning: 15 runs, retention=3 leaves 3 files on disk", async () => {
+  test("retention pruning runs end-to-end: daily=3 leaves 3 most recent", async () => {
     makeFakeDb(join(home, "daily.db"), "m");
     const cfg: BackupConfig = {
       schedule: "manual",
-      retention: 3,
+      // Pure daily tier so this test stays focused on pipeline integration
+      // rather than tier bucketing (unit-tested above).
+      retention: { daily: 3, weekly: 0, monthly: 0, yearly: 0 },
       destinations: [{ kind: "local", path: destDir }],
     };
 
@@ -387,7 +553,7 @@ describe("backup — runBackup end-to-end", () => {
     // user account will reject with EACCES.
     const cfg: BackupConfig = {
       schedule: "manual",
-      retention: 14,
+      retention: { daily: 7, weekly: 4, monthly: 12, yearly: null },
       destinations: [
         { kind: "local", path: "/this/path/should/definitely/not/exist/and/be/unwritable" },
         { kind: "local", path: destDir },
@@ -488,7 +654,11 @@ describe("CLI — vault backup", () => {
         "default_vault: default",
         "backup:",
         "  schedule: manual",
-        "  retention: 14",
+        "  retention:",
+        "    daily: 7",
+        "    weekly: 4",
+        "    monthly: 12",
+        "    yearly: null",
         "  destinations:",
         "    - kind: local",
         `      path: ${destDir}`,
@@ -523,7 +693,11 @@ describe("CLI — vault backup", () => {
         "port: 1940",
         "backup:",
         "  schedule: daily",
-        "  retention: 7",
+        "  retention:",
+        "    daily: 7",
+        "    weekly: 4",
+        "    monthly: 12",
+        "    yearly: null",
         "  destinations:",
         "    - kind: local",
         `      path: ${destDir}`,
@@ -532,7 +706,8 @@ describe("CLI — vault backup", () => {
     const res = runCli(["backup", "status"], home);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toMatch(/Schedule:\s+daily/);
-    expect(res.stdout).toMatch(/Retention:\s+7/);
+    // Tiered retention line: "7 daily / 4 weekly / 12 monthly / ∞ yearly"
+    expect(res.stdout).toMatch(/Retention:\s+7 daily \/ 4 weekly \/ 12 monthly \/ ∞ yearly/);
     expect(res.stdout).toMatch(new RegExp(`local:\\s+${destDir.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}`));
     // No backup has been run yet — assert on the "never" line.
     expect(res.stdout).toMatch(/Last run:\s+\(never\)/);

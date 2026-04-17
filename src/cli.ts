@@ -50,6 +50,7 @@ import {
   updateBackupConfig,
   expandTilde,
   checkDestinationWritable,
+  tierTally,
 } from "./backup.ts";
 import {
   installBackupAgent,
@@ -1658,7 +1659,11 @@ async function cmdBackupStatus() {
 
   console.log("Parachute Vault — backup\n");
   console.log(`  Schedule:   ${cfg.schedule}`);
-  console.log(`  Retention:  ${cfg.retention} snapshot(s)`);
+  // Tiered retention is always rendered as a one-line summary; per-tier
+  // counts from real destinations go under each destination below.
+  const r = cfg.retention;
+  const yearlyStr = r.yearly === null ? "∞" : String(r.yearly);
+  console.log(`  Retention:  ${r.daily} daily / ${r.weekly} weekly / ${r.monthly} monthly / ${yearlyStr} yearly`);
 
   if (cfg.destinations.length === 0) {
     console.log(`  Destinations: (none)`);
@@ -1666,7 +1671,15 @@ async function cmdBackupStatus() {
     console.log(`  Destinations:`);
     for (const d of cfg.destinations) {
       if (d.kind === "local") {
-        console.log(`    - local: ${expandTilde(d.path)}`);
+        const path = expandTilde(d.path);
+        console.log(`    - local: ${path}`);
+        // Per-destination tier breakdown — counts the snapshots on disk and
+        // each tier's individual contribution to the keep set. A snapshot
+        // can satisfy multiple tiers, so per-tier counts may sum to > total.
+        const t = tierTally(path, cfg.retention);
+        if (t.total > 0) {
+          console.log(`        on-disk: ${t.total} snapshot(s) — ${t.daily}d / ${t.weekly}w / ${t.monthly}mo / ${t.yearly}y`);
+        }
       }
     }
   }

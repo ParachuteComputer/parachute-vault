@@ -34,8 +34,9 @@ import {
   readGlobalConfig,
   writeGlobalConfig,
   defaultBackupConfig,
+  defaultRetentionPolicy,
 } from "./config.ts";
-import type { BackupConfig, BackupDestination, BackupSchedule } from "./config.ts";
+import type { BackupConfig, BackupDestination, BackupSchedule, RetentionPolicy } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -262,7 +263,7 @@ export async function assembleTarball(stagingDir: string, outPath: string): Prom
 export async function writeToDestinations(
   tarballPath: string,
   destinations: BackupDestination[],
-  retention: number,
+  retention: RetentionPolicy,
 ): Promise<DestinationResult[]> {
   const results: DestinationResult[] = [];
   for (const dest of destinations) {
@@ -284,7 +285,7 @@ export async function writeToDestinations(
 async function writeToDestination(
   tarballPath: string,
   dest: BackupDestination,
-  retention: number,
+  retention: RetentionPolicy,
 ): Promise<DestinationResult> {
   switch (dest.kind) {
     case "local": {
@@ -305,30 +306,244 @@ async function writeToDestination(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tiered retention — grandfather / father / son
+// ---------------------------------------------------------------------------
+
 /**
- * Retention: keep the N most recent `parachute-backup-*.tar.gz` files by
- * filename timestamp (NOT file mtime — mtime is unreliable after move/sync,
- * especially under iCloud which rewrites timestamps). Returns the count
- * pruned.
+ * Parse a backup filename's timestamp component back into a Date. We wrote the
+ * timestamp as ISO-8601 with colons swapped for hyphens (for filesystem
+ * portability), so we have to swap back before handing to `new Date()`.
+ *
+ * The hyphen-for-colon swap is position-specific: the ISO-8601 date-time
+ * separator is `T`, after which there are three hyphens we introduced (HH-MM-SS)
+ * but also possibly real hyphens in the timezone offset (…+00:00 → +00-00).
+ * We undo every hyphen that appears AFTER the `T`, preserving the three
+ * leading hyphens in the YYYY-MM-DD portion.
  */
-export function pruneRetention(dir: string, keep: number): number {
+function timestampToDate(stamp: string): Date | null {
+  const tIdx = stamp.indexOf("T");
+  if (tIdx < 0) return null;
+  const head = stamp.slice(0, tIdx);
+  const tail = stamp.slice(tIdx).replace(/-/g, ":");
+  const iso = head + tail;
+  const d = new Date(iso);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+/**
+ * Bucket key for the daily tier: ISO calendar date in the local timezone
+ * (YYYY-MM-DD). We lean on `Intl.DateTimeFormat` with the system's default
+ * timezone because it handles DST transitions correctly, unlike hand-rolling
+ * with `getDate()` from a UTC Date that's been shifted by offset math.
+ */
+function localDateKey(d: Date): string {
+  // `en-CA` gives us ISO-like `YYYY-MM-DD` by default — a happy accident that
+  // saves us from assembling the pieces ourselves.
+  return new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+function localYearKey(d: Date): string {
+  return new Intl.DateTimeFormat("en-CA", { year: "numeric" }).format(d);
+}
+
+function localYearMonthKey(d: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+  }).format(d);
+}
+
+/**
+ * ISO week bucket: (ISO week year, ISO week number). We compute both in the
+ * local timezone so "end-of-week rollover" aligns with what the user sees on
+ * their calendar. The ISO week year can differ from the calendar year at
+ * year boundaries (a Dec 31 Monday belongs to next year's week 1; a Jan 1
+ * Friday belongs to last year's week 53) — we handle that with the standard
+ * "week containing the year's first Thursday is week 1" rule.
+ */
+function isoWeekKey(d: Date): string {
+  // Pull out local-tz Y/M/D so week math stays aligned to the user's calendar
+  // instead of UTC.
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const yStr = parts.find((p) => p.type === "year")?.value ?? "1970";
+  const mStr = parts.find((p) => p.type === "month")?.value ?? "01";
+  const dStr = parts.find((p) => p.type === "day")?.value ?? "01";
+  const year = parseInt(yStr, 10);
+  const month = parseInt(mStr, 10);
+  const day = parseInt(dStr, 10);
+
+  // Work in a UTC Date that carries our local Y/M/D, so further arithmetic
+  // doesn't get perturbed by DST.
+  const target = new Date(Date.UTC(year, month - 1, day));
+  // Shift target to the Thursday of its week (ISO weeks are anchored there).
+  // getUTCDay(): 0=Sun, 1=Mon, …, 6=Sat. ISO wants Mon=1, so (day+6)%7 maps
+  // Sun→6, Mon→0, …, Sat→5, which is the "days since Monday."
+  const dayNum = (target.getUTCDay() + 6) % 7;
+  target.setUTCDate(target.getUTCDate() - dayNum + 3);
+  // Week 1 is the one containing Jan 4 (equivalently, the year's first Thursday).
+  const week1 = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round(
+    ((target.getTime() - week1.getTime()) / 86400000 - 3 + ((week1.getUTCDay() + 6) % 7)) / 7,
+  );
+  const isoYear = target.getUTCFullYear();
+  // Pad week to 2 digits so string-sort matches chronological order.
+  return `${isoYear}-W${String(week).padStart(2, "0")}`;
+}
+
+export interface SnapshotEntry {
+  name: string;
+  timestamp: string;
+  date: Date;
+}
+
+/**
+ * Enumerate the `parachute-backup-*.tar.gz` files in a directory, parse each
+ * timestamp, and return them sorted ascending (oldest first) — the order we
+ * rely on for bucket-last-wins and for test determinism.
+ */
+export function listSnapshots(dir: string): SnapshotEntry[] {
+  if (!existsSync(dir)) return [];
+  const entries: SnapshotEntry[] = [];
+  for (const name of readdirSync(dir)) {
+    const parsed = parseBackupFilename(name);
+    if (!parsed) continue;
+    const d = timestampToDate(parsed.timestamp);
+    if (!d) continue;
+    entries.push({ name, timestamp: parsed.timestamp, date: d });
+  }
+  // Because our filename timestamps are lexicographically sortable, sorting
+  // by name and sorting by date yield the same order. We sort by timestamp
+  // string because it's cheaper and deterministic across clock skew.
+  entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  return entries;
+}
+
+/**
+ * Compute the subset of snapshots that the tiered policy keeps. Public for
+ * testability — `pruneRetention` is the mutating variant.
+ *
+ * Algorithm:
+ *   1. Group entries by bucket key for each tier (daily / weekly / monthly /
+ *      yearly). Since inputs are sorted ascending, the last entry overwriting
+ *      a given bucket key is the most-recent-in-bucket — exactly the one we
+ *      want to keep for that tier.
+ *   2. For weekly/monthly/yearly, take the N most recent bucket keys (or all
+ *      of them if yearly is null) and union their keepers.
+ *   3. For daily, skip the bucketing step — just keep the last N entries.
+ *   4. Return the union as a Set of filenames.
+ *
+ * A tier set to 0 contributes no keepers but doesn't disable the others.
+ * Sparse data (gaps) just means fewer buckets; no special-casing required.
+ */
+export function computeKeepSet(
+  entries: SnapshotEntry[],
+  policy: RetentionPolicy,
+): Set<string> {
+  const keep = new Set<string>();
+
+  // Daily: take the last N entries outright. No bucketing by day needed;
+  // if two backups land on the same day, they both count toward the daily
+  // tier's "last N" — this is the intuitive "keep my 7 most recent" promise.
+  if (policy.daily > 0) {
+    for (const entry of entries.slice(-policy.daily)) keep.add(entry.name);
+  }
+
+  // Weekly / monthly / yearly — all follow the same pattern: bucket by key,
+  // take the most recent entry per bucket, then cap to the N most recent
+  // buckets. Implemented once here with a small helper to avoid drift.
+  const tierByBucket = (
+    keyFn: (d: Date) => string,
+    limit: number | null,
+  ) => {
+    if (limit === 0) return;
+    const buckets = new Map<string, SnapshotEntry>();
+    for (const entry of entries) {
+      // Last-write-wins: because entries are sorted ascending, the final
+      // overwrite for a given key IS the most recent entry in that bucket.
+      buckets.set(keyFn(entry.date), entry);
+    }
+    // Sort bucket keys descending (most recent first) then cap. Our keys
+    // are all lex-sortable (ISO-like), so string compare == chronological.
+    const keysDesc = [...buckets.keys()].sort().reverse();
+    const chosen = limit === null ? keysDesc : keysDesc.slice(0, limit);
+    for (const k of chosen) keep.add(buckets.get(k)!.name);
+  };
+
+  tierByBucket(isoWeekKey, policy.weekly);
+  tierByBucket(localYearMonthKey, policy.monthly);
+  tierByBucket(localYearKey, policy.yearly);
+
+  return keep;
+}
+
+/**
+ * Per-tier breakdown of a destination's current keep set — how many snapshots
+ * each tier contributes. Sums are with respect to the un-pruned contents of
+ * `dir` (i.e., snapshot-of-current-state, not "what would we prune next"),
+ * which is what `backup status` wants to render.
+ *
+ * `total` is the number of snapshot files present on disk. Per-tier counts
+ * sum to the size of the union; because a single snapshot can satisfy
+ * multiple tiers, they can sum to more than `total`.
+ */
+export interface TierTally {
+  total: number;
+  daily: number;
+  weekly: number;
+  monthly: number;
+  yearly: number;
+}
+
+export function tierTally(dir: string, policy: RetentionPolicy): TierTally {
+  const entries = listSnapshots(dir);
+  const total = entries.length;
+  // Re-run each tier in isolation to count its individual contribution.
+  // Tiny N (usually < 100 snapshots), so the duplicated bucketing is fine.
+  const isolate = (tier: Partial<RetentionPolicy>): number => {
+    const p: RetentionPolicy = { daily: 0, weekly: 0, monthly: 0, yearly: 0, ...tier };
+    return computeKeepSet(entries, p).size;
+  };
+  return {
+    total,
+    daily: isolate({ daily: policy.daily }),
+    weekly: isolate({ weekly: policy.weekly }),
+    monthly: isolate({ monthly: policy.monthly }),
+    yearly: isolate({ yearly: policy.yearly }),
+  };
+}
+
+/**
+ * Tiered retention: keep the union of daily/weekly/monthly/yearly tiers,
+ * delete everything else. Returns the number of files deleted.
+ *
+ * Uses filename-embedded timestamps (NOT file mtime — mtime is unreliable
+ * after move/sync, especially under iCloud which rewrites timestamps).
+ */
+export function pruneRetention(dir: string, policy: RetentionPolicy): number {
   if (!existsSync(dir)) return 0;
-  const entries = readdirSync(dir).filter((n) => parseBackupFilename(n) !== null);
-  // Lexicographic sort works because our timestamp format is ISO8601 with
-  // colons replaced by hyphens — still left-padded and zero-aligned.
-  entries.sort();
-  const excess = entries.length - keep;
-  if (excess <= 0) return 0;
-  const doomed = entries.slice(0, excess);
-  for (const name of doomed) {
+  const entries = listSnapshots(dir);
+  const keep = computeKeepSet(entries, policy);
+  let deleted = 0;
+  for (const entry of entries) {
+    if (keep.has(entry.name)) continue;
     try {
-      rmSync(join(dir, name));
+      rmSync(join(dir, entry.name));
+      deleted++;
     } catch {
       // Prune failure is non-fatal; we'd rather keep making new backups
       // than abort because one stale file is locked.
     }
   }
-  return doomed.length;
+  return deleted;
 }
 
 // ---------------------------------------------------------------------------

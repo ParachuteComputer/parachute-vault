@@ -185,11 +185,26 @@ Configure destinations in `~/.parachute/config.yaml`:
 ```yaml
 backup:
   schedule: daily       # hourly | daily | weekly | manual
-  retention: 14         # keep the N most recent snapshots per destination
+  retention:
+    daily: 7            # last 7 daily snapshots
+    weekly: 4           # last-of-week for 4 weeks
+    monthly: 12         # last-of-month for 12 months
+    yearly: null        # last-of-year, unbounded (null = keep every year forever)
   destinations:
     - kind: local
       path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
 ```
+
+**Retention is tiered** (grandfather / father / son). After each run, the pruner keeps the union of four tiers:
+
+| Tier    | What it keeps                                          |
+|---------|--------------------------------------------------------|
+| daily   | The N most recent snapshots.                           |
+| weekly  | The last snapshot of each of the last N ISO weeks.     |
+| monthly | The last snapshot of each of the last N calendar months.|
+| yearly  | The last snapshot of each year — `null` means unbounded.|
+
+A snapshot that qualifies for multiple tiers is kept once. Set any tier to `0` to disable it; sparse data (days without a backup) just means some tiers contribute nothing that day. Bucketing uses your local timezone, so calendars line up with what you see, not UTC.
 
 **What's in a snapshot**: atomic `VACUUM INTO` copies of every `vaults/<name>/vault.db`, your `config.yaml`, and each vault's `vault.yaml`, bundled as `parachute-backup-<timestamp>.tar.gz`. Safe under concurrent reads/writes — no need to stop the daemon.
 
