@@ -169,6 +169,46 @@ export interface GlobalConfig {
    *   callers.
    */
   discovery?: "enabled" | "disabled";
+  /** Backup configuration: schedule, retention, destinations. */
+  backup?: BackupConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Backup configuration
+// ---------------------------------------------------------------------------
+
+export type BackupSchedule = "hourly" | "daily" | "weekly" | "manual";
+
+/**
+ * Discriminated union over destination kinds. For the MVP we ship `local`
+ * only; `s3`, `rsync`, and `cloud` kinds will be added as additional variants
+ * without breaking existing configs. Unknown kinds are preserved verbatim so
+ * a forward-rolled config edited by a newer CLI isn't silently downgraded by
+ * an older CLI rewriting the file.
+ */
+export interface LocalBackupDestination {
+  kind: "local";
+  /** Absolute or `~/`-prefixed path. `~/` is expanded at use-time. */
+  path: string;
+}
+
+export type BackupDestination = LocalBackupDestination;
+
+export interface BackupConfig {
+  /** How often the scheduler fires. "manual" = scheduler is not registered. */
+  schedule: BackupSchedule;
+  /** Keep the most recent N snapshots per destination; older are pruned. */
+  retention: number;
+  /** Pluggable destinations. Runs in order; a destination error logs + continues. */
+  destinations: BackupDestination[];
+}
+
+export function defaultBackupConfig(): BackupConfig {
+  return {
+    schedule: "manual",
+    retention: 14,
+    destinations: [],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +499,125 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Backup YAML parsing / serialization
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the `backup:` section. Returns undefined if no section is present so
+ * callers can tell "user hasn't configured backups" apart from "user asked
+ * for the default (schedule: manual, empty destinations)."
+ *
+ * Shape:
+ *   backup:
+ *     schedule: daily
+ *     retention: 14
+ *     destinations:
+ *       - kind: local
+ *         path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
+ */
+function parseBackup(yaml: string): BackupConfig | undefined {
+  const startMatch = yaml.match(/^backup:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const backup: BackupConfig = defaultBackupConfig();
+  let section: "top" | "destinations" = "top";
+  let currentDest: Partial<BackupDestination> & { kind?: string } = {};
+  let hasDest = false;
+
+  const pushDest = () => {
+    if (!hasDest) return;
+    // For the MVP we only ship `local`. Unknown/malformed destination kinds
+    // are skipped rather than rejected: a forward-rolled config authored by
+    // a newer CLI mustn't break backup for the features this CLI does
+    // understand. The backup command itself warns about skipped kinds.
+    if (currentDest.kind === "local" && typeof currentDest.path === "string") {
+      backup.destinations.push({ kind: "local", path: currentDest.path });
+    }
+    currentDest = {};
+    hasDest = false;
+  };
+
+  for (const line of lines) {
+    // Stop at next top-level key.
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    // Section header: `destinations:` at 2-space indent.
+    if (/^destinations:\s*$/.test(trimmed)) {
+      section = "destinations";
+      continue;
+    }
+
+    if (section === "top") {
+      const schedMatch = trimmed.match(/^schedule:\s*(\S+)/);
+      if (schedMatch) {
+        const v = schedMatch[1];
+        if (v === "hourly" || v === "daily" || v === "weekly" || v === "manual") {
+          backup.schedule = v;
+        }
+        continue;
+      }
+      const retMatch = trimmed.match(/^retention:\s*(\d+)/);
+      if (retMatch) {
+        const n = parseInt(retMatch[1], 10);
+        if (Number.isFinite(n) && n >= 1) backup.retention = n;
+        continue;
+      }
+    }
+
+    if (section === "destinations") {
+      // Start of a new list item: "- kind: local" or just "- kind:"
+      const itemMatch = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+      if (itemMatch) {
+        pushDest();
+        hasDest = true;
+        currentDest = {};
+        (currentDest as Record<string, string>)[itemMatch[1]] = itemMatch[2].trim();
+        continue;
+      }
+      // Continuation line inside the current list item.
+      const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+      if (fieldMatch && hasDest) {
+        (currentDest as Record<string, string>)[fieldMatch[1]] = fieldMatch[2].trim();
+        continue;
+      }
+    }
+  }
+  pushDest();
+
+  return backup;
+}
+
+function serializeBackup(backup: BackupConfig): string[] {
+  const lines: string[] = [];
+  lines.push("backup:");
+  lines.push(`  schedule: ${backup.schedule}`);
+  lines.push(`  retention: ${backup.retention}`);
+  if (backup.destinations.length > 0) {
+    lines.push("  destinations:");
+    for (const dest of backup.destinations) {
+      lines.push(`    - kind: ${dest.kind}`);
+      // Paths may contain ~, spaces, and `.` — the whole line being on its
+      // own key line means we don't need to quote unless the value begins
+      // with a YAML-special character. Quoting defensively keeps the
+      // hand-rolled parser happy under future path-with-colons pressure.
+      if ("path" in dest) {
+        const needsQuote = /[:#]/.test(dest.path);
+        lines.push(`      path: ${needsQuote ? `"${dest.path}"` : dest.path}`);
+      }
+    }
+  } else {
+    lines.push("  destinations: []");
+  }
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Directory management
 // ---------------------------------------------------------------------------
 
@@ -538,6 +697,9 @@ export function readGlobalConfig(): GlobalConfig {
       // Parse triggers
       config.triggers = parseTriggers(yaml);
 
+      // Parse backup section
+      config.backup = parseBackup(yaml);
+
       return config;
     }
   } catch {}
@@ -604,6 +766,10 @@ export function writeGlobalConfig(config: GlobalConfig): void {
         lines.push(`      timeout: ${trigger.action.timeout}`);
       }
     }
+  }
+
+  if (config.backup) {
+    lines.push(...serializeBackup(config.backup));
   }
 
   // 0600 — owner read/write only. This file may contain the bcrypt password

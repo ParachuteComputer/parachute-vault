@@ -65,6 +65,11 @@ parachute vault tokens revoke <token-id> --vault work         # revoke a token
 parachute vault config                     # show all options
 parachute vault config set KEY value       # set a config value
 parachute vault restart                    # apply changes
+
+# Backup
+parachute vault backup                         # one-shot backup to configured destinations
+parachute vault backup --schedule daily        # hourly | daily | weekly | manual (macOS)
+parachute vault backup status                  # schedule, last run, destinations, next run
 ```
 
 ## MCP tools (9)
@@ -163,6 +168,36 @@ triggers:
 5. Vault saves the audio as an attachment and sets `narrate_rendered_at` metadata
 
 Webhook servers (scribe, narrate) are stateless — they don't need vault's API key.
+
+### Backing up your vault
+
+Your vault is just SQLite DBs + a handful of YAML files under `~/.parachute/`. `parachute vault backup` snapshots everything into a single timestamped tarball, for a one-shot or a scheduled run.
+
+```bash
+parachute vault backup                         # one-shot — snapshot + ship to destinations
+parachute vault backup --schedule daily        # register a launchd agent (macOS)
+parachute vault backup --schedule manual       # stop scheduled backups
+parachute vault backup status                  # schedule, last run, destinations, next run
+```
+
+Configure destinations in `~/.parachute/config.yaml`:
+
+```yaml
+backup:
+  schedule: daily       # hourly | daily | weekly | manual
+  retention: 14         # keep the N most recent snapshots per destination
+  destinations:
+    - kind: local
+      path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
+```
+
+**What's in a snapshot**: atomic `VACUUM INTO` copies of every `vaults/<name>/vault.db`, your `config.yaml`, and each vault's `vault.yaml`, bundled as `parachute-backup-<timestamp>.tar.gz`. Safe under concurrent reads/writes — no need to stop the daemon.
+
+**Restore**: extract the tarball into a fresh `~/.parachute/` and run `parachute vault init` to re-register the daemon. The DBs and configs drop in place; you don't need any special restore command (for now — a dedicated `vault restore` is coming soon).
+
+Destination kinds shipping in this release: `local` (any filesystem path — including iCloud Drive, a mounted external disk, or an rsync/Syncthing-backed folder). `s3`, `rsync`, and `cloud` destinations are planned but not yet implemented.
+
+On Linux, scheduled runs via systemd timers are a follow-up; for now `parachute vault backup` works on Linux but you'll need to wire the cron yourself.
 
 ### View endpoint
 

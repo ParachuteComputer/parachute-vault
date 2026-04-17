@@ -140,3 +140,91 @@ describe("config", () => {
     expect(readGlobalConfig().discovery).toBe("disabled");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Backup config — round-trip through writeGlobalConfig + readGlobalConfig
+// ---------------------------------------------------------------------------
+
+import { describe as describe2, test as test2, expect as expect2, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+
+describe2("backup config round-trip", () => {
+  // We can't just call writeGlobalConfig / readGlobalConfig like above: they
+  // write into CONFIG_DIR, which is derived from PARACHUTE_HOME at import
+  // time. So we spawn a child process with an isolated PARACHUTE_HOME to
+  // test the full read/write cycle, matching the pattern in doctor.test.ts.
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "backup-cfg-")); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test2("writes and reads a backup section with a local destination", async () => {
+    // Child script writes a config, re-reads it, and prints the normalized
+    // result. This exercises the full YAML round-trip without mocking.
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({
+        port: 1940,
+        default_vault: "default",
+        backup: {
+          schedule: "daily",
+          retention: 7,
+          destinations: [{ kind: "local", path: "~/parachute-backups" }],
+        },
+      });
+      const read = readGlobalConfig();
+      console.log(JSON.stringify(read.backup));
+    `;
+    const proc = Bun.spawnSync({
+      cmd: ["bun", "-e", script],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new TextDecoder().decode(proc.stdout);
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+
+    const parsed = JSON.parse(stdout.trim());
+    expect2(parsed.schedule).toBe("daily");
+    expect2(parsed.retention).toBe(7);
+    expect2(parsed.destinations.length).toBe(1);
+    expect2(parsed.destinations[0].kind).toBe("local");
+    expect2(parsed.destinations[0].path).toBe("~/parachute-backups");
+  });
+
+  test2("config without a backup section reads back with backup === undefined", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({ port: 1940, default_vault: "default" });
+      const read = readGlobalConfig();
+      console.log(JSON.stringify({ backup: read.backup ?? null }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.backup).toBeNull();
+  });
+
+  test2("empty destinations round-trips as empty list (not missing key)", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const { writeGlobalConfig, readGlobalConfig } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      writeGlobalConfig({
+        port: 1940,
+        backup: { schedule: "manual", retention: 14, destinations: [] },
+      });
+      const read = readGlobalConfig();
+      console.log(JSON.stringify(read.backup));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(proc.stdout);
+    expect2(proc.exitCode).toBe(0);
+    const parsed = JSON.parse(out.trim());
+    expect2(parsed.schedule).toBe("manual");
+    expect2(parsed.destinations).toEqual([]);
+  });
+});
