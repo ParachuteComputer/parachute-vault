@@ -1095,7 +1095,11 @@ async function cmdDoctor() {
 
 function cmdUrl() {
   // Intentionally minimal — scripts parse this, so print only the URL.
-  const port = readGlobalConfig().port || DEFAULT_PORT;
+  // Load .env first so PORT overrides in the env file take precedence over
+  // config.yaml, matching the behavior of `status` and `restart`.
+  loadEnvFile();
+  const envPort = process.env.PORT ? Number(process.env.PORT) : undefined;
+  const port = envPort ?? readGlobalConfig().port ?? DEFAULT_PORT;
   console.log(`http://127.0.0.1:${port}`);
 }
 
