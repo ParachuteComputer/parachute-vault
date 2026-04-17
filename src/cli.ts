@@ -188,10 +188,30 @@ async function cmdInit() {
     console.log(`Found ${vaults.length} existing vault(s)`);
   }
 
-  // 2. Write global config
+  // 2. Write global config. Set default_vault to the lone existing vault
+  // when unset or stale — this keeps unscoped routes (/mcp, /api/*) working
+  // for users who bootstrapped with `vault create <name>` before running init.
   const globalConfig = readGlobalConfig();
-  if (!globalConfig.default_vault) {
-    globalConfig.default_vault = "default";
+  const allVaults = listVaults();
+  const needsDefault = !globalConfig.default_vault
+    || !allVaults.includes(globalConfig.default_vault);
+  if (needsDefault) {
+    if (allVaults.length === 1) {
+      globalConfig.default_vault = allVaults[0];
+    } else if (allVaults.includes("default")) {
+      globalConfig.default_vault = "default";
+    } else if (allVaults.length > 0) {
+      // Multi-vault, no safe fallback — don't guess. Operator must set it.
+      console.log(
+        `  No default_vault set and multiple vaults exist. Unscoped routes (/mcp) will error until you set one.`,
+      );
+      console.log(
+        `  Fix:  echo 'default_vault: <name>' >> ${CONFIG_DIR}/config.yaml`,
+      );
+    } else {
+      // We created "default" above (vaults.length === 0 branch).
+      globalConfig.default_vault = "default";
+    }
   }
   writeGlobalConfig(globalConfig);
 
@@ -515,6 +535,13 @@ function cmdCreate(args: string[]) {
     console.error("Vault name must contain only letters, numbers, hyphens, and underscores.");
     process.exit(1);
   }
+  if (name === "list") {
+    // Reserved — /vaults/list is the public discovery endpoint. Allowing a
+    // vault with this name would let its routes (/vaults/list/mcp, etc.) be
+    // shadowed by the discovery handler.
+    console.error(`"list" is a reserved vault name.`);
+    process.exit(1);
+  }
 
   const existing = readVaultConfig(name);
   if (existing) {
@@ -523,12 +550,31 @@ function cmdCreate(args: string[]) {
   }
 
   ensureConfigDirSync();
+  const wasFirst = listVaults().length === 0;
   const key = createVault(name);
+
+  // If this is the only vault now, make it the default so unscoped routes
+  // (/mcp, /api/*, /oauth/*) target it. Avoids the "single vault named
+  // 'journal' but /mcp returns 404" surprise.
+  const globalConfig = readGlobalConfig();
+  const needsDefault = !globalConfig.default_vault
+    || !listVaults().includes(globalConfig.default_vault);
+  let defaultNote: string | null = null;
+  if (needsDefault) {
+    globalConfig.default_vault = name;
+    writeGlobalConfig(globalConfig);
+    defaultNote = wasFirst
+      ? `Set as default vault (unscoped routes will target "${name}")`
+      : `Set as default vault (previous default was missing)`;
+  }
 
   console.log(`Vault "${name}" created.`);
   console.log(`  Path: ${vaultDir(name)}`);
   console.log(`  API token: ${key}`);
   console.log(`  Save this — it will not be shown again.`);
+  if (defaultNote) {
+    console.log(`  ${defaultNote}`);
+  }
   console.log();
   console.log(`To add MCP to Claude: parachute vault mcp-install ${name}`);
 }
@@ -577,6 +623,24 @@ function cmdRemove(args: string[]) {
 
   rmSync(vaultDir(name), { recursive: true, force: true });
   console.log(`Vault "${name}" removed.`);
+
+  // Keep default_vault in sync. If the removed vault was the default, either
+  // promote the remaining vault (if exactly one) or clear the setting.
+  const globalConfig = readGlobalConfig();
+  if (globalConfig.default_vault === name) {
+    const remaining = listVaults();
+    if (remaining.length === 1) {
+      globalConfig.default_vault = remaining[0];
+      writeGlobalConfig(globalConfig);
+      console.log(`  Default vault is now "${remaining[0]}".`);
+    } else {
+      delete globalConfig.default_vault;
+      writeGlobalConfig(globalConfig);
+      if (remaining.length > 1) {
+        console.log(`  Cleared default_vault — set one with: editor ${CONFIG_DIR}/config.yaml`);
+      }
+    }
+  }
 }
 
 async function cmdConfig(args: string[]) {

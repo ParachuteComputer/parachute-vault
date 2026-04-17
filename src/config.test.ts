@@ -2,6 +2,8 @@ import { describe, test, expect } from "bun:test";
 import {
   writeVaultConfig,
   readVaultConfig,
+  writeGlobalConfig,
+  readGlobalConfig,
   generateApiKey,
   hashKey,
   verifyKey,
@@ -121,5 +123,20 @@ describe("config", () => {
     const loaded = readVaultConfig("testvault");
     expect(loaded).not.toBeNull();
     expect(loaded!.tag_schemas).toBeUndefined();
+  });
+
+  test("round-trips discovery: enabled|disabled", () => {
+    // Default: absent means enabled (endpoint serves names).
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().discovery).toBeUndefined();
+
+    // Explicit enabled.
+    writeGlobalConfig({ port: 1940, discovery: "enabled" });
+    expect(readGlobalConfig().discovery).toBe("enabled");
+
+    // Explicit disabled — this is the opt-out flag operators set when they
+    // don't want /vaults/list to reveal vault names publicly.
+    writeGlobalConfig({ port: 1940, discovery: "disabled" });
+    expect(readGlobalConfig().discovery).toBe("disabled");
   });
 });

@@ -19,9 +19,34 @@ import crypto from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Paths
+//
+// Historical note: the exported `CONFIG_DIR`, `VAULTS_DIR`, etc. used to be
+// `const` captured at module load. That made tests flaky: anything setting
+// `process.env.PARACHUTE_HOME` after import would be ignored, and when `bun
+// test` shares one process across files, whichever test loaded first froze
+// the path for the rest. Internal read/write now go through the `*Path()`
+// getters so `PARACHUTE_HOME` is re-read per call. The top-level constants
+// are kept for backward-compat (other modules import them) and reflect the
+// value at load time.
 // ---------------------------------------------------------------------------
 
-export const CONFIG_DIR = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+function configDirPath(): string {
+  return process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+}
+
+function vaultsDirPath(): string {
+  return join(configDirPath(), "vaults");
+}
+
+function globalConfigPath(): string {
+  return join(configDirPath(), "config.yaml");
+}
+
+function envFilePath(): string {
+  return join(configDirPath(), ".env");
+}
+
+export const CONFIG_DIR = configDirPath();
 export const VAULTS_DIR = join(CONFIG_DIR, "vaults");
 export const GLOBAL_CONFIG_PATH = join(CONFIG_DIR, "config.yaml");
 export const ENV_PATH = join(CONFIG_DIR, ".env");
@@ -31,7 +56,7 @@ export const DEFAULT_PORT = 1940;
 export const ASSETS_DIR = join(CONFIG_DIR, "assets");
 
 export function vaultDir(name: string): string {
-  return join(VAULTS_DIR, name);
+  return join(vaultsDirPath(), name);
 }
 
 export function vaultDbPath(name: string): string {
@@ -137,6 +162,13 @@ export interface GlobalConfig {
   totp_secret?: string;
   /** Bcrypt hashes of single-use backup codes for 2FA recovery. */
   backup_codes?: string[];
+  /**
+   * Controls the public `GET /vaults/list` endpoint.
+   * - `"enabled"` (default): returns vault names (no other metadata).
+   * - `"disabled"`: returns 404, hiding vault existence from unauthenticated
+   *   callers.
+   */
+  discovery?: "enabled" | "disabled";
 }
 
 // ---------------------------------------------------------------------------
@@ -431,13 +463,13 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
 // ---------------------------------------------------------------------------
 
 export async function ensureConfigDir(): Promise<void> {
-  await mkdir(CONFIG_DIR, { recursive: true });
-  await mkdir(VAULTS_DIR, { recursive: true });
+  await mkdir(configDirPath(), { recursive: true });
+  await mkdir(vaultsDirPath(), { recursive: true });
 }
 
 export function ensureConfigDirSync(): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  mkdirSync(VAULTS_DIR, { recursive: true });
+  mkdirSync(configDirPath(), { recursive: true });
+  mkdirSync(vaultsDirPath(), { recursive: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -446,18 +478,23 @@ export function ensureConfigDirSync(): void {
 
 export function readGlobalConfig(): GlobalConfig {
   try {
-    if (existsSync(GLOBAL_CONFIG_PATH)) {
-      const yaml = readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
+    const gcPath = globalConfigPath();
+    if (existsSync(gcPath)) {
+      const yaml = readFileSync(gcPath, "utf-8");
       const portMatch = yaml.match(/^port:\s*(\d+)/m);
       const defaultVaultMatch = yaml.match(/^default_vault:\s*(\S+)/m);
       const passwordHashMatch = yaml.match(/^owner_password_hash:\s*"([^"]+)"/m);
       const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
+      const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
       const config: GlobalConfig = {
         port: portMatch ? parseInt(portMatch[1], 10) : DEFAULT_PORT,
         default_vault: defaultVaultMatch?.[1],
         owner_password_hash: passwordHashMatch?.[1],
         totp_secret: totpSecretMatch?.[1],
       };
+      if (discoveryMatch) {
+        config.discovery = discoveryMatch[1] as "enabled" | "disabled";
+      }
 
       // Parse backup_codes: a YAML list of quoted bcrypt hashes under
       //   backup_codes:
@@ -511,6 +548,7 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   ensureConfigDirSync();
   const lines = [`port: ${config.port}`];
   if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
+  if (config.discovery) lines.push(`discovery: ${config.discovery}`);
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
   }
@@ -570,10 +608,10 @@ export function writeGlobalConfig(config: GlobalConfig): void {
 
   // 0600 — owner read/write only. This file may contain the bcrypt password
   // hash and plaintext TOTP secret; it must not be world- or group-readable.
-  writeFileSync(GLOBAL_CONFIG_PATH, lines.join("\n") + "\n", { mode: 0o600 });
+  writeFileSync(globalConfigPath(), lines.join("\n") + "\n", { mode: 0o600 });
   // writeFileSync's `mode` only applies on file creation, so chmod an existing
   // file explicitly in case it was written by an older version at 0644.
-  try { chmodSync(GLOBAL_CONFIG_PATH, 0o600); } catch {}
+  try { chmodSync(globalConfigPath(), 0o600); } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -629,8 +667,9 @@ export function generateApiKey(): { fullKey: string; keyId: string } {
 export function readEnvFile(): Record<string, string> {
   const env: Record<string, string> = {};
   try {
-    if (!existsSync(ENV_PATH)) return env;
-    const content = readFileSync(ENV_PATH, "utf-8");
+    const p = envFilePath();
+    if (!existsSync(p)) return env;
+    const content = readFileSync(p, "utf-8");
     for (const line of content.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
@@ -665,7 +704,7 @@ export function writeEnvFile(env: Record<string, string>): void {
       lines.push(`${key}=${val}`);
     }
   }
-  writeFileSync(ENV_PATH, lines.join("\n") + "\n");
+  writeFileSync(envFilePath(), lines.join("\n") + "\n");
 }
 
 /**
@@ -704,8 +743,9 @@ export function loadEnvFile(): void {
 
 export function listVaults(): string[] {
   try {
-    if (!existsSync(VAULTS_DIR)) return [];
-    const entries = Bun.spawnSync(["ls", VAULTS_DIR]).stdout.toString().trim();
+    const dir = vaultsDirPath();
+    if (!existsSync(dir)) return [];
+    const entries = Bun.spawnSync(["ls", dir]).stdout.toString().trim();
     if (!entries) return [];
     return entries.split("\n").filter((name) => {
       return existsSync(vaultConfigPath(name));
@@ -713,4 +753,36 @@ export function listVaults(): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Resolve the vault that unscoped routes (`/mcp`, `/api/*`, `/oauth/*`,
+ * `/view/*`) should target.
+ *
+ * Resolution order:
+ *  1. If `default_vault` is set in config.yaml AND that vault exists → use it.
+ *  2. Else if exactly one vault exists → use that vault regardless of its name.
+ *     This is the "single-vault auto-default": if you only have `journal`,
+ *     `/mcp` transparently targets `journal` without requiring you to visit
+ *     `/vaults/journal/mcp`.
+ *  3. Otherwise → return `null` (multi-vault deployment with no/bad default;
+ *     the caller should surface an explicit error rather than guess).
+ *
+ * Notes:
+ *  - If `default_vault` points to a deleted vault, step 2 still kicks in so
+ *    operators aren't stranded after `vault remove`.
+ *  - The name "default" has no special meaning here; it's just whatever
+ *    `vault init` happens to create on first run. A single vault named
+ *    "journal" behaves identically.
+ */
+export function resolveDefaultVault(): string | null {
+  const globalConfig = readGlobalConfig();
+  const vaults = listVaults();
+  if (globalConfig.default_vault && vaults.includes(globalConfig.default_vault)) {
+    return globalConfig.default_vault;
+  }
+  if (vaults.length === 1) {
+    return vaults[0];
+  }
+  return null;
 }
