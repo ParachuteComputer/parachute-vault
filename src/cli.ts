@@ -50,6 +50,7 @@ import {
   SERVER_PATH_FILE,
   readServerPathPointer,
   removeDaemonWrapper,
+  resolveServerPath,
 } from "./daemon.ts";
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
@@ -1071,6 +1072,114 @@ async function cmdDoctor() {
     });
   }
 
+  // bun on PATH. Not strictly required for an already-installed vault
+  // (start.sh embeds an absolute bun path at init time), but missing `bun`
+  // is the #1 failure mode for first-time OSS users, so surface it clearly.
+  const bunOnPath = Bun.which("bun");
+  if (bunOnPath) {
+    checks.push({ name: "bun on PATH", status: "pass", detail: bunOnPath });
+  } else {
+    checks.push({
+      name: "bun on PATH",
+      status: "warn",
+      detail: "`bun` not resolvable via PATH",
+      fix: "Install Bun: curl -fsSL https://bun.sh/install | bash (then restart your shell).",
+    });
+  }
+
+  // MCP entry in ~/.claude.json. Split into three separate checks so the
+  // user can see exactly which condition fails: "entry present", "port
+  // matches vault", "daemon reachable over MCP URL". A common failure is
+  // "entry exists but port is stale" after the user changed PORT without
+  // re-running `mcp-install`.
+  const port = resolveVaultPort();
+  const mcpEntry = readMcpEntry();
+  if (!mcpEntry.found) {
+    checks.push({
+      name: "MCP entry in ~/.claude.json",
+      status: "warn",
+      detail: mcpEntry.reason,
+      fix: "Run `parachute vault mcp-install` to register the vault with Claude.",
+    });
+  } else {
+    checks.push({
+      name: "MCP entry in ~/.claude.json",
+      status: "pass",
+      detail: mcpEntry.url,
+    });
+
+    // Port match. Fall back to a warn if the URL has no parseable port
+    // (malformed entry) rather than a hard fail — we can still tell the
+    // user what we saw.
+    if (mcpEntry.port === port) {
+      checks.push({
+        name: "MCP URL port matches vault",
+        status: "pass",
+        detail: `port ${port}`,
+      });
+    } else {
+      checks.push({
+        name: "MCP URL port matches vault",
+        status: "warn",
+        detail: `MCP URL port ${mcpEntry.port ?? "(unparseable)"} ≠ vault port ${port}`,
+        fix: "Re-run `parachute vault mcp-install` to refresh the MCP URL.",
+      });
+    }
+
+    // Reachability probe. We do NOT require the daemon to be up for doctor
+    // to pass: a user who ran `vault status` already knows the daemon is
+    // off. This line is just a bonus telltale. Treat any HTTP response
+    // (even 401/404) as "reachable" — we're testing TCP+HTTP, not auth.
+    const reach = await probeMcpUrl(mcpEntry.url);
+    if (reach.ok) {
+      checks.push({
+        name: "MCP URL reachable",
+        status: "pass",
+        detail: reach.detail,
+      });
+    } else {
+      checks.push({
+        name: "MCP URL reachable",
+        status: "warn",
+        detail: reach.detail,
+        fix: "Start the daemon: `parachute vault restart` (or `init` if not yet installed).",
+      });
+    }
+  }
+
+  // Port collision. If something's holding the vault's configured port
+  // that ISN'T our daemon, the server will fail to bind on restart — a
+  // silent-until-crash-loop failure we want to catch at doctor time.
+  const collision = await checkPortCollision(port);
+  switch (collision.status) {
+    case "free":
+      checks.push({
+        name: `port ${port} availability`,
+        status: "pass",
+        detail: "no listener (ready to bind)",
+      });
+      break;
+    case "ours":
+      checks.push({
+        name: `port ${port} availability`,
+        status: "pass",
+        detail: `held by our daemon (pid ${collision.pids.join(", ")})`,
+      });
+      break;
+    case "foreign":
+      checks.push({
+        name: `port ${port} availability`,
+        status: "warn",
+        detail: `port in use by non-vault process: ${collision.detail}`,
+        fix: "Stop the conflicting process, or set a different PORT in ~/.parachute/.env and re-run `parachute vault init`.",
+      });
+      break;
+    case "unknown":
+      // Tool unavailable (no lsof / ss). Silent: we prefer a missing check
+      // over a spurious warning on minimal Linux images.
+      break;
+  }
+
   // Render.
   const icons = { pass: " ✓", warn: " !", fail: " ✗" } as const;
   console.log("Parachute Vault — doctor\n");
@@ -1095,12 +1204,204 @@ async function cmdDoctor() {
 
 function cmdUrl() {
   // Intentionally minimal — scripts parse this, so print only the URL.
-  // Load .env first so PORT overrides in the env file take precedence over
-  // config.yaml, matching the behavior of `status` and `restart`.
+  console.log(`http://127.0.0.1:${resolveVaultPort()}`);
+}
+
+/**
+ * Resolve the vault's port the way `status`, `restart`, `url`, and `doctor`
+ * all need to agree on: env override (~/.parachute/.env) wins, then
+ * config.yaml, then DEFAULT_PORT. Sources .env as a side effect so callers
+ * running this before any env read still see PORT.
+ */
+function resolveVaultPort(): number {
   loadEnvFile();
   const envPort = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const port = envPort ?? readGlobalConfig().port ?? DEFAULT_PORT;
-  console.log(`http://127.0.0.1:${port}`);
+  return envPort ?? readGlobalConfig().port ?? DEFAULT_PORT;
+}
+
+// ---------------------------------------------------------------------------
+// Doctor helpers — MCP entry / port collision
+// ---------------------------------------------------------------------------
+
+type McpEntryLookup =
+  | { found: false; reason: string }
+  | { found: true; url: string; port: number | null };
+
+/**
+ * Read `~/.claude.json` and return the shape of the `parachute-vault` MCP
+ * entry if present. The entry is always an HTTP MCP pointing at the local
+ * daemon — `{ type: "http", url: "http://127.0.0.1:<port>/vaults/<name>/mcp" }`
+ * — so we parse the URL's port for the port-match check.
+ *
+ * Invariant: the check is NON-fatal. A missing ~/.claude.json is a warn,
+ * not a fail: plenty of users install the vault first and wire it to
+ * Claude later. We just make the "is it wired up?" state legible.
+ */
+function readMcpEntry(): McpEntryLookup {
+  const claudeJsonPath = resolve(homedir(), ".claude.json");
+  if (!existsSync(claudeJsonPath)) {
+    return { found: false, reason: `${claudeJsonPath} does not exist` };
+  }
+  let config: any;
+  try {
+    config = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
+  } catch (err: any) {
+    return {
+      found: false,
+      reason: `${claudeJsonPath} is not valid JSON: ${String(err?.message ?? err)}`,
+    };
+  }
+  const entry = config?.mcpServers?.["parachute-vault"];
+  if (!entry) {
+    return {
+      found: false,
+      reason: `no mcpServers["parachute-vault"] entry in ${claudeJsonPath}`,
+    };
+  }
+  // The entry is always a URL-bearing HTTP MCP. Non-URL shapes are
+  // unexpected (Claude Code would ignore them anyway) but we surface the
+  // raw shape so the user can see what's there.
+  const url = typeof entry.url === "string" ? entry.url : null;
+  if (!url) {
+    return {
+      found: false,
+      reason: `mcpServers["parachute-vault"] has no \`url\` field (got ${JSON.stringify(entry).slice(0, 80)})`,
+    };
+  }
+  let entryPort: number | null = null;
+  try {
+    const parsed = new URL(url);
+    entryPort = parsed.port ? Number(parsed.port) : null;
+  } catch {
+    entryPort = null;
+  }
+  return { found: true, url, port: entryPort };
+}
+
+/**
+ * HEAD-probe the MCP URL to tell "entry present but daemon unreachable"
+ * apart from "entry present and daemon happily responding." Any HTTP
+ * response — including auth failures — counts as reachable: the check is
+ * about TCP + HTTP liveness, not correctness of the user's token.
+ *
+ * 2s timeout keeps `doctor` snappy when the daemon is down.
+ */
+async function probeMcpUrl(url: string): Promise<{ ok: boolean; detail: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    const resp = await fetch(url, { method: "HEAD", signal: controller.signal });
+    return { ok: true, detail: `HTTP ${resp.status}` };
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    if (
+      /ECONNREFUSED|ConnectionRefused|Unable to connect|refused/i.test(msg) ||
+      err?.code === "ECONNREFUSED"
+    ) {
+      return { ok: false, detail: `connection refused (daemon not running?)` };
+    }
+    if (err?.name === "AbortError" || /aborted|timeout/i.test(msg)) {
+      return { ok: false, detail: `timeout after 2000ms` };
+    }
+    return { ok: false, detail: msg };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+type PortCollision =
+  | { status: "free" }
+  | { status: "ours"; pids: number[] }
+  | { status: "foreign"; pids: number[]; detail: string }
+  | { status: "unknown" }; // no probe tool available
+
+/**
+ * Probe which process (if any) holds a TCP LISTEN socket on `port`.
+ *
+ * macOS: lsof is ubiquitous; we prefer it.
+ * Linux: lsof is common but not guaranteed. Fall back to `ss -tlnp`. If
+ *        neither exists, return "unknown" rather than a misleading "free."
+ *
+ * To decide whether the holder is "ours," we pull `ps -o command= -p <pid>`
+ * for each listening PID and look for a marker unique to our daemon —
+ * either the wrapper path or the pointer-file's server.ts path. This is
+ * heuristic but good enough to avoid warning when the vault is just
+ * running normally.
+ */
+async function checkPortCollision(port: number): Promise<PortCollision> {
+  const pids = await listListeningPids(port);
+  if (pids === null) return { status: "unknown" };
+  if (pids.length === 0) return { status: "free" };
+
+  // Build the set of path fragments that mark a process as ours. We check
+  // multiple signals because `doctor` may be running from a different
+  // PARACHUTE_HOME than the live daemon (tempdirs, Docker, developer
+  // machines): the wrapper path alone isn't enough. The pointer target and
+  // the currently-resolved server.ts path cover the common deployments.
+  const marks: string[] = [WRAPPER_PATH, resolveServerPath()];
+  const pointed = readServerPathPointer();
+  if (pointed) marks.push(pointed);
+
+  const descriptions: string[] = [];
+  let allOurs = true;
+  for (const pid of pids) {
+    const cmdline = await describeProcess(pid);
+    descriptions.push(`pid ${pid}: ${cmdline ?? "(unknown)"}`);
+    const mine = cmdline !== null && marks.some((m) => cmdline.includes(m));
+    if (!mine) allOurs = false;
+  }
+  if (allOurs) return { status: "ours", pids };
+  return { status: "foreign", pids, detail: descriptions.join("; ") };
+}
+
+/**
+ * Return PIDs holding a TCP LISTEN socket on `port`, or null if we can't
+ * tell (no probe tool). Empty array means no listener.
+ */
+async function listListeningPids(port: number): Promise<number[] | null> {
+  // Prefer lsof — same invocation works on macOS and Linux where present.
+  if (Bun.which("lsof")) {
+    try {
+      const r = await Bun.$`lsof -nP -iTCP:${port} -sTCP:LISTEN -Fp`.quiet().nothrow();
+      // lsof exits 1 with no output when nothing matches; that's "free," not
+      // an error. We distinguish by inspecting stdout rather than exitCode.
+      const out = r.stdout.toString();
+      const pids = [...out.matchAll(/^p(\d+)/gm)].map((m) => Number(m[1]));
+      return [...new Set(pids)];
+    } catch {
+      // Fall through to ss if lsof itself blew up unexpectedly.
+    }
+  }
+  if (Bun.which("ss")) {
+    try {
+      const r = await Bun.$`ss -tlnpH sport = :${port}`.quiet().nothrow();
+      const out = r.stdout.toString();
+      // `users:(("bun",pid=12345,fd=7))` — we pull every pid=NNNN.
+      const pids = [...out.matchAll(/pid=(\d+)/g)].map((m) => Number(m[1]));
+      if (pids.length > 0) return [...new Set(pids)];
+      // No users field but a listener row present? Treat as foreign with no
+      // attributable PID. Parsing the local address is overkill for a warn.
+      if (/LISTEN/.test(out)) return [-1];
+      return [];
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Fetch a one-line description of a process by PID. Returns null if the
+ * PID is gone or ps is missing. Used only to classify a listener as ours
+ * vs foreign, so "good enough" beats "precisely parsed."
+ */
+async function describeProcess(pid: number): Promise<string | null> {
+  if (pid < 0) return null;
+  try {
+    const r = await Bun.$`ps -o command= -p ${pid}`.quiet().nothrow();
+    if (r.exitCode !== 0) return null;
+    return r.stdout.toString().trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
