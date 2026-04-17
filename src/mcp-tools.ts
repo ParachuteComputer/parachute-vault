@@ -7,7 +7,7 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
-import { readVaultConfig, writeVaultConfig, readGlobalConfig, listVaults as getVaultNames } from "./config.ts";
+import { readVaultConfig, writeVaultConfig, listVaults as getVaultNames, resolveDefaultVault } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 
 /**
@@ -15,8 +15,7 @@ import { getVaultStore } from "./vault-store.ts";
  * Sent once at session init — not per tool.
  */
 export function getServerInstruction(vaultName?: string): string {
-  const globalConfig = readGlobalConfig();
-  const name = vaultName ?? globalConfig.default_vault ?? "default";
+  const name = vaultName ?? resolveDefaultVault() ?? "default";
   const config = readVaultConfig(name);
 
   const parts: string[] = [
@@ -35,9 +34,8 @@ export function getServerInstruction(vaultName?: string): string {
  * Each tool has an optional `vault` param that defaults to the default vault.
  */
 export function generateUnifiedMcpTools(): McpToolDef[] {
-  const globalConfig = readGlobalConfig();
-  const defaultVault = globalConfig.default_vault ?? "default";
   const vaultNames = getVaultNames();
+  const defaultVault = resolveDefaultVault() ?? "default";
   const multiVault = vaultNames.length > 1;
 
   // Get tool definitions from core (using default vault for schema)
