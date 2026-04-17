@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 );
 
 -- OAuth: authorization codes (single-use, short-lived)
+-- vault_name pins the code to the vault it was issued for. handleToken
+-- must verify it matches the requested vault — otherwise a code issued
+-- under /vaults/A/oauth/authorize could be redeemed at /vaults/B/oauth/token.
 CREATE TABLE IF NOT EXISTS oauth_codes (
   code TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,
@@ -83,7 +86,8 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
   redirect_uri TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   used INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  vault_name TEXT
 );
 
 -- Schema version tracking
@@ -155,6 +159,9 @@ export function initSchema(db: Database): void {
   // Migrate v7 → v8: OAuth tables (created by SCHEMA_SQL above,
   // this just ensures the tables exist for databases created before v8)
   migrateToV8(db);
+
+  // Migrate v8 → v9: add vault_name column to oauth_codes
+  migrateToV9(db);
 
   // Record schema version
   db.prepare("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(
@@ -252,6 +259,15 @@ function migrateToV7(db: Database): void {
 function migrateToV8(db: Database): void {
   // SCHEMA_SQL already creates oauth_clients and oauth_codes via
   // CREATE TABLE IF NOT EXISTS. Nothing extra needed here.
+}
+
+function migrateToV9(db: Database): void {
+  // Add vault_name column to existing oauth_codes tables. Codes predating
+  // this migration have NULL vault_name and will fail the token-exchange
+  // vault check — acceptable because codes expire in 10 minutes.
+  if (hasTable(db, "oauth_codes") && !hasColumn(db, "oauth_codes", "vault_name")) {
+    db.exec("ALTER TABLE oauth_codes ADD COLUMN vault_name TEXT");
+  }
 }
 
 function hasTable(db: Database, name: string): boolean {

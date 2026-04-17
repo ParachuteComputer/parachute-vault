@@ -63,23 +63,44 @@ function escapeHtml(s: string): string {
 // Discovery endpoints
 // ---------------------------------------------------------------------------
 
-export function handleProtectedResource(req: Request, mcpPath = "/mcp"): Response {
+/**
+ * OAuth 2.0 Protected Resource Metadata (RFC 9728).
+ *
+ * @param mcpPath       — the resource URL (e.g. `/mcp` or `/vaults/X/mcp`).
+ * @param authServerPrefix — path prefix for the authorization server issuer
+ *                           (e.g. `""` for global, `/vaults/X` for scoped).
+ *                           The client discovers the AS metadata at
+ *                           `{base}{prefix}/.well-known/oauth-authorization-server`.
+ */
+export function handleProtectedResource(
+  req: Request,
+  mcpPath = "/mcp",
+  authServerPrefix = "",
+): Response {
   const base = getBaseUrl(req);
   return Response.json({
     resource: `${base}${mcpPath}`,
-    authorization_servers: [base],
+    authorization_servers: [`${base}${authServerPrefix}`],
     scopes_supported: ["full", "read"],
     bearer_methods_supported: ["header"],
   });
 }
 
-export function handleAuthorizationServer(req: Request): Response {
+/**
+ * OAuth 2.0 Authorization Server Metadata (RFC 8414).
+ *
+ * @param vaultName — when provided, returns vault-scoped endpoints
+ *                    (`/vaults/<name>/oauth/*`) and issuer. Tokens minted
+ *                    via these endpoints are scoped to the named vault's DB.
+ */
+export function handleAuthorizationServer(req: Request, vaultName?: string): Response {
   const base = getBaseUrl(req);
+  const prefix = vaultName ? `/vaults/${vaultName}` : "";
   return Response.json({
-    issuer: base,
-    authorization_endpoint: `${base}/oauth/authorize`,
-    token_endpoint: `${base}/oauth/token`,
-    registration_endpoint: `${base}/oauth/register`,
+    issuer: `${base}${prefix}`,
+    authorization_endpoint: `${base}${prefix}/oauth/authorize`,
+    token_endpoint: `${base}${prefix}/oauth/token`,
+    registration_endpoint: `${base}${prefix}/oauth/register`,
     response_types_supported: ["code"],
     code_challenge_methods_supported: ["S256"],
     grant_types_supported: ["authorization_code"],
@@ -354,10 +375,12 @@ export async function handleAuthorizePost(
   const code = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes
 
+  // vault_name pins the code to the issuing vault. handleToken rejects
+  // any code whose vault_name doesn't match the token-endpoint's vault.
   db.prepare(`
-    INSERT INTO oauth_codes (code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(code, clientId, codeChallenge, codeChallengeMethod, selectedScope, redirectUri, expiresAt, new Date().toISOString());
+    INSERT INTO oauth_codes (code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, created_at, vault_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(code, clientId, codeChallenge, codeChallengeMethod, selectedScope, redirectUri, expiresAt, new Date().toISOString(), vaultName ?? null);
 
   redirect.searchParams.set("code", code);
   return Response.redirect(redirect.toString(), 302);
@@ -367,7 +390,19 @@ export async function handleAuthorizePost(
 // Token endpoint
 // ---------------------------------------------------------------------------
 
-export async function handleToken(req: Request, db: Database): Promise<Response> {
+/**
+ * OAuth 2.1 token endpoint — exchanges an auth code for a vault token.
+ *
+ * @param vaultName — the name of the vault this token is scoped to. Included
+ *                    in the response as `vault: <name>` so the client knows
+ *                    which vault was just connected. The token itself lives
+ *                    in that vault's tokens table.
+ */
+export async function handleToken(
+  req: Request,
+  db: Database,
+  vaultName: string,
+): Promise<Response> {
   if (req.method !== "POST") {
     return Response.json({ error: "method_not_allowed" }, { status: 405 });
   }
@@ -404,7 +439,7 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
 
   // Look up the auth code
   const authCode = db.prepare(`
-    SELECT code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, used
+    SELECT code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, used, vault_name
     FROM oauth_codes WHERE code = ?
   `).get(code) as {
     code: string;
@@ -415,6 +450,7 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
     redirect_uri: string;
     expires_at: string;
     used: number;
+    vault_name: string | null;
   } | null;
 
   if (!authCode) {
@@ -439,6 +475,14 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
   // Validate redirect_uri matches
   if (authCode.redirect_uri !== redirectUri) {
     return Response.json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, { status: 400 });
+  }
+
+  // Validate the code was issued for the same vault this token endpoint
+  // serves. Without this, a code issued under /vaults/A/oauth/authorize
+  // could be presented to /vaults/B/oauth/token and the token would be
+  // minted into B's DB — privilege escalation across vault boundaries.
+  if (authCode.vault_name !== vaultName) {
+    return Response.json({ error: "invalid_grant", error_description: "vault mismatch" }, { status: 400 });
   }
 
   // PKCE verification: SHA256(code_verifier) must match stored code_challenge
@@ -466,6 +510,7 @@ export async function handleToken(req: Request, db: Database): Promise<Response>
     access_token: fullToken,
     token_type: "bearer",
     scope: permission,
+    vault: vaultName,
   });
 }
 

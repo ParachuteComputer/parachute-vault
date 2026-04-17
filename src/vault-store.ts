@@ -38,10 +38,27 @@ export function getVaultNameForStore(store: SqliteStore): string | undefined {
   return storeToVault.get(store);
 }
 
-/** Close all open stores. */
-export function closeAllStores(): void {
+/**
+ * Close all open stores. When `silent` is true, swallow errors from
+ * `db.close()` — used by test cleanup where the underlying DB files may
+ * already be gone.
+ */
+export function closeAllStores(silent = false): void {
   for (const [, store] of stores) {
-    store.db.close();
+    if (silent) {
+      try { store.db.close(); } catch {}
+    } else {
+      store.db.close();
+    }
   }
   stores.clear();
+}
+
+/**
+ * Test-only: close and clear all cached stores. Used between tests that
+ * swap `PARACHUTE_HOME` out from under the cache, which would otherwise
+ * hold handles to DBs whose files no longer exist.
+ */
+export function clearVaultStoreCache(): void {
+  closeAllStores(true);
 }

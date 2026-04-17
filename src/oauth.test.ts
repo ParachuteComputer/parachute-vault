@@ -84,7 +84,7 @@ async function fullOAuthFlow(opts?: { scope?: string }): Promise<string> {
       owner_token: ownerToken,
     }),
   });
-  const authRes = await handleAuthorizePost(authReq, db);
+  const authRes = await handleAuthorizePost(authReq, db, { vaultName: "default" });
   expect(authRes.status).toBe(302);
   const location = new URL(authRes.headers.get("location")!);
   const code = location.searchParams.get("code")!;
@@ -102,7 +102,7 @@ async function fullOAuthFlow(opts?: { scope?: string }): Promise<string> {
       redirect_uri: redirectUri,
     }).toString(),
   });
-  const tokenRes = await handleToken(tokenReq, db);
+  const tokenRes = await handleToken(tokenReq, db, "default");
   const tokenBody = await tokenRes.json();
   return tokenBody.access_token;
 }
@@ -407,7 +407,7 @@ describe("OAuth token exchange", () => {
         redirect_uri: "https://example.com/callback",
       }).toString(),
     });
-    const res = await handleToken(req, db);
+    const res = await handleToken(req, db, "default");
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toBe("invalid_grant");
@@ -432,7 +432,7 @@ describe("OAuth token exchange", () => {
         owner_token: ownerToken,
       }),
     });
-    const authRes = await handleAuthorizePost(authReq, db);
+    const authRes = await handleAuthorizePost(authReq, db, { vaultName: "default" });
     const location = new URL(authRes.headers.get("location")!);
     const code = location.searchParams.get("code")!;
 
@@ -448,7 +448,7 @@ describe("OAuth token exchange", () => {
         redirect_uri: redirectUri,
       }).toString(),
     });
-    const res = await handleToken(tokenReq, db);
+    const res = await handleToken(tokenReq, db, "default");
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error_description).toContain("PKCE");
@@ -473,7 +473,7 @@ describe("OAuth token exchange", () => {
         owner_token: ownerToken,
       }),
     });
-    const authRes = await handleAuthorizePost(authReq, db);
+    const authRes = await handleAuthorizePost(authReq, db, { vaultName: "default" });
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
 
     const tokenParams = new URLSearchParams({
@@ -492,6 +492,7 @@ describe("OAuth token exchange", () => {
         body: tokenParams,
       }),
       db,
+      "default",
     );
     expect(res1.status).toBe(200);
 
@@ -503,6 +504,7 @@ describe("OAuth token exchange", () => {
         body: tokenParams,
       }),
       db,
+      "default",
     );
     expect(res2.status).toBe(400);
     const body = await res2.json();
@@ -534,6 +536,7 @@ describe("OAuth token exchange", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -562,6 +565,7 @@ describe("OAuth token exchange", () => {
         }),
       }),
       db,
+      { vaultName: "default" },
     );
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
 
@@ -579,6 +583,7 @@ describe("OAuth token exchange", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -593,6 +598,7 @@ describe("OAuth token exchange", () => {
         body: "grant_type=client_credentials",
       }),
       db,
+      "default",
     );
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -619,6 +625,7 @@ describe("OAuth token exchange", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -629,6 +636,7 @@ describe("OAuth token exchange", () => {
     const res = await handleToken(
       makeRequest("https://vault.test/oauth/token"),
       db,
+      "default",
     );
     expect(res.status).toBe(405);
   });
@@ -697,7 +705,7 @@ describe("OAuth consent — password mode", () => {
         }),
       }),
       db,
-      { ownerPasswordHash: passwordHash },
+      { ownerPasswordHash: passwordHash, vaultName: "default" },
     );
 
     expect(authRes.status).toBe(302);
@@ -717,6 +725,7 @@ describe("OAuth consent — password mode", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     const body = await tokenRes.json();
     expect(body.access_token.startsWith("pvt_")).toBe(true);
@@ -959,6 +968,7 @@ describe("OAuth consent — scope selection", () => {
         }),
       }),
       db,
+      { vaultName: "default" },
     );
     expect(authRes.status).toBe(302);
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
@@ -976,6 +986,7 @@ describe("OAuth consent — scope selection", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     const body = await tokenRes.json();
     expect(body.scope).toBe("read");
@@ -1001,6 +1012,7 @@ describe("OAuth consent — scope selection", () => {
         }),
       }),
       db,
+      { vaultName: "default" },
     );
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
 
@@ -1017,6 +1029,7 @@ describe("OAuth consent — scope selection", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     const body = await tokenRes.json();
     expect(body.scope).toBe("read");
@@ -1118,7 +1131,7 @@ describe("OAuth consent — 2FA (TOTP)", () => {
         }),
       }),
       db,
-      { ownerPasswordHash: passwordHash, totpSecret: secret },
+      { ownerPasswordHash: passwordHash, totpSecret: secret, vaultName: "default" },
     );
     expect(res.status).toBe(302);
     const authCode = new URL(res.headers.get("location")!).searchParams.get("code")!;
@@ -1138,6 +1151,7 @@ describe("OAuth consent — 2FA (TOTP)", () => {
         }).toString(),
       }),
       db,
+      "default",
     );
     expect(tokenRes.status).toBe(200);
     const body = await tokenRes.json();
@@ -1238,5 +1252,272 @@ describe("OAuth consent — 2FA (TOTP)", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("Invalid credentials");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token response — honest vault name (Fix 1)
+// ---------------------------------------------------------------------------
+
+describe("OAuth token response — vault name", () => {
+  test("includes vault name for the default (unscoped) flow", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    const body = await tokenRes.json();
+    expect(body.access_token).toMatch(/^pvt_/);
+    expect(body.vault).toBe("default");
+    expect(body.token_type).toBe("bearer");
+    expect(body.scope).toBe("full");
+  });
+
+  test("includes vault name for a scoped (named-vault) flow", async () => {
+    // The vaultName is purely a response-shape concern; the DB is the same
+    // in-memory DB here. The point is that handleToken echoes the name it
+    // was called with, so the client can trust which vault it just connected to.
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/vaults/work/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "work" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/vaults/work/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "work",
+    );
+    const body = await tokenRes.json();
+    expect(body.vault).toBe("work");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Vault-scoped discovery (Fix 3 — routing coherence)
+// ---------------------------------------------------------------------------
+
+describe("OAuth discovery — vault-scoped", () => {
+  test("authorization-server metadata scopes all endpoints to the vault", async () => {
+    const req = makeRequest("https://vault.test/vaults/work/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "work");
+    const body = await res.json();
+    // Issuer and endpoints all live under /vaults/work. This is what makes
+    // vault-scoped OAuth work end-to-end: a client following the scoped
+    // discovery gets redirected to the scoped authorize/token endpoints,
+    // which in turn mint the token into the named vault's DB.
+    expect(body.issuer).toBe("https://vault.test/vaults/work");
+    expect(body.authorization_endpoint).toBe("https://vault.test/vaults/work/oauth/authorize");
+    expect(body.token_endpoint).toBe("https://vault.test/vaults/work/oauth/token");
+    expect(body.registration_endpoint).toBe("https://vault.test/vaults/work/oauth/register");
+    expect(body.code_challenge_methods_supported).toEqual(["S256"]);
+  });
+
+  test("authorization-server metadata defaults to unscoped endpoints when no vaultName", async () => {
+    // Regression check — the unscoped form still returns unscoped endpoints.
+    const req = makeRequest("https://vault.test/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req);
+    const body = await res.json();
+    expect(body.issuer).toBe("https://vault.test");
+    expect(body.authorization_endpoint).toBe("https://vault.test/oauth/authorize");
+    expect(body.token_endpoint).toBe("https://vault.test/oauth/token");
+  });
+
+  test("protected-resource advertises a vault-scoped authorization server", async () => {
+    const req = makeRequest("https://vault.test/vaults/work/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req, "/vaults/work/mcp", "/vaults/work");
+    const body = await res.json();
+    expect(body.resource).toBe("https://vault.test/vaults/work/mcp");
+    // The authorization server the client should fetch next is the scoped one,
+    // so the client discovers the scoped authorize/token endpoints.
+    expect(body.authorization_servers).toEqual(["https://vault.test/vaults/work"]);
+  });
+
+  test("protected-resource defaults to root authorization server when no prefix", async () => {
+    const req = makeRequest("https://vault.test/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req);
+    const body = await res.json();
+    expect(body.authorization_servers).toEqual(["https://vault.test"]);
+  });
+
+  test("scoped discovery honors x-forwarded-host", async () => {
+    const req = makeRequest("http://localhost:1940/vaults/work/.well-known/oauth-authorization-server", {
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "vault.example.com",
+      },
+    });
+    const res = handleAuthorizationServer(req, "work");
+    const body = await res.json();
+    expect(body.issuer).toBe("https://vault.example.com/vaults/work");
+    expect(body.authorization_endpoint).toBe("https://vault.example.com/vaults/work/oauth/authorize");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-vault code replay defense
+// ---------------------------------------------------------------------------
+
+describe("OAuth token — cross-vault code replay", () => {
+  // The in-memory DB in this suite is shared, but handleToken is passed the
+  // vaultName it was invoked under. That's the check: a code issued for
+  // vault A must not mint a token when presented to vault B's token endpoint,
+  // even if both endpoints share storage.
+
+  test("code issued for vault A rejected at vault B's token endpoint", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    // Issue a code under vault A's authorize endpoint
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/vaults/vault-a/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "vault-a" },
+    );
+    expect(authRes.status).toBe(302);
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    // Try to redeem it at vault B's token endpoint — must reject with
+    // invalid_grant per RFC 6749 §5.2. This is the privilege-escalation
+    // barrier: without the vault_name pinning, the code would mint a token
+    // into whichever vault's DB this handleToken was called against.
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/vaults/vault-b/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "vault-b",
+    );
+    expect(tokenRes.status).toBe(400);
+    const body = await tokenRes.json();
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  test("code issued for vault A still redeems successfully at vault A's token endpoint", async () => {
+    // Control case — same setup as the rejection test, but the token
+    // endpoint matches the authorize endpoint. Must succeed.
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/vaults/vault-a/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "vault-a" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/vaults/vault-a/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "vault-a",
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = await tokenRes.json();
+    expect(body.vault).toBe("vault-a");
+    expect(body.access_token).toMatch(/^pvt_/);
   });
 });
