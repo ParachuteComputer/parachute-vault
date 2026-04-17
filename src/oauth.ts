@@ -375,10 +375,12 @@ export async function handleAuthorizePost(
   const code = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes
 
+  // vault_name pins the code to the issuing vault. handleToken rejects
+  // any code whose vault_name doesn't match the token-endpoint's vault.
   db.prepare(`
-    INSERT INTO oauth_codes (code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(code, clientId, codeChallenge, codeChallengeMethod, selectedScope, redirectUri, expiresAt, new Date().toISOString());
+    INSERT INTO oauth_codes (code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, created_at, vault_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(code, clientId, codeChallenge, codeChallengeMethod, selectedScope, redirectUri, expiresAt, new Date().toISOString(), vaultName ?? null);
 
   redirect.searchParams.set("code", code);
   return Response.redirect(redirect.toString(), 302);
@@ -437,7 +439,7 @@ export async function handleToken(
 
   // Look up the auth code
   const authCode = db.prepare(`
-    SELECT code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, used
+    SELECT code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, used, vault_name
     FROM oauth_codes WHERE code = ?
   `).get(code) as {
     code: string;
@@ -448,6 +450,7 @@ export async function handleToken(
     redirect_uri: string;
     expires_at: string;
     used: number;
+    vault_name: string | null;
   } | null;
 
   if (!authCode) {
@@ -472,6 +475,14 @@ export async function handleToken(
   // Validate redirect_uri matches
   if (authCode.redirect_uri !== redirectUri) {
     return Response.json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, { status: 400 });
+  }
+
+  // Validate the code was issued for the same vault this token endpoint
+  // serves. Without this, a code issued under /vaults/A/oauth/authorize
+  // could be presented to /vaults/B/oauth/token and the token would be
+  // minted into B's DB — privilege escalation across vault boundaries.
+  if (authCode.vault_name !== vaultName) {
+    return Response.json({ error: "invalid_grant", error_description: "vault mismatch" }, { status: 400 });
   }
 
   // PKCE verification: SHA256(code_verifier) must match stored code_challenge

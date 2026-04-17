@@ -107,20 +107,61 @@ describe("auth — default-vault routing coherence", () => {
     expect("error" in global).toBe(false);
   });
 
-  test("scoped and unscoped auth return the same permission for the same token", () => {
+  // HTTP-level routing stand-in. Mirrors server.ts's vault-resolution step:
+  // unscoped `/api/*` resolves to the default vault; scoped `/vaults/X/api/*`
+  // extracts the name from the URL. After resolution both paths funnel into
+  // `authenticateVaultRequest` with that vault's config + DB. The earlier
+  // version of this test called `authenticateVaultRequest` twice with the same
+  // args and labelled the calls "scoped"/"unscoped" — tautological, because
+  // routing was never exercised. This variant drives the resolver from the
+  // URL, so the routing step is the thing under test.
+  function dispatchAuthFromPath(path: string, req: Request): {
+    status: number;
+    permission?: string;
+  } {
+    let vaultName: string;
+    if (path.startsWith("/vaults/")) {
+      vaultName = path.split("/")[2];
+    } else if (path.startsWith("/api/")) {
+      const gc = readGlobalConfig();
+      vaultName = gc.default_vault ?? "default";
+    } else {
+      return { status: 404 };
+    }
+    const vaultConfig = readVaultConfig(vaultName);
+    if (!vaultConfig) return { status: 404 };
+    const store = getVaultStore(vaultName);
+    const res = authenticateVaultRequest(req, vaultConfig, store.db);
+    if ("error" in res) return { status: res.error.status };
+    return { status: 200, permission: res.permission };
+  }
+
+  test("routing coherence: unscoped and scoped /api/health accept a default-vault token identically", () => {
     seedVault("default", { isDefault: true });
     const token = mintTokenInVault("default");
-    const cfg = readVaultConfig("default")!;
-    const db = getVaultStore("default").db;
 
-    const a = authenticateVaultRequest(bearer(token), cfg, db);
-    const b = authenticateVaultRequest(bearer(token), cfg, db);
-    const g = authenticateGlobalRequest(bearer(token));
-    if ("error" in a || "error" in b || "error" in g) {
-      throw new Error("Expected all three to succeed");
-    }
-    expect(a.permission).toBe(b.permission);
-    expect(a.permission).toBe(g.permission);
+    // (a) unscoped /api/health with default-vault token
+    const unscoped = dispatchAuthFromPath("/api/health", bearer(token));
+    expect(unscoped.status).toBe(200);
+
+    // (b) scoped /vaults/default/api/health with the same token
+    const scoped = dispatchAuthFromPath("/vaults/default/api/health", bearer(token));
+    expect(scoped.status).toBe(200);
+
+    // Both paths resolve the same vault → same permission level comes back.
+    expect(unscoped.permission).toBe(scoped.permission);
+  });
+
+  test("routing coherence: scoped /vaults/X/api/health rejects a token issued for vault Y", () => {
+    // The privilege-escalation barrier: a valid token for vault A must not
+    // authenticate at vault B's scoped endpoint, even though the URL is
+    // well-formed and the token itself is valid for *some* vault.
+    seedVault("default", { isDefault: true });
+    seedVault("work");
+    const workToken = mintTokenInVault("work");
+
+    const crossVault = dispatchAuthFromPath("/vaults/default/api/health", bearer(workToken));
+    expect(crossVault.status).toBe(401);
   });
 });
 
