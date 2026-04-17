@@ -211,16 +211,23 @@ async function cmdInit() {
     await promptForOwnerPassword("Set an owner password for OAuth consent?");
   }
 
-  // 6. Install daemon (platform-aware)
+  // 6. Install daemon (platform-aware). Idempotent — safe to re-run after
+  // a folder move; this refreshes ~/.parachute/server-path and bounces the
+  // daemon so the new location takes effect immediately.
   console.log("Installing daemon...");
+  let serverPath: string | null = null;
   if (isMac) {
-    await installAgent();
+    ({ serverPath } = await installAgent());
   } else if (isLinux && isSystemdAvailable()) {
-    await installSystemdService();
+    ({ serverPath } = await installSystemdService());
   } else {
     console.log("  Auto-start not available on this platform.");
     console.log("  Run manually: bun src/server.ts");
     console.log("  Or use Docker: docker compose up -d");
+  }
+  if (serverPath) {
+    console.log(`  Server path:  ${serverPath}`);
+    console.log(`  Wrapper:      ~/.parachute/start.sh`);
   }
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
