@@ -42,6 +42,8 @@ import {
 import type { VaultConfig } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import { installSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
+import { checkHealth, waitForHealthy, tailFile } from "./health.ts";
+import type { HealthResult } from "./health.ts";
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
@@ -771,6 +773,9 @@ async function cmdLogs() {
 }
 
 async function cmdRestart() {
+  loadEnvFile();
+  const port = readGlobalConfig().port || DEFAULT_PORT;
+
   console.log("Restarting daemon...");
   if (process.platform === "darwin") {
     await restartAgent();
@@ -780,30 +785,48 @@ async function cmdRestart() {
     console.error("No daemon manager available. Restart manually or use Docker.");
     process.exit(1);
   }
-  console.log("Done.");
+
+  process.stdout.write("Waiting for /health ");
+  // Dot-progress only to interactive terminals so piped output stays clean.
+  const interval = process.stdout.isTTY
+    ? setInterval(() => process.stdout.write("."), 500)
+    : null;
+  const health = await waitForHealthy(port, { totalMs: 10_000 });
+  if (interval) clearInterval(interval);
+  process.stdout.write("\n");
+
+  if (health.status === "healthy") {
+    console.log(`Vault is healthy at http://127.0.0.1:${port} (${health.latencyMs}ms)`);
+    return;
+  }
+
+  console.error(`Vault did not come up within 10s — status: ${health.status}${health.error ? ` (${health.error})` : ""}`);
+  printErrLogTail(20);
+  process.exit(1);
 }
 
 async function cmdStatus() {
   loadEnvFile();
-  let loaded: boolean;
+  const globalConfig = readGlobalConfig();
+  const port = globalConfig.port || DEFAULT_PORT;
+  const vaults = listVaults();
+
+  // Three distinct states:
+  //   loaded — launchd/systemd believes the agent is running
+  //   health — what the HTTP server at <port> actually responds with
+  let loaded: boolean | "n/a";
   if (process.platform === "darwin") {
     loaded = await isAgentLoaded();
   } else if (isSystemdAvailable()) {
     loaded = await isServiceActive();
   } else {
-    // Check if server responds on the port
-    try {
-      const resp = await fetch(`http://127.0.0.1:${readGlobalConfig().port || DEFAULT_PORT}/health`);
-      loaded = resp.ok;
-    } catch { loaded = false; }
+    loaded = "n/a"; // no daemon manager on this platform
   }
-  const vaults = listVaults();
-  const globalConfig = readGlobalConfig();
+  const health = await checkHealth(port);
 
   console.log("Parachute Vault\n");
-
-  // Server
-  console.log(`  Server:   ${loaded ? "running" : "stopped"} on port ${globalConfig.port}`);
+  console.log(`  Daemon:   ${renderLoaded(loaded)}`);
+  console.log(`  Server:   ${renderHealth(health, port)}`);
   console.log(`  Config:   ${CONFIG_DIR}`);
 
   // Vaults
@@ -825,16 +848,50 @@ async function cmdStatus() {
     console.log(`  Triggers:   none configured`);
   }
 
-  // Quick health check if daemon is running
-  if (loaded) {
-    try {
-      const resp = await fetch(`http://127.0.0.1:${globalConfig.port}/health`);
-      if (resp.ok) {
-        console.log(`\n  Health:   ok`);
-      }
-    } catch {
-      console.log(`\n  Health:   daemon loaded but not responding`);
-    }
+  // If loaded but not healthy, surface the recent error log. This is the
+  // "daemon is running but wedged" case that bit us when start.sh pointed
+  // at a moved repo — launchctl said it was loaded, the port was closed,
+  // and the cause was sitting in vault.err.
+  if (loaded === true && health.status !== "healthy") {
+    printErrLogTail(20);
+  }
+}
+
+function renderLoaded(loaded: boolean | "n/a"): string {
+  if (loaded === "n/a") return "(no daemon manager on this platform)";
+  if (!loaded) return "not loaded";
+  // Keep the manager name honest per-platform so Linux users don't see
+  // "launchctl" in their status output.
+  const manager = process.platform === "darwin" ? "launchctl" : "systemd";
+  return `loaded (${manager})`;
+}
+
+function renderHealth(h: HealthResult, port: number): string {
+  switch (h.status) {
+    case "healthy":
+      return `healthy — http://127.0.0.1:${port} (${h.latencyMs}ms)`;
+    case "unhealthy":
+      return `responding but unhealthy — HTTP ${h.statusCode} on port ${port}`;
+    case "not-listening":
+      return `not listening — nothing bound to port ${port}`;
+    case "error":
+      return `unreachable — ${h.error ?? "unknown error"}`;
+  }
+}
+
+function printErrLogTail(n: number) {
+  const tail = tailFile(ERR_PATH, n);
+  console.log(`\n  Recent errors from ${ERR_PATH}:`);
+  if (tail === null) {
+    console.log(`    (no log file at ${ERR_PATH})`);
+    return;
+  }
+  if (tail === "") {
+    console.log(`    (log file is empty)`);
+    return;
+  }
+  for (const line of tail.split("\n")) {
+    console.log(`    ${line}`);
   }
 }
 
