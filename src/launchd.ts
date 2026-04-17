@@ -58,13 +58,19 @@ export async function installAgent(): Promise<{ serverPath: string }> {
 
   // Bounce launchd so it picks up a refreshed wrapper + pointer. `load`
   // alone fails with "Operation already in progress" if we're already
-  // registered, which used to silently leave stale config in place.
+  // registered, which used to silently leave stale config in place. If
+  // two `vault init` calls race, the second `load` may also see the
+  // service as still-loaded; swallow it so re-runs don't blow up.
   try {
     await $`launchctl unload ${PLIST_PATH}`.quiet();
   } catch {
     // Not loaded yet — fine.
   }
-  await $`launchctl load ${PLIST_PATH}`.quiet();
+  try {
+    await $`launchctl load ${PLIST_PATH}`.quiet();
+  } catch {
+    // A concurrent init already reloaded it — fine.
+  }
 
   return { serverPath };
 }
@@ -77,8 +83,10 @@ export async function uninstallAgent(): Promise<void> {
     await unlink(PLIST_PATH);
   } catch {}
   // Wrapper + pointer removal lives in daemon.ts so it's shared with the
-  // Linux uninstall path. We leave that to the CLI's `uninstall` command
-  // (PR 3) which is responsible for whole-daemon teardown.
+  // Linux uninstall path. Callers that want a fully-clean teardown must
+  // also call `removeDaemonWrapper()` — the CLI's `uninstall` command in
+  // PR 3 wires that up. Leaving them here programmatically would strand
+  // orphaned files in `~/.parachute/`.
 }
 
 export async function isAgentLoaded(): Promise<boolean> {

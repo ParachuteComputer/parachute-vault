@@ -1,7 +1,10 @@
 import { describe, test, expect } from "bun:test";
-import { generateWrapper } from "./daemon.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { $ } from "bun";
+import { generateWrapper, WRAPPER_PATH } from "./daemon.ts";
 import { generatePlist } from "./launchd.ts";
-import { WRAPPER_PATH } from "./daemon.ts";
 
 describe("generateWrapper", () => {
   // The incident that triggered this module: start.sh had the server path
@@ -59,6 +62,21 @@ describe("generateWrapper", () => {
     const wrapper = generateWrapper({ bunPath: "/Users/alice/.bun/bin/bun" });
     // The exec line uses $SERVER_PATH (dereferenced at boot), not a literal.
     expect(wrapper).toMatch(/exec "\/Users\/alice\/\.bun\/bin\/bun" "\$SERVER_PATH"/);
+  });
+
+  test("output is syntactically valid bash (bash -n passes)", async () => {
+    // Catch any shell-quoting regressions before they become crash-looping
+    // daemons in production. `bash -n` parses without executing.
+    const wrapper = generateWrapper({ bunPath: "/bin/bun" });
+    const dir = mkdtempSync(join(tmpdir(), "vault-wrapper-"));
+    const path = join(dir, "start.sh");
+    try {
+      writeFileSync(path, wrapper);
+      const result = await $`bash -n ${path}`.quiet().nothrow();
+      expect(result.exitCode).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

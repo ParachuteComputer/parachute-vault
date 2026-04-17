@@ -90,6 +90,10 @@ exec "${opts.bunPath}" "$SERVER_PATH"
  * Resolve the absolute path to server.ts for the currently-running CLI.
  * Works for both `bun src/cli.ts` (dev) and `bun x @openparachute/vault`
  * (published) — whichever path the CLI loaded from, server.ts sits next to it.
+ *
+ * NOTE: this relies on `server.ts` shipping next to `cli.ts` in the
+ * published package. If a `"files"` allowlist is ever added to
+ * package.json, `src/server.ts` must be included explicitly.
  */
 export function resolveServerPath(): string {
   return resolve(dirname(import.meta.path), "server.ts");
@@ -117,7 +121,11 @@ export async function removeDaemonWrapper(): Promise<void> {
   }
 }
 
-/** Read the pointer file, returning null if it's missing or unreadable. */
+/**
+ * Read the pointer file, returning null if it's missing or unreadable.
+ * Used by the `vault doctor` / `vault uninstall` commands in PR 3 to tell
+ * whether the daemon is pointing at a real file.
+ */
 export function readServerPathPointer(): string | null {
   try {
     if (!existsSync(SERVER_PATH_FILE)) return null;
