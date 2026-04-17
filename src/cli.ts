@@ -40,10 +40,17 @@ import {
   ERR_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
+import { VAULTS_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
-import { installSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
+import { installSystemdService, uninstallSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
 import { checkHealth, waitForHealthy, tailFile } from "./health.ts";
 import type { HealthResult } from "./health.ts";
+import {
+  WRAPPER_PATH,
+  SERVER_PATH_FILE,
+  readServerPathPointer,
+  removeDaemonWrapper,
+} from "./daemon.ts";
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
@@ -130,6 +137,15 @@ switch (command) {
     break;
   case "restart":
     await cmdRestart();
+    break;
+  case "uninstall":
+    await cmdUninstall(cmdArgs);
+    break;
+  case "doctor":
+    await cmdDoctor();
+    break;
+  case "url":
+    cmdUrl();
     break;
   case "import":
     await cmdImport(cmdArgs);
@@ -903,6 +919,177 @@ function printErrLogTail(n: number) {
 }
 
 // ---------------------------------------------------------------------------
+// Uninstall / Doctor / URL
+// ---------------------------------------------------------------------------
+
+async function cmdUninstall(argsList: string[]) {
+  const wipe = argsList.includes("--wipe");
+  const skipPrompts = argsList.includes("--yes") || argsList.includes("-y");
+
+  console.log("Parachute Vault uninstall\n");
+  console.log("This removes the daemon registration and wrapper script.");
+  if (wipe) {
+    console.log("`--wipe` will ALSO remove vaults (SQLite DBs) and .env.\n");
+  } else {
+    console.log("User data (~/.parachute/vaults, ~/.parachute/.env) is left alone.\n");
+  }
+
+  if (!skipPrompts) {
+    const ok = await confirm("Proceed?");
+    if (!ok) {
+      console.log("Cancelled.");
+      return;
+    }
+  }
+
+  // 1. Stop and remove the daemon registration.
+  if (process.platform === "darwin") {
+    console.log("Removing launchd agent...");
+    await uninstallAgent();
+  } else if (isSystemdAvailable()) {
+    console.log("Removing systemd service...");
+    await uninstallSystemdService();
+  } else {
+    console.log("No daemon manager on this platform — skipping service removal.");
+  }
+
+  // 2. Remove wrapper + pointer file (shared across platforms).
+  console.log("Removing wrapper and server-path pointer...");
+  await removeDaemonWrapper();
+
+  // 3. Optionally wipe user data. Double-confirm so nobody loses a vault
+  // by muscle-memory — this is the one genuinely destructive path.
+  if (wipe) {
+    const vaultsExist = existsSync(VAULTS_DIR);
+    const envExists = existsSync(ENV_PATH);
+    if (!vaultsExist && !envExists) {
+      console.log("No user data to remove.");
+    } else {
+      console.log("\nUser data that would be removed:");
+      if (vaultsExist) console.log(`  ${VAULTS_DIR} (SQLite vaults)`);
+      if (envExists) console.log(`  ${ENV_PATH} (.env config + secrets)`);
+
+      let doWipe = skipPrompts;
+      if (!skipPrompts) {
+        doWipe = await confirm("Delete this data? (cannot be undone)");
+      }
+      if (doWipe) {
+        if (vaultsExist) rmSync(VAULTS_DIR, { recursive: true, force: true });
+        if (envExists) rmSync(ENV_PATH, { force: true });
+        console.log("User data removed.");
+      } else {
+        console.log("Kept user data.");
+      }
+    }
+  }
+
+  console.log("\nDone. To reinstall: `parachute vault init`.");
+}
+
+interface DoctorCheck {
+  name: string;
+  status: "pass" | "warn" | "fail";
+  detail?: string;
+  fix?: string;
+}
+
+async function cmdDoctor() {
+  const checks: DoctorCheck[] = [];
+
+  // Pointer file. The stale-path failure mode shows up here first.
+  if (!existsSync(SERVER_PATH_FILE)) {
+    checks.push({
+      name: "server-path pointer",
+      status: "fail",
+      detail: `missing: ${SERVER_PATH_FILE}`,
+      fix: "Run `parachute vault init` to create it.",
+    });
+  } else {
+    const pointed = readServerPathPointer();
+    if (!pointed) {
+      checks.push({
+        name: "server-path pointer",
+        status: "fail",
+        detail: `empty: ${SERVER_PATH_FILE}`,
+        fix: "Run `parachute vault init` to rewrite it.",
+      });
+    } else if (!existsSync(pointed)) {
+      checks.push({
+        name: "server.ts at pointer target",
+        status: "fail",
+        detail: `points to ${pointed}, which does not exist`,
+        fix: "Run `parachute vault init` from the current repo location.",
+      });
+    } else {
+      checks.push({
+        name: "server-path pointer",
+        status: "pass",
+        detail: `→ ${pointed}`,
+      });
+    }
+  }
+
+  // Wrapper script. Independent of the pointer — a missing wrapper means
+  // launchd/systemd has nothing to exec.
+  if (!existsSync(WRAPPER_PATH)) {
+    checks.push({
+      name: "wrapper script",
+      status: "fail",
+      detail: `missing: ${WRAPPER_PATH}`,
+      fix: "Run `parachute vault init`.",
+    });
+  } else {
+    checks.push({ name: "wrapper script", status: "pass", detail: WRAPPER_PATH });
+  }
+
+  // Daemon registration.
+  if (process.platform === "darwin") {
+    const loaded = await isAgentLoaded();
+    checks.push({
+      name: "launchd agent",
+      status: loaded ? "pass" : "warn",
+      detail: loaded ? "loaded" : "not loaded",
+      fix: loaded ? undefined : "Run `parachute vault init` or `parachute vault restart`.",
+    });
+  } else if (isSystemdAvailable()) {
+    const active = await isServiceActive();
+    checks.push({
+      name: "systemd service",
+      status: active ? "pass" : "warn",
+      detail: active ? "active" : "not active",
+      fix: active ? undefined : "Run `parachute vault init` or `parachute vault restart`.",
+    });
+  }
+
+  // Render.
+  const icons = { pass: " ✓", warn: " !", fail: " ✗" } as const;
+  console.log("Parachute Vault — doctor\n");
+  for (const c of checks) {
+    const icon = icons[c.status];
+    console.log(`  ${icon} ${c.name}${c.detail ? `  (${c.detail})` : ""}`);
+    if (c.fix) console.log(`       fix: ${c.fix}`);
+  }
+
+  const hasFailure = checks.some((c) => c.status === "fail");
+  const hasWarn = checks.some((c) => c.status === "warn");
+  console.log();
+  if (hasFailure) {
+    console.log("doctor: problems found (exit 1). See `parachute vault status` for runtime details.");
+    process.exit(1);
+  } else if (hasWarn) {
+    console.log("doctor: warnings only. `parachute vault status` has live runtime detail.");
+  } else {
+    console.log("doctor: all checks passed. For live runtime state: `parachute vault status`.");
+  }
+}
+
+function cmdUrl() {
+  // Intentionally minimal — scripts parse this, so print only the URL.
+  const port = readGlobalConfig().port || DEFAULT_PORT;
+  console.log(`http://127.0.0.1:${port}`);
+}
+
+// ---------------------------------------------------------------------------
 // Import / Export
 // ---------------------------------------------------------------------------
 
@@ -1151,8 +1338,11 @@ function usage() {
 Parachute Vault — self-hosted knowledge graph
 
 Setup:
-  parachute vault init                     Set up everything (one command)
+  parachute vault init                     Set up everything (one command, idempotent)
   parachute vault status                   Check what's running
+  parachute vault doctor                   Diagnose install/config issues
+  parachute vault uninstall [--wipe]       Remove daemon; --wipe also removes vaults + .env
+  parachute vault url                      Print the local server URL (for scripts)
 
 Vaults:
   parachute vault create <name>            Create a new vault
