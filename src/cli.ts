@@ -19,6 +19,10 @@
 import { resolve } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "fs";
+// JSON import — resolved at module load, works for both dev runs
+// (`bun src/cli.ts …`) and the published package (`bunx @openparachute/vault`)
+// because package.json ships at the root next to src/.
+import pkg from "../package.json" with { type: "json" };
 import {
   ensureConfigDirSync,
   readVaultConfig,
@@ -179,6 +183,14 @@ switch (command) {
   case "--help":
   case "-h":
     usage();
+    break;
+  case "version":
+  case "--version":
+  case "-v":
+    // Intentionally minimal — just the version string on stdout. Scripts
+    // (and `parachute vault doctor` in a future check) rely on this being
+    // a bare-number line; anything else belongs in `vault status`.
+    console.log(pkg.version);
     break;
   default:
     console.error(`Unknown command: ${command}`);
@@ -1976,6 +1988,7 @@ Setup:
                                            config.yaml, and daemon logs (vault.log, vault.err).
                                            --yes skips prompts (DANGEROUS with --wipe: no confirmation).
   parachute vault url                      Print the local server URL (for scripts)
+  parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
   parachute vault create <name>            Create a new vault

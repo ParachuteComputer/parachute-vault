@@ -4,6 +4,16 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.2.2] — 2026-04-17
+
+### Fixed
+
+- **`start.sh` daemon wrapper no longer crashes on user shell profiles that reference unbound variables.** The generated wrapper ran `source ~/.zprofile` and `source ~/.zshrc` under `set -u`, so a zsh plugin framework or any conditional profile setup that touched an unset variable would abort the wrapper with exit 1. The `2>/dev/null` redirect swallowed the error, launchd saw repeated exit 1s, and the daemon silently refused to start with an empty `vault.err`. The wrapper now brackets the profile-source lines with `set +u` / `set -u` so -u is only active for code the wrapper owns. Run `parachute vault init` once on 0.2.2 to rewrite `~/.parachute/start.sh` — the rewrite is idempotent.
+
+### Added
+
+- **`parachute --version` / `parachute -v` / `parachute version`** print the installed package version to stdout. Works at the root and with the `vault` prefix (`parachute vault --version`, etc.). Reads from the installed `package.json` at module load, not a hardcoded string.
+
 ## [0.2.1] — 2026-04-17
 
 ### Fixed
@@ -83,5 +93,6 @@ First tagged public release. Ships the auth, backup, and onboarding surface the 
 - **`core/src/test-preload.ts`** isolates `PARACHUTE_HOME` for tests so `bun test` never touches a user's real `~/.parachute/`.
 - Test suite at release cut: **538 passing / 0 failing / 3 skipped** across 22 files (541 tests total).
 
+[0.2.2]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.0

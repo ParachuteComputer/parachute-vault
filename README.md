@@ -172,6 +172,7 @@ parachute vault init                       # one-command setup (idempotent — s
 parachute vault status                     # check what's running
 parachute vault doctor                     # diagnose install/config issues (see Troubleshooting)
 parachute vault url                        # print the local server URL (for scripts)
+parachute --version                        # print the installed version (aliases: -v, version)
 parachute vault uninstall                  # remove daemon + MCP entry; keeps user data
 parachute vault uninstall --wipe           # ...and also remove vaults, .env, config.yaml, logs
 parachute vault uninstall --yes --wipe     # scripted destructive wipe (prints an audit line)

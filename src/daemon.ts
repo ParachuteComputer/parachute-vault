@@ -55,8 +55,17 @@ export function generateWrapper(opts: {
 set -u
 
 # Source user shell profile for PATH (needed for parakeet-mlx, ffmpeg, etc.)
+# Temporarily disable -u around these: user rc files routinely reference
+# unbound variables (zsh plugin frameworks, conditional setups), and a bare
+# \`set -u\` source would crash the wrapper with exit 1 and leave vault.err
+# empty because of the 2>/dev/null below — launchd would respawn silently
+# until it gave up. Keep the stderr redirect so expected "command not found"
+# noise from incomplete setups doesn't fill vault.err; to debug silent
+# wrapper failures, run \`bash -x ~/.parachute/start.sh\` by hand.
+set +u
 [ -f "$HOME/.zprofile" ] && source "$HOME/.zprofile" 2>/dev/null
 [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
+set -u
 
 if [ -f "${envPath}" ]; then
   set -a
