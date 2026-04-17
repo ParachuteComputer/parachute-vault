@@ -46,8 +46,10 @@ Authorization: Bearer <key>
 X-API-Key: <key>
 ```
 
-Requests from localhost bypass auth (you can hit the server directly without a
-key for local dev).
+Every request is authenticated — localhost and remote traffic go through the
+same path, there is no bypass. Local dev feels friction-free because you can
+hand the CLI-generated API key to your script without exposing it to the
+network, not because the auth check is skipped.
 
 Keys have a **scope**:
 

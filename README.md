@@ -285,14 +285,14 @@ Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp
 
 ### Claude Code
 
-`vault init` auto-configures `~/.claude.json`. To set manually:
+`vault init` auto-configures `~/.claude.json`. To set manually, use the vault-scoped endpoint — `{name}` is the vault to target (`default` on a fresh install, whatever you passed to `vault create` otherwise):
 
 ```json
 {
   "mcpServers": {
     "parachute-vault": {
       "type": "http",
-      "url": "http://127.0.0.1:1940/mcp",
+      "url": "http://127.0.0.1:1940/vaults/{name}/mcp",
       "headers": { "Authorization": "Bearer pvk_..." }
     }
   }
