@@ -43,6 +43,23 @@ import {
 import type { VaultConfig } from "./config.ts";
 import { VAULTS_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
+import {
+  runBackup,
+  readLastBackup,
+  nextRunEstimate,
+  updateBackupConfig,
+  expandTilde,
+  checkDestinationWritable,
+  tierTally,
+} from "./backup.ts";
+import {
+  installBackupAgent,
+  uninstallBackupAgent,
+  isBackupAgentLoaded,
+  BACKUP_PLIST_PATH,
+} from "./backup-launchd.ts";
+import { defaultBackupConfig } from "./config.ts";
+import type { BackupSchedule } from "./config.ts";
 import { installSystemdService, uninstallSystemdService, restartSystemdService, isSystemdAvailable, isServiceActive } from "./systemd.ts";
 import { checkHealth, waitForHealthy, tailFile } from "./health.ts";
 import type { HealthResult } from "./health.ts";
@@ -148,6 +165,9 @@ switch (command) {
     break;
   case "url":
     cmdUrl();
+    break;
+  case "backup":
+    await cmdBackup(cmdArgs);
     break;
   case "import":
     await cmdImport(cmdArgs);
@@ -1023,6 +1043,10 @@ async function cmdUninstall(argsList: string[]) {
   if (process.platform === "darwin") {
     console.log("Removing launchd agent...");
     await uninstallAgent();
+    // Scheduled backup agent lives in a separate plist — uninstall it too,
+    // otherwise `uninstall` leaves the backup job firing forever on an
+    // install whose daemon has been removed.
+    await uninstallBackupAgent();
   } else if (isSystemdAvailable()) {
     console.log("Removing systemd service...");
     await uninstallSystemdService();
@@ -1270,6 +1294,48 @@ async function cmdDoctor() {
       break;
   }
 
+  // Backup — only verify when the user has asked for automatic backups.
+  // Manual mode is the default; showing a "not loaded" check when the user
+  // explicitly didn't configure scheduled backups is noise, not a finding.
+  const backupCfg = readGlobalConfig().backup;
+  if (backupCfg && backupCfg.schedule !== "manual") {
+    // 1. Agent loaded? (macOS only — systemd path for backup lands in a
+    // follow-up PR; on Linux we silently skip this half of the check.)
+    if (process.platform === "darwin") {
+      const loaded = await isBackupAgentLoaded();
+      checks.push({
+        name: "backup agent",
+        status: loaded ? "pass" : "warn",
+        detail: loaded ? `loaded (schedule: ${backupCfg.schedule})` : `not loaded (schedule: ${backupCfg.schedule})`,
+        fix: loaded ? undefined : `Re-run \`parachute vault backup --schedule ${backupCfg.schedule}\` to reinstall the agent.`,
+      });
+    }
+
+    // 2. Destination writability. A backup agent that fires into a path that
+    // doesn't exist (or is read-only) is the worst failure mode — silent
+    // until the user needs the backup, then "I have no backups." We try to
+    // mkdir the configured path and tap it for write access.
+    if (backupCfg.destinations.length === 0) {
+      checks.push({
+        name: "backup destinations",
+        status: "warn",
+        detail: "schedule is active but no destinations configured",
+        fix: "Edit ~/.parachute/config.yaml and add at least one destination under `backup.destinations`.",
+      });
+    } else {
+      for (const dest of backupCfg.destinations) {
+        const res = checkDestinationWritable(dest);
+        checks.push({
+          name: `backup destination (${dest.kind})`,
+          status: res.ok ? "pass" : "warn",
+          detail: res.ok ? res.path : `${res.path}: ${res.error}`,
+          fix: res.ok ? undefined : "Ensure the path exists and is writable, or update it in ~/.parachute/config.yaml.",
+        });
+      }
+    }
+  }
+
+
   // Render.
   const icons = { pass: " ✓", warn: " !", fail: " ✗" } as const;
   console.log("Parachute Vault — doctor\n");
@@ -1492,6 +1558,165 @@ async function describeProcess(pid: number): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Backup — parachute vault backup [--schedule <freq> | status]
+// ---------------------------------------------------------------------------
+
+async function cmdBackup(args: string[]) {
+  // Subcommand: `status`
+  if (args[0] === "status") {
+    await cmdBackupStatus();
+    return;
+  }
+
+  // Flag: `--schedule <freq>`
+  const schedFlag = args.indexOf("--schedule");
+  if (schedFlag !== -1) {
+    const raw = args[schedFlag + 1];
+    if (!raw) {
+      console.error("Usage: parachute vault backup --schedule <hourly|daily|weekly|manual>");
+      process.exit(1);
+    }
+    if (raw !== "hourly" && raw !== "daily" && raw !== "weekly" && raw !== "manual") {
+      console.error(`Invalid schedule: ${raw}. Must be one of: hourly, daily, weekly, manual.`);
+      process.exit(1);
+    }
+    await cmdBackupSchedule(raw);
+    return;
+  }
+
+  // Default: one-shot backup.
+  await cmdBackupRun();
+}
+
+async function cmdBackupRun() {
+  const cfg = readGlobalConfig().backup ?? defaultBackupConfig();
+  if (cfg.destinations.length === 0) {
+    console.error("No backup destinations configured. Edit ~/.parachute/config.yaml:");
+    console.error("  backup:");
+    console.error("    destinations:");
+    console.error("      - kind: local");
+    console.error(`        path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups`);
+    process.exit(1);
+  }
+
+  console.log("Running backup...");
+  const result = await runBackup({ backup: cfg });
+  const bytes = result.bytes;
+  const kb = Math.round(bytes / 1024);
+  console.log(`  Snapshot: ${result.contents.dbSnapshots.length} DB(s), ${result.contents.configFiles.length} config file(s), ${kb} KB`);
+
+  let ok = 0;
+  for (const r of result.destinations) {
+    if (r.error) {
+      console.error(`  ${r.destination.kind} — FAILED: ${r.error}`);
+      continue;
+    }
+    ok++;
+    const prunedStr = r.pruned > 0 ? ` (pruned ${r.pruned} older)` : "";
+    console.log(`  ${r.destination.kind} → ${r.writtenPath}${prunedStr}`);
+  }
+  if (ok === 0) {
+    process.exit(1);
+  }
+}
+
+async function cmdBackupSchedule(schedule: BackupSchedule) {
+  const cfg = updateBackupConfig({ schedule });
+
+  if (process.platform !== "darwin") {
+    console.log(`Schedule set to: ${schedule}`);
+    console.log("Note: scheduled backups are only registered on macOS in this MVP.");
+    console.log("Linux systemd-timer support is a follow-up PR.");
+    return;
+  }
+
+  if (schedule === "manual") {
+    await uninstallBackupAgent();
+    console.log("Schedule: manual — backup agent removed.");
+    console.log("Run `parachute vault backup` to trigger a backup on demand.");
+    return;
+  }
+
+  if (cfg.destinations.length === 0) {
+    console.log(`Schedule set to: ${schedule}`);
+    console.log();
+    console.log("WARNING: no destinations configured — scheduled runs will fail.");
+    console.log("Edit ~/.parachute/config.yaml and add at least one destination under `backup.destinations`.");
+  }
+
+  await installBackupAgent(schedule);
+  console.log(`Schedule: ${schedule} — backup agent installed.`);
+  console.log(`  Plist:    ${BACKUP_PLIST_PATH}`);
+  console.log(`  Next run: ${describeNextRun(schedule)}`);
+}
+
+async function cmdBackupStatus() {
+  const cfg = readGlobalConfig().backup ?? defaultBackupConfig();
+  const last = readLastBackup();
+
+  console.log("Parachute Vault — backup\n");
+  console.log(`  Schedule:   ${cfg.schedule}`);
+  // Tiered retention is always rendered as a one-line summary; per-tier
+  // counts from real destinations go under each destination below.
+  const r = cfg.retention;
+  const yearlyStr = r.yearly === null ? "∞" : String(r.yearly);
+  console.log(`  Retention:  ${r.daily} daily / ${r.weekly} weekly / ${r.monthly} monthly / ${yearlyStr} yearly`);
+
+  if (cfg.destinations.length === 0) {
+    console.log(`  Destinations: (none)`);
+  } else {
+    console.log(`  Destinations:`);
+    for (const d of cfg.destinations) {
+      if (d.kind === "local") {
+        const path = expandTilde(d.path);
+        console.log(`    - local: ${path}`);
+        // Per-destination tier breakdown — counts the snapshots on disk and
+        // each tier's individual contribution to the keep set. A snapshot
+        // can satisfy multiple tiers, so per-tier counts may sum to > total.
+        const t = tierTally(path, cfg.retention);
+        if (t.total > 0) {
+          console.log(`        on-disk: ${t.total} snapshot(s) — ${t.daily}d / ${t.weekly}w / ${t.monthly}mo / ${t.yearly}y`);
+        }
+      }
+    }
+  }
+
+  if (process.platform === "darwin") {
+    const loaded = await isBackupAgentLoaded();
+    console.log(`  Agent:      ${loaded ? "loaded (launchctl)" : "not loaded"}`);
+  }
+
+  if (last) {
+    console.log();
+    console.log(`  Last run:   ${last.timestamp}`);
+    console.log(`    Size:     ${Math.round(last.bytes / 1024)} KB`);
+    for (const d of last.destinations) {
+      if (d.error) {
+        console.log(`    FAILED:   ${d.error}`);
+      } else if (d.path) {
+        console.log(`    Wrote:    ${d.path}`);
+      }
+    }
+  } else {
+    console.log();
+    console.log("  Last run:   (never)");
+  }
+
+  if (cfg.schedule !== "manual") {
+    console.log();
+    console.log(`  Next run:   ${describeNextRun(cfg.schedule)}`);
+  }
+}
+
+function describeNextRun(schedule: BackupSchedule): string {
+  const est = nextRunEstimate(schedule, new Date());
+  if (!est) return "(manual — on demand only)";
+  // Render in local time so the user's sense of "around 3am" matches what
+  // launchd will actually do.
+  return est.toLocaleString();
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,6 +2004,11 @@ Config:
   parachute vault config                   Show current configuration
   parachute vault config set <key> <val>   Set a config value
   parachute vault config unset <key>       Remove a config value
+
+Backup:
+  parachute vault backup                        One-shot backup to configured destinations
+  parachute vault backup --schedule <freq>      hourly | daily | weekly | manual (macOS launchd)
+  parachute vault backup status                 Show schedule, last run, destinations, next run
 
 Import/Export:
   parachute vault import <path>            Import an Obsidian vault

@@ -169,6 +169,83 @@ export interface GlobalConfig {
    *   callers.
    */
   discovery?: "enabled" | "disabled";
+  /** Backup configuration: schedule, retention, destinations. */
+  backup?: BackupConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Backup configuration
+// ---------------------------------------------------------------------------
+
+export type BackupSchedule = "hourly" | "daily" | "weekly" | "manual";
+
+/**
+ * Discriminated union over destination kinds. For the MVP we ship `local`
+ * only; `s3`, `rsync`, and `cloud` kinds will be added as additional variants
+ * without breaking existing configs. Unknown kinds are preserved verbatim so
+ * a forward-rolled config edited by a newer CLI isn't silently downgraded by
+ * an older CLI rewriting the file.
+ */
+export interface LocalBackupDestination {
+  kind: "local";
+  /** Absolute or `~/`-prefixed path. `~/` is expanded at use-time. */
+  path: string;
+}
+
+export type BackupDestination = LocalBackupDestination;
+
+/**
+ * Tiered (grandfather-father-son) retention policy. After each backup we keep
+ * the union of four tier queries:
+ *
+ *   daily   — the N most recent snapshots (unconditionally).
+ *   weekly  — one snapshot per ISO week, for the N most recent such weeks.
+ *   monthly — one snapshot per calendar month, for the N most recent months.
+ *   yearly  — one snapshot per calendar year; `null` means keep every year
+ *             (never prune by age — the long-tail archive).
+ *
+ * A tier set to 0 is disabled (it contributes no keepers, but the other tiers
+ * still apply). All bucketing uses the local timezone so calendar alignment
+ * matches the user's expectations, not UTC.
+ */
+export interface RetentionPolicy {
+  /** Keep the last N daily snapshots. 0 disables the daily tier. */
+  daily: number;
+  /** Keep the last snapshot from each of the last N ISO weeks. 0 disables. */
+  weekly: number;
+  /** Keep the last snapshot from each of the last N months. 0 disables. */
+  monthly: number;
+  /**
+   * Keep the last snapshot from each of the last N years. `null` or `undefined`
+   * means unbounded — keep one snapshot per year, forever, across the full
+   * history. 0 disables the yearly tier entirely.
+   */
+  yearly: number | null;
+}
+
+export interface BackupConfig {
+  /** How often the scheduler fires. "manual" = scheduler is not registered. */
+  schedule: BackupSchedule;
+  /** Tiered retention policy — grandfather/father/son. */
+  retention: RetentionPolicy;
+  /** Pluggable destinations. Runs in order; a destination error logs + continues. */
+  destinations: BackupDestination[];
+}
+
+export function defaultRetentionPolicy(): RetentionPolicy {
+  // Defaults balance "I want to roll back yesterday's accidental delete"
+  // against "my iCloud folder shouldn't blow up in a year." The yearly tier
+  // is unbounded by default — the whole point of the tiered policy is that
+  // one-per-year is cheap forever.
+  return { daily: 7, weekly: 4, monthly: 12, yearly: null };
+}
+
+export function defaultBackupConfig(): BackupConfig {
+  return {
+    schedule: "manual",
+    retention: defaultRetentionPolicy(),
+    destinations: [],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +536,180 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Backup YAML parsing / serialization
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the `backup:` section. Returns undefined if no section is present so
+ * callers can tell "user hasn't configured backups" apart from "user asked
+ * for the default (schedule: manual, empty destinations)."
+ *
+ * Shape:
+ *   backup:
+ *     schedule: daily
+ *     retention:
+ *       daily: 7
+ *       weekly: 4
+ *       monthly: 12
+ *       yearly: null       # or omit for unbounded; 0 disables the tier
+ *     destinations:
+ *       - kind: local
+ *         path: ~/Library/Mobile Documents/com~apple~CloudDocs/parachute-backups
+ */
+function parseBackup(yaml: string): BackupConfig | undefined {
+  const startMatch = yaml.match(/^backup:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const backup: BackupConfig = defaultBackupConfig();
+  let section: "top" | "retention" | "destinations" = "top";
+  let currentDest: Partial<BackupDestination> & { kind?: string } = {};
+  let hasDest = false;
+  // Track whether the user supplied a retention block at all. If they did,
+  // we start from a clean slate (all tiers default 0, yearly null) so that
+  // an explicit partial policy overrides defaults rather than merging with
+  // them — predictable semantics beat magical merging.
+  let retentionSeen = false;
+
+  const pushDest = () => {
+    if (!hasDest) return;
+    // For the MVP we only ship `local`. Unknown/malformed destination kinds
+    // are skipped rather than rejected: a forward-rolled config authored by
+    // a newer CLI mustn't break backup for the features this CLI does
+    // understand. The backup command itself warns about skipped kinds.
+    if (currentDest.kind === "local" && typeof currentDest.path === "string") {
+      backup.destinations.push({ kind: "local", path: currentDest.path });
+    }
+    currentDest = {};
+    hasDest = false;
+  };
+
+  for (const line of lines) {
+    // Stop at next top-level key.
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    // A 2-space-indented line starting a new sub-section closes the previous
+    // section. The only 2-space keys under `backup:` today are `schedule`,
+    // `retention`, and `destinations`, so we key off indent depth here.
+    const indent = line.match(/^ */)?.[0].length ?? 0;
+
+    if (indent === 2) {
+      if (/^retention:\s*$/.test(trimmed)) {
+        section = "retention";
+        retentionSeen = true;
+        // Zero-out tiers so partially specified blocks don't silently merge
+        // with defaults in surprising ways.
+        backup.retention = { daily: 0, weekly: 0, monthly: 0, yearly: 0 };
+        continue;
+      }
+      if (/^destinations:\s*$/.test(trimmed)) {
+        pushDest();
+        section = "destinations";
+        continue;
+      }
+      // Any other 2-space top field terminates the current sub-section.
+      if (section !== "top") {
+        pushDest();
+        section = "top";
+      }
+    }
+
+    if (section === "top" && indent === 2) {
+      const schedMatch = trimmed.match(/^schedule:\s*(\S+)/);
+      if (schedMatch) {
+        const v = schedMatch[1];
+        if (v === "hourly" || v === "daily" || v === "weekly" || v === "manual") {
+          backup.schedule = v;
+        }
+        continue;
+      }
+    }
+
+    if (section === "retention" && indent === 4) {
+      const tierMatch = trimmed.match(/^(daily|weekly|monthly|yearly):\s*(\S+)/);
+      if (tierMatch) {
+        const tier = tierMatch[1] as keyof RetentionPolicy;
+        const raw = tierMatch[2].trim();
+        // "null" / "~" / "unbounded" all mean "keep every year" for the
+        // yearly tier. For the other tiers they'd be meaningless; we
+        // silently treat them as disabled (0) rather than erroring.
+        if (raw === "null" || raw === "~" || raw === "unbounded") {
+          if (tier === "yearly") backup.retention.yearly = null;
+          // Other tiers stay at 0.
+          continue;
+        }
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n >= 0) {
+          backup.retention[tier] = n as never;
+        }
+        continue;
+      }
+    }
+
+    if (section === "destinations") {
+      // Start of a new list item: "- kind: local" or just "- kind:"
+      const itemMatch = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+      if (itemMatch) {
+        pushDest();
+        hasDest = true;
+        currentDest = {};
+        (currentDest as Record<string, string>)[itemMatch[1]] = itemMatch[2].trim();
+        continue;
+      }
+      // Continuation line inside the current list item.
+      const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+      if (fieldMatch && hasDest) {
+        (currentDest as Record<string, string>)[fieldMatch[1]] = fieldMatch[2].trim();
+        continue;
+      }
+    }
+  }
+  pushDest();
+
+  // If the user left retention out entirely, fall back to the shipped default.
+  if (!retentionSeen) {
+    backup.retention = defaultRetentionPolicy();
+  }
+
+  return backup;
+}
+
+function serializeBackup(backup: BackupConfig): string[] {
+  const lines: string[] = [];
+  lines.push("backup:");
+  lines.push(`  schedule: ${backup.schedule}`);
+  lines.push("  retention:");
+  lines.push(`    daily: ${backup.retention.daily}`);
+  lines.push(`    weekly: ${backup.retention.weekly}`);
+  lines.push(`    monthly: ${backup.retention.monthly}`);
+  // `null` is serialized as the YAML literal `null` so round-trips preserve
+  // "unbounded." Numbers render as-is, including 0 (disabled).
+  lines.push(`    yearly: ${backup.retention.yearly === null ? "null" : backup.retention.yearly}`);
+  if (backup.destinations.length > 0) {
+    lines.push("  destinations:");
+    for (const dest of backup.destinations) {
+      lines.push(`    - kind: ${dest.kind}`);
+      // Paths may contain ~, spaces, and `.` — the whole line being on its
+      // own key line means we don't need to quote unless the value begins
+      // with a YAML-special character. Quoting defensively keeps the
+      // hand-rolled parser happy under future path-with-colons pressure.
+      if ("path" in dest) {
+        const needsQuote = /[:#]/.test(dest.path);
+        lines.push(`      path: ${needsQuote ? `"${dest.path}"` : dest.path}`);
+      }
+    }
+  } else {
+    lines.push("  destinations: []");
+  }
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Directory management
 // ---------------------------------------------------------------------------
 
@@ -538,6 +789,9 @@ export function readGlobalConfig(): GlobalConfig {
       // Parse triggers
       config.triggers = parseTriggers(yaml);
 
+      // Parse backup section
+      config.backup = parseBackup(yaml);
+
       return config;
     }
   } catch {}
@@ -604,6 +858,10 @@ export function writeGlobalConfig(config: GlobalConfig): void {
         lines.push(`      timeout: ${trigger.action.timeout}`);
       }
     }
+  }
+
+  if (config.backup) {
+    lines.push(...serializeBackup(config.backup));
   }
 
   // 0600 — owner read/write only. This file may contain the bcrypt password
