@@ -96,7 +96,7 @@ Daily uses the same OAuth flow. On first launch: enter the server URL, pick the 
 
 ### Multi-vault note
 
-OAuth tokens are vault-scoped — a token minted via `/vaults/work/oauth/token` only authenticates against `work`. The cross-vault code-replay attack was closed in #111: an auth code issued for one vault will be rejected at another vault's token endpoint.
+OAuth tokens are vault-scoped — a token minted via `/vaults/work/oauth/token` only authenticates against `work`. Cross-vault substitution is enforced at the OAuth layer: an auth code minted for one vault cannot be redeemed at another vault's token endpoint.
 
 On a **single-vault deployment**, the unscoped `/oauth/*` and `/mcp` paths transparently resolve to the lone vault — regardless of its name. A vault named `journal` works at `https://vault.example.com/mcp` with no vault-in-URL needed. On a **multi-vault deployment**, always use the vault-scoped path (`/vaults/{name}/mcp`, `/vaults/{name}/oauth/authorize`) so OAuth tokens mint against the intended vault.
 
@@ -327,7 +327,7 @@ Metadata is a JSON column. Vaults start blank — no predefined tags or schema.
 
 **All API and MCP requests require a valid API key.** No exceptions — localhost gets no special treatment.
 
-For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [Connecting a client](#connecting-a-client) above. This section covers token-level details: how to pass a key, how to manage tokens, and which endpoints bypass auth.
+For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [Connecting a client](#connecting-a-client) above. This section covers token-level details: how to pass a key, how to manage tokens, and which endpoints are public by design (`/health`, published notes at `/view/:id`).
 
 ### Passing the key
 
