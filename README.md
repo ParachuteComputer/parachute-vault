@@ -119,6 +119,9 @@ parachute vault remove work --yes
 parachute vault init                       # one-command setup
 parachute vault status                     # check what's running
 parachute vault doctor                     # diagnose install/config issues (see Troubleshooting)
+parachute vault uninstall                  # remove daemon + MCP entry; keeps user data
+parachute vault uninstall --wipe           # ...and also remove vaults, .env, config.yaml, logs
+parachute vault uninstall --yes --wipe     # scripted destructive wipe (prints an audit line)
 
 # Vaults
 parachute vault create work                # create a new vault
@@ -474,6 +477,36 @@ sudo systemctl start cloudflared
 ```
 
 Then in Claude Desktop: Settings → Integrations → Add MCP → `https://vault.yourdomain.com/mcp` with `Authorization: Bearer pvk_...`.
+
+### Remote access via Tailscale Funnel
+
+If you're already on [Tailscale](https://tailscale.com), Funnel is the shortest path to a public HTTPS URL — no custom domain, no reverse-proxy config, no cert management. Good for a single-user vault or a vault shared with a handful of people; the edge has bandwidth and connection-count caps, so not suited to heavy traffic.
+
+Prerequisites: Tailscale v1.52 or later (earlier versions use a two-command `tailscale serve` + `tailscale funnel on` form that is now deprecated), the tailnet must have MagicDNS and HTTPS enabled in the admin console, and the `funnel` node attribute must be granted in your ACLs. The CLI adds the ACL entry on first use if you're the tailnet owner.
+
+Expose the vault:
+
+```bash
+# One command — Tailscale provisions the HTTPS cert, updates the ACL if needed,
+# and registers a persistent funnel that survives reboots.
+tailscale funnel --bg --https=443 localhost:1940
+
+# See what's being served and on which tailnet hostname
+tailscale funnel status
+
+# Take it down later
+tailscale funnel --https=443 localhost:1940 off
+# ...or nuke the whole funnel config
+tailscale funnel reset
+```
+
+The resulting URL is `https://<your-device>.<your-tailnet>.ts.net/` — `tailscale funnel status` prints it verbatim. You can also use ports `8443` or `10000` via `--https=<port>`; no other public ports are available to Funnel.
+
+Point any MCP client at the Tailscale URL:
+- Claude Desktop → Settings → Integrations → Add MCP → `https://<your-device>.<your-tailnet>.ts.net/vaults/{name}/mcp` (leave the Authorization field empty; the OAuth flow will handle it — see [Connecting a client](#connecting-a-client)).
+- Parachute Daily → enter the base URL `https://<your-device>.<your-tailnet>.ts.net`, pick the vault, tap Connect.
+
+**Cloudflare vs Tailscale, at a glance.** Pick Cloudflare when you want a custom domain, bandwidth headroom for heavier traffic, or to share the vault with people who aren't on your tailnet. Pick Tailscale when you're already running it, you're fine with a `*.ts.net` URL, and you want the setup to fit in two commands.
 
 ### Docker
 
