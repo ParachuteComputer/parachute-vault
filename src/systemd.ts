@@ -6,28 +6,33 @@
  */
 
 import { homedir } from "os";
-import { join, resolve } from "path";
+import { join } from "path";
 import { writeFile, mkdir, unlink } from "fs/promises";
 import { existsSync } from "fs";
 import { $ } from "bun";
-import { CONFIG_DIR, ENV_PATH, LOG_PATH, ERR_PATH } from "./config.ts";
+import { CONFIG_DIR, LOG_PATH, ERR_PATH } from "./config.ts";
+import { WRAPPER_PATH, writeDaemonWrapper } from "./daemon.ts";
 
 const SERVICE_NAME = "parachute-vault";
 const SERVICE_DIR = join(homedir(), ".config", "systemd", "user");
 const SERVICE_PATH = join(SERVICE_DIR, `${SERVICE_NAME}.service`);
 
-function generateUnit(serverPath: string, bunPath: string): string {
+/**
+ * systemd unit invokes the shared start.sh wrapper. Env + server path
+ * resolution lives in the wrapper (see daemon.ts) — keeping systemd and
+ * launchd aligned on a single source of truth.
+ */
+export function generateUnit(): string {
   return `[Unit]
 Description=Parachute Vault
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${resolve(serverPath, "..")}
-ExecStart=${bunPath} ${serverPath}
+WorkingDirectory=${CONFIG_DIR}
+ExecStart=/bin/bash ${WRAPPER_PATH}
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=${ENV_PATH}
 StandardOutput=append:${LOG_PATH}
 StandardError=append:${ERR_PATH}
 
@@ -36,12 +41,11 @@ WantedBy=default.target
 `;
 }
 
-export async function installSystemdService(): Promise<void> {
-  const serverPath = resolve(import.meta.dir, "server.ts");
-  const bunPath = (await $`which bun`.text()).trim();
+export async function installSystemdService(): Promise<{ serverPath: string }> {
+  const { serverPath } = await writeDaemonWrapper();
 
   await mkdir(SERVICE_DIR, { recursive: true });
-  await writeFile(SERVICE_PATH, generateUnit(serverPath, bunPath));
+  await writeFile(SERVICE_PATH, generateUnit());
 
   // Enable lingering so user services run without login session
   try {
@@ -52,7 +56,10 @@ export async function installSystemdService(): Promise<void> {
 
   await $`systemctl --user daemon-reload`.quiet();
   await $`systemctl --user enable ${SERVICE_NAME}`.quiet();
-  await $`systemctl --user start ${SERVICE_NAME}`.quiet();
+  // Idempotent: `restart` works whether or not the service was running.
+  await $`systemctl --user restart ${SERVICE_NAME}`.quiet();
+
+  return { serverPath };
 }
 
 export async function uninstallSystemdService(): Promise<void> {
