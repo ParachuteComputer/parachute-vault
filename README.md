@@ -35,6 +35,71 @@ A server on port 1940 with:
 
 Each vault is its own SQLite database. Run multiple vaults on one server.
 
+## Connecting a client
+
+Two ways to authenticate — pick based on the client, not the deployment:
+
+| Path | When to use | User action |
+|---|---|---|
+| **OAuth 2.1 + PKCE (browser flow)** | Claude Desktop, Parachute Daily, any third-party MCP client set up interactively | Click "Add integration", enter server URL, a browser opens to the vault's consent page, you enter the owner password, done — no token ever touches your clipboard |
+| **Bearer token** | Claude Code (auto-wired by `vault init`), CLI scripts, cron jobs, any non-interactive caller | `curl -H "Authorization: Bearer pvt_..."` — the token is printed once at `vault init` (save it) or minted on demand with `parachute vault tokens create` |
+
+Both paths end up with the same kind of token in the vault's DB — a `pvt_` string, scoped to one vault and one permission level (`full` or `read`). OAuth just moves the "how does the client get that token" step from "human copy-pastes it" to "browser-based handshake with the owner's consent."
+
+### Owner password (needed for OAuth)
+
+`vault init` prompts you to set an owner password (minimum 12 characters). This is what the OAuth consent page asks for when a client requests access. If you skip the prompt, OAuth still works but the consent page falls back to asking for a vault token instead — functional but clunky. Set it later with:
+
+```bash
+parachute vault set-password                # set / change
+parachute vault set-password --clear        # remove (reverts to token fallback)
+parachute vault 2fa enroll                  # optional: add TOTP 2FA on top
+```
+
+Password and 2FA secrets live in `~/.parachute/config.yaml` at mode 0600 (bcrypt hash + base32 TOTP secret).
+
+### Claude Code
+
+`vault init` fully auto-configures `~/.claude.json` — there's nothing else to do. The entry it writes uses a baked-in `pvt_` token rather than OAuth:
+
+```json
+{
+  "mcpServers": {
+    "parachute-vault": {
+      "type": "http",
+      "url": "http://127.0.0.1:1940/vaults/{name}/mcp",
+      "headers": { "Authorization": "Bearer pvt_..." }
+    }
+  }
+}
+```
+
+Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **First MCP call after `vault init` requires no browser handoff — Claude Code uses the baked-in token and the vault's tools show up in your next session.** This is intentional: for an owner connecting their own machine's vault to their own Claude Code, the token is already there and OAuth would add friction.
+
+To re-point Claude Code at a different vault or rotate the token, re-run `parachute vault mcp-install` (idempotent) or edit `~/.claude.json` by hand.
+
+### Claude Desktop (OAuth)
+
+For Claude Desktop — or any install where the server is on a different machine from the client — use the browser-based OAuth flow:
+
+1. Claude Desktop → Settings → Integrations → Add MCP server.
+2. Enter the URL: `https://vault.yourdomain.com/vaults/{name}/mcp` (replace `{name}`, or use the unscoped `https://vault.yourdomain.com/mcp` on a single-vault deployment). **Do not paste a bearer token** — leave the auth field empty.
+3. An OAuth-capable MCP client discovers the vault's authorization server at `/.well-known/oauth-authorization-server`, registers itself via Dynamic Client Registration (RFC 7591), and opens your browser to the vault's consent page.
+4. Enter your owner password (plus TOTP code / backup code if 2FA is enabled), pick a scope (`full` or `read`), click Authorize.
+5. Browser redirects back. The connection is live. The client now holds a `pvt_` token scoped to this vault.
+
+If you'd rather skip OAuth — e.g. you're scripting the setup — Claude Desktop also accepts a bearer token via the integration's auth header field. Use a token from `parachute vault tokens create` (or the one from `vault init` if you still have it). This is the "manual bearer" fallback; OAuth is the recommended path.
+
+### Parachute Daily (mobile)
+
+Daily uses the same OAuth flow. On first launch: enter the server URL, pick the vault from the drop-down (populated from the public `GET /vaults/list` endpoint), tap **Connect to Vault**. The same consent-page handoff runs in your phone's browser, then redirects back to the app via the `parachute://oauth/callback` deep link. The app stores the `pvt_` token in platform secure storage.
+
+### Multi-vault note
+
+OAuth tokens are vault-scoped — a token minted via `/vaults/work/oauth/token` only authenticates against `work`. Cross-vault substitution is enforced at the OAuth layer: an auth code minted for one vault cannot be redeemed at another vault's token endpoint.
+
+On a **single-vault deployment**, the unscoped `/oauth/*` and `/mcp` paths transparently resolve to the lone vault — regardless of its name. A vault named `journal` works at `https://vault.example.com/mcp` with no vault-in-URL needed. On a **multi-vault deployment**, always use the vault-scoped path (`/vaults/{name}/mcp`, `/vaults/{name}/oauth/authorize`) so OAuth tokens mint against the intended vault.
+
 ## CLI
 
 ```bash
@@ -262,11 +327,14 @@ Metadata is a JSON column. Vaults start blank — no predefined tags or schema.
 
 **All API and MCP requests require a valid API key.** No exceptions — localhost gets no special treatment.
 
-`vault init` generates an API key automatically and configures Claude Code's MCP with it.
+For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [Connecting a client](#connecting-a-client) above. This section covers token-level details: how to pass a key, how to manage tokens, and which endpoints are public by design (`/health`, published notes at `/view/:id`).
 
 ### Passing the key
 
-Both legacy API keys (`pvk_...`) and scoped tokens (`pvt_...`) work interchangeably:
+Tokens come in two shapes. Both work interchangeably at every authenticated endpoint:
+
+- `pvt_...` — per-vault scoped tokens (the modern format; what `vault init` mints, what OAuth issues, what `parachute vault tokens create` produces)
+- `pvk_...` — legacy global API keys from `config.yaml` (still honored for existing deployments)
 
 ```bash
 # Header (preferred)
@@ -277,26 +345,6 @@ curl -H "X-API-Key: pvt_..." http://localhost:1940/api/notes
 
 # Query param (for /view endpoint only — convenient for browsers)
 curl http://localhost:1940/view/noteId?key=pvt_...
-```
-
-### Claude Desktop
-
-Settings → Integrations → Add MCP → URL: `https://vault.yourdomain.com/mcp`, Header: `Authorization: Bearer pvk_...`
-
-### Claude Code
-
-`vault init` auto-configures `~/.claude.json`. To set manually, use the vault-scoped endpoint — `{name}` is the vault to target (`default` on a fresh install, whatever you passed to `vault create` otherwise):
-
-```json
-{
-  "mcpServers": {
-    "parachute-vault": {
-      "type": "http",
-      "url": "http://127.0.0.1:1940/vaults/{name}/mcp",
-      "headers": { "Authorization": "Bearer pvk_..." }
-    }
-  }
-}
 ```
 
 ### Token management
