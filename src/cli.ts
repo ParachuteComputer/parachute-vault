@@ -957,8 +957,15 @@ async function cmdUninstall(argsList: string[]) {
   console.log("Removing wrapper and server-path pointer...");
   await removeDaemonWrapper();
 
-  // 3. Optionally wipe user data. Double-confirm so nobody loses a vault
-  // by muscle-memory — this is the one genuinely destructive path.
+  // 3. Clear the MCP entry in ~/.claude.json so Claude Code doesn't keep
+  // retrying a dead server every session. If ~/.claude.json doesn't exist
+  // or has no matching entry, this is a silent no-op.
+  console.log("Removing MCP entry from ~/.claude.json...");
+  removeMcpConfig();
+
+  // 4. Optionally wipe user data. The second confirm below defaults to
+  // NO so a distracted Enter-presser can't lose their vault. `--yes`
+  // explicitly opts into the destructive path for scripted uninstalls.
   if (wipe) {
     const vaultsExist = existsSync(VAULTS_DIR);
     const envExists = existsSync(ENV_PATH);
@@ -969,9 +976,12 @@ async function cmdUninstall(argsList: string[]) {
       if (vaultsExist) console.log(`  ${VAULTS_DIR} (SQLite vaults)`);
       if (envExists) console.log(`  ${ENV_PATH} (.env config + secrets)`);
 
+      // Default to NO on the wipe confirm — this is the "don't lose a
+      // vault to muscle memory" guard. `--yes` is an explicit opt-in to
+      // the whole destructive path.
       let doWipe = skipPrompts;
       if (!skipPrompts) {
-        doWipe = await confirm("Delete this data? (cannot be undone)");
+        doWipe = await confirm("Delete this data? (cannot be undone)", false);
       }
       if (doWipe) {
         if (vaultsExist) rmSync(VAULTS_DIR, { recursive: true, force: true });
@@ -1341,7 +1351,9 @@ Setup:
   parachute vault init                     Set up everything (one command, idempotent)
   parachute vault status                   Check what's running
   parachute vault doctor                   Diagnose install/config issues
-  parachute vault uninstall [--wipe]       Remove daemon; --wipe also removes vaults + .env
+  parachute vault uninstall [--wipe] [--yes]
+                                           Remove daemon + MCP entry; --wipe also removes vaults + .env.
+                                           --yes skips prompts (DANGEROUS with --wipe: no confirmation).
   parachute vault url                      Print the local server URL (for scripts)
 
 Vaults:

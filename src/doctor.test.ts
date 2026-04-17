@@ -79,6 +79,27 @@ describe("vault uninstall", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("--yes --wipe removes user data non-interactively", async () => {
+    // Scripted uninstall contract. --yes is an explicit opt-in to the
+    // destructive path — skipping the interactive guard is the whole
+    // point. We keep this behavior, but the help text warns.
+    // Note: this test exercises filesystem wipe only. It still invokes
+    // uninstallAgent(), which is safe because launchd.ts wraps each
+    // step in try/catch and we're on a tempdir that was never registered.
+    const vaultsDir = join(dir, "vaults");
+    const envFile = join(dir, ".env");
+    mkdirSync(vaultsDir, { recursive: true });
+    writeFileSync(join(vaultsDir, "marker"), "doomed");
+    writeFileSync(envFile, "PORT=1940\n");
+
+    const res = runCli(["uninstall", "--yes", "--wipe"], dir);
+    expect(res.exitCode).toBe(0);
+
+    const { existsSync } = await import("fs");
+    expect(existsSync(vaultsDir)).toBe(false);
+    expect(existsSync(envFile)).toBe(false);
+  });
+
   test("answering 'no' at the prompt does not touch daemon/filesystem", async () => {
     // Set up a fake install: wrapper + pointer in the temp PARACHUTE_HOME.
     const wrapper = join(dir, "start.sh");
