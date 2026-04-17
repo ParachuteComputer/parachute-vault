@@ -76,7 +76,7 @@ Password and 2FA secrets live in `~/.parachute/config.yaml` at mode 0600 (bcrypt
 
 Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **First MCP call after `vault init` requires no browser handoff — Claude Code uses the baked-in token and the vault's tools show up in your next session.** This is intentional: for an owner connecting their own machine's vault to their own Claude Code, the token is already there and OAuth would add friction.
 
-To re-point Claude Code at a different vault or rotate the token, re-run `parachute vault mcp-install` (idempotent) or edit `~/.claude.json` by hand.
+To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/config.yaml` and re-run `parachute vault init` — which re-mints an API token and re-writes the `~/.claude.json` entry end-to-end. To rotate the token only, edit `~/.claude.json` and replace the `Authorization` header value with a fresh token from `parachute vault tokens create`. (Running `parachute vault mcp-install` on its own overwrites the MCP entry *without* an `Authorization` header and is intended for the rare case where you want to drop the token and connect via OAuth instead.)
 
 ### Claude Desktop (OAuth)
 
@@ -94,11 +94,23 @@ If you'd rather skip OAuth — e.g. you're scripting the setup — Claude Deskto
 
 Daily uses the same OAuth flow. On first launch: enter the server URL, pick the vault from the drop-down (populated from the public `GET /vaults/list` endpoint), tap **Connect to Vault**. The same consent-page handoff runs in your phone's browser, then redirects back to the app via the `parachute://oauth/callback` deep link. The app stores the `pvt_` token in platform secure storage.
 
-### Multi-vault note
+### Multi-vault
 
-OAuth tokens are vault-scoped — a token minted via `/vaults/work/oauth/token` only authenticates against `work`. Cross-vault substitution is enforced at the OAuth layer: an auth code minted for one vault cannot be redeemed at another vault's token endpoint.
+One server, many vaults. Each vault is its own SQLite DB with its own MCP endpoint, its own OAuth, and its own tokens.
 
-On a **single-vault deployment**, the unscoped `/oauth/*` and `/mcp` paths transparently resolve to the lone vault — regardless of its name. A vault named `journal` works at `https://vault.example.com/mcp` with no vault-in-URL needed. On a **multi-vault deployment**, always use the vault-scoped path (`/vaults/{name}/mcp`, `/vaults/{name}/oauth/authorize`) so OAuth tokens mint against the intended vault.
+```bash
+parachute vault create work     # new vault named "work"
+parachute vault list            # show all vaults on this server
+parachute vault remove work --yes
+```
+
+**The default vault is managed for you.** `vault init` creates `default` on first install and records it as `default_vault` in `~/.parachute/config.yaml`. `vault create <name>` promotes the newly-created vault to default when no default exists or when the configured default points at a missing vault. `vault remove <name>` promotes the sole survivor when you delete the default and one vault remains; if multiple remain after removing the default, it clears the setting and tells you to edit `config.yaml` yourself. There is no `vault set-default` subcommand — to point the server at a different existing vault, edit the `default_vault:` line in `~/.parachute/config.yaml` and `parachute vault restart`.
+
+**Single-vault rule.** When the server has exactly one vault, the unscoped `/oauth/*` and `/mcp` paths transparently resolve to it — regardless of its name. A lone vault named `journal` works at `https://vault.example.com/mcp` with no vault-in-URL needed.
+
+**Multi-vault rule.** When the server has two or more vaults, always use the vault-scoped path (`/vaults/{name}/mcp`, `/vaults/{name}/oauth/authorize`). OAuth tokens minted there are scoped to that vault alone — cross-vault substitution is enforced at the OAuth layer: an auth code minted for one vault cannot be redeemed at another vault's token endpoint.
+
+**Listing vaults from a client.** The authenticated `GET /vaults` endpoint returns full vault metadata. The public `GET /vaults/list` endpoint returns names only, no metadata, no auth required — this is what Parachute Daily's vault picker calls before the user authenticates. Operators who want to hide the vault list from unauthenticated callers can set `discovery: disabled` in `~/.parachute/config.yaml` to make `/vaults/list` return 404.
 
 ## CLI
 
@@ -106,6 +118,7 @@ On a **single-vault deployment**, the unscoped `/oauth/*` and `/mcp` paths trans
 # Setup
 parachute vault init                       # one-command setup
 parachute vault status                     # check what's running
+parachute vault doctor                     # diagnose install/config issues (see Troubleshooting)
 
 # Vaults
 parachute vault create work                # create a new vault
@@ -391,6 +404,37 @@ For remote access, always use a TLS-terminating proxy:
 | Cloudflare Tunnel (public HTTPS) | HTTPS at edge, local socket to machine | Yes |
 | Direct LAN IP (no TLS) | Plaintext on WiFi | Avoid |
 | Direct internet (no TLS) | Plaintext on internet | Never do this |
+
+## Troubleshooting
+
+### `parachute vault doctor` is your first stop
+
+`doctor` inspects the install and prints one line per check with a status (`✓` pass, `!` warn, `✗` fail) and, when relevant, a suggested fix. It exits 1 on any `fail` and 0 otherwise. Run it any time something feels off.
+
+The checks, in the order they're emitted:
+
+| Check | What it verifies | Typical fix when failing |
+|---|---|---|
+| server-path pointer | `~/.parachute/server-path` exists, is non-empty, and points at a `src/server.ts` that actually exists. This is where the stale-path failure after a repo move shows up first. | `parachute vault init` from the current repo location. |
+| wrapper script | `~/.parachute/start.sh` exists. Without it, launchd / systemd has nothing to exec. | `parachute vault init`. |
+| launchd agent (macOS) / systemd service (Linux) | The daemon is registered and loaded/active. On Linux without systemd, the check is silently skipped. | `parachute vault restart` or re-run `vault init`. |
+| bun on PATH | `bun` is resolvable via your shell's PATH. Not required once the daemon is installed (`start.sh` embeds an absolute bun path at init time) but missing bun is the #1 first-time-user failure. | `curl -fsSL https://bun.sh/install \| bash` and restart the shell. |
+| MCP entry in `~/.claude.json` | An entry is present. When it is, two follow-ups: the URL's port matches the running vault's port, and the MCP URL is reachable over HTTP (any response — even 401 — counts as reachable). | `parachute vault mcp-install` to rewrite the entry, or `parachute vault restart` if the daemon is down. |
+| port `1940` availability | Probes via `lsof` / `ss` and classifies: free, held by our daemon (pass), held by a foreign process (warn), or unknown (tool unavailable → check silently omitted). | Stop the conflicting process, or set a different `PORT` in `~/.parachute/.env` and re-run `vault init`. |
+| backup agent (macOS, only when `backup.schedule != manual`) | The scheduled-backup launchd agent is loaded. | `parachute vault backup --schedule <hourly\|daily\|weekly>` to reinstall the agent. |
+| backup destinations (only when `backup.schedule != manual`) | At least one destination is configured; each configured destination is writable. | Edit `~/.parachute/config.yaml` under `backup.destinations`, or fix the path's permissions. |
+
+### Common failure modes
+
+- **Daemon won't start after a port change.** `~/.parachute/.env` has the new `PORT=...` but the daemon is still trying to bind the old one, or something else already holds the new port. `parachute vault doctor` surfaces both conditions. Fix the holder (or pick a different port) and `parachute vault restart`.
+- **MCP entry is stale after moving the repo.** launchd/systemd keeps pointing at the old path. `doctor` flags this as a failed `server.ts at pointer target` check; `parachute vault init` from the new location rewrites the pointer, wrapper, and daemon registration.
+- **Claude Code shows no vault tools.** Check in order: (1) is the daemon up (`parachute vault status`)? (2) does `~/.claude.json` have a `parachute-vault` entry with both `url` and a valid `Authorization` header? (3) does the URL's vault name match an existing vault? `parachute vault doctor` catches the first two. A missing or stale `Authorization` header after a bare `vault mcp-install` is the usual culprit for #2 — see the Claude Code section of [Connecting a client](#connecting-a-client) for how to rewrite it.
+- **Claude Desktop / Daily won't connect via OAuth.** If the owner-password prompt was skipped at `vault init`, the consent page falls back to requiring a vault token in place of the password (functional but clunky). Set one now with `parachute vault set-password`. If 2FA is enrolled, have your authenticator app ready before starting the flow; lost TOTP access recovers via the backup codes printed at enrollment.
+- **Scheduled backups aren't running.** On macOS: `doctor` flags `backup agent: not loaded` when `schedule` isn't `manual` but the launchd agent is missing — rerun `parachute vault backup --schedule <freq>` to reinstall it. On Linux: systemd-timer support for backup isn't shipped yet, so `--schedule daily` silently skips the scheduler. Run `parachute vault backup` from cron (or similar) until that lands.
+
+### Getting help
+
+If `doctor` is all-green but something still isn't working, capture the output alongside `parachute vault status` and open an issue at <https://github.com/ParachuteComputer/parachute-vault/issues>. Redact tokens from any logs before attaching.
 
 ## Deployment
 
