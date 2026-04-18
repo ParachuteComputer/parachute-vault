@@ -475,6 +475,9 @@ export function getVaultStats(
   const tagCountRow = db.prepare("SELECT COUNT(DISTINCT tag_name) as c FROM note_tags").get() as { c: number };
   const tagCount = tagCountRow.c;
 
+  const linkCountRow = db.prepare("SELECT COUNT(*) as c FROM links").get() as { c: number };
+  const linkCount = linkCountRow.c;
+
   return {
     totalNotes,
     earliestNote: earliestRow
@@ -486,6 +489,7 @@ export function getVaultStats(
     notesByMonth: monthRows,
     topTags: topTagRows,
     tagCount,
+    linkCount,
   };
 }
 
