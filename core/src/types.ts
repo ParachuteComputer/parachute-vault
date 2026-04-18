@@ -41,6 +41,7 @@ export interface VaultStats {
   notesByMonth: { month: string; count: number }[];
   topTags: { tag: string; count: number }[];
   tagCount: number;
+  linkCount: number;
 }
 
 // ---- Query Options ----

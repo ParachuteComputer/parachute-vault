@@ -163,6 +163,7 @@ describe("vault stats", async () => {
     expect(stats.notesByMonth).toEqual([]);
     expect(stats.topTags).toEqual([]);
     expect(stats.tagCount).toBe(0);
+    expect(stats.linkCount).toBe(0);
   });
 
   it("counts total notes and tagCount", async () => {
@@ -231,6 +232,17 @@ describe("vault stats", async () => {
     expect(stats).toHaveProperty("notesByMonth");
     expect(stats).toHaveProperty("topTags");
     expect(stats).toHaveProperty("tagCount");
+    expect(stats).toHaveProperty("linkCount");
+  });
+
+  it("counts resolved wikilinks in linkCount", async () => {
+    await store.createNote("Target A", { path: "alpha" });
+    await store.createNote("Target B", { path: "beta" });
+    await store.createNote("Refs both [[alpha]] and [[beta]]", { path: "hub" });
+    await store.createNote("Refs alpha only [[alpha]]", { path: "solo" });
+
+    const stats = await store.getVaultStats();
+    expect(stats.linkCount).toBe(3);
   });
 
   it("getVaultStats returns correct stats", async () => {

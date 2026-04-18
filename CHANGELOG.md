@@ -4,6 +4,12 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.2.4] — 2026-04-18
+
+### Added
+
+- `link_count` surfaced in the vault stats response (REST + MCP `vault-info`), matching the existing note and tag counts.
+
 ## [0.2.3] — 2026-04-17
 
 ### Fixed
