@@ -291,6 +291,25 @@ export class BunSqliteStore implements Store {
       };
     });
   }
+
+  async deleteAttachment(
+    noteId: string,
+    attachmentId: string,
+  ): Promise<{ deleted: boolean; path: string | null; orphaned: boolean }> {
+    // Scope by noteId so a token authorized for note A can't delete note B's attachments.
+    const row = this.db.prepare(
+      "SELECT path FROM attachments WHERE id = ? AND note_id = ?",
+    ).get(attachmentId, noteId) as { path: string } | undefined;
+    if (!row) return { deleted: false, path: null, orphaned: false };
+
+    this.db.prepare("DELETE FROM attachments WHERE id = ? AND note_id = ?").run(attachmentId, noteId);
+
+    // Orphan check: caller uses this to decide whether to unlink the file on disk.
+    const other = this.db.prepare(
+      "SELECT 1 FROM attachments WHERE path = ? LIMIT 1",
+    ).get(row.path);
+    return { deleted: true, path: row.path, orphaned: !other };
+  }
 }
 
 /** @deprecated Renamed to `BunSqliteStore` to make the runtime split explicit. Kept as an alias for backward compatibility. */

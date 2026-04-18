@@ -445,6 +445,41 @@ describe("attachments", async () => {
     const attachments = await store.getAttachments(note.id);
     expect(attachments).toHaveLength(0);
   });
+
+  it("deleteAttachment removes row and reports orphaned path", async () => {
+    const note = await store.createNote("Has attachment");
+    const att = await store.addAttachment(note.id, "2026-04-18/pic.png", "image/png");
+
+    const result = await store.deleteAttachment(note.id, att.id);
+    expect(result).toEqual({ deleted: true, path: "2026-04-18/pic.png", orphaned: true });
+    expect(await store.getAttachments(note.id)).toHaveLength(0);
+  });
+
+  it("deleteAttachment returns deleted:false for nonexistent id", async () => {
+    const note = await store.createNote("x");
+    const result = await store.deleteAttachment(note.id, "does-not-exist");
+    expect(result).toEqual({ deleted: false, path: null, orphaned: false });
+  });
+
+  it("deleteAttachment is scoped to noteId (cross-note attempt is a no-op)", async () => {
+    const a = await store.createNote("A");
+    const b = await store.createNote("B");
+    const attA = await store.addAttachment(a.id, "files/a.png", "image/png");
+
+    const result = await store.deleteAttachment(b.id, attA.id);
+    expect(result.deleted).toBe(false);
+    expect(await store.getAttachments(a.id)).toHaveLength(1);
+  });
+
+  it("deleteAttachment reports orphaned:false when a sibling attachment shares the path", async () => {
+    const a = await store.createNote("A");
+    const b = await store.createNote("B");
+    const attA = await store.addAttachment(a.id, "shared/pic.png", "image/png");
+    await store.addAttachment(b.id, "shared/pic.png", "image/png");
+
+    const result = await store.deleteAttachment(a.id, attA.id);
+    expect(result).toEqual({ deleted: true, path: "shared/pic.png", orphaned: false });
+  });
 });
 
 // ---- MCP Tools ----

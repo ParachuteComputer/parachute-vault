@@ -24,7 +24,7 @@ import {
   type ExpandMode,
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
 
 // ---------------------------------------------------------------------------
@@ -124,6 +124,7 @@ export async function handleNotes(
   req: Request,
   store: Store,
   subpath: string,
+  vault?: string,
 ): Promise<Response> {
   const url = new URL(req.url);
   const method = req.method;
@@ -317,6 +318,29 @@ export async function handleNotes(
       const note = await resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
       return json(await store.getAttachments(note.id));
+    }
+    return json({ error: "Method not allowed" }, 405);
+  }
+
+  const attMatch = sub.match(/^\/attachments\/([^/]+)$/);
+  if (attMatch) {
+    const attId = decodeURIComponent(attMatch[1]!);
+    if (method === "DELETE") {
+      const note = await resolveNote(store, idOrPath);
+      if (!note) return json({ error: "Not found" }, 404);
+      const result = await store.deleteAttachment(note.id, attId);
+      if (!result.deleted) return json({ error: "Not found" }, 404);
+      // Unlink the storage file only if no other attachment still references
+      // the same path. Best-effort: the row is already gone, so a missing
+      // file or unlink error should not flip the DELETE to an error.
+      if (vault && result.path && result.orphaned) {
+        const assets = assetsDir(vault);
+        const filePath = normalize(join(assets, result.path));
+        if (filePath.startsWith(normalize(assets)) && existsSync(filePath)) {
+          try { unlinkSync(filePath); } catch {}
+        }
+      }
+      return new Response(null, { status: 204 });
     }
     return json({ error: "Method not allowed" }, 405);
   }

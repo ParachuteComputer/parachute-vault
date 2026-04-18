@@ -4,7 +4,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, rmSync, existsSync } from "fs";
+import { mkdirSync, rmSync, existsSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
@@ -961,6 +961,117 @@ describe("HTTP /notes", async () => {
     expect(res.status).toBe(201);
     const body = await res.json() as any;
     expect(body.mimeType).toBe("image/png");
+  });
+
+  describe("DELETE /notes/:id/attachments/:attId", async () => {
+    test("happy path: 204, DB row gone, storage file unlinked", async () => {
+      const assetsRoot = join(tmpDir, "assets");
+      mkdirSync(join(assetsRoot, "2026-04-18"), { recursive: true });
+      const relPath = "2026-04-18/shot.png";
+      const filePath = join(assetsRoot, relPath);
+      writeFileSync(filePath, Buffer.from([1, 2, 3]));
+      process.env.ASSETS_DIR = assetsRoot;
+
+      const n = await store.createNote("x", { id: "n1" });
+      const att = await store.addAttachment(n.id, relPath, "image/png");
+
+      const res = await handleNotes(
+        mkReq("DELETE", `/notes/n1/attachments/${att.id}`),
+        store,
+        `/n1/attachments/${att.id}`,
+        "default",
+      );
+      expect(res.status).toBe(204);
+      expect((await store.getAttachments(n.id)).length).toBe(0);
+      expect(existsSync(filePath)).toBe(false);
+
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("404 when attachment does not exist", async () => {
+      await store.createNote("x", { id: "n2" });
+      const res = await handleNotes(
+        mkReq("DELETE", "/notes/n2/attachments/nonexistent"),
+        store,
+        "/n2/attachments/nonexistent",
+        "default",
+      );
+      expect(res.status).toBe(404);
+    });
+
+    test("second delete is idempotent (404)", async () => {
+      const n = await store.createNote("x", { id: "n3" });
+      const att = await store.addAttachment(n.id, "files/a.png", "image/png");
+      const first = await handleNotes(
+        mkReq("DELETE", `/notes/n3/attachments/${att.id}`),
+        store,
+        `/n3/attachments/${att.id}`,
+      );
+      expect(first.status).toBe(204);
+      const second = await handleNotes(
+        mkReq("DELETE", `/notes/n3/attachments/${att.id}`),
+        store,
+        `/n3/attachments/${att.id}`,
+      );
+      expect(second.status).toBe(404);
+    });
+
+    test("cross-note delete attempt returns 404 and leaves record intact", async () => {
+      const a = await store.createNote("a", { id: "na" });
+      const b = await store.createNote("b", { id: "nb" });
+      const attA = await store.addAttachment(a.id, "files/a.png", "image/png");
+
+      const res = await handleNotes(
+        mkReq("DELETE", `/notes/nb/attachments/${attA.id}`),
+        store,
+        `/nb/attachments/${attA.id}`,
+      );
+      expect(res.status).toBe(404);
+      expect((await store.getAttachments(a.id)).length).toBe(1);
+    });
+
+    test("file survives first delete when a sibling attachment still references it", async () => {
+      const assetsRoot = join(tmpDir, "assets");
+      mkdirSync(join(assetsRoot, "shared"), { recursive: true });
+      const relPath = "shared/pic.png";
+      const filePath = join(assetsRoot, relPath);
+      writeFileSync(filePath, Buffer.from([9]));
+      process.env.ASSETS_DIR = assetsRoot;
+
+      const a = await store.createNote("a", { id: "sa" });
+      const b = await store.createNote("b", { id: "sb" });
+      const attA = await store.addAttachment(a.id, relPath, "image/png");
+      const attB = await store.addAttachment(b.id, relPath, "image/png");
+
+      await handleNotes(
+        mkReq("DELETE", `/notes/sa/attachments/${attA.id}`),
+        store,
+        `/sa/attachments/${attA.id}`,
+        "default",
+      );
+      expect(existsSync(filePath)).toBe(true);
+
+      await handleNotes(
+        mkReq("DELETE", `/notes/sb/attachments/${attB.id}`),
+        store,
+        `/sb/attachments/${attB.id}`,
+        "default",
+      );
+      expect(existsSync(filePath)).toBe(false);
+
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("method not allowed on /attachments/:attId returns 405", async () => {
+      const n = await store.createNote("x", { id: "nm" });
+      const att = await store.addAttachment(n.id, "files/a.png", "image/png");
+      const res = await handleNotes(
+        mkReq("PATCH", `/notes/nm/attachments/${att.id}`),
+        store,
+        `/nm/attachments/${att.id}`,
+      );
+      expect(res.status).toBe(405);
+    });
   });
 });
 

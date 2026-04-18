@@ -288,7 +288,7 @@ export async function route(
       );
     }
     const apiPath = path.slice(4); // strip "/api"
-    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
+    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), defaultVault);
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/find-path") return handleFindPath(req, store);
     if (apiPath === "/vault") {
@@ -432,7 +432,7 @@ export async function route(
 
   const apiPath = apiMatch[1] ?? "";
 
-  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6));
+  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName);
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
   if (apiPath === "/find-path") return handleFindPath(req, store);
   if (apiPath === "/vault") {

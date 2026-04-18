@@ -209,6 +209,12 @@ Body: `{"path": "files/a.png", "mimeType": "image/png"}`.
 #### `GET /notes/{id}/attachments`
 Returns `Attachment[]`.
 
+#### `DELETE /notes/{id}/attachments/{attId}`
+Returns `204 No Content`. The attachment record is removed and the underlying
+storage file is unlinked when no other attachment still references the same
+path (orphan-check). Returns `404` if the attachment doesn't exist or belongs
+to a different note. Idempotent: a second delete of the same id returns `404`.
+
 ### Links
 
 #### `GET /links`

@@ -138,4 +138,5 @@ export interface Store {
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
   getAttachments(noteId: string): Promise<Attachment[]>;
+  deleteAttachment(noteId: string, attachmentId: string): Promise<{ deleted: boolean; path: string | null; orphaned: boolean }>;
 }
