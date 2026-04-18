@@ -4,6 +4,12 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.2.3] — 2026-04-17
+
+### Fixed
+
+- **OAuth discovery endpoints now served at RFC-compliant path-insertion URLs (`/.well-known/oauth-authorization-server/{path}`) in addition to the existing path-append form.** Restores Claude Code's MCP OAuth SDK compatibility, which follows RFC 8414 §3.1 and RFC 9728 §3 strictly and probes only the path-insertion shape. Before 0.2.3, the SDK's AS-metadata fetch 404'd, leaving it without a `registration_endpoint` and cascading into a 404 on the `/register` fallback. Both scoped forms now work: `/.well-known/oauth-authorization-server/vaults/<name>` and the longer `/.well-known/oauth-authorization-server/vaults/<name>/mcp`; same shapes on `/.well-known/oauth-protected-resource/...`. Path-append routes (`/vaults/<name>/.well-known/<type>`) are unchanged so lax clients keep working.
+
 ## [0.2.2] — 2026-04-17
 
 ### Fixed
@@ -93,6 +99,7 @@ First tagged public release. Ships the auth, backup, and onboarding surface the 
 - **`core/src/test-preload.ts`** isolates `PARACHUTE_HOME` for tests so `bun test` never touches a user's real `~/.parachute/`.
 - Test suite at release cut: **538 passing / 0 failing / 3 skipped** across 22 files (541 tests total).
 
+[0.2.3]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.3
 [0.2.2]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.2.0
