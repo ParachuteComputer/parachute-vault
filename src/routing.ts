@@ -115,7 +115,43 @@ export async function route(
   path: string,
   clientIp?: string,
 ): Promise<Response> {
-  // OAuth discovery endpoints (no auth required)
+  // OAuth discovery endpoints (no auth required).
+  //
+  // RFC 8414 §3.1 and RFC 9728 §3 specify the discovery URL shape when an
+  // authorization server (or protected resource) has a path component `/p`:
+  //
+  //   Path-insertion (spec-mandated):
+  //     <host>/.well-known/<metadata-type>/p
+  //   Path-append (widespread in the wild, shipped in PR #111):
+  //     <host>/p/.well-known/<metadata-type>
+  //
+  // Strict clients — including Claude Code's MCP OAuth SDK — probe only the
+  // path-insertion form. Lax clients try path-append. We serve both so any
+  // conformant probe hits a live endpoint. Unscoped root forms
+  // (`/.well-known/oauth-*`) are the third accepted shape, and the
+  // path-append branch for scoped discovery lives further down alongside the
+  // other `/vaults/{name}/*` routing.
+  const protectedResourceInsert = path.match(
+    /^\/\.well-known\/oauth-protected-resource\/vaults\/([^/]+)(?:\/mcp)?$/,
+  );
+  if (protectedResourceInsert) {
+    const vaultName = protectedResourceInsert[1];
+    if (!readVaultConfig(vaultName)) {
+      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+    }
+    return handleProtectedResource(req, `/vaults/${vaultName}/mcp`, `/vaults/${vaultName}`);
+  }
+  const authServerInsert = path.match(
+    /^\/\.well-known\/oauth-authorization-server\/vaults\/([^/]+)(?:\/mcp)?$/,
+  );
+  if (authServerInsert) {
+    const vaultName = authServerInsert[1];
+    if (!readVaultConfig(vaultName)) {
+      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+    }
+    return handleAuthorizationServer(req, vaultName);
+  }
+
   if (path === "/.well-known/oauth-protected-resource") {
     return handleProtectedResource(req);
   }
