@@ -1,20 +1,31 @@
 /**
  * HTTP request router for the multi-vault server.
  *
- * Extracted from server.ts so routes are unit-testable without spinning up
- * Bun.serve(). server.ts imports this and wires it into the listener.
+ * All per-vault resources live under `/vault/<name>/...`. There is no
+ * unscoped fallback — a request must name the vault it targets. A fresh
+ * install creates a vault named `default`, so `/vault/default/...` is the
+ * baseline URL for single-vault deployments.
  *
- * Path dispatch order (skim):
- *   - /.well-known/oauth-*           — public OAuth discovery
- *   - /oauth/*                       — unscoped OAuth (targets default vault)
- *   - /health                        — lightweight ping
- *   - /mcp, /mcp/*                   — unified MCP (global auth)
- *   - /view/:id                      — default-vault HTML view
- *   - /public/:id                    — backward-compat redirect → /view
- *   - /vaults/list                   — PUBLIC vault names (no auth, no metadata)
- *   - /vaults                        — authenticated vault metadata listing
- *   - /api/*                         — default-vault REST API
- *   - /vaults/:name/*                — vault-scoped: view, oauth, mcp, api
+ * Dispatch shape:
+ *
+ *   /.well-known/parachute.json        — NOT served here (CLI owns it at
+ *                                        origin root; vault never handles it)
+ *   /health                            — liveness ping, vault names leaked
+ *                                        only to authenticated callers
+ *   /vaults/list                       — public vault-name discovery (can be
+ *                                        disabled globally via config)
+ *   /vaults                            — authenticated vault metadata list
+ *   /vault/<name>/.well-known/*        — per-vault OAuth discovery
+ *   /vault/<name>/oauth/{register,authorize,token}
+ *   /vault/<name>/mcp[/*]              — MCP endpoint (Bearer auth)
+ *   /vault/<name>/view/<idOrPath>      — auth-aware HTML view
+ *   /vault/<name>/public/<noteId>      — legacy alias → /view redirect
+ *   /vault/<name>                      — vault metadata + stats (auth)
+ *   /vault/<name>/api/...              — REST surface (auth)
+ *
+ * There is deliberately no compat for the old `/api/*`, `/mcp`, `/oauth/*`,
+ * `/view/*`, or `/vaults/<name>/*` prefixes. Clients must re-authenticate
+ * after the upgrade and point at the new URLs.
  */
 
 import type { VaultConfig } from "./config.ts";
@@ -23,7 +34,6 @@ import {
   readGlobalConfig,
   writeVaultConfig,
   listVaults,
-  resolveDefaultVault,
 } from "./config.ts";
 import {
   authenticateVaultRequest,
@@ -32,7 +42,7 @@ import {
   extractApiKey,
 } from "./auth.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { handleUnifiedMcp, handleScopedMcp } from "./mcp-http.ts";
+import { handleScopedMcp } from "./mcp-http.ts";
 import {
   handleNotes,
   handleTags,
@@ -57,22 +67,12 @@ import {
  * header pointing at the matching protected-resource metadata document.
  *
  * An MCP-capable OAuth client that receives a plain 401 has no structured way
- * to discover which authorization server to use, and SDKs that follow RFC 9728
- * (including Claude Code's) default to probing the *root* `/.well-known/oauth-
- * protected-resource`. That document advertises `resource: <base>/mcp` — which
- * then fails the SDK's strict resource-URL match when the client is actually
- * connecting to `/vaults/{name}/mcp`. The `WWW-Authenticate` header tells the
- * client exactly which metadata document applies to the endpoint it just hit,
- * closing the mismatch.
- *
- * Scoped calls pass `vaultName`; unscoped omits it. Other 401-emitting
- * endpoints (`/api/*`, `/vaults`, `/health` when authenticated) are not MCP
- * resources and intentionally do not carry this header.
+ * to discover which authorization server to use; the `WWW-Authenticate`
+ * header names the metadata document for the exact endpoint they hit.
  */
-function mcpWwwAuthenticate(req: Request, vaultName?: string): string {
+function mcpWwwAuthenticate(req: Request, vaultName: string): string {
   const base = getBaseUrl(req);
-  const prefix = vaultName ? `/vaults/${vaultName}` : "";
-  return `Bearer resource_metadata="${base}${prefix}/.well-known/oauth-protected-resource"`;
+  return `Bearer resource_metadata="${base}/vault/${vaultName}/.well-known/oauth-protected-resource"`;
 }
 
 /**
@@ -83,7 +83,7 @@ function mcpWwwAuthenticate(req: Request, vaultName?: string): string {
 async function withMcpChallenge(
   res: Response,
   req: Request,
-  vaultName?: string,
+  vaultName: string,
 ): Promise<Response> {
   if (res.status !== 401) return res;
   const body = await res.text();
@@ -103,7 +103,6 @@ function isViewAuthenticated(
   vaultDb?: import("bun:sqlite").Database,
 ): boolean {
   if (!vaultConfig) return false;
-  // extractApiKey now checks headers AND ?key= query param
   const key = extractApiKey(req);
   if (!key) return false;
   const auth = authenticateVaultRequest(req, vaultConfig, vaultDb);
@@ -115,91 +114,10 @@ export async function route(
   path: string,
   clientIp?: string,
 ): Promise<Response> {
-  // OAuth discovery endpoints (no auth required).
-  //
-  // RFC 8414 §3.1 and RFC 9728 §3 specify the discovery URL shape when an
-  // authorization server (or protected resource) has a path component `/p`:
-  //
-  //   Path-insertion (spec-mandated):
-  //     <host>/.well-known/<metadata-type>/p
-  //   Path-append (widespread in the wild, shipped in PR #111):
-  //     <host>/p/.well-known/<metadata-type>
-  //
-  // Strict clients — including Claude Code's MCP OAuth SDK — probe only the
-  // path-insertion form. Lax clients try path-append. We serve both so any
-  // conformant probe hits a live endpoint. Unscoped root forms
-  // (`/.well-known/oauth-*`) are the third accepted shape, and the
-  // path-append branch for scoped discovery lives further down alongside the
-  // other `/vaults/{name}/*` routing.
-  const protectedResourceInsert = path.match(
-    /^\/\.well-known\/oauth-protected-resource\/vaults\/([^/]+)(?:\/mcp)?$/,
-  );
-  if (protectedResourceInsert) {
-    const vaultName = protectedResourceInsert[1];
-    if (!readVaultConfig(vaultName)) {
-      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
-    }
-    return handleProtectedResource(req, `/vaults/${vaultName}/mcp`, `/vaults/${vaultName}`);
-  }
-  const authServerInsert = path.match(
-    /^\/\.well-known\/oauth-authorization-server\/vaults\/([^/]+)(?:\/mcp)?$/,
-  );
-  if (authServerInsert) {
-    const vaultName = authServerInsert[1];
-    if (!readVaultConfig(vaultName)) {
-      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
-    }
-    return handleAuthorizationServer(req, vaultName);
-  }
+  // ---------------------------------------------------------------------
+  // Cross-vault / origin-root endpoints
+  // ---------------------------------------------------------------------
 
-  if (path === "/.well-known/oauth-protected-resource") {
-    return handleProtectedResource(req);
-  }
-  if (path === "/.well-known/oauth-authorization-server") {
-    return handleAuthorizationServer(req);
-  }
-
-  // OAuth flow endpoints (no auth — these ARE the auth)
-  if (path === "/oauth/register" || path === "/oauth/authorize" || path === "/oauth/token") {
-    const defaultVault = resolveDefaultVault();
-    const vaultConfig = defaultVault ? readVaultConfig(defaultVault) : null;
-    if (!defaultVault || !vaultConfig) {
-      return Response.json(
-        { error: "server_error", error_description: "Default vault not configured" },
-        { status: 500 },
-      );
-    }
-    const store = getVaultStore(defaultVault);
-
-    if (path === "/oauth/register") {
-      return handleRegister(req, store.db);
-    }
-    if (path === "/oauth/authorize") {
-      const gc = readGlobalConfig();
-      const ownerPasswordHash = gc.owner_password_hash ?? null;
-      const totpSecret = gc.totp_secret ?? null;
-      const totpEnrolled = typeof totpSecret === "string" && totpSecret.length > 0;
-      if (req.method === "GET") {
-        return handleAuthorizeGet(req, store.db, vaultConfig.name, ownerPasswordHash, totpEnrolled);
-      }
-      if (req.method === "POST") {
-        return handleAuthorizePost(req, store.db, {
-          vaultName: vaultConfig.name,
-          clientIp,
-          ownerPasswordHash,
-          totpSecret,
-        });
-      }
-      return Response.json({ error: "method_not_allowed" }, { status: 405 });
-    }
-    if (path === "/oauth/token") {
-      // PR #111: handleToken echoes the vault name back to the client so it
-      // knows which vault it just connected to.
-      return handleToken(req, store.db, defaultVault);
-    }
-  }
-
-  // Health check — vault names only for authenticated requests
   if (path === "/health") {
     const auth = authenticateGlobalRequest(req);
     if ("error" in auth) {
@@ -208,45 +126,10 @@ export async function route(
     return Response.json({ status: "ok", vaults: listVaults() });
   }
 
-  // Unified MCP (all vaults, global auth)
-  if (path === "/mcp" || path.startsWith("/mcp/")) {
-    const auth = authenticateGlobalRequest(req);
-    if ("error" in auth) return withMcpChallenge(auth.error, req);
-    return handleUnifiedMcp(req, auth);
-  }
-
-  // View endpoint — serves notes as HTML (auth-aware, supports ID or path)
-  const viewMatch = path.match(/^\/view\/(.+)$/);
-  if (viewMatch && req.method === "GET") {
-    const defaultVault = resolveDefaultVault();
-    const vaultConfig = defaultVault ? readVaultConfig(defaultVault) : null;
-    if (!defaultVault || !vaultConfig) {
-      return Response.json({ error: "Default vault not found" }, { status: 404 });
-    }
-    const store = getVaultStore(defaultVault);
-    const authenticated = isViewAuthenticated(req, vaultConfig, store.db);
-    return handleViewNote(store, decodeURIComponent(viewMatch[1]), {
-      authenticated,
-      publishedTag: vaultConfig.published_tag,
-    });
-  }
-
-  // Backward compat: /public/:noteId → /view/:noteId (preserving query params)
-  const publicMatch = path.match(/^\/public\/([^/]+)$/);
-  if (publicMatch && req.method === "GET") {
-    const dest = new URL(`/view/${publicMatch[1]}`, req.url);
-    dest.search = new URL(req.url).search;
-    return Response.redirect(dest.toString(), 301);
-  }
-
-  // Public vault names — no auth, no metadata. Lets unauthenticated clients
-  // (e.g. the Daily vault-picker dropdown before OAuth) know which vault to
-  // target. Only vault names are exposed; descriptions, counts, timestamps,
-  // and API keys are never returned from this endpoint.
-  //
-  // Operators who want to hide vault existence from anonymous callers can set
-  // `discovery: disabled` in ~/.parachute/config.yaml — the endpoint then
-  // returns 404 as if it didn't exist.
+  // Public vault-name discovery. Lets unauthenticated clients (e.g. the
+  // Daily vault-picker dropdown before OAuth) know which vault to target.
+  // Operators who want to hide vault existence can set `discovery: disabled`
+  // in ~/.parachute/config.yaml — the endpoint then returns 404.
   if (path === "/vaults/list" && req.method === "GET") {
     const globalConfig = readGlobalConfig();
     if (globalConfig.discovery === "disabled") {
@@ -255,7 +138,7 @@ export async function route(
     return Response.json({ vaults: listVaults() });
   }
 
-  // List vaults — requires auth
+  // Authenticated vault metadata list.
   if (path === "/vaults" && req.method === "GET") {
     const auth = authenticateGlobalRequest(req);
     if ("error" in auth) return auth.error;
@@ -271,38 +154,11 @@ export async function route(
     return Response.json({ vaults });
   }
 
-  // Backward-compatible: /api/* routes to default vault
-  if (path.startsWith("/api/")) {
-    const defaultVault = resolveDefaultVault();
-    const vaultConfig = defaultVault ? readVaultConfig(defaultVault) : null;
-    if (!defaultVault || !vaultConfig) {
-      return Response.json({ error: "Default vault not found" }, { status: 404 });
-    }
-    const store = getVaultStore(defaultVault);
-    const auth = authenticateVaultRequest(req, vaultConfig, store.db);
-    if ("error" in auth) return auth.error;
-    if (!isMethodAllowed(req.method, auth.permission)) {
-      return Response.json(
-        { error: "Forbidden", message: "Insufficient permissions" },
-        { status: 403 },
-      );
-    }
-    const apiPath = path.slice(4); // strip "/api"
-    if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), defaultVault);
-    if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
-    if (apiPath === "/find-path") return handleFindPath(req, store);
-    if (apiPath === "/vault") {
-      return handleVault(req, store, vaultConfig, () => {
-        writeVaultConfig(vaultConfig);
-      });
-    }
-    if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
-    if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), defaultVault);
-    if (apiPath === "/health") return Response.json({ status: "ok", vault: defaultVault });
-  }
+  // ---------------------------------------------------------------------
+  // Per-vault routing: /vault/<name>/...
+  // ---------------------------------------------------------------------
 
-  // Vault-scoped routes: /vaults/{name}/...
-  const vaultMatch = path.match(/^\/vaults\/([^/]+)(\/.*)?$/);
+  const vaultMatch = path.match(/^\/vault\/([^/]+)(\/.*)?$/);
   if (!vaultMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
@@ -315,15 +171,18 @@ export async function route(
     return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
   }
 
-  // Backward compat: /vaults/{name}/public/:noteId → /view/:noteId
+  // Legacy-style /public/:noteId → /view/:noteId redirect (kept as a
+  // convenience for published-note URLs that predate the /view/ path).
   const vaultPublicMatch = subpath.match(/^\/public\/([^/]+)$/);
   if (vaultPublicMatch && req.method === "GET") {
-    const dest = new URL(`/vaults/${vaultName}/view/${vaultPublicMatch[1]}`, req.url);
+    const dest = new URL(`/vault/${vaultName}/view/${vaultPublicMatch[1]}`, req.url);
     dest.search = new URL(req.url).search;
     return Response.redirect(dest.toString(), 301);
   }
 
-  // View endpoint — serves notes as HTML (auth-aware, vault-scoped, supports ID or path)
+  // View endpoint — auth-aware HTML renderer. Unauthenticated requests
+  // still serve public notes; a valid API key via header or ?key= query
+  // parameter unlocks private notes.
   const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
@@ -334,7 +193,7 @@ export async function route(
     });
   }
 
-  // Vault-scoped OAuth endpoints (no auth — these ARE the auth)
+  // OAuth flow endpoints (no auth — these ARE the auth).
   if (subpath === "/oauth/register" || subpath === "/oauth/authorize" || subpath === "/oauth/token") {
     const store = getVaultStore(vaultName);
     if (subpath === "/oauth/register") return handleRegister(req, store.db);
@@ -362,33 +221,27 @@ export async function route(
       }
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
     }
-    // PR #111: handleToken now requires the vault name so it can (a) pin the
-    // OAuth code to the issuing vault (prevents cross-vault code replay) and
-    // (b) echo `vault: <name>` back to the client in the token response.
+    // handleToken pins the OAuth code to the issuing vault (prevents
+    // cross-vault code replay) and echoes `vault: <name>` in the response.
     if (subpath === "/oauth/token") return handleToken(req, store.db, vaultName);
   }
 
-  // Vault-scoped discovery endpoints. PR #111: the protected-resource
-  // advertises a vault-scoped authorization server (`${base}/vaults/${name}`),
-  // and the vault-scoped authorization-server metadata returns endpoints
-  // scoped to `/vaults/${name}/oauth/*` so tokens mint against this vault's
-  // DB. Keeps the RFC 9728 → RFC 8414 chain coherent end-to-end.
+  // OAuth discovery (no auth). The protected-resource metadata advertises
+  // this vault's MCP endpoint and names the vault's authorization server;
+  // the authorization-server metadata returns endpoints scoped to
+  // `/vault/<name>/oauth/*`. Together they keep RFC 9728 → RFC 8414
+  // discovery coherent for a single vault.
   if (subpath === "/.well-known/oauth-protected-resource") {
-    return handleProtectedResource(
-      req,
-      `/vaults/${vaultName}/mcp`,
-      `/vaults/${vaultName}`,
-    );
+    return handleProtectedResource(req, vaultName);
   }
   if (subpath === "/.well-known/oauth-authorization-server") {
     return handleAuthorizationServer(req, vaultName);
   }
 
-  // Auth: per-vault key OR global key.
-  // The auth check is shared between the scoped MCP branch and the scoped
-  // /api/* branches, so we can't unconditionally attach the MCP-only
-  // WWW-Authenticate challenge here — we pass the challenge back only when
-  // the failing request was actually targeting /vaults/{name}/mcp.
+  // ---------------------------------------------------------------------
+  // Authenticated surface
+  // ---------------------------------------------------------------------
+
   const store = getVaultStore(vaultName);
   const auth = authenticateVaultRequest(req, vaultConfig, store.db);
   const isScopedMcp = subpath === "/mcp" || subpath.startsWith("/mcp/");
@@ -396,12 +249,12 @@ export async function route(
     return isScopedMcp ? withMcpChallenge(auth.error, req, vaultName) : auth.error;
   }
 
-  // Per-vault scoped MCP
+  // MCP (per-vault, single-vault session).
   if (isScopedMcp) {
     return handleScopedMcp(req, vaultName, auth);
   }
 
-  // Bare /vaults/{name} — single-vault root. Returns name, description,
+  // Bare `/vault/<name>` — single-vault root. Returns name, description,
   // createdAt, and stats. One round trip for a viz landing page.
   if (subpath === "" || subpath === "/") {
     if (req.method !== "GET") {
@@ -416,7 +269,7 @@ export async function route(
     });
   }
 
-  // REST API — enforce permission level
+  // REST API — enforce permission level.
   if (!isMethodAllowed(req.method, auth.permission)) {
     return Response.json(
       { error: "Forbidden", message: "Insufficient permissions" },

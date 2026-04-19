@@ -172,7 +172,7 @@ describe("vault doctor — extended checks", () => {
     // Use a non-default port to prove we're actually reading config.yaml,
     // not just matching against DEFAULT_PORT.
     writeFileSync(join(dir, "config.yaml"), "port: 4321\n");
-    writeClaudeJson(dir, "http://127.0.0.1:4321/vaults/default/mcp");
+    writeClaudeJson(dir, "http://127.0.0.1:4321/vault/default/mcp");
     const res = runCli(["doctor"], dir, { HOME: dir });
     expect(res.stdout).toMatch(/✓ MCP entry in ~\/\.claude\.json/);
     expect(res.stdout).toMatch(/✓ MCP URL port matches vault\s+\(port 4321\)/);
@@ -184,7 +184,7 @@ describe("vault doctor — extended checks", () => {
 
   test("warns when MCP URL port does not match the vault's configured port", () => {
     writeFileSync(join(dir, "config.yaml"), "port: 4321\n");
-    writeClaudeJson(dir, "http://127.0.0.1:9999/vaults/default/mcp");
+    writeClaudeJson(dir, "http://127.0.0.1:9999/vault/default/mcp");
     const res = runCli(["doctor"], dir, { HOME: dir });
     expect(res.stdout).toMatch(/✓ MCP entry in ~\/\.claude\.json/);
     expect(res.stdout).toMatch(/! MCP URL port matches vault/);

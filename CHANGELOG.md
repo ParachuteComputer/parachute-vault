@@ -6,6 +6,17 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: every vault-touching route moved to `/vault/<name>/...`; unscoped routes removed.** There is one URL shape for every client, same layout whether you have one vault or ten. The API lives at `/vault/<name>/api/...`, MCP at `/vault/<name>/mcp`, OAuth at `/vault/<name>/oauth/{register,authorize,token}`, discovery at `/vault/<name>/.well-known/oauth-*`, published notes at `/vault/<name>/view/:id`. The old unscoped `/api`, `/mcp`, `/oauth/*`, `/view/*` paths — and the previous `/vaults/<name>/...` prefix — are gone; requests to them return 404. Cross-vault endpoints (`GET /vaults`, `GET /vaults/list`, `GET /health`) are unchanged. The unified MCP endpoint that fanned tool calls across vaults via a `vault` param has been dropped — each MCP session now pins to one vault by the URL and the `list-vaults` tool is no longer exposed. A new `WWW-Authenticate: Bearer resource_metadata="..."` header decorates every MCP 401 so OAuth-capable clients can discover the right authorization server directly from the challenge (RFC 9728).
+
+#### Upgrading from 0.2.x
+
+- **Claude Code**: run `parachute-vault mcp-install` (or re-run `parachute-vault init`) to rewrite `~/.claude.json` with the new `/vault/<name>/mcp` URL. Existing `pvt_` tokens are kept; no re-auth needed.
+- **Claude Desktop / Parachute Daily / any OAuth client**: remove the integration and add it back pointing at `https://<your-host>/vault/<name>/mcp`. The OAuth handshake will re-run and mint a fresh per-vault token. Pasted bearer-token integrations need only the URL updated.
+- **curl / scripts**: rewrite hardcoded URLs. Old `/api/notes` → `/vault/default/api/notes`; old `/vaults/work/api/...` → `/vault/work/api/...`; old unscoped `/mcp` → `/vault/default/mcp`. Tokens keep working.
+- **Published-note permalinks**: `/view/<id>` and `/vaults/<name>/view/<id>` now 404. Update to `/vault/<name>/view/<id>`.
+
 ### Fixed
 
 - **Fresh notes now have `updated_at = created_at` instead of `NULL`.** Clients that fall back to `createdAt` when computing an optimistic-concurrency token (the common `updatedAt ?? createdAt` pattern, used by the Lens editor) were being rejected with a `409 CONFLICT` on the very first edit of a just-created note, because the stored `updated_at IS NULL` never matched the sent timestamp. The insert path now writes both columns at once; a one-time idempotent migration backfills `updated_at = created_at` for any existing rows with `NULL`. Rows that already had a real `updated_at` are untouched. Hook-style writes with `skipUpdatedAt` continue to preserve the column, so `updated_at > created_at` still means "user-touched since creation."

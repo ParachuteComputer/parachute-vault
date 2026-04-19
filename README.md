@@ -77,7 +77,7 @@ The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST,
 
 ### `~/.claude.json`
 
-`vault init` adds one entry — `mcpServers["parachute-vault"]` — pointing at `http://127.0.0.1:<port>/vaults/<default-vault>/mcp` with a baked-in `Authorization: Bearer pvt_...` header. Next Claude Code session picks it up; there's no further wiring. See [Connecting a client](#connecting-a-client) for rotating that token or pointing it elsewhere.
+`vault init` adds one entry — `mcpServers["parachute-vault"]` — pointing at `http://127.0.0.1:<port>/vault/<default-vault>/mcp` with a baked-in `Authorization: Bearer pvt_...` header. Next Claude Code session picks it up; there's no further wiring. See [Connecting a client](#connecting-a-client) for rotating that token or pointing it elsewhere.
 
 ### Your API token
 
@@ -119,7 +119,7 @@ Password and 2FA secrets live in `~/.parachute/config.yaml` at mode 0600 (bcrypt
   "mcpServers": {
     "parachute-vault": {
       "type": "http",
-      "url": "http://127.0.0.1:1940/vaults/{name}/mcp",
+      "url": "http://127.0.0.1:1940/vault/{name}/mcp",
       "headers": { "Authorization": "Bearer pvt_..." }
     }
   }
@@ -135,8 +135,8 @@ To re-point Claude Code at a different vault, change `default_vault` in `~/.para
 For Claude Desktop — or any install where the server is on a different machine from the client — use the browser-based OAuth flow:
 
 1. Claude Desktop → Settings → Integrations → Add MCP server.
-2. Enter the URL: `https://vault.yourdomain.com/vaults/{name}/mcp` (replace `{name}`, or use the unscoped `https://vault.yourdomain.com/mcp` on a single-vault deployment). **Do not paste a bearer token** — leave the auth field empty.
-3. An OAuth-capable MCP client discovers the vault's authorization server at `/.well-known/oauth-authorization-server`, registers itself via Dynamic Client Registration (RFC 7591), and opens your browser to the vault's consent page.
+2. Enter the URL: `https://vault.yourdomain.com/vault/{name}/mcp` (replace `{name}` with your vault name — e.g. `default`). **Do not paste a bearer token** — leave the auth field empty.
+3. An OAuth-capable MCP client discovers the vault's authorization server at `/vault/{name}/.well-known/oauth-authorization-server`, registers itself via Dynamic Client Registration (RFC 7591), and opens your browser to the vault's consent page.
 4. Enter your owner password (plus TOTP code / backup code if 2FA is enabled), pick a scope (`full` or `read`), click Authorize.
 5. Browser redirects back. The connection is live. The client now holds a `pvt_` token scoped to this vault.
 
@@ -158,9 +158,7 @@ parachute-vault remove work --yes
 
 **The default vault is managed for you.** `vault init` creates `default` on first install and records it as `default_vault` in `~/.parachute/config.yaml`. `vault create <name>` promotes the newly-created vault to default when no default exists or when the configured default points at a missing vault. `vault remove <name>` promotes the sole survivor when you delete the default and one vault remains; if multiple remain after removing the default, it clears the setting and tells you to edit `config.yaml` yourself. There is no `vault set-default` subcommand — to point the server at a different existing vault, edit the `default_vault:` line in `~/.parachute/config.yaml` and `parachute-vault restart`.
 
-**Single-vault rule.** When the server has exactly one vault, the unscoped `/oauth/*` and `/mcp` paths transparently resolve to it — regardless of its name. A lone vault named `journal` works at `https://vault.example.com/mcp` with no vault-in-URL needed.
-
-**Multi-vault rule.** When the server has two or more vaults, always use the vault-scoped path (`/vaults/{name}/mcp`, `/vaults/{name}/oauth/authorize`). OAuth tokens minted there are scoped to that vault alone — cross-vault substitution is enforced at the OAuth layer: an auth code minted for one vault cannot be redeemed at another vault's token endpoint.
+**URL shape.** Every vault-touching route lives under `/vault/{name}/...`: `/vault/{name}/mcp`, `/vault/{name}/oauth/authorize`, `/vault/{name}/api/notes`, `/vault/{name}/view/{id}`. There is no unscoped fallback — pick the vault in the URL even if you only have one. OAuth tokens are scoped to the vault in their issuing URL; cross-vault substitution is rejected at the OAuth layer (an auth code minted for one vault cannot be redeemed at another vault's token endpoint).
 
 **Listing vaults from a client.** The authenticated `GET /vaults` endpoint returns full vault metadata. The public `GET /vaults/list` endpoint returns names only, no metadata, no auth required — this is what Parachute Daily's vault picker calls before the user authenticates. Operators who want to hide the vault list from unauthenticated callers can set `discovery: disabled` in `~/.parachute/config.yaml` to make `/vaults/list` return 404.
 
@@ -400,24 +398,28 @@ published_tag: public
 
 ## REST API
 
-```
-GET/POST       /api/notes                         query or create notes
-GET/PATCH/DEL  /api/notes/:idOrPath                read, update, delete a single note
-GET/POST       /api/notes/:id/attachments          list or add attachments
-GET            /api/tags                           list tags (?include_schema=true for schemas)
-GET/PUT/DEL    /api/tags/:name                     get, update, or delete a tag
-POST           /api/tags/:name/rename              atomic rename (409 if target_exists)
-POST           /api/tags/merge                     atomic multi-source merge into a target tag
-GET            /api/find-path?source=...&target=...  shortest path between two notes
-GET/PATCH      /api/vault                          vault info (get or update description)
-POST           /api/storage/upload                 upload file (audio/image)
-GET            /api/storage/:path                  download file
-POST           /mcp                                MCP endpoint (unified, all vaults)
-GET            /view/:idOrPath                     render note as HTML (public or auth)
-GET            /health                             health check
-```
+Every vault-touching path is scoped under `/vault/{name}/` — substitute your vault name (e.g. `default`) for `{name}`:
 
-Per-vault routes at `/vaults/{name}/api/...`, `/vaults/{name}/mcp`, and `/vaults/{name}/view/:idOrPath`.
+```
+GET/POST       /vault/{name}/api/notes                           query or create notes
+GET/PATCH/DEL  /vault/{name}/api/notes/:idOrPath                  read, update, delete a single note
+GET/POST       /vault/{name}/api/notes/:id/attachments            list or add attachments
+GET            /vault/{name}/api/tags                             list tags (?include_schema=true for schemas)
+GET/PUT/DEL    /vault/{name}/api/tags/:name                       get, update, or delete a tag
+POST           /vault/{name}/api/tags/:name/rename                atomic rename (409 if target_exists)
+POST           /vault/{name}/api/tags/merge                       atomic multi-source merge into a target tag
+GET            /vault/{name}/api/find-path?source=...&target=...  shortest path between two notes
+GET/PATCH      /vault/{name}/api/vault                            vault info (get or update description)
+POST           /vault/{name}/api/storage/upload                   upload file (audio/image)
+GET            /vault/{name}/api/storage/:path                    download file
+POST           /vault/{name}/mcp                                  MCP endpoint (per-vault session)
+*              /vault/{name}/oauth/{register,authorize,token}     OAuth 2.1 + PKCE flow
+*              /vault/{name}/.well-known/oauth-*                  RFC 8414 / RFC 9728 discovery
+GET            /vault/{name}/view/:idOrPath                       render note as HTML (public or auth)
+GET            /vaults                                            authenticated: full metadata
+GET            /vaults/list                                       public: vault names only (unless discovery: disabled)
+GET            /health                                            health check
+```
 
 ## Data model
 
@@ -435,7 +437,7 @@ Metadata is a JSON column. Vaults start blank — no predefined tags or schema.
 
 **All API and MCP requests require a valid API key.** No exceptions — localhost gets no special treatment.
 
-For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [Connecting a client](#connecting-a-client) above. This section covers token-level details: how to pass a key, how to manage tokens, and which endpoints are public by design (`/health`, published notes at `/view/:id`).
+For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [Connecting a client](#connecting-a-client) above. This section covers token-level details: how to pass a key, how to manage tokens, and which endpoints are public by design (`/health`, `/vaults/list`, published notes at `/vault/{name}/view/:id`).
 
 ### Passing the key
 
@@ -446,13 +448,13 @@ Tokens come in two shapes. Both work interchangeably at every authenticated endp
 
 ```bash
 # Header (preferred)
-curl -H "Authorization: Bearer pvt_..." http://localhost:1940/api/notes
+curl -H "Authorization: Bearer pvt_..." http://localhost:1940/vault/default/api/notes
 
 # Alternative header
-curl -H "X-API-Key: pvt_..." http://localhost:1940/api/notes
+curl -H "X-API-Key: pvt_..." http://localhost:1940/vault/default/api/notes
 
 # Query param (for /view endpoint only — convenient for browsers)
-curl http://localhost:1940/view/noteId?key=pvt_...
+curl http://localhost:1940/vault/default/view/noteId?key=pvt_...
 ```
 
 ### Token management
@@ -479,9 +481,10 @@ Legacy API keys (`pvk_...`) from config.yaml still work at runtime but the `vaul
 
 ### Public endpoints
 
-Only two endpoints work without auth:
+Three endpoints work without auth:
 - `GET /health` — returns `{ status: "ok" }` (no sensitive data)
-- `GET /view/:noteId` — serves published notes only (returns 404 for unpublished)
+- `GET /vaults/list` — vault names only (set `discovery: disabled` in `config.yaml` to hide)
+- `GET /vault/{name}/view/:noteId` — serves published notes only (returns 404 for unpublished)
 
 ## Network security
 
@@ -568,7 +571,7 @@ sudo cloudflared service install
 sudo systemctl start cloudflared
 ```
 
-Then point any client at `https://vault.yourdomain.com/vaults/{name}/mcp` (or `https://vault.yourdomain.com/mcp` for a single-vault deployment). See [Connecting a client → Claude Desktop (OAuth)](#claude-desktop-oauth) — the flow is identical to the local case once the URL is remote; the browser-based OAuth handshake makes the connection without pasting a bearer token.
+Then point any client at `https://vault.yourdomain.com/vault/{name}/mcp`. See [Connecting a client → Claude Desktop (OAuth)](#claude-desktop-oauth) — the flow is identical to the local case once the URL is remote; the browser-based OAuth handshake makes the connection without pasting a bearer token.
 
 ### Remote access via Tailscale Funnel
 
@@ -595,7 +598,7 @@ tailscale funnel reset
 The resulting URL is `https://<your-device>.<your-tailnet>.ts.net/` — `tailscale funnel status` prints it verbatim. You can also use ports `8443` or `10000` via `--https=<port>`; no other public ports are available to Funnel.
 
 Point any MCP client at the Tailscale URL:
-- Claude Desktop → Settings → Integrations → Add MCP → `https://<your-device>.<your-tailnet>.ts.net/vaults/{name}/mcp` (leave the Authorization field empty; the OAuth flow will handle it — see [Connecting a client](#connecting-a-client)).
+- Claude Desktop → Settings → Integrations → Add MCP → `https://<your-device>.<your-tailnet>.ts.net/vault/{name}/mcp` (leave the Authorization field empty; the OAuth flow will handle it — see [Connecting a client](#connecting-a-client)).
 - Parachute Daily → enter the base URL `https://<your-device>.<your-tailnet>.ts.net`, pick the vault, tap Connect.
 
 **Cloudflare vs Tailscale, at a glance.** Pick Cloudflare when you want a custom domain, bandwidth headroom for heavier traffic, or to share the vault with people who aren't on your tailnet. Pick Tailscale when you're already running it, you're fine with a `*.ts.net` URL, and you want the setup to fit in two commands.

@@ -33,7 +33,6 @@ const READ_TOOLS = new Set([
   "list-tags",
   "find-path",
   "vault-info",
-  "list-vaults",
 ]);
 
 /** Check if a tool call is allowed for a given permission level. */

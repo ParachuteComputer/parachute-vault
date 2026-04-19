@@ -4,10 +4,10 @@
  * Implements the subset of OAuth 2.1 needed for MCP clients (Claude Web,
  * Claude Desktop, etc.) to connect via the standard browser-based flow:
  *
- *   1. Dynamic Client Registration (RFC 7591)  — POST /oauth/register
- *   2. Authorization endpoint (PKCE required)   — GET/POST /oauth/authorize
- *   3. Token endpoint (code exchange)           — POST /oauth/token
- *   4. Discovery endpoints                      — GET /.well-known/*
+ *   1. Dynamic Client Registration (RFC 7591)  — POST /vault/<name>/oauth/register
+ *   2. Authorization endpoint (PKCE required)   — GET/POST /vault/<name>/oauth/authorize
+ *   3. Token endpoint (code exchange)           — POST /vault/<name>/oauth/token
+ *   4. Discovery endpoints                      — GET /vault/<name>/.well-known/*
  *
  * The flow produces a standard `pvt_` token stored in the vault's tokens table.
  * After the OAuth handshake, all requests use the same Bearer token auth path.
@@ -74,36 +74,31 @@ function escapeHtml(s: string): string {
 /**
  * OAuth 2.0 Protected Resource Metadata (RFC 9728).
  *
- * @param mcpPath       — the resource URL (e.g. `/mcp` or `/vaults/X/mcp`).
- * @param authServerPrefix — path prefix for the authorization server issuer
- *                           (e.g. `""` for global, `/vaults/X` for scoped).
- *                           The client discovers the AS metadata at
- *                           `{base}{prefix}/.well-known/oauth-authorization-server`.
+ * @param vaultName — the vault whose MCP endpoint is the protected resource.
+ *                    The metadata advertises `resource: {base}/vault/{name}/mcp`
+ *                    and the vault's authorization server at
+ *                    `{base}/vault/{name}`. Clients discover the AS metadata
+ *                    at `{base}/vault/{name}/.well-known/oauth-authorization-server`.
  */
-export function handleProtectedResource(
-  req: Request,
-  mcpPath = "/mcp",
-  authServerPrefix = "",
-): Response {
+export function handleProtectedResource(req: Request, vaultName: string): Response {
   const base = getBaseUrl(req);
+  const prefix = `/vault/${vaultName}`;
   return Response.json({
-    resource: `${base}${mcpPath}`,
-    authorization_servers: [`${base}${authServerPrefix}`],
+    resource: `${base}${prefix}/mcp`,
+    authorization_servers: [`${base}${prefix}`],
     scopes_supported: ["full", "read"],
     bearer_methods_supported: ["header"],
   });
 }
 
 /**
- * OAuth 2.0 Authorization Server Metadata (RFC 8414).
- *
- * @param vaultName — when provided, returns vault-scoped endpoints
- *                    (`/vaults/<name>/oauth/*`) and issuer. Tokens minted
- *                    via these endpoints are scoped to the named vault's DB.
+ * OAuth 2.0 Authorization Server Metadata (RFC 8414). The endpoints are
+ * vault-scoped under `/vault/<name>/oauth/*`; tokens minted via these
+ * endpoints are scoped to the named vault's DB.
  */
-export function handleAuthorizationServer(req: Request, vaultName?: string): Response {
+export function handleAuthorizationServer(req: Request, vaultName: string): Response {
   const base = getBaseUrl(req);
-  const prefix = vaultName ? `/vaults/${vaultName}` : "";
+  const prefix = `/vault/${vaultName}`;
   return Response.json({
     issuer: `${base}${prefix}`,
     authorization_endpoint: `${base}${prefix}/oauth/authorize`,
@@ -486,8 +481,8 @@ export async function handleToken(
   }
 
   // Validate the code was issued for the same vault this token endpoint
-  // serves. Without this, a code issued under /vaults/A/oauth/authorize
-  // could be presented to /vaults/B/oauth/token and the token would be
+  // serves. Without this, a code issued under /vault/A/oauth/authorize
+  // could be presented to /vault/B/oauth/token and the token would be
   // minted into B's DB — privilege escalation across vault boundaries.
   if (authCode.vault_name !== vaultName) {
     return Response.json({ error: "invalid_grant", error_description: "vault mismatch" }, { status: 400 });
@@ -708,7 +703,7 @@ function renderConsentPage(p: ConsentParams): string {
 <div class="card">
   <h1>Authorize access</h1>
   <p><span class="client">${escapeHtml(p.clientName)}</span> wants to access your <strong>${escapeHtml(p.vaultName)}</strong> vault.</p>
-  <form method="POST" action="/oauth/authorize">
+  <form method="POST" action="">
     <input type="hidden" name="client_id" value="${escapeHtml(p.clientId)}">
     <input type="hidden" name="redirect_uri" value="${escapeHtml(p.redirectUri)}">
     <input type="hidden" name="code_challenge" value="${escapeHtml(p.codeChallenge)}">

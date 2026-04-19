@@ -1,25 +1,24 @@
 /**
- * MCP tool generation for multi-vault.
+ * MCP tool generation for the scoped (per-vault) MCP endpoint.
  *
- * Wraps core tools with vault resolution (optional `vault` param) and
- * overrides vault-info with actual vault config access.
+ * Every MCP session is now bound to one vault via `/vault/<name>/mcp`, so
+ * tools operate on that vault and vault-info picks up its config directly.
  */
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
-import { readVaultConfig, writeVaultConfig, listVaults as getVaultNames, resolveDefaultVault } from "./config.ts";
+import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 
 /**
- * Get the MCP server instruction for a vault (or the default vault).
+ * Get the MCP server instruction for a vault.
  * Sent once at session init — not per tool.
  */
-export function getServerInstruction(vaultName?: string): string {
-  const name = vaultName ?? resolveDefaultVault() ?? "default";
-  const config = readVaultConfig(name);
+export function getServerInstruction(vaultName: string): string {
+  const config = readVaultConfig(vaultName);
 
   const parts: string[] = [
-    `You are connected to Parachute Vault "${name}".`,
+    `You are connected to Parachute Vault "${vaultName}".`,
   ];
 
   if (config?.description) {
@@ -27,83 +26,6 @@ export function getServerInstruction(vaultName?: string): string {
   }
 
   return parts.join("\n");
-}
-
-/**
- * Generate the unified MCP tool set.
- * Each tool has an optional `vault` param that defaults to the default vault.
- */
-export function generateUnifiedMcpTools(): McpToolDef[] {
-  const vaultNames = getVaultNames();
-  const defaultVault = resolveDefaultVault() ?? "default";
-  const multiVault = vaultNames.length > 1;
-
-  // Get tool definitions from core (using default vault for schema)
-  const defaultStore = getVaultStore(defaultVault);
-  const coreTools = generateMcpTools(defaultStore);
-
-  // Wrap each core tool with vault resolution
-  const tools: McpToolDef[] = coreTools.map((coreTool) => {
-    let description = coreTool.description;
-    if (multiVault) {
-      description += `\n\nMulti-vault: pass 'vault' to target a specific vault. Default: "${defaultVault}". Available: ${vaultNames.join(", ")}`;
-    }
-
-    const inputSchema = {
-      ...coreTool.inputSchema,
-      properties: {
-        vault: {
-          type: "string",
-          description: `Vault name (default: "${defaultVault}")`,
-        },
-        ...(coreTool.inputSchema as any).properties,
-      },
-    };
-
-    return {
-      name: coreTool.name,
-      description,
-      inputSchema,
-      execute: async (params) => {
-        const vaultName = (params.vault as string) ?? defaultVault;
-        const config = readVaultConfig(vaultName);
-        if (!config) {
-          throw new Error(`Vault "${vaultName}" not found. Available: ${getVaultNames().join(", ")}`);
-        }
-        const store = getVaultStore(vaultName);
-        const vaultTools = generateMcpTools(store);
-        const tool = vaultTools.find((t) => t.name === coreTool.name)!;
-        const { vault: _, ...rest } = params;
-        return await tool.execute(rest);
-      },
-    };
-  });
-
-  // Override vault-info with actual vault config access
-  overrideVaultInfo(tools, defaultVault);
-
-  // Add list-vaults (multi-vault only, not in core)
-  if (multiVault) {
-    tools.push({
-      name: "list-vaults",
-      description: "List all available vaults with their descriptions.",
-      inputSchema: { type: "object", properties: {} },
-      execute: () => {
-        const names = getVaultNames();
-        return names.map((name) => {
-          const config = readVaultConfig(name);
-          return {
-            name,
-            description: config?.description,
-            created_at: config?.created_at,
-            is_default: name === defaultVault,
-          };
-        });
-      },
-    });
-  }
-
-  return tools;
 }
 
 /**
@@ -123,12 +45,11 @@ export function generateScopedMcpTools(vaultName: string): McpToolDef[] {
 /**
  * Override vault-info's placeholder execute with real vault config access.
  */
-function overrideVaultInfo(tools: McpToolDef[], defaultVault: string): void {
+function overrideVaultInfo(tools: McpToolDef[], vaultName: string): void {
   const vaultInfo = tools.find((t) => t.name === "vault-info");
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
-    const vaultName = (params.vault as string) ?? defaultVault;
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
 
