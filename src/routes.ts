@@ -190,21 +190,33 @@ export async function handleNotes(
 
       // Structured query
       const tags = parseQueryList(url, "tag");
-      let results: Note[] = await store.queryNotes({
-        tags,
-        tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
-        excludeTags: parseQueryList(url, "exclude_tag"),
-        hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
-        hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
-        path: parseQuery(url, "path") ?? undefined,
-        pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
-        metadata: undefined, // metadata filter not practical in query params
-        dateFrom: parseQuery(url, "date_from") ?? undefined,
-        dateTo: parseQuery(url, "date_to") ?? undefined,
-        sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
-        limit: parseInt10(parseQuery(url, "limit")) ?? 50,
-        offset: parseInt10(parseQuery(url, "offset")),
-      });
+      let results: Note[];
+      try {
+        results = await store.queryNotes({
+          tags,
+          tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+          excludeTags: parseQueryList(url, "exclude_tag"),
+          hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
+          hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+          path: parseQuery(url, "path") ?? undefined,
+          pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+          metadata: undefined, // metadata filter not practical in query params
+          dateFrom: parseQuery(url, "date_from") ?? undefined,
+          dateTo: parseQuery(url, "date_to") ?? undefined,
+          sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
+          orderBy: parseQuery(url, "order_by") ?? undefined,
+          limit: parseInt10(parseQuery(url, "limit")) ?? 50,
+          offset: parseInt10(parseQuery(url, "offset")),
+        });
+      } catch (e: any) {
+        // QueryError (non-indexed order_by, unknown operator, ...) surfaces
+        // here. Duck-type on `name` + `code` — core is a separate module, so
+        // `instanceof` is fragile across bundling boundaries.
+        if (e && e.name === "QueryError") {
+          return json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400);
+        }
+        throw e;
+      }
 
       // Near-scope filter (graph neighborhood)
       const nearNoteId = parseQuery(url, "near[note_id]");

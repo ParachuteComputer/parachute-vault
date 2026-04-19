@@ -1,6 +1,11 @@
 import { Database } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
+import {
+  buildOperatorClause,
+  isOperatorObject,
+  requireIndexedField,
+} from "./query-operators.js";
 
 let idCounter = 0;
 
@@ -264,11 +269,23 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     params.push(opts.pathPrefix + "%");
   }
 
-  // Metadata filters
+  // Metadata filters — operator objects route through the indexed generated
+  // column (fast, loud errors on non-indexed fields); primitives keep the
+  // existing JSON-scan exact-match behavior for backcompat.
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
-      conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
-      params.push(key, typeof value === "string" ? value : JSON.stringify(value));
+      if (isOperatorObject(value)) {
+        requireIndexedField(db, key);
+        const { sql, params: opParams } = buildOperatorClause(
+          key,
+          value as Record<string, unknown>,
+        );
+        conditions.push(sql);
+        params.push(...opParams);
+      } else {
+        conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
+        params.push(key, typeof value === "string" ? value : JSON.stringify(value));
+      }
     }
   }
 
@@ -282,7 +299,18 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     params.push(opts.dateTo);
   }
 
-  const orderBy = `n.created_at ${opts.sort === "desc" ? "DESC" : "ASC"}`;
+  const direction = opts.sort === "desc" ? "DESC" : "ASC";
+  let orderBy: string;
+  if (opts.orderBy) {
+    requireIndexedField(db, opts.orderBy);
+    // `orderBy` came from indexed_fields (validated on declaration), so
+    // the column name is safe to interpolate. Append created_at as a
+    // stable tiebreaker so two rows with the same indexed value have a
+    // deterministic order.
+    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}`;
+  } else {
+    orderBy = `n.created_at ${direction}`;
+  }
   const limit = typeof opts.limit === "number" ? opts.limit : 100;
   const offset = typeof opts.offset === "number" ? opts.offset : 0;
 

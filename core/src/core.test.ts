@@ -619,6 +619,135 @@ describe("queryNotes", async () => {
     const results = await store.queryNotes({ hasTags: false, excludeTags: ["archived"] });
     expect(results.map((n) => n.content)).toEqual(["Plain"]);
   });
+
+  // ---- Operator objects + order_by on indexed metadata fields ----
+
+  describe("metadata operators + order_by", () => {
+    async function seedIndexedPriorities() {
+      const { declareField } = await import("./indexed-fields.js");
+      declareField(db, "priority", "INTEGER", "project");
+      declareField(db, "status", "TEXT", "project");
+    }
+
+    it("eq operator on indexed field matches primitive exactly", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("high", { metadata: { priority: 5 } });
+      await store.createNote("low", { metadata: { priority: 1 } });
+
+      const results = await store.queryNotes({ metadata: { priority: { eq: 5 } } });
+      expect(results.map((n) => n.content)).toEqual(["high"]);
+    });
+
+    it("ne operator returns non-matching rows AND rows without the field", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("has-1", { metadata: { priority: 1 } });
+      await store.createNote("has-2", { metadata: { priority: 2 } });
+      await store.createNote("missing"); // no priority at all
+
+      const results = await store.queryNotes({ metadata: { priority: { ne: 1 } } });
+      expect(results.map((n) => n.content).sort()).toEqual(["has-2", "missing"]);
+    });
+
+    it("gt / gte / lt / lte compose into range queries on one field", async () => {
+      await seedIndexedPriorities();
+      for (const p of [1, 2, 3, 4, 5]) {
+        await store.createNote(`p${p}`, { metadata: { priority: p } });
+      }
+      const range = await store.queryNotes({ metadata: { priority: { gte: 2, lt: 5 } } });
+      expect(range.map((n) => n.content).sort()).toEqual(["p2", "p3", "p4"]);
+    });
+
+    it("in and not_in take arrays; empty in returns no rows, empty not_in returns all", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("a", { metadata: { status: "active" } });
+      await store.createNote("b", { metadata: { status: "exploring" } });
+      await store.createNote("c", { metadata: { status: "done" } });
+
+      const inResult = await store.queryNotes({ metadata: { status: { in: ["active", "exploring"] } } });
+      expect(inResult.map((n) => n.content).sort()).toEqual(["a", "b"]);
+
+      const notInResult = await store.queryNotes({ metadata: { status: { not_in: ["done"] } } });
+      // "done" excluded; rows with status=null (none here) would also pass.
+      expect(notInResult.map((n) => n.content).sort()).toEqual(["a", "b"]);
+
+      const emptyIn = await store.queryNotes({ metadata: { status: { in: [] } } });
+      expect(emptyIn).toHaveLength(0);
+    });
+
+    it("exists: true / false distinguishes present vs absent field", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("has", { metadata: { priority: 3 } });
+      await store.createNote("missing");
+
+      const has = await store.queryNotes({ metadata: { priority: { exists: true } } });
+      expect(has.map((n) => n.content)).toEqual(["has"]);
+
+      const missing = await store.queryNotes({ metadata: { priority: { exists: false } } });
+      expect(missing.map((n) => n.content)).toEqual(["missing"]);
+    });
+
+    it("order_by sorts by the indexed field; sort='desc' reverses direction", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("p3", { metadata: { priority: 3 } });
+      await store.createNote("p1", { metadata: { priority: 1 } });
+      await store.createNote("p2", { metadata: { priority: 2 } });
+
+      const asc = await store.queryNotes({ orderBy: "priority" });
+      expect(asc.map((n) => n.content)).toEqual(["p1", "p2", "p3"]);
+
+      const desc = await store.queryNotes({ orderBy: "priority", sort: "desc" });
+      expect(desc.map((n) => n.content)).toEqual(["p3", "p2", "p1"]);
+    });
+
+    it("operator objects compose with tag and exclude_tags filters", async () => {
+      await seedIndexedPriorities();
+      await store.createNote("p5-project", { tags: ["project"], metadata: { priority: 5 } });
+      await store.createNote("p3-project", { tags: ["project"], metadata: { priority: 3 } });
+      await store.createNote("p5-other", { tags: ["other"], metadata: { priority: 5 } });
+
+      const results = await store.queryNotes({
+        tags: ["project"],
+        metadata: { priority: { gte: 4 } },
+      });
+      expect(results.map((n) => n.content)).toEqual(["p5-project"]);
+    });
+
+    it("primitive metadata values keep working (backcompat, scan JSON)", async () => {
+      // Note: priority is NOT declared indexed here — primitive match still
+      // goes through json_extract and doesn't require an index.
+      await store.createNote("match", { metadata: { kind: "draft" } });
+      await store.createNote("other", { metadata: { kind: "final" } });
+
+      const results = await store.queryNotes({ metadata: { kind: "draft" } });
+      expect(results.map((n) => n.content)).toEqual(["match"]);
+    });
+
+    it("operator on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
+      await store.createNote("x", { metadata: { foo: "bar" } });
+      expect(
+        store.queryNotes({ metadata: { foo: { eq: "bar" } } }),
+      ).rejects.toThrow(/not indexed/);
+    });
+
+    it("order_by on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
+      await store.createNote("x", { metadata: { foo: 1 } });
+      expect(store.queryNotes({ orderBy: "foo" })).rejects.toThrow(/not indexed/);
+    });
+
+    it("unknown operator throws UNKNOWN_OPERATOR with supported-op list", async () => {
+      await seedIndexedPriorities();
+      expect(
+        store.queryNotes({ metadata: { priority: { bogus: 5 } as any } }),
+      ).rejects.toThrow(/unknown operator "bogus"/);
+    });
+
+    it("in/not_in without an array value throws INVALID_OPERATOR_VALUE", async () => {
+      await seedIndexedPriorities();
+      expect(
+        store.queryNotes({ metadata: { priority: { in: 5 } as any } }),
+      ).rejects.toThrow(/expects an array/);
+    });
+  });
 });
 
 // ---- Search ----
@@ -1128,6 +1257,39 @@ describe("MCP tools", async () => {
     const query = tools.find((t) => t.name === "query-notes")!;
     const result = await query.execute({ has_links: false, include_content: true }) as any[];
     expect(result.map((n) => n.content)).toEqual(["Orphan"]);
+  });
+
+  it("query-notes metadata operator query routes through the indexed column", async () => {
+    const { declareField } = await import("./indexed-fields.js");
+    declareField(db, "priority", "INTEGER", "project");
+    await store.createNote("high", { metadata: { priority: 5 } });
+    await store.createNote("mid", { metadata: { priority: 3 } });
+    await store.createNote("low", { metadata: { priority: 1 } });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      metadata: { priority: { gte: 3 } },
+      include_content: true,
+    }) as any[];
+    expect(result.map((n) => n.content).sort()).toEqual(["high", "mid"]);
+  });
+
+  it("query-notes order_by + sort=desc surfaces highest-priority first", async () => {
+    const { declareField } = await import("./indexed-fields.js");
+    declareField(db, "priority", "INTEGER", "project");
+    await store.createNote("p2", { metadata: { priority: 2 } });
+    await store.createNote("p5", { metadata: { priority: 5 } });
+    await store.createNote("p1", { metadata: { priority: 1 } });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      order_by: "priority",
+      sort: "desc",
+      include_content: true,
+    }) as any[];
+    expect(result.map((n) => n.content)).toEqual(["p5", "p2", "p1"]);
   });
 
   it("query-notes list defaults to no content (index mode)", async () => {
