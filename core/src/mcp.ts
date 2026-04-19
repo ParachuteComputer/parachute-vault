@@ -108,7 +108,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           path: { type: "string", description: "Exact path match (case-insensitive)" },
           path_prefix: { type: "string", description: "Path prefix match (e.g., 'Projects/')" },
           search: { type: "string", description: "Full-text search query" },
-          metadata: { type: "object", description: "Filter by metadata values (exact match per key)" },
+          metadata: {
+            type: "object",
+            description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
+          },
+          order_by: { type: "string", description: "Sort by an indexed metadata field instead of `created_at`. Field must be declared `indexed: true`; errors otherwise. Direction is taken from `sort` (default 'asc'); `created_at` is appended as a stable tiebreaker." },
           date_from: { type: "string", description: "Start date (ISO, inclusive)" },
           date_to: { type: "string", description: "End date (ISO, exclusive)" },
           near: {
@@ -213,6 +217,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             dateFrom: params.date_from as string | undefined,
             dateTo: params.date_to as string | undefined,
             sort: params.sort as "asc" | "desc" | undefined,
+            orderBy: params.order_by as string | undefined,
             limit: (params.limit as number) ?? 50,
             offset: params.offset as number | undefined,
           });

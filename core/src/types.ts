@@ -57,10 +57,20 @@ export interface QueryOpts {
   hasLinks?: boolean;
   path?: string;        // exact path match (case-insensitive)
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
-  metadata?: Record<string, unknown>; // filter by metadata values (exact match on each key)
+  // Per-field metadata filter. Each value is either a primitive (exact
+  // match, today's behavior) or an operator object — `{ eq, ne, gt, gte, lt,
+  // lte, in, not_in, exists }` — which routes through the generated column
+  // for the field. Operator queries require the field to be declared
+  // `indexed: true` in a tag schema; undeclared fields error loudly.
+  metadata?: Record<string, unknown>;
   dateFrom?: string;    // ISO date
   dateTo?: string;      // ISO date
   sort?: "asc" | "desc";
+  // Sort by an indexed metadata field instead of `created_at`. Must be
+  // declared `indexed: true`; errors loudly otherwise. Direction is taken
+  // from `sort` (default "asc") and `created_at` is appended as a stable
+  // tiebreaker.
+  orderBy?: string;
   limit?: number;
   offset?: number;
 }
