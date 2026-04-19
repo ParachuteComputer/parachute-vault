@@ -40,6 +40,13 @@ function parseBool(val: string | null, defaultVal: boolean): boolean {
   return val === "true" || val === "1";
 }
 
+function parseBoolOrUndef(val: string | null): boolean | undefined {
+  if (val === null) return undefined;
+  if (val === "true" || val === "1") return true;
+  if (val === "false" || val === "0") return false;
+  return undefined;
+}
+
 function parseQuery(url: URL, key: string): string | null {
   return url.searchParams.get(key);
 }
@@ -187,6 +194,8 @@ export async function handleNotes(
         tags,
         tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
         excludeTags: parseQueryList(url, "exclude_tag"),
+        hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
+        hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
         path: parseQuery(url, "path") ?? undefined,
         pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
         metadata: undefined, // metadata filter not practical in query params

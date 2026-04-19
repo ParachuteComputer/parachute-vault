@@ -50,6 +50,11 @@ export interface QueryOpts {
   tags?: string[];
   tagMatch?: "all" | "any"; // "all" = must have ALL tags (default), "any" = must have ANY tag
   excludeTags?: string[];
+  // Presence filters. `true` → has at least one; `false` → has none.
+  // When `tags` is also set, `hasTags` is ignored (the tag filter already constrains the set).
+  // `hasLinks` checks both directions — inbound or outbound counts as "has links".
+  hasTags?: boolean;
+  hasLinks?: boolean;
   path?: string;        // exact path match (case-insensitive)
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
   metadata?: Record<string, unknown>; // filter by metadata values (exact match on each key)
