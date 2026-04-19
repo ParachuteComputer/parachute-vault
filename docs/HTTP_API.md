@@ -294,6 +294,30 @@ Query params:
 #### `GET /tags`
 Returns `[{name, count}]`.
 
+#### `POST /tags/{name}/rename`
+Body: `{ "new_name": string }`. Atomically renames the tag across `tags`,
+`note_tags`, and `tag_schemas` in a single transaction.
+
+Returns `{ "renamed": number }` on success — the number of note-tag rows
+rewritten.
+
+Errors:
+- `404 { "error": "not_found" }` — source tag does not exist.
+- `409 { "error": "target_exists", "target": string, "message": "..." }` —
+  `new_name` is already a tag. The client should call `POST /tags/merge`
+  instead if combining the two tags is the intent.
+
+#### `POST /tags/merge`
+Body: `{ "sources": string[], "target": string }`. Retags every note carrying
+any of the `sources` tags with `target`, then drops the source tags (and
+their schemas) in a single transaction. `target`'s own schema is preserved.
+
+`target` is created if it doesn't exist yet. Sources that don't exist are
+recorded with count `0`. Duplicate sources are deduped; `target` appearing
+in `sources` is a no-op for that entry.
+
+Returns `{ "merged": { [source]: count }, "target": string }`.
+
 ### Vault stats
 
 You usually want `GET /vaults/{name}` which bundles stats with vault metadata.

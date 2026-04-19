@@ -152,6 +152,144 @@ describe("tags", async () => {
   });
 });
 
+// ---- Tag rename + merge ----
+
+describe("renameTag", async () => {
+  it("retags every note and drops the old tag", async () => {
+    const n1 = await store.createNote("A", { tags: ["voice"] });
+    const n2 = await store.createNote("B", { tags: ["voice", "keeper"] });
+
+    const result = await store.renameTag("voice", "memo");
+    expect(result).toEqual({ renamed: 2 });
+
+    expect((await store.getNote(n1.id))!.tags).toEqual(["memo"]);
+    expect((await store.getNote(n2.id))!.tags?.sort()).toEqual(["keeper", "memo"]);
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "voice")).toBe(false);
+    expect(tags.find((t) => t.name === "memo")!.count).toBe(2);
+  });
+
+  it("carries the schema row onto the new tag name", async () => {
+    await store.createNote("A", { tags: ["voice"] });
+    await store.upsertTagSchema("voice", {
+      description: "Voice memos",
+      fields: { transcribed: { type: "boolean" } },
+    });
+
+    await store.renameTag("voice", "memo");
+
+    expect(await store.getTagSchema("voice")).toBeNull();
+    const schema = await store.getTagSchema("memo");
+    expect(schema?.description).toBe("Voice memos");
+    expect(schema?.fields?.transcribed.type).toBe("boolean");
+  });
+
+  it("renames an unused tag (zero notes)", async () => {
+    await store.createNote("A", { tags: ["doomed"] });
+    await store.untagNote((await store.queryNotes({}))[0].id, ["doomed"]);
+
+    const result = await store.renameTag("doomed", "archived");
+    expect(result).toEqual({ renamed: 0 });
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "doomed")).toBe(false);
+    expect(tags.some((t) => t.name === "archived")).toBe(true);
+  });
+
+  it("returns target_exists without mutating when new_name already in use", async () => {
+    await store.createNote("A", { tags: ["old"] });
+    await store.createNote("B", { tags: ["new"] });
+
+    const result = await store.renameTag("old", "new");
+    expect(result).toEqual({ error: "target_exists" });
+
+    // No bleed — both tags still present with their original counts.
+    const tags = await store.listTags();
+    expect(tags.find((t) => t.name === "old")!.count).toBe(1);
+    expect(tags.find((t) => t.name === "new")!.count).toBe(1);
+  });
+
+  it("returns not_found when source tag does not exist", async () => {
+    const result = await store.renameTag("nope", "something");
+    expect(result).toEqual({ error: "not_found" });
+  });
+
+  it("same-name rename is a no-op on an existing tag", async () => {
+    await store.createNote("A", { tags: ["voice"] });
+    const result = await store.renameTag("voice", "voice");
+    expect(result).toEqual({ renamed: 0 });
+    expect((await store.listTags()).find((t) => t.name === "voice")!.count).toBe(1);
+  });
+});
+
+describe("mergeTags", async () => {
+  it("retags every note from every source onto target and drops sources", async () => {
+    const n1 = await store.createNote("A", { tags: ["v1"] });
+    const n2 = await store.createNote("B", { tags: ["v2"] });
+    const n3 = await store.createNote("C", { tags: ["v1", "v2"] });
+
+    const result = await store.mergeTags(["v1", "v2"], "voice");
+    expect(result.target).toBe("voice");
+    expect(result.merged).toEqual({ v1: 2, v2: 2 });
+
+    expect((await store.getNote(n1.id))!.tags).toEqual(["voice"]);
+    expect((await store.getNote(n2.id))!.tags).toEqual(["voice"]);
+    expect((await store.getNote(n3.id))!.tags).toEqual(["voice"]);
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "v1")).toBe(false);
+    expect(tags.some((t) => t.name === "v2")).toBe(false);
+    expect(tags.find((t) => t.name === "voice")!.count).toBe(3);
+  });
+
+  it("creates target if it does not exist", async () => {
+    await store.createNote("A", { tags: ["old"] });
+    const result = await store.mergeTags(["old"], "brand-new");
+    expect(result).toEqual({ merged: { old: 1 }, target: "brand-new" });
+    expect((await store.listTags()).find((t) => t.name === "brand-new")!.count).toBe(1);
+  });
+
+  it("leaves target's schema intact; drops sources' schemas", async () => {
+    await store.createNote("A", { tags: ["v1"] });
+    await store.createNote("B", { tags: ["voice"] });
+    await store.upsertTagSchema("v1", { description: "legacy" });
+    await store.upsertTagSchema("voice", { description: "the keeper" });
+
+    await store.mergeTags(["v1"], "voice");
+
+    expect(await store.getTagSchema("v1")).toBeNull();
+    expect((await store.getTagSchema("voice"))!.description).toBe("the keeper");
+  });
+
+  it("dedups duplicate sources in the request", async () => {
+    await store.createNote("A", { tags: ["v1"] });
+    const result = await store.mergeTags(["v1", "v1"], "voice");
+    // A duplicated source counts once — not twice.
+    expect(result.merged).toEqual({ v1: 1 });
+  });
+
+  it("silently skips target when it appears in sources", async () => {
+    await store.createNote("A", { tags: ["v1", "voice"] });
+    const result = await store.mergeTags(["v1", "voice"], "voice");
+    // voice is target; it should drop out of sources, not be deleted.
+    expect(result.merged).toEqual({ v1: 1 });
+    expect((await store.listTags()).some((t) => t.name === "voice")).toBe(true);
+  });
+
+  it("records 0 for sources that do not exist", async () => {
+    await store.createNote("A", { tags: ["real"] });
+    const result = await store.mergeTags(["real", "ghost"], "voice");
+    expect(result.merged).toEqual({ real: 1, ghost: 0 });
+  });
+
+  it("is idempotent on notes that already have the target tag", async () => {
+    // Both source and target tags present on the same note. Merge must not
+    // blow up on the INSERT OR IGNORE into note_tags.
+    const note = await store.createNote("A", { tags: ["v1", "voice"] });
+    const result = await store.mergeTags(["v1"], "voice");
+    expect(result.merged).toEqual({ v1: 1 });
+    expect((await store.getNote(note.id))!.tags).toEqual(["voice"]);
+  });
+});
+
 // ---- Vault Stats ----
 
 describe("vault stats", async () => {

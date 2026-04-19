@@ -385,6 +385,8 @@ GET/PATCH/DEL  /api/notes/:idOrPath                read, update, delete a single
 GET/POST       /api/notes/:id/attachments          list or add attachments
 GET            /api/tags                           list tags (?include_schema=true for schemas)
 GET/PUT/DEL    /api/tags/:name                     get, update, or delete a tag
+POST           /api/tags/:name/rename              atomic rename (409 if target_exists)
+POST           /api/tags/merge                     atomic multi-source merge into a target tag
 GET            /api/find-path?source=...&target=...  shortest path between two notes
 GET/PATCH      /api/vault                          vault info (get or update description)
 POST           /api/storage/upload                 upload file (audio/image)

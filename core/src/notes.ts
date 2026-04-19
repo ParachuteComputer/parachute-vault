@@ -375,6 +375,90 @@ export function deleteTag(db: Database, name: string): { deleted: boolean; notes
   return { deleted: true, notes_untagged: notesUntagged };
 }
 
+// The UNIQUE PRIMARY KEY on tags.name means rename-to-existing is ambiguous:
+// do you drop the source, or retag-and-drop? Callers must pick — rename errors
+// out; mergeTags explicitly retags.
+export type RenameTagResult =
+  | { renamed: number }
+  | { error: "not_found" }
+  | { error: "target_exists" };
+
+export function renameTag(db: Database, oldName: string, newName: string): RenameTagResult {
+  if (oldName === newName) {
+    const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(oldName);
+    return exists ? { renamed: 0 } : { error: "not_found" };
+  }
+
+  const oldExists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(oldName);
+  if (!oldExists) return { error: "not_found" };
+
+  const newExists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(newName);
+  if (newExists) return { error: "target_exists" };
+
+  db.exec("BEGIN");
+  try {
+    // Order matters: the note_tags FK points at tags(name), and tag_schemas'
+    // FK cascades on delete. Seed the new row, move the schema + note_tags
+    // onto it, then drop the old row.
+    db.prepare("INSERT INTO tags (name) VALUES (?)").run(newName);
+    db.prepare("UPDATE tag_schemas SET tag_name = ? WHERE tag_name = ?").run(newName, oldName);
+    const updated = db.prepare("UPDATE note_tags SET tag_name = ? WHERE tag_name = ?").run(newName, oldName);
+    db.prepare("DELETE FROM tags WHERE name = ?").run(oldName);
+    db.exec("COMMIT");
+    return { renamed: Number(updated.changes) };
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+export function mergeTags(
+  db: Database,
+  sources: string[],
+  target: string,
+): { merged: Record<string, number>; target: string } {
+  // Dedup + drop target-in-sources (self-merge is a no-op).
+  const uniqueSources = Array.from(new Set(sources)).filter((s) => s !== target);
+
+  const merged: Record<string, number> = {};
+
+  db.exec("BEGIN");
+  try {
+    // Target might not exist yet. Seed it so INSERT OR IGNORE into note_tags
+    // can reference it; leave any existing schema on target untouched.
+    db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)").run(target);
+
+    const retagStmt = db.prepare(
+      "INSERT OR IGNORE INTO note_tags (note_id, tag_name) SELECT note_id, ? FROM note_tags WHERE tag_name = ?",
+    );
+    const deleteNoteTagsStmt = db.prepare("DELETE FROM note_tags WHERE tag_name = ?");
+    const deleteTagStmt = db.prepare("DELETE FROM tags WHERE name = ?");
+    const countStmt = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?");
+
+    for (const source of uniqueSources) {
+      const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(source);
+      if (!exists) {
+        merged[source] = 0;
+        continue;
+      }
+      const before = (countStmt.get(source) as { c: number }).c;
+      retagStmt.run(target, source);
+      deleteNoteTagsStmt.run(source);
+      // tag_schemas has ON DELETE CASCADE from tags(name), so dropping the
+      // tag row also drops its schema — which is what we want for a merge.
+      deleteTagStmt.run(source);
+      merged[source] = before;
+    }
+
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  return { merged, target };
+}
+
 // ---- Lean note index shape ----
 
 /** Max code points in a NoteIndex preview. */

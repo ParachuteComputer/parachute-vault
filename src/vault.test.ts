@@ -1310,6 +1310,115 @@ describe("HTTP /tags", async () => {
     expect(body.deleted).toBe(true);
     expect((await store.listTags()).some((t) => t.name === "doomed")).toBe(false);
   });
+
+  test("POST /tags/:name/rename retags every note in one shot", async () => {
+    const n1 = await store.createNote("A", { tags: ["voice"] });
+    const n2 = await store.createNote("B", { tags: ["voice", "keeper"] });
+    const res = await handleTags(
+      mkReq("POST", "/tags/voice/rename", { new_name: "memo" }),
+      store,
+      "/voice/rename",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body).toEqual({ renamed: 2 });
+    expect((await store.getNote(n1.id))!.tags).toEqual(["memo"]);
+    expect((await store.getNote(n2.id))!.tags?.sort()).toEqual(["keeper", "memo"]);
+  });
+
+  test("POST /tags/:name/rename returns 409 target_exists when new_name is taken", async () => {
+    await store.createNote("A", { tags: ["old"] });
+    await store.createNote("B", { tags: ["new"] });
+    const res = await handleTags(
+      mkReq("POST", "/tags/old/rename", { new_name: "new" }),
+      store,
+      "/old/rename",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error).toBe("target_exists");
+    expect(body.target).toBe("new");
+    // Hint at the remediation so clients don't reinvent merge client-side.
+    expect(body.message).toMatch(/merge/i);
+  });
+
+  test("POST /tags/:name/rename returns 404 when source tag does not exist", async () => {
+    const res = await handleTags(
+      mkReq("POST", "/tags/ghost/rename", { new_name: "phantom" }),
+      store,
+      "/ghost/rename",
+    );
+    expect(res.status).toBe(404);
+    const body = await res.json() as any;
+    expect(body.error).toBe("not_found");
+  });
+
+  test("POST /tags/:name/rename rejects empty/missing new_name with 400", async () => {
+    const res = await handleTags(
+      mkReq("POST", "/tags/anything/rename", { new_name: "" }),
+      store,
+      "/anything/rename",
+    );
+    expect(res.status).toBe(400);
+  });
+
+  test("POST /tags/merge combines multiple sources into target", async () => {
+    await store.createNote("A", { tags: ["v1"] });
+    await store.createNote("B", { tags: ["v2"] });
+    await store.createNote("C", { tags: ["v1", "v2"] });
+
+    const res = await handleTags(
+      mkReq("POST", "/tags/merge", { sources: ["v1", "v2"], target: "voice" }),
+      store,
+      "/merge",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.target).toBe("voice");
+    expect(body.merged).toEqual({ v1: 2, v2: 2 });
+
+    const tags = await store.listTags();
+    expect(tags.find((t: any) => t.name === "voice")!.count).toBe(3);
+    expect(tags.some((t: any) => t.name === "v1")).toBe(false);
+    expect(tags.some((t: any) => t.name === "v2")).toBe(false);
+  });
+
+  test("POST /tags/merge dedupes duplicate sources", async () => {
+    await store.createNote("A", { tags: ["v1"] });
+    const res = await handleTags(
+      mkReq("POST", "/tags/merge", { sources: ["v1", "v1"], target: "voice" }),
+      store,
+      "/merge",
+    );
+    const body = await res.json() as any;
+    expect(body.merged).toEqual({ v1: 1 });
+  });
+
+  test("POST /tags/merge creates the target tag if missing", async () => {
+    await store.createNote("A", { tags: ["legacy"] });
+    const res = await handleTags(
+      mkReq("POST", "/tags/merge", { sources: ["legacy"], target: "fresh" }),
+      store,
+      "/merge",
+    );
+    expect(res.status).toBe(200);
+    const tags = await store.listTags();
+    expect(tags.find((t: any) => t.name === "fresh")!.count).toBe(1);
+  });
+
+  test("POST /tags/merge rejects bad body with 400", async () => {
+    const res = await handleTags(
+      mkReq("POST", "/tags/merge", { sources: "v1", target: "voice" }),
+      store,
+      "/merge",
+    );
+    expect(res.status).toBe(400);
+  });
+
+  test("POST /tags/merge rejects non-POST with 405", async () => {
+    const res = await handleTags(mkReq("GET", "/tags/merge"), store, "/merge");
+    expect(res.status).toBe(405);
+  });
 });
 
 describe("HTTP /find-path", async () => {
