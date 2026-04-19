@@ -348,6 +348,55 @@ Returns `{ "merged": { [source]: count }, "target": string }`.
 You usually want `GET /vaults/{name}` which bundles stats with vault metadata.
 If you only need the stats, call `GET /vaults/{name}` and read `.stats`.
 
+### Vault config
+
+#### `GET /api/vault`
+Returns the vault's identity plus a nested `config` block for mutable
+settings.
+
+```json
+{
+  "name": "default",
+  "description": "My knowledge graph",
+  "config": {
+    "audio_retention": "keep"
+  }
+}
+```
+
+`?include_stats=true` folds the same `VaultStats` shape into the response
+under `stats`.
+
+#### `PATCH /api/vault`
+Update the description and/or nested `config` fields. Only the fields you
+pass are changed; omitted fields are left alone.
+
+```json
+{
+  "description": "new description",
+  "config": { "audio_retention": "until_transcribed" }
+}
+```
+
+Response echoes the full vault payload (same shape as `GET /api/vault`).
+
+##### `config.audio_retention`
+
+Controls what the transcription worker does with the audio file on disk
+once it reaches a terminal state. The attachment row (including any
+recorded transcript) is always preserved — only the file on disk is
+affected.
+
+| Value | Behavior |
+|---|---|
+| `"keep"` (default) | Never unlink. The original audio stays on disk indefinitely. |
+| `"until_transcribed"` | Unlink on successful transcription. On failure the file is kept so you can retry or re-upload. |
+| `"never"` | Unlink on any terminal state — **including failure**. Users who opt in accept that losing a bad transcription also loses the source audio. |
+
+Validation: `audio_retention` must be exactly one of those three strings.
+Any other value returns `400 { "error": "invalid_audio_retention" }`.
+Vaults created before this setting existed read back as `"keep"`.
+
 ### Storage
 
 #### `POST /storage/upload`

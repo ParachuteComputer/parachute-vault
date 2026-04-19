@@ -1678,3 +1678,111 @@ describe("extractApiKey", () => {
   });
 });
 
+describe("handleVault: audio_retention", async () => {
+  function mkVaultReq(method: string, body?: unknown): Request {
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.body = JSON.stringify(body);
+      init.headers = { "Content-Type": "application/json" };
+    }
+    return new Request(`${BASE}/vault`, init);
+  }
+
+  test("GET returns config.audio_retention defaulting to 'keep' when unset", async () => {
+    const cfg = { name: "default" } as { name: string; audio_retention?: string };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.name).toBe("default");
+    expect(body.config.audio_retention).toBe("keep");
+  });
+
+  test("GET reflects the currently stored value", async () => {
+    const cfg = { name: "default", audio_retention: "until_transcribed" };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    const body = await res.json() as any;
+    expect(body.config.audio_retention).toBe("until_transcribed");
+  });
+
+  test("PATCH sets audio_retention and invokes persist", async () => {
+    const cfg: { name: string; audio_retention?: string } = { name: "default" };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { audio_retention: "until_transcribed" } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.config.audio_retention).toBe("until_transcribed");
+    expect(cfg.audio_retention).toBe("until_transcribed");
+    expect(persisted).toBe(1);
+  });
+
+  test("PATCH accepts 'never'", async () => {
+    const cfg: { name: string; audio_retention?: string } = { name: "default" };
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { audio_retention: "never" } }),
+      store,
+      cfg as any,
+      () => {},
+    );
+    expect(res.status).toBe(200);
+    expect(cfg.audio_retention).toBe("never");
+  });
+
+  test("PATCH rejects invalid modes with 400 and does not mutate", async () => {
+    const cfg: { name: string; audio_retention?: string } = {
+      name: "default",
+      audio_retention: "keep",
+    };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { audio_retention: "forever" } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error).toBe("invalid_audio_retention");
+    expect(cfg.audio_retention).toBe("keep");
+    expect(persisted).toBe(0);
+  });
+
+  test("PATCH with only description leaves audio_retention alone", async () => {
+    const cfg: { name: string; description?: string; audio_retention?: string } = {
+      name: "default",
+      audio_retention: "until_transcribed",
+    };
+    const res = await handleVault(
+      mkVaultReq("PATCH", { description: "new desc" }),
+      store,
+      cfg as any,
+      () => {},
+    );
+    expect(res.status).toBe(200);
+    expect(cfg.description).toBe("new desc");
+    expect(cfg.audio_retention).toBe("until_transcribed");
+  });
+
+  test("PATCH with empty body is a no-op that still returns current state", async () => {
+    const cfg: { name: string; audio_retention?: string } = {
+      name: "default",
+      audio_retention: "never",
+    };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", {}),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.config.audio_retention).toBe("never");
+    expect(persisted).toBe(0);
+  });
+});
+

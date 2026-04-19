@@ -332,10 +332,13 @@ SCRIBE_TOKEN=optional-bearer-token
 
 The worker POSTs audio as multipart to `${SCRIBE_URL}/v1/audio/transcriptions` and expects `{ text: string }` back. On success it replaces the `_Transcript pending._` placeholder in the note body (or the whole body if the placeholder is absent), clears `transcribe_stub`, and records `transcript` + `transcribe_done_at` on the attachment. If the user edited the note and cleared `transcribe_stub` before the transcript landed, the note is left alone — but the transcript is still stored on the attachment. Failures retry with exponential backoff up to three attempts before flipping `transcribe_status` to `"failed"`.
 
-Per-vault `audio_retention` in `vault.yaml` controls what happens to the audio after a successful transcription:
+Per-vault `audio_retention` controls what happens to the audio file on disk once the worker reaches a terminal state. It's readable and mutable at runtime via `GET` / `PATCH /api/vault` (under `config.audio_retention`), or by hand-editing `vault.yaml`.
 
-- `keep` (default) — leave the file on disk.
-- `until_transcribed` — unlink the audio once the transcript lands; the attachment row (including the stored transcript) is preserved.
+- `keep` (default) — leave the file on disk indefinitely.
+- `until_transcribed` — unlink on successful transcription; on failure the file is kept so you can retry or re-upload.
+- `never` — unlink on any terminal state, **including failure**. Users who opt in accept that losing a bad transcription also loses the source audio. The file stays during mid-queue retries so in-flight attempts still have something to send.
+
+In every mode the attachment row (and any stored transcript) is preserved; only the file on disk is affected.
 
 ### Backing up your vault
 

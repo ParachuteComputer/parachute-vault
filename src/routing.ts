@@ -292,8 +292,7 @@ export async function route(
     if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
     if (apiPath === "/find-path") return handleFindPath(req, store);
     if (apiPath === "/vault") {
-      return handleVault(req, store, vaultConfig, (desc) => {
-        vaultConfig.description = desc;
+      return handleVault(req, store, vaultConfig, () => {
         writeVaultConfig(vaultConfig);
       });
     }
@@ -436,8 +435,7 @@ export async function route(
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
   if (apiPath === "/find-path") return handleFindPath(req, store);
   if (apiPath === "/vault") {
-    return handleVault(req, store, vaultConfig, (desc) => {
-      vaultConfig.description = desc;
+    return handleVault(req, store, vaultConfig, () => {
       writeVaultConfig(vaultConfig);
     });
   }
