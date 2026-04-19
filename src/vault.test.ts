@@ -963,6 +963,63 @@ describe("HTTP /notes", async () => {
     expect(body.mimeType).toBe("image/png");
   });
 
+  describe("POST /notes/:id/attachments with transcribe flag", async () => {
+    test("transcribe: true seeds pending status and marks note as stub", async () => {
+      await store.createNote("# 🎙️ Voice memo\n\n_Transcript pending._", { id: "v1" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/v1/attachments", {
+          path: "memos/memo-1.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+        }),
+        store,
+        "/v1/attachments",
+      );
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      expect(att.metadata?.transcribe_status).toBe("pending");
+      expect(att.metadata?.transcribe_requested_at).toBeTruthy();
+
+      const note = await store.getNote("v1");
+      expect((note!.metadata as any)?.transcribe_stub).toBe(true);
+    });
+
+    test("transcribe: false (default) leaves metadata empty and note untouched", async () => {
+      await store.createNote("note body", { id: "v2" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/v2/attachments", {
+          path: "memos/memo-2.webm",
+          mimeType: "audio/webm",
+        }),
+        store,
+        "/v2/attachments",
+      );
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      expect(att.metadata?.transcribe_status).toBeUndefined();
+
+      const note = await store.getNote("v2");
+      expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+    });
+
+    test("transcribe: true preserves other note metadata", async () => {
+      await store.createNote("body", { id: "v3", metadata: { summary: "keep me" } });
+      await handleNotes(
+        mkReq("POST", "/notes/v3/attachments", {
+          path: "memos/memo-3.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+        }),
+        store,
+        "/v3/attachments",
+      );
+      const note = await store.getNote("v3");
+      const meta = note!.metadata as any;
+      expect(meta?.summary).toBe("keep me");
+      expect(meta?.transcribe_stub).toBe(true);
+    });
+  });
+
   describe("DELETE /notes/:id/attachments/:attId", async () => {
     test("happy path: 204, DB row gone, storage file unlinked", async () => {
       const assetsRoot = join(tmpDir, "assets");

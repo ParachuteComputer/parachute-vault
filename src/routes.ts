@@ -310,9 +310,32 @@ export async function handleNotes(
     if (method === "POST") {
       const note = await resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
-      const body = await req.json() as { path: string; mimeType: string };
+      const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
       if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
-      return json(await store.addAttachment(note.id, body.path, body.mimeType), 201);
+
+      // `transcribe: true` asks the transcription worker to read this audio
+      // file and replace the note's content with the transcript. The caller
+      // is declaring "overwrite my current content when the transcript lands"
+      // — we persist that as `transcribe_stub: true` on the note so a later
+      // user edit (which clears the marker) can opt out before the worker
+      // runs.
+      const attMeta = body.transcribe
+        ? { transcribe_status: "pending" as const, transcribe_requested_at: new Date().toISOString() }
+        : undefined;
+
+      const attachment = await store.addAttachment(note.id, body.path, body.mimeType, attMeta);
+
+      if (body.transcribe) {
+        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+        if (noteMeta.transcribe_stub !== true) {
+          await store.updateNote(note.id, {
+            metadata: { ...noteMeta, transcribe_stub: true },
+            skipUpdatedAt: true,
+          });
+        }
+      }
+
+      return json(attachment, 201);
     }
     if (method === "GET") {
       const note = await resolveNote(store, idOrPath);

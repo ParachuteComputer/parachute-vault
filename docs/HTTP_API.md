@@ -204,7 +204,32 @@ Returns `{deleted: true}`.
 Body: `{"tags": ["a", "b"]}`.
 
 #### `POST /notes/{id}/attachments`
-Body: `{"path": "files/a.png", "mimeType": "image/png"}`.
+Body: `{"path": "files/a.png", "mimeType": "image/png", "transcribe"?: boolean}`.
+
+When `transcribe: true` and the file is audio, the server queues a
+transcription job: `attachment.metadata.transcribe_status = "pending"` is
+set, and `note.metadata.transcribe_stub = true` is written as the opt-in to
+overwrite content when the transcript lands. A background worker (enabled
+by setting `SCRIBE_URL` on the server) drains the queue FIFO, one at a
+time, calling `${SCRIBE_URL}/v1/audio/transcriptions` with the audio as
+multipart `file` and expecting `{ text: string }` back.
+
+On success:
+- If `note.metadata.transcribe_stub === true`, the worker replaces the
+  literal `_Transcript pending._` placeholder in the note body with the
+  transcript, or the whole body if the placeholder is absent. The stub
+  marker is cleared. A user edit clearing `transcribe_stub` before the
+  transcript arrives opts out of the overwrite.
+- `attachment.metadata.transcribe_status` becomes `"done"` and
+  `transcript` + `transcribe_done_at` are recorded on the attachment even
+  when the note opted out, so the transcript is always addressable.
+
+On failure, the worker retries with exponential backoff up to three
+attempts before setting `transcribe_status = "failed"` and capturing
+`transcribe_error`.
+
+The queue lives in the DB (`attachments` table), so a server restart
+resumes pending work without replay.
 
 #### `GET /notes/{id}/attachments`
 Returns `Attachment[]`.

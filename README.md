@@ -319,6 +319,24 @@ triggers:
 
 Webhook servers (scribe, narrate) are stateless — they don't need vault's API key.
 
+### On-upload transcription
+
+The trigger system above handles the "tag a note and let a webhook fill in content later" shape. Clients that already know at upload time that an audio file should be transcribed can take a shorter path: `POST /api/notes/{id}/attachments` with `{transcribe: true}` in the body. The vault stamps the attachment with `transcribe_status: "pending"` and the note with `transcribe_stub: true`, then a background worker drains the queue FIFO.
+
+Enable the worker by pointing the server at a Whisper-compatible endpoint:
+
+```
+SCRIBE_URL=http://localhost:3200
+SCRIBE_TOKEN=optional-bearer-token
+```
+
+The worker POSTs audio as multipart to `${SCRIBE_URL}/v1/audio/transcriptions` and expects `{ text: string }` back. On success it replaces the `_Transcript pending._` placeholder in the note body (or the whole body if the placeholder is absent), clears `transcribe_stub`, and records `transcript` + `transcribe_done_at` on the attachment. If the user edited the note and cleared `transcribe_stub` before the transcript landed, the note is left alone — but the transcript is still stored on the attachment. Failures retry with exponential backoff up to three attempts before flipping `transcribe_status` to `"failed"`.
+
+Per-vault `audio_retention` in `vault.yaml` controls what happens to the audio after a successful transcription:
+
+- `keep` (default) — leave the file on disk.
+- `until_transcribed` — unlink the audio once the transcript lands; the attachment row (including the stored transcript) is preserved.
+
 ### Backing up your vault
 
 Your vault is just SQLite DBs + a handful of YAML files under `~/.parachute/`. `parachute vault backup` snapshots everything into a single timestamped tarball, for a one-shot or a scheduled run.
