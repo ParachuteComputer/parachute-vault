@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
+import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -51,6 +52,16 @@ CREATE TABLE IF NOT EXISTS tag_schemas (
   tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
   description TEXT,
   fields TEXT -- JSON: { "field_name": { "type": "string", "description": "..." }, ... }
+);
+
+-- Indexed fields: SSOT for generated columns and indexes on notes derived
+-- from tag-declared fields with indexed=true. One row per indexed metadata
+-- field; declarer_tags is a JSON array of tags that currently declare it.
+-- See core/src/indexed-fields.ts.
+CREATE TABLE IF NOT EXISTS indexed_fields (
+  field TEXT PRIMARY KEY,
+  sqlite_type TEXT NOT NULL,
+  declarer_tags TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Tokens: API authentication with scoped permissions
@@ -163,6 +174,13 @@ export function initSchema(db: Database): void {
   // Migrate v8 → v9: add vault_name column to oauth_codes
   migrateToV9(db);
 
+  // Migrate v9 → v10: indexed_fields table (created by SCHEMA_SQL above).
+  migrateToV10(db);
+
+  // Rebuild any generated columns + indexes declared in indexed_fields.
+  // No-op for a fresh vault; idempotent on existing vaults.
+  rebuildIndexes(db);
+
   // Record schema version
   db.prepare("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)").run(
     SCHEMA_VERSION,
@@ -268,6 +286,13 @@ function migrateToV9(db: Database): void {
   if (hasTable(db, "oauth_codes") && !hasColumn(db, "oauth_codes", "vault_name")) {
     db.exec("ALTER TABLE oauth_codes ADD COLUMN vault_name TEXT");
   }
+}
+
+function migrateToV10(db: Database): void {
+  // SCHEMA_SQL's CREATE TABLE IF NOT EXISTS covers fresh vaults; this
+  // ensures indexed_fields exists on vaults created before v10. No data
+  // migration — rebuildIndexes() downstream handles column/index creation
+  // if any rows are already present.
 }
 
 function hasTable(db: Database, name: string): boolean {
