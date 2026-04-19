@@ -1,8 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { CONFIG_DIR } from "./config.ts";
+import { homedir } from "node:os";
 
-export const SERVICES_MANIFEST_PATH = join(CONFIG_DIR, "services.json");
+// Resolve per-call so `PARACHUTE_HOME` set at runtime (Docker, tests) is
+// honored, matching the pattern in `config.ts`.
+function servicesManifestPath(): string {
+  const root = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+  return join(root, "services.json");
+}
 
 export interface ServiceEntry {
   name: string;
@@ -57,7 +62,7 @@ function validateManifest(raw: unknown, where: string): ServicesManifest {
   };
 }
 
-export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesManifest {
+export function readManifest(path: string = servicesManifestPath()): ServicesManifest {
   if (!existsSync(path)) return { services: [] };
   let raw: unknown;
   try {
@@ -79,7 +84,7 @@ function writeManifest(manifest: ServicesManifest, path: string): void {
 
 export function upsertService(
   entry: ServiceEntry,
-  path: string = SERVICES_MANIFEST_PATH,
+  path: string = servicesManifestPath(),
 ): ServicesManifest {
   validateEntry(entry, "entry");
   const current = readManifest(path);

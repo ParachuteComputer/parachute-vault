@@ -122,4 +122,19 @@ describe("services-manifest", () => {
       cleanup();
     }
   });
+
+  test("default path honors PARACHUTE_HOME set at runtime", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pvault-home-"));
+    const prior = process.env.PARACHUTE_HOME;
+    process.env.PARACHUTE_HOME = dir;
+    try {
+      upsertService(vault);
+      expect(readManifest()).toEqual({ services: [vault] });
+      expect(readManifest(join(dir, "services.json"))).toEqual({ services: [vault] });
+    } finally {
+      if (prior === undefined) delete process.env.PARACHUTE_HOME;
+      else process.env.PARACHUTE_HOME = prior;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
