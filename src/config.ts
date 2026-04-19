@@ -1037,15 +1037,15 @@ export function listVaults(): string[] {
 }
 
 /**
- * Resolve the vault that unscoped routes (`/mcp`, `/api/*`, `/oauth/*`,
- * `/view/*`) should target.
+ * Resolve the vault that tooling-level defaults (e.g. the `parachute-vault`
+ * MCP entry the CLI writes into `~/.claude.json`) should target. HTTP routing
+ * is vault-scoped — `/vault/<name>/...` is the only URL shape — so this helper
+ * is no longer on the request path; it just picks the one vault the CLI wires
+ * up by default.
  *
  * Resolution order:
  *  1. If `default_vault` is set in config.yaml AND that vault exists → use it.
  *  2. Else if exactly one vault exists → use that vault regardless of its name.
- *     This is the "single-vault auto-default": if you only have `journal`,
- *     `/mcp` transparently targets `journal` without requiring you to visit
- *     `/vaults/journal/mcp`.
  *  3. Otherwise → return `null` (multi-vault deployment with no/bad default;
  *     the caller should surface an explicit error rather than guess).
  *
@@ -1053,8 +1053,7 @@ export function listVaults(): string[] {
  *  - If `default_vault` points to a deleted vault, step 2 still kicks in so
  *    operators aren't stranded after `vault remove`.
  *  - The name "default" has no special meaning here; it's just whatever
- *    `vault init` happens to create on first run. A single vault named
- *    "journal" behaves identically.
+ *    `vault init` happens to create on first run.
  */
 export function resolveDefaultVault(): string | null {
   const globalConfig = readGlobalConfig();

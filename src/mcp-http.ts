@@ -10,12 +10,9 @@
  * root cause of vault#56. The `initialize` method still works if a
  * client sends it (the Server class handles it natively).
  *
- * Two modes:
- *   /mcp              — unified, all vaults via `vault` param + list-vaults
- *   /vaults/{name}/mcp — scoped to one vault, no vault param
- *
- * Vault description is sent as the MCP server instruction.
- * Read-only keys see fewer tools.
+ * Every MCP session is scoped to one vault via `/vault/{name}/mcp`.
+ * The vault's description is sent as the MCP server instruction, and
+ * read-only keys see a filtered tool list.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -24,18 +21,12 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { generateUnifiedMcpTools, generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
+import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import { isToolAllowed } from "./auth.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 
-/** Handle unified MCP at /mcp (all vaults). */
-export async function handleUnifiedMcp(req: Request, auth: AuthResult): Promise<Response> {
-  const instruction = getServerInstruction();
-  return handleMcp(req, () => generateUnifiedMcpTools(), "parachute-vault", auth, instruction);
-}
-
-/** Handle scoped MCP at /vaults/{name}/mcp (single vault). */
+/** Handle scoped MCP at /vault/{name}/mcp (single vault). */
 export async function handleScopedMcp(req: Request, vaultName: string, auth: AuthResult): Promise<Response> {
   const instruction = getServerInstruction(vaultName);
   return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, auth, instruction);

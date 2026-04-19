@@ -588,9 +588,9 @@ function cmdCreate(args: string[]) {
     process.exit(1);
   }
   if (name === "list") {
-    // Reserved — /vaults/list is the public discovery endpoint. Allowing a
-    // vault with this name would let its routes (/vaults/list/mcp, etc.) be
-    // shadowed by the discovery handler.
+    // Reserved — keeps the "list" vault name out of play even though per-vault
+    // routes now live under /vault/<name>/ and no longer collide with the
+    // /vaults/list discovery endpoint.
     console.error(`"list" is a reserved vault name.`);
     process.exit(1);
   }
@@ -1416,7 +1416,7 @@ type McpEntryLookup =
 /**
  * Read `~/.claude.json` and return the shape of the `parachute-vault` MCP
  * entry if present. The entry is always an HTTP MCP pointing at the local
- * daemon — `{ type: "http", url: "http://127.0.0.1:<port>/vaults/<name>/mcp" }`
+ * daemon — `{ type: "http", url: "http://127.0.0.1:<port>/vault/<name>/mcp" }`
  * — so we parse the URL's port for the port-match check.
  *
  * Invariant: the check is NON-fatal. A missing ~/.claude.json is a warn,
@@ -1967,7 +1967,7 @@ function installMcpConfig(apiKey?: string) {
   const defaultVault = globalConfig.default_vault || "default";
   const mcpEntry: Record<string, unknown> = {
     type: "http",
-    url: `http://127.0.0.1:${port}/vaults/${defaultVault}/mcp`,
+    url: `http://127.0.0.1:${port}/vault/${defaultVault}/mcp`,
   };
   if (apiKey) {
     mcpEntry.headers = { Authorization: `Bearer ${apiKey}` };

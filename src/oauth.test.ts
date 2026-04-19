@@ -113,44 +113,45 @@ async function fullOAuthFlow(opts?: { scope?: string }): Promise<string> {
 
 describe("OAuth discovery", () => {
   test("protected resource metadata", async () => {
-    const req = makeRequest("https://vault.test/.well-known/oauth-protected-resource");
-    const res = handleProtectedResource(req);
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req, "default");
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.resource).toBe("https://vault.test/mcp");
+    expect(body.resource).toBe("https://vault.test/vault/default/mcp");
+    expect(body.authorization_servers).toEqual(["https://vault.test/vault/default"]);
     expect(body.scopes_supported).toContain("full");
     expect(body.scopes_supported).toContain("read");
   });
 
   test("authorization server metadata", async () => {
-    const req = makeRequest("https://vault.test/.well-known/oauth-authorization-server");
-    const res = handleAuthorizationServer(req);
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "default");
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.issuer).toBe("https://vault.test");
-    expect(body.authorization_endpoint).toBe("https://vault.test/oauth/authorize");
-    expect(body.token_endpoint).toBe("https://vault.test/oauth/token");
-    expect(body.registration_endpoint).toBe("https://vault.test/oauth/register");
+    expect(body.issuer).toBe("https://vault.test/vault/default");
+    expect(body.authorization_endpoint).toBe("https://vault.test/vault/default/oauth/authorize");
+    expect(body.token_endpoint).toBe("https://vault.test/vault/default/oauth/token");
+    expect(body.registration_endpoint).toBe("https://vault.test/vault/default/oauth/register");
     expect(body.code_challenge_methods_supported).toEqual(["S256"]);
   });
 
-  test("resource URL includes custom mcpPath for per-vault", async () => {
-    const req = makeRequest("https://vault.test/.well-known/oauth-protected-resource");
-    const res = handleProtectedResource(req, "/vaults/work/mcp");
+  test("resource URL reflects the vault name", async () => {
+    const req = makeRequest("https://vault.test/vault/work/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req, "work");
     const body = await res.json();
-    expect(body.resource).toBe("https://vault.test/vaults/work/mcp");
+    expect(body.resource).toBe("https://vault.test/vault/work/mcp");
   });
 
   test("uses x-forwarded-proto and x-forwarded-host", async () => {
-    const req = makeRequest("http://localhost:1940/.well-known/oauth-protected-resource", {
+    const req = makeRequest("http://localhost:1940/vault/default/.well-known/oauth-protected-resource", {
       headers: {
         "x-forwarded-proto": "https",
         "x-forwarded-host": "vault.example.com",
       },
     });
-    const res = handleProtectedResource(req);
+    const res = handleProtectedResource(req, "default");
     const body = await res.json();
-    expect(body.resource).toBe("https://vault.example.com/mcp");
+    expect(body.resource).toBe("https://vault.example.com/vault/default/mcp");
   });
 });
 
@@ -1316,7 +1317,7 @@ describe("OAuth token response — vault name", () => {
     const redirectUri = "https://example.com/callback";
 
     const authRes = await handleAuthorizePost(
-      makeRequest("https://vault.test/vaults/work/oauth/authorize", {
+      makeRequest("https://vault.test/vault/work/oauth/authorize", {
         method: "POST",
         body: new URLSearchParams({
           action: "authorize",
@@ -1334,7 +1335,7 @@ describe("OAuth token response — vault name", () => {
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
 
     const tokenRes = await handleToken(
-      makeRequest("https://vault.test/vaults/work/oauth/token", {
+      makeRequest("https://vault.test/vault/work/oauth/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -1359,49 +1360,31 @@ describe("OAuth token response — vault name", () => {
 
 describe("OAuth discovery — vault-scoped", () => {
   test("authorization-server metadata scopes all endpoints to the vault", async () => {
-    const req = makeRequest("https://vault.test/vaults/work/.well-known/oauth-authorization-server");
+    const req = makeRequest("https://vault.test/vault/work/.well-known/oauth-authorization-server");
     const res = handleAuthorizationServer(req, "work");
     const body = await res.json();
-    // Issuer and endpoints all live under /vaults/work. This is what makes
-    // vault-scoped OAuth work end-to-end: a client following the scoped
-    // discovery gets redirected to the scoped authorize/token endpoints,
+    // Issuer and endpoints all live under /vault/work. A client following the
+    // scoped discovery gets redirected to the scoped authorize/token endpoints,
     // which in turn mint the token into the named vault's DB.
-    expect(body.issuer).toBe("https://vault.test/vaults/work");
-    expect(body.authorization_endpoint).toBe("https://vault.test/vaults/work/oauth/authorize");
-    expect(body.token_endpoint).toBe("https://vault.test/vaults/work/oauth/token");
-    expect(body.registration_endpoint).toBe("https://vault.test/vaults/work/oauth/register");
+    expect(body.issuer).toBe("https://vault.test/vault/work");
+    expect(body.authorization_endpoint).toBe("https://vault.test/vault/work/oauth/authorize");
+    expect(body.token_endpoint).toBe("https://vault.test/vault/work/oauth/token");
+    expect(body.registration_endpoint).toBe("https://vault.test/vault/work/oauth/register");
     expect(body.code_challenge_methods_supported).toEqual(["S256"]);
   });
 
-  test("authorization-server metadata defaults to unscoped endpoints when no vaultName", async () => {
-    // Regression check — the unscoped form still returns unscoped endpoints.
-    const req = makeRequest("https://vault.test/.well-known/oauth-authorization-server");
-    const res = handleAuthorizationServer(req);
-    const body = await res.json();
-    expect(body.issuer).toBe("https://vault.test");
-    expect(body.authorization_endpoint).toBe("https://vault.test/oauth/authorize");
-    expect(body.token_endpoint).toBe("https://vault.test/oauth/token");
-  });
-
   test("protected-resource advertises a vault-scoped authorization server", async () => {
-    const req = makeRequest("https://vault.test/vaults/work/.well-known/oauth-protected-resource");
-    const res = handleProtectedResource(req, "/vaults/work/mcp", "/vaults/work");
+    const req = makeRequest("https://vault.test/vault/work/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req, "work");
     const body = await res.json();
-    expect(body.resource).toBe("https://vault.test/vaults/work/mcp");
+    expect(body.resource).toBe("https://vault.test/vault/work/mcp");
     // The authorization server the client should fetch next is the scoped one,
     // so the client discovers the scoped authorize/token endpoints.
-    expect(body.authorization_servers).toEqual(["https://vault.test/vaults/work"]);
-  });
-
-  test("protected-resource defaults to root authorization server when no prefix", async () => {
-    const req = makeRequest("https://vault.test/.well-known/oauth-protected-resource");
-    const res = handleProtectedResource(req);
-    const body = await res.json();
-    expect(body.authorization_servers).toEqual(["https://vault.test"]);
+    expect(body.authorization_servers).toEqual(["https://vault.test/vault/work"]);
   });
 
   test("scoped discovery honors x-forwarded-host", async () => {
-    const req = makeRequest("http://localhost:1940/vaults/work/.well-known/oauth-authorization-server", {
+    const req = makeRequest("http://localhost:1940/vault/work/.well-known/oauth-authorization-server", {
       headers: {
         "x-forwarded-proto": "https",
         "x-forwarded-host": "vault.example.com",
@@ -1409,8 +1392,8 @@ describe("OAuth discovery — vault-scoped", () => {
     });
     const res = handleAuthorizationServer(req, "work");
     const body = await res.json();
-    expect(body.issuer).toBe("https://vault.example.com/vaults/work");
-    expect(body.authorization_endpoint).toBe("https://vault.example.com/vaults/work/oauth/authorize");
+    expect(body.issuer).toBe("https://vault.example.com/vault/work");
+    expect(body.authorization_endpoint).toBe("https://vault.example.com/vault/work/oauth/authorize");
   });
 });
 
@@ -1432,7 +1415,7 @@ describe("OAuth token — cross-vault code replay", () => {
 
     // Issue a code under vault A's authorize endpoint
     const authRes = await handleAuthorizePost(
-      makeRequest("https://vault.test/vaults/vault-a/oauth/authorize", {
+      makeRequest("https://vault.test/vault/vault-a/oauth/authorize", {
         method: "POST",
         body: new URLSearchParams({
           action: "authorize",
@@ -1455,7 +1438,7 @@ describe("OAuth token — cross-vault code replay", () => {
     // barrier: without the vault_name pinning, the code would mint a token
     // into whichever vault's DB this handleToken was called against.
     const tokenRes = await handleToken(
-      makeRequest("https://vault.test/vaults/vault-b/oauth/token", {
+      makeRequest("https://vault.test/vault/vault-b/oauth/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -1483,7 +1466,7 @@ describe("OAuth token — cross-vault code replay", () => {
     const redirectUri = "https://example.com/callback";
 
     const authRes = await handleAuthorizePost(
-      makeRequest("https://vault.test/vaults/vault-a/oauth/authorize", {
+      makeRequest("https://vault.test/vault/vault-a/oauth/authorize", {
         method: "POST",
         body: new URLSearchParams({
           action: "authorize",
@@ -1501,7 +1484,7 @@ describe("OAuth token — cross-vault code replay", () => {
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
 
     const tokenRes = await handleToken(
-      makeRequest("https://vault.test/vaults/vault-a/oauth/token", {
+      makeRequest("https://vault.test/vault/vault-a/oauth/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({

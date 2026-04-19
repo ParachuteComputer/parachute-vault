@@ -528,30 +528,29 @@ describe("MCP tools", async () => {
   });
 });
 
-describe("unified MCP wrapper", async () => {
-  test("vault-info routes through vault param", async () => {
-    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+describe("scoped MCP wrapper", async () => {
+  test("vault-info returns the vault's stats", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
-    const vaultName = `unified-stats-${Date.now()}`;
+    const vaultName = `scoped-stats-${Date.now()}`;
     writeVaultConfig({
       name: vaultName,
       api_keys: [],
       created_at: new Date().toISOString(),
       description: "Test vault",
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
     await vaultStore.createNote("alpha", { tags: ["x", "y"] });
     await vaultStore.createNote("beta", { tags: ["x"] });
 
-    const tools = generateUnifiedMcpTools();
+    const tools = generateScopedMcpTools(vaultName);
     const vaultInfo = tools.find((t) => t.name === "vault-info");
     expect(vaultInfo).toBeTruthy();
 
-    const result = await vaultInfo!.execute({ vault: vaultName, include_stats: true }) as any;
+    const result = await vaultInfo!.execute({ include_stats: true }) as any;
     expect(result.name).toBe(vaultName);
     expect(result.description).toBe("Test vault");
     expect(result.stats.totalNotes).toBe(2);
@@ -560,9 +559,9 @@ describe("unified MCP wrapper", async () => {
     closeAllStores();
   });
 
-  test("list-tags with schema works through unified wrapper", async () => {
-    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+  test("list-tags with schema returns per-tag detail", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
     const vaultName = `tag-schema-${Date.now()}`;
@@ -571,7 +570,6 @@ describe("unified MCP wrapper", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
     await vaultStore.createNote("A", { tags: ["person"] });
@@ -580,11 +578,11 @@ describe("unified MCP wrapper", async () => {
       fields: { name: { type: "string", description: "Full name" } },
     });
 
-    const tools = generateUnifiedMcpTools();
+    const tools = generateScopedMcpTools(vaultName);
 
     // list-tags with tag param for single tag detail
     const listTags = tools.find((t) => t.name === "list-tags")!;
-    const detail = await listTags.execute({ vault: vaultName, tag: "person" }) as any;
+    const detail = await listTags.execute({ tag: "person" }) as any;
     expect(detail.name).toBe("person");
     expect(detail.count).toBe(1);
     expect(detail.description).toBe("A person");
@@ -594,8 +592,8 @@ describe("unified MCP wrapper", async () => {
   });
 
   test("create-note with schema tag auto-populates defaults", async () => {
-    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
     const vaultName = `schema-create-${Date.now()}`;
@@ -604,7 +602,6 @@ describe("unified MCP wrapper", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
     await vaultStore.upsertTagSchema("person", {
@@ -615,31 +612,29 @@ describe("unified MCP wrapper", async () => {
       },
     });
 
-    const tools = generateUnifiedMcpTools();
+    const tools = generateScopedMcpTools(vaultName);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
     // Create a note tagged person with no metadata — defaults auto-populated
     const result = await createNote.execute({
-      vault: vaultName,
       content: "Alice",
       tags: ["person"],
     }) as any;
     expect(result.content).toBe("Alice");
 
     // Verify defaults were written
-    const fresh = await queryNotes.execute({ vault: vaultName, id: result.id }) as any;
+    const fresh = await queryNotes.execute({ id: result.id }) as any;
     expect(fresh.metadata.first_appeared).toBe("");
     expect(fresh.metadata.relationship).toBe("");
 
     // Create with explicit metadata — preserved
     const result2 = await createNote.execute({
-      vault: vaultName,
       content: "Bob",
       tags: ["person"],
       metadata: { first_appeared: "2024-01", relationship: "friend" },
     }) as any;
-    const fresh2 = await queryNotes.execute({ vault: vaultName, id: result2.id }) as any;
+    const fresh2 = await queryNotes.execute({ id: result2.id }) as any;
     expect(fresh2.metadata.first_appeared).toBe("2024-01");
     expect(fresh2.metadata.relationship).toBe("friend");
 
@@ -647,8 +642,8 @@ describe("unified MCP wrapper", async () => {
   });
 
   test("update-note tags.add with schema auto-populates defaults", async () => {
-    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
 
     const vaultName = `schema-defaults-${Date.now()}`;
@@ -657,7 +652,6 @@ describe("unified MCP wrapper", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
     await vaultStore.upsertTagSchema("person", {
@@ -675,41 +669,40 @@ describe("unified MCP wrapper", async () => {
         priority: { type: "integer", description: "Priority level" },
       },
     });
-    const tools = generateUnifiedMcpTools();
+    const tools = generateScopedMcpTools(vaultName);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const updateNote = tools.find((t) => t.name === "update-note")!;
     const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
     // Create a note, then add #person tag via update-note
-    const note = await createNote.execute({ vault: vaultName, content: "Alice" }) as any;
-    await updateNote.execute({ vault: vaultName, id: note.id, tags: { add: ["person"] } });
-    const after = await queryNotes.execute({ vault: vaultName, id: note.id }) as any;
+    const note = await createNote.execute({ content: "Alice" }) as any;
+    await updateNote.execute({ id: note.id, tags: { add: ["person"] } });
+    const after = await queryNotes.execute({ id: note.id }) as any;
     expect(after.metadata.first_appeared).toBe("");
     expect(after.metadata.relationship).toBe("");
 
     // Tag note that already has partial metadata — only missing fields populated
     const note2 = await createNote.execute({
-      vault: vaultName,
       content: "Bob",
       metadata: { first_appeared: "2023-11" },
     }) as any;
-    await updateNote.execute({ vault: vaultName, id: note2.id, tags: { add: ["person"] } });
-    const after2 = await queryNotes.execute({ vault: vaultName, id: note2.id }) as any;
+    await updateNote.execute({ id: note2.id, tags: { add: ["person"] } });
+    const after2 = await queryNotes.execute({ id: note2.id }) as any;
     expect(after2.metadata.first_appeared).toBe("2023-11"); // preserved
     expect(after2.metadata.relationship).toBe(""); // added
 
     // Tag with #project — enum defaults to first value, boolean to false, integer to 0
-    const note4 = await createNote.execute({ vault: vaultName, content: "My Project" }) as any;
-    await updateNote.execute({ vault: vaultName, id: note4.id, tags: { add: ["project"] } });
-    const after4 = await queryNotes.execute({ vault: vaultName, id: note4.id }) as any;
+    const note4 = await createNote.execute({ content: "My Project" }) as any;
+    await updateNote.execute({ id: note4.id, tags: { add: ["project"] } });
+    const after4 = await queryNotes.execute({ id: note4.id }) as any;
     expect(after4.metadata.status).toBe("active");
     expect(after4.metadata.active).toBe(false);
     expect(after4.metadata.priority).toBe(0);
 
     // Multiple schema tags at once — all defaults merged
-    const note5 = await createNote.execute({ vault: vaultName, content: "Multi" }) as any;
-    await updateNote.execute({ vault: vaultName, id: note5.id, tags: { add: ["person", "project"] } });
-    const after5 = await queryNotes.execute({ vault: vaultName, id: note5.id }) as any;
+    const note5 = await createNote.execute({ content: "Multi" }) as any;
+    await updateNote.execute({ id: note5.id, tags: { add: ["person", "project"] } });
+    const after5 = await queryNotes.execute({ id: note5.id }) as any;
     expect(after5.metadata.first_appeared).toBe("");
     expect(after5.metadata.relationship).toBe("");
     expect(after5.metadata.status).toBe("active");
@@ -719,8 +712,8 @@ describe("unified MCP wrapper", async () => {
   });
 
   test("update-note tags.add auto-populate does not bump updatedAt", async () => {
-    const { generateUnifiedMcpTools } = await import("./mcp-tools.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
 
     const vaultName = `schema-noupdate-${Date.now()}`;
@@ -729,7 +722,6 @@ describe("unified MCP wrapper", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
     await vaultStore.upsertTagSchema("person", {
@@ -737,15 +729,15 @@ describe("unified MCP wrapper", async () => {
       fields: { name: { type: "string" } },
     });
 
-    const tools = generateUnifiedMcpTools();
+    const tools = generateScopedMcpTools(vaultName);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const updateNote = tools.find((t) => t.name === "update-note")!;
     const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
-    const note = await createNote.execute({ vault: vaultName, content: "Test" }) as any;
+    const note = await createNote.execute({ content: "Test" }) as any;
     const originalUpdatedAt = note.updatedAt;
-    await updateNote.execute({ vault: vaultName, id: note.id, tags: { add: ["person"] } });
-    const after = await queryNotes.execute({ vault: vaultName, id: note.id }) as any;
+    await updateNote.execute({ id: note.id, tags: { add: ["person"] } });
+    const after = await queryNotes.execute({ id: note.id }) as any;
     expect(after.updatedAt).toBe(originalUpdatedAt);
     expect(after.metadata.name).toBe("");
 
@@ -760,7 +752,6 @@ describe("auth permissions", () => {
     expect(isToolAllowed("list-tags", "read")).toBe(true);
     expect(isToolAllowed("find-path", "read")).toBe(true);
     expect(isToolAllowed("vault-info", "read")).toBe(true);
-    expect(isToolAllowed("list-vaults", "read")).toBe(true);
   });
 
   test("read permission blocks mutation tools", () => {
@@ -1513,8 +1504,8 @@ describe("HTTP /find-path", async () => {
 
 describe("stateless MCP transport", async () => {
   test("tools/call works without prior initialize handshake", async () => {
-    const { handleUnifiedMcp } = await import("./mcp-http.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
     const vaultName = `stateless-mcp-${Date.now()}`;
@@ -1523,13 +1514,12 @@ describe("stateless MCP transport", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
     const vaultStore = getVaultStore(vaultName);
     await vaultStore.createNote("test note", { tags: ["daily"] });
 
     // Direct tools/call — no initialize, no session header
-    const req = new Request("http://localhost:1940/mcp", {
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1539,11 +1529,11 @@ describe("stateless MCP transport", async () => {
         jsonrpc: "2.0",
         id: 1,
         method: "tools/call",
-        params: { name: "vault-info", arguments: { vault: vaultName, include_stats: true } },
+        params: { name: "vault-info", arguments: { include_stats: true } },
       }),
     });
 
-    const res = await handleUnifiedMcp(req, "write");
+    const res = await handleScopedMcp(req, vaultName, { permission: "full" });
     expect(res.status).toBe(200);
 
     const body = await res.json() as any;
@@ -1555,8 +1545,8 @@ describe("stateless MCP transport", async () => {
   });
 
   test("tools/list works without prior initialize handshake", async () => {
-    const { handleUnifiedMcp } = await import("./mcp-http.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
 
     const vaultName = `stateless-list-${Date.now()}`;
@@ -1565,9 +1555,8 @@ describe("stateless MCP transport", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
-    const req = new Request("http://localhost:1940/mcp", {
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1581,7 +1570,7 @@ describe("stateless MCP transport", async () => {
       }),
     });
 
-    const res = await handleUnifiedMcp(req, "write");
+    const res = await handleScopedMcp(req, vaultName, { permission: "full" });
     expect(res.status).toBe(200);
 
     const body = await res.json() as any;
@@ -1595,8 +1584,8 @@ describe("stateless MCP transport", async () => {
   });
 
   test("initialize still works for clients that send it", async () => {
-    const { handleUnifiedMcp } = await import("./mcp-http.ts");
-    const { writeVaultConfig, writeGlobalConfig } = await import("./config.ts");
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
 
     const vaultName = `stateless-init-${Date.now()}`;
@@ -1605,9 +1594,8 @@ describe("stateless MCP transport", async () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    writeGlobalConfig({ port: 1940, default_vault: vaultName });
 
-    const req = new Request("http://localhost:1940/mcp", {
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1625,12 +1613,12 @@ describe("stateless MCP transport", async () => {
       }),
     });
 
-    const res = await handleUnifiedMcp(req, "write");
+    const res = await handleScopedMcp(req, vaultName, { permission: "full" });
     expect(res.status).toBe(200);
 
     const body = await res.json() as any;
     expect(body.result.protocolVersion).toBe("2024-11-05");
-    expect(body.result.serverInfo.name).toBe("parachute-vault");
+    expect(body.result.serverInfo.name).toBe(`parachute-vault/${vaultName}`);
     expect(body.result.capabilities.tools).toBeDefined();
 
     closeAllStores();

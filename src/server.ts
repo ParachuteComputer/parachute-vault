@@ -4,11 +4,13 @@
  *
  * Routes:
  *   GET  /health                           — health check
- *   *    /mcp                              — unified MCP (all vaults, vault param)
- *   *    /vaults/{name}/mcp                — scoped MCP (single vault, no vault param)
  *   GET  /vaults                           — list vaults with metadata (authenticated)
  *   GET  /vaults/list                      — list vault names (public; disable via config.discovery)
- *   *    /vaults/{name}/api/...            — per-vault REST API
+ *   *    /vault/{name}/mcp                 — scoped MCP (per-vault session)
+ *   *    /vault/{name}/oauth/...           — per-vault OAuth flow
+ *   *    /vault/{name}/.well-known/...     — per-vault OAuth discovery
+ *   *    /vault/{name}/view/...            — auth-aware HTML note view
+ *   *    /vault/{name}/api/...             — per-vault REST API
  *
  * The request pipeline lives in ./routing.ts (exported for unit testing).
  */

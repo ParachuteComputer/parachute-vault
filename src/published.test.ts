@@ -25,8 +25,8 @@ describe("/public → /view redirect", () => {
   });
 
   it("works for vault-scoped paths", () => {
-    const url = buildRedirectUrl("http://localhost:1940/vaults/work/public/abc?key=pvk_x", "abc", "/vaults/work");
-    expect(url).toBe("http://localhost:1940/vaults/work/view/abc?key=pvk_x");
+    const url = buildRedirectUrl("http://localhost:1940/vault/work/public/abc?key=pvk_x", "abc", "/vault/work");
+    expect(url).toBe("http://localhost:1940/vault/work/view/abc?key=pvk_x");
   });
 });
 

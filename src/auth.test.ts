@@ -1,11 +1,10 @@
 /**
- * Auth invariants — routing coherence between unscoped and scoped paths.
+ * Auth invariants — per-vault routing with strict isolation.
  *
- * See Fix 2 in the OAuth-to-Daily launch work: a vault token minted by one
- * path (unscoped `/oauth/token` or scoped `/vaults/X/oauth/token`) must
- * authenticate identically at every endpoint that addresses the same vault,
- * regardless of whether the URL uses `/api/*` (default-vault shortcut) or
- * `/vaults/X/api/*` (explicit). Same for `/mcp` vs `/vaults/X/mcp`.
+ * Every HTTP path that touches a vault lives under `/vault/<name>/...`, so
+ * a token minted for vault A must authenticate at vault A endpoints and
+ * must not authenticate at vault B endpoints. The global auth path still
+ * exists for cross-vault listings (`/vaults`) and scans every vault's DB.
  *
  * These tests isolate `PARACHUTE_HOME` so they don't touch the user's real
  * config. Each test builds 1-2 vaults from scratch.
@@ -83,51 +82,35 @@ function bearer(token: string): Request {
   });
 }
 
-describe("auth — default-vault routing coherence", () => {
-  test("token minted in default vault authenticates at both unscoped and scoped paths", () => {
-    seedVault("default", { isDefault: true });
-    const token = mintTokenInVault("default");
-    const defaultConfig = readVaultConfig("default")!;
-    const defaultStore = getVaultStore("default");
+describe("auth — per-vault routing", () => {
+  test("token minted in a vault authenticates at its own /vault/<name>/* endpoints", () => {
+    seedVault("journal");
+    const token = mintTokenInVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
 
-    // Unscoped `/api/*` flow: server resolves default vault, calls
-    // authenticateVaultRequest with default's config + DB. Token must resolve.
-    const unscoped = authenticateVaultRequest(bearer(token), defaultConfig, defaultStore.db);
-    expect("error" in unscoped).toBe(false);
-    if (!("error" in unscoped)) expect(unscoped.permission).toBe("full");
+    // /vault/journal/api/* and /vault/journal/mcp both funnel into
+    // authenticateVaultRequest with journal's config + DB.
+    const vaultAuth = authenticateVaultRequest(bearer(token), journalConfig, journalStore.db);
+    expect("error" in vaultAuth).toBe(false);
+    if (!("error" in vaultAuth)) expect(vaultAuth.permission).toBe("full");
 
-    // Scoped `/vaults/default/api/*` flow: same defaultConfig + DB. Must also
-    // resolve — this is the invariant Aaron's complaint hinges on.
-    const scoped = authenticateVaultRequest(bearer(token), defaultConfig, defaultStore.db);
-    expect("error" in scoped).toBe(false);
-
-    // Unified `/mcp` flow: authenticateGlobalRequest scans every vault's DB.
-    // Since the token is in default's DB, this must also resolve.
+    // /vaults (global metadata listing) uses authenticateGlobalRequest which
+    // scans every vault's DB. Since the token is in journal's DB, it must resolve.
     const global = authenticateGlobalRequest(bearer(token));
     expect("error" in global).toBe(false);
   });
 
-  // HTTP-level routing stand-in. Mirrors server.ts's vault-resolution step:
-  // unscoped `/api/*` resolves to the default vault; scoped `/vaults/X/api/*`
-  // extracts the name from the URL. After resolution both paths funnel into
-  // `authenticateVaultRequest` with that vault's config + DB. The earlier
-  // version of this test called `authenticateVaultRequest` twice with the same
-  // args and labelled the calls "scoped"/"unscoped" — tautological, because
-  // routing was never exercised. This variant drives the resolver from the
-  // URL, so the routing step is the thing under test.
+  // HTTP-level routing stand-in. Mirrors routing.ts: every vault-scoped path
+  // matches `/vault/<name>/...`, we look the vault up, then authenticate the
+  // request against that vault's DB.
   function dispatchAuthFromPath(path: string, req: Request): {
     status: number;
     permission?: string;
   } {
-    let vaultName: string;
-    if (path.startsWith("/vaults/")) {
-      vaultName = path.split("/")[2];
-    } else if (path.startsWith("/api/")) {
-      const gc = readGlobalConfig();
-      vaultName = gc.default_vault ?? "default";
-    } else {
-      return { status: 404 };
-    }
+    const match = path.match(/^\/vault\/([^/]+)(\/.*)?$/);
+    if (!match) return { status: 404 };
+    const vaultName = match[1];
     const vaultConfig = readVaultConfig(vaultName);
     if (!vaultConfig) return { status: 404 };
     const store = getVaultStore(vaultName);
@@ -136,77 +119,71 @@ describe("auth — default-vault routing coherence", () => {
     return { status: 200, permission: res.permission };
   }
 
-  test("routing coherence: unscoped and scoped /api/health accept a default-vault token identically", () => {
-    seedVault("default", { isDefault: true });
-    const token = mintTokenInVault("default");
+  test("routing: /vault/<name>/api/health accepts a token minted in that vault", () => {
+    seedVault("journal");
+    const token = mintTokenInVault("journal");
 
-    // (a) unscoped /api/health with default-vault token
-    const unscoped = dispatchAuthFromPath("/api/health", bearer(token));
-    expect(unscoped.status).toBe(200);
-
-    // (b) scoped /vaults/default/api/health with the same token
-    const scoped = dispatchAuthFromPath("/vaults/default/api/health", bearer(token));
-    expect(scoped.status).toBe(200);
-
-    // Both paths resolve the same vault → same permission level comes back.
-    expect(unscoped.permission).toBe(scoped.permission);
+    const result = dispatchAuthFromPath("/vault/journal/api/health", bearer(token));
+    expect(result.status).toBe(200);
+    expect(result.permission).toBe("full");
   });
 
-  test("routing coherence: scoped /vaults/X/api/health rejects a token issued for vault Y", () => {
+  test("routing: /vault/A/api/* rejects a token issued for vault B", () => {
     // The privilege-escalation barrier: a valid token for vault A must not
-    // authenticate at vault B's scoped endpoint, even though the URL is
-    // well-formed and the token itself is valid for *some* vault.
-    seedVault("default", { isDefault: true });
+    // authenticate at vault B's endpoint, even though the token is valid
+    // for some vault. This is the point of per-vault DBs.
+    seedVault("journal");
     seedVault("work");
     const workToken = mintTokenInVault("work");
 
-    const crossVault = dispatchAuthFromPath("/vaults/default/api/health", bearer(workToken));
+    const crossVault = dispatchAuthFromPath("/vault/journal/api/health", bearer(workToken));
     expect(crossVault.status).toBe(401);
+  });
+
+  test("routing: /vault/<unknown> returns 404 (not 401)", () => {
+    seedVault("journal");
+    const token = mintTokenInVault("journal");
+    const result = dispatchAuthFromPath("/vault/nonexistent/api/health", bearer(token));
+    expect(result.status).toBe(404);
   });
 });
 
-describe("auth — named-vault routing coherence", () => {
+describe("auth — cross-vault isolation", () => {
   test("token minted in a non-default vault authenticates via scoped and global paths", () => {
-    seedVault("default", { isDefault: true });
+    seedVault("journal", { isDefault: true });
     seedVault("work");
     const workToken = mintTokenInVault("work");
     const workConfig = readVaultConfig("work")!;
     const workStore = getVaultStore("work");
 
-    // Scoped `/vaults/work/api/*` — must resolve against work's DB.
     const scoped = authenticateVaultRequest(bearer(workToken), workConfig, workStore.db);
     expect("error" in scoped).toBe(false);
 
-    // Unified `/mcp` — global auth scans all vaults, must find it.
+    // Global auth scans every vault, must find the token in work's DB.
     const global = authenticateGlobalRequest(bearer(workToken));
     expect("error" in global).toBe(false);
   });
 
-  test("a work-vault token does NOT authenticate against the default vault's /api/*", () => {
-    // This is the correct isolation behavior: a token scoped to vault X has no
-    // business being accepted at endpoints that address vault Y. If this ever
-    // regressed, we'd have a privilege-escalation bug (read a different vault
-    // by just sending a valid token at the wrong URL).
-    seedVault("default", { isDefault: true });
+  test("a work-vault token does NOT authenticate against the journal vault", () => {
+    seedVault("journal", { isDefault: true });
     seedVault("work");
     const workToken = mintTokenInVault("work");
-    const defaultConfig = readVaultConfig("default")!;
-    const defaultStore = getVaultStore("default");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
 
-    const res = authenticateVaultRequest(bearer(workToken), defaultConfig, defaultStore.db);
+    const res = authenticateVaultRequest(bearer(workToken), journalConfig, journalStore.db);
     expect("error" in res).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end: OAuth flow → resulting token authenticates at expected paths
+// End-to-end: OAuth flow → resulting token authenticates against its vault
 // ---------------------------------------------------------------------------
 
-describe("OAuth-minted tokens — cross-endpoint coherence", () => {
+describe("OAuth-minted tokens — per-vault coherence", () => {
   // These tests drive the OAuth handlers directly (no HTTP), then take the
-  // resulting access_token and verify it resolves at every endpoint that
-  // addresses its issuing vault. This is the key coherence invariant for
-  // Aaron's launch complaint.
+  // resulting access_token and verify it resolves at endpoints addressing
+  // its issuing vault — and only its issuing vault.
 
   async function runOAuthFlow(vaultName: string): Promise<string> {
     const store = getVaultStore(vaultName);
@@ -218,7 +195,7 @@ describe("OAuth-minted tokens — cross-endpoint coherence", () => {
 
     // 1. Register client
     const regRes = await handleRegister(
-      new Request("https://vault.test/oauth/register", {
+      new Request(`https://vault.test/vault/${vaultName}/oauth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -234,7 +211,7 @@ describe("OAuth-minted tokens — cross-endpoint coherence", () => {
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
     const authRes = await handleAuthorizePost(
-      new Request("https://vault.test/oauth/authorize", {
+      new Request(`https://vault.test/vault/${vaultName}/oauth/authorize`, {
         method: "POST",
         body: new URLSearchParams({
           action: "authorize",
@@ -253,7 +230,7 @@ describe("OAuth-minted tokens — cross-endpoint coherence", () => {
 
     // 3. Token exchange
     const tokRes = await handleToken(
-      new Request("https://vault.test/oauth/token", {
+      new Request(`https://vault.test/vault/${vaultName}/oauth/token`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -272,48 +249,40 @@ describe("OAuth-minted tokens — cross-endpoint coherence", () => {
     return tokBody.access_token;
   }
 
-  test("default-vault OAuth: token works at /api/*, /mcp, /vaults/default/api/*, /vaults/default/mcp", async () => {
-    seedVault("default", { isDefault: true });
-    const token = await runOAuthFlow("default");
-    const cfg = readVaultConfig("default")!;
-    const store = getVaultStore("default");
+  test("OAuth-minted token works at /vault/<name>/api/* and /vault/<name>/mcp", async () => {
+    seedVault("journal", { isDefault: true });
+    const token = await runOAuthFlow("journal");
+    const cfg = readVaultConfig("journal")!;
+    const store = getVaultStore("journal");
 
-    // `/api/*` — unscoped path resolves default vault, calls authenticateVaultRequest.
-    const apiUnscoped = authenticateVaultRequest(bearer(token), cfg, store.db);
-    expect("error" in apiUnscoped).toBe(false);
+    // /vault/journal/api/* and /vault/journal/mcp both reach this auth call.
+    const vaultAuth = authenticateVaultRequest(bearer(token), cfg, store.db);
+    expect("error" in vaultAuth).toBe(false);
 
-    // `/vaults/default/api/*` — scoped path resolves same default, same DB, same call.
-    const apiScoped = authenticateVaultRequest(bearer(token), cfg, store.db);
-    expect("error" in apiScoped).toBe(false);
-
-    // `/mcp` — unified endpoint uses authenticateGlobalRequest which scans all DBs.
-    const mcpUnscoped = authenticateGlobalRequest(bearer(token));
-    expect("error" in mcpUnscoped).toBe(false);
-
-    // `/vaults/default/mcp` — scoped MCP uses authenticateVaultRequest (same as api).
-    const mcpScoped = authenticateVaultRequest(bearer(token), cfg, store.db);
-    expect("error" in mcpScoped).toBe(false);
+    // /vaults (authenticated listing) uses authenticateGlobalRequest.
+    const global = authenticateGlobalRequest(bearer(token));
+    expect("error" in global).toBe(false);
   });
 
-  test("named-vault OAuth: token works at /vaults/X/api/*, /vaults/X/mcp, /mcp", async () => {
-    seedVault("default", { isDefault: true });
+  test("named-vault OAuth: token works for its vault, rejected by others", async () => {
+    seedVault("journal", { isDefault: true });
     seedVault("work");
     const token = await runOAuthFlow("work");
     const workCfg = readVaultConfig("work")!;
     const workStore = getVaultStore("work");
 
-    // Scoped endpoints addressing vault work — must resolve.
-    const apiScoped = authenticateVaultRequest(bearer(token), workCfg, workStore.db);
-    expect("error" in apiScoped).toBe(false);
+    // Valid at work's own endpoints.
+    const scoped = authenticateVaultRequest(bearer(token), workCfg, workStore.db);
+    expect("error" in scoped).toBe(false);
 
-    // Unified /mcp scans all vaults, must find the token in work's DB.
-    const mcpUnified = authenticateGlobalRequest(bearer(token));
-    expect("error" in mcpUnified).toBe(false);
+    // Global auth finds the token in work's DB.
+    const global = authenticateGlobalRequest(bearer(token));
+    expect("error" in global).toBe(false);
 
-    // Defensive: the same token is NOT usable against the default vault's /api/*.
-    const defaultCfg = readVaultConfig("default")!;
-    const defaultStore = getVaultStore("default");
-    const crossCheck = authenticateVaultRequest(bearer(token), defaultCfg, defaultStore.db);
+    // Isolation: the token is NOT usable against the journal vault.
+    const journalCfg = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+    const crossCheck = authenticateVaultRequest(bearer(token), journalCfg, journalStore.db);
     expect("error" in crossCheck).toBe(true);
   });
 });
