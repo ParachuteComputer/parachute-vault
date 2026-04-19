@@ -254,11 +254,20 @@ async function cmdInit() {
   // dispatcher can discover this service and its health endpoint. Upserts
   // by name, preserving entries for other services. Non-fatal on failure —
   // init can complete without the manifest, just with a warning.
+  //
+  // `paths[0]` is the canonical mount point — CLI uses it for the
+  // `.well-known/parachute.json` URL and for `parachute expose`. Advertise
+  // `/vault/<default_vault>` so MCP clients land at the scoped endpoint.
+  // When no default vault exists yet (multi-vault, no fallback), fall back
+  // to "/" — the CLI can detect and prompt.
+  const servicePath = globalConfig.default_vault
+    ? `/vault/${globalConfig.default_vault}`
+    : "/";
   try {
     upsertService({
       name: "parachute-vault",
       port: globalConfig.port || DEFAULT_PORT,
-      paths: ["/"],
+      paths: [servicePath],
       health: "/health",
       version: pkg.version,
     });
