@@ -52,7 +52,7 @@ function seedAudio(relPath: string): string {
 
 function makeWorker(opts: {
   fetchImpl: typeof fetch;
-  retention?: "keep" | "until_transcribed";
+  retention?: "keep" | "until_transcribed" | "never";
   maxAttempts?: number;
 }) {
   return startTranscriptionWorker({
@@ -289,6 +289,80 @@ describe("transcription worker", () => {
     const [att] = await store.getAttachments("r1");
     expect(att.metadata?.transcribe_status).toBe("done");
     expect(att.metadata?.transcript).toBe("t");
+  });
+
+  test("retention=never unlinks the audio file after success", async () => {
+    await store.createNote("s", { id: "rn1", metadata: { transcribe_stub: true } });
+    const full = seedAudio("memos/rn1.webm");
+    await store.addAttachment("rn1", "memos/rn1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "t" }]),
+      retention: "never",
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    expect(existsSync(full)).toBe(false);
+    const [att] = await store.getAttachments("rn1");
+    expect(att.metadata?.transcribe_status).toBe("done");
+    expect(att.metadata?.transcript).toBe("t");
+  });
+
+  test("retention=never unlinks the audio file after terminal failure", async () => {
+    await store.createNote("s", { id: "rn2", metadata: { transcribe_stub: true } });
+    const full = seedAudio("memos/rn2.webm");
+    // Pre-seed attempts=2 so a single tick with maxAttempts=3 is terminal.
+    await store.addAttachment("rn2", "memos/rn2.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "boom", status: 500 }]),
+      retention: "never",
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const [att] = await store.getAttachments("rn2");
+    expect(att.metadata?.transcribe_status).toBe("failed");
+    // The whole point of "never": audio gone even when transcription failed.
+    expect(existsSync(full)).toBe(false);
+  });
+
+  test("retention=never keeps the audio file during non-terminal retry", async () => {
+    await store.createNote("s", { id: "rn3", metadata: { transcribe_stub: true } });
+    const full = seedAudio("memos/rn3.webm");
+    // attempts=0 so a single failure is retry-pending, not terminal.
+    await store.addAttachment("rn3", "memos/rn3.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "transient", status: 503 }]),
+      retention: "never",
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const [att] = await store.getAttachments("rn3");
+    expect(att.metadata?.transcribe_status).toBe("pending");
+    // File must remain for the retry to have something to send.
+    expect(existsSync(full)).toBe(true);
   });
 
   test("retention=keep leaves the audio file in place after success", async () => {

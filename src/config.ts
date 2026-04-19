@@ -102,14 +102,19 @@ export interface VaultConfig {
   /** Tag name that marks a note as publicly viewable. Default: "published". */
   published_tag?: string;
   /**
-   * What to do with audio files after successful transcription.
+   * What to do with the audio file on disk once the worker is done with it.
    * - `"keep"` (default): leave the file on disk.
-   * - `"until_transcribed"`: unlink the file once the transcript lands;
-   *   the attachment row (including the stored transcript) is preserved.
+   * - `"until_transcribed"`: unlink once the transcript lands successfully;
+   *   on failure the file is kept so the user can retry or re-upload.
+   * - `"never"`: unlink whenever the worker reaches a terminal state
+   *   (`done` OR `failed`). Audio is discarded even if transcription
+   *   failed — users who opt in accept that losing a bad transcription
+   *   also loses the source audio.
    *
-   * PR 3 adds `"never"` and surfaces this via GET/PATCH /api/vault.
+   * In every mode the attachment row (including any stored transcript) is
+   * preserved; only the file on disk is affected.
    */
-  audio_retention?: "keep" | "until_transcribed";
+  audio_retention?: "keep" | "until_transcribed" | "never";
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +340,7 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   const retentionMatch = yaml.match(/^audio_retention:\s*(\S+)/m);
   if (retentionMatch) {
     const v = retentionMatch[1];
-    if (v === "keep" || v === "until_transcribed") config.audio_retention = v;
+    if (v === "keep" || v === "until_transcribed" || v === "never") config.audio_retention = v;
   }
 
   // Parse description (block scalar)

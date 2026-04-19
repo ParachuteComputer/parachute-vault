@@ -48,7 +48,7 @@ const DEFAULT_POLL_MS = 5_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_TIMEOUT_MS = 120_000;
 
-export type AudioRetention = "keep" | "until_transcribed";
+export type AudioRetention = "keep" | "until_transcribed" | "never";
 
 export interface TranscriptionWorkerOpts {
   /** Vault names to scan each cycle. */
@@ -151,6 +151,12 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
           transcribe_attempts: nextAttempts,
           transcribe_error: errMsg,
         });
+        // retention=never drops the audio on any terminal state, including
+        // failure. The user opted in to "I don't want the audio kept around
+        // regardless of outcome" — honor it.
+        if (retentionFor(vault) === "never") {
+          unlinkIfSafe(filePath, assetsRoot, logger);
+        }
         return;
       }
       // Exponential backoff: 30s, 2m, 8m, ...
@@ -202,15 +208,24 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     await store.setAttachmentMetadata(attachment.id, doneMeta);
 
     // Retention: drop the file but keep the row so the transcript stays
-    // addressable.
-    if (retentionFor(vault) === "until_transcribed") {
-      try {
-        if (filePath.startsWith(normalize(assetsRoot)) && existsSync(filePath)) {
-          unlinkSync(filePath);
-        }
-      } catch (err) {
-        logger.error(`[transcribe] retention unlink failed for ${filePath}:`, err);
+    // addressable. "until_transcribed" and "never" both unlink on success.
+    const retention = retentionFor(vault);
+    if (retention === "until_transcribed" || retention === "never") {
+      unlinkIfSafe(filePath, assetsRoot, logger);
+    }
+  }
+
+  function unlinkIfSafe(
+    filePath: string,
+    assetsRoot: string,
+    logger: { error: (...args: unknown[]) => void },
+  ): void {
+    try {
+      if (filePath.startsWith(normalize(assetsRoot)) && existsSync(filePath)) {
+        unlinkSync(filePath);
       }
+    } catch (err) {
+      logger.error(`[transcribe] retention unlink failed for ${filePath}:`, err);
     }
   }
 

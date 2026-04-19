@@ -646,19 +646,34 @@ export async function handleFindPath(req: Request, store: Store): Promise<Respon
 // Vault info — GET/PATCH /api/vault
 // ---------------------------------------------------------------------------
 
+type VaultConfigLike = {
+  name: string;
+  description?: string;
+  audio_retention?: "keep" | "until_transcribed" | "never";
+};
+
+const VALID_AUDIO_RETENTION = ["keep", "until_transcribed", "never"] as const;
+
+function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
+  return {
+    name: vaultConfig.name,
+    description: vaultConfig.description ?? null,
+    config: {
+      audio_retention: vaultConfig.audio_retention ?? "keep",
+    },
+  };
+}
+
 export async function handleVault(
   req: Request,
   store: Store,
-  vaultConfig: { name: string; description?: string },
-  updateDescription?: (description: string) => void,
+  vaultConfig: VaultConfigLike,
+  persist?: () => void,
 ): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET") {
-    const result: any = {
-      name: vaultConfig.name,
-      description: vaultConfig.description ?? null,
-    };
+    const result: Record<string, unknown> = vaultResponse(vaultConfig);
     if (parseBool(parseQuery(url, "include_stats"), false)) {
       result.stats = await store.getVaultStats();
     }
@@ -666,14 +681,34 @@ export async function handleVault(
   }
 
   if (req.method === "PATCH") {
-    const body = await req.json() as { description?: string };
-    if (body.description !== undefined && updateDescription) {
-      updateDescription(body.description);
+    const body = await req.json() as {
+      description?: string;
+      config?: { audio_retention?: string };
+    };
+    let dirty = false;
+
+    if (body.description !== undefined) {
+      vaultConfig.description = body.description;
+      dirty = true;
     }
-    return json({
-      name: vaultConfig.name,
-      description: body.description ?? vaultConfig.description ?? null,
-    });
+
+    if (body.config?.audio_retention !== undefined) {
+      const v = body.config.audio_retention;
+      if (!VALID_AUDIO_RETENTION.includes(v as typeof VALID_AUDIO_RETENTION[number])) {
+        return json(
+          {
+            error: "invalid_audio_retention",
+            message: `audio_retention must be one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
+          },
+          400,
+        );
+      }
+      vaultConfig.audio_retention = v as typeof VALID_AUDIO_RETENTION[number];
+      dirty = true;
+    }
+
+    if (dirty && persist) persist();
+    return json(vaultResponse(vaultConfig));
   }
 
   return json({ error: "Method not allowed" }, 405);
