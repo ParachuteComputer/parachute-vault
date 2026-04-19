@@ -469,7 +469,8 @@ export async function handleNotes(
 }
 
 // ---------------------------------------------------------------------------
-// Tags — GET/PUT/DELETE /api/tags[/:name]
+// Tags — GET/PUT/DELETE /api/tags[/:name], POST /api/tags/merge,
+//        POST /api/tags/:name/rename
 // ---------------------------------------------------------------------------
 
 export async function handleTags(req: Request, store: Store, subpath = ""): Promise<Response> {
@@ -501,6 +502,54 @@ export async function handleTags(req: Request, store: Store, subpath = ""): Prom
       })));
     }
     return json(tags);
+  }
+
+  // POST /tags/merge — atomic multi-source merge into a target tag.
+  // Must come before the /:name matcher so "merge" isn't read as a tag name.
+  if (subpath === "/merge") {
+    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const body = (await req.json().catch(() => null)) as
+      | { sources?: unknown; target?: unknown }
+      | null;
+    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    const sources = body.sources;
+    const target = body.target;
+    if (!Array.isArray(sources) || !sources.every((s) => typeof s === "string" && s.length > 0)) {
+      return json({ error: "sources must be a non-empty array of strings" }, 400);
+    }
+    if (typeof target !== "string" || target.length === 0) {
+      return json({ error: "target must be a non-empty string" }, 400);
+    }
+    const result = await store.mergeTags(sources, target);
+    return json(result);
+  }
+
+  // POST /tags/:name/rename — atomic rename across tags + note_tags + schema
+  const renameMatch = subpath.match(/^\/([^/]+)\/rename$/);
+  if (renameMatch) {
+    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const oldName = decodeURIComponent(renameMatch[1]);
+    const body = (await req.json().catch(() => null)) as { new_name?: unknown } | null;
+    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    const newName = body.new_name;
+    if (typeof newName !== "string" || newName.length === 0) {
+      return json({ error: "new_name must be a non-empty string" }, 400);
+    }
+    const result = await store.renameTag(oldName, newName);
+    if ("error" in result) {
+      if (result.error === "not_found") return json({ error: "not_found", tag: oldName }, 404);
+      if (result.error === "target_exists") {
+        return json(
+          {
+            error: "target_exists",
+            target: newName,
+            message: "Target tag already exists; use POST /api/tags/merge to combine them.",
+          },
+          409,
+        );
+      }
+    }
+    return json(result);
   }
 
   // Routes with tag name

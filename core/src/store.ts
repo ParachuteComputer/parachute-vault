@@ -151,6 +151,17 @@ export class BunSqliteStore implements Store {
     return noteOps.deleteTag(this.db, name);
   }
 
+  async renameTag(oldName: string, newName: string): Promise<noteOps.RenameTagResult> {
+    return noteOps.renameTag(this.db, oldName, newName);
+  }
+
+  async mergeTags(
+    sources: string[],
+    target: string,
+  ): Promise<{ merged: Record<string, number>; target: string }> {
+    return noteOps.mergeTags(this.db, sources, target);
+  }
+
   // ---- Vault Stats ----
 
   async getVaultStats(opts?: { topTagsLimit?: number }) {

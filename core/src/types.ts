@@ -109,6 +109,14 @@ export interface Store {
   untagNote(noteId: string, tags: string[]): Promise<void>;
   listTags(): Promise<{ name: string; count: number }[]>;
   deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
+  renameTag(
+    oldName: string,
+    newName: string,
+  ): Promise<{ renamed: number } | { error: "not_found" } | { error: "target_exists" }>;
+  mergeTags(
+    sources: string[],
+    target: string,
+  ): Promise<{ merged: Record<string, number>; target: string }>;
 
   // Vault stats (aggregate, read-only)
   getVaultStats(opts?: { topTagsLimit?: number }): Promise<VaultStats>;
