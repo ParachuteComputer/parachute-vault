@@ -16,6 +16,11 @@ export interface TagFieldSchema {
   type: string;
   description?: string;
   enum?: string[];
+  // When true, a generated column + index are maintained on `notes` for this
+  // field, making it available for operator queries and `order_by`. Global
+  // across declarers — all tags declaring this field must agree on both
+  // `type` and `indexed`. See core/src/indexed-fields.ts for lifecycle.
+  indexed?: boolean;
 }
 
 export interface TagSchema {

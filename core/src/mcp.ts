@@ -4,6 +4,8 @@ import * as noteOps from "./notes.js";
 import { filterMetadata } from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
+import type { TagFieldSchema } from "./tag-schemas.js";
+import * as indexedFieldOps from "./indexed-fields.js";
 import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
@@ -585,6 +587,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                 type: { type: "string", description: "Field type: string, boolean, integer" },
                 description: { type: "string" },
                 enum: { type: "array", items: { type: "string" }, description: "Allowed values (first is default)" },
+                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed." },
               },
               required: ["type"],
             },
@@ -595,11 +598,76 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       execute: (params) => {
         const tag = params.tag as string;
         const existing = tagSchemaOps.getTagSchema(db, tag);
-        const mergedFields = { ...existing?.fields, ...(params.fields as any) };
-        return tagSchemaOps.upsertTagSchema(db, tag, {
+        const incomingFields = (params.fields as Record<string, TagFieldSchema> | undefined) ?? {};
+        const mergedFields: Record<string, TagFieldSchema> = {
+          ...(existing?.fields ?? {}),
+          ...incomingFields,
+        };
+
+        // Validate cross-tag consistency on fields being (re)declared in this
+        // call. `type` and `indexed` are global — all declarers must agree.
+        // `description` and `enum` are per-tag, so we don't compare them.
+        const otherSchemas = tagSchemaOps
+          .listTagSchemas(db)
+          .filter((s) => s.tag !== tag);
+        for (const [fieldName, spec] of Object.entries(incomingFields)) {
+          const incomingIndexed = spec.indexed === true;
+          for (const other of otherSchemas) {
+            const otherSpec = other.fields?.[fieldName];
+            if (!otherSpec) continue;
+            if (otherSpec.type !== spec.type) {
+              throw new Error(
+                `field "${fieldName}" type conflict: tag "${tag}" declares "${spec.type}"; tag "${other.tag}" declares "${otherSpec.type}". Types must agree across all declarers.`,
+              );
+            }
+            if ((otherSpec.indexed === true) !== incomingIndexed) {
+              throw new Error(
+                `field "${fieldName}" indexed-flag conflict: tag "${tag}" sets indexed=${incomingIndexed}; tag "${other.tag}" sets indexed=${otherSpec.indexed === true}. Must match across all declarers — change them atomically or not at all.`,
+              );
+            }
+          }
+          if (incomingIndexed) {
+            const mapped = indexedFieldOps.mapFieldType(spec.type);
+            if (!mapped) {
+              throw new Error(
+                `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
+              );
+            }
+            indexedFieldOps.validateFieldName(fieldName);
+          }
+        }
+
+        // Persist the schema first, then reconcile indexing lifecycle. An
+        // error here would leave the on-disk schema untouched, matching
+        // prior behavior.
+        const result = tagSchemaOps.upsertTagSchema(db, tag, {
           description: (params.description as string | undefined) ?? existing?.description,
           fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
         });
+
+        // Diff indexed state for this tag: what it indexed before vs. now.
+        const priorIndexed = new Set(
+          Object.entries(existing?.fields ?? {})
+            .filter(([, v]) => v.indexed === true)
+            .map(([k]) => k),
+        );
+        const nextIndexed = new Set(
+          Object.entries(mergedFields)
+            .filter(([, v]) => v.indexed === true)
+            .map(([k]) => k),
+        );
+        for (const fieldName of nextIndexed) {
+          const spec = mergedFields[fieldName]!;
+          const mapped = indexedFieldOps.mapFieldType(spec.type)!;
+          indexedFieldOps.declareField(db, fieldName, mapped, tag);
+        }
+        for (const fieldName of priorIndexed) {
+          if (!nextIndexed.has(fieldName)) {
+            indexedFieldOps.releaseField(db, fieldName, tag);
+          }
+        }
+
+        return result;
       },
     },
 
@@ -618,6 +686,17 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       },
       execute: async (params) => {
         const tag = params.tag as string;
+        // Release any indexed fields this tag declared before the schema
+        // row disappears. releaseField drops the generated column + index
+        // when the declarer set empties.
+        const schema = tagSchemaOps.getTagSchema(db, tag);
+        if (schema?.fields) {
+          for (const [fieldName, spec] of Object.entries(schema.fields)) {
+            if (spec.indexed === true) {
+              indexedFieldOps.releaseField(db, fieldName, tag);
+            }
+          }
+        }
         // Delete schema first (FK cascade would handle it, but be explicit)
         tagSchemaOps.deleteTagSchema(db, tag);
         return await store.deleteTag(tag);
