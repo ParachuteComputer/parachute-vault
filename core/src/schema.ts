@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -177,6 +177,9 @@ export function initSchema(db: Database): void {
   // Migrate v9 → v10: indexed_fields table (created by SCHEMA_SQL above).
   migrateToV10(db);
 
+  // Migrate v10 → v11: backfill updated_at = created_at for legacy rows.
+  migrateToV11(db);
+
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
   rebuildIndexes(db);
@@ -293,6 +296,19 @@ function migrateToV10(db: Database): void {
   // ensures indexed_fields exists on vaults created before v10. No data
   // migration — rebuildIndexes() downstream handles column/index creation
   // if any rows are already present.
+}
+
+/**
+ * Migrate v10 → v11: backfill `updated_at = created_at` for notes that never
+ * received an update. Pre-v11 inserts left `updated_at` NULL, which broke
+ * optimistic concurrency for clients that fall back to `createdAt` (the
+ * common `updatedAt ?? createdAt` pattern) — the `updated_at IS ?` guard
+ * never matched. From v11 onward, `createNote` sets both columns at insert.
+ * Idempotent — safe to run on every boot.
+ */
+function migrateToV11(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  db.exec("UPDATE notes SET updated_at = created_at WHERE updated_at IS NULL");
 }
 
 function hasTable(db: Database, name: string): boolean {

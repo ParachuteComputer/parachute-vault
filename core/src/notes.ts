@@ -30,9 +30,15 @@ export function createNote(
   const metadata = opts?.metadata ? JSON.stringify(opts.metadata) : "{}";
   const path = normalizePath(opts?.path);
 
+  // `updated_at` is set to `created_at` on insert so a client whose optimistic
+  // concurrency check falls back to `createdAt` on a never-updated note
+  // (the common shape: `note.updatedAt ?? note.createdAt`) matches the stored
+  // value. Hook-style writes with `skipUpdatedAt` preserve this; real user
+  // edits bump it strictly upward, so `updated_at > created_at` still means
+  // "user-touched since creation."
   db.prepare(
-    `INSERT INTO notes (id, content, path, metadata, created_at) VALUES (?, ?, ?, ?, ?)`,
-  ).run(id, content, path, metadata, createdAt);
+    `INSERT INTO notes (id, content, path, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(id, content, path, metadata, createdAt, createdAt);
 
   if (opts?.tags && opts.tags.length > 0) {
     tagNote(db, id, opts.tags);
