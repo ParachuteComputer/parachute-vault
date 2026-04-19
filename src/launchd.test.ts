@@ -40,7 +40,7 @@ describe("generateWrapper", () => {
     expect(wrapper).toContain('if [ -z "$SERVER_PATH" ]; then');
     expect(wrapper).toContain("exit 1");
     // Actionable message — user needs to know what to run.
-    expect(wrapper).toMatch(/parachute vault init/);
+    expect(wrapper).toMatch(/parachute-vault init/);
   });
 
   test("fails loudly when pointer target no longer exists (moved repo)", () => {

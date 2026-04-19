@@ -5,7 +5,7 @@
   "module": "src/cli.ts",
   "type": "module",
   "bin": {
-    "parachute": "src/cli.ts"
+    "parachute-vault": "src/cli.ts"
   },
   "scripts": {
     "start": "bun src/server.ts",

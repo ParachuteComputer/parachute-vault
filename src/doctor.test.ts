@@ -1,5 +1,5 @@
 /**
- * Integration tests for `parachute vault doctor` and `parachute vault url`.
+ * Integration tests for `parachute-vault doctor` and `parachute-vault url`.
  *
  * We spawn the CLI as a subprocess with `PARACHUTE_HOME` pointed at a
  * fresh tempdir — so each test exercises the real code path (config +
@@ -74,7 +74,7 @@ describe("vault doctor", () => {
     expect(res.exitCode).toBe(1);
     expect(res.stdout).toMatch(/server-path pointer/);
     expect(res.stdout).toMatch(/missing/);
-    expect(res.stdout).toMatch(/parachute vault init/);
+    expect(res.stdout).toMatch(/parachute-vault init/);
   });
 
   test("fails when the pointer targets a non-existent file (moved repo)", () => {

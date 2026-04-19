@@ -4,16 +4,16 @@
  * Parachute Vault CLI.
  *
  * Usage:
- *   parachute vault init                    — set up everything, one command
- *   parachute vault create <name>           — create a new vault
- *   parachute vault list                    — list all vaults
- *   parachute vault mcp-install <name>      — add vault MCP to ~/.claude.json
- *   parachute vault remove <name>           — remove a vault
- *   parachute vault config                  — show all config
- *   parachute vault config set <key> <val>  — set a config value
- *   parachute vault config unset <key>      — remove a config value
- *   parachute vault serve                   — run the server (foreground)
- *   parachute vault status                  — show full status
+ *   parachute-vault init                    — set up everything, one command
+ *   parachute-vault create <name>           — create a new vault
+ *   parachute-vault list                    — list all vaults
+ *   parachute-vault mcp-install <name>      — add vault MCP to ~/.claude.json
+ *   parachute-vault remove <name>           — remove a vault
+ *   parachute-vault config                  — show all config
+ *   parachute-vault config set <key> <val>  — set a config value
+ *   parachute-vault config unset <key>      — remove a config value
+ *   parachute-vault serve                   — run the server (foreground)
+ *   parachute-vault status                  — show full status
  */
 
 import { resolve } from "path";
@@ -103,7 +103,7 @@ import {
 
 const args = process.argv.slice(2);
 
-// Support both `parachute vault <cmd>` and `parachute <cmd>` patterns
+// Support both `parachute-vault <cmd>` and `parachute <cmd>` patterns
 let command: string;
 let cmdArgs: string[];
 
@@ -188,7 +188,7 @@ switch (command) {
   case "--version":
   case "-v":
     // Intentionally minimal — just the version string on stdout. Scripts
-    // (and `parachute vault doctor` in a future check) rely on this being
+    // (and `parachute-vault doctor` in a future check) rely on this being
     // a bare-number line; anything else belongs in `vault status`.
     console.log(pkg.version);
     break;
@@ -326,8 +326,8 @@ async function cmdInit() {
   }
 
   console.log(`\nNext steps:`);
-  console.log(`  parachute vault status            check everything is running`);
-  console.log(`  parachute vault config             view/edit configuration`);
+  console.log(`  parachute-vault status            check everything is running`);
+  console.log(`  parachute-vault config             view/edit configuration`);
 }
 
 async function promptForOwnerPassword(purpose: string): Promise<boolean> {
@@ -339,7 +339,7 @@ async function promptForOwnerPassword(purpose: string): Promise<boolean> {
   while (true) {
     const pw = await askPassword("  Password (or leave blank to skip)");
     if (!pw) {
-      console.log("  Skipped — you can set one later with `parachute vault set-password`.");
+      console.log("  Skipped — you can set one later with `parachute-vault set-password`.");
       return false;
     }
 
@@ -391,13 +391,13 @@ async function cmdSetPassword(args: string[]) {
 }
 
 // ---------------------------------------------------------------------------
-// 2FA — parachute vault 2fa [enroll | disable | backup-codes | status]
+// 2FA — parachute-vault 2fa [enroll | disable | backup-codes | status]
 // ---------------------------------------------------------------------------
 
 async function confirmOwnerPassword(purpose: string): Promise<boolean> {
   const hash = getOwnerPasswordHash();
   if (!hash) {
-    console.error("No owner password is set. Run: parachute vault set-password");
+    console.error("No owner password is set. Run: parachute-vault set-password");
     return false;
   }
   console.log(purpose);
@@ -460,14 +460,14 @@ async function cmd2fa(args: string[]) {
       console.log(`2FA: enabled (${getBackupCodeCount()} backup code(s) remaining)`);
     } else {
       console.log("2FA: not enabled");
-      console.log("  Enable with: parachute vault 2fa enroll");
+      console.log("  Enable with: parachute-vault 2fa enroll");
     }
     return;
   }
 
   if (sub === "enroll") {
     if (!hasOwnerPassword()) {
-      console.error("Set an owner password first: parachute vault set-password");
+      console.error("Set an owner password first: parachute-vault set-password");
       process.exit(1);
     }
     if (hasTotpEnrolled()) {
@@ -511,7 +511,7 @@ async function cmd2fa(args: string[]) {
       console.log(`  Incorrect code. (${2 - attempt} attempt(s) left)`);
     }
     if (!confirmed) {
-      console.error("Enrollment failed — rolling back. Re-run `parachute vault 2fa enroll` to try again.");
+      console.error("Enrollment failed — rolling back. Re-run `parachute-vault 2fa enroll` to try again.");
       disableTotp();
       process.exit(1);
     }
@@ -539,7 +539,7 @@ async function cmd2fa(args: string[]) {
 
   if (sub === "backup-codes") {
     if (!hasTotpEnrolled()) {
-      console.error("2FA is not enabled. Run: parachute vault 2fa enroll");
+      console.error("2FA is not enabled. Run: parachute-vault 2fa enroll");
       process.exit(1);
     }
     if (!(await confirmForTwoFactor("Confirm ownership to regenerate backup codes:"))) {
@@ -554,14 +554,14 @@ async function cmd2fa(args: string[]) {
   }
 
   console.error(`Unknown 2fa command: ${sub}`);
-  console.error("Usage: parachute vault 2fa [status | enroll | disable | backup-codes]");
+  console.error("Usage: parachute-vault 2fa [status | enroll | disable | backup-codes]");
   process.exit(1);
 }
 
 function cmdCreate(args: string[]) {
   const name = args[0];
   if (!name) {
-    console.error("Usage: parachute vault create <name>");
+    console.error("Usage: parachute-vault create <name>");
     process.exit(1);
   }
 
@@ -610,13 +610,13 @@ function cmdCreate(args: string[]) {
     console.log(`  ${defaultNote}`);
   }
   console.log();
-  console.log(`To add MCP to Claude: parachute vault mcp-install ${name}`);
+  console.log(`To add MCP to Claude: parachute-vault mcp-install ${name}`);
 }
 
 function cmdList() {
   const vaults = listVaults();
   if (vaults.length === 0) {
-    console.log("No vaults. Run: parachute vault init");
+    console.log("No vaults. Run: parachute-vault init");
     return;
   }
 
@@ -637,7 +637,7 @@ function cmdMcpInstall(_args: string[]) {
 function cmdRemove(args: string[]) {
   const name = args[0];
   if (!name) {
-    console.error("Usage: parachute vault remove <name>");
+    console.error("Usage: parachute-vault remove <name>");
     process.exit(1);
   }
 
@@ -651,7 +651,7 @@ function cmdRemove(args: string[]) {
   if (!force) {
     console.log(`This will permanently delete vault "${name}" and all its data.`);
     console.log(`  Path: ${vaultDir(name)}`);
-    console.log(`\nTo confirm: parachute vault remove ${name} --yes`);
+    console.log(`\nTo confirm: parachute-vault remove ${name} --yes`);
     return;
   }
 
@@ -680,7 +680,7 @@ function cmdRemove(args: string[]) {
 async function cmdConfig(args: string[]) {
   const subcmd = args[0];
 
-  // parachute vault config — show current config
+  // parachute-vault config — show current config
   if (!subcmd) {
     loadEnvFile();
     const env = readEnvFile();
@@ -693,7 +693,7 @@ async function cmdConfig(args: string[]) {
     console.log();
 
     if (Object.keys(env).length === 0) {
-      console.log("  No env vars set. Use: parachute vault config set <key> <value>");
+      console.log("  No env vars set. Use: parachute-vault config set <key> <value>");
     } else {
       for (const [key, val] of Object.entries(env)) {
         // Mask sensitive values
@@ -707,46 +707,46 @@ async function cmdConfig(args: string[]) {
     return;
   }
 
-  // parachute vault config set <key> <value>
+  // parachute-vault config set <key> <value>
   if (subcmd === "set") {
     const key = args[1];
     const value = args.slice(2).join(" ");
     if (!key || !value) {
-      console.error("Usage: parachute vault config set <key> <value>");
+      console.error("Usage: parachute-vault config set <key> <value>");
       process.exit(1);
     }
     setEnvVar(key, value);
     console.log(`Set ${key}=${key.includes("KEY") ? value.slice(0, 8) + "..." : value}`);
-    console.log("Restart the daemon to apply: parachute vault restart");
+    console.log("Restart the daemon to apply: parachute-vault restart");
     return;
   }
 
-  // parachute vault config unset <key>
+  // parachute-vault config unset <key>
   if (subcmd === "unset") {
     const key = args[1];
     if (!key) {
-      console.error("Usage: parachute vault config unset <key>");
+      console.error("Usage: parachute-vault config unset <key>");
       process.exit(1);
     }
     unsetEnvVar(key);
     console.log(`Removed ${key}`);
-    console.log("Restart the daemon to apply: parachute vault restart");
+    console.log("Restart the daemon to apply: parachute-vault restart");
     return;
   }
 
   console.error(`Unknown config command: ${subcmd}`);
-  console.error("Usage: parachute vault config [set <key> <value> | unset <key>]");
+  console.error("Usage: parachute-vault config [set <key> <value> | unset <key>]");
   process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// Tokens — parachute vault tokens [create | list | revoke]
+// Tokens — parachute-vault tokens [create | list | revoke]
 // ---------------------------------------------------------------------------
 
 function cmdTokens(args: string[]) {
   const subcmd = args[0];
 
-  // parachute vault tokens — list all tokens (across all vaults)
+  // parachute-vault tokens — list all tokens (across all vaults)
   if (!subcmd || subcmd === "list") {
     const vaults = listVaults();
     let anyTokens = false;
@@ -773,12 +773,12 @@ function cmdTokens(args: string[]) {
     }
 
     if (!anyTokens) {
-      console.log("No tokens found. Create one: parachute vault tokens create");
+      console.log("No tokens found. Create one: parachute-vault tokens create");
     }
     return;
   }
 
-  // parachute vault tokens create --vault <name> [--permission full|read]
+  // parachute-vault tokens create --vault <name> [--permission full|read]
   //   [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
@@ -832,11 +832,11 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // parachute vault tokens revoke <token-id> --vault <name>
+  // parachute-vault tokens revoke <token-id> --vault <name>
   if (subcmd === "revoke") {
     const tokenId = args[1];
     if (!tokenId) {
-      console.error("Usage: parachute vault tokens revoke <token-id> --vault <name>");
+      console.error("Usage: parachute-vault tokens revoke <token-id> --vault <name>");
       process.exit(1);
     }
 
@@ -860,7 +860,7 @@ function cmdTokens(args: string[]) {
   }
 
   console.error(`Unknown tokens command: ${subcmd}`);
-  console.error("Usage: parachute vault tokens [create | list | revoke <id>]");
+  console.error("Usage: parachute-vault tokens [create | list | revoke <id>]");
   process.exit(1);
 }
 
@@ -1120,7 +1120,7 @@ async function cmdUninstall(argsList: string[]) {
     }
   }
 
-  console.log("\nDone. To reinstall: `parachute vault init`.");
+  console.log("\nDone. To reinstall: `parachute-vault init`.");
 }
 
 interface DoctorCheck {
@@ -1139,7 +1139,7 @@ async function cmdDoctor() {
       name: "server-path pointer",
       status: "fail",
       detail: `missing: ${SERVER_PATH_FILE}`,
-      fix: "Run `parachute vault init` to create it.",
+      fix: "Run `parachute-vault init` to create it.",
     });
   } else {
     const pointed = readServerPathPointer();
@@ -1148,14 +1148,14 @@ async function cmdDoctor() {
         name: "server-path pointer",
         status: "fail",
         detail: `empty: ${SERVER_PATH_FILE}`,
-        fix: "Run `parachute vault init` to rewrite it.",
+        fix: "Run `parachute-vault init` to rewrite it.",
       });
     } else if (!existsSync(pointed)) {
       checks.push({
         name: "server.ts at pointer target",
         status: "fail",
         detail: `points to ${pointed}, which does not exist`,
-        fix: "Run `parachute vault init` from the current repo location.",
+        fix: "Run `parachute-vault init` from the current repo location.",
       });
     } else {
       checks.push({
@@ -1173,7 +1173,7 @@ async function cmdDoctor() {
       name: "wrapper script",
       status: "fail",
       detail: `missing: ${WRAPPER_PATH}`,
-      fix: "Run `parachute vault init`.",
+      fix: "Run `parachute-vault init`.",
     });
   } else {
     checks.push({ name: "wrapper script", status: "pass", detail: WRAPPER_PATH });
@@ -1186,7 +1186,7 @@ async function cmdDoctor() {
       name: "launchd agent",
       status: loaded ? "pass" : "warn",
       detail: loaded ? "loaded" : "not loaded",
-      fix: loaded ? undefined : "Run `parachute vault init` or `parachute vault restart`.",
+      fix: loaded ? undefined : "Run `parachute-vault init` or `parachute-vault restart`.",
     });
   } else if (isSystemdAvailable()) {
     const active = await isServiceActive();
@@ -1194,7 +1194,7 @@ async function cmdDoctor() {
       name: "systemd service",
       status: active ? "pass" : "warn",
       detail: active ? "active" : "not active",
-      fix: active ? undefined : "Run `parachute vault init` or `parachute vault restart`.",
+      fix: active ? undefined : "Run `parachute-vault init` or `parachute-vault restart`.",
     });
   }
 
@@ -1225,7 +1225,7 @@ async function cmdDoctor() {
       name: "MCP entry in ~/.claude.json",
       status: "warn",
       detail: mcpEntry.reason,
-      fix: "Run `parachute vault mcp-install` to register the vault with Claude.",
+      fix: "Run `parachute-vault mcp-install` to register the vault with Claude.",
     });
   } else {
     checks.push({
@@ -1248,7 +1248,7 @@ async function cmdDoctor() {
         name: "MCP URL port matches vault",
         status: "warn",
         detail: `MCP URL port ${mcpEntry.port ?? "(unparseable)"} ≠ vault port ${port}`,
-        fix: "Re-run `parachute vault mcp-install` to refresh the MCP URL.",
+        fix: "Re-run `parachute-vault mcp-install` to refresh the MCP URL.",
       });
     }
 
@@ -1268,7 +1268,7 @@ async function cmdDoctor() {
         name: "MCP URL reachable",
         status: "warn",
         detail: reach.detail,
-        fix: "Start the daemon: `parachute vault restart` (or `init` if not yet installed).",
+        fix: "Start the daemon: `parachute-vault restart` (or `init` if not yet installed).",
       });
     }
   }
@@ -1297,7 +1297,7 @@ async function cmdDoctor() {
         name: `port ${port} availability`,
         status: "warn",
         detail: `port in use by non-vault process: ${collision.detail}`,
-        fix: "Stop the conflicting process, or set a different PORT in ~/.parachute/.env and re-run `parachute vault init`.",
+        fix: "Stop the conflicting process, or set a different PORT in ~/.parachute/.env and re-run `parachute-vault init`.",
       });
       break;
     case "unknown":
@@ -1319,7 +1319,7 @@ async function cmdDoctor() {
         name: "backup agent",
         status: loaded ? "pass" : "warn",
         detail: loaded ? `loaded (schedule: ${backupCfg.schedule})` : `not loaded (schedule: ${backupCfg.schedule})`,
-        fix: loaded ? undefined : `Re-run \`parachute vault backup --schedule ${backupCfg.schedule}\` to reinstall the agent.`,
+        fix: loaded ? undefined : `Re-run \`parachute-vault backup --schedule ${backupCfg.schedule}\` to reinstall the agent.`,
       });
     }
 
@@ -1361,12 +1361,12 @@ async function cmdDoctor() {
   const hasWarn = checks.some((c) => c.status === "warn");
   console.log();
   if (hasFailure) {
-    console.log("doctor: problems found (exit 1). See `parachute vault status` for runtime details.");
+    console.log("doctor: problems found (exit 1). See `parachute-vault status` for runtime details.");
     process.exit(1);
   } else if (hasWarn) {
-    console.log("doctor: warnings only. `parachute vault status` has live runtime detail.");
+    console.log("doctor: warnings only. `parachute-vault status` has live runtime detail.");
   } else {
-    console.log("doctor: all checks passed. For live runtime state: `parachute vault status`.");
+    console.log("doctor: all checks passed. For live runtime state: `parachute-vault status`.");
   }
 }
 
@@ -1573,7 +1573,7 @@ async function describeProcess(pid: number): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Backup — parachute vault backup [--schedule <freq> | status]
+// Backup — parachute-vault backup [--schedule <freq> | status]
 // ---------------------------------------------------------------------------
 
 async function cmdBackup(args: string[]) {
@@ -1588,7 +1588,7 @@ async function cmdBackup(args: string[]) {
   if (schedFlag !== -1) {
     const raw = args[schedFlag + 1];
     if (!raw) {
-      console.error("Usage: parachute vault backup --schedule <hourly|daily|weekly|manual>");
+      console.error("Usage: parachute-vault backup --schedule <hourly|daily|weekly|manual>");
       process.exit(1);
     }
     if (raw !== "hourly" && raw !== "daily" && raw !== "weekly" && raw !== "manual") {
@@ -1648,7 +1648,7 @@ async function cmdBackupSchedule(schedule: BackupSchedule) {
   if (schedule === "manual") {
     await uninstallBackupAgent();
     console.log("Schedule: manual — backup agent removed.");
-    console.log("Run `parachute vault backup` to trigger a backup on demand.");
+    console.log("Run `parachute-vault backup` to trigger a backup on demand.");
     return;
   }
 
@@ -1759,7 +1759,7 @@ async function cmdImport(args: string[]) {
   sourcePath = positional[0] ?? "";
 
   if (!sourcePath) {
-    console.error("Usage: parachute vault import <path> [--vault <name>] [--dry-run]");
+    console.error("Usage: parachute-vault import <path> [--vault <name>] [--dry-run]");
     console.error("\nImports an Obsidian vault into Parachute Vault.");
     console.error("\nOptions:");
     console.error("  --vault <name>   Target vault (default: 'default')");
@@ -1778,7 +1778,7 @@ async function cmdImport(args: string[]) {
   // Verify vault exists
   const config = readVaultConfig(vaultName);
   if (!config) {
-    console.error(`Vault "${vaultName}" not found. Run: parachute vault create ${vaultName}`);
+    console.error(`Vault "${vaultName}" not found. Run: parachute-vault create ${vaultName}`);
     process.exit(1);
   }
 
@@ -1865,7 +1865,7 @@ async function cmdExport(args: string[]) {
   outputPath = positional[0] ?? "";
 
   if (!outputPath) {
-    console.error("Usage: parachute vault export <output-path> [--vault <name>]");
+    console.error("Usage: parachute-vault export <output-path> [--vault <name>]");
     console.error("\nExports a Parachute Vault as Obsidian-compatible markdown files.");
     process.exit(1);
   }
@@ -1980,57 +1980,57 @@ function usage() {
 Parachute Vault — self-hosted knowledge graph
 
 Setup:
-  parachute vault init                     Set up everything (one command, idempotent)
-  parachute vault status                   Check what's running
-  parachute vault doctor                   Diagnose install/config issues
-  parachute vault uninstall [--wipe] [--yes]
+  parachute-vault init                     Set up everything (one command, idempotent)
+  parachute-vault status                   Check what's running
+  parachute-vault doctor                   Diagnose install/config issues
+  parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,
                                            config.yaml, and daemon logs (vault.log, vault.err).
                                            --yes skips prompts (DANGEROUS with --wipe: no confirmation).
-  parachute vault url                      Print the local server URL (for scripts)
+  parachute-vault url                      Print the local server URL (for scripts)
   parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
-  parachute vault create <name>            Create a new vault
-  parachute vault list                     List all vaults
-  parachute vault remove <name> [--yes]    Remove a vault
-  parachute vault mcp-install              Add vault MCP to Claude
+  parachute-vault create <name>            Create a new vault
+  parachute-vault list                     List all vaults
+  parachute-vault remove <name> [--yes]    Remove a vault
+  parachute-vault mcp-install              Add vault MCP to Claude
 
 Tokens:
-  parachute vault tokens                          List all tokens
-  parachute vault tokens create                   Create a full-access token in the default vault
-  parachute vault tokens create --vault <name>    Create a token in a specific vault
-  parachute vault tokens create --read            Read-only token
-  parachute vault tokens create --label x         Set a label
-  parachute vault tokens create --expires 30d     Expiring token
-  parachute vault tokens revoke <token-id>        Revoke a token (default vault)
+  parachute-vault tokens                          List all tokens
+  parachute-vault tokens create                   Create a full-access token in the default vault
+  parachute-vault tokens create --vault <name>    Create a token in a specific vault
+  parachute-vault tokens create --read            Read-only token
+  parachute-vault tokens create --label x         Set a label
+  parachute-vault tokens create --expires 30d     Expiring token
+  parachute-vault tokens revoke <token-id>        Revoke a token (default vault)
 
 OAuth:
-  parachute vault set-password             Set/change the owner password (for consent page)
-  parachute vault set-password --clear     Remove the owner password
-  parachute vault 2fa status               Show 2FA state
-  parachute vault 2fa enroll               Enable TOTP 2FA (QR + backup codes)
-  parachute vault 2fa disable              Disable 2FA (requires password)
-  parachute vault 2fa backup-codes         Regenerate backup codes
+  parachute-vault set-password             Set/change the owner password (for consent page)
+  parachute-vault set-password --clear     Remove the owner password
+  parachute-vault 2fa status               Show 2FA state
+  parachute-vault 2fa enroll               Enable TOTP 2FA (QR + backup codes)
+  parachute-vault 2fa disable              Disable 2FA (requires password)
+  parachute-vault 2fa backup-codes         Regenerate backup codes
 
 Config:
-  parachute vault config                   Show current configuration
-  parachute vault config set <key> <val>   Set a config value
-  parachute vault config unset <key>       Remove a config value
+  parachute-vault config                   Show current configuration
+  parachute-vault config set <key> <val>   Set a config value
+  parachute-vault config unset <key>       Remove a config value
 
 Backup:
-  parachute vault backup                        One-shot backup to configured destinations
-  parachute vault backup --schedule <freq>      hourly | daily | weekly | manual (macOS launchd)
-  parachute vault backup status                 Show schedule, last run, destinations, next run
+  parachute-vault backup                        One-shot backup to configured destinations
+  parachute-vault backup --schedule <freq>      hourly | daily | weekly | manual (macOS launchd)
+  parachute-vault backup status                 Show schedule, last run, destinations, next run
 
 Import/Export:
-  parachute vault import <path>            Import an Obsidian vault
-  parachute vault import <path> --dry-run  Preview import without writing
-  parachute vault export <path>            Export vault as Obsidian markdown
+  parachute-vault import <path>            Import an Obsidian vault
+  parachute-vault import <path> --dry-run  Preview import without writing
+  parachute-vault export <path>            Export vault as Obsidian markdown
 
 Server:
-  parachute vault serve                    Run server (foreground)
-  parachute vault logs                     Stream server logs
-  parachute vault restart                  Restart the daemon
+  parachute-vault serve                    Run server (foreground)
+  parachute-vault logs                     Stream server logs
+  parachute-vault restart                  Restart the daemon
 `);
 }

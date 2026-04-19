@@ -31,7 +31,7 @@ function runCli(args: string[]): {
 
 describe("parachute version", () => {
   // Every spelling must print the package's version and nothing else.
-  // `parachute vault --version` works via the argv parser's existing
+  // `parachute-vault --version` works via the argv parser's existing
   // `args[0] === "vault"` branch, which shifts "vault" off and treats
   // `--version` as the command — so the same switch case handles both
   // root and vault-prefixed invocations.

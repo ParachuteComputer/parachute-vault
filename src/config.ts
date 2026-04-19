@@ -975,7 +975,7 @@ export function writeEnvFile(env: Record<string, string>): void {
   ensureConfigDirSync();
   const lines: string[] = [
     "# Parachute Vault configuration",
-    "# Managed by: parachute vault config",
+    "# Managed by: parachute-vault config",
     "",
   ];
   for (const [key, val] of Object.entries(env)) {
