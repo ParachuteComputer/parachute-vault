@@ -146,5 +146,8 @@ export interface Store {
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
   getAttachments(noteId: string): Promise<Attachment[]>;
+  getAttachment(attachmentId: string): Promise<Attachment | null>;
+  setAttachmentMetadata(attachmentId: string, metadata: Record<string, unknown>): Promise<void>;
   deleteAttachment(noteId: string, attachmentId: string): Promise<{ deleted: boolean; path: string | null; orphaned: boolean }>;
+  listAttachmentsByTranscribeStatus(status: "pending" | "failed" | "done", limit?: number): Promise<Attachment[]>;
 }

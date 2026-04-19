@@ -321,6 +321,68 @@ export class BunSqliteStore implements Store {
     ).get(row.path);
     return { deleted: true, path: row.path, orphaned: !other };
   }
+
+  async getAttachment(attachmentId: string): Promise<Attachment | null> {
+    const row = this.db.prepare(
+      "SELECT * FROM attachments WHERE id = ?",
+    ).get(attachmentId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string } | undefined;
+    if (!row) return null;
+    let metadata: Record<string, unknown> | undefined;
+    if (row.metadata && row.metadata !== "{}") {
+      try { metadata = JSON.parse(row.metadata); } catch {}
+    }
+    return {
+      id: row.id,
+      noteId: row.note_id,
+      path: row.path,
+      mimeType: row.mime_type,
+      metadata,
+      createdAt: row.created_at,
+    };
+  }
+
+  /**
+   * Replace the attachment's metadata JSON blob. The caller passes the full
+   * merged object — this is a set, not a patch, so partial-field updates
+   * don't silently drop other keys.
+   */
+  async setAttachmentMetadata(attachmentId: string, metadata: Record<string, unknown>): Promise<void> {
+    const json = JSON.stringify(metadata);
+    this.db.prepare("UPDATE attachments SET metadata = ? WHERE id = ?").run(json, attachmentId);
+  }
+
+  /**
+   * Return attachments whose metadata.transcribe_status matches the given
+   * status, oldest first (FIFO). Used by the transcription worker to drain
+   * the queue. `status = "pending"` is the queue; `"failed"` feeds a retry
+   * sweep; `"done"` is only useful for tests and diagnostics.
+   */
+  async listAttachmentsByTranscribeStatus(
+    status: "pending" | "failed" | "done",
+    limit = 50,
+  ): Promise<Attachment[]> {
+    const rows = this.db.prepare(
+      `SELECT * FROM attachments
+       WHERE json_extract(metadata, '$.transcribe_status') = ?
+       ORDER BY created_at ASC
+       LIMIT ?`,
+    ).all(status, limit) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string }[];
+
+    return rows.map((r) => {
+      let metadata: Record<string, unknown> | undefined;
+      if (r.metadata && r.metadata !== "{}") {
+        try { metadata = JSON.parse(r.metadata); } catch {}
+      }
+      return {
+        id: r.id,
+        noteId: r.note_id,
+        path: r.path,
+        mimeType: r.mime_type,
+        metadata,
+        createdAt: r.created_at,
+      };
+    });
+  }
 }
 
 /** @deprecated Renamed to `BunSqliteStore` to make the runtime split explicit. Kept as an alias for backward compatibility. */

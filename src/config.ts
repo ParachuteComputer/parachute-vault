@@ -101,6 +101,15 @@ export interface VaultConfig {
   tag_schemas?: Record<string, TagSchema>;
   /** Tag name that marks a note as publicly viewable. Default: "published". */
   published_tag?: string;
+  /**
+   * What to do with audio files after successful transcription.
+   * - `"keep"` (default): leave the file on disk.
+   * - `"until_transcribed"`: unlink the file once the transcript lands;
+   *   the attachment row (including the stored transcript) is preserved.
+   *
+   * PR 3 adds `"never"` and surfaces this via GET/PATCH /api/vault.
+   */
+  audio_retention?: "keep" | "until_transcribed";
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +274,9 @@ function serializeVaultConfig(config: VaultConfig): string {
   if (config.published_tag) {
     lines.push(`published_tag: ${config.published_tag}`);
   }
+  if (config.audio_retention) {
+    lines.push(`audio_retention: ${config.audio_retention}`);
+  }
 
   lines.push("api_keys:");
   for (const key of config.api_keys) {
@@ -319,6 +331,12 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
 
   const pubTagMatch = yaml.match(/^published_tag:\s*(\S+)/m);
   if (pubTagMatch) config.published_tag = pubTagMatch[1];
+
+  const retentionMatch = yaml.match(/^audio_retention:\s*(\S+)/m);
+  if (retentionMatch) {
+    const v = retentionMatch[1];
+    if (v === "keep" || v === "until_transcribed") config.audio_retention = v;
+  }
 
   // Parse description (block scalar)
   const descMatch = yaml.match(/^description:\s*\|\s*\n((?:\s{2}.+\n?)+)/m);

@@ -19,6 +19,8 @@ import { getVaultStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { route } from "./routing.ts";
+import { startTranscriptionWorker, type TranscriptionWorker } from "./transcription-worker.ts";
+import { assetsDir } from "./routes.ts";
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -33,6 +35,27 @@ function registerConfiguredTriggers(): void {
 }
 
 registerConfiguredTriggers();
+
+/**
+ * Start the transcription worker if SCRIBE_URL is configured. The worker
+ * polls every vault for attachments with `metadata.transcribe_status = "pending"`
+ * and sends the audio to scribe. Absent SCRIBE_URL, the worker stays off
+ * — `{transcribe: true}` uploads still enqueue, they just wait.
+ */
+let transcriptionWorker: TranscriptionWorker | null = null;
+if (process.env.SCRIBE_URL) {
+  transcriptionWorker = startTranscriptionWorker({
+    vaultList: () => listVaults(),
+    getStore: (name) => getVaultStore(name),
+    scribeUrl: process.env.SCRIBE_URL,
+    scribeToken: process.env.SCRIBE_TOKEN,
+    resolveAssetsDir: (vault) => assetsDir(vault),
+    getAudioRetention: (vault) => readVaultConfig(vault)?.audio_retention ?? "keep",
+  });
+  console.log(`[transcribe] worker started → ${process.env.SCRIBE_URL}`);
+} else {
+  console.log("[transcribe] worker disabled (set SCRIBE_URL to enable)");
+}
 
 ensureConfigDirSync();
 loadEnvFile();
@@ -166,11 +189,14 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`\n[${signal}] shutting down; in-flight hooks: ${defaultHookRegistry.inFlightCount}`);
   try {
     await Promise.race([
-      defaultHookRegistry.drain(),
+      Promise.all([
+        defaultHookRegistry.drain(),
+        transcriptionWorker?.stop() ?? Promise.resolve(),
+      ]),
       new Promise<void>((resolve) => setTimeout(resolve, 5000)),
     ]);
   } catch (err) {
-    console.error("[shutdown] hook drain error:", err);
+    console.error("[shutdown] drain error:", err);
   }
   process.exit(0);
 }
