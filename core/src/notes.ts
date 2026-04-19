@@ -232,6 +232,26 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
+  // Presence: has_tags. When specific tags were already supplied, skip —
+  // the existing join/condition already enforces that any result has tags.
+  const filterByTags = Boolean(opts.tags && opts.tags.length > 0);
+  if (opts.hasTags !== undefined && !filterByTags) {
+    conditions.push(
+      opts.hasTags
+        ? `EXISTS (SELECT 1 FROM note_tags ht WHERE ht.note_id = n.id)`
+        : `NOT EXISTS (SELECT 1 FROM note_tags ht WHERE ht.note_id = n.id)`,
+    );
+  }
+
+  // Presence: has_links (either direction counts).
+  if (opts.hasLinks !== undefined) {
+    conditions.push(
+      opts.hasLinks
+        ? `EXISTS (SELECT 1 FROM links hl WHERE hl.source_id = n.id OR hl.target_id = n.id)`
+        : `NOT EXISTS (SELECT 1 FROM links hl WHERE hl.source_id = n.id OR hl.target_id = n.id)`,
+    );
+  }
+
   // Exact path match (case-insensitive)
   if (opts.path) {
     conditions.push("n.path = ? COLLATE NOCASE");

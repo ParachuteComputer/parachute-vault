@@ -6,6 +6,10 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Added
+
+- **`query-notes` gains `has_tags` and `has_links` presence filters.** Two new booleans on the `query-notes` MCP tool and the `GET /vault/<name>/api/notes` REST endpoint: `has_tags` (true = tagged-only, false = untagged-only) and `has_links` (true = notes with any inbound or outbound link, false = orphans in either direction). Composable with each other and with existing filters; `has_tags: false, has_links: false` returns the true loners. When `tag` is already set, `has_tags` is ignored — the tag filter is strictly narrower and wins. Implemented as correlated `EXISTS` / `NOT EXISTS` subqueries against `note_tags` and `links`, which lets SQLite use the existing indexes and stay O(rows) rather than O(rows × tags).
+
 ### Changed
 
 - **Breaking: every vault-touching route moved to `/vault/<name>/...`; unscoped routes removed.** There is one URL shape for every client, same layout whether you have one vault or ten. The API lives at `/vault/<name>/api/...`, MCP at `/vault/<name>/mcp`, OAuth at `/vault/<name>/oauth/{register,authorize,token}`, discovery at `/vault/<name>/.well-known/oauth-*`, published notes at `/vault/<name>/view/:id`. The old unscoped `/api`, `/mcp`, `/oauth/*`, `/view/*` paths — and the previous `/vaults/<name>/...` prefix — are gone; requests to them return 404. Cross-vault endpoints (`GET /vaults`, `GET /vaults/list`, `GET /health`) are unchanged. The unified MCP endpoint that fanned tool calls across vaults via a `vault` param has been dropped — each MCP session now pins to one vault by the URL and the `list-vaults` tool is no longer exposed. A new `WWW-Authenticate: Bearer resource_metadata="..."` header decorates every MCP 401 so OAuth-capable clients can discover the right authorization server directly from the challenge (RFC 9728).

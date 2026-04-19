@@ -550,6 +550,75 @@ describe("queryNotes", async () => {
     const results = await store.queryNotes({ limit: 3 });
     expect(results).toHaveLength(3);
   });
+
+  it("has_tags=false returns only untagged notes", async () => {
+    await store.createNote("Tagged", { tags: ["daily"] });
+    await store.createNote("Plain");
+
+    const results = await store.queryNotes({ hasTags: false });
+    expect(results.map((n) => n.content).sort()).toEqual(["Plain"]);
+  });
+
+  it("has_tags=true returns only tagged notes", async () => {
+    await store.createNote("Tagged", { tags: ["daily"] });
+    await store.createNote("Plain");
+
+    const results = await store.queryNotes({ hasTags: true });
+    expect(results.map((n) => n.content).sort()).toEqual(["Tagged"]);
+  });
+
+  it("has_tags is ignored when `tags` is also provided (tag filter wins)", async () => {
+    await store.createNote("A", { tags: ["daily"] });
+    await store.createNote("B");
+
+    // tags:["daily"] already constrains to tagged notes; has_tags is a no-op.
+    const truthy = await store.queryNotes({ tags: ["daily"], hasTags: true });
+    expect(truthy.map((n) => n.content)).toEqual(["A"]);
+
+    // `has_tags: false` would contradict `tags` — but tag filter wins, so "A" still returns.
+    const falsy = await store.queryNotes({ tags: ["daily"], hasTags: false });
+    expect(falsy.map((n) => n.content)).toEqual(["A"]);
+  });
+
+  it("has_links=false returns orphaned notes (no inbound or outbound links)", async () => {
+    const a = await store.createNote("A", { id: "ha" });
+    const b = await store.createNote("B", { id: "hb" });
+    await store.createNote("Orphan", { id: "ho" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    const orphans = await store.queryNotes({ hasLinks: false });
+    expect(orphans.map((n) => n.content).sort()).toEqual(["Orphan"]);
+  });
+
+  it("has_links=true returns notes with any link (inbound or outbound)", async () => {
+    const a = await store.createNote("Source", { id: "la" });
+    const b = await store.createNote("Target", { id: "lb" });
+    await store.createNote("Orphan", { id: "lo" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    // Both Source (outbound) and Target (inbound) should appear.
+    const linked = await store.queryNotes({ hasLinks: true });
+    expect(linked.map((n) => n.content).sort()).toEqual(["Source", "Target"]);
+  });
+
+  it("composes has_tags + has_links (untagged and orphaned)", async () => {
+    const a = await store.createNote("Tagged+linked", { tags: ["x"], id: "ca" });
+    const b = await store.createNote("Plain+linked", { id: "cb" });
+    await store.createNote("Tagged+orphan", { tags: ["x"], id: "cc" });
+    await store.createNote("Plain+orphan", { id: "cd" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    const loners = await store.queryNotes({ hasTags: false, hasLinks: false });
+    expect(loners.map((n) => n.content)).toEqual(["Plain+orphan"]);
+  });
+
+  it("has_tags=false composes with exclude_tags as a no-op (untagged notes have no tags to exclude)", async () => {
+    await store.createNote("Tagged", { tags: ["archived"] });
+    await store.createNote("Plain");
+
+    const results = await store.queryNotes({ hasTags: false, excludeTags: ["archived"] });
+    expect(results.map((n) => n.content)).toEqual(["Plain"]);
+  });
 });
 
 // ---- Search ----
@@ -1038,6 +1107,27 @@ describe("MCP tools", async () => {
     const query = tools.find((t) => t.name === "query-notes")!;
     const result = await query.execute({ tag: ["daily"] }) as any[];
     expect(result).toHaveLength(1);
+  });
+
+  it("query-notes has_tags=false surfaces untagged notes", async () => {
+    await store.createNote("Tagged", { tags: ["daily"] });
+    await store.createNote("Plain");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_tags: false, include_content: true }) as any[];
+    expect(result.map((n) => n.content)).toEqual(["Plain"]);
+  });
+
+  it("query-notes has_links=false surfaces orphaned notes", async () => {
+    const a = await store.createNote("Source", { id: "mq-a" });
+    const b = await store.createNote("Target", { id: "mq-b" });
+    await store.createNote("Orphan", { id: "mq-o" });
+    await store.createLink(a.id, b.id, "mentions");
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_links: false, include_content: true }) as any[];
+    expect(result.map((n) => n.content)).toEqual(["Orphan"]);
   });
 
   it("query-notes list defaults to no content (index mode)", async () => {

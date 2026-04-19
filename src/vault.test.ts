@@ -831,6 +831,24 @@ describe("HTTP /notes", async () => {
     expect(body).toHaveLength(1);
   });
 
+  test("GET /notes?has_tags=false returns only untagged notes", async () => {
+    await store.createNote("tagged", { tags: ["x"], path: "t" });
+    await store.createNote("plain", { path: "p" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_tags=false&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["plain"]);
+  });
+
+  test("GET /notes?has_links=false returns only orphaned notes", async () => {
+    const a = await store.createNote("src", { id: "qa" });
+    const b = await store.createNote("tgt", { id: "qb" });
+    await store.createNote("orphan", { id: "qo" });
+    await store.createLink(a.id, b.id, "mentions");
+    const res = await handleNotes(mkReq("GET", "/notes?has_links=false&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["orphan"]);
+  });
+
   test("GET /notes?search=fox&include_metadata=false strips metadata from search results", async () => {
     await store.createNote("The quick brown fox", { metadata: { summary: "animal" } });
     const res = await handleNotes(mkReq("GET", "/notes?search=fox&include_metadata=false"), store, "");
