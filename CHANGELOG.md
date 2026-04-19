@@ -6,6 +6,10 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Changed
+
+- **CLI renamed: `parachute` → `parachute-vault`.** The published `@openparachute/vault` package now exposes its binary as `parachute-vault`, freeing the `parachute` name for the forthcoming `@openparachute/cli` dispatcher that will front this service alongside sibling Parachute Computer services. Direct invocations become `parachute-vault init`, `parachute-vault status`, etc. Users installing the upcoming dispatcher can keep typing `parachute vault <cmd>` — the dispatcher forwards to `parachute-vault <cmd>` transparently. The CLI's own arg-parser still accepts a leading `vault` prefix (`parachute-vault vault init` works), so existing launchd / systemd wrappers that hardcode the full form continue to work across the upgrade.
+
 ### Added
 
 - **Atomic tag rename + merge endpoints.** `POST /api/tags/{name}/rename` with `{new_name}` rewrites the tag across `tags`, `note_tags`, and the schema row in a single transaction; `POST /api/tags/merge` with `{sources, target}` retags every note carrying any source tag onto the target (creating it if missing), preserves the target's schema, and drops the sources. Rename returns `409 {error: "target_exists"}` when `new_name` is already a tag, pointing clients at the merge endpoint instead of the previous N+1 client-side PATCH stopgap.

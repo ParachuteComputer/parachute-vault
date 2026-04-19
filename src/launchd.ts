@@ -3,7 +3,7 @@
  *
  * The plist runs `~/.parachute/start.sh` (the shared wrapper from
  * daemon.ts). The wrapper reads the pointer file at every boot, so
- * moving the repo only requires re-running `parachute vault init`.
+ * moving the repo only requires re-running `parachute-vault init`.
  */
 
 import { homedir } from "os";
@@ -45,7 +45,7 @@ export function generatePlist(): string {
 /**
  * Install or re-install the launchd agent. Idempotent: if the agent is
  * already loaded, it's unloaded first so the new wrapper + pointer take
- * effect. This is what makes `parachute vault init` safe to re-run after
+ * effect. This is what makes `parachute-vault init` safe to re-run after
  * a folder move — the incident that motivated this PR.
  */
 export async function installAgent(): Promise<{ serverPath: string }> {

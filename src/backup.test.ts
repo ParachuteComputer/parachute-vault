@@ -604,7 +604,7 @@ describe("backup — checkDestinationWritable", () => {
 });
 
 // ---------------------------------------------------------------------------
-// CLI integration — `parachute vault backup` + `backup status`
+// CLI integration — `parachute-vault backup` + `backup status`
 // ---------------------------------------------------------------------------
 
 describe("CLI — vault backup", () => {

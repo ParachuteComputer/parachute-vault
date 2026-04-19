@@ -552,7 +552,7 @@ export function pruneRetention(dir: string, policy: RetentionPolicy): number {
 
 /**
  * Run a single backup end-to-end: stage, tar, ship to destinations. This is
- * what `parachute vault backup` and the launchd-scheduled job both invoke.
+ * what `parachute-vault backup` and the launchd-scheduled job both invoke.
  *
  * The staging dir is cleaned up on exit; the tarball itself is kept (copied
  * to each destination) and also left behind in the staging dir's parent —

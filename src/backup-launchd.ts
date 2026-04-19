@@ -35,7 +35,7 @@ export const BACKUP_PLIST_PATH = join(homedir(), "Library", "LaunchAgents", `${B
  * Resolve the CLI path the backup job should invoke. Sibling-to-server.ts
  * — we reuse `resolveServerPath()`'s dirname-of-module approach so a move
  * of the repo updates both the daemon and the backup agent on the next
- * `parachute vault backup --schedule <f>` run.
+ * `parachute-vault backup --schedule <f>` run.
  */
 export function resolveCliPath(): string {
   const serverPath = resolveServerPath(); // <repo>/src/server.ts
