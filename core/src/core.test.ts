@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
+import { initSchema } from "./schema.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -68,7 +69,11 @@ describe("notes", async () => {
     const updated = await store.updateNote(note.id, { created_at: newDate });
     expect(updated.createdAt).toBe(newDate);
     expect(updated.content).toBe("Test"); // content unchanged
-    expect(updated.updatedAt).not.toBe(note.updatedAt); // updated_at bumped
+    // updated_at is bumped to "now" by the update path. Can't strictly
+    // differ from note.updatedAt (same-ms collision possible) but must be
+    // monotonically non-decreasing from the prior value.
+    expect(updated.updatedAt).toBeTruthy();
+    expect(updated.updatedAt! >= note.updatedAt!).toBe(true);
   });
 
   it("updates metadata and created_at together", async () => {
@@ -87,6 +92,36 @@ describe("notes", async () => {
     expect(updated.createdAt).toBe(note.createdAt);
   });
 
+  it("sets updatedAt === createdAt on insert", async () => {
+    const note = await store.createNote("Fresh");
+    expect(note.updatedAt).toBe(note.createdAt);
+    const fetched = (await store.getNote(note.id))!;
+    expect(fetched.updatedAt).toBe(fetched.createdAt);
+  });
+
+  it("create-insert updatedAt respects an explicit created_at", async () => {
+    const note = await store.createNote("Imported", {
+      created_at: "2024-02-14T09:30:00.000Z",
+    });
+    expect(note.createdAt).toBe("2024-02-14T09:30:00.000Z");
+    expect(note.updatedAt).toBe("2024-02-14T09:30:00.000Z");
+  });
+
+  it("fresh note: if_updated_at with createdAt as the token succeeds", async () => {
+    // Regression guard: clients that pass `updatedAt ?? createdAt` as the
+    // OC token used to hit a CONFLICT on the very first edit because stored
+    // `updated_at` was NULL. Insert-time backfill removes that class of
+    // spurious conflict.
+    const note = await store.createNote("First");
+    const updated = await store.updateNote(note.id, {
+      content: "Second",
+      if_updated_at: note.createdAt,
+    });
+    expect(updated.content).toBe("Second");
+    expect(updated.updatedAt).toBeTruthy();
+    expect(updated.updatedAt).not.toBe(note.createdAt);
+  });
+
   it("deletes a note", async () => {
     const note = await store.createNote("Delete me");
     await store.deleteNote(note.id);
@@ -100,6 +135,57 @@ describe("notes", async () => {
 
     await store.deleteNote("a");
     expect(await store.getLinks("b")).toHaveLength(0);
+  });
+});
+
+// ---- Backfill migration: legacy rows with NULL updated_at ----
+
+describe("updated_at backfill on init", async () => {
+  it("backfills updated_at = created_at for pre-existing NULL rows", () => {
+    const raw = new Database(":memory:");
+    initSchema(raw); // create tables
+
+    // Simulate a legacy row (pre-fix insert path left updated_at NULL).
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("legacy", "old", "2024-01-01T00:00:00.000Z", null);
+    const before = raw.prepare("SELECT updated_at FROM notes WHERE id = ?").get("legacy") as {
+      updated_at: string | null;
+    };
+    expect(before.updated_at).toBeNull();
+
+    // Re-run init: migration should backfill without touching the row otherwise.
+    initSchema(raw);
+    const after = raw.prepare("SELECT created_at, updated_at FROM notes WHERE id = ?").get(
+      "legacy",
+    ) as { created_at: string; updated_at: string };
+    expect(after.updated_at).toBe(after.created_at);
+    expect(after.created_at).toBe("2024-01-01T00:00:00.000Z");
+  });
+
+  it("leaves rows whose updated_at is already set untouched", () => {
+    const raw = new Database(":memory:");
+    initSchema(raw);
+
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("edited", "content", "2024-01-01T00:00:00.000Z", "2024-06-15T12:00:00.000Z");
+
+    initSchema(raw); // migration is idempotent
+
+    const row = raw.prepare("SELECT created_at, updated_at FROM notes WHERE id = ?").get(
+      "edited",
+    ) as { created_at: string; updated_at: string };
+    expect(row.created_at).toBe("2024-01-01T00:00:00.000Z");
+    expect(row.updated_at).toBe("2024-06-15T12:00:00.000Z");
+  });
+
+  it("is a no-op for a fresh vault with zero notes", () => {
+    const raw = new Database(":memory:");
+    initSchema(raw);
+    initSchema(raw);
+    const count = raw.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
+    expect(count.c).toBe(0);
   });
 });
 
@@ -808,9 +894,11 @@ describe("MCP tools", async () => {
     expect((await store.getNote(note.id))!.content).toBe("Second");
   });
 
-  it("update-note if_updated_at conflicts for a never-updated note when caller expects a value", async () => {
+  it("update-note if_updated_at conflicts when the caller's timestamp doesn't match", async () => {
     const note = await store.createNote("First");
-    expect(note.updatedAt).toBeUndefined();
+    // A fresh note has updatedAt === createdAt. Sending a
+    // mismatching timestamp must still be rejected as a conflict.
+    expect(note.updatedAt).toBe(note.createdAt);
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
@@ -826,7 +914,7 @@ describe("MCP tools", async () => {
     }
     expect(err).toBeTruthy();
     expect(err.code).toBe("CONFLICT");
-    expect(err.current_updated_at).toBeNull();
+    expect(err.current_updated_at).toBe(note.createdAt);
   });
 
   it("update-note batch aborts on first conflict without touching subsequent items", async () => {

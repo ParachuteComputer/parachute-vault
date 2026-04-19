@@ -60,25 +60,31 @@ describe("BunStore", async () => {
 
   test("user updates bump updatedAt", async () => {
     const note = await store.createNote("Original");
-    expect(note.updatedAt).toBeUndefined();
+    expect(note.updatedAt).toBe(note.createdAt);
     const updated = await store.updateNote(note.id, { content: "Edited by user" });
     expect(updated.updatedAt).toBeTruthy();
+    // Must be monotonically non-decreasing — and strictly greater when the
+    // caller passed if_updated_at (tested elsewhere). Same-millisecond
+    // collisions are possible here since no if_updated_at is supplied.
+    expect(updated.updatedAt! >= note.createdAt).toBe(true);
   });
 
   test("skipUpdatedAt preserves updatedAt (hook-style writes)", async () => {
     // Hook writes (e.g., the reader-audio hook's metadata markers) must not
     // count as user activity. See issue #44 — hook writes were bumping
-    // updatedAt and wrecking Daily's reader sort.
+    // updatedAt and wrecking Daily's reader sort. Fresh notes have
+    // `updatedAt === createdAt`; a hook write must leave it at that value so
+    // `updatedAt > createdAt` remains the correct "user-touched" signal.
     const note = await store.createNote("Content");
-    expect(note.updatedAt).toBeUndefined();
+    expect(note.updatedAt).toBe(note.createdAt);
 
-    // Fresh note: a machine write must not set updatedAt.
+    // Fresh note: a machine write must not advance updatedAt past createdAt.
     await store.updateNote(note.id, {
       metadata: { audio_pending_at: "2026-04-09T10:00:00.000Z" },
       skipUpdatedAt: true,
     });
     let fetched = (await store.getNote(note.id))!;
-    expect(fetched.updatedAt).toBeUndefined();
+    expect(fetched.updatedAt).toBe(note.createdAt);
     expect((fetched.metadata as { audio_pending_at?: string } | undefined)?.audio_pending_at).toBe(
       "2026-04-09T10:00:00.000Z",
     );
