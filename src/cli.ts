@@ -78,6 +78,7 @@ import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import { getVaultStore } from "./vault-store.ts";
+import { upsertService, ServicesManifestError } from "./services-manifest.ts";
 import {
   hasOwnerPassword,
   setOwnerPassword,
@@ -248,6 +249,23 @@ async function cmdInit() {
     }
   }
   writeGlobalConfig(globalConfig);
+
+  // 2a. Register in the shared services manifest so the @openparachute/cli
+  // dispatcher can discover this service and its health endpoint. Upserts
+  // by name, preserving entries for other services. Non-fatal on failure —
+  // init can complete without the manifest, just with a warning.
+  try {
+    upsertService({
+      name: "parachute-vault",
+      port: globalConfig.port || DEFAULT_PORT,
+      paths: ["/"],
+      health: "/health",
+      version: pkg.version,
+    });
+  } catch (err) {
+    const msg = err instanceof ServicesManifestError ? err.message : String(err);
+    console.log(`  Warning: could not update ~/.parachute/services.json: ${msg}`);
+  }
 
   // 2b. Migrate existing legacy keys into per-vault token tables
   for (const v of listVaults()) {
