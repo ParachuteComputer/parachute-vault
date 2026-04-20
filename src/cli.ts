@@ -2018,10 +2018,10 @@ function usage() {
   console.log(`
 Parachute Vault — self-hosted knowledge graph
 
-If you installed via the Parachute CLI, prefer the wrapper commands for
-lifecycle — \`parachute start vault\`, \`parachute stop vault\`,
-\`parachute status\` — and use the vault-direct commands below for setup,
-data, and debugging.
+If you installed via the Parachute CLI, prefer the wrapper commands — lifecycle
+(\`parachute start vault\`, \`parachute stop vault\`, \`parachute status\`) and
+identity (\`parachute auth *\`) both dispatch into this binary. Reach for the
+vault-direct commands below for setup, data, and debugging.
 
 ── Standard use ───────────────────────────────────────────────────────
 
@@ -2050,14 +2050,6 @@ Tokens:
   parachute-vault tokens create --expires 30d     Expiring token
   parachute-vault tokens revoke <token-id>        Revoke a token (default vault)
 
-OAuth:
-  parachute-vault set-password             Set/change the owner password (for consent page)
-  parachute-vault set-password --clear     Remove the owner password
-  parachute-vault 2fa status               Show 2FA state
-  parachute-vault 2fa enroll               Enable TOTP 2FA (QR + backup codes)
-  parachute-vault 2fa disable              Disable 2FA (requires password)
-  parachute-vault 2fa backup-codes         Regenerate backup codes
-
 Config:
   parachute-vault config                   Show current configuration
   parachute-vault config set <key> <val>   Set a config value
@@ -2075,15 +2067,30 @@ Import/Export:
 
 ── Advanced / standalone ──────────────────────────────────────────────
 
-Direct daemon controls. For normal use, prefer the Parachute CLI wrappers
-— they add PID tracking, log rotation, and cross-service \`parachute status\`
-visibility. Use these when running vault without the CLI or when debugging.
+Vault-direct implementation commands. For normal use, prefer the Parachute
+CLI wrappers: lifecycle (\`parachute start/stop/status\`) and identity
+(\`parachute auth *\`) both dispatch into these. Reach for them directly when
+running vault standalone or when debugging.
 
+Daemon:
   parachute-vault serve                    Run server in the foreground (no PID tracking).
                                            Prefer \`parachute start vault\` for managed lifecycle.
   parachute-vault status                   Vault-only daemon status.
                                            Prefer \`parachute status\` for a cross-service view.
   parachute-vault logs                     Stream server logs
   parachute-vault restart                  Restart the daemon
+
+Identity:
+  parachute-vault set-password             Set/change the owner password (for consent page).
+                                           Prefer \`parachute auth set-password\`.
+  parachute-vault set-password --clear     Remove the owner password.
+  parachute-vault 2fa status               Show 2FA state.
+                                           Prefer \`parachute auth 2fa status\`.
+  parachute-vault 2fa enroll               Enable TOTP 2FA (QR + backup codes).
+                                           Prefer \`parachute auth 2fa enroll\`.
+  parachute-vault 2fa disable              Disable 2FA (requires password).
+                                           Prefer \`parachute auth 2fa disable\`.
+  parachute-vault 2fa backup-codes         Regenerate backup codes.
+                                           Prefer \`parachute auth 2fa backup-codes\`.
 `);
 }
