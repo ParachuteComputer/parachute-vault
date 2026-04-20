@@ -5,6 +5,9 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { initSchema } from "../core/src/schema.ts";
 import { generateToken, createToken, resolveToken } from "./token-store.ts";
 import {
@@ -1502,5 +1505,241 @@ describe("OAuth token — cross-vault code replay", () => {
     const body = await tokenRes.json();
     expect(body.vault).toBe("vault-a");
     expect(body.access_token).toMatch(/^pvt_/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 0+1: PARACHUTE_HUB_ORIGIN + service catalog in token response
+// ---------------------------------------------------------------------------
+
+describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
+  const HUB = "https://hub.example";
+  let origHub: string | undefined;
+  let origHome: string | undefined;
+  let tmpHome: string;
+
+  beforeEach(() => {
+    origHub = process.env.PARACHUTE_HUB_ORIGIN;
+    origHome = process.env.PARACHUTE_HOME;
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "vault-oauth-phase0-"));
+    process.env.PARACHUTE_HOME = tmpHome;
+  });
+
+  afterEach(() => {
+    if (origHub === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
+    else process.env.PARACHUTE_HUB_ORIGIN = origHub;
+    if (origHome === undefined) delete process.env.PARACHUTE_HOME;
+    else process.env.PARACHUTE_HOME = origHome;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  test("discovery: issuer + endpoints point at the hub when env is set", () => {
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "default");
+    expect(res.status).toBe(200);
+    return res.json().then((body: any) => {
+      expect(body.issuer).toBe(HUB);
+      expect(body.authorization_endpoint).toBe(`${HUB}/oauth/authorize`);
+      expect(body.token_endpoint).toBe(`${HUB}/oauth/token`);
+      expect(body.registration_endpoint).toBe(`${HUB}/oauth/register`);
+      expect(body.scopes_supported).toContain("vault:read");
+      expect(body.scopes_supported).toContain("vault:write");
+    });
+  });
+
+  test("discovery: trailing slash on hub origin is stripped", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = `${HUB}/`;
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "default");
+    const body = await res.json();
+    expect(body.issuer).toBe(HUB);
+    expect(body.token_endpoint).toBe(`${HUB}/oauth/token`);
+  });
+
+  test("discovery: protected-resource metadata uses hub as authorization_server", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req, "default");
+    const body = await res.json();
+    expect(body.authorization_servers).toEqual([HUB]);
+    // Resource URL still reflects the vault's own origin — that's where the
+    // MCP endpoint actually lives.
+    expect(body.resource).toBe("https://vault.test/vault/default/mcp");
+    expect(body.scopes_supported).toContain("vault:read");
+  });
+
+  test("discovery: falls back to vault origin when env is unset", async () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "default");
+    const body = await res.json();
+    expect(body.issuer).toBe("https://vault.test/vault/default");
+    expect(body.token_endpoint).toBe("https://vault.test/vault/default/oauth/token");
+  });
+
+  test("scopes_supported publishes new shape alongside legacy names", async () => {
+    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "default");
+    const body = await res.json();
+    expect(body.scopes_supported).toEqual(expect.arrayContaining(["vault:read", "vault:write", "full", "read"]));
+  });
+
+  test("token response includes iss = hub and an additive services field", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    const token = await fullOAuthFlow();
+    // Re-issue a token to inspect the body (fullOAuthFlow returns only the string)
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/vault/default/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/vault/default/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = await tokenRes.json();
+    expect(body.iss).toBe(HUB);
+    expect(body.services).toEqual({});
+    // Back-compat: access_token still present and unchanged shape-wise.
+    expect(body.access_token).toMatch(/^pvt_/);
+    expect(token).toMatch(/^pvt_/);
+  });
+
+  test("token response services catalog reflects services.json when present", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    fs.writeFileSync(
+      path.join(tmpHome, "services.json"),
+      JSON.stringify({
+        services: [
+          { name: "vault", port: 1940, paths: ["/vault/default"], health: "/health", version: "0.3.0" },
+          { name: "notes", port: 1941, paths: ["/notes"], health: "/health", version: "0.1.0" },
+        ],
+      }),
+    );
+
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/vault/default/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/vault/default/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    const body = await tokenRes.json();
+    expect(body.services).toEqual({
+      vault: { url: `${HUB}/vault/default`, version: "0.3.0" },
+      notes: { url: `${HUB}/notes`, version: "0.1.0" },
+    });
+  });
+
+  test("token response services catalog falls back to vault origin when hub env unset", async () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    fs.writeFileSync(
+      path.join(tmpHome, "services.json"),
+      JSON.stringify({
+        services: [
+          { name: "vault", port: 1940, paths: ["/vault/default"], health: "/health", version: "0.3.0" },
+        ],
+      }),
+    );
+
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/vault/default/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/vault/default/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    const body = await tokenRes.json();
+    expect(body.iss).toBe("https://vault.test/vault/default");
+    expect(body.services).toEqual({
+      vault: { url: "https://vault.test/vault/default", version: "0.3.0" },
+    });
   });
 });

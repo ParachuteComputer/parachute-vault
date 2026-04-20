@@ -123,6 +123,10 @@ function handleParachuteInfo(vaultName: string): Response {
     tagline: "Agent-native knowledge graph — notes, tags, links, attachments over REST + MCP",
     version: pkg.version,
     iconUrl: `/vault/${vaultName}/.parachute/icon.svg`,
+    // Hub renders `kind: "api"` cards as an expandable detail panel (MCP URL,
+    // OAuth link, version) rather than navigating to the API's root. Vault
+    // has no browser UI, so navigating to it shows raw JSON — not useful.
+    kind: "api",
   };
   return Response.json(body, {
     headers: { "Access-Control-Allow-Origin": "*" },

@@ -19,6 +19,7 @@ import { generateToken, createToken, resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import { verifyOwnerPassword, authorizeRateLimit, type RateLimiter } from "./owner-auth.ts";
 import { verifyTotpCode, verifyAndConsumeBackupCode } from "./two-factor.ts";
+import { readManifest, ServicesManifestError } from "./services-manifest.ts";
 
 /** Options for handleAuthorizePost. */
 export interface AuthorizePostOptions {
@@ -63,6 +64,83 @@ export function getBaseUrl(req: Request): string {
   return url.origin;
 }
 
+/**
+ * OAuth endpoint coordinates — honors `PARACHUTE_HUB_ORIGIN` (Phase 0 of the
+ * hub-as-OAuth-issuer design, 2026-04-20). When the hub origin env is set, the
+ * vault advertises *the hub* as the issuer and publishes hub-rooted endpoint
+ * URLs; the CLI is responsible for routing `${hub}/oauth/*` at the
+ * tailscale/reverse-proxy layer into the vault's real endpoints. Internally
+ * vault still handles the OAuth flow on its own `/vault/<name>/oauth/*`
+ * routes — those don't move and remain reachable for standalone deployments.
+ *
+ * When the env is unset (standalone vault, no hub), behavior is unchanged
+ * from pre-Phase-0: vault advertises itself as the issuer.
+ */
+export function resolveOAuthCoordinates(
+  req: Request,
+  vaultName: string,
+): {
+  issuer: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  registrationEndpoint: string;
+} {
+  const hub = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
+  if (hub) {
+    return {
+      issuer: hub,
+      authorizationEndpoint: `${hub}/oauth/authorize`,
+      tokenEndpoint: `${hub}/oauth/token`,
+      registrationEndpoint: `${hub}/oauth/register`,
+    };
+  }
+  const base = getBaseUrl(req);
+  const prefix = `/vault/${vaultName}`;
+  return {
+    issuer: `${base}${prefix}`,
+    authorizationEndpoint: `${base}${prefix}/oauth/authorize`,
+    tokenEndpoint: `${base}${prefix}/oauth/token`,
+    registrationEndpoint: `${base}${prefix}/oauth/register`,
+  };
+}
+
+/**
+ * Ecosystem service catalog for the token response (Phase 1 of the
+ * hub-as-OAuth-issuer design). Reads `~/.parachute/services.json` — the same
+ * manifest the CLI maintains — and rewrites each entry's canonical path into
+ * an absolute URL, using `PARACHUTE_HUB_ORIGIN` when set (so clients get the
+ * externally-reachable URL) and falling back to the request origin otherwise.
+ *
+ * Failure to read the manifest is non-fatal: we log and return an empty
+ * catalog rather than refusing to issue the token. The token response shape
+ * is additive — clients that don't expect `services` ignore it.
+ */
+export function buildServiceCatalog(
+  req: Request,
+): Record<string, { url: string; version: string }> {
+  let entries: ReturnType<typeof readManifest>["services"];
+  try {
+    entries = readManifest().services;
+  } catch (err) {
+    if (err instanceof ServicesManifestError) {
+      console.warn(`[parachute-vault] services.json unreadable: ${err.message}`);
+      return {};
+    }
+    throw err;
+  }
+  const hub = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
+  const origin = hub ?? getBaseUrl(req);
+  const catalog: Record<string, { url: string; version: string }> = {};
+  for (const entry of entries) {
+    const path = entry.paths[0] ?? "/";
+    catalog[entry.name] = {
+      url: `${origin}${path}`,
+      version: entry.version,
+    };
+  }
+  return catalog;
+}
+
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -81,36 +159,52 @@ function escapeHtml(s: string): string {
  *                    at `{base}/vault/{name}/.well-known/oauth-authorization-server`.
  */
 export function handleProtectedResource(req: Request, vaultName: string): Response {
+  const { issuer } = resolveOAuthCoordinates(req, vaultName);
   const base = getBaseUrl(req);
   const prefix = `/vault/${vaultName}`;
   return Response.json({
     resource: `${base}${prefix}/mcp`,
-    authorization_servers: [`${base}${prefix}`],
-    scopes_supported: ["full", "read"],
+    // `authorization_servers` points clients at the AS metadata doc. When the
+    // hub is the issuer (Phase 0), the AS metadata still lives on the vault
+    // itself — it's the document that tells clients where the hub endpoints
+    // are. So we use the issuer as the AS locator when set, otherwise the
+    // vault origin.
+    authorization_servers: [issuer],
+    scopes_supported: SCOPES_SUPPORTED,
     bearer_methods_supported: ["header"],
   });
 }
 
 /**
- * OAuth 2.0 Authorization Server Metadata (RFC 8414). The endpoints are
- * vault-scoped under `/vault/<name>/oauth/*`; tokens minted via these
- * endpoints are scoped to the named vault's DB.
+ * OAuth 2.0 Authorization Server Metadata (RFC 8414). Endpoint URLs and
+ * `issuer` honor `PARACHUTE_HUB_ORIGIN` when set — see
+ * `resolveOAuthCoordinates` for the hub-vs-standalone contract.
  */
 export function handleAuthorizationServer(req: Request, vaultName: string): Response {
-  const base = getBaseUrl(req);
-  const prefix = `/vault/${vaultName}`;
+  const coord = resolveOAuthCoordinates(req, vaultName);
   return Response.json({
-    issuer: `${base}${prefix}`,
-    authorization_endpoint: `${base}${prefix}/oauth/authorize`,
-    token_endpoint: `${base}${prefix}/oauth/token`,
-    registration_endpoint: `${base}${prefix}/oauth/register`,
+    issuer: coord.issuer,
+    authorization_endpoint: coord.authorizationEndpoint,
+    token_endpoint: coord.tokenEndpoint,
+    registration_endpoint: coord.registrationEndpoint,
     response_types_supported: ["code"],
     code_challenge_methods_supported: ["S256"],
     grant_types_supported: ["authorization_code"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["full", "read"],
+    scopes_supported: SCOPES_SUPPORTED,
   });
 }
+
+/**
+ * Scopes published in OAuth discovery. Phase 0 publishes the final shape but
+ * does not enforce per-scope distinctions yet — all issued tokens continue to
+ * grant full access. `vault:<name>:*` refinements are documented as future
+ * shape; the scope parser accepts them as synonyms for `vault:*` for now.
+ *
+ * Legacy `full`/`read` remain in the list for back-compat with 0.2.x clients
+ * that hardcoded those names.
+ */
+const SCOPES_SUPPORTED = ["vault:read", "vault:write", "full", "read"];
 
 // ---------------------------------------------------------------------------
 // Dynamic Client Registration (RFC 7591)
@@ -509,11 +603,19 @@ export async function handleToken(
     permission,
   });
 
+  const { issuer } = resolveOAuthCoordinates(req, vaultName);
   return Response.json({
     access_token: fullToken,
     token_type: "bearer",
     scope: permission,
     vault: vaultName,
+    // Phase 0: identify the issuer so tokens validated by downstream services
+    // can pin trust on the hub-origin URL, not vault's internal address.
+    iss: issuer,
+    // Phase 1: bundle the ecosystem service catalog so Notes/clients learn
+    // all sibling service URLs from the token response and don't need to
+    // prompt the user for each one. Additive field — older clients ignore.
+    services: buildServiceCatalog(req),
   });
 }
 
