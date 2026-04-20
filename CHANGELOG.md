@@ -6,6 +6,10 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Changed
+
+- **Filesystem hygiene inside `~/.parachute/vault/`: `vaults/` → `data/`, and logs moved into `logs/`.** Two internal moves with the same target-wins, idempotent, auto-migrating shape as the 0.3 ecosystem-root move. Per-vault SQLite state now lives at `~/.parachute/vault/data/<name>/` (was `vaults/<name>/`) — matches the Postgres/Redis convention and avoids the doubled "vault/vaults" path. Daemon logs now live at `~/.parachute/vault/logs/vault.log` and `~/.parachute/vault/logs/vault.err` (were flat in `~/.parachute/vault/`) — matches the `~/.parachute/<svc>/logs/<svc>.log` convention the CLI uses for every sibling service. On first post-upgrade run the vault auto-migrates `vault/vaults/` → `vault/data/` and `vault/vault.log`/`vault.err` → `vault/logs/`, logging each move to stderr. Target-wins on conflict: if both `vault/data/` and `vault/vaults/` exist (or both log locations), the new one is kept and the legacy copy is left in place with a warning. No user action required — any `parachute-vault` invocation triggers the migration. Note: vault does not use `~/.parachute/tokens.db` (no code references it), so it is not part of this move; the CLI will archive that file separately.
+
 ### Added
 
 - **`GET /vault/<name>/.parachute/info` + `/.parachute/icon.svg` for the CLI hub page.** Two public (no auth), CORS-`*` endpoints so the ecosystem-root hub rendered by the CLI can aggregate service cards. `info` returns a locked card shape — `name`, `displayName`, `tagline`, `version` (from `package.json`), `iconUrl` — and `icon.svg` returns a small placeholder monogram inline. Zero PII, read-only. Non-GET methods return 405.
