@@ -993,7 +993,7 @@ describe("OAuth consent — scope selection", () => {
       "default",
     );
     const body = await tokenRes.json();
-    expect(body.scope).toBe("read");
+    expect(body.scope).toBe("vault:read");
   });
 
   test("defaults selected_scope to requested scope when not provided", async () => {
@@ -1036,7 +1036,7 @@ describe("OAuth consent — scope selection", () => {
       "default",
     );
     const body = await tokenRes.json();
-    expect(body.scope).toBe("read");
+    expect(body.scope).toBe("vault:read");
   });
 
   test("consent HTML includes both scope radio buttons", async () => {
@@ -1307,7 +1307,7 @@ describe("OAuth token response — vault name", () => {
     expect(body.access_token).toMatch(/^pvt_/);
     expect(body.vault).toBe("default");
     expect(body.token_type).toBe("bearer");
-    expect(body.scope).toBe("full");
+    expect(body.scope).toBe("vault:read vault:write vault:admin");
   });
 
   test("includes vault name for a scoped (named-vault) flow", async () => {

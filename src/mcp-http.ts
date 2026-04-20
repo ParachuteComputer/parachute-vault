@@ -24,14 +24,41 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
-import { isToolAllowed } from "./auth.ts";
+import { requireScope } from "./auth.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import { SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
+
+/**
+ * Required scope for each MCP tool. Tools that mutate note/tag state require
+ * `vault:write`; pure query tools need `vault:read`. `vault-info` is listed as
+ * read because read-only callers can fetch stats — the description-update
+ * branch inside vault-info performs its own secondary `vault:write` check
+ * (see `overrideVaultInfo` in mcp-tools.ts). Do not assume the outer gate
+ * alone protects the inner branch.
+ */
+const TOOL_REQUIRED_SCOPE: Record<string, string> = {
+  "query-notes": SCOPE_READ,
+  "list-tags": SCOPE_READ,
+  "find-path": SCOPE_READ,
+  "vault-info": SCOPE_READ,
+  "create-note": SCOPE_WRITE,
+  "update-note": SCOPE_WRITE,
+  "delete-note": SCOPE_WRITE,
+  "update-tag": SCOPE_WRITE,
+  "delete-tag": SCOPE_WRITE,
+};
+
+function requiredScopeForTool(toolName: string): string {
+  // Default-deny: unknown tools require write. Keeps accidental reads of
+  // a not-yet-mapped mutation tool from slipping past.
+  return TOOL_REQUIRED_SCOPE[toolName] ?? SCOPE_WRITE;
+}
 
 /** Handle scoped MCP at /vault/{name}/mcp (single vault). */
 export async function handleScopedMcp(req: Request, vaultName: string, auth: AuthResult): Promise<Response> {
   const instruction = getServerInstruction(vaultName);
-  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, auth, instruction);
+  return handleMcp(req, () => generateScopedMcpTools(vaultName, auth), `parachute-vault/${vaultName}`, auth, instruction);
 }
 
 async function handleMcp(
@@ -41,7 +68,6 @@ async function handleMcp(
   auth: AuthResult,
   instruction: string,
 ): Promise<Response> {
-  const { permission } = auth;
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -57,10 +83,13 @@ async function handleMcp(
 
   const mcpTools = getTools();
 
-  // For read-only keys, only list readable tools
-  const visibleTools = permission === "read"
-    ? mcpTools.filter((t) => isToolAllowed(t.name, "read"))
-    : mcpTools;
+  // Filter the advertised tool list to what the caller's scopes actually
+  // permit. Callers without `vault:write` don't see mutation tools at all —
+  // matches the prior behavior of the read/full permission model but is now
+  // driven by scope inheritance.
+  const visibleTools = mcpTools.filter((t) =>
+    requireScope(auth, requiredScopeForTool(t.name)),
+  );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: visibleTools.map((t) => ({
@@ -73,9 +102,13 @@ async function handleMcp(
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    if (!isToolAllowed(name, permission)) {
+    const neededScope = requiredScopeForTool(name);
+    if (!requireScope(auth, neededScope)) {
       return {
-        content: [{ type: "text" as const, text: `Forbidden: insufficient permissions to call ${name}` }],
+        content: [{
+          type: "text" as const,
+          text: `Forbidden: tool '${name}' requires the '${neededScope}' scope. Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
+        }],
         isError: true,
       };
     }

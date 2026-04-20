@@ -40,7 +40,8 @@ const {
 // clearVaultStoreCache was added in #111 for exactly this kind of test
 // that wipes its PARACHUTE_HOME between runs — it closes stores silently
 // even when the DB files are already gone.
-const { clearVaultStoreCache } = await import("./vault-store.ts");
+const { clearVaultStoreCache, getVaultStore } = await import("./vault-store.ts");
+const { generateToken, createToken } = await import("./token-store.ts");
 
 function createVault(name: string, description?: string): void {
   writeVaultConfig({
@@ -49,6 +50,21 @@ function createVault(name: string, description?: string): void {
     created_at: new Date().toISOString(),
     description,
   });
+}
+
+/**
+ * Mint an admin-scoped token for `vaultName` and return its bearer value.
+ * Used by tests that hit admin-gated endpoints (e.g. /.parachute/config).
+ */
+function createAdminToken(vaultName: string): string {
+  const store = getVaultStore(vaultName);
+  const { fullToken } = generateToken();
+  createToken(store.db, fullToken, {
+    label: "test-admin",
+    permission: "full",
+    scopes: ["vault:read", "vault:write", "vault:admin"],
+  });
+  return fullToken;
 }
 
 function reset(): void {
@@ -793,13 +809,19 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
 
   test("config returns current values with writeOnly fields excluded", async () => {
     createVault("journal");
+    const token = createAdminToken("journal");
     const path = "/vault/journal/.parachute/config";
     const origScribeToken = process.env.SCRIBE_TOKEN;
     const origScribeUrl = process.env.SCRIBE_URL;
     process.env.SCRIBE_TOKEN = "super-secret-should-never-appear";
     process.env.SCRIBE_URL = "https://scribe.example/v1";
     try {
-      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      const res = await route(
+        new Request(`http://localhost:1940${path}`, {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        path,
+      );
       expect(res.status).toBe(200);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.audio_retention).toBe("keep"); // default when unset
@@ -824,19 +846,31 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
       created_at: new Date().toISOString(),
       audio_retention: "until_transcribed",
     });
+    const token = createAdminToken("journal");
     const path = "/vault/journal/.parachute/config";
-    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      path,
+    );
     const body = (await res.json()) as { audio_retention: string };
     expect(body.audio_retention).toBe("until_transcribed");
   });
 
   test("config scribe_url falls back to empty string when SCRIBE_URL env is unset", async () => {
     createVault("journal");
+    const token = createAdminToken("journal");
     const orig = process.env.SCRIBE_URL;
     delete process.env.SCRIBE_URL;
     try {
       const path = "/vault/journal/.parachute/config";
-      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      const res = await route(
+        new Request(`http://localhost:1940${path}`, {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        path,
+      );
       const body = (await res.json()) as { scribe_url: string };
       expect(body.scribe_url).toBe("");
     } finally {
@@ -871,14 +905,274 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
     }
   });
 
-  test("endpoints are public — no auth header required (Phase 2 pre-enforcement)", async () => {
+  test("schema endpoint is public — hub form renders without auth", async () => {
     createVault("journal");
-    for (const path of [
-      "/vault/journal/.parachute/config/schema",
-      "/vault/journal/.parachute/config",
-    ]) {
-      const res = await route(new Request(`http://localhost:1940${path}`), path);
-      expect(res.status).toBe(200);
+    const path = "/vault/journal/.parachute/config/schema";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("config endpoint requires vault:admin — unauthenticated GET returns 401", async () => {
+    createVault("journal");
+    const path = "/vault/journal/.parachute/config";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(401);
+  });
+
+  test("config endpoint rejects a vault:read token with 403 + insufficient_scope", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
+      label: "reader",
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+    const path = "/vault/journal/.parachute/config";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        headers: { authorization: `Bearer ${fullToken}` },
+      }),
+      path,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope enforcement on /api/* — PR D (task #97).
+//
+// The REST surface picks the required scope per method (GET → vault:read,
+// POST/PATCH/DELETE → vault:write). These tests pin the full matrix:
+// read-only rejected on writes, write succeeds on GET via inheritance, admin
+// succeeds everywhere, legacy DB rows with NULL scopes keep working, and the
+// 403 body names the required scope so agents can diagnose without tracing.
+// ---------------------------------------------------------------------------
+
+describe("scope enforcement on /api/*", () => {
+  /** Mint a token with the given scopes and return its bearer value. */
+  function mintToken(
+    vaultName: string,
+    opts: {
+      permission: "full" | "read";
+      scopes?: string[];
+      legacyNullScopes?: boolean;
+    },
+  ): string {
+    const store = getVaultStore(vaultName);
+    const { fullToken } = generateToken();
+    if (opts.legacyNullScopes) {
+      // Simulate a pre-v12 token row: NULL scopes column, legacy permission
+      // value. resolveToken should fall back via legacyPermissionToScopes.
+      const { hashKey } = require("./config.ts");
+      const hash = hashKey(fullToken);
+      store.db.prepare(
+        "INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)",
+      ).run(hash, `legacy-${opts.permission}`, opts.permission, new Date().toISOString());
+    } else {
+      createToken(store.db, fullToken, {
+        label: `test-${opts.permission}`,
+        permission: opts.permission,
+        scopes: opts.scopes,
+      });
     }
+    return fullToken;
+  }
+
+  function authed(token: string, method = "GET", path: string): Request {
+    return new Request(`http://localhost:1940${path}`, {
+      method,
+      headers: { authorization: `Bearer ${token}` },
+    });
+  }
+
+  test("vault:read token permits GET /api/vault", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+    const path = "/vault/journal/api/vault";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("vault:read token rejected on POST /api/notes with 403 insufficient_scope", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ content: "nope" }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string; granted_scopes?: string[] };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:write");
+    expect(body.granted_scopes).toEqual(["vault:read"]);
+  });
+
+  test("vault:write token permits GET (inheritance: write ⊇ read)", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "full",
+      scopes: ["vault:write"],
+    });
+    const path = "/vault/journal/api/vault";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("vault:write token permits POST /api/notes", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "full",
+      scopes: ["vault:write"],
+    });
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ content: "hi" }),
+      }),
+      path,
+    );
+    // 200/201 means scope gate allowed through — we don't care about the
+    // shape of the note here, just that we got past auth.
+    expect(res.status).toBeLessThan(400);
+  });
+
+  test("vault:admin token permits admin-only /.parachute/config", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "full",
+      scopes: ["vault:admin"],
+    });
+    const path = "/vault/journal/.parachute/config";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("vault:admin token permits GET + POST via inheritance", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "full",
+      scopes: ["vault:admin"],
+    });
+    const getPath = "/vault/journal/api/vault";
+    const getRes = await route(authed(token, "GET", getPath), getPath);
+    expect(getRes.status).toBe(200);
+
+    const postPath = "/vault/journal/api/notes";
+    const postRes = await route(
+      new Request(`http://localhost:1940${postPath}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ content: "hi" }),
+      }),
+      postPath,
+    );
+    expect(postRes.status).toBeLessThan(400);
+  });
+
+  test("legacy token (NULL scopes, permission='full') still works on writes", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "full",
+      legacyNullScopes: true,
+    });
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ content: "legacy" }),
+      }),
+      path,
+    );
+    expect(res.status).toBeLessThan(400);
+  });
+
+  test("legacy token (NULL scopes, permission='read') rejected on writes", async () => {
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "read",
+      legacyNullScopes: true,
+    });
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ content: "nope" }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { required_scope?: string };
+    expect(body.required_scope).toBe("vault:write");
+  });
+
+  test("unauthenticated request to /api returns 401 (not 403)", async () => {
+    createVault("journal");
+    const path = "/vault/journal/api/vault";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(401);
+  });
+
+  test("CLI --read equivalent token (permission='read', scopes=[vault:read]) is read-only at the HTTP boundary", async () => {
+    // This pins the end-to-end contract: a token minted the way
+    // `parachute-vault tokens create --read` mints them actually refuses
+    // writes. Without this, a cosmetic `--read` flag could silently allow
+    // mutations — the whole point of the review item.
+    createVault("journal");
+    const token = mintToken("journal", {
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+
+    const readPath = "/vault/journal/api/vault";
+    const readRes = await route(authed(token, "GET", readPath), readPath);
+    expect(readRes.status).toBe(200);
+
+    const writePath = "/vault/journal/api/notes";
+    const writeRes = await route(
+      new Request(`http://localhost:1940${writePath}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ content: "nope" }),
+      }),
+      writePath,
+    );
+    expect(writeRes.status).toBe(403);
   });
 });
