@@ -20,6 +20,8 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ErrorCode,
+  McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
 import { isToolAllowed } from "./auth.ts";
@@ -91,7 +93,35 @@ async function handleMcp(
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };
     } catch (err) {
+      // Domain errors from the core tools (conflict, missing precondition) get
+      // surfaced as JSON-RPC errors with a structured `data` field so an
+      // agent can key off `data.error_type` and the concurrency tokens.
+      // Everything else falls through to an in-band tool error with
+      // `isError: true` — legible but unstructured.
       const message = err instanceof Error ? err.message : "Unknown error";
+      const e = err as {
+        code?: string;
+        note_id?: string;
+        note_path?: string | null;
+        current_updated_at?: string | null;
+        expected_updated_at?: string;
+      };
+      if (e?.code === "CONFLICT") {
+        throw new McpError(ErrorCode.InvalidRequest, message, {
+          error_type: "conflict",
+          current_updated_at: e.current_updated_at ?? null,
+          your_updated_at: e.expected_updated_at,
+          path: e.note_path ?? null,
+          note_id: e.note_id,
+        });
+      }
+      if (e?.code === "PRECONDITION_REQUIRED") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: "precondition_required",
+          note_id: e.note_id,
+          path: e.note_path ?? null,
+        });
+      }
       return {
         content: [{ type: "text" as const, text: `Error: ${message}` }],
         isError: true,

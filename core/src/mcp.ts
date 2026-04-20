@@ -359,7 +359,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
-- Optimistic concurrency: pass \`if_updated_at\` with the \`updated_at\` value you last read. The update is rejected with a conflict error if the note has changed since. Re-read the note, reconcile, and retry.`,
+- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -368,7 +368,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           path: { type: "string", description: "New path" },
           metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
           created_at: { type: "string", description: "New created_at timestamp" },
-          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since." },
+          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set." },
+          force: { type: "boolean", description: "Override the required `if_updated_at` check and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe." },
           tags: {
             type: "object",
             properties: {
@@ -416,7 +417,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                 path: { type: "string" },
                 metadata: { type: "object" },
                 created_at: { type: "string" },
-                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since." },
+                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item." },
+                force: { type: "boolean", description: "Override the required `if_updated_at` check for this item." },
                 tags: { type: "object" },
                 links: { type: "object" },
               },
@@ -433,6 +435,15 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         const updated: Note[] = [];
         for (const item of items) {
           const note = requireNote(db, item.id as string);
+
+          // --- Safety-by-default: refuse mutations without a precondition ---
+          // The caller must either echo the note's last-seen `updated_at`
+          // (`if_updated_at`) so the conditional UPDATE can catch lost
+          // writes, or explicitly opt out with `force: true`. This runs
+          // *before* any DB writes so a rejection leaves the note untouched.
+          if (item.if_updated_at === undefined && item.force !== true) {
+            throw new PreconditionRequiredError(note.id, note.path ?? null);
+          }
 
           // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
           // We compute the cleaned content so we can do the core UPDATE first
@@ -820,4 +831,26 @@ function normalizeTags(tag: unknown): string[] | undefined {
 // Re-exported for backward compat; defined in notes.ts alongside the
 // conditional-UPDATE implementation that raises it.
 export { ConflictError } from "./notes.js";
+
+/**
+ * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a
+ * caller tries to mutate a note without either an `if_updated_at` token or
+ * an explicit `force: true` opt-out. The `if_updated_at` requirement is the
+ * safety-by-default posture — we'd rather refuse an ambiguous write than
+ * silently overwrite someone else's edit.
+ */
+export class PreconditionRequiredError extends Error {
+  code = "PRECONDITION_REQUIRED" as const;
+  note_id: string;
+  note_path: string | null;
+
+  constructor(noteId: string, notePath: string | null) {
+    super(
+      `precondition required: update-note rejects an item without \`if_updated_at\` (read the note's updated_at and echo it) or \`force: true\` (explicit override). note="${noteId}"`,
+    );
+    this.name = "PreconditionRequiredError";
+    this.note_id = noteId;
+    this.note_path = notePath;
+  }
+}
 
