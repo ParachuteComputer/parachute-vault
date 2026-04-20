@@ -24,7 +24,7 @@ import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 import { $ } from "bun";
 import {
-  CONFIG_DIR,
+  VAULT_HOME,
   VAULTS_DIR,
   GLOBAL_CONFIG_PATH,
   listVaults,
@@ -105,33 +105,34 @@ export function parseBackupFilename(name: string): { timestamp: string } | null 
 // ---------------------------------------------------------------------------
 
 /**
- * Take a `VACUUM INTO` snapshot of every `.db` file we can find in
- * `CONFIG_DIR`:
+ * Take a `VACUUM INTO` snapshot of every `.db` file we can find under
+ * `VAULT_HOME`:
  *
- *   1. Top-level `~/.parachute/*.db` — covers legacy pre-multi-vault installs
- *      (e.g. `daily.db`) and any user-placed sidecar DBs. Hits include `.bak`
- *      copies, which we intentionally skip since they're already static
- *      snapshots that `cp` would duplicate faster than VACUUM.
+ *   1. Top-level `~/.parachute/vault/*.db` — covers legacy pre-multi-vault
+ *      installs (e.g. `daily.db`) and any user-placed sidecar DBs. Hits
+ *      include `.bak` copies, which we intentionally skip since they're
+ *      already static snapshots that `cp` would duplicate faster than
+ *      VACUUM.
  *   2. Per-vault `vaults/<name>/vault.db` via `listVaults()`.
  *
  * Returns the staging directory so the next stage can tar it up.
  */
 export async function stageSnapshot(opts?: {
-  /** Override config dir. Tests point this at a tempdir. */
+  /** Override vault-home dir. Tests point this at a tempdir. */
   configDir?: string;
   /** Override vaults dir. Tests point this at a tempdir's vaults/. */
   vaultsDir?: string;
   /** Override staging dir. Tests pass a tempdir to inspect contents. */
   stagingDir?: string;
 }): Promise<{ stagingDir: string; contents: TarballContents }> {
-  const configDir = opts?.configDir ?? CONFIG_DIR;
+  const configDir = opts?.configDir ?? VAULT_HOME;
   const vaultsDir = opts?.vaultsDir ?? VAULTS_DIR;
   const stagingDir = opts?.stagingDir ?? mkdtempSync(join(tmpdir(), "parachute-backup-"));
 
   const dbSnapshots: string[] = [];
   const configFiles: string[] = [];
 
-  // 1. Top-level *.db files in CONFIG_DIR. Skip .bak and other non-live files.
+  // 1. Top-level *.db files in VAULT_HOME. Skip .bak and other non-live files.
   if (existsSync(configDir)) {
     for (const entry of readdirSync(configDir)) {
       if (!entry.endsWith(".db")) continue;
@@ -583,7 +584,7 @@ export async function runBackup(opts?: {
     const results = await writeToDestinations(tarballPath, backup.destinations, backup.retention);
 
     // Record last-backup metadata for `status`. Stored in a small JSON file
-    // inside CONFIG_DIR so it survives across daemons and doesn't require
+    // inside VAULT_HOME so it survives across daemons and doesn't require
     // plumbing through config.yaml (which is hand-edited by users).
     recordLastBackup({
       timestamp,
@@ -613,12 +614,12 @@ export interface LastBackupMeta {
 }
 
 export function lastBackupPath(configDir?: string): string {
-  return join(configDir ?? CONFIG_DIR, "backup-last.json");
+  return join(configDir ?? VAULT_HOME, "backup-last.json");
 }
 
 function recordLastBackup(meta: LastBackupMeta, configDir?: string): void {
   try {
-    mkdirSync(configDir ?? CONFIG_DIR, { recursive: true });
+    mkdirSync(configDir ?? VAULT_HOME, { recursive: true });
     Bun.write(lastBackupPath(configDir), JSON.stringify(meta, null, 2) + "\n");
   } catch {
     // Non-fatal — losing last-run metadata is a UX regression, not a data loss.

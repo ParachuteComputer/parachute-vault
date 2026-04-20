@@ -2,7 +2,7 @@
  * Linux systemd service management for the vault daemon.
  *
  * Installs a user-level systemd service (~/.config/systemd/user/).
- * Uses EnvironmentFile to load ~/.parachute/.env.
+ * Uses EnvironmentFile to load ~/.parachute/vault/.env.
  */
 
 import { homedir } from "os";
@@ -10,7 +10,7 @@ import { join } from "path";
 import { writeFile, mkdir, unlink } from "fs/promises";
 import { existsSync } from "fs";
 import { $ } from "bun";
-import { CONFIG_DIR, LOG_PATH, ERR_PATH } from "./config.ts";
+import { VAULT_HOME, LOG_PATH, ERR_PATH } from "./config.ts";
 import { WRAPPER_PATH, writeDaemonWrapper } from "./daemon.ts";
 
 const SERVICE_NAME = "parachute-vault";
@@ -29,7 +29,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${CONFIG_DIR}
+WorkingDirectory=${VAULT_HOME}
 ExecStart=/bin/bash ${WRAPPER_PATH}
 Restart=on-failure
 RestartSec=5

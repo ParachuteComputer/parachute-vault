@@ -2,19 +2,28 @@
  * Configuration management for Parachute Vault.
  *
  * Directory layout:
- *   ~/.parachute/
- *     config.yaml          — global server config
- *     vault.log / vault.err — daemon logs
- *     vaults/
- *       {name}/
- *         vault.db          — SQLite database
- *         vault.yaml        — per-vault config (description, tool_hints, api_keys)
+ *   ~/.parachute/                 — ecosystem root (shared with sibling services)
+ *     services.json               — CLI-owned manifest (services-manifest.ts)
+ *     well-known/                 — CLI-owned (.well-known serving)
+ *     vault/                      — everything vault owns
+ *       .env
+ *       config.yaml               — global server config
+ *       vault.log / vault.err     — daemon logs
+ *       start.sh / server-path    — daemon wrapper + pointer (daemon.ts)
+ *       vaults/
+ *         {name}/
+ *           vault.db              — SQLite database
+ *           vault.yaml            — per-vault config (description, api_keys, …)
+ *           assets/               — per-vault attachments
+ *
+ * Pre-0.3 installs put vault state directly under `~/.parachute/`; on startup
+ * we auto-migrate those paths into `vault/` (see `migrateFromLegacyLayout`).
  */
 
 import { homedir } from "os";
 import { join } from "path";
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from "fs";
 import crypto from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -28,32 +37,42 @@ import crypto from "node:crypto";
 // getters so `PARACHUTE_HOME` is re-read per call. The top-level constants
 // are kept for backward-compat (other modules import them) and reflect the
 // value at load time.
+//
+// `configDirPath()` is the ecosystem root — shared with sibling services
+// (channel, scribe, …) and with the CLI's `services.json` + `well-known/`.
+// `vaultHomePath()` is the vault-scoped subdir; all vault-owned files live
+// under it.
 // ---------------------------------------------------------------------------
 
 function configDirPath(): string {
   return process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
 }
 
+function vaultHomePath(): string {
+  return join(configDirPath(), "vault");
+}
+
 function vaultsDirPath(): string {
-  return join(configDirPath(), "vaults");
+  return join(vaultHomePath(), "vaults");
 }
 
 function globalConfigPath(): string {
-  return join(configDirPath(), "config.yaml");
+  return join(vaultHomePath(), "config.yaml");
 }
 
 function envFilePath(): string {
-  return join(configDirPath(), ".env");
+  return join(vaultHomePath(), ".env");
 }
 
 export const CONFIG_DIR = configDirPath();
-export const VAULTS_DIR = join(CONFIG_DIR, "vaults");
-export const GLOBAL_CONFIG_PATH = join(CONFIG_DIR, "config.yaml");
-export const ENV_PATH = join(CONFIG_DIR, ".env");
-export const LOG_PATH = join(CONFIG_DIR, "vault.log");
-export const ERR_PATH = join(CONFIG_DIR, "vault.err");
+export const VAULT_HOME = join(CONFIG_DIR, "vault");
+export const VAULTS_DIR = join(VAULT_HOME, "vaults");
+export const GLOBAL_CONFIG_PATH = join(VAULT_HOME, "config.yaml");
+export const ENV_PATH = join(VAULT_HOME, ".env");
+export const LOG_PATH = join(VAULT_HOME, "vault.log");
+export const ERR_PATH = join(VAULT_HOME, "vault.err");
 export const DEFAULT_PORT = 1940;
-export const ASSETS_DIR = join(CONFIG_DIR, "assets");
+export const ASSETS_DIR = join(VAULT_HOME, "assets");
 
 export function vaultDir(name: string): string {
   return join(vaultsDirPath(), name);
@@ -738,12 +757,88 @@ function serializeBackup(backup: BackupConfig): string[] {
 
 export async function ensureConfigDir(): Promise<void> {
   await mkdir(configDirPath(), { recursive: true });
+  migrateFromLegacyLayout();
+  await mkdir(vaultHomePath(), { recursive: true });
   await mkdir(vaultsDirPath(), { recursive: true });
 }
 
 export function ensureConfigDirSync(): void {
   mkdirSync(configDirPath(), { recursive: true });
+  migrateFromLegacyLayout();
+  mkdirSync(vaultHomePath(), { recursive: true });
   mkdirSync(vaultsDirPath(), { recursive: true });
+}
+
+/**
+ * Move vault-owned state from the legacy root layout (`~/.parachute/.env`,
+ * `~/.parachute/vaults/`, …) into `~/.parachute/vault/`. Fresh installs see
+ * nothing to migrate and exit quickly; double-calls are a no-op.
+ *
+ * Per-path move policy: if a legacy path exists AND the target under `vault/`
+ * does not, rename the legacy path into place. If both exist, the target
+ * wins — we don't overwrite a user's manually-migrated state — and the
+ * legacy path is left alone with a warning logged. Each moved path is
+ * announced on stdout so users notice when vault relocates their files.
+ */
+export function migrateFromLegacyLayout(): void {
+  const root = configDirPath();
+  const dest = vaultHomePath();
+
+  const candidates: Array<[string, string]> = [
+    [".env", ".env"],
+    ["config.yaml", "config.yaml"],
+    ["vault.log", "vault.log"],
+    ["vault.err", "vault.err"],
+    ["start.sh", "start.sh"],
+    ["server-path", "server-path"],
+    ["vaults", "vaults"],
+    ["assets", "assets"],
+  ];
+
+  const present: Array<[string, string]> = [];
+  for (const [from, to] of candidates) {
+    const src = join(root, from);
+    if (existsSync(src)) present.push([from, to]);
+  }
+  if (present.length === 0) return;
+
+  mkdirSync(dest, { recursive: true });
+
+  const moved: string[] = [];
+  const skipped: string[] = [];
+  for (const [from, to] of present) {
+    const src = join(root, from);
+    const dst = join(dest, to);
+    if (existsSync(dst)) {
+      skipped.push(from);
+      continue;
+    }
+    try {
+      renameSync(src, dst);
+      moved.push(from);
+    } catch (err) {
+      // Cross-device rename failures shouldn't be possible here (same
+      // filesystem), but surface them instead of silently leaving files in
+      // the legacy spot — users need to know their data didn't move.
+      console.warn(
+        `[parachute-vault] failed to migrate ${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Log to stderr — migration is operational/audit output, and keeping
+  // stdout clean lets callers that pipe stdout (the CLI, spawned child
+  // processes, JSON-consuming shells) run without interference.
+  if (moved.length > 0) {
+    console.error(
+      `[parachute-vault] migrated to new layout: moved ${moved.map((p) => join(root, p)).join(", ")} → ${dest}/`,
+    );
+  }
+  if (skipped.length > 0) {
+    console.error(
+      `[parachute-vault] left legacy paths in place (target already exists under vault/): ${skipped.map((p) => join(root, p)).join(", ")}. Remove the legacy copies once you've confirmed the vault/ copies are current.`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -939,7 +1034,7 @@ export function generateApiKey(): { fullKey: string; keyId: string } {
 }
 
 // ---------------------------------------------------------------------------
-// Environment file (~/.parachute/.env)
+// Environment file (~/.parachute/vault/.env)
 // ---------------------------------------------------------------------------
 
 /**

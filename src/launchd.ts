@@ -1,7 +1,7 @@
 /**
  * macOS launchd agent management for the vault daemon.
  *
- * The plist runs `~/.parachute/start.sh` (the shared wrapper from
+ * The plist runs `~/.parachute/vault/start.sh` (the shared wrapper from
  * daemon.ts). The wrapper reads the pointer file at every boot, so
  * moving the repo only requires re-running `parachute-vault init`.
  */
@@ -10,7 +10,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { writeFile, unlink } from "fs/promises";
 import { $ } from "bun";
-import { CONFIG_DIR, LOG_PATH, ERR_PATH } from "./config.ts";
+import { VAULT_HOME, LOG_PATH, ERR_PATH } from "./config.ts";
 import { WRAPPER_PATH, writeDaemonWrapper } from "./daemon.ts";
 
 const LABEL = "computer.parachute.vault";
@@ -37,7 +37,7 @@ export function generatePlist(): string {
   <key>StandardErrorPath</key>
   <string>${ERR_PATH}</string>
   <key>WorkingDirectory</key>
-  <string>${CONFIG_DIR}</string>
+  <string>${VAULT_HOME}</string>
 </dict>
 </plist>`;
 }
@@ -86,7 +86,7 @@ export async function uninstallAgent(): Promise<void> {
   // Linux uninstall path. Callers that want a fully-clean teardown must
   // also call `removeDaemonWrapper()` — the CLI's `uninstall` command in
   // PR 3 wires that up. Leaving them here programmatically would strand
-  // orphaned files in `~/.parachute/`.
+  // orphaned files in `~/.parachute/vault/`.
 }
 
 export async function isAgentLoaded(): Promise<boolean> {

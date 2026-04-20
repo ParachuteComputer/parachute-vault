@@ -304,9 +304,11 @@ describe("vault uninstall", () => {
   });
 
   test("answering 'no' at the prompt does not touch daemon/filesystem", async () => {
-    // Set up a fake install: wrapper + pointer in the temp PARACHUTE_HOME.
-    const wrapper = join(dir, "start.sh");
-    const pointer = join(dir, "server-path");
+    // Set up a fake install: wrapper + pointer in the vault/ subdir of the
+    // temp PARACHUTE_HOME (the post-0.3 layout).
+    mkdirSync(join(dir, "vault"), { recursive: true });
+    const wrapper = join(dir, "vault", "start.sh");
+    const pointer = join(dir, "vault", "server-path");
     writeFileSync(wrapper, "#!/bin/bash\n");
     writeFileSync(pointer, "/tmp/fake.ts\n");
 

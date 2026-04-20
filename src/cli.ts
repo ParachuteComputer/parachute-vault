@@ -25,6 +25,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "fs";
 import pkg from "../package.json" with { type: "json" };
 import {
   ensureConfigDirSync,
+  migrateFromLegacyLayout,
   readVaultConfig,
   writeVaultConfig,
   readGlobalConfig,
@@ -119,6 +120,17 @@ if (args[0] === "vault") {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+// Pre-0.3 installs kept vault state directly under ~/.parachute/. Run the
+// migration unconditionally so any command (including read-only ones like
+// `doctor` and `url`) picks up the relocated state on first post-upgrade run.
+// No-op when no legacy paths exist. Skipped for `help` and `version`, which
+// are expected to produce *only* their documented output — and because scripts
+// piping `parachute-vault --version` shouldn't get migration chatter on stderr.
+const SKIP_MIGRATION = new Set(["help", "--help", "-h", "version", "--version", "-v"]);
+if (!SKIP_MIGRATION.has(command)) {
+  migrateFromLegacyLayout();
+}
 
 switch (command) {
   case "init":
@@ -324,7 +336,7 @@ async function cmdInit() {
   }
   if (serverPath) {
     console.log(`  Server path:  ${serverPath}`);
-    console.log(`  Wrapper:      ~/.parachute/start.sh`);
+    console.log(`  Wrapper:      ~/.parachute/vault/start.sh`);
   }
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
@@ -1056,7 +1068,7 @@ async function cmdUninstall(argsList: string[]) {
   if (wipe) {
     console.log("`--wipe` will ALSO remove vaults, .env, config.yaml, and daemon logs.\n");
   } else {
-    console.log("User data (~/.parachute/vaults, ~/.parachute/.env) is left alone.\n");
+    console.log("User data (~/.parachute/vault/) is left alone.\n");
   }
 
   // Scripted `--yes --wipe` bypasses both interactive confirms. That's the
@@ -1324,7 +1336,7 @@ async function cmdDoctor() {
         name: `port ${port} availability`,
         status: "warn",
         detail: `port in use by non-vault process: ${collision.detail}`,
-        fix: "Stop the conflicting process, or set a different PORT in ~/.parachute/.env and re-run `parachute-vault init`.",
+        fix: "Stop the conflicting process, or set a different PORT in ~/.parachute/vault/.env and re-run `parachute-vault init`.",
       });
       break;
     case "unknown":
@@ -1359,7 +1371,7 @@ async function cmdDoctor() {
         name: "backup destinations",
         status: "warn",
         detail: "schedule is active but no destinations configured",
-        fix: "Edit ~/.parachute/config.yaml and add at least one destination under `backup.destinations`.",
+        fix: "Edit ~/.parachute/vault/config.yaml and add at least one destination under `backup.destinations`.",
       });
     } else {
       for (const dest of backupCfg.destinations) {
@@ -1368,7 +1380,7 @@ async function cmdDoctor() {
           name: `backup destination (${dest.kind})`,
           status: res.ok ? "pass" : "warn",
           detail: res.ok ? res.path : `${res.path}: ${res.error}`,
-          fix: res.ok ? undefined : "Ensure the path exists and is writable, or update it in ~/.parachute/config.yaml.",
+          fix: res.ok ? undefined : "Ensure the path exists and is writable, or update it in ~/.parachute/vault/config.yaml.",
         });
       }
     }
@@ -1404,7 +1416,7 @@ function cmdUrl() {
 
 /**
  * Resolve the vault's port the way `status`, `restart`, `url`, and `doctor`
- * all need to agree on: env override (~/.parachute/.env) wins, then
+ * all need to agree on: env override (~/.parachute/vault/.env) wins, then
  * config.yaml, then DEFAULT_PORT. Sources .env as a side effect so callers
  * running this before any env read still see PORT.
  */
@@ -1633,7 +1645,7 @@ async function cmdBackup(args: string[]) {
 async function cmdBackupRun() {
   const cfg = readGlobalConfig().backup ?? defaultBackupConfig();
   if (cfg.destinations.length === 0) {
-    console.error("No backup destinations configured. Edit ~/.parachute/config.yaml:");
+    console.error("No backup destinations configured. Edit ~/.parachute/vault/config.yaml:");
     console.error("  backup:");
     console.error("    destinations:");
     console.error("      - kind: local");
@@ -1683,7 +1695,7 @@ async function cmdBackupSchedule(schedule: BackupSchedule) {
     console.log(`Schedule set to: ${schedule}`);
     console.log();
     console.log("WARNING: no destinations configured — scheduled runs will fail.");
-    console.log("Edit ~/.parachute/config.yaml and add at least one destination under `backup.destinations`.");
+    console.log("Edit ~/.parachute/vault/config.yaml and add at least one destination under `backup.destinations`.");
   }
 
   await installBackupAgent(schedule);
