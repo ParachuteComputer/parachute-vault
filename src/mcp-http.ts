@@ -31,10 +31,11 @@ import { SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
 
 /**
  * Required scope for each MCP tool. Tools that mutate note/tag state require
- * `vault:write`; pure query tools need `vault:read`. `vault-info` is read at
- * the contract level — it does have an optional description-update branch,
- * but that path requires the caller to already hold `vault:write`, which is
- * enforced by inheritance when we call through.
+ * `vault:write`; pure query tools need `vault:read`. `vault-info` is listed as
+ * read because read-only callers can fetch stats — the description-update
+ * branch inside vault-info performs its own secondary `vault:write` check
+ * (see `overrideVaultInfo` in mcp-tools.ts). Do not assume the outer gate
+ * alone protects the inner branch.
  */
 const TOOL_REQUIRED_SCOPE: Record<string, string> = {
   "query-notes": SCOPE_READ,
@@ -57,7 +58,7 @@ function requiredScopeForTool(toolName: string): string {
 /** Handle scoped MCP at /vault/{name}/mcp (single vault). */
 export async function handleScopedMcp(req: Request, vaultName: string, auth: AuthResult): Promise<Response> {
   const instruction = getServerInstruction(vaultName);
-  return handleMcp(req, () => generateScopedMcpTools(vaultName), `parachute-vault/${vaultName}`, auth, instruction);
+  return handleMcp(req, () => generateScopedMcpTools(vaultName, auth), `parachute-vault/${vaultName}`, auth, instruction);
 }
 
 async function handleMcp(

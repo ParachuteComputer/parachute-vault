@@ -41,9 +41,12 @@ export function parseScopes(raw: string | null | undefined): string[] {
 }
 
 function normalizeScope(scope: string): string {
-  // `vault:<name>:<verb>` → `vault:<verb>` (synonym collapse)
+  // `vault:<name>:<verb>` → `vault:<verb>` (synonym collapse). Reject an empty
+  // name segment (`vault::read`) — preserve it as-is so it can't accidentally
+  // satisfy a `vault:read` check. Only reachable via direct DB write, but the
+  // one-liner keeps the parser honest.
   const parts = scope.split(":");
-  if (parts.length === 3 && parts[0] === "vault") {
+  if (parts.length === 3 && parts[0] === "vault" && parts[1].length > 0) {
     const verb = parts[2];
     if (verb === "read" || verb === "write" || verb === "admin") {
       return `vault:${verb}`;

@@ -43,6 +43,14 @@ describe("parseScopes", () => {
     expect(parseScopes("profile email")).toEqual(["profile", "email"]);
     expect(parseScopes("vault:unknown:frob")).toEqual(["vault:unknown:frob"]);
   });
+
+  test("empty name segment does NOT collapse (vault::read stays literal)", () => {
+    // Guard against a hand-crafted DB row with `vault::read` satisfying a
+    // `vault:read` check by accident. Only reachable via direct DB write,
+    // not API input, but the parser stays honest.
+    expect(parseScopes("vault::read")).toEqual(["vault::read"]);
+    expect(hasScope(parseScopes("vault::read"), SCOPE_READ)).toBe(false);
+  });
 });
 
 describe("hasScope — inheritance admin ⊇ write ⊇ read", () => {

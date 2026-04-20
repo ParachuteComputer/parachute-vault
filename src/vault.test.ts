@@ -1682,6 +1682,101 @@ describe("stateless MCP transport", async () => {
     closeAllStores();
   });
 
+  test("tools/call of vault-info with description arg and vault:read scope is refused", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-vault-info-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "original description",
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "vault-info",
+          arguments: { description: "hijacked description" },
+        },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "read",
+      scopes: ["vault:read"],
+      legacyDerived: false,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    // The tool call must surface as an error (isError: true) and mention
+    // the required scope — the inner guard fired even though the outer tool
+    // gate allowed read-only callers through for stats.
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("vault:write");
+
+    // And critically: the vault description must NOT have been mutated.
+    const cfg = readVaultConfig(vaultName);
+    expect(cfg?.description).toBe("original description");
+
+    closeAllStores();
+  });
+
+  test("tools/call of vault-info with description arg and vault:write scope is allowed", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-vault-info-write-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "original",
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "vault-info",
+          arguments: { description: "updated via write scope" },
+        },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write"],
+      legacyDerived: false,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.result.isError).toBeFalsy();
+    expect(readVaultConfig(vaultName)?.description).toBe("updated via write scope");
+
+    closeAllStores();
+  });
+
   test("tools/call of create-note with vault:read scope is refused (not silently allowed)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");

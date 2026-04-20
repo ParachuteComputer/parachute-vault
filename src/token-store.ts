@@ -18,6 +18,10 @@ import crypto from "node:crypto";
 import { hashKey } from "./config.ts";
 import { legacyPermissionToScopes, parseScopes, serializeScopes } from "./scopes.ts";
 
+function scopesForMigratedPermission(permission: string): string {
+  return serializeScopes(legacyPermissionToScopes(permission));
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -229,13 +233,15 @@ export function migrateVaultKeys(
   for (const key of vaultKeys) {
     const exists = db.prepare("SELECT 1 FROM tokens WHERE token_hash = ?").get(key.key_hash);
     if (!exists) {
+      const permission = key.scope === "read" ? "read" : "full";
       db.prepare(`
-        INSERT INTO tokens (token_hash, label, permission, created_at, last_used_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO tokens (token_hash, label, permission, scopes, created_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         key.key_hash,
         key.label,
-        key.scope === "read" ? "read" : "full",
+        permission,
+        scopesForMigratedPermission(permission),
         key.created_at,
         key.last_used_at ?? null,
       );
@@ -249,12 +255,13 @@ export function migrateVaultKeys(
       const exists = db.prepare("SELECT 1 FROM tokens WHERE token_hash = ?").get(key.key_hash);
       if (!exists) {
         db.prepare(`
-          INSERT INTO tokens (token_hash, label, permission, created_at, last_used_at)
-          VALUES (?, ?, ?, ?, ?)
+          INSERT INTO tokens (token_hash, label, permission, scopes, created_at, last_used_at)
+          VALUES (?, ?, ?, ?, ?, ?)
         `).run(
           key.key_hash,
           key.label,
           "full",
+          scopesForMigratedPermission("full"),
           key.created_at,
           key.last_used_at ?? null,
         );
