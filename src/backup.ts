@@ -25,7 +25,7 @@ import { Database } from "bun:sqlite";
 import { $ } from "bun";
 import {
   VAULT_HOME,
-  VAULTS_DIR,
+  DATA_DIR,
   GLOBAL_CONFIG_PATH,
   listVaults,
   vaultDir,
@@ -126,7 +126,7 @@ export async function stageSnapshot(opts?: {
   stagingDir?: string;
 }): Promise<{ stagingDir: string; contents: TarballContents }> {
   const configDir = opts?.configDir ?? VAULT_HOME;
-  const vaultsDir = opts?.vaultsDir ?? VAULTS_DIR;
+  const vaultsDir = opts?.vaultsDir ?? DATA_DIR;
   const stagingDir = opts?.stagingDir ?? mkdtempSync(join(tmpdir(), "parachute-backup-"));
 
   const dbSnapshots: string[] = [];
@@ -211,7 +211,7 @@ function vacuumInto(srcDbPath: string, destPath: string): void {
 
 /**
  * Small internal helper so tests can point us at a vaults dir that isn't
- * the global VAULTS_DIR without plumbing the override through `listVaults()`.
+ * the global DATA_DIR without plumbing the override through `listVaults()`.
  */
 function listVaultsIn(dir: string): string[] {
   if (!existsSync(dir)) return [];

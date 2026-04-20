@@ -33,7 +33,7 @@ let prevHome: string | undefined;
 
 beforeEach(() => {
   tmpHome = join(tmpdir(), `vault-auth-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  mkdirSync(join(tmpHome, "vault", "vaults"), { recursive: true });
+  mkdirSync(join(tmpHome, "vault", "data"), { recursive: true });
   prevHome = process.env.PARACHUTE_HOME;
   process.env.PARACHUTE_HOME = tmpHome;
   clearVaultStoreCache();

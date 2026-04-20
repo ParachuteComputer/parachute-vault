@@ -8,9 +8,14 @@
  *     vault/                      — everything vault owns
  *       .env
  *       config.yaml               — global server config
- *       vault.log / vault.err     — daemon logs
  *       start.sh / server-path    — daemon wrapper + pointer (daemon.ts)
- *       vaults/
+ *       logs/
+ *         vault.log / vault.err   — daemon stdout/stderr (matches
+ *                                   `~/.parachute/<svc>/logs/<svc>.log` — the
+ *                                   CLI lifecycle convention from PR #83)
+ *       data/                     — per-vault SQLite data (Postgres-style:
+ *                                   named `data/` rather than `vaults/` so it
+ *                                   doesn't read as doubled)
  *         {name}/
  *           vault.db              — SQLite database
  *           vault.yaml            — per-vault config (description, api_keys, …)
@@ -18,6 +23,9 @@
  *
  * Pre-0.3 installs put vault state directly under `~/.parachute/`; on startup
  * we auto-migrate those paths into `vault/` (see `migrateFromLegacyLayout`).
+ * Pre-filesystem-hygiene 0.3 installs put per-vault state under
+ * `vault/vaults/` and daemon logs flat in `vault/`; those are moved into
+ * `data/` and `logs/` by `migrateVaultInternalLayout` on startup.
  */
 
 import { homedir } from "os";
@@ -29,7 +37,7 @@ import crypto from "node:crypto";
 // ---------------------------------------------------------------------------
 // Paths
 //
-// Historical note: the exported `CONFIG_DIR`, `VAULTS_DIR`, etc. used to be
+// Historical note: the exported `CONFIG_DIR`, `DATA_DIR`, etc. used to be
 // `const` captured at module load. That made tests flaky: anything setting
 // `process.env.PARACHUTE_HOME` after import would be ignored, and when `bun
 // test` shares one process across files, whichever test loaded first froze
@@ -52,8 +60,12 @@ function vaultHomePath(): string {
   return join(configDirPath(), "vault");
 }
 
-function vaultsDirPath(): string {
-  return join(vaultHomePath(), "vaults");
+function dataDirPath(): string {
+  return join(vaultHomePath(), "data");
+}
+
+function logsDirPath(): string {
+  return join(vaultHomePath(), "logs");
 }
 
 function globalConfigPath(): string {
@@ -66,16 +78,17 @@ function envFilePath(): string {
 
 export const CONFIG_DIR = configDirPath();
 export const VAULT_HOME = join(CONFIG_DIR, "vault");
-export const VAULTS_DIR = join(VAULT_HOME, "vaults");
+export const DATA_DIR = join(VAULT_HOME, "data");
+export const LOGS_DIR = join(VAULT_HOME, "logs");
 export const GLOBAL_CONFIG_PATH = join(VAULT_HOME, "config.yaml");
 export const ENV_PATH = join(VAULT_HOME, ".env");
-export const LOG_PATH = join(VAULT_HOME, "vault.log");
-export const ERR_PATH = join(VAULT_HOME, "vault.err");
+export const LOG_PATH = join(LOGS_DIR, "vault.log");
+export const ERR_PATH = join(LOGS_DIR, "vault.err");
 export const DEFAULT_PORT = 1940;
 export const ASSETS_DIR = join(VAULT_HOME, "assets");
 
 export function vaultDir(name: string): string {
-  return join(vaultsDirPath(), name);
+  return join(dataDirPath(), name);
 }
 
 export function vaultDbPath(name: string): string {
@@ -759,14 +772,16 @@ export async function ensureConfigDir(): Promise<void> {
   await mkdir(configDirPath(), { recursive: true });
   migrateFromLegacyLayout();
   await mkdir(vaultHomePath(), { recursive: true });
-  await mkdir(vaultsDirPath(), { recursive: true });
+  await mkdir(dataDirPath(), { recursive: true });
 }
 
 export function ensureConfigDirSync(): void {
   mkdirSync(configDirPath(), { recursive: true });
   migrateFromLegacyLayout();
   mkdirSync(vaultHomePath(), { recursive: true });
-  mkdirSync(vaultsDirPath(), { recursive: true });
+  migrateVaultInternalLayout();
+  mkdirSync(dataDirPath(), { recursive: true });
+  mkdirSync(logsDirPath(), { recursive: true });
 }
 
 /**
@@ -784,14 +799,18 @@ export function migrateFromLegacyLayout(): void {
   const root = configDirPath();
   const dest = vaultHomePath();
 
+  // Pre-0.3 installs targeted flat names at root (`vaults`, `vault.log`);
+  // we now land those directly under their current canonical subdirs
+  // (`data/`, `logs/`) so upgrading users skip the intermediate shape that
+  // `migrateVaultInternalLayout` would otherwise correct on a second pass.
   const candidates: Array<[string, string]> = [
     [".env", ".env"],
     ["config.yaml", "config.yaml"],
-    ["vault.log", "vault.log"],
-    ["vault.err", "vault.err"],
+    ["vault.log", "logs/vault.log"],
+    ["vault.err", "logs/vault.err"],
     ["start.sh", "start.sh"],
     ["server-path", "server-path"],
-    ["vaults", "vaults"],
+    ["vaults", "data"],
     ["assets", "assets"],
   ];
 
@@ -813,6 +832,10 @@ export function migrateFromLegacyLayout(): void {
       skipped.push(from);
       continue;
     }
+    // Target may live in a subdir (logs/, data/); ensure parent exists
+    // before renameSync, which is strict about target parent existence.
+    const parent = join(dst, "..");
+    mkdirSync(parent, { recursive: true });
     try {
       renameSync(src, dst);
       moved.push(from);
@@ -837,6 +860,80 @@ export function migrateFromLegacyLayout(): void {
   if (skipped.length > 0) {
     console.error(
       `[parachute-vault] left legacy paths in place (target already exists under vault/): ${skipped.map((p) => join(root, p)).join(", ")}. Remove the legacy copies once you've confirmed the vault/ copies are current.`,
+    );
+  }
+}
+
+/**
+ * Tidies the layout *inside* `vault/` for installs upgrading across the
+ * filesystem-hygiene refactor:
+ *
+ *   vault/vaults/   → vault/data/         (matches Postgres/Redis convention;
+ *                                          avoids the doubled "vault/vaults")
+ *   vault/vault.log → vault/logs/vault.log
+ *   vault/vault.err → vault/logs/vault.err
+ *
+ * Same target-wins, idempotent, rename-only policy as
+ * `migrateFromLegacyLayout`. Runs every boot — once the moves have
+ * happened, subsequent calls are pure existence checks that exit fast.
+ *
+ * If `vault/` doesn't exist yet (never booted before), this returns
+ * immediately — `ensureConfigDirSync` creates the fresh layout right after.
+ */
+export function migrateVaultInternalLayout(): void {
+  const vaultHome = vaultHomePath();
+  if (!existsSync(vaultHome)) return;
+
+  // vault/vaults/ → vault/data/
+  const legacyData = join(vaultHome, "vaults");
+  const newData = dataDirPath();
+  if (existsSync(legacyData)) {
+    if (existsSync(newData)) {
+      console.error(
+        `[parachute-vault] both ${legacyData}/ and ${newData}/ exist — using data/, leaving vaults/ in place. Remove the legacy copy once you've confirmed data/ is current.`,
+      );
+    } else {
+      try {
+        renameSync(legacyData, newData);
+        console.error(`[parachute-vault] migrated ${legacyData}/ → ${newData}/`);
+      } catch (err) {
+        console.warn(
+          `[parachute-vault] failed to migrate ${legacyData}/ → ${newData}/: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  // vault/{vault.log,vault.err} → vault/logs/{vault.log,vault.err}
+  const logsDir = logsDirPath();
+  const logsMoved: string[] = [];
+  const logsSkipped: string[] = [];
+  for (const name of ["vault.log", "vault.err"]) {
+    const src = join(vaultHome, name);
+    if (!existsSync(src)) continue;
+    const dst = join(logsDir, name);
+    if (existsSync(dst)) {
+      logsSkipped.push(name);
+      continue;
+    }
+    mkdirSync(logsDir, { recursive: true });
+    try {
+      renameSync(src, dst);
+      logsMoved.push(name);
+    } catch (err) {
+      console.warn(
+        `[parachute-vault] failed to migrate ${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (logsMoved.length > 0) {
+    console.error(
+      `[parachute-vault] migrated ${logsMoved.map((n) => join(vaultHome, n)).join(", ")} → ${logsDir}/`,
+    );
+  }
+  if (logsSkipped.length > 0) {
+    console.error(
+      `[parachute-vault] left legacy log files in place (target already exists under logs/): ${logsSkipped.map((n) => join(vaultHome, n)).join(", ")}.`,
     );
   }
 }
@@ -1119,7 +1216,7 @@ export function loadEnvFile(): void {
 
 export function listVaults(): string[] {
   try {
-    const dir = vaultsDirPath();
+    const dir = dataDirPath();
     if (!existsSync(dir)) return [];
     const entries = Bun.spawnSync(["ls", dir]).stdout.toString().trim();
     if (!entries) return [];

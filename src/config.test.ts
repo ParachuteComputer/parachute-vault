@@ -311,7 +311,7 @@ describe2("migrateFromLegacyLayout", () => {
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "parachute-migrate-")); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  test2("fresh install with no legacy files is a no-op", async () => {
+  test2("fresh install with no legacy files is a no-op and creates data/ + logs/", async () => {
     const script = `
       process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
       const fs = await import("fs");
@@ -321,7 +321,9 @@ describe2("migrateFromLegacyLayout", () => {
       const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
       console.log(JSON.stringify({
         vaultHomeExists: fs.existsSync(vaultHome),
-        vaultsExists: fs.existsSync(path.join(vaultHome, "vaults")),
+        dataExists: fs.existsSync(path.join(vaultHome, "data")),
+        logsExists: fs.existsSync(path.join(vaultHome, "logs")),
+        legacyVaultsDirExists: fs.existsSync(path.join(vaultHome, "vaults")),
         rootEnvExists: fs.existsSync(path.join(${JSON.stringify(dir)}, ".env")),
       }));
     `;
@@ -330,11 +332,13 @@ describe2("migrateFromLegacyLayout", () => {
     expect2(proc.exitCode, stderr).toBe(0);
     const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
     expect2(parsed.vaultHomeExists).toBe(true);
-    expect2(parsed.vaultsExists).toBe(true);
+    expect2(parsed.dataExists).toBe(true);
+    expect2(parsed.logsExists).toBe(true);
+    expect2(parsed.legacyVaultsDirExists).toBe(false);
     expect2(parsed.rootEnvExists).toBe(false);
   });
 
-  test2("moves legacy .env, config.yaml, vaults/, start.sh, server-path into vault/", async () => {
+  test2("moves legacy root files into vault/ (vaults → data/, logs → logs/)", async () => {
     const script = `
       process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
       const fs = await import("fs");
@@ -357,9 +361,13 @@ describe2("migrateFromLegacyLayout", () => {
         config: fs.readFileSync(path.join(vaultHome, "config.yaml"), "utf-8"),
         start: fs.readFileSync(path.join(vaultHome, "start.sh"), "utf-8"),
         serverPath: fs.readFileSync(path.join(vaultHome, "server-path"), "utf-8"),
-        vaultYaml: fs.readFileSync(path.join(vaultHome, "vaults", "default", "vault.yaml"), "utf-8"),
+        vaultYaml: fs.readFileSync(path.join(vaultHome, "data", "default", "vault.yaml"), "utf-8"),
+        log: fs.readFileSync(path.join(vaultHome, "logs", "vault.log"), "utf-8"),
+        err: fs.readFileSync(path.join(vaultHome, "logs", "vault.err"), "utf-8"),
         legacyEnv: fs.existsSync(path.join(root, ".env")),
         legacyVaults: fs.existsSync(path.join(root, "vaults")),
+        legacyVaultLog: fs.existsSync(path.join(root, "vault.log")),
+        legacyVaultErr: fs.existsSync(path.join(root, "vault.err")),
       }));
     `;
     const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
@@ -371,9 +379,13 @@ describe2("migrateFromLegacyLayout", () => {
     expect2(parsed.start).toContain("#!/bin/bash");
     expect2(parsed.serverPath).toContain("/repo/src/server.ts");
     expect2(parsed.vaultYaml).toContain("name: default");
+    expect2(parsed.log).toContain("log");
+    expect2(parsed.err).toContain("err");
     // Legacy paths should be gone after the move.
     expect2(parsed.legacyEnv).toBe(false);
     expect2(parsed.legacyVaults).toBe(false);
+    expect2(parsed.legacyVaultLog).toBe(false);
+    expect2(parsed.legacyVaultErr).toBe(false);
   });
 
   test2("double-migration is idempotent", async () => {
@@ -398,6 +410,98 @@ describe2("migrateFromLegacyLayout", () => {
     const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
     expect2(parsed.envInVault).toContain("PORT=1940");
     expect2(parsed.rootEnv).toBe(false);
+  });
+
+  test2("0.3 install: vault/vaults/ → vault/data/, vault/{vault.log,vault.err} → vault/logs/", async () => {
+    // Users who installed on 0.3 (post-PR-8 but pre-filesystem-hygiene)
+    // have vault state under `vault/` with the old internal names.
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      fs.mkdirSync(path.join(vaultHome, "vaults", "work"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "vaults", "work", "vault.yaml"), "name: work\\napi_keys: []\\n");
+      fs.writeFileSync(path.join(vaultHome, "vault.log"), "daemon-stdout\\n");
+      fs.writeFileSync(path.join(vaultHome, "vault.err"), "daemon-stderr\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      console.log(JSON.stringify({
+        vaultYaml: fs.readFileSync(path.join(vaultHome, "data", "work", "vault.yaml"), "utf-8"),
+        log: fs.readFileSync(path.join(vaultHome, "logs", "vault.log"), "utf-8"),
+        err: fs.readFileSync(path.join(vaultHome, "logs", "vault.err"), "utf-8"),
+        legacyVaultsDir: fs.existsSync(path.join(vaultHome, "vaults")),
+        legacyLog: fs.existsSync(path.join(vaultHome, "vault.log")),
+        legacyErr: fs.existsSync(path.join(vaultHome, "vault.err")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.vaultYaml).toContain("name: work");
+    expect2(parsed.log).toContain("daemon-stdout");
+    expect2(parsed.err).toContain("daemon-stderr");
+    expect2(parsed.legacyVaultsDir).toBe(false);
+    expect2(parsed.legacyLog).toBe(false);
+    expect2(parsed.legacyErr).toBe(false);
+  });
+
+  test2("0.3 internal migration: both vault/vaults/ and vault/data/ exist — data/ wins, vaults/ preserved", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      // Both layouts present with distinct marker content — migration
+      // must NOT overwrite data/ (user may have manually staged it).
+      fs.mkdirSync(path.join(vaultHome, "vaults"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "vaults", "MARKER_LEGACY"), "legacy\\n");
+      fs.mkdirSync(path.join(vaultHome, "data"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "data", "MARKER_CURRENT"), "current\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      console.log(JSON.stringify({
+        dataMarker: fs.existsSync(path.join(vaultHome, "data", "MARKER_CURRENT")),
+        legacyMarker: fs.existsSync(path.join(vaultHome, "vaults", "MARKER_LEGACY")),
+        dataOverwrittenByLegacy: fs.existsSync(path.join(vaultHome, "data", "MARKER_LEGACY")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.dataMarker).toBe(true); // data/ untouched
+    expect2(parsed.legacyMarker).toBe(true); // vaults/ untouched, for user to inspect
+    expect2(parsed.dataOverwrittenByLegacy).toBe(false);
+    // Warning surfaces on stderr so the user sees it.
+    expect2(stderr).toContain("both");
+    expect2(stderr).toContain("vaults");
+    expect2(stderr).toContain("data");
+  });
+
+  test2("0.3 internal migration: idempotent — second boot is a no-op", async () => {
+    const script = `
+      process.env.PARACHUTE_HOME = ${JSON.stringify(dir)};
+      const fs = await import("fs");
+      const path = await import("path");
+      const vaultHome = path.join(${JSON.stringify(dir)}, "vault");
+      fs.mkdirSync(path.join(vaultHome, "vaults", "journal"), { recursive: true });
+      fs.writeFileSync(path.join(vaultHome, "vaults", "journal", "vault.yaml"), "name: journal\\n");
+      const { ensureConfigDirSync } = await import(${JSON.stringify(join(import.meta.dir, "config.ts"))});
+      ensureConfigDirSync();
+      ensureConfigDirSync(); // second boot — no-op.
+      console.log(JSON.stringify({
+        vaultYaml: fs.readFileSync(path.join(vaultHome, "data", "journal", "vault.yaml"), "utf-8"),
+        legacyVaultsDir: fs.existsSync(path.join(vaultHome, "vaults")),
+      }));
+    `;
+    const proc = Bun.spawnSync({ cmd: ["bun", "-e", script], stdout: "pipe", stderr: "pipe" });
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect2(proc.exitCode, stderr).toBe(0);
+    const parsed = JSON.parse(new TextDecoder().decode(proc.stdout).trim());
+    expect2(parsed.vaultYaml).toContain("name: journal");
+    expect2(parsed.legacyVaultsDir).toBe(false);
   });
 
   test2("leaves legacy in place when target already exists (no overwrite)", async () => {

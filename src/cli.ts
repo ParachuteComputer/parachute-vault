@@ -46,7 +46,7 @@ import {
   GLOBAL_CONFIG_PATH,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
-import { VAULTS_DIR } from "./config.ts";
+import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import {
   runBackup,
@@ -1078,7 +1078,7 @@ async function cmdUninstall(argsList: string[]) {
   // miss this; interactive users already see the prompts.
   if (skipPrompts && wipe) {
     const ts = new Date().toISOString();
-    const targets = [VAULTS_DIR, ENV_PATH, GLOBAL_CONFIG_PATH, LOG_PATH, ERR_PATH].join(", ");
+    const targets = [DATA_DIR, ENV_PATH, GLOBAL_CONFIG_PATH, LOG_PATH, ERR_PATH].join(", ");
     console.log(`[${ts}] scripted destructive wipe: ${targets}`);
   }
 
@@ -1122,7 +1122,7 @@ async function cmdUninstall(argsList: string[]) {
     // Inventory what's actually on disk. Paths that don't exist are a
     // silent no-op on removal, but we also skip listing them so the
     // "would be removed" summary doesn't lie to the user.
-    const vaultsExist = existsSync(VAULTS_DIR);
+    const vaultsExist = existsSync(DATA_DIR);
     const envExists = existsSync(ENV_PATH);
     const configExists = existsSync(GLOBAL_CONFIG_PATH);
     const logExists = existsSync(LOG_PATH);
@@ -1133,7 +1133,7 @@ async function cmdUninstall(argsList: string[]) {
       console.log("No user data to remove.");
     } else {
       console.log("\nUser data that would be removed:");
-      if (vaultsExist) console.log(`  ${VAULTS_DIR} (SQLite vaults)`);
+      if (vaultsExist) console.log(`  ${DATA_DIR} (per-vault SQLite data)`);
       if (envExists) console.log(`  ${ENV_PATH} (.env config + secrets)`);
       if (configExists) console.log(`  ${GLOBAL_CONFIG_PATH} (global config)`);
       if (logExists) console.log(`  ${LOG_PATH} (daemon log)`);
@@ -1147,7 +1147,7 @@ async function cmdUninstall(argsList: string[]) {
         doWipe = await confirm("Delete this data? (cannot be undone)", false);
       }
       if (doWipe) {
-        if (vaultsExist) rmSync(VAULTS_DIR, { recursive: true, force: true });
+        if (vaultsExist) rmSync(DATA_DIR, { recursive: true, force: true });
         if (envExists) rmSync(ENV_PATH, { force: true });
         if (configExists) rmSync(GLOBAL_CONFIG_PATH, { force: true });
         if (logExists) rmSync(LOG_PATH, { force: true });
