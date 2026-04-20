@@ -465,3 +465,109 @@ describe("per-vault OAuth discovery", () => {
     expect(regRes.status).toBe(201);
   });
 });
+
+// ---------------------------------------------------------------------------
+// /.parachute/info + /.parachute/icon.svg — public service-info card for the
+// CLI hub page at the ecosystem root. The hub fetches these per service to
+// render tiles, so the endpoints are public (no auth), CORS `*`, and zero
+// PII. Shape is locked so all services line up in the aggregator UI.
+// ---------------------------------------------------------------------------
+
+describe("/.parachute/info + /.parachute/icon.svg", () => {
+  test("info returns the locked card shape with version from package.json", async () => {
+    createVault("journal");
+    const pkg = (await import("../package.json", { with: { type: "json" } })).default;
+    const path = "/vault/journal/.parachute/info";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    const body = (await res.json()) as {
+      name: string;
+      displayName: string;
+      tagline: string;
+      version: string;
+      iconUrl: string;
+    };
+    expect(body).toEqual({
+      name: "parachute-vault",
+      displayName: "Vault",
+      tagline: expect.stringContaining("knowledge graph"),
+      version: pkg.version,
+      iconUrl: "/vault/journal/.parachute/icon.svg",
+    });
+  });
+
+  test("info iconUrl is vault-scoped and points at a live icon handler", async () => {
+    createVault("work");
+    const infoPath = "/vault/work/.parachute/info";
+    const infoRes = await route(new Request(`http://localhost:1940${infoPath}`), infoPath);
+    const info = (await infoRes.json()) as { iconUrl: string };
+    expect(info.iconUrl).toBe("/vault/work/.parachute/icon.svg");
+
+    // Follow the pointer — the advertised iconUrl must resolve.
+    const iconRes = await route(
+      new Request(`http://localhost:1940${info.iconUrl}`),
+      info.iconUrl,
+    );
+    expect(iconRes.status).toBe(200);
+  });
+
+  test("icon.svg returns an SVG body with the right content-type + CORS", async () => {
+    createVault("journal");
+    const path = "/vault/journal/.parachute/icon.svg";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("image/svg+xml");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    const body = await res.text();
+    expect(body).toContain("<svg");
+    expect(body).toContain("</svg>");
+  });
+
+  test("both endpoints are public — no auth header required, none honored", async () => {
+    createVault("journal");
+    for (const path of [
+      "/vault/journal/.parachute/info",
+      "/vault/journal/.parachute/icon.svg",
+    ]) {
+      // No Authorization header.
+      const resAnon = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(resAnon.status).toBe(200);
+
+      // Bogus Authorization header — still 200, auth is not consulted.
+      const resWithHeader = await route(
+        new Request(`http://localhost:1940${path}`, {
+          headers: { Authorization: "Bearer pvt_nonsense" },
+        }),
+        path,
+      );
+      expect(resWithHeader.status).toBe(200);
+    }
+  });
+
+  test("unknown vault returns 404 before reaching the info/icon handlers", async () => {
+    createVault("journal");
+    for (const path of [
+      "/vault/nonexistent/.parachute/info",
+      "/vault/nonexistent/.parachute/icon.svg",
+    ]) {
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(res.status).toBe(404);
+    }
+  });
+
+  test("non-GET methods return 405 (and never trigger auth — stays public)", async () => {
+    createVault("journal");
+    for (const path of [
+      "/vault/journal/.parachute/info",
+      "/vault/journal/.parachute/icon.svg",
+    ]) {
+      const res = await route(
+        new Request(`http://localhost:1940${path}`, { method: "POST" }),
+        path,
+      );
+      expect(res.status).toBe(405);
+    }
+  });
+});

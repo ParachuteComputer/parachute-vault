@@ -6,6 +6,10 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /vault/<name>/.parachute/info` + `/.parachute/icon.svg` for the CLI hub page.** Two public (no auth), CORS-`*` endpoints so the ecosystem-root hub rendered by the CLI can aggregate service cards. `info` returns a locked card shape — `name`, `displayName`, `tagline`, `version` (from `package.json`), `iconUrl` — and `icon.svg` returns a small placeholder monogram inline. Zero PII, read-only. Non-GET methods return 405.
+
 ### Changed
 
 - **Vault state moved from `~/.parachute/` into `~/.parachute/vault/`.** The ecosystem root (`~/.parachute/`) now hosts multiple sibling services — `services.json` and `well-known/` stay at the root (CLI-owned), and everything vault owns (`.env`, `config.yaml`, `vault.log`, `vault.err`, `start.sh`, `server-path`, `vaults/`, `assets/`, `backup-last.json`, top-level `*.db` snapshots) has moved under `~/.parachute/vault/`. `PARACHUTE_HOME` still points at the ecosystem root; the vault subdir is derived as `${PARACHUTE_HOME}/vault`. On first post-upgrade run, any legacy paths still at the root are auto-migrated into `vault/` — the CLI logs each moved path to stderr and the migration is idempotent (double-runs are a no-op). If a legacy path and its new counterpart both exist, the new one wins and the legacy copy is left in place with a warning so users can inspect before removing. The launchd plist + systemd unit both point `WorkingDirectory` at the new `vault/` subdir, and the generated `start.sh` wrapper now sources `~/.parachute/vault/.env`. No user action is required — running any `parachute-vault` command (including `doctor` and `url`) triggers the migration.
