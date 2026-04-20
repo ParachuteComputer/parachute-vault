@@ -1533,9 +1533,9 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  test("discovery: issuer + endpoints point at the hub when env is set", () => {
+  test("discovery: returns hub issuer when request arrives via hub origin", () => {
     process.env.PARACHUTE_HUB_ORIGIN = HUB;
-    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const req = makeRequest(`${HUB}/vault/default/.well-known/oauth-authorization-server`);
     const res = handleAuthorizationServer(req, "default");
     expect(res.status).toBe(200);
     return res.json().then((body: any) => {
@@ -1550,23 +1550,44 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
 
   test("discovery: trailing slash on hub origin is stripped", async () => {
     process.env.PARACHUTE_HUB_ORIGIN = `${HUB}/`;
-    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-authorization-server");
+    const req = makeRequest(`${HUB}/vault/default/.well-known/oauth-authorization-server`);
     const res = handleAuthorizationServer(req, "default");
     const body = await res.json();
     expect(body.issuer).toBe(HUB);
     expect(body.token_endpoint).toBe(`${HUB}/oauth/token`);
   });
 
-  test("discovery: protected-resource metadata uses hub as authorization_server", async () => {
+  test("discovery: protected-resource metadata uses hub as authorization_server when request arrives via hub", async () => {
     process.env.PARACHUTE_HUB_ORIGIN = HUB;
-    const req = makeRequest("https://vault.test/vault/default/.well-known/oauth-protected-resource");
+    const req = makeRequest(`${HUB}/vault/default/.well-known/oauth-protected-resource`);
     const res = handleProtectedResource(req, "default");
     const body = await res.json();
     expect(body.authorization_servers).toEqual([HUB]);
-    // Resource URL still reflects the vault's own origin — that's where the
-    // MCP endpoint actually lives.
-    expect(body.resource).toBe("https://vault.test/vault/default/mcp");
+    expect(body.resource).toBe(`${HUB}/vault/default/mcp`);
     expect(body.scopes_supported).toContain("vault:read");
+  });
+
+  test("discovery: RFC 8414 — hub env set, request via loopback returns loopback issuer, not hub", async () => {
+    // Aaron's bug: mcp-install wrote a loopback URL while PARACHUTE_HUB_ORIGIN
+    // was set, so the client fetched discovery via http://127.0.0.1 but got
+    // back `issuer: https://hub.example` — origin mismatch, strict OAuth
+    // clients (Claude Code) reject. Each origin must advertise its own issuer.
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    const req = makeRequest("http://127.0.0.1:1940/vault/default/.well-known/oauth-authorization-server");
+    const res = handleAuthorizationServer(req, "default");
+    const body = await res.json();
+    expect(body.issuer).toBe("http://127.0.0.1:1940/vault/default");
+    expect(body.token_endpoint).toBe("http://127.0.0.1:1940/vault/default/oauth/token");
+    expect(body.registration_endpoint).toBe("http://127.0.0.1:1940/vault/default/oauth/register");
+  });
+
+  test("discovery: protected-resource on loopback returns loopback AS even with hub env set", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    const req = makeRequest("http://127.0.0.1:1940/vault/default/.well-known/oauth-protected-resource");
+    const res = handleProtectedResource(req, "default");
+    const body = await res.json();
+    expect(body.authorization_servers).toEqual(["http://127.0.0.1:1940/vault/default"]);
+    expect(body.resource).toBe("http://127.0.0.1:1940/vault/default/mcp");
   });
 
   test("discovery: falls back to vault origin when env is unset", async () => {
@@ -1585,7 +1606,7 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     expect(body.scopes_supported).toEqual(expect.arrayContaining(["vault:read", "vault:write", "full", "read"]));
   });
 
-  test("token response includes iss = hub and an additive services field", async () => {
+  test("token response includes iss = hub when issued on hub origin", async () => {
     process.env.PARACHUTE_HUB_ORIGIN = HUB;
     const token = await fullOAuthFlow();
     // Re-issue a token to inspect the body (fullOAuthFlow returns only the string)
@@ -1594,7 +1615,7 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     const { codeVerifier, codeChallenge } = generatePkce();
     const redirectUri = "https://example.com/callback";
     const authRes = await handleAuthorizePost(
-      makeRequest("https://vault.test/vault/default/oauth/authorize", {
+      makeRequest(`${HUB}/vault/default/oauth/authorize`, {
         method: "POST",
         body: new URLSearchParams({
           action: "authorize",
@@ -1611,7 +1632,7 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     );
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
     const tokenRes = await handleToken(
-      makeRequest("https://vault.test/vault/default/oauth/token", {
+      makeRequest(`${HUB}/vault/default/oauth/token`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -1634,24 +1655,17 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     expect(token).toMatch(/^pvt_/);
   });
 
-  test("token response services catalog reflects services.json when present", async () => {
+  test("token iss matches request origin when client came via loopback even with hub env set", async () => {
+    // Same-vault twin of the discovery-on-loopback test: a token minted over
+    // the loopback flow carries `iss` = the loopback issuer, not the hub.
+    // Tokens introspected against loopback discovery's issuer must validate.
     process.env.PARACHUTE_HUB_ORIGIN = HUB;
-    fs.writeFileSync(
-      path.join(tmpHome, "services.json"),
-      JSON.stringify({
-        services: [
-          { name: "vault", port: 1940, paths: ["/vault/default"], health: "/health", version: "0.3.0" },
-          { name: "notes", port: 1941, paths: ["/notes"], health: "/health", version: "0.1.0" },
-        ],
-      }),
-    );
-
     const ownerToken = createOwnerToken();
     const clientId = await registerClient();
     const { codeVerifier, codeChallenge } = generatePkce();
     const redirectUri = "https://example.com/callback";
     const authRes = await handleAuthorizePost(
-      makeRequest("https://vault.test/vault/default/oauth/authorize", {
+      makeRequest("http://127.0.0.1:1940/vault/default/oauth/authorize", {
         method: "POST",
         body: new URLSearchParams({
           action: "authorize",
@@ -1668,7 +1682,59 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     );
     const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
     const tokenRes = await handleToken(
-      makeRequest("https://vault.test/vault/default/oauth/token", {
+      makeRequest("http://127.0.0.1:1940/vault/default/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    const body = await tokenRes.json();
+    expect(body.iss).toBe("http://127.0.0.1:1940/vault/default");
+  });
+
+  test("token response services catalog reflects services.json using hub origin when issued via hub", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = HUB;
+    fs.writeFileSync(
+      path.join(tmpHome, "services.json"),
+      JSON.stringify({
+        services: [
+          { name: "vault", port: 1940, paths: ["/vault/default"], health: "/health", version: "0.3.0" },
+          { name: "notes", port: 1941, paths: ["/notes"], health: "/health", version: "0.1.0" },
+        ],
+      }),
+    );
+
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+    const authRes = await handleAuthorizePost(
+      makeRequest(`${HUB}/vault/default/oauth/authorize`, {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+    const tokenRes = await handleToken(
+      makeRequest(`${HUB}/vault/default/oauth/token`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
