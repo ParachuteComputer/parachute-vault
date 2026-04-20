@@ -62,6 +62,7 @@ import {
   handleToken,
   getBaseUrl,
 } from "./oauth.ts";
+import { handleConfigSchema, handleConfig } from "./module-config.ts";
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -327,6 +328,27 @@ export async function route(
     return subpath === "/.parachute/info"
       ? handleParachuteInfo(vaultName)
       : handleParachuteIcon();
+  }
+
+  // Module configuration endpoints (Phase 2 of the module architecture).
+  // Schema is always public — hub reads it to render the config form, no
+  // secrets involved. Current values are also public during Phase 0–2 while
+  // the hub is loopback-only; the `vault:admin` scope will gate them once
+  // Phase 3 enforcement lands.
+  if (subpath === "/.parachute/config/schema") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return handleConfigSchema();
+  }
+  if (subpath === "/.parachute/config") {
+    if (req.method !== "GET") {
+      // PUT lands in Phase 3 — return 405 so clients that already speak the
+      // full contract discover the gap rather than silently succeeding.
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    const globalConfig = readGlobalConfig();
+    return handleConfig(vaultConfig, globalConfig);
   }
 
   // OAuth discovery (no auth). The protected-resource metadata advertises
