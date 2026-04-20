@@ -467,6 +467,194 @@ describe("per-vault OAuth discovery", () => {
 });
 
 // ---------------------------------------------------------------------------
+// RFC 8414 §3.1 / RFC 9728 §3 path-insertion discovery URLs.
+//
+// For a resource at `/vault/<name>/mcp`, conformant clients (including
+// Claude Code's MCP OAuth SDK) probe metadata at
+//
+//   /.well-known/oauth-authorization-server/vault/<name>[/mcp]
+//   /.well-known/oauth-protected-resource/vault/<name>[/mcp]
+//
+// These routes MUST return the same document as the path-append form —
+// otherwise mixed-toolchain clients see drifted metadata. Coherence check
+// below asserts deep equality.
+// ---------------------------------------------------------------------------
+
+describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
+  test("AS metadata at path-insertion short form returns vault-scoped endpoints", async () => {
+    createVault("journal");
+    const path = "/.well-known/oauth-authorization-server/vault/journal";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      issuer: string;
+      authorization_endpoint: string;
+      token_endpoint: string;
+      registration_endpoint: string;
+    };
+    expect(body.issuer).toBe("http://localhost:1940/vault/journal");
+    expect(body.authorization_endpoint).toBe("http://localhost:1940/vault/journal/oauth/authorize");
+    expect(body.token_endpoint).toBe("http://localhost:1940/vault/journal/oauth/token");
+    expect(body.registration_endpoint).toBe("http://localhost:1940/vault/journal/oauth/register");
+  });
+
+  test("AS metadata at path-insertion long form (/mcp suffix) also works", async () => {
+    // Some SDKs probe with the exact resource path appended. The optional
+    // `/mcp` suffix covers that.
+    createVault("journal");
+    const path = "/.well-known/oauth-authorization-server/vault/journal/mcp";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { issuer: string };
+    expect(body.issuer).toBe("http://localhost:1940/vault/journal");
+  });
+
+  test("PRM at path-insertion short form returns vault-scoped resource", async () => {
+    createVault("journal");
+    const path = "/.well-known/oauth-protected-resource/vault/journal";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { resource: string; authorization_servers: string[] };
+    expect(body.resource).toBe("http://localhost:1940/vault/journal/mcp");
+    expect(body.authorization_servers).toEqual(["http://localhost:1940/vault/journal"]);
+  });
+
+  test("PRM at path-insertion long form (/mcp suffix) also works", async () => {
+    createVault("journal");
+    const path = "/.well-known/oauth-protected-resource/vault/journal/mcp";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { resource: string };
+    expect(body.resource).toBe("http://localhost:1940/vault/journal/mcp");
+  });
+
+  test("path-insertion and path-append forms return deep-equal JSON (coherence)", async () => {
+    // Belt-and-braces: a client that probes one form and validates against
+    // the other (or a proxy that caches based on URL) must see identical
+    // bytes. If these drift, strict/lax clients will disagree on reality.
+    createVault("journal");
+    const asPaths = [
+      "/.well-known/oauth-authorization-server/vault/journal",
+      "/vault/journal/.well-known/oauth-authorization-server",
+    ];
+    const [asInsert, asAppend] = await Promise.all(
+      asPaths.map(async (p) => {
+        const r = await route(new Request(`http://localhost:1940${p}`), p);
+        return r.json();
+      }),
+    );
+    expect(asInsert).toEqual(asAppend);
+
+    const prmPaths = [
+      "/.well-known/oauth-protected-resource/vault/journal",
+      "/vault/journal/.well-known/oauth-protected-resource",
+    ];
+    const [prmInsert, prmAppend] = await Promise.all(
+      prmPaths.map(async (p) => {
+        const r = await route(new Request(`http://localhost:1940${p}`), p);
+        return r.json();
+      }),
+    );
+    expect(prmInsert).toEqual(prmAppend);
+  });
+
+  test("unknown vault → 404 on all four path-insertion shapes (no phantom metadata)", async () => {
+    createVault("journal");
+    for (const path of [
+      "/.well-known/oauth-authorization-server/vault/nonexistent",
+      "/.well-known/oauth-authorization-server/vault/nonexistent/mcp",
+      "/.well-known/oauth-protected-resource/vault/nonexistent",
+      "/.well-known/oauth-protected-resource/vault/nonexistent/mcp",
+    ]) {
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(res.status).toBe(404);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("Vault not found");
+    }
+  });
+
+  test("x-forwarded-* headers propagate through path-insertion URLs", async () => {
+    createVault("journal");
+    const path = "/.well-known/oauth-authorization-server/vault/journal";
+    const res = await route(
+      new Request(`http://127.0.0.1:1940${path}`, {
+        headers: {
+          "x-forwarded-host": "vault.example.com",
+          "x-forwarded-proto": "https",
+        },
+      }),
+      path,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { issuer: string; registration_endpoint: string };
+    expect(body.issuer).toBe("https://vault.example.com/vault/journal");
+    expect(body.registration_endpoint).toBe(
+      "https://vault.example.com/vault/journal/oauth/register",
+    );
+  });
+
+  test("end-to-end: 401 → PRM (path-insertion) → AS (path-insertion) → DCR lands", async () => {
+    // Exact handshake Claude Code's MCP OAuth SDK performs. If any hop
+    // 404s, auth cascade-fails — this is the launch-blocker regression
+    // we're fixing.
+    createVault("journal");
+
+    // Step 1: unauth MCP → 401 + WWW-Authenticate with PRM pointer.
+    const mcpPath = "/vault/journal/mcp";
+    const mcpRes = await route(new Request(`http://localhost:1940${mcpPath}`), mcpPath);
+    expect(mcpRes.status).toBe(401);
+    const challenge = mcpRes.headers.get("WWW-Authenticate")!;
+    const prmUrl = challenge.match(/resource_metadata="([^"]+)"/)![1];
+
+    // The challenge still points at the path-append PRM (we emit one URL
+    // in the header). Strict clients ignore the hint and probe the
+    // path-insertion form regardless — that's the path we care about here.
+    const prmInsertPath = "/.well-known/oauth-protected-resource/vault/journal";
+    const prmRes = await route(
+      new Request(`http://localhost:1940${prmInsertPath}`),
+      prmInsertPath,
+    );
+    expect(prmRes.status).toBe(200);
+    const prm = (await prmRes.json()) as { authorization_servers: string[] };
+    const asBase = prm.authorization_servers[0]; // http://localhost:1940/vault/journal
+
+    // Step 2: fetch AS metadata via path-insertion. The issuer path is
+    // everything after the host — here, `/vault/journal`.
+    const asBasePath = new URL(asBase).pathname;
+    const asInsertPath = `/.well-known/oauth-authorization-server${asBasePath}`;
+    const asRes = await route(
+      new Request(`http://localhost:1940${asInsertPath}`),
+      asInsertPath,
+    );
+    expect(asRes.status).toBe(200);
+    const asMeta = (await asRes.json()) as { registration_endpoint: string };
+
+    // Step 3: registration_endpoint must be live.
+    const regPath = new URL(asMeta.registration_endpoint).pathname;
+    const regRes = await route(
+      new Request(`http://localhost:1940${regPath}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Test",
+          redirect_uris: ["https://example.com/cb"],
+        }),
+      }),
+      regPath,
+    );
+    expect(regRes.status).toBe(201);
+
+    // Path-append PRM URL in the challenge header must still resolve —
+    // we haven't broken the back-compat path.
+    const prmAppendRes = await route(
+      new Request(prmUrl),
+      new URL(prmUrl).pathname,
+    );
+    expect(prmAppendRes.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // /.parachute/info + /.parachute/icon.svg — public service-info card for the
 // CLI hub page at the ecosystem root. The hub fetches these per service to
 // render tiles, so the endpoints are public (no auth), CORS `*`, and zero

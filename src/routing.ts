@@ -152,6 +152,49 @@ export async function route(
   clientIp?: string,
 ): Promise<Response> {
   // ---------------------------------------------------------------------
+  // OAuth discovery — RFC 8414 §3.1 / RFC 9728 §3 path-insertion form.
+  //
+  // For a resource at `/vault/<name>/mcp`, the spec-mandated metadata URLs
+  // are
+  //
+  //   /.well-known/oauth-authorization-server/vault/<name>[/mcp]
+  //   /.well-known/oauth-protected-resource/vault/<name>[/mcp]
+  //
+  // (path-insertion — `.well-known` goes ABOVE the issuer path), not the
+  // path-append shape `/vault/<name>/.well-known/<type>` served further
+  // down. Strict clients — Claude Code's MCP SDK, and any RFC 8414-
+  // conformant MCP client — only probe the path-insertion form; without
+  // these routes they 404 on discovery and can't authenticate.
+  //
+  // Both shapes return byte-identical JSON via the shared handlers. The
+  // path-append branch lives inside the per-vault block alongside the
+  // rest of `/vault/<name>/*` routing. PR #124 originally shipped this
+  // for the `/vaults/<name>/` URL shape; PR #138 migrated URLs to
+  // `/vault/<name>/` and dropped the insertion routes — this restores
+  // them for the new URL shape.
+  // ---------------------------------------------------------------------
+  const protectedResourceInsert = path.match(
+    /^\/\.well-known\/oauth-protected-resource\/vault\/([^/]+)(?:\/mcp)?$/,
+  );
+  if (protectedResourceInsert) {
+    const vaultName = protectedResourceInsert[1];
+    if (!readVaultConfig(vaultName)) {
+      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+    }
+    return handleProtectedResource(req, vaultName);
+  }
+  const authServerInsert = path.match(
+    /^\/\.well-known\/oauth-authorization-server\/vault\/([^/]+)(?:\/mcp)?$/,
+  );
+  if (authServerInsert) {
+    const vaultName = authServerInsert[1];
+    if (!readVaultConfig(vaultName)) {
+      return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
+    }
+    return handleAuthorizationServer(req, vaultName);
+  }
+
+  // ---------------------------------------------------------------------
   // Cross-vault / origin-root endpoints
   // ---------------------------------------------------------------------
 
