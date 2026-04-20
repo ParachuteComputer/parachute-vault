@@ -676,6 +676,7 @@ describe("/.parachute/info + /.parachute/icon.svg", () => {
       tagline: string;
       version: string;
       iconUrl: string;
+      kind: string;
     };
     expect(body).toEqual({
       name: "parachute-vault",
@@ -683,6 +684,7 @@ describe("/.parachute/info + /.parachute/icon.svg", () => {
       tagline: expect.stringContaining("knowledge graph"),
       version: pkg.version,
       iconUrl: "/vault/journal/.parachute/icon.svg",
+      kind: "api",
     });
   });
 
