@@ -44,26 +44,33 @@ A mental model for "where is my data?" and "what can I poke at?" after the one-c
 ### On disk — `~/.parachute/`
 
 ```
-~/.parachute/
-  config.yaml           # global config — port, default_vault, owner password hash,
-                        # TOTP secret, backup-codes hashes, backup schedule. 0600.
-  .env                  # runtime env vars (PORT=1940 by default; any webhook API
-                        # keys you add later). Sourced by the daemon wrapper.
-  vault.log             # stdout of the running daemon (tail via `parachute-vault logs`)
-  vault.err             # stderr of the running daemon
-  server-path           # text file: absolute path to the repo's src/server.ts —
-                        # how the daemon wrapper finds the source after you move it
-  start.sh              # the wrapper launchd/systemd execs. Knows the absolute
-                        # path to `bun` so a later PATH change doesn't break the daemon
-  assets/               # legacy top-level uploads dir (attachments now land per-vault)
-  vaults/               # one subdirectory per vault
-    default/
-      vault.db          # the SQLite database — notes, tags, links, attachments,
-                        # per-vault tokens, OAuth clients + codes, tag schemas
-      vault.yaml        # per-vault config — description (sent as MCP session
-                        # instruction), published_tag override, legacy api_keys
-      assets/           # per-vault uploaded attachments (audio, images)
+~/.parachute/               # ecosystem root — shared with sibling services
+  services.json             # CLI-owned manifest (used by the dispatcher for
+                            # discovery + routing across Parachute services)
+  well-known/               # CLI-owned (.well-known serving)
+  vault/                    # everything vault owns
+    config.yaml             # global config — port, default_vault, owner password
+                            # hash, TOTP secret, backup-codes hashes, backup
+                            # schedule. 0600.
+    .env                    # runtime env vars (PORT=1940 by default; any webhook
+                            # API keys you add later). Sourced by the daemon wrapper.
+    vault.log               # stdout of the running daemon (tail via `parachute-vault logs`)
+    vault.err               # stderr of the running daemon
+    server-path             # text file: absolute path to the repo's src/server.ts —
+                            # how the daemon wrapper finds the source after you move it
+    start.sh                # the wrapper launchd/systemd execs. Knows the absolute
+                            # path to `bun` so a later PATH change doesn't break the daemon
+    assets/                 # legacy top-level uploads dir (attachments now land per-vault)
+    vaults/                 # one subdirectory per vault
+      default/
+        vault.db            # the SQLite database — notes, tags, links, attachments,
+                            # per-vault tokens, OAuth clients + codes, tag schemas
+        vault.yaml          # per-vault config — description (sent as MCP session
+                            # instruction), published_tag override, legacy api_keys
+        assets/             # per-vault uploaded attachments (audio, images)
 ```
+
+`~/.parachute/` itself is the ecosystem root shared across sibling services — `services.json` and `well-known/` live at the root and are managed by the top-level CLI. Everything vault owns is scoped under `~/.parachute/vault/`. Pre-0.3 installs kept vault state directly at the root; any legacy paths still there are auto-migrated into `vault/` on first post-upgrade run (see CHANGELOG).
 
 `config.yaml` is the one file written at 0600 because it holds the bcrypt owner-password hash and the plaintext TOTP secret. `.env` is written with your umask default (typically 0644); if you add webhook API keys there, tighten the mode yourself. SQLite DBs follow your umask.
 
@@ -108,7 +115,7 @@ parachute-vault set-password --clear        # remove (reverts to token fallback)
 parachute-vault 2fa enroll                  # optional: add TOTP 2FA on top
 ```
 
-Password and 2FA secrets live in `~/.parachute/config.yaml` at mode 0600 (bcrypt hash + base32 TOTP secret).
+Password and 2FA secrets live in `~/.parachute/vault/config.yaml` at mode 0600 (bcrypt hash + base32 TOTP secret).
 
 ### Claude Code
 
@@ -128,7 +135,7 @@ Password and 2FA secrets live in `~/.parachute/config.yaml` at mode 0600 (bcrypt
 
 Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **First MCP call after `vault init` requires no browser handoff — Claude Code uses the baked-in token and the vault's tools show up in your next session.** This is intentional: for an owner connecting their own machine's vault to their own Claude Code, the token is already there and OAuth would add friction.
 
-To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/config.yaml` and re-run `parachute-vault init` — which re-mints an API token and re-writes the `~/.claude.json` entry end-to-end. To rotate the token only, edit `~/.claude.json` and replace the `Authorization` header value with a fresh token from `parachute-vault tokens create`. (Running `parachute-vault mcp-install` on its own overwrites the MCP entry *without* an `Authorization` header and is intended for the rare case where you want to drop the token and connect via OAuth instead.)
+To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/vault/config.yaml` and re-run `parachute-vault init` — which re-mints an API token and re-writes the `~/.claude.json` entry end-to-end. To rotate the token only, edit `~/.claude.json` and replace the `Authorization` header value with a fresh token from `parachute-vault tokens create`. (Running `parachute-vault mcp-install` on its own overwrites the MCP entry *without* an `Authorization` header and is intended for the rare case where you want to drop the token and connect via OAuth instead.)
 
 ### Claude Desktop (OAuth)
 
@@ -160,7 +167,7 @@ parachute-vault remove work --yes
 
 **URL shape.** Every vault-touching route lives under `/vault/{name}/...`: `/vault/{name}/mcp`, `/vault/{name}/oauth/authorize`, `/vault/{name}/api/notes`, `/vault/{name}/view/{id}`. There is no unscoped fallback — pick the vault in the URL even if you only have one. OAuth tokens are scoped to the vault in their issuing URL; cross-vault substitution is rejected at the OAuth layer (an auth code minted for one vault cannot be redeemed at another vault's token endpoint).
 
-**Listing vaults from a client.** The authenticated `GET /vaults` endpoint returns full vault metadata. The public `GET /vaults/list` endpoint returns names only, no metadata, no auth required — this is what Parachute Daily's vault picker calls before the user authenticates. Operators who want to hide the vault list from unauthenticated callers can set `discovery: disabled` in `~/.parachute/config.yaml` to make `/vaults/list` return 404.
+**Listing vaults from a client.** The authenticated `GET /vaults` endpoint returns full vault metadata. The public `GET /vaults/list` endpoint returns names only, no metadata, no auth required — this is what Parachute Daily's vault picker calls before the user authenticates. Operators who want to hide the vault list from unauthenticated callers can set `discovery: disabled` in `~/.parachute/vault/config.yaml` to make `/vaults/list` return 404.
 
 ## CLI
 
@@ -232,7 +239,7 @@ parachute-vault backup status                  # schedule, last run, destination
 Each vault teaches AI agents how to use it:
 
 ```yaml
-# ~/.parachute/vaults/default/vault.yaml
+# ~/.parachute/vault/vaults/default/vault.yaml
 name: default
 description: |
   Personal knowledge vault. Tags in use: daily, voice, reader, project.
@@ -263,7 +270,7 @@ Note paths work like Obsidian file paths (`Projects/Parachute/README`). Normaliz
 
 ### Webhook triggers
 
-Declarative config-driven webhooks that fire when a note mutation matches a predicate. Configured in `~/.parachute/config.yaml`:
+Declarative config-driven webhooks that fire when a note mutation matches a predicate. Configured in `~/.parachute/vault/config.yaml`:
 
 ```yaml
 triggers:
@@ -340,7 +347,7 @@ In every mode the attachment row (and any stored transcript) is preserved; only 
 
 ### Backing up your vault
 
-Your vault is just SQLite DBs + a handful of YAML files under `~/.parachute/`. `parachute-vault backup` snapshots everything into a single timestamped tarball, for a one-shot or a scheduled run.
+Your vault is just SQLite DBs + a handful of YAML files under `~/.parachute/vault/`. `parachute-vault backup` snapshots everything into a single timestamped tarball, for a one-shot or a scheduled run.
 
 ```bash
 parachute-vault backup                         # one-shot — snapshot + ship to destinations
@@ -349,7 +356,7 @@ parachute-vault backup --schedule manual       # stop scheduled backups
 parachute-vault backup status                  # schedule, last run, destinations, next run
 ```
 
-Configure destinations in `~/.parachute/config.yaml`:
+Configure destinations in `~/.parachute/vault/config.yaml`:
 
 ```yaml
 backup:
@@ -377,7 +384,7 @@ A snapshot that qualifies for multiple tiers is kept once. Set any tier to `0` t
 
 **What's in a snapshot**: atomic `VACUUM INTO` copies of every `vaults/<name>/vault.db`, your `config.yaml`, and each vault's `vault.yaml`, bundled as `parachute-backup-<timestamp>.tar.gz`. Safe under concurrent reads/writes — no need to stop the daemon.
 
-**Restore**: extract the tarball into a fresh `~/.parachute/` and run `parachute-vault init` to re-register the daemon. The DBs and configs drop in place; you don't need any special restore command (for now — a dedicated `vault restore` is coming soon).
+**Restore**: extract the tarball into a fresh `~/.parachute/vault/` and run `parachute-vault init` to re-register the daemon. The DBs and configs drop in place; you don't need any special restore command (for now — a dedicated `vault restore` is coming soon).
 
 Destination kinds shipping in this release: `local` (any filesystem path — including iCloud Drive, a mounted external disk, or an rsync/Syncthing-backed folder). `s3`, `rsync`, and `cloud` destinations are planned but not yet implemented.
 
@@ -392,7 +399,7 @@ Serve notes as clean HTML pages at `/view/:noteId`:
 - **Custom tag**: set `published_tag` in vault.yaml to use a different tag name (default: `publish`).
 
 ```yaml
-# ~/.parachute/vaults/default/vault.yaml
+# ~/.parachute/vault/vaults/default/vault.yaml
 published_tag: public
 ```
 
@@ -513,18 +520,18 @@ The checks, in the order they're emitted:
 
 | Check | What it verifies | Typical fix when failing |
 |---|---|---|
-| server-path pointer | `~/.parachute/server-path` exists, is non-empty, and points at a `src/server.ts` that actually exists. This is where the stale-path failure after a repo move shows up first. | `parachute-vault init` from the current repo location. |
-| wrapper script | `~/.parachute/start.sh` exists. Without it, launchd / systemd has nothing to exec. | `parachute-vault init`. |
+| server-path pointer | `~/.parachute/vault/server-path` exists, is non-empty, and points at a `src/server.ts` that actually exists. This is where the stale-path failure after a repo move shows up first. | `parachute-vault init` from the current repo location. |
+| wrapper script | `~/.parachute/vault/start.sh` exists. Without it, launchd / systemd has nothing to exec. | `parachute-vault init`. |
 | launchd agent (macOS) / systemd service (Linux) | The daemon is registered and loaded/active. On Linux without systemd, the check is silently skipped. | `parachute-vault restart` or re-run `vault init`. |
 | bun on PATH | `bun` is resolvable via your shell's PATH. Not required once the daemon is installed (`start.sh` embeds an absolute bun path at init time) but missing bun is the #1 first-time-user failure. | `curl -fsSL https://bun.sh/install \| bash` and restart the shell. |
 | MCP entry in `~/.claude.json` | An entry is present. When it is, two follow-ups: the URL's port matches the running vault's port, and the MCP URL is reachable over HTTP (any response — even 401 — counts as reachable). | `parachute-vault mcp-install` to rewrite the entry, or `parachute-vault restart` if the daemon is down. |
-| port `1940` availability | Probes via `lsof` / `ss` and classifies: free, held by our daemon (pass), held by a foreign process (warn), or unknown (tool unavailable → check silently omitted). | Stop the conflicting process, or set a different `PORT` in `~/.parachute/.env` and re-run `vault init`. |
+| port `1940` availability | Probes via `lsof` / `ss` and classifies: free, held by our daemon (pass), held by a foreign process (warn), or unknown (tool unavailable → check silently omitted). | Stop the conflicting process, or set a different `PORT` in `~/.parachute/vault/.env` and re-run `vault init`. |
 | backup agent (macOS, only when `backup.schedule != manual`) | The scheduled-backup launchd agent is loaded. | `parachute-vault backup --schedule <hourly\|daily\|weekly>` to reinstall the agent. |
-| backup destinations (only when `backup.schedule != manual`) | At least one destination is configured; each configured destination is writable. | Edit `~/.parachute/config.yaml` under `backup.destinations`, or fix the path's permissions. |
+| backup destinations (only when `backup.schedule != manual`) | At least one destination is configured; each configured destination is writable. | Edit `~/.parachute/vault/config.yaml` under `backup.destinations`, or fix the path's permissions. |
 
 ### Common failure modes
 
-- **Daemon won't start after a port change.** `~/.parachute/.env` has the new `PORT=...` but the daemon is still trying to bind the old one, or something else already holds the new port. `parachute-vault doctor` surfaces both conditions. Fix the holder (or pick a different port) and `parachute-vault restart`.
+- **Daemon won't start after a port change.** `~/.parachute/vault/.env` has the new `PORT=...` but the daemon is still trying to bind the old one, or something else already holds the new port. `parachute-vault doctor` surfaces both conditions. Fix the holder (or pick a different port) and `parachute-vault restart`.
 - **MCP entry is stale after moving the repo.** launchd/systemd keeps pointing at the old path. `doctor` flags this as a failed `server.ts at pointer target` check; `parachute-vault init` from the new location rewrites the pointer, wrapper, and daemon registration.
 - **Claude Code shows no vault tools.** Check in order: (1) is the daemon up (`parachute-vault status`)? (2) does `~/.claude.json` have a `parachute-vault` entry with both `url` and a valid `Authorization` header? (3) does the URL's vault name match an existing vault? `parachute-vault doctor` catches the first two. A missing or stale `Authorization` header after a bare `vault mcp-install` is the usual culprit for #2 — see the Claude Code section of [Connecting a client](#connecting-a-client) for how to rewrite it.
 - **Claude Desktop / Daily won't connect via OAuth.** If the owner-password prompt was skipped at `vault init`, the consent page falls back to requiring a vault token in place of the password (functional but clunky). Set one now with `parachute-vault set-password`. If 2FA is enrolled, have your authenticator app ready before starting the flow; lost TOTP access recovers via the backup codes printed at enrollment.

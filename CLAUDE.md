@@ -5,7 +5,7 @@ Agent-native knowledge graph. Notes, tags, links over MCP. Self-hosted, one comm
 ## Architecture
 
 ```
-parachute-vault init     →  ~/.parachute/ (config, .env, daemon, MCP)
+parachute-vault init     →  ~/.parachute/vault/ (config, .env, daemon, MCP)
 parachute-vault create   →  new vault (SQLite DB + vault.yaml + pvt_ token)
 parachute-vault config   →  manage env vars (PORT, etc.)
 parachute-vault tokens   →  list / create / revoke per-vault tokens
@@ -73,12 +73,12 @@ Use Bun for everything. No Node.js.
 - **Wikilink auto-linking**: `[[wikilinks]]` in note content are automatically parsed and maintained as links. Unresolved links auto-resolve when target notes are created.
 - **Path normalization**: Paths are normalized on write (strip .md, collapse slashes, trim). UNIQUE constraint enforced. Rename cascading updates wikilinks in other notes.
 - **Obsidian interop**: Import/export preserves frontmatter, tags, wikilinks, and file paths.
-- **Unified config**: All env vars in `~/.parachute/.env` (or `$PARACHUTE_HOME/.env` in Docker).
-- **Docker-friendly**: `PARACHUTE_HOME` env var overrides data directory. Server auto-creates default vault on first run.
+- **Unified config**: All env vars in `~/.parachute/vault/.env` (or `$PARACHUTE_HOME/vault/.env` in Docker).
+- **Docker-friendly**: `PARACHUTE_HOME` env var overrides the ecosystem root; vault state lands at `$PARACHUTE_HOME/vault/`. Server auto-creates default vault on first run.
 
 ## Config
 
-All configuration in `~/.parachute/.env`:
+All configuration in `~/.parachute/vault/.env`:
 
 ```
 PORT=1940

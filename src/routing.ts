@@ -129,7 +129,7 @@ export async function route(
   // Public vault-name discovery. Lets unauthenticated clients (e.g. the
   // Daily vault-picker dropdown before OAuth) know which vault to target.
   // Operators who want to hide vault existence can set `discovery: disabled`
-  // in ~/.parachute/config.yaml — the endpoint then returns 404.
+  // in ~/.parachute/vault/config.yaml — the endpoint then returns 404.
   if (path === "/vaults/list" && req.method === "GET") {
     const globalConfig = readGlobalConfig();
     if (globalConfig.discovery === "disabled") {

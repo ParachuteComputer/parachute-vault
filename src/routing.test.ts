@@ -55,7 +55,7 @@ function reset(): void {
   clearVaultStoreCache();
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
   mkdirSync(testDir, { recursive: true });
-  mkdirSync(join(testDir, "vaults"), { recursive: true });
+  mkdirSync(join(testDir, "vault", "vaults"), { recursive: true });
   writeGlobalConfig({ port: 1940 });
 }
 
