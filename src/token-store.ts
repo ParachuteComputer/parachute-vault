@@ -16,6 +16,7 @@
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import { hashKey } from "./config.ts";
+import { legacyPermissionToScopes, parseScopes, serializeScopes } from "./scopes.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,6 +48,15 @@ export interface Token {
 
 export interface ResolvedToken {
   permission: TokenPermission;
+  /**
+   * Granted scopes, parsed from the token row's `scopes` column. Pre-v12
+   * tokens (where the column is NULL) fall back to the legacy permission
+   * → scopes mapping and `legacyDerived` is set true so callers can log
+   * a deprecation warning on first use.
+   */
+  scopes: string[];
+  /** True iff `scopes` was derived from the legacy `permission` column. */
+  legacyDerived: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +75,12 @@ export function createToken(
   opts: {
     label: string;
     permission?: TokenPermission;
+    /**
+     * Explicit OAuth-standard scopes to persist. If omitted, derived from
+     * `permission` (read → [vault:read], anything else → [vault:read,
+     * vault:write, vault:admin]). Written as a whitespace-separated string.
+     */
+    scopes?: string[];
     /** @deprecated Written to DB but not enforced at runtime. */
     scope_tag?: string | null;
     /** @deprecated Written to DB but not enforced at runtime. */
@@ -75,14 +91,17 @@ export function createToken(
   const tokenHash = hashKey(fullToken);
   const now = new Date().toISOString();
   const permission = opts.permission ?? "full";
+  const scopes = opts.scopes ?? legacyPermissionToScopes(permission);
+  const scopesStr = serializeScopes(scopes);
 
   db.prepare(`
-    INSERT INTO tokens (token_hash, label, permission, scope_tag, scope_path_prefix, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tokens (token_hash, label, permission, scopes, scope_tag, scope_path_prefix, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     tokenHash,
     opts.label,
     permission,
+    scopesStr,
     opts.scope_tag ?? null,
     opts.scope_path_prefix ?? null,
     opts.expires_at ?? null,
@@ -112,11 +131,12 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const candidateHash = hashKey(providedToken);
 
   const row = db.prepare(`
-    SELECT token_hash, permission, expires_at
+    SELECT token_hash, permission, scopes, expires_at
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
     permission: string;
+    scopes: string | null;
     expires_at: string | null;
   } | null;
 
@@ -131,7 +151,13 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   db.prepare("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
     .run(new Date().toISOString(), row.token_hash);
 
-  return { permission: normalizePermission(row.permission) };
+  const permission = normalizePermission(row.permission);
+  const parsed = parseScopes(row.scopes);
+  const hasVaultScope = parsed.some((s) => s.startsWith("vault:"));
+  const scopes = hasVaultScope ? parsed : legacyPermissionToScopes(permission);
+  const legacyDerived = !hasVaultScope;
+
+  return { permission, scopes, legacyDerived };
 }
 
 /**

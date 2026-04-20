@@ -1574,7 +1574,11 @@ describe("stateless MCP transport", async () => {
       }),
     });
 
-    const res = await handleScopedMcp(req, vaultName, { permission: "full" });
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+    });
     expect(res.status).toBe(200);
 
     const body = await res.json() as any;
@@ -1611,7 +1615,11 @@ describe("stateless MCP transport", async () => {
       }),
     });
 
-    const res = await handleScopedMcp(req, vaultName, { permission: "full" });
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+    });
     expect(res.status).toBe(200);
 
     const body = await res.json() as any;
@@ -1620,6 +1628,95 @@ describe("stateless MCP transport", async () => {
     const toolNames = body.result.tools.map((t: any) => t.name);
     expect(toolNames).toContain("create-note");
     expect(toolNames).toContain("vault-info");
+
+    closeAllStores();
+  });
+
+  test("tools/list with vault:read scope only advertises read-only tools", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-list-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {},
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "read",
+      scopes: ["vault:read"],
+      legacyDerived: false,
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as any;
+    const toolNames: string[] = body.result.tools.map((t: any) => t.name);
+    // Read-only tools are visible
+    expect(toolNames).toContain("query-notes");
+    expect(toolNames).toContain("list-tags");
+    expect(toolNames).toContain("find-path");
+    expect(toolNames).toContain("vault-info");
+    // Mutation tools are hidden — filter applied before advertising
+    expect(toolNames).not.toContain("create-note");
+    expect(toolNames).not.toContain("update-note");
+    expect(toolNames).not.toContain("delete-note");
+    expect(toolNames).not.toContain("update-tag");
+    expect(toolNames).not.toContain("delete-tag");
+
+    closeAllStores();
+  });
+
+  test("tools/call of create-note with vault:read scope is refused (not silently allowed)", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-call-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "create-note", arguments: { content: "nope" } },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "read",
+      scopes: ["vault:read"],
+      legacyDerived: false,
+    });
+    expect(res.status).toBe(200); // JSON-RPC envelope is 200 even for tool errors
+    const body = await res.json() as any;
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("vault:write");
 
     closeAllStores();
   });
@@ -1654,7 +1751,11 @@ describe("stateless MCP transport", async () => {
       }),
     });
 
-    const res = await handleScopedMcp(req, vaultName, { permission: "full" });
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+    });
     expect(res.status).toBe(200);
 
     const body = await res.json() as any;

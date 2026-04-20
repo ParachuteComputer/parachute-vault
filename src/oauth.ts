@@ -20,6 +20,7 @@ import type { TokenPermission } from "./token-store.ts";
 import { verifyOwnerPassword, authorizeRateLimit, type RateLimiter } from "./owner-auth.ts";
 import { verifyTotpCode, verifyAndConsumeBackupCode } from "./two-factor.ts";
 import { readManifest, ServicesManifestError } from "./services-manifest.ts";
+import { legacyPermissionToScopes, SCOPE_READ, serializeScopes } from "./scopes.ts";
 
 /** Options for handleAuthorizePost. */
 export interface AuthorizePostOptions {
@@ -209,15 +210,16 @@ export function handleAuthorizationServer(req: Request, vaultName: string): Resp
 }
 
 /**
- * Scopes published in OAuth discovery. Phase 0 publishes the final shape but
- * does not enforce per-scope distinctions yet — all issued tokens continue to
- * grant full access. `vault:<name>:*` refinements are documented as future
- * shape; the scope parser accepts them as synonyms for `vault:*` for now.
+ * Scopes published in OAuth discovery. Phase 2 enforces these at request time
+ * (`vault:admin` ⊇ `vault:write` ⊇ `vault:read`). `vault:<name>:*` refinements
+ * are documented as future shape; the scope parser accepts them as synonyms
+ * for `vault:*` today.
  *
  * Legacy `full`/`read` remain in the list for back-compat with 0.2.x clients
- * that hardcoded those names.
+ * that hardcoded those names — they're translated into `vault:*` scopes on the
+ * way in and out.
  */
-const SCOPES_SUPPORTED = ["vault:read", "vault:write", "full", "read"];
+const SCOPES_SUPPORTED = ["vault:read", "vault:write", "vault:admin", "full", "read"];
 
 // ---------------------------------------------------------------------------
 // Dynamic Client Registration (RFC 7591)
@@ -608,19 +610,27 @@ export async function handleToken(
   // Mark code as used
   db.prepare("UPDATE oauth_codes SET used = 1 WHERE code = ?").run(code);
 
-  // Create a real pvt_ token
+  // Translate the consent-time selected scope into both the legacy permission
+  // column and the OAuth-standard scope list we now persist on the token row.
+  // The consent page only offers read vs full today; full becomes the
+  // admin-inheriting scope set so hub admin operations keep working.
   const permission: TokenPermission = authCode.scope === "read" ? "read" : "full";
+  const scopes = legacyPermissionToScopes(permission);
+  const scopeString = serializeScopes(scopes);
+
   const { fullToken } = generateToken();
   createToken(db, fullToken, {
     label: `oauth:${clientId.slice(0, 8)}`,
     permission,
+    scopes,
   });
 
   const { issuer } = resolveOAuthCoordinates(req, vaultName);
   return Response.json({
     access_token: fullToken,
     token_type: "bearer",
-    scope: permission,
+    // RFC 6749 §5.1: scope is an OAuth-standard whitespace-separated string.
+    scope: scopeString,
     vault: vaultName,
     // Phase 0: identify the issuer so tokens validated by downstream services
     // can pin trust on the hub-origin URL, not vault's internal address.

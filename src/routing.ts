@@ -39,9 +39,10 @@ import {
 import {
   authenticateVaultRequest,
   authenticateGlobalRequest,
-  isMethodAllowed,
   extractApiKey,
+  requireScope,
 } from "./auth.ts";
+import { SCOPE_ADMIN, scopeForMethod } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
 import {
@@ -332,9 +333,7 @@ export async function route(
 
   // Module configuration endpoints (Phase 2 of the module architecture).
   // Schema is always public — hub reads it to render the config form, no
-  // secrets involved. Current values are also public during Phase 0–2 while
-  // the hub is loopback-only; the `vault:admin` scope will gate them once
-  // Phase 3 enforcement lands.
+  // secrets involved. Current values require `vault:admin` as of Phase 3.
   if (subpath === "/.parachute/config/schema") {
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
@@ -343,9 +342,27 @@ export async function route(
   }
   if (subpath === "/.parachute/config") {
     if (req.method !== "GET") {
-      // PUT lands in Phase 3 — return 405 so clients that already speak the
-      // full contract discover the gap rather than silently succeeding.
+      // PUT lands in a future phase — return 405 so clients that already speak
+      // the full contract discover the gap rather than silently succeeding.
       return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    // Admin-gated: the current config includes things that aren't user data
+    // (worker intervals, TTLs, retention policy) but are still configuration
+    // an attacker could use to map the deployment. `vault:admin` keeps the
+    // hub's loopback workflow intact while locking out read-only tokens.
+    const configAuth = authenticateVaultRequest(req, vaultConfig, getVaultStore(vaultName).db);
+    if ("error" in configAuth) return configAuth.error;
+    if (!requireScope(configAuth, SCOPE_ADMIN)) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope.`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: configAuth.scopes,
+        },
+        { status: 403 },
+      );
     }
     const globalConfig = readGlobalConfig();
     return handleConfig(vaultConfig, globalConfig);
@@ -394,17 +411,26 @@ export async function route(
     });
   }
 
-  // REST API — enforce permission level.
-  if (!isMethodAllowed(req.method, auth.permission)) {
-    return Response.json(
-      { error: "Forbidden", message: "Insufficient permissions" },
-      { status: 403 },
-    );
-  }
-
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
+  }
+
+  // REST API — scope gate. GET/HEAD/OPTIONS → vault:read,
+  // POST/PATCH/PUT/DELETE → vault:write. Inheritance (admin ⊇ write ⊇ read)
+  // is handled inside `requireScope`.
+  const requiredApiScope = scopeForMethod(req.method);
+  if (!requireScope(auth, requiredApiScope)) {
+    return Response.json(
+      {
+        error: "Forbidden",
+        error_type: "insufficient_scope",
+        message: `This endpoint requires the '${requiredApiScope}' scope.`,
+        required_scope: requiredApiScope,
+        granted_scopes: auth.scopes,
+      },
+      { status: 403 },
+    );
   }
 
   const apiPath = apiMatch[1] ?? "";

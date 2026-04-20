@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -64,11 +64,22 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
   declarer_tags TEXT NOT NULL DEFAULT '[]'
 );
 
--- Tokens: API authentication with scoped permissions
+-- Tokens: API authentication with OAuth-standard scopes.
+--
+-- scopes is a whitespace-separated list of granted scopes (OAuth 2.0 §3.3)
+-- — e.g. "vault:read vault:write". Introduced in v12 alongside enforcement;
+-- NULL rows are pre-v12 tokens which fall back to deriving scopes from the
+-- legacy permission column (see src/scopes.ts). permission is kept for the
+-- one-release-cycle back-compat window and will be dropped in a future
+-- migration.
+--
+-- scope_tag / scope_path_prefix are deprecated Phase-0 columns — never
+-- enforced at runtime, kept only for schema stability.
 CREATE TABLE IF NOT EXISTS tokens (
   token_hash TEXT PRIMARY KEY,
   label TEXT NOT NULL,
   permission TEXT NOT NULL DEFAULT 'admin',
+  scopes TEXT,
   scope_tag TEXT,
   scope_path_prefix TEXT,
   expires_at TEXT,
@@ -179,6 +190,9 @@ export function initSchema(db: Database): void {
 
   // Migrate v10 → v11: backfill updated_at = created_at for legacy rows.
   migrateToV11(db);
+
+  // Migrate v11 → v12: add `scopes` column to tokens for Phase 2 enforcement.
+  migrateToV12(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -309,6 +323,18 @@ function migrateToV10(db: Database): void {
 function migrateToV11(db: Database): void {
   if (!hasTable(db, "notes")) return;
   db.exec("UPDATE notes SET updated_at = created_at WHERE updated_at IS NULL");
+}
+
+/**
+ * Migrate v11 → v12: add `scopes` column to tokens. Existing rows get NULL
+ * and fall back to legacy `permission` → scopes derivation at read time
+ * (see src/scopes.ts:legacyPermissionToScopes). New tokens minted on v12+
+ * populate the column explicitly.
+ */
+function migrateToV12(db: Database): void {
+  if (hasTable(db, "tokens") && !hasColumn(db, "tokens", "scopes")) {
+    db.exec("ALTER TABLE tokens ADD COLUMN scopes TEXT");
+  }
 }
 
 function hasTable(db: Database, name: string): boolean {
