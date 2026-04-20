@@ -28,6 +28,7 @@
  * after the upgrade and point at the new URLs.
  */
 
+import pkg from "../package.json" with { type: "json" };
 import type { VaultConfig } from "./config.ts";
 import {
   readVaultConfig,
@@ -107,6 +108,42 @@ function isViewAuthenticated(
   if (!key) return false;
   const auth = authenticateVaultRequest(req, vaultConfig, vaultDb);
   return !("error" in auth);
+}
+
+/**
+ * Public service-info card for the CLI hub page. The CLI fetches this from
+ * every service registered in `~/.parachute/well-known/parachute.json` and
+ * renders each as a tile — services own their display story, CLI is a dumb
+ * aggregator. No auth, no PII, CORS `*` so the hub can call us cross-origin.
+ */
+function handleParachuteInfo(vaultName: string): Response {
+  const body = {
+    name: "parachute-vault",
+    displayName: "Vault",
+    tagline: "Agent-native knowledge graph — notes, tags, links, attachments over REST + MCP",
+    version: pkg.version,
+    iconUrl: `/vault/${vaultName}/.parachute/icon.svg`,
+  };
+  return Response.json(body, {
+    headers: { "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+/**
+ * Placeholder monogram icon for the hub tile. Kept inline so the endpoint
+ * has zero filesystem dependency — the CLI can render a card even on a
+ * pristine install where no assets have been written out yet.
+ */
+const PARACHUTE_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="30" fill="#879B7E"/><text x="32" y="43" text-anchor="middle" font-family="system-ui,sans-serif" font-size="32" font-weight="600" fill="#FAFAF7">V</text></svg>`;
+
+function handleParachuteIcon(): Response {
+  return new Response(PARACHUTE_ICON_SVG, {
+    headers: {
+      "Content-Type": "image/svg+xml",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
 }
 
 export async function route(
@@ -224,6 +261,20 @@ export async function route(
     // handleToken pins the OAuth code to the issuing vault (prevents
     // cross-vault code replay) and echoes `vault: <name>` in the response.
     if (subpath === "/oauth/token") return handleToken(req, store.db, vaultName);
+  }
+
+  // Parachute service-info + icon (no auth, CORS *). The CLI hub page at
+  // the ecosystem root reads `~/.parachute/well-known/parachute.json`,
+  // fans out to each service's `/.parachute/info`, and renders a card per
+  // response. Keeping display copy here means the hub never needs a vault
+  // release to pick up wording changes.
+  if (subpath === "/.parachute/info" || subpath === "/.parachute/icon.svg") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return subpath === "/.parachute/info"
+      ? handleParachuteInfo(vaultName)
+      : handleParachuteIcon();
   }
 
   // OAuth discovery (no auth). The protected-resource metadata advertises
