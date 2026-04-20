@@ -140,6 +140,11 @@ function handleParachuteIcon(): Response {
   return new Response(PARACHUTE_ICON_SVG, {
     headers: {
       "Content-Type": "image/svg+xml",
+      // Defense-in-depth: the payload is a static inline SVG with no
+      // script/foreignObject, but older Edge/IE have been known to sniff
+      // image/svg+xml as HTML under certain conditions. nosniff pins the
+      // declared type and takes the sniff path off the table entirely.
+      "X-Content-Type-Options": "nosniff",
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "public, max-age=3600",
     },

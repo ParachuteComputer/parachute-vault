@@ -30,7 +30,6 @@
 
 import { homedir } from "os";
 import { join } from "path";
-import { mkdir, readFile, writeFile } from "fs/promises";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from "fs";
 import crypto from "node:crypto";
 
@@ -768,13 +767,6 @@ function serializeBackup(backup: BackupConfig): string[] {
 // Directory management
 // ---------------------------------------------------------------------------
 
-export async function ensureConfigDir(): Promise<void> {
-  await mkdir(configDirPath(), { recursive: true });
-  migrateFromLegacyLayout();
-  await mkdir(vaultHomePath(), { recursive: true });
-  await mkdir(dataDirPath(), { recursive: true });
-}
-
 export function ensureConfigDirSync(): void {
   mkdirSync(configDirPath(), { recursive: true });
   migrateFromLegacyLayout();
@@ -840,12 +832,7 @@ export function migrateFromLegacyLayout(): void {
       renameSync(src, dst);
       moved.push(from);
     } catch (err) {
-      // Cross-device rename failures shouldn't be possible here (same
-      // filesystem), but surface them instead of silently leaving files in
-      // the legacy spot — users need to know their data didn't move.
-      console.warn(
-        `[parachute-vault] failed to migrate ${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      console.warn(formatMigrationFailure(src, dst, err));
     }
   }
 
@@ -862,6 +849,22 @@ export function migrateFromLegacyLayout(): void {
       `[parachute-vault] left legacy paths in place (target already exists under vault/): ${skipped.map((p) => join(root, p)).join(", ")}. Remove the legacy copies once you've confirmed the vault/ copies are current.`,
     );
   }
+}
+
+/**
+ * Format a migration-rename failure warning. If the underlying error is
+ * EXDEV (cross-device rename — `PARACHUTE_HOME` straddles a mount, a common
+ * shape in Docker with bind-mounts or multi-disk dev setups), the raw error
+ * message is opaque. Surface the likely cause and note that vault continues
+ * on the legacy layout rather than exiting.
+ */
+export function formatMigrationFailure(src: string, dst: string, err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;
+  if (code === "EXDEV") {
+    return `[parachute-vault] migration failed for ${src} → ${dst}: likely because PARACHUTE_HOME crosses a mount boundary (EXDEV). Vault will continue on the legacy layout; move the file manually to complete the upgrade.`;
+  }
+  return `[parachute-vault] failed to migrate ${src} → ${dst}: ${msg}`;
 }
 
 /**
@@ -897,9 +900,7 @@ export function migrateVaultInternalLayout(): void {
         renameSync(legacyData, newData);
         console.error(`[parachute-vault] migrated ${legacyData}/ → ${newData}/`);
       } catch (err) {
-        console.warn(
-          `[parachute-vault] failed to migrate ${legacyData}/ → ${newData}/: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        console.warn(formatMigrationFailure(`${legacyData}/`, `${newData}/`, err));
       }
     }
   }
@@ -921,9 +922,7 @@ export function migrateVaultInternalLayout(): void {
       renameSync(src, dst);
       logsMoved.push(name);
     } catch (err) {
-      console.warn(
-        `[parachute-vault] failed to migrate ${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      console.warn(formatMigrationFailure(src, dst, err));
     }
   }
   if (logsMoved.length > 0) {

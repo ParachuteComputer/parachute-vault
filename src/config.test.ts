@@ -532,3 +532,41 @@ describe2("migrateFromLegacyLayout", () => {
     expect2(parsed.legacyEnv).toBe("LEGACY\n");
   });
 });
+
+// ---------------------------------------------------------------------------
+// formatMigrationFailure: the warn-line the migration catches emit. EXDEV
+// (cross-device rename) is hard to simulate in a test — PARACHUTE_HOME
+// straddling a mount is the real trigger — but we can at least verify the
+// helper attaches the "mount boundary" hint when the error code matches,
+// so users debugging a Docker/multi-disk layout get a meaningful message
+// instead of "failed to migrate X → Y: EXDEV: cross-device link not permitted".
+// ---------------------------------------------------------------------------
+
+import { formatMigrationFailure } from "./config.ts";
+
+describe("formatMigrationFailure", () => {
+  test("EXDEV errors get a mount-boundary hint and note legacy fallback", () => {
+    const err = Object.assign(new Error("EXDEV: cross-device link not permitted"), {
+      code: "EXDEV",
+    });
+    const msg = formatMigrationFailure("/src/path", "/dst/path", err);
+    expect(msg).toContain("mount boundary");
+    expect(msg).toContain("EXDEV");
+    expect(msg).toContain("legacy layout");
+    expect(msg).toContain("/src/path");
+    expect(msg).toContain("/dst/path");
+  });
+
+  test("non-EXDEV errors fall back to the raw message", () => {
+    const err = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    const msg = formatMigrationFailure("/src/path", "/dst/path", err);
+    expect(msg).toContain("EACCES: permission denied");
+    expect(msg).not.toContain("mount boundary");
+  });
+
+  test("non-Error values are stringified safely", () => {
+    const msg = formatMigrationFailure("/src", "/dst", "weird string");
+    expect(msg).toContain("weird string");
+    expect(msg).not.toContain("mount boundary");
+  });
+});

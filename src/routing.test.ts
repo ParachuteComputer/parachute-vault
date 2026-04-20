@@ -520,6 +520,8 @@ describe("/.parachute/info + /.parachute/icon.svg", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("image/svg+xml");
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    // Pin nosniff so older Edge/IE can't sniff the inline SVG as HTML.
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
     const body = await res.text();
     expect(body).toContain("<svg");
     expect(body).toContain("</svg>");
