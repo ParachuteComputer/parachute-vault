@@ -676,7 +676,7 @@ describe("scoped MCP wrapper", async () => {
 
     // Create a note, then add #person tag via update-note
     const note = await createNote.execute({ content: "Alice" }) as any;
-    await updateNote.execute({ id: note.id, tags: { add: ["person"] } });
+    await updateNote.execute({ id: note.id, tags: { add: ["person"] }, force: true });
     const after = await queryNotes.execute({ id: note.id }) as any;
     expect(after.metadata.first_appeared).toBe("");
     expect(after.metadata.relationship).toBe("");
@@ -686,14 +686,14 @@ describe("scoped MCP wrapper", async () => {
       content: "Bob",
       metadata: { first_appeared: "2023-11" },
     }) as any;
-    await updateNote.execute({ id: note2.id, tags: { add: ["person"] } });
+    await updateNote.execute({ id: note2.id, tags: { add: ["person"] }, force: true });
     const after2 = await queryNotes.execute({ id: note2.id }) as any;
     expect(after2.metadata.first_appeared).toBe("2023-11"); // preserved
     expect(after2.metadata.relationship).toBe(""); // added
 
     // Tag with #project — enum defaults to first value, boolean to false, integer to 0
     const note4 = await createNote.execute({ content: "My Project" }) as any;
-    await updateNote.execute({ id: note4.id, tags: { add: ["project"] } });
+    await updateNote.execute({ id: note4.id, tags: { add: ["project"] }, force: true });
     const after4 = await queryNotes.execute({ id: note4.id }) as any;
     expect(after4.metadata.status).toBe("active");
     expect(after4.metadata.active).toBe(false);
@@ -701,7 +701,7 @@ describe("scoped MCP wrapper", async () => {
 
     // Multiple schema tags at once — all defaults merged
     const note5 = await createNote.execute({ content: "Multi" }) as any;
-    await updateNote.execute({ id: note5.id, tags: { add: ["person", "project"] } });
+    await updateNote.execute({ id: note5.id, tags: { add: ["person", "project"] }, force: true });
     const after5 = await queryNotes.execute({ id: note5.id }) as any;
     expect(after5.metadata.first_appeared).toBe("");
     expect(after5.metadata.relationship).toBe("");
@@ -736,7 +736,7 @@ describe("scoped MCP wrapper", async () => {
 
     const note = await createNote.execute({ content: "Test" }) as any;
     const originalUpdatedAt = note.updatedAt;
-    await updateNote.execute({ id: note.id, tags: { add: ["person"] } });
+    await updateNote.execute({ id: note.id, tags: { add: ["person"] }, force: true });
     const after = await queryNotes.execute({ id: note.id }) as any;
     expect(after.updatedAt).toBe(originalUpdatedAt);
     expect(after.metadata.name).toBe("");
@@ -1231,7 +1231,7 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
   test("PATCH updates content and merges metadata", async () => {
     const note = await store.createNote("original", { id: "x", metadata: { a: 1 } });
     const res = await handleNotes(
-      mkReq("PATCH", "/notes/x", { content: "updated", metadata: { b: 2 } }),
+      mkReq("PATCH", "/notes/x", { content: "updated", metadata: { b: 2 }, force: true }),
       store,
       "/x",
     );
@@ -1243,7 +1243,7 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
   test("PATCH adds/removes tags", async () => {
     await store.createNote("x", { id: "x", tags: ["old"] });
     const res = await handleNotes(
-      mkReq("PATCH", "/notes/x", { tags: { add: ["new"], remove: ["old"] } }),
+      mkReq("PATCH", "/notes/x", { tags: { add: ["new"], remove: ["old"] }, force: true }),
       store,
       "/x",
     );
@@ -1256,7 +1256,7 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     await store.createNote("a", { id: "a" });
     await store.createNote("b", { id: "b" });
     const res = await handleNotes(
-      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "b", relationship: "mentions" }] } }),
+      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "b", relationship: "mentions" }] }, force: true }),
       store,
       "/a",
     );
@@ -1266,7 +1266,7 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
 
     // Remove
     await handleNotes(
-      mkReq("PATCH", "/notes/a", { links: { remove: [{ target: "b", relationship: "mentions" }] } }),
+      mkReq("PATCH", "/notes/a", { links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true }),
       store,
       "/a",
     );
@@ -1276,7 +1276,7 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
   test("PATCH resolves note by path", async () => {
     await store.createNote("x", { path: "Projects/README" });
     const res = await handleNotes(
-      mkReq("PATCH", `/notes/${encodeURIComponent("Projects/README")}`, { content: "updated" }),
+      mkReq("PATCH", `/notes/${encodeURIComponent("Projects/README")}`, { content: "updated", force: true }),
       store,
       `/${encodeURIComponent("Projects/README")}`,
     );
@@ -1288,7 +1288,7 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     const note = await store.createNote("first", { id: "x" });
     // First bump — sets updated_at
     const first = await handleNotes(
-      mkReq("PATCH", "/notes/x", { content: "second" }),
+      mkReq("PATCH", "/notes/x", { content: "second", force: true }),
       store,
       "/x",
     );
@@ -1306,8 +1306,8 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
   });
 
   test("PATCH with stale if_updated_at returns 409 and does not modify note", async () => {
-    await store.createNote("first", { id: "x" });
-    await handleNotes(mkReq("PATCH", "/notes/x", { content: "second" }), store, "/x");
+    await store.createNote("first", { id: "x", path: "Inbox/x" });
+    await handleNotes(mkReq("PATCH", "/notes/x", { content: "second", force: true }), store, "/x");
     const current = await store.getNote("x");
 
     const res = await handleNotes(
@@ -1320,6 +1320,11 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     );
     expect(res.status).toBe(409);
     const body = await res.json() as any;
+    // New structured shape
+    expect(body.error_type).toBe("conflict");
+    expect(body.path).toBe("Inbox/x");
+    expect(body.your_updated_at).toBe("2020-01-01T00:00:00.000Z");
+    // Legacy fields retained for compat
     expect(body.error).toBe("conflict");
     expect(body.note_id).toBe("x");
     expect(body.current_updated_at).toBe(current!.updatedAt);
@@ -1327,6 +1332,24 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
 
     // Unchanged
     expect((await store.getNote("x"))!.content).toBe("second");
+  });
+
+  test("PATCH without if_updated_at or force returns 428 and does not modify note", async () => {
+    await store.createNote("first", { id: "x", path: "Inbox/x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "second" }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(428);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("precondition_required");
+    expect(body.note_id).toBe("x");
+    expect(body.path).toBe("Inbox/x");
+
+    // Unchanged
+    expect((await store.getNote("x"))!.content).toBe("first");
   });
 
   test("DELETE resolves note by path", async () => {

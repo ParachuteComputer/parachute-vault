@@ -962,7 +962,7 @@ describe("MCP tools", async () => {
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
     const newDate = "2025-03-01T00:00:00.000Z";
-    const result = await updateNote.execute({ id: note.id, created_at: newDate }) as any;
+    const result = await updateNote.execute({ id: note.id, created_at: newDate, force: true }) as any;
     expect(result.createdAt).toBe(newDate);
     expect(result.content).toBe("Test");
   });
@@ -971,7 +971,7 @@ describe("MCP tools", async () => {
     const note = await store.createNote("Test", { metadata: { existing: "value" } });
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
-    const result = await updateNote.execute({ id: note.id, metadata: { importance: "high" } }) as any;
+    const result = await updateNote.execute({ id: note.id, metadata: { importance: "high" }, force: true }) as any;
     expect(result.metadata).toEqual({ existing: "value", importance: "high" });
   });
 
@@ -981,12 +981,12 @@ describe("MCP tools", async () => {
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
     // Add tags
-    await updateNote.execute({ id: note.id, tags: { add: ["pinned", "daily"] } });
+    await updateNote.execute({ id: note.id, tags: { add: ["pinned", "daily"] }, force: true });
     expect((await store.getNote(note.id))!.tags).toContain("pinned");
     expect((await store.getNote(note.id))!.tags).toContain("daily");
 
     // Remove tags
-    await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] } });
+    await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] }, force: true });
     expect((await store.getNote(note.id))!.tags).not.toContain("pinned");
     expect((await store.getNote(note.id))!.tags).toContain("daily");
   });
@@ -998,11 +998,11 @@ describe("MCP tools", async () => {
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
     // Add link
-    await updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] } });
+    await updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true });
     expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
 
     // Remove link
-    await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] } });
+    await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
     expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
   });
 
@@ -1016,6 +1016,7 @@ describe("MCP tools", async () => {
     const result = await updateNote.execute({
       id: "source",
       links: { remove: [{ target: "target", relationship: "wikilink" }] },
+      force: true,
     }) as any;
     expect(result.content).toBe("See People/Alice for details");
   });
@@ -1027,8 +1028,8 @@ describe("MCP tools", async () => {
     const updateNote = tools.find((t) => t.name === "update-note")!;
     const result = await updateNote.execute({
       notes: [
-        { id: "a", content: "A updated" },
-        { id: "b", tags: { add: ["pinned"] } },
+        { id: "a", content: "A updated", force: true },
+        { id: "b", tags: { add: ["pinned"] }, force: true },
       ],
     }) as any[];
     expect(result).toHaveLength(2);
@@ -1040,7 +1041,7 @@ describe("MCP tools", async () => {
     await store.createNote("Test", { path: "Projects/README" });
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
-    const result = await updateNote.execute({ id: "Projects/README", content: "Updated" }) as any;
+    const result = await updateNote.execute({ id: "Projects/README", content: "Updated", force: true }) as any;
     expect(result.content).toBe("Updated");
   });
 
@@ -1049,7 +1050,7 @@ describe("MCP tools", async () => {
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
-    const first = await updateNote.execute({ id: note.id, content: "Second" }) as any;
+    const first = await updateNote.execute({ id: note.id, content: "Second", force: true }) as any;
     expect(first.content).toBe("Second");
     expect(first.updatedAt).toBeTruthy();
 
@@ -1066,7 +1067,7 @@ describe("MCP tools", async () => {
     const tools = generateMcpTools(store);
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
-    const after = await updateNote.execute({ id: note.id, content: "Second" }) as any;
+    const after = await updateNote.execute({ id: note.id, content: "Second", force: true }) as any;
 
     // Simulate a stale client that has the pre-update timestamp (or something else).
     const staleTimestamp = "2020-01-01T00:00:00.000Z";
@@ -1115,6 +1116,59 @@ describe("MCP tools", async () => {
     expect(err.current_updated_at).toBe(note.createdAt);
   });
 
+  it("create-note returns updatedAt equal to createdAt on fresh notes", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "Hello" }) as any;
+    expect(result.updatedAt).toBeTruthy();
+    expect(result.updatedAt).toBe(result.createdAt);
+  });
+
+  it("update-note requires if_updated_at or force (precondition-required)", async () => {
+    const note = await store.createNote("Test", { path: "Inbox/x" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, content: "changed" });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+    expect(err.note_id).toBe(note.id);
+    expect(err.note_path).toBe("Inbox/x");
+    expect((await store.getNote(note.id))!.content).toBe("Test");
+  });
+
+  it("update-note force:true bypasses precondition and mutates unconditionally", async () => {
+    const note = await store.createNote("First");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: note.id, content: "Second", force: true }) as any;
+    expect(result.content).toBe("Second");
+  });
+
+  it("update-note conflict error surfaces note_path", async () => {
+    const note = await store.createNote("First", { path: "Inbox/y" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, content: "Second", force: true });
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "Third",
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+    expect(err.note_path).toBe("Inbox/y");
+  });
+
   it("update-note batch aborts on first conflict without touching subsequent items", async () => {
     await store.createNote("A", { id: "a" });
     await store.createNote("B", { id: "b" });
@@ -1122,7 +1176,7 @@ describe("MCP tools", async () => {
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
     // Bump a's updated_at so any stale if_updated_at conflicts.
-    const bumped = await updateNote.execute({ id: "a", content: "A bumped" }) as any;
+    const bumped = await updateNote.execute({ id: "a", content: "A bumped", force: true }) as any;
     expect(bumped.updatedAt).toBeTruthy();
 
     let err: any;
@@ -1130,7 +1184,7 @@ describe("MCP tools", async () => {
       await updateNote.execute({
         notes: [
           { id: "a", content: "A new", if_updated_at: "2020-01-01T00:00:00.000Z" },
-          { id: "b", content: "B new" },
+          { id: "b", content: "B new", force: true },
         ],
       });
     } catch (e) {
@@ -1157,7 +1211,7 @@ describe("MCP tools", async () => {
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
     // Establish a known updated_at the two callers both read.
-    const seed = await updateNote.execute({ id: note.id, content: "seed-v1" }) as any;
+    const seed = await updateNote.execute({ id: note.id, content: "seed-v1", force: true }) as any;
     expect(seed.updatedAt).toBeTruthy();
 
     const results = await Promise.allSettled([
@@ -1190,7 +1244,7 @@ describe("MCP tools", async () => {
     const updateNote = tools.find((t) => t.name === "update-note")!;
 
     // Bump so a stale if_updated_at conflicts; and capture state after bump.
-    await updateNote.execute({ id: "source", content: "See [[People/Alice]] for details" });
+    await updateNote.execute({ id: "source", content: "See [[People/Alice]] for details", force: true });
     const preConflictLinks = await store.getLinks("source", { direction: "outbound" });
     expect(preConflictLinks).toHaveLength(1);
 
@@ -1220,6 +1274,11 @@ describe("MCP tools", async () => {
     const result = await query.execute({ id: note.id }) as any;
     expect(result.content).toBe("Hello");
     expect(result.path).toBe("test/note");
+    // updatedAt is the optimistic-concurrency token. Callers can't arm a
+    // followup update without it, so it must always come back from a
+    // single-note fetch.
+    expect(result.updatedAt).toBeTruthy();
+    expect(result.updatedAt).toBe(note.updatedAt);
   });
 
   it("query-notes single note by path", async () => {

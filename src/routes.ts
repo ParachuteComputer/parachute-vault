@@ -419,6 +419,24 @@ export async function handleNotes(
       if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
       const body = await req.json() as any;
 
+      // --- Safety-by-default: refuse mutations without a precondition ---
+      // Mirror the MCP tool: require `if_updated_at` unless the caller
+      // explicitly sets `force: true`. 428 Precondition Required is the
+      // RFC 6585 status for exactly this case.
+      if (body.if_updated_at === undefined && body.force !== true) {
+        return json(
+          {
+            error_type: "precondition_required",
+            error: "precondition_required",
+            message:
+              "update requires `if_updated_at` (the note's last-seen updated_at) or `force: true`.",
+            note_id: note.id,
+            path: note.path ?? null,
+          },
+          428,
+        );
+      }
+
       // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
       // The actual link deletions happen only after the core UPDATE succeeds,
       // so a conflict leaves the note untouched.
@@ -488,10 +506,16 @@ export async function handleNotes(
       if (e && e.code === "CONFLICT") {
         return json(
           {
-            error: "conflict",
-            message: e.message,
-            note_id: e.note_id,
+            // New structured shape — what agents should key on.
+            error_type: "conflict",
             current_updated_at: e.current_updated_at ?? null,
+            your_updated_at: e.expected_updated_at,
+            path: e.note_path ?? null,
+            note_id: e.note_id,
+            message: e.message,
+            // Legacy fields — kept for the lens VaultConflictError shim and
+            // any other pre-launch callers. Safe to drop post-launch.
+            error: "conflict",
             expected_updated_at: e.expected_updated_at,
           },
           409,

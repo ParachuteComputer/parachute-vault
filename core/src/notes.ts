@@ -92,15 +92,17 @@ export function getNotes(db: Database, ids: string[]): Note[] {
 export class ConflictError extends Error {
   code = "CONFLICT" as const;
   note_id: string;
+  note_path: string | null;
   current_updated_at: string | null;
   expected_updated_at: string;
 
-  constructor(noteId: string, current: string | null, expected: string) {
+  constructor(noteId: string, notePath: string | null, current: string | null, expected: string) {
     super(
       `conflict: note "${noteId}" has been modified (current updated_at=${current ?? "null"}, expected=${expected})`,
     );
     this.name = "ConflictError";
     this.note_id = noteId;
+    this.note_path = notePath;
     this.current_updated_at = current;
     this.expected_updated_at = expected;
   }
@@ -195,13 +197,13 @@ export function updateNote(
 }
 
 function throwConflictOrMissing(db: Database, id: string, expected: string): never {
-  const row = db.prepare("SELECT updated_at FROM notes WHERE id = ?").get(id) as
-    | { updated_at: string | null }
+  const row = db.prepare("SELECT updated_at, path FROM notes WHERE id = ?").get(id) as
+    | { updated_at: string | null; path: string | null }
     | undefined;
   if (!row) {
     throw new Error(`Note not found: "${id}"`);
   }
-  throw new ConflictError(id, row.updated_at, expected);
+  throw new ConflictError(id, row.path, row.updated_at, expected);
 }
 
 export function deleteNote(db: Database, id: string): void {
@@ -735,6 +737,8 @@ function rowToNote(row: NoteRow): Note {
     path: row.path ?? undefined,
     metadata,
     createdAt: row.created_at,
-    updatedAt: row.updated_at ?? undefined,
+    // Legacy notes (pre-#70) may have NULL updated_at. Fall back to created_at
+    // so the optimistic-concurrency contract always has a real token to echo.
+    updatedAt: row.updated_at ?? row.created_at,
   };
 }
