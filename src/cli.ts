@@ -2018,9 +2018,15 @@ function usage() {
   console.log(`
 Parachute Vault — self-hosted knowledge graph
 
+If you installed via the Parachute CLI, prefer the wrapper commands for
+lifecycle — \`parachute start vault\`, \`parachute stop vault\`,
+\`parachute status\` — and use the vault-direct commands below for setup,
+data, and debugging.
+
+── Standard use ───────────────────────────────────────────────────────
+
 Setup:
   parachute-vault init                     Set up everything (one command, idempotent)
-  parachute-vault status                   Check what's running
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,
@@ -2067,8 +2073,16 @@ Import/Export:
   parachute-vault import <path> --dry-run  Preview import without writing
   parachute-vault export <path>            Export vault as Obsidian markdown
 
-Server:
-  parachute-vault serve                    Run server (foreground)
+── Advanced / standalone ──────────────────────────────────────────────
+
+Direct daemon controls. For normal use, prefer the Parachute CLI wrappers
+— they add PID tracking, log rotation, and cross-service \`parachute status\`
+visibility. Use these when running vault without the CLI or when debugging.
+
+  parachute-vault serve                    Run server in the foreground (no PID tracking).
+                                           Prefer \`parachute start vault\` for managed lifecycle.
+  parachute-vault status                   Vault-only daemon status.
+                                           Prefer \`parachute status\` for a cross-service view.
   parachute-vault logs                     Stream server logs
   parachute-vault restart                  Restart the daemon
 `);
