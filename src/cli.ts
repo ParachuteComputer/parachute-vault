@@ -48,6 +48,7 @@ import {
 import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
+import { chooseMcpUrl } from "./mcp-install.ts";
 import {
   runBackup,
   readLastBackup,
@@ -1984,12 +1985,16 @@ function installMcpConfig(apiKey?: string) {
     }
   }
 
-  // Single HTTP MCP entry — use per-vault endpoint so pvt_ tokens work
+  // Single HTTP MCP entry — use per-vault endpoint so pvt_ tokens work.
+  // Pick the URL that matches the OAuth issuer vault will advertise, in this
+  // order: explicit hub origin env > active tailnet/public exposure >
+  // loopback. Otherwise a strict MCP client (Claude Code) hits a loopback URL
+  // whose discovery issuer points at the hub and rejects on origin mismatch
+  // (RFC 8414).
   const defaultVault = globalConfig.default_vault || "default";
-  const mcpEntry: Record<string, unknown> = {
-    type: "http",
-    url: `http://127.0.0.1:${port}/vault/${defaultVault}/mcp`,
-  };
+  const { url: mcpUrl, source } = chooseMcpUrl(defaultVault, port);
+  console.log(`MCP URL: ${mcpUrl} (${source})`);
+  const mcpEntry: Record<string, unknown> = { type: "http", url: mcpUrl };
   if (apiKey) {
     mcpEntry.headers = { Authorization: `Bearer ${apiKey}` };
   }

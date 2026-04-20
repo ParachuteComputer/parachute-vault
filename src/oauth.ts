@@ -65,16 +65,29 @@ export function getBaseUrl(req: Request): string {
 }
 
 /**
- * OAuth endpoint coordinates — honors `PARACHUTE_HUB_ORIGIN` (Phase 0 of the
- * hub-as-OAuth-issuer design, 2026-04-20). When the hub origin env is set, the
- * vault advertises *the hub* as the issuer and publishes hub-rooted endpoint
- * URLs; the CLI is responsible for routing `${hub}/oauth/*` at the
- * tailscale/reverse-proxy layer into the vault's real endpoints. Internally
- * vault still handles the OAuth flow on its own `/vault/<name>/oauth/*`
- * routes — those don't move and remain reachable for standalone deployments.
+ * Public origin the client reached vault through. When `PARACHUTE_HUB_ORIGIN`
+ * is set AND matches the incoming request's base URL, returns the hub; else
+ * returns the request base. This is the RFC 8414 compliance hinge: discovery
+ * metadata's `issuer`, token `iss` claims, and the service catalog all stem
+ * from this, so the issuer view is always self-consistent with the origin the
+ * client is actually talking to.
+ */
+function resolvePublicOrigin(req: Request): string {
+  const hub = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
+  const base = getBaseUrl(req);
+  return hub && base === hub ? hub : base;
+}
+
+/**
+ * OAuth endpoint coordinates. Hub-rooted when the request came in through the
+ * hub origin (`PARACHUTE_HUB_ORIGIN` set AND matches the incoming base URL),
+ * vault-path-rooted otherwise. The same vault exposes both views concurrently:
+ * a loopback client gets `issuer = http://127.0.0.1:<port>/vault/<name>`; a
+ * client reaching vault via the hub reverse proxy gets `issuer = <hub>`.
  *
- * When the env is unset (standalone vault, no hub), behavior is unchanged
- * from pre-Phase-0: vault advertises itself as the issuer.
+ * This is how vault stays RFC 8414 compliant while a single process serves
+ * both origins — discovery always returns the issuer matching the client's
+ * origin.
  */
 export function resolveOAuthCoordinates(
   req: Request,
@@ -85,8 +98,9 @@ export function resolveOAuthCoordinates(
   tokenEndpoint: string;
   registrationEndpoint: string;
 } {
+  const origin = resolvePublicOrigin(req);
   const hub = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
-  if (hub) {
+  if (hub && origin === hub) {
     return {
       issuer: hub,
       authorizationEndpoint: `${hub}/oauth/authorize`,
@@ -94,13 +108,12 @@ export function resolveOAuthCoordinates(
       registrationEndpoint: `${hub}/oauth/register`,
     };
   }
-  const base = getBaseUrl(req);
   const prefix = `/vault/${vaultName}`;
   return {
-    issuer: `${base}${prefix}`,
-    authorizationEndpoint: `${base}${prefix}/oauth/authorize`,
-    tokenEndpoint: `${base}${prefix}/oauth/token`,
-    registrationEndpoint: `${base}${prefix}/oauth/register`,
+    issuer: `${origin}${prefix}`,
+    authorizationEndpoint: `${origin}${prefix}/oauth/authorize`,
+    tokenEndpoint: `${origin}${prefix}/oauth/token`,
+    registrationEndpoint: `${origin}${prefix}/oauth/register`,
   };
 }
 
@@ -108,8 +121,9 @@ export function resolveOAuthCoordinates(
  * Ecosystem service catalog for the token response (Phase 1 of the
  * hub-as-OAuth-issuer design). Reads `~/.parachute/services.json` — the same
  * manifest the CLI maintains — and rewrites each entry's canonical path into
- * an absolute URL, using `PARACHUTE_HUB_ORIGIN` when set (so clients get the
- * externally-reachable URL) and falling back to the request origin otherwise.
+ * an absolute URL rooted at the origin the client reached vault through. A
+ * client that came in via the hub gets hub-rooted URLs; a loopback client
+ * gets loopback URLs. Same vault, same manifest, origin-consistent.
  *
  * Failure to read the manifest is non-fatal: we log and return an empty
  * catalog rather than refusing to issue the token. The token response shape
@@ -128,8 +142,7 @@ export function buildServiceCatalog(
     }
     throw err;
   }
-  const hub = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
-  const origin = hub ?? getBaseUrl(req);
+  const origin = resolvePublicOrigin(req);
   const catalog: Record<string, { url: string; version: string }> = {};
   for (const entry of entries) {
     const path = entry.paths[0] ?? "/";
