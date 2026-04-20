@@ -763,3 +763,122 @@ describe("/.parachute/info + /.parachute/icon.svg", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// /.parachute/config/schema + /.parachute/config — module config (Phase 2).
+// ---------------------------------------------------------------------------
+
+describe("/.parachute/config/schema + /.parachute/config", () => {
+  test("schema returns JSON Schema draft-07 shape with the documented properties", async () => {
+    createVault("journal");
+    const path = "/vault/journal/.parachute/config/schema";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    const body = (await res.json()) as {
+      $schema: string;
+      type: string;
+      title: string;
+      properties: Record<string, { type?: string; enum?: string[]; writeOnly?: boolean; readOnly?: boolean }>;
+    };
+    expect(body.$schema).toBe("http://json-schema.org/draft-07/schema#");
+    expect(body.type).toBe("object");
+    expect(body.properties.audio_retention?.type).toBe("string");
+    expect(body.properties.audio_retention?.enum).toEqual(["keep", "until_transcribed", "never"]);
+    expect(body.properties.scribe_url?.type).toBe("string");
+    expect(body.properties.scribe_token?.writeOnly).toBe(true);
+    expect(body.properties.port?.readOnly).toBe(true);
+  });
+
+  test("config returns current values with writeOnly fields excluded", async () => {
+    createVault("journal");
+    const path = "/vault/journal/.parachute/config";
+    const origScribeToken = process.env.SCRIBE_TOKEN;
+    const origScribeUrl = process.env.SCRIBE_URL;
+    process.env.SCRIBE_TOKEN = "super-secret-should-never-appear";
+    process.env.SCRIBE_URL = "https://scribe.example/v1";
+    try {
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.audio_retention).toBe("keep"); // default when unset
+      expect(body.scribe_url).toBe("https://scribe.example/v1");
+      expect(body.port).toBe(1940);
+      // writeOnly field must not appear in GET.
+      expect(body).not.toHaveProperty("scribe_token");
+      // Defense in depth: grep the raw body for the token value.
+      expect(JSON.stringify(body)).not.toContain("super-secret-should-never-appear");
+    } finally {
+      if (origScribeToken === undefined) delete process.env.SCRIBE_TOKEN;
+      else process.env.SCRIBE_TOKEN = origScribeToken;
+      if (origScribeUrl === undefined) delete process.env.SCRIBE_URL;
+      else process.env.SCRIBE_URL = origScribeUrl;
+    }
+  });
+
+  test("config reflects per-vault audio_retention override", async () => {
+    writeVaultConfig({
+      name: "journal",
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      audio_retention: "until_transcribed",
+    });
+    const path = "/vault/journal/.parachute/config";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    const body = (await res.json()) as { audio_retention: string };
+    expect(body.audio_retention).toBe("until_transcribed");
+  });
+
+  test("config scribe_url falls back to empty string when SCRIBE_URL env is unset", async () => {
+    createVault("journal");
+    const orig = process.env.SCRIBE_URL;
+    delete process.env.SCRIBE_URL;
+    try {
+      const path = "/vault/journal/.parachute/config";
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      const body = (await res.json()) as { scribe_url: string };
+      expect(body.scribe_url).toBe("");
+    } finally {
+      if (orig !== undefined) process.env.SCRIBE_URL = orig;
+    }
+  });
+
+  test("unknown vault returns 404 before reaching the config handlers", async () => {
+    createVault("journal");
+    for (const path of [
+      "/vault/nonexistent/.parachute/config/schema",
+      "/vault/nonexistent/.parachute/config",
+    ]) {
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(res.status).toBe(404);
+    }
+  });
+
+  test("non-GET methods return 405 — PUT lands in Phase 3, not silently accepted now", async () => {
+    createVault("journal");
+    for (const path of [
+      "/vault/journal/.parachute/config/schema",
+      "/vault/journal/.parachute/config",
+    ]) {
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        const res = await route(
+          new Request(`http://localhost:1940${path}`, { method }),
+          path,
+        );
+        expect(res.status).toBe(405);
+      }
+    }
+  });
+
+  test("endpoints are public — no auth header required (Phase 2 pre-enforcement)", async () => {
+    createVault("journal");
+    for (const path of [
+      "/vault/journal/.parachute/config/schema",
+      "/vault/journal/.parachute/config",
+    ]) {
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(res.status).toBe(200);
+    }
+  });
+});
