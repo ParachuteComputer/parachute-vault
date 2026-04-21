@@ -113,3 +113,13 @@ Self-hosted:
 Hosted (future, issue #5):
 - Cloudflare Workers + D1 + R2
 - Requires async Store interface refactor
+
+## Post-merge hygiene
+
+When a PR is merged, locally:
+
+```
+git checkout main && git pull
+```
+
+Aaron runs vault via `bun link` in development — the linked install follows whatever branch is checked out. Leaving the repo on a feature branch after merge means Aaron's `parachute start vault` is running stale feature-branch code, not the merged main. Caught 2026-04-21 when several stewards (including vault) left their local repo on a feature branch after merge.
