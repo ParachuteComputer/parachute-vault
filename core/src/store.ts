@@ -279,7 +279,9 @@ export class BunSqliteStore implements Store {
       "INSERT INTO attachments (id, note_id, path, mime_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     ).run(id, noteId, filePath, mimeType, metadataJson, now);
 
-    return { id, noteId, path: filePath, mimeType, metadata, createdAt: now };
+    const attachment: Attachment = { id, noteId, path: filePath, mimeType, metadata, createdAt: now };
+    this.hooks.dispatchAttachment("created", attachment, this);
+    return attachment;
   }
 
   async getAttachments(noteId: string): Promise<Attachment[]> {

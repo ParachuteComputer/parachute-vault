@@ -1,13 +1,22 @@
 /**
- * Background worker that drains pending transcription requests.
+ * Event-driven transcription with a safety-net sweep.
  *
- * ## How a request enters the queue
+ * ## Shape (event-driven happy path, timer-driven failure path)
  *
- * The caller `POST /api/notes/:id/attachments` with `{transcribe: true}`.
- * The route writes `attachment.metadata.transcribe_status = "pending"` and
- * sets `note.metadata.transcribe_stub = true` as the opt-in to overwrite.
- * The DB is the queue — a server restart resumes the scan without losing
- * requests.
+ * - **Event path (hot):** `POST /api/notes/:id/attachments` with
+ *   `{transcribe: true}` writes `attachment.metadata.transcribe_status =
+ *   "pending"` via `store.addAttachment`, which dispatches an
+ *   `attachment:created` hook. A handler registered via
+ *   `registerTranscriptionHook` calls `worker.kick()` on the owning vault,
+ *   so the cycle begins in the microtask after the HTTP response returns —
+ *   upload latency is not gated on transcription latency.
+ * - **Sweep path (safety net):** Every `pollIntervalMs` (default 30s), the
+ *   worker lists pending attachments across all vaults and runs them. This
+ *   catches items queued during a server restart, items whose backoff just
+ *   elapsed, and anything that got orphaned by a dropped hook dispatch.
+ *
+ * The DB remains the queue — `metadata.transcribe_status = "pending"` is
+ * the source of truth; the hook is a shortcut for cache warmth.
  *
  * ## What the worker does per pending attachment
  *
@@ -25,28 +34,52 @@
  *      metadata is still addressable).
  * 4. On failure:
  *    - Up to `maxAttempts` retries with exponential backoff encoded as
- *      `transcribe_backoff_until`. Status stays `"pending"`; we simply skip
- *      ones whose backoff hasn't expired.
+ *      `transcribe_backoff_until`. Status stays `"pending"`; the sweep
+ *      skips ones whose backoff hasn't expired.
  *    - After `maxAttempts`, flip status to `"failed"` with `transcribe_error`.
  *
  * ## Concurrency
  *
- * FIFO, one at a time, across all vaults. The poll-then-process loop is
- * intentionally simple — transcription is already seconds-long and scribe
- * is not designed for high concurrency. Scaling to multiple in-flight
- * jobs can be added later without changing the wire contract.
+ * FIFO across all vaults. Hook-driven and sweep-driven paths race on the
+ * same attachment if an upload arrives just before a sweep runs; an
+ * in-memory `inFlight` set dedupes within the process so we don't double-
+ * POST to scribe. Cross-process guarantees still live in the DB — a sweep
+ * on another process would see `transcribe_status = "pending"` and try
+ * again, which scribe and the metadata writes handle idempotently.
  */
 
 import { join, normalize } from "path";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import type { Store, Attachment } from "../core/src/types.ts";
+import type { HookRegistry } from "../core/src/hooks.ts";
 import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
 import type { TriggerIncludeContext } from "./config.ts";
 
 /** Placeholder pattern written by Lens's voice-memo stub. */
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
 
-const DEFAULT_POLL_MS = 5_000;
+/**
+ * Body written when transcription reaches a terminal failure (maxAttempts
+ * exhausted, or the audio file is missing). This used to be written by
+ * Lens's now-removed scribe client; owning it here means a failed upload
+ * stops reading "Transcript pending" forever regardless of which client
+ * uploaded the audio.
+ */
+const TRANSCRIPT_UNAVAILABLE = "_Transcription unavailable._";
+
+/**
+ * Default sweep cadence (ms). The sweep is the safety net for backoff-
+ * queued items, items that arrived while the server was down, or dispatches
+ * that got dropped — not the hot path. Fresh uploads land in single-digit
+ * ms via the `attachment:created` hook (see `registerTranscriptionHook`).
+ *
+ * Operators can override this with the `TRANSCRIPTION_SWEEP_MS` env var
+ * (read at `startTranscriptionWorker()` time, not module load, so values
+ * in `~/.parachute/vault/.env` apply — ES module import happens before
+ * `loadEnvFile()` in server.ts). Per-caller override via the
+ * `pollIntervalMs` opt wins over both.
+ */
+const DEFAULT_POLL_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -85,6 +118,17 @@ export interface TranscriptionWorker {
   stop(): Promise<void>;
   /** Run one poll cycle now. Returns number of attachments processed. */
   tick(): Promise<number>;
+  /**
+   * Process a single attachment immediately. Called by the
+   * `attachment:created` hook to short-circuit the sweep wait.
+   *
+   * Safe to race with `tick()` — an in-memory `inFlight` guard dedupes
+   * same-attachment requests within this process. The handler returns
+   * once processing finishes (or is skipped as a dup / backoff / non-
+   * pending status). Errors are logged and swallowed so a thrown hook
+   * handler never crashes the dispatcher.
+   */
+  kick(vault: string, attachment: Attachment): Promise<void>;
 }
 
 interface PendingMeta {
@@ -106,7 +150,12 @@ interface PendingMeta {
 export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): TranscriptionWorker {
   const logger = opts.logger ?? console;
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const pollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
+  // Precedence: opts.pollIntervalMs > TRANSCRIPTION_SWEEP_MS env > DEFAULT_POLL_MS.
+  // Reading env here (not at module scope) means `~/.parachute/vault/.env`
+  // values loaded by server.ts still apply, matching how SCRIBE_URL works.
+  const envPoll = Number(process.env.TRANSCRIPTION_SWEEP_MS);
+  const defaultPollMs = Number.isFinite(envPoll) && envPoll > 0 ? envPoll : DEFAULT_POLL_MS;
+  const pollMs = opts.pollIntervalMs ?? defaultPollMs;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retentionFor = opts.getAudioRetention ?? (() => "keep" as const);
@@ -115,9 +164,67 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
   let inflight: Promise<void> = Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * In-process dedupe: holds attachment IDs currently being worked. The
+   * event-driven `kick()` path can race the sweep on the same attachment
+   * when an upload lands moments before a tick starts. Without this guard
+   * both paths would fetch the audio and POST to scribe twice.
+   */
+  const inFlightAttachments = new Set<string>();
+
   async function processOne(vault: string, attachment: Attachment): Promise<void> {
+    // Dedupe: another path (sweep vs hook kick, or a duplicate dispatch)
+    // is already working this attachment. Drop — its result is durable
+    // in the DB, and the sweep will re-pick anything that truly needs it.
+    if (inFlightAttachments.has(attachment.id)) return;
+    inFlightAttachments.add(attachment.id);
+    try {
+      await processOneLocked(vault, attachment);
+    } finally {
+      inFlightAttachments.delete(attachment.id);
+    }
+  }
+
+  /**
+   * On a terminal failure (maxAttempts exhausted, or audio file missing),
+   * swap the stub placeholder for the "unavailable" marker — otherwise
+   * Lens's voice memo sits reading "Transcript pending" forever. Mirrors
+   * the success-path note write in shape: only touches the note when
+   * `transcribe_stub === true`, clears the stub marker, uses `skipUpdatedAt`
+   * so the note's modification time still reflects user intent. Errors
+   * are logged and swallowed so a note-write failure doesn't mask the
+   * attachment failure we're trying to record.
+   */
+  async function applyFailureMarker(store: Store, noteId: string): Promise<void> {
+    const note = await store.getNote(noteId);
+    if (!note) return;
+    const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+    if (noteMeta.transcribe_stub !== true) return;
+
+    const body = TRANSCRIPT_PLACEHOLDER.test(note.content)
+      ? note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE)
+      : TRANSCRIPT_UNAVAILABLE;
+    const { transcribe_stub: _drop, ...restMeta } = noteMeta;
+    try {
+      await store.updateNote(note.id, {
+        content: body,
+        metadata: restMeta,
+        skipUpdatedAt: true,
+      });
+    } catch (err) {
+      logger.error(`[transcribe] failed to apply failure marker to note ${note.id}:`, err);
+    }
+  }
+
+  async function processOneLocked(vault: string, attachment: Attachment): Promise<void> {
     const store = opts.getStore(vault);
-    const meta: PendingMeta = { ...(attachment.metadata ?? {}) };
+    // Re-read metadata — the in-memory `attachment` may be stale (the hook
+    // path hands us the row from just after insert; a concurrent completion
+    // in another path may have already flipped status). Skip if not pending.
+    const fresh = (await store.getAttachment(attachment.id)) ?? attachment;
+    const meta: PendingMeta = { ...(fresh.metadata ?? {}) };
+    if (meta.transcribe_status !== "pending") return;
+
     const attempts = (meta.transcribe_attempts as number | undefined) ?? 0;
 
     // Honor backoff — we re-check here in case another tick queued this
@@ -136,6 +243,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         transcribe_status: "failed",
         transcribe_error: "audio file not found",
       });
+      await applyFailureMarker(store, attachment.noteId);
       return;
     }
 
@@ -171,6 +279,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
           transcribe_attempts: nextAttempts,
           transcribe_error: errMsg,
         });
+        await applyFailureMarker(store, attachment.noteId);
         // retention=never drops the audio on any terminal state, including
         // failure. The user opted in to "I don't want the audio kept around
         // regardless of outcome" — honor it.
@@ -293,6 +402,15 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
 
   schedule();
 
+  async function kick(vault: string, attachment: Attachment): Promise<void> {
+    if (stopped) return;
+    try {
+      await processOne(vault, attachment);
+    } catch (err) {
+      logger.error(`[transcribe] kick error on attachment ${attachment.id}:`, err);
+    }
+  }
+
   return {
     async stop() {
       stopped = true;
@@ -300,7 +418,44 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       await inflight;
     },
     tick,
+    kick,
   };
+}
+
+/**
+ * Wire the transcription worker up as an `attachment:created` hook. This
+ * is the event-driven fast path — when a new attachment is inserted with
+ * `transcribe_status = "pending"`, the hook fires within a microtask and
+ * the worker begins processing without waiting for the next sweep.
+ *
+ * `resolveVault(store)` maps the store handle delivered to the hook back
+ * to its vault name (needed so the worker can resolve the assets dir,
+ * retention policy, and context predicates). Returns an unregister
+ * function so tests can tear down cleanly.
+ */
+export function registerTranscriptionHook(
+  registry: HookRegistry,
+  worker: TranscriptionWorker,
+  resolveVault: (store: Store) => string | undefined,
+  logger: { error: (...args: unknown[]) => void } = console,
+): () => void {
+  return registry.onAttachment({
+    name: "transcription-kickoff",
+    event: "created",
+    when: (att) =>
+      (att.metadata as { transcribe_status?: string } | undefined)
+        ?.transcribe_status === "pending",
+    handler: async (attachment, store) => {
+      const vault = resolveVault(store);
+      if (!vault) {
+        logger.error(
+          `[transcribe] could not resolve vault for attachment ${attachment.id}; sweep will pick it up`,
+        );
+        return;
+      }
+      await worker.kick(vault, attachment);
+    },
+  });
 }
 
 async function callScribe(args: {
