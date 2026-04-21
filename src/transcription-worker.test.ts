@@ -411,6 +411,156 @@ describe("transcription worker", () => {
   });
 });
 
+describe("transcription worker — auth + context", () => {
+  test("attaches multipart context part when getContextPredicates returns entries", async () => {
+    await store.createNote("stub", { id: "ctx1", metadata: { transcribe_stub: true } });
+    seedAudio("memos/ctx1.webm");
+    await store.addAttachment("ctx1", "memos/ctx1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+    // Seed a context note the worker will fetch via queryNotes.
+    await store.createNote("", {
+      id: "p1",
+      path: "People/Aaron.md",
+      tags: ["person"],
+      metadata: { summary: "founder", aliases: ["AG"] },
+    });
+
+    let captured: { headers: Headers; form: FormData } | null = null;
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const form = init?.body as unknown as FormData;
+      captured = { headers: new Headers(init?.headers as HeadersInit), form };
+      return new Response(JSON.stringify({ text: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => store as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      resolveAssetsDir: () => assetsRoot,
+      getContextPredicates: () => [
+        { tag: "person", include_metadata: ["summary", "aliases"] },
+      ],
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    expect(captured).not.toBeNull();
+    const part = captured!.form.get("context");
+    expect(part).toBeInstanceOf(Blob);
+    const body = JSON.parse(await (part as Blob).text());
+    expect(body.entries).toEqual([
+      { name: "Aaron", summary: "founder", aliases: ["AG"] },
+    ]);
+  });
+
+  test("sends Bearer header when scribeToken is set", async () => {
+    await store.createNote("stub", { id: "auth1", metadata: { transcribe_stub: true } });
+    seedAudio("memos/auth1.webm");
+    await store.addAttachment("auth1", "memos/auth1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    let capturedAuth: string | null = null;
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedAuth = new Headers(init?.headers as HeadersInit).get("authorization");
+      return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+    }) as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => store as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      scribeToken: "shh-secret",
+      resolveAssetsDir: () => assetsRoot,
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    expect(capturedAuth).toBe("Bearer shh-secret");
+  });
+
+  test("omits Authorization header when scribeToken is unset (loopback back-compat)", async () => {
+    await store.createNote("stub", { id: "auth2", metadata: { transcribe_stub: true } });
+    seedAudio("memos/auth2.webm");
+    await store.addAttachment("auth2", "memos/auth2.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    let capturedAuth: string | null | undefined = undefined;
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedAuth = new Headers(init?.headers as HeadersInit).get("authorization");
+      return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+    }) as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => store as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      resolveAssetsDir: () => assetsRoot,
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    // Headers#get returns null when absent — this is how we confirm no header was set.
+    expect(capturedAuth).toBeNull();
+  });
+
+  test("no context attached when getContextPredicates is undefined (no regression)", async () => {
+    await store.createNote("stub", { id: "np1", metadata: { transcribe_stub: true } });
+    seedAudio("memos/np1.webm");
+    await store.addAttachment("np1", "memos/np1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    let capturedForm: FormData | null = null;
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      capturedForm = init?.body as unknown as FormData;
+      return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+    }) as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => store as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      resolveAssetsDir: () => assetsRoot,
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    expect(capturedForm).not.toBeNull();
+    expect(capturedForm!.get("context")).toBeNull();
+    expect(capturedForm!.get("file")).not.toBeNull();
+  });
+});
+
 describe("store.listAttachmentsByTranscribeStatus", () => {
   test("returns only matching status, oldest first", async () => {
     await store.createNote("s", { id: "q1" });

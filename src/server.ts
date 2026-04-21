@@ -23,6 +23,7 @@ import { registerTriggers } from "./triggers.ts";
 import { route } from "./routing.ts";
 import { startTranscriptionWorker, type TranscriptionWorker } from "./transcription-worker.ts";
 import { assetsDir } from "./routes.ts";
+import { resolveScribeAuthToken } from "./scribe-env.ts";
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -34,6 +35,28 @@ function registerConfiguredTriggers(): void {
   }
   registerTriggers(defaultHookRegistry, config.triggers);
   console.log(`[triggers] registered ${config.triggers.length} trigger(s)`);
+
+  // Soft-deprecation warning: if the dedicated transcription worker is
+  // enabled AND a trigger points at what looks like the same scribe endpoint,
+  // both will process the same attachments. The trigger's `missing_metadata`
+  // guard keeps it idempotent once the worker marks `transcript` on the
+  // attachment, but the noise is worth flagging.
+  if (process.env.SCRIBE_URL) {
+    const scribeHost = safeHost(process.env.SCRIBE_URL);
+    for (const t of config.triggers) {
+      if (t.action.send !== "attachment") continue;
+      if (scribeHost && safeHost(t.action.webhook) === scribeHost) {
+        console.warn(
+          `[triggers] "${t.name}" points at scribe (${t.action.webhook}) and the dedicated worker is also enabled; ` +
+          `these may double-fire. Prefer the dedicated worker for /v1/audio/transcriptions and remove this trigger.`,
+        );
+      }
+    }
+  }
+}
+
+function safeHost(url: string): string | null {
+  try { return new URL(url).host; } catch { return null; }
 }
 
 registerConfiguredTriggers();
@@ -50,9 +73,10 @@ if (process.env.SCRIBE_URL) {
     vaultList: () => listVaults(),
     getStore: (name) => getVaultStore(name),
     scribeUrl: process.env.SCRIBE_URL,
-    scribeToken: process.env.SCRIBE_TOKEN,
+    scribeToken: resolveScribeAuthToken(),
     resolveAssetsDir: (vault) => assetsDir(vault),
     getAudioRetention: (vault) => readVaultConfig(vault)?.audio_retention ?? "keep",
+    getContextPredicates: (vault) => readVaultConfig(vault)?.transcription?.context,
   });
   console.log(`[transcribe] worker started → ${process.env.SCRIBE_URL}`);
 } else {

@@ -146,6 +146,15 @@ export interface VaultConfig {
    * preserved; only the file on disk is affected.
    */
   audio_retention?: "keep" | "until_transcribed" | "never";
+  /**
+   * Transcription worker settings for this vault. Today only `context` is
+   * honored — a list of context predicates the worker attaches to each
+   * transcription POST so scribe sees person/project context alongside the
+   * audio. Same shape as triggers' `action.include_context`.
+   */
+  transcription?: {
+    context?: TriggerIncludeContext[];
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +185,20 @@ export interface TriggerWhen {
  */
 export type TriggerSendMode = "json" | "attachment" | "content";
 
+/**
+ * A single `include_context` entry — a query over the vault whose matching
+ * notes are serialized as context entries and included alongside the primary
+ * webhook payload. See `src/context.ts` for the fetch + serialization rules.
+ */
+export interface TriggerIncludeContext {
+  /** Tag the note must carry. Required. */
+  tag: string;
+  /** If set, notes also carrying this tag are excluded. */
+  exclude_tag?: string;
+  /** Metadata keys to surface on each resulting entry. */
+  include_metadata?: string[];
+}
+
 export interface TriggerAction {
   /** URL to POST the webhook payload to. */
   webhook: string;
@@ -183,6 +206,12 @@ export interface TriggerAction {
   timeout?: number;
   /** How to send data to the webhook. Default "json". */
   send?: TriggerSendMode;
+  /**
+   * If present, the trigger pre-fetches the matching vault notes at fire
+   * time and attaches them as a `context` JSON part (send=attachment) or a
+   * top-level `context` field (send=json). send=content ignores this.
+   */
+  include_context?: TriggerIncludeContext[];
 }
 
 export interface TriggerConfig {
@@ -314,6 +343,20 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push(`audio_retention: ${config.audio_retention}`);
   }
 
+  if (config.transcription?.context?.length) {
+    lines.push("transcription:");
+    lines.push("  context:");
+    for (const entry of config.transcription.context) {
+      lines.push(`    - tag: ${entry.tag}`);
+      if (entry.exclude_tag) {
+        lines.push(`      exclude_tag: ${entry.exclude_tag}`);
+      }
+      if (entry.include_metadata?.length) {
+        lines.push(`      include_metadata: [${entry.include_metadata.map((v) => `"${v}"`).join(", ")}]`);
+      }
+    }
+  }
+
   lines.push("api_keys:");
   for (const key of config.api_keys) {
     lines.push(`  - id: ${key.id}`);
@@ -412,7 +455,62 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   // Parse tag_schemas
   config.tag_schemas = parseTagSchemas(yaml);
 
+  // Parse transcription.context (same shape as triggers' include_context)
+  const transcriptionContext = parseTranscriptionContext(yaml);
+  if (transcriptionContext) {
+    config.transcription = { context: transcriptionContext };
+  }
+
   return config;
+}
+
+/**
+ * Parse the `transcription: { context: [...] }` section from vault.yaml.
+ * Shape matches triggers' `action.include_context` so callers can reuse the
+ * same `ContextPredicate` helpers from src/context.ts.
+ */
+function parseTranscriptionContext(yaml: string): TriggerIncludeContext[] | undefined {
+  const startMatch = yaml.match(/^transcription:\s*$/m);
+  if (!startMatch) return undefined;
+
+  const startIdx = (startMatch.index ?? 0) + startMatch[0].length;
+  const lines = yaml.slice(startIdx).split("\n");
+
+  const entries: TriggerIncludeContext[] = [];
+  let inContext = false;
+  let current: TriggerIncludeContext | null = null;
+
+  const pushCurrent = () => {
+    if (current && current.tag) entries.push(current);
+    current = null;
+  };
+
+  for (const line of lines) {
+    // Stop at next top-level key.
+    if (line.match(/^\S/) && line.trim().length > 0) break;
+    if (line.trim().length === 0) continue;
+
+    const trimmed = line.trim();
+
+    if (trimmed === "context:") { inContext = true; continue; }
+    if (!inContext) continue;
+
+    const itemStart = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+    if (itemStart) {
+      pushCurrent();
+      current = { tag: "" };
+      applyContextField(current, itemStart[1], itemStart[2]);
+      continue;
+    }
+    const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+    if (fieldMatch && current) {
+      applyContextField(current, fieldMatch[1], fieldMatch[2]);
+      continue;
+    }
+  }
+
+  pushCurrent();
+  return entries.length > 0 ? entries : undefined;
 }
 
 /**
@@ -498,6 +596,25 @@ function parseYamlList(val: string): string[] {
   return inner.split(",").map((s) => s.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
 }
 
+/**
+ * Apply a single "key: value" line to the include_context item being built.
+ * Shared between triggers and vault-config transcription.context (same shape).
+ */
+function applyContextField(
+  item: TriggerIncludeContext,
+  key: string,
+  raw: string,
+): void {
+  const value = raw.trim();
+  if (key === "tag") { item.tag = value.replace(/^"(.*)"$/, "$1"); return; }
+  if (key === "exclude_tag") { item.exclude_tag = value.replace(/^"(.*)"$/, "$1"); return; }
+  if (key === "include_metadata") {
+    const listMatch = value.match(/^\[([^\]]*)\]/);
+    if (listMatch) item.include_metadata = parseYamlList(listMatch[1]);
+    return;
+  }
+}
+
 function parseTriggers(yaml: string): TriggerConfig[] | undefined {
   const startMatch = yaml.match(/^triggers:\s*$/m);
   if (!startMatch) return undefined;
@@ -508,7 +625,17 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
   const triggers: TriggerConfig[] = [];
   let current: Partial<TriggerConfig> | null = null;
   // Track which section we're in by the last seen section header
-  let section: "top" | "when" | "action" = "top";
+  let section: "top" | "when" | "action" | "include_context" = "top";
+  // When inside include_context, track the item currently being parsed.
+  let currentContext: TriggerIncludeContext | null = null;
+
+  const pushContextItem = () => {
+    if (currentContext && current?.action) {
+      current.action.include_context = current.action.include_context ?? [];
+      current.action.include_context.push(currentContext);
+    }
+    currentContext = null;
+  };
 
   for (const line of lines) {
     // Stop at next top-level key
@@ -520,6 +647,7 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
     // New trigger item: "- name: ..."
     const nameMatch = trimmed.match(/^-\s+name:\s*(.+)/);
     if (nameMatch) {
+      pushContextItem();
       if (current?.name) {
         if (current.action?.webhook) {
           triggers.push(current as TriggerConfig);
@@ -535,8 +663,16 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
     if (!current) continue;
 
     // Section headers — detect by key name regardless of indent
-    if (trimmed === "when:") { section = "when"; continue; }
-    if (trimmed === "action:") { section = "action"; continue; }
+    if (trimmed === "when:") { pushContextItem(); section = "when"; continue; }
+    if (trimmed === "action:") { pushContextItem(); section = "action"; continue; }
+    if (trimmed === "include_context:") {
+      // Entering the nested list under action:.
+      if (!current.action) current.action = { webhook: "" } as TriggerAction;
+      current.action.include_context = current.action.include_context ?? [];
+      section = "include_context";
+      currentContext = null;
+      continue;
+    }
 
     // Top-level trigger field
     const eventsMatch = trimmed.match(/^events:\s*\[([^\]]*)\]/);
@@ -575,7 +711,26 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
         continue;
       }
     }
+
+    // include_context list items: "- tag: X" starts a new item; subsequent
+    // indented lines set fields on it.
+    if (section === "include_context") {
+      const itemStart = trimmed.match(/^-\s+(\w+):\s*(.*)$/);
+      if (itemStart) {
+        pushContextItem();
+        currentContext = { tag: "" };
+        applyContextField(currentContext, itemStart[1], itemStart[2]);
+        continue;
+      }
+      const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
+      if (fieldMatch && currentContext) {
+        applyContextField(currentContext, fieldMatch[1], fieldMatch[2]);
+        continue;
+      }
+    }
   }
+
+  pushContextItem();
 
   // Push the last trigger
   if (current?.name) {
@@ -1070,6 +1225,18 @@ export function writeGlobalConfig(config: GlobalConfig): void {
       }
       if (trigger.action.timeout) {
         lines.push(`      timeout: ${trigger.action.timeout}`);
+      }
+      if (trigger.action.include_context?.length) {
+        lines.push("      include_context:");
+        for (const entry of trigger.action.include_context) {
+          lines.push(`        - tag: ${entry.tag}`);
+          if (entry.exclude_tag) {
+            lines.push(`          exclude_tag: ${entry.exclude_tag}`);
+          }
+          if (entry.include_metadata?.length) {
+            lines.push(`          include_metadata: [${entry.include_metadata.map((v) => `"${v}"`).join(", ")}]`);
+          }
+        }
       }
     }
   }

@@ -129,7 +129,11 @@ describe("registerTriggers — dispatch modes", async () => {
     webhookServer?.stop(true);
   });
 
-  function makeMockStore(note: Note, attachments: Attachment[] = []): Store {
+  function makeMockStore(
+    note: Note,
+    attachments: Attachment[] = [],
+    contextNotesByTag: Record<string, Note[]> = {},
+  ): Store {
     const notes = new Map<string, Note>();
     notes.set(note.id, { ...note });
     const attachmentStore = new Map<string, Attachment[]>();
@@ -152,6 +156,14 @@ describe("registerTriggers — dispatch modes", async () => {
         existing.push(att);
         attachmentStore.set(noteId, existing);
         return att;
+      },
+      queryNotes: async ({ tags, excludeTags }: { tags?: string[]; excludeTags?: string[] }) => {
+        const tag = tags?.[0];
+        if (!tag) return [];
+        const pool = contextNotesByTag[tag] ?? [];
+        if (!excludeTags?.length) return pool;
+        const excluded = new Set(excludeTags);
+        return pool.filter((n) => !(n.tags ?? []).some((t) => excluded.has(t)));
       },
     } as unknown as Store;
   }
@@ -333,6 +345,184 @@ describe("registerTriggers — dispatch modes", async () => {
     const updated = await store.getNote("n5");
     const meta = updated?.metadata as Record<string, unknown>;
     expect(meta.empty_test_skipped_reason).toBe("note has no content to synthesize");
+  });
+
+  it("send=attachment with include_context attaches context JSON part", async () => {
+    const hooks = new HookRegistry();
+    const note = makeNote({ id: "ctx1", content: "", tags: ["capture"] });
+
+    const tmpDir = `/tmp/trigger-ctx-att-${Date.now()}`;
+    const { mkdirSync, writeFileSync, rmSync } = await import("fs");
+    mkdirSync(`${tmpDir}/2026-04-11`, { recursive: true });
+    writeFileSync(`${tmpDir}/2026-04-11/recording.wav`, Buffer.from("fake-wav"));
+
+    const attachment: Attachment = {
+      id: "att-c1",
+      noteId: "ctx1",
+      path: "2026-04-11/recording.wav",
+      mimeType: "audio/wav",
+      createdAt: "2025-01-01T00:00:00Z",
+    };
+
+    const person = makeNote({
+      id: "p1",
+      path: "People/Aaron.md",
+      tags: ["person"],
+      metadata: { summary: "founder", aliases: ["AG"], secret: "nope" },
+    });
+    const project = makeNote({
+      id: "pj1",
+      path: "Projects/Lens.md",
+      tags: ["project"],
+      metadata: { summary: "note app" },
+    });
+    const store = makeMockStore(note, [attachment], { person: [person], project: [project] });
+
+    const originalAssetsDir = process.env.ASSETS_DIR;
+    process.env.ASSETS_DIR = tmpDir;
+
+    webhookHandler = () => Response.json({ text: "transcribed" });
+
+    registerTriggers(hooks, [{
+      name: "ctx_attachment_test",
+      when: { tags: ["capture"], has_content: false },
+      action: {
+        webhook: `http://127.0.0.1:${webhookPort}/transcribe`,
+        send: "attachment",
+        include_context: [
+          { tag: "person", include_metadata: ["summary", "aliases"] },
+          { tag: "project", include_metadata: ["summary"] },
+        ],
+      },
+    }], { error: () => {}, info: () => {} });
+
+    await hooks.dispatch("created", note, store);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(lastRequest?.formData).toBeDefined();
+    const part = lastRequest!.formData!.get("context");
+    expect(part).toBeInstanceOf(Blob);
+    const body = JSON.parse(await (part as Blob).text());
+    expect(body.entries.length).toBe(2);
+    expect(body.entries[0]).toEqual({ name: "Aaron", summary: "founder", aliases: ["AG"] });
+    expect(body.entries[1]).toEqual({ name: "Lens", summary: "note app" });
+    // Non-whitelisted metadata must not leak.
+    expect(body.entries[0].secret).toBeUndefined();
+
+    if (originalAssetsDir) process.env.ASSETS_DIR = originalAssetsDir;
+    else delete process.env.ASSETS_DIR;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("send=attachment without include_context omits context part (no regression)", async () => {
+    const hooks = new HookRegistry();
+    const note = makeNote({ id: "nx", content: "", tags: ["capture"] });
+
+    const tmpDir = `/tmp/trigger-ctx-none-${Date.now()}`;
+    const { mkdirSync, writeFileSync, rmSync } = await import("fs");
+    mkdirSync(`${tmpDir}/2026-04-11`, { recursive: true });
+    writeFileSync(`${tmpDir}/2026-04-11/recording.wav`, Buffer.from("fake-wav"));
+    const attachment: Attachment = {
+      id: "att-x",
+      noteId: "nx",
+      path: "2026-04-11/recording.wav",
+      mimeType: "audio/wav",
+      createdAt: "2025-01-01T00:00:00Z",
+    };
+    const store = makeMockStore(note, [attachment]);
+    const originalAssetsDir = process.env.ASSETS_DIR;
+    process.env.ASSETS_DIR = tmpDir;
+
+    webhookHandler = () => Response.json({ text: "ok" });
+
+    registerTriggers(hooks, [{
+      name: "no_ctx",
+      when: { tags: ["capture"], has_content: false },
+      action: { webhook: `http://127.0.0.1:${webhookPort}/transcribe`, send: "attachment" },
+    }], { error: () => {}, info: () => {} });
+
+    await hooks.dispatch("created", note, store);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(lastRequest?.formData).toBeDefined();
+    expect(lastRequest!.formData!.get("context")).toBeNull();
+
+    if (originalAssetsDir) process.env.ASSETS_DIR = originalAssetsDir;
+    else delete process.env.ASSETS_DIR;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("send=json with include_context inlines context field", async () => {
+    const hooks = new HookRegistry();
+    const note = makeNote({ id: "j1", content: "hello", tags: ["test"] });
+    const person = makeNote({
+      id: "p1",
+      path: "People/Aaron.md",
+      tags: ["person"],
+      metadata: { summary: "founder" },
+    });
+    const store = makeMockStore(note, [], { person: [person] });
+
+    webhookHandler = () => Response.json({});
+
+    registerTriggers(hooks, [{
+      name: "json_ctx",
+      when: { tags: ["test"] },
+      action: {
+        webhook: `http://127.0.0.1:${webhookPort}/hook`,
+        include_context: [{ tag: "person", include_metadata: ["summary"] }],
+      },
+    }], { error: () => {}, info: () => {} });
+
+    await hooks.dispatch("created", note, store);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const body = lastRequest!.body as Record<string, unknown>;
+    expect(body.context).toBeDefined();
+    const ctx = body.context as { entries: Array<Record<string, unknown>> };
+    expect(ctx.entries).toEqual([{ name: "Aaron", summary: "founder" }]);
+  });
+
+  it("send=content ignores include_context (TTS-out has no use for it)", async () => {
+    const hooks = new HookRegistry();
+    const note = makeNote({ id: "c1", content: "speak", tags: ["reader"] });
+    const person = makeNote({
+      id: "p1",
+      path: "People/Aaron.md",
+      tags: ["person"],
+      metadata: { summary: "founder" },
+    });
+    const store = makeMockStore(note, [], { person: [person] });
+
+    const tmpDir = `/tmp/trigger-ctx-content-${Date.now()}`;
+    const { mkdirSync, rmSync } = await import("fs");
+    mkdirSync(tmpDir, { recursive: true });
+    const originalAssetsDir = process.env.ASSETS_DIR;
+    process.env.ASSETS_DIR = tmpDir;
+
+    webhookHandler = () =>
+      new Response(Buffer.from("audio"), { headers: { "Content-Type": "audio/ogg" } });
+
+    registerTriggers(hooks, [{
+      name: "content_ctx",
+      when: { tags: ["reader"], has_content: true },
+      action: {
+        webhook: `http://127.0.0.1:${webhookPort}/speech`,
+        send: "content",
+        include_context: [{ tag: "person", include_metadata: ["summary"] }],
+      },
+    }], { error: () => {}, info: () => {} });
+
+    await hooks.dispatch("created", note, store);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const body = lastRequest!.body as Record<string, unknown>;
+    expect(body.context).toBeUndefined();
+    expect(body.input).toBe("speak");
+
+    if (originalAssetsDir) process.env.ASSETS_DIR = originalAssetsDir;
+    else delete process.env.ASSETS_DIR;
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 });
 

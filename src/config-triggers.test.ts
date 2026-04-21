@@ -80,4 +80,53 @@ describe("trigger config round-trip", () => {
     const config = readGlobalConfig();
     expect(config.triggers).toBeUndefined();
   });
+
+  it("roundtrips triggers with action.include_context", () => {
+    mkdirSync(testDir, { recursive: true });
+    writeGlobalConfig({
+      port: 1940,
+      triggers: [
+        {
+          name: "transcribe-with-people",
+          when: { tags: ["capture"], has_content: false },
+          action: {
+            webhook: "http://localhost:1943/v1/audio/transcriptions",
+            send: "attachment",
+            include_context: [
+              { tag: "person", include_metadata: ["summary", "aliases"] },
+              { tag: "project", exclude_tag: "archived", include_metadata: ["summary"] },
+            ],
+          },
+        },
+      ],
+    });
+
+    const config = readGlobalConfig();
+    const ctx = config.triggers![0].action.include_context!;
+    expect(ctx.length).toBe(2);
+    expect(ctx[0]).toEqual({ tag: "person", include_metadata: ["summary", "aliases"] });
+    expect(ctx[1]).toEqual({
+      tag: "project",
+      exclude_tag: "archived",
+      include_metadata: ["summary"],
+    });
+  });
+
+  it("skips include_context serialization when empty", () => {
+    mkdirSync(testDir, { recursive: true });
+    writeGlobalConfig({
+      port: 1940,
+      triggers: [
+        {
+          name: "plain",
+          when: { tags: ["t"] },
+          action: { webhook: "http://x/y" },
+        },
+      ],
+    });
+    const raw = readFileSync(join(testDir, "vault", "config.yaml"), "utf8");
+    expect(raw).not.toContain("include_context");
+    const config = readGlobalConfig();
+    expect(config.triggers![0].action.include_context).toBeUndefined();
+  });
 });
