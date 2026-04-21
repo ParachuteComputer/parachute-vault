@@ -33,6 +33,7 @@ import type { HookRegistry, HookEvent } from "../core/src/hooks.ts";
 import type { TriggerConfig, TriggerWhen } from "./config.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
+import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
 
 const DEFAULT_TIMEOUT = 60_000;
 
@@ -157,6 +158,7 @@ async function dispatchJson(
   attachments: Attachment[],
   existingMeta: Record<string, unknown>,
   hookEvent: HookEvent | undefined,
+  context: ContextPayload | null,
   signal: AbortSignal,
 ): Promise<DispatchResult> {
   const resp = await fetch(url, {
@@ -175,6 +177,10 @@ async function dispatchJson(
         createdAt: note.createdAt,
         updatedAt: note.updatedAt,
       },
+      // Inline when include_context is configured and matched anything; the
+      // receiver can key off a top-level `context` field without having to
+      // parse multipart.
+      ...(context && context.entries.length ? { context } : {}),
     }),
     signal,
   });
@@ -196,6 +202,7 @@ async function dispatchAttachment(
   note: Note,
   attachments: Attachment[],
   store: Store,
+  context: ContextPayload | null,
   signal: AbortSignal,
 ): Promise<DispatchResult> {
   const assetsRoot = resolveAssetsDir(store);
@@ -210,6 +217,7 @@ async function dispatchAttachment(
 
   const form = new FormData();
   form.append("file", file);
+  if (context) appendContextPart(form, context);
 
   const resp = await fetch(url, { method: "POST", body: form, signal });
   if (!resp.ok) {
@@ -325,20 +333,27 @@ export function registerTriggers(
         // Fire the webhook using the configured send mode
         let webhookResult: WebhookResponse;
         const attachments = await store.getAttachments(note.id);
+        // Pre-fetch context once per fire. Predicate errors are logged and
+        // the fire continues — context is additive, never blocking.
+        const context = trigger.action.include_context?.length
+          ? await fetchContextEntries(store, trigger.action.include_context, logger)
+          : null;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
         try {
           let result: DispatchResult;
           switch (sendMode) {
             case "attachment":
-              result = await dispatchAttachment(trigger.action.webhook, note, attachments, store, controller.signal);
+              result = await dispatchAttachment(trigger.action.webhook, note, attachments, store, context, controller.signal);
               break;
             case "content":
+              // send=content is pure TTS (audio out); vault context makes no
+              // sense here and would confuse the server contract.
               result = await dispatchContent(trigger.action.webhook, note, store, controller.signal);
               break;
             case "json":
             default:
-              result = await dispatchJson(trigger.action.webhook, trigger, note, attachments, existingMeta, hookEvent, controller.signal);
+              result = await dispatchJson(trigger.action.webhook, trigger, note, attachments, existingMeta, hookEvent, context, controller.signal);
               break;
           }
           webhookResult = result.webhookResult;

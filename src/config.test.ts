@@ -125,6 +125,47 @@ describe("config", () => {
     expect(loaded!.tag_schemas).toBeUndefined();
   });
 
+  test("round-trips vault config transcription.context", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+      transcription: {
+        context: [
+          { tag: "person", include_metadata: ["summary", "aliases"] },
+          { tag: "project", exclude_tag: "archived", include_metadata: ["summary"] },
+        ],
+      },
+    };
+
+    writeVaultConfig(config);
+
+    const loaded = readVaultConfig("testvault");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.transcription?.context).toBeDefined();
+    expect(loaded!.transcription!.context!.length).toBe(2);
+    expect(loaded!.transcription!.context![0]).toEqual({
+      tag: "person",
+      include_metadata: ["summary", "aliases"],
+    });
+    expect(loaded!.transcription!.context![1]).toEqual({
+      tag: "project",
+      exclude_tag: "archived",
+      include_metadata: ["summary"],
+    });
+  });
+
+  test("vault config without transcription.context loads cleanly", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    writeVaultConfig(config);
+    const loaded = readVaultConfig("testvault");
+    expect(loaded!.transcription).toBeUndefined();
+  });
+
   test("round-trips discovery: enabled|disabled", () => {
     // Default: absent means enabled (endpoint serves names).
     writeGlobalConfig({ port: 1940 });

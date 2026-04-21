@@ -40,6 +40,8 @@
 import { join, normalize } from "path";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import type { Store, Attachment } from "../core/src/types.ts";
+import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
+import type { TriggerIncludeContext } from "./config.ts";
 
 /** Placeholder pattern written by Lens's voice-memo stub. */
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
@@ -63,6 +65,14 @@ export interface TranscriptionWorkerOpts {
   resolveAssetsDir: (vault: string) => string;
   /** Per-vault audio retention. Default "keep". */
   getAudioRetention?: (vault: string) => AudioRetention;
+  /**
+   * Per-vault context predicates for enriching the scribe POST. When present,
+   * the worker runs each predicate against the vault store and attaches the
+   * resulting entries as a `context` multipart part. Matches triggers'
+   * `action.include_context` so scribe sees the same shape via either path.
+   * Returning `undefined` or `[]` means no context is attached.
+   */
+  getContextPredicates?: (vault: string) => TriggerIncludeContext[] | undefined;
   pollIntervalMs?: number;
   maxAttempts?: number;
   timeoutMs?: number;
@@ -129,6 +139,15 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       return;
     }
 
+    // Fetch context predicates for this vault. Errors are logged inside
+    // fetchContextEntries — we always have a payload (possibly empty) to
+    // pass through, so a bad predicate doesn't block transcription.
+    let context: ContextPayload | null = null;
+    const predicates = opts.getContextPredicates?.(vault);
+    if (predicates && predicates.length) {
+      context = await fetchContextEntries(store, predicates, logger);
+    }
+
     let transcript: string;
     try {
       transcript = await callScribe({
@@ -137,6 +156,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         filePath,
         filename: attachment.path.split("/").pop() ?? "audio",
         mimeType: attachment.mimeType,
+        context,
         timeoutMs,
         fetchImpl,
       });
@@ -289,6 +309,7 @@ async function callScribe(args: {
   filePath: string;
   filename: string;
   mimeType: string;
+  context: ContextPayload | null;
   timeoutMs: number;
   fetchImpl: typeof fetch;
 }): Promise<string> {
@@ -299,6 +320,7 @@ async function callScribe(args: {
     const file = new File([fileBuffer], args.filename, { type: args.mimeType });
     const form = new FormData();
     form.append("file", file);
+    if (args.context) appendContextPart(form, args.context);
 
     const endpoint = `${args.url.replace(/\/$/, "")}/v1/audio/transcriptions`;
     const headers: Record<string, string> = {};
