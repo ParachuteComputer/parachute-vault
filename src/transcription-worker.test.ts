@@ -665,9 +665,9 @@ describe("transcription worker — hook-driven", () => {
 
     // Seed an attachment already in backoff, but with a backoff window that
     // has already elapsed — the sweep should pick it up on the next tick.
-    // (A fresh attachment-created dispatch does NOT fire here because the
-    //  row was written before the hook existed; we prove the sweep is still
-    //  the fallback.)
+    // The hook is registered below, AFTER this insert, so the dispatch at
+    // addAttachment time has no subscribers and the event-driven path is
+    // never taken. What drives the completion is `worker.tick()` alone.
     const past = new Date(Date.now() - 1_000).toISOString();
     await hookedStore.addAttachment("h2", "memos/h2.webm", "audio/webm", {
       transcribe_status: "pending",

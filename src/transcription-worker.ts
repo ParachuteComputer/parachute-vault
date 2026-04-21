@@ -59,10 +59,16 @@ import type { TriggerIncludeContext } from "./config.ts";
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
 
 /**
- * Default sweep cadence. The sweep is the safety net for backoff-queued
- * items, items that arrived while the server was down, or dispatches that
- * got dropped — not the hot path. Fresh uploads land in single-digit ms
- * via the `attachment:created` hook (see `registerTranscriptionHook`).
+ * Default sweep cadence (ms). The sweep is the safety net for backoff-
+ * queued items, items that arrived while the server was down, or dispatches
+ * that got dropped — not the hot path. Fresh uploads land in single-digit
+ * ms via the `attachment:created` hook (see `registerTranscriptionHook`).
+ *
+ * Operators can override this with the `TRANSCRIPTION_SWEEP_MS` env var
+ * (read at `startTranscriptionWorker()` time, not module load, so values
+ * in `~/.parachute/vault/.env` apply — ES module import happens before
+ * `loadEnvFile()` in server.ts). Per-caller override via the
+ * `pollIntervalMs` opt wins over both.
  */
 const DEFAULT_POLL_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -135,7 +141,12 @@ interface PendingMeta {
 export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): TranscriptionWorker {
   const logger = opts.logger ?? console;
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const pollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
+  // Precedence: opts.pollIntervalMs > TRANSCRIPTION_SWEEP_MS env > DEFAULT_POLL_MS.
+  // Reading env here (not at module scope) means `~/.parachute/vault/.env`
+  // values loaded by server.ts still apply, matching how SCRIBE_URL works.
+  const envPoll = Number(process.env.TRANSCRIPTION_SWEEP_MS);
+  const defaultPollMs = Number.isFinite(envPoll) && envPoll > 0 ? envPoll : DEFAULT_POLL_MS;
+  const pollMs = opts.pollIntervalMs ?? defaultPollMs;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retentionFor = opts.getAudioRetention ?? (() => "keep" as const);
