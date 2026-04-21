@@ -59,6 +59,15 @@ import type { TriggerIncludeContext } from "./config.ts";
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
 
 /**
+ * Body written when transcription reaches a terminal failure (maxAttempts
+ * exhausted, or the audio file is missing). This used to be written by
+ * Lens's now-removed scribe client; owning it here means a failed upload
+ * stops reading "Transcript pending" forever regardless of which client
+ * uploaded the audio.
+ */
+const TRANSCRIPT_UNAVAILABLE = "_Transcription unavailable._";
+
+/**
  * Default sweep cadence (ms). The sweep is the safety net for backoff-
  * queued items, items that arrived while the server was down, or dispatches
  * that got dropped — not the hot path. Fresh uploads land in single-digit
@@ -176,6 +185,37 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     }
   }
 
+  /**
+   * On a terminal failure (maxAttempts exhausted, or audio file missing),
+   * swap the stub placeholder for the "unavailable" marker — otherwise
+   * Lens's voice memo sits reading "Transcript pending" forever. Mirrors
+   * the success-path note write in shape: only touches the note when
+   * `transcribe_stub === true`, clears the stub marker, uses `skipUpdatedAt`
+   * so the note's modification time still reflects user intent. Errors
+   * are logged and swallowed so a note-write failure doesn't mask the
+   * attachment failure we're trying to record.
+   */
+  async function applyFailureMarker(store: Store, noteId: string): Promise<void> {
+    const note = await store.getNote(noteId);
+    if (!note) return;
+    const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+    if (noteMeta.transcribe_stub !== true) return;
+
+    const body = TRANSCRIPT_PLACEHOLDER.test(note.content)
+      ? note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE)
+      : TRANSCRIPT_UNAVAILABLE;
+    const { transcribe_stub: _drop, ...restMeta } = noteMeta;
+    try {
+      await store.updateNote(note.id, {
+        content: body,
+        metadata: restMeta,
+        skipUpdatedAt: true,
+      });
+    } catch (err) {
+      logger.error(`[transcribe] failed to apply failure marker to note ${note.id}:`, err);
+    }
+  }
+
   async function processOneLocked(vault: string, attachment: Attachment): Promise<void> {
     const store = opts.getStore(vault);
     // Re-read metadata — the in-memory `attachment` may be stale (the hook
@@ -203,6 +243,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         transcribe_status: "failed",
         transcribe_error: "audio file not found",
       });
+      await applyFailureMarker(store, attachment.noteId);
       return;
     }
 
@@ -238,6 +279,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
           transcribe_attempts: nextAttempts,
           transcribe_error: errMsg,
         });
+        await applyFailureMarker(store, attachment.noteId);
         // retention=never drops the audio on any terminal state, including
         // failure. The user opted in to "I don't want the audio kept around
         // regardless of outcome" — honor it.

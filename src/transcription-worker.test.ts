@@ -204,6 +204,101 @@ describe("transcription worker", () => {
     expect(att.metadata?.transcribe_error).toContain("boom");
   });
 
+  test("terminal failure with stub=true → note shows 'Transcription unavailable' and stub is cleared", async () => {
+    // Mirrors Lens's voice-memo stub shape: note with placeholder body and
+    // transcribe_stub marker, attachment pre-loaded near the retry limit.
+    await store.createNote(
+      "# 🎙️ Voice memo\n\n_Transcript pending._\n",
+      { id: "unavail1", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/unavail1.webm");
+    await store.addAttachment("unavail1", "memos/unavail1.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "scribe down hard", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("unavail1");
+    expect(note!.content).toBe("# 🎙️ Voice memo\n\n_Transcription unavailable._\n");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+
+    const [att] = await store.getAttachments("unavail1");
+    expect(att!.metadata?.transcribe_status).toBe("failed");
+    expect(att!.metadata?.transcribe_error).toContain("scribe down hard");
+  });
+
+  test("audio-not-found with stub=true → note shows 'Transcription unavailable' and stub is cleared", async () => {
+    await store.createNote(
+      "# 🎙️ Voice memo\n\n_Transcript pending._\n",
+      { id: "unavail2", metadata: { transcribe_stub: true } },
+    );
+    // No seedAudio — the file is deliberately missing.
+    await store.addAttachment("unavail2", "memos/gone.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    let called = 0;
+    const worker = makeWorker({
+      fetchImpl: (async () => {
+        called++;
+        return new Response("x", { status: 200 });
+      }) as typeof fetch,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    // Scribe was never called — audio-missing check short-circuits before
+    // the network call, same as before. What's new is the note rewrite.
+    expect(called).toBe(0);
+
+    const note = await store.getNote("unavail2");
+    expect(note!.content).toBe("# 🎙️ Voice memo\n\n_Transcription unavailable._\n");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+
+    const [att] = await store.getAttachments("unavail2");
+    expect(att!.metadata?.transcribe_status).toBe("failed");
+    expect(att!.metadata?.transcribe_error).toContain("audio file not found");
+  });
+
+  test("terminal failure with stub=false → note content is NOT touched", async () => {
+    // User edited the note after upload, which cleared the stub marker.
+    // Worker must not clobber their edit even though transcription failed.
+    await store.createNote("my own words", { id: "unavail3" });
+    seedAudio("memos/unavail3.webm");
+    await store.addAttachment("unavail3", "memos/unavail3.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "boom", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("unavail3");
+    expect(note!.content).toBe("my own words");
+
+    const [att] = await store.getAttachments("unavail3");
+    expect(att!.metadata?.transcribe_status).toBe("failed");
+  });
+
   test("FIFO: oldest pending is processed first", async () => {
     await store.createNote("s", { id: "f1", metadata: { transcribe_stub: true } });
     await store.createNote("s", { id: "f2", metadata: { transcribe_stub: true } });
