@@ -45,7 +45,7 @@
  * work is durably committed, so restart reconciliation works.
  */
 
-import type { Note, Store } from "./types.js";
+import type { Note, Store, Attachment } from "./types.js";
 
 export type HookEvent = "created" | "updated";
 
@@ -67,6 +67,34 @@ export interface NoteHook {
 
 interface RegisteredHook extends NoteHook {
   events: Set<HookEvent>;
+}
+
+/**
+ * Attachment-mutation events. Today only `"created"` is dispatched — the
+ * transcription worker (and any future attachment-aware feature) registers
+ * here to move off its poll-driven steady state and onto the same event bus
+ * that note hooks use. Keeping attachments separate from notes means a
+ * `NoteHook` predicate doesn't have to learn a second argument shape.
+ */
+export type AttachmentHookEvent = "created";
+
+export interface AttachmentHook {
+  /** Events this hook listens for. Defaults to ["created"]. */
+  event?: AttachmentHookEvent | AttachmentHookEvent[];
+  /** Sync predicate. Same idempotency contract as `NoteHook.when`. */
+  when?: (attachment: Attachment) => boolean;
+  /** Handler — runs async, off the request path. */
+  handler: (
+    attachment: Attachment,
+    store: Store,
+    event?: AttachmentHookEvent,
+  ) => Promise<void> | void;
+  /** Optional label for logs. */
+  name?: string;
+}
+
+interface RegisteredAttachmentHook extends AttachmentHook {
+  events: Set<AttachmentHookEvent>;
 }
 
 /**
@@ -110,6 +138,7 @@ export interface HookRegistryOptions {
 
 export class HookRegistry {
   private hooks: RegisteredHook[] = [];
+  private attachmentHooks: RegisteredAttachmentHook[] = [];
   private semaphore: Semaphore;
   private inFlight = new Set<Promise<void>>();
   private logger: { error: (...args: unknown[]) => void };
@@ -138,14 +167,32 @@ export class HookRegistry {
     };
   }
 
+  /** Register an attachment-mutation hook. Returns an unregister function. */
+  onAttachment(hook: AttachmentHook): () => void {
+    const events = new Set<AttachmentHookEvent>(
+      Array.isArray(hook.event)
+        ? hook.event
+        : hook.event
+          ? [hook.event]
+          : (["created"] as AttachmentHookEvent[]),
+    );
+    const entry: RegisteredAttachmentHook = { ...hook, events };
+    this.attachmentHooks.push(entry);
+    return () => {
+      const idx = this.attachmentHooks.indexOf(entry);
+      if (idx >= 0) this.attachmentHooks.splice(idx, 1);
+    };
+  }
+
   /** Remove all registered hooks. Mostly for tests. */
   clear(): void {
     this.hooks = [];
+    this.attachmentHooks = [];
   }
 
-  /** Count of currently registered hooks. */
+  /** Count of currently registered hooks (notes + attachments). */
   get size(): number {
-    return this.hooks.length;
+    return this.hooks.length + this.attachmentHooks.length;
   }
 
   /** Count of currently in-flight handler executions. */
@@ -192,6 +239,44 @@ export class HookRegistry {
     });
   }
 
+  /**
+   * Dispatch an attachment-mutation event. Same post-commit/microtask
+   * contract as `dispatch()` for notes — callers are never blocked on
+   * handler execution, and the triggering SQLite write must already be
+   * committed.
+   */
+  dispatchAttachment(
+    event: AttachmentHookEvent,
+    attachment: Attachment,
+    store: Store,
+  ): void {
+    if (this.attachmentHooks.length === 0) return;
+
+    const matches: RegisteredAttachmentHook[] = [];
+    for (const hook of this.attachmentHooks) {
+      if (!hook.events.has(event)) continue;
+      try {
+        if (hook.when && !hook.when(attachment)) continue;
+      } catch (err) {
+        this.logger.error(
+          `[hooks] predicate threw for ${hook.name ?? "anonymous"} on attachment ${attachment.id}:`,
+          err,
+        );
+        continue;
+      }
+      matches.push(hook);
+    }
+    if (matches.length === 0) return;
+
+    queueMicrotask(() => {
+      for (const hook of matches) {
+        const task = this.runAttachmentHandler(hook, event, attachment, store);
+        this.inFlight.add(task);
+        task.finally(() => this.inFlight.delete(task));
+      }
+    });
+  }
+
   private async runHandler(
     hook: RegisteredHook,
     event: HookEvent,
@@ -208,6 +293,29 @@ export class HookRegistry {
     } catch (err) {
       this.logger.error(
         `[hooks] handler ${hook.name ?? "anonymous"} threw on ${event} ${note.id}:`,
+        err,
+      );
+    } finally {
+      release();
+    }
+  }
+
+  private async runAttachmentHandler(
+    hook: RegisteredAttachmentHook,
+    event: AttachmentHookEvent,
+    attachment: Attachment,
+    store: Store,
+  ): Promise<void> {
+    const release = await this.semaphore.acquire();
+    try {
+      // Re-read the attachment so the handler sees the latest metadata
+      // (another handler may have written back in between). If the
+      // attachment was deleted, silently drop.
+      const fresh = (await store.getAttachment(attachment.id)) ?? attachment;
+      await hook.handler(fresh, store, event);
+    } catch (err) {
+      this.logger.error(
+        `[hooks] attachment handler ${hook.name ?? "anonymous"} threw on ${event} ${attachment.id}:`,
         err,
       );
     } finally {

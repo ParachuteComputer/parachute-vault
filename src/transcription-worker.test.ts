@@ -4,7 +4,9 @@ import { mkdirSync, rmSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
-import { startTranscriptionWorker } from "./transcription-worker.ts";
+import { startTranscriptionWorker, registerTranscriptionHook } from "./transcription-worker.ts";
+import { HookRegistry } from "../core/src/hooks.ts";
+import { SqliteStore } from "../core/src/store.ts";
 import type { Store } from "../core/src/types.ts";
 
 let db: Database;
@@ -579,5 +581,189 @@ describe("store.listAttachmentsByTranscribeStatus", () => {
     const done = await store.listAttachmentsByTranscribeStatus("done");
     expect(done).toHaveLength(1);
     expect(done[0]!.path).toBe("a.webm");
+  });
+});
+
+describe("transcription worker — hook-driven", () => {
+  // These tests use a private HookRegistry so they don't collide with
+  // defaultHookRegistry state or other test files.
+  let hooks: HookRegistry;
+  let hookedStore: SqliteStore;
+  let hookedDb: Database;
+
+  beforeEach(() => {
+    hookedDb = new Database(":memory:");
+    hooks = new HookRegistry({ concurrency: 4, logger: silentLogger });
+    hookedStore = new SqliteStore(hookedDb, { hooks });
+  });
+
+  afterEach(() => {
+    hookedDb.close();
+  });
+
+  test("attachment:created event triggers a cycle before the sweep fires", async () => {
+    await hookedStore.createNote("stub", { id: "h1", metadata: { transcribe_stub: true } });
+    seedAudio("memos/h1.webm");
+
+    let callCount = 0;
+    const fetchImpl = (async () => {
+      callCount++;
+      return new Response(JSON.stringify({ text: "hook-path" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => hookedStore as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      resolveAssetsDir: () => assetsRoot,
+      // Sweep would never fire within the test window — we prove the hook
+      // path is what drives processing.
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    registerTranscriptionHook(hooks, worker, () => "default");
+
+    try {
+      const start = Date.now();
+      await hookedStore.addAttachment("h1", "memos/h1.webm", "audio/webm", {
+        transcribe_status: "pending",
+      });
+
+      // Poll for completion rather than sleep-and-hope — `queueMicrotask` +
+      // semaphore acquire + a faked fetch round-trip is well under 50ms but
+      // not zero.
+      const deadline = start + 500;
+      while (Date.now() < deadline) {
+        const [att] = await hookedStore.getAttachments("h1");
+        if (att?.metadata?.transcribe_status === "done") break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const elapsed = Date.now() - start;
+
+      expect(callCount).toBe(1);
+      expect(elapsed).toBeLessThan(500);
+
+      const [att] = await hookedStore.getAttachments("h1");
+      expect(att!.metadata?.transcribe_status).toBe("done");
+      expect(att!.metadata?.transcript).toBe("hook-path");
+
+      const note = await hookedStore.getNote("h1");
+      expect(note!.content).toBe("hook-path");
+    } finally {
+      await worker.stop();
+      await hooks.drain();
+    }
+  });
+
+  test("sweep still catches a backoff-queued item after its backoff elapses", async () => {
+    await hookedStore.createNote("stub", { id: "h2", metadata: { transcribe_stub: true } });
+    seedAudio("memos/h2.webm");
+
+    // Seed an attachment already in backoff, but with a backoff window that
+    // has already elapsed — the sweep should pick it up on the next tick.
+    // (A fresh attachment-created dispatch does NOT fire here because the
+    //  row was written before the hook existed; we prove the sweep is still
+    //  the fallback.)
+    const past = new Date(Date.now() - 1_000).toISOString();
+    await hookedStore.addAttachment("h2", "memos/h2.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 1,
+      transcribe_backoff_until: past,
+    });
+
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response(JSON.stringify({ text: "sweep-recovered" }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => hookedStore as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      resolveAssetsDir: () => assetsRoot,
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    // Hook is registered but won't fire (no new addAttachment inside this
+    // test window). The sweep is what we're exercising.
+    registerTranscriptionHook(hooks, worker, () => "default");
+
+    try {
+      const processed = await worker.tick();
+      expect(processed).toBe(1);
+      expect(calls).toBe(1);
+
+      const [att] = await hookedStore.getAttachments("h2");
+      expect(att!.metadata?.transcribe_status).toBe("done");
+      expect(att!.metadata?.transcript).toBe("sweep-recovered");
+    } finally {
+      await worker.stop();
+      await hooks.drain();
+    }
+  });
+
+  test("back-compat: pending status set without dispatching a hook is picked up by the sweep", async () => {
+    // Simulate a row inserted by something other than the hooked store —
+    // e.g., a restart resumes with a pre-existing pending attachment, or a
+    // migration/backfill that writes directly. The sweep must still drain
+    // it even though no `attachment:created` event was dispatched.
+    await hookedStore.createNote("stub", { id: "h3", metadata: { transcribe_stub: true } });
+    seedAudio("memos/h3.webm");
+
+    // Insert the attachment directly via raw SQL so no hook dispatches.
+    const now = new Date().toISOString();
+    hookedDb
+      .prepare(
+        "INSERT INTO attachments (id, note_id, path, mime_type, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        "att-h3",
+        "h3",
+        "memos/h3.webm",
+        "audio/webm",
+        JSON.stringify({ transcribe_status: "pending" }),
+        now,
+      );
+
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response(JSON.stringify({ text: "back-compat-sweep" }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => hookedStore as unknown as Store,
+      scribeUrl: "http://scribe.test",
+      resolveAssetsDir: () => assetsRoot,
+      pollIntervalMs: 10_000_000,
+      fetchImpl,
+      logger: silentLogger,
+    });
+    registerTranscriptionHook(hooks, worker, () => "default");
+
+    try {
+      // No hook fires — row was inserted via raw SQL. Prove the hook is idle.
+      await new Promise((r) => setTimeout(r, 30));
+      expect(calls).toBe(0);
+
+      // Sweep tick drains it.
+      const processed = await worker.tick();
+      expect(processed).toBe(1);
+      expect(calls).toBe(1);
+
+      const [att] = await hookedStore.getAttachments("h3");
+      expect(att!.metadata?.transcribe_status).toBe("done");
+      expect(att!.metadata?.transcript).toBe("back-compat-sweep");
+    } finally {
+      await worker.stop();
+      await hooks.drain();
+    }
   });
 });

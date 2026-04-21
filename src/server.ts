@@ -17,11 +17,11 @@
 
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
 import { migrateVaultKeys } from "./token-store.ts";
-import { getVaultStore } from "./vault-store.ts";
+import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { route } from "./routing.ts";
-import { startTranscriptionWorker, type TranscriptionWorker } from "./transcription-worker.ts";
+import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { assetsDir } from "./routes.ts";
 import { resolveScribeAuthToken } from "./scribe-env.ts";
 
@@ -84,6 +84,13 @@ if (process.env.SCRIBE_URL) {
     getAudioRetention: (vault) => readVaultConfig(vault)?.audio_retention ?? "keep",
     getContextPredicates: (vault) => readVaultConfig(vault)?.transcription?.context,
   });
+  // Event-driven hot path — the `attachment:created` hook fires the worker
+  // in a microtask instead of waiting for the 30s sweep.
+  registerTranscriptionHook(
+    defaultHookRegistry,
+    transcriptionWorker,
+    (store) => getVaultNameForStore(store as never),
+  );
   console.log(`[transcribe] worker started → ${process.env.SCRIBE_URL}`);
 } else {
   console.log("[transcribe] worker disabled (set SCRIBE_URL to enable)");
