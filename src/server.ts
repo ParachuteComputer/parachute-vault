@@ -59,6 +59,12 @@ function safeHost(url: string): string | null {
   try { return new URL(url).host; } catch { return null; }
 }
 
+// Load .env before anything reads process.env — otherwise SCRIBE_URL and
+// friends configured in ~/.parachute/vault/.env are invisible to the
+// transcription-worker check and the trigger double-fire warning below.
+ensureConfigDirSync();
+loadEnvFile();
+
 registerConfiguredTriggers();
 
 /**
@@ -82,9 +88,6 @@ if (process.env.SCRIBE_URL) {
 } else {
   console.log("[transcribe] worker disabled (set SCRIBE_URL to enable)");
 }
-
-ensureConfigDirSync();
-loadEnvFile();
 
 // Auto-init: create a default vault if none exist (first run in Docker)
 if (listVaults().length === 0) {
