@@ -77,6 +77,7 @@ import {
   resolveServerPath,
 } from "./daemon.ts";
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
+import { resolveBindHostname } from "./bind.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import { resolveCreateTokenFlags, VAULT_SCOPES } from "./scopes.ts";
@@ -347,7 +348,8 @@ async function cmdInit(args: string[] = []) {
     console.log(`  Server path:  ${serverPath}`);
     console.log(`  Wrapper:      ~/.parachute/vault/start.sh`);
   }
-  console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
+  const bindHost = resolveBindHostname(process.env);
+  console.log(`  Listening on http://${bindHost}:${globalConfig.port || DEFAULT_PORT}`);
 
   // 7. Install MCP for Claude Code (with token for auth) — user confirms
   // unless --mcp / --no-mcp explicitly passed. Writing to ~/.claude.json
@@ -384,7 +386,7 @@ async function cmdInit(args: string[] = []) {
   }
 
   console.log(`\nConfig:   ${CONFIG_DIR}`);
-  console.log(`Server:   http://0.0.0.0:${port}`);
+  console.log(`Server:   http://${bindHost}:${port}`);
 
   console.log(`\nUsage examples:`);
   console.log(`  curl http://localhost:${port}/health`);
