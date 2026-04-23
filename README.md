@@ -90,7 +90,9 @@ The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST,
 
 ### Your API token
 
-The `pvt_...` token printed at init is the one baked into `~/.claude.json`. It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Just mint a new one: `parachute-vault tokens create`. Tokens are SHA-256 hashed at rest in each vault's `vault.db`.
+`vault init` asks two explicit questions: (1) install vault as an MCP server in `~/.claude.json`? (2) also surface the API token so you can paste it into other MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or `curl`? Both default yes. Pass `--mcp` / `--no-mcp` and `--token` / `--no-token` for non-interactive installs.
+
+If you said yes to (2), the `pvt_...` token is printed prominently at the end — it's the same token baked into `~/.claude.json` (if you also said yes to (1)). It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Just mint a new one: `parachute-vault tokens create`. Tokens are SHA-256 hashed at rest in each vault's `vault.db`.
 
 ### Owner password (for OAuth, coming soon)
 
