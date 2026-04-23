@@ -49,6 +49,7 @@ import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import { chooseMcpUrl } from "./mcp-install.ts";
+import { buildInitSummaryLines } from "./init-summary.ts";
 import {
   runBackup,
   readLastBackup,
@@ -225,8 +226,14 @@ async function cmdInit(args: string[] = []) {
   // --no-mcp skips it without prompting. If both passed, --no-mcp wins
   // (safer default). Neither → prompt in a TTY, default-yes in a
   // non-TTY for back-compat with existing piped install scripts.
+  //
+  // --token / --no-token follow the same pattern for whether the API
+  // token is surfaced to the user at the end of init (for pasting into
+  // other MCP clients, scripts, or curl).
   const flagMcpOn = args.includes("--mcp");
   const flagMcpOff = args.includes("--no-mcp");
+  const flagTokenOn = args.includes("--token");
+  const flagTokenOff = args.includes("--no-token");
 
   const isMac = process.platform === "darwin";
   const isLinux = process.platform === "linux";
@@ -368,9 +375,41 @@ async function cmdInit(args: string[] = []) {
   } else if (flagMcpOn) {
     addMcp = true;
   } else if (process.stdin.isTTY) {
-    addMcp = await confirm("Add Vault MCP to Claude Code (~/.claude.json)?", true);
+    addMcp = await confirm("Install Vault as an MCP server in Claude Code (~/.claude.json)?", true);
   } else {
     addMcp = true; // non-interactive: preserve the installable-via-pipe default
+  }
+
+  // 7b. Surface an API token for other clients? (Codex, Goose, OpenCode,
+  // Cursor, Zed, Cline, scripts, curl.) Same flag/TTY precedence as MCP.
+  // Note: a token is always minted when addMcp is true (it gets baked into
+  // the ~/.claude.json entry); this prompt controls whether that token is
+  // printed prominently at the end so the user can paste it elsewhere.
+  let addToken: boolean;
+  if (flagTokenOff) {
+    addToken = false;
+  } else if (flagTokenOn) {
+    addToken = true;
+  } else if (process.stdin.isTTY) {
+    addToken = await confirm(
+      "Generate an API token for other MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or curl?",
+      true,
+    );
+  } else {
+    addToken = true; // non-interactive: default-yes matches addMcp default
+  }
+
+  // Mint a token if we need one (for the claude.json entry and/or for
+  // prominent display) and don't already have one from vault creation.
+  // Re-runs of init that opt in will mint a fresh token — old tokens
+  // continue to work; the user can `tokens revoke` the unused ones.
+  const defaultVault = globalConfig.default_vault || "default";
+  const needToken = addMcp || addToken;
+  if (needToken && !apiKey) {
+    const store = getVaultStore(defaultVault);
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, { label: "init", permission: "full" });
+    apiKey = fullToken;
   }
 
   if (addMcp) {
@@ -382,43 +421,20 @@ async function cmdInit(args: string[] = []) {
   }
 
   // 8. Summary
-  console.log("\n---");
   const port = globalConfig.port || DEFAULT_PORT;
-  if (apiKey) {
-    console.log(`\nYour API token: ${apiKey}`);
-    console.log("  Use this in Claude Desktop, curl, or any client.");
-    console.log("  Pass via: Authorization: Bearer <token>");
-    console.log("  Or via:   X-API-Key: <token>");
-    console.log("\nSave this — it will not be shown again.");
-  }
-
-  console.log(`\nConfig:   ${CONFIG_DIR}`);
-  console.log(`Server:   http://${bindHost}:${port}`);
-
-  console.log(`\nUsage examples:`);
-  console.log(`  curl http://localhost:${port}/health`);
-  if (apiKey) {
-    console.log(`  curl -H "Authorization: Bearer ${apiKey}" http://localhost:${port}/api/notes`);
-  }
-
-  const defaultVault = globalConfig.default_vault ?? "default";
   const mcpUrl = `http://127.0.0.1:${port}/vault/${defaultVault}/mcp`;
-  console.log(`\nNext steps:`);
-  if (addMcp) {
-    console.log(`  - Start a new Claude Code session — your Vault is already wired in. Try:`);
-    console.log(`      claude "Help me set up my parachute vault"`);
-    console.log(`  - Or point any other local MCP client (Codex, Goose, OpenCode, Cursor,`);
-    console.log(`    Zed, Cline, your own agent) at:`);
-    console.log(`      ${mcpUrl}`);
-  } else {
-    console.log(`  - Point any local MCP client (Codex, Goose, OpenCode, Cursor, Zed,`);
-    console.log(`    Cline, your own agent) at:`);
-    console.log(`      ${mcpUrl}`);
-    console.log(`  - Or add Claude Code back anytime:  parachute-vault mcp-install`);
-  }
-  console.log(`  - Check status:     parachute-vault status`);
-  console.log(`  - Edit config:      parachute-vault config`);
+  const lines = buildInitSummaryLines({
+    addMcp,
+    addToken,
+    apiKey,
+    configDir: CONFIG_DIR,
+    bindHost,
+    port,
+    mcpUrl,
+  });
+  for (const line of lines) console.log(line);
 }
+
 
 async function promptForOwnerPassword(purpose: string): Promise<boolean> {
   console.log(`\n${purpose}`);
@@ -2087,7 +2103,11 @@ data, and debugging.
 ── Standard use ───────────────────────────────────────────────────────
 
 Setup:
-  parachute-vault init [--mcp | --no-mcp]  Set up everything (one command, idempotent)
+  parachute-vault init [--mcp|--no-mcp] [--token|--no-token]
+                                           Set up everything (one command, idempotent).
+                                           --mcp/--no-mcp controls the Claude Code MCP entry;
+                                           --token/--no-token controls whether an API token is
+                                           printed for pasting into other MCP clients / scripts.
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,
