@@ -160,3 +160,94 @@ export function parseScopeFlags(
   }
   return { scopes: deduped, error: null };
 }
+
+/**
+ * Resolve `parachute vault tokens create` argv into a concrete scope set +
+ * legacy `permission` column value, or an actionable error.
+ *
+ * Precedence is **exclusive**: `--scope`, `--read`, and `--permission` all
+ * narrow the token, but combining them is always an error — a user who
+ * writes `--scope vault:write --read` almost certainly expects one of the
+ * two to win, and silently picking would mint the opposite of what at
+ * least one reading intended. Fail loud for anything token-minting.
+ *
+ * With no narrowing flag, falls back to a full-scope token for back-compat.
+ */
+export function resolveCreateTokenFlags(args: string[]): {
+  scopes: string[] | undefined;
+  permission: "full" | "read";
+  error: string | null;
+} {
+  const scopeResult = parseScopeFlags(args);
+  if (scopeResult.error) {
+    return { scopes: undefined, permission: "full", error: scopeResult.error };
+  }
+  const hasScopeFlag = scopeResult.scopes !== null;
+  const hasReadFlag = args.includes("--read");
+  const permIdx = args.indexOf("--permission");
+  const hasPermFlag = permIdx !== -1;
+
+  if (hasScopeFlag && hasReadFlag) {
+    return {
+      scopes: undefined,
+      permission: "full",
+      error:
+        "--scope and --read cannot be combined. Pick one:\n" +
+        "  --read                     # shorthand for --scope vault:read\n" +
+        "  --scope vault:read         # equivalent, explicit\n" +
+        "  --scope vault:write        # write scope",
+    };
+  }
+  if (hasScopeFlag && hasPermFlag) {
+    return {
+      scopes: undefined,
+      permission: "full",
+      error:
+        "--scope and --permission cannot be combined. --scope is the canonical way to narrow a token; --permission is legacy.",
+    };
+  }
+  if (hasReadFlag && hasPermFlag) {
+    return {
+      scopes: undefined,
+      permission: "full",
+      error: "--read and --permission cannot be combined. --read is a shorthand for --permission read.",
+    };
+  }
+
+  if (hasPermFlag) {
+    const rawPerm = args[permIdx + 1];
+    if (!rawPerm || rawPerm.startsWith("--")) {
+      return {
+        scopes: undefined,
+        permission: "full",
+        error: `--permission requires a value ("full" or "read"). Prefer --scope for new scripts.`,
+      };
+    }
+    if (!["full", "read"].includes(rawPerm)) {
+      return {
+        scopes: undefined,
+        permission: "full",
+        error: `Invalid --permission: ${rawPerm}. Must be "full" or "read". Prefer --scope for new scripts.`,
+      };
+    }
+  }
+
+  if (scopeResult.scopes) {
+    const scopes = scopeResult.scopes;
+    const permission: "full" | "read" =
+      scopes.includes(SCOPE_WRITE) || scopes.includes(SCOPE_ADMIN) ? "full" : "read";
+    return { scopes, permission, error: null };
+  }
+  if (hasReadFlag) {
+    return { scopes: [SCOPE_READ], permission: "read", error: null };
+  }
+  if (hasPermFlag) {
+    const rawPerm = args[permIdx + 1];
+    return {
+      scopes: undefined,
+      permission: rawPerm === "read" ? "read" : "full",
+      error: null,
+    };
+  }
+  return { scopes: undefined, permission: "full", error: null };
+}

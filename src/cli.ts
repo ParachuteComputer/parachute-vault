@@ -79,7 +79,7 @@ import {
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
-import { parseScopeFlags, SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN } from "./scopes.ts";
+import { resolveCreateTokenFlags, VAULT_SCOPES } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { upsertService, ServicesManifestError } from "./services-manifest.ts";
 import {
@@ -858,35 +858,17 @@ function cmdTokens(args: string[]) {
       process.exit(1);
     }
 
-    // Precedence: --scope (most explicit) > --read shorthand > --permission (legacy) > default full.
-    // All three narrow from full; omit every flag to get the historical default.
-    const scopeResult = parseScopeFlags(args);
-    if (scopeResult.error) {
-      console.error(scopeResult.error);
+    // Combining --scope / --read / --permission is always an error: a
+    // user minting a token expects exactly one narrowing signal, and
+    // silently picking one would mint the opposite of what the other
+    // reading intended. See resolveCreateTokenFlags.
+    const resolved = resolveCreateTokenFlags(args);
+    if (resolved.error) {
+      console.error(resolved.error);
       process.exit(1);
     }
-    const isReadShorthand = args.includes("--read");
-    const permFlag = args.indexOf("--permission");
-    const rawPerm = permFlag !== -1 ? args[permFlag + 1] : null;
-    if (rawPerm !== null && !["full", "read", "admin", "write"].includes(rawPerm)) {
-      console.error(`Invalid permission: ${rawPerm}. Must be full or read.`);
-      process.exit(1);
-    }
-
-    let scopes: string[] | undefined;
-    let permission: TokenPermission;
-    if (scopeResult.scopes) {
-      scopes = scopeResult.scopes;
-      // Map scopes → permission column for legacy readers. Any write/admin
-      // surface means the token can mutate, which is what "full" encodes.
-      permission = scopes.includes(SCOPE_WRITE) || scopes.includes(SCOPE_ADMIN) ? "full" : "read";
-    } else if (isReadShorthand) {
-      permission = "read";
-      scopes = [SCOPE_READ];
-    } else {
-      permission = rawPerm === "read" ? "read" : "full";
-      scopes = undefined; // token-store derives from permission
-    }
+    const scopes = resolved.scopes;
+    const permission: TokenPermission = resolved.permission;
 
     const expiresFlag = args.indexOf("--expires");
     let expiresAt: string | null = null;
@@ -911,7 +893,7 @@ function cmdTokens(args: string[]) {
       expires_at: expiresAt,
     });
 
-    const displayScopes = scopes ?? [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN];
+    const displayScopes = scopes ?? [...VAULT_SCOPES];
     console.log(`Created token for vault "${vaultName}":`);
     console.log(`  Token:      ${fullToken}`);
     console.log(`  Permission: ${permission}`);
