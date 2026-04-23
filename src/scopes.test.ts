@@ -10,6 +10,7 @@ import {
   SCOPE_WRITE,
   SCOPE_ADMIN,
   parseScopes,
+  parseScopeFlags,
   hasScope,
   scopeForMethod,
   legacyPermissionToScopes,
@@ -120,6 +121,77 @@ describe("legacyPermissionToScopes", () => {
     expect(legacyPermissionToScopes("full")).toEqual([SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]);
     expect(legacyPermissionToScopes("admin")).toEqual([SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]);
     expect(legacyPermissionToScopes("write")).toEqual([SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]);
+  });
+});
+
+describe("parseScopeFlags", () => {
+  test("returns null scopes when --scope is absent", () => {
+    expect(parseScopeFlags([])).toEqual({ scopes: null, error: null });
+    expect(parseScopeFlags(["--vault", "default", "--label", "x"]))
+      .toEqual({ scopes: null, error: null });
+  });
+
+  test("single --scope with one value", () => {
+    expect(parseScopeFlags(["--scope", "vault:read"]))
+      .toEqual({ scopes: [SCOPE_READ], error: null });
+  });
+
+  test("single --scope with comma-separated values", () => {
+    expect(parseScopeFlags(["--scope", "vault:read,vault:write"]))
+      .toEqual({ scopes: [SCOPE_READ, SCOPE_WRITE], error: null });
+  });
+
+  test("repeated --scope flags", () => {
+    expect(parseScopeFlags(["--scope", "vault:read", "--scope", "vault:write"]))
+      .toEqual({ scopes: [SCOPE_READ, SCOPE_WRITE], error: null });
+  });
+
+  test("dedupes while preserving first-occurrence order", () => {
+    expect(parseScopeFlags(["--scope", "vault:write,vault:read,vault:write"]))
+      .toEqual({ scopes: [SCOPE_WRITE, SCOPE_READ], error: null });
+  });
+
+  test("trims whitespace around each scope", () => {
+    expect(parseScopeFlags(["--scope", "  vault:read ,  vault:write  "]))
+      .toEqual({ scopes: [SCOPE_READ, SCOPE_WRITE], error: null });
+  });
+
+  test("rejects unknown scopes with a helpful error", () => {
+    const result = parseScopeFlags(["--scope", "vault:frob"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("Unknown scope");
+    expect(result.error).toContain("vault:frob");
+    expect(result.error).toContain("vault:read, vault:write, vault:admin");
+  });
+
+  test("rejects a mixed list with one invalid scope", () => {
+    const result = parseScopeFlags(["--scope", "vault:read,admin"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("admin");
+  });
+
+  test("rejects --scope with no value (end of argv)", () => {
+    const result = parseScopeFlags(["--scope"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("--scope requires a value");
+  });
+
+  test("rejects --scope followed by another flag", () => {
+    const result = parseScopeFlags(["--scope", "--label", "x"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("--scope requires a value");
+  });
+
+  test("rejects --scope with an empty value", () => {
+    const result = parseScopeFlags(["--scope", ""]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("empty");
+  });
+
+  test("rejects --scope with only commas", () => {
+    const result = parseScopeFlags(["--scope", ",,"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("empty");
   });
 });
 

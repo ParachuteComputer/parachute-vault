@@ -79,6 +79,7 @@ import {
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
+import { parseScopeFlags, SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { upsertService, ServicesManifestError } from "./services-manifest.ts";
 import {
@@ -844,7 +845,8 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // parachute-vault tokens create --vault <name> [--permission full|read]
+  // parachute-vault tokens create --vault <name>
+  //   [--scope vault:read,vault:write | --read | --permission full|read]
   //   [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
@@ -856,14 +858,34 @@ function cmdTokens(args: string[]) {
       process.exit(1);
     }
 
-    // --read shorthand or --permission full|read
+    // Precedence: --scope (most explicit) > --read shorthand > --permission (legacy) > default full.
+    // All three narrow from full; omit every flag to get the historical default.
+    const scopeResult = parseScopeFlags(args);
+    if (scopeResult.error) {
+      console.error(scopeResult.error);
+      process.exit(1);
+    }
     const isReadShorthand = args.includes("--read");
     const permFlag = args.indexOf("--permission");
-    const rawPerm = isReadShorthand ? "read" : (permFlag !== -1 ? args[permFlag + 1] : "full");
-    const permission: TokenPermission = rawPerm === "read" ? "read" : "full";
-    if (!["full", "read", "admin", "write"].includes(rawPerm)) {
+    const rawPerm = permFlag !== -1 ? args[permFlag + 1] : null;
+    if (rawPerm !== null && !["full", "read", "admin", "write"].includes(rawPerm)) {
       console.error(`Invalid permission: ${rawPerm}. Must be full or read.`);
       process.exit(1);
+    }
+
+    let scopes: string[] | undefined;
+    let permission: TokenPermission;
+    if (scopeResult.scopes) {
+      scopes = scopeResult.scopes;
+      // Map scopes → permission column for legacy readers. Any write/admin
+      // surface means the token can mutate, which is what "full" encodes.
+      permission = scopes.includes(SCOPE_WRITE) || scopes.includes(SCOPE_ADMIN) ? "full" : "read";
+    } else if (isReadShorthand) {
+      permission = "read";
+      scopes = [SCOPE_READ];
+    } else {
+      permission = rawPerm === "read" ? "read" : "full";
+      scopes = undefined; // token-store derives from permission
     }
 
     const expiresFlag = args.indexOf("--expires");
@@ -885,12 +907,15 @@ function cmdTokens(args: string[]) {
     createToken(store.db, fullToken, {
       label,
       permission,
+      scopes,
       expires_at: expiresAt,
     });
 
+    const displayScopes = scopes ?? [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN];
     console.log(`Created token for vault "${vaultName}":`);
     console.log(`  Token:      ${fullToken}`);
     console.log(`  Permission: ${permission}`);
+    console.log(`  Scopes:     ${displayScopes.join(" ")}`);
     if (expiresAt) console.log(`  Expires:    ${expiresAt}`);
     console.log(`  Label:      ${label}`);
     console.log();
@@ -2076,7 +2101,11 @@ Tokens:
   parachute-vault tokens                          List all tokens
   parachute-vault tokens create                   Create a full-access token in the default vault
   parachute-vault tokens create --vault <name>    Create a token in a specific vault
-  parachute-vault tokens create --read            Read-only token
+  parachute-vault tokens create --read            Read-only token (shorthand for --scope vault:read)
+  parachute-vault tokens create --scope vault:write
+                                                  Narrow the token's scopes. Accepts a comma-separated
+                                                  list or repeated --scope flags. Valid scopes:
+                                                  vault:read, vault:write, vault:admin.
   parachute-vault tokens create --label x         Set a label
   parachute-vault tokens create --expires 30d     Expiring token
   parachute-vault tokens revoke <token-id>        Revoke a token (default vault)

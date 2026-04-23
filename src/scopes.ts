@@ -103,3 +103,60 @@ export function legacyPermissionToScopes(permission: string): string[] {
 export function serializeScopes(scopes: string[]): string {
   return scopes.join(" ");
 }
+
+/**
+ * Parse `--scope` flag values from an argv list into a validated scope list.
+ *
+ * Accepts repeatable `--scope vault:read --scope vault:write` and
+ * comma-separated `--scope vault:read,vault:write` (and a mix of the two).
+ * Scopes are validated against `VAULT_SCOPES` — we refuse to mint a token
+ * with a scope the server has no way to enforce.
+ *
+ * Return shape: `{scopes}` is `null` when no `--scope` appears anywhere, so
+ * the caller can distinguish "flag not set" from "flag set to empty." On
+ * validation failure, `error` is a human-readable message suitable for
+ * `console.error` + `process.exit(1)`.
+ */
+export function parseScopeFlags(
+  args: string[],
+): { scopes: string[] | null; error: string | null } {
+  const validList = VAULT_SCOPES.join(", ");
+  const raw: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== "--scope") continue;
+    const val = args[i + 1];
+    if (val === undefined || val.startsWith("--")) {
+      return { scopes: null, error: `--scope requires a value. Valid scopes: ${validList}` };
+    }
+    raw.push(val);
+    i++;
+  }
+  if (raw.length === 0) return { scopes: null, error: null };
+
+  const expanded = raw
+    .flatMap((v) => v.split(","))
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (expanded.length === 0) {
+    return { scopes: null, error: `--scope value was empty. Valid scopes: ${validList}` };
+  }
+
+  const validSet = new Set<string>(VAULT_SCOPES);
+  const invalid = expanded.filter((s) => !validSet.has(s));
+  if (invalid.length > 0) {
+    return {
+      scopes: null,
+      error: `Unknown scope(s): ${invalid.join(", ")}. Valid scopes: ${validList}`,
+    };
+  }
+
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const s of expanded) {
+    if (!seen.has(s)) {
+      seen.add(s);
+      deduped.push(s);
+    }
+  }
+  return { scopes: deduped, error: null };
+}
