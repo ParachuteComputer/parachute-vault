@@ -325,9 +325,16 @@ async function cmdInit(args: string[] = []) {
     console.log();
   }
 
-  // 5b. Offer to set an owner password for OAuth consent, unless one is already set.
+  // 5b. Owner password is only needed for OAuth consent (browser-based
+  // clients like claude.ai / ChatGPT / Claude Desktop). Those paths are
+  // coming in the next few weeks; until then, skip the prompt. Users who
+  // want to expose the vault publicly today can set one manually via
+  // `parachute-vault set-password`.
   if (!hasOwnerPassword()) {
-    await promptForOwnerPassword("Set an owner password for OAuth consent?");
+    console.log();
+    console.log("Public exposure + web-AI connectors (claude.ai, ChatGPT, etc.) are coming soon.");
+    console.log("  When you're ready to expose this vault publicly, run:");
+    console.log("    parachute-vault set-password    # required for OAuth consent");
   }
 
   // 6. Install daemon (platform-aware). Idempotent — safe to re-run after
@@ -394,9 +401,23 @@ async function cmdInit(args: string[] = []) {
     console.log(`  curl -H "Authorization: Bearer ${apiKey}" http://localhost:${port}/api/notes`);
   }
 
+  const defaultVault = globalConfig.default_vault ?? "default";
+  const mcpUrl = `http://127.0.0.1:${port}/vault/${defaultVault}/mcp`;
   console.log(`\nNext steps:`);
-  console.log(`  parachute-vault status            check everything is running`);
-  console.log(`  parachute-vault config             view/edit configuration`);
+  if (addMcp) {
+    console.log(`  - Start a new Claude Code session — your Vault is already wired in. Try:`);
+    console.log(`      claude "Help me set up my parachute vault"`);
+    console.log(`  - Or point any other local MCP client (Codex, Goose, OpenCode, Cursor,`);
+    console.log(`    Zed, Cline, your own agent) at:`);
+    console.log(`      ${mcpUrl}`);
+  } else {
+    console.log(`  - Point any local MCP client (Codex, Goose, OpenCode, Cursor, Zed,`);
+    console.log(`    Cline, your own agent) at:`);
+    console.log(`      ${mcpUrl}`);
+    console.log(`  - Or add Claude Code back anytime:  parachute-vault mcp-install`);
+  }
+  console.log(`  - Check status:     parachute-vault status`);
+  console.log(`  - Edit config:      parachute-vault config`);
 }
 
 async function promptForOwnerPassword(purpose: string): Promise<boolean> {

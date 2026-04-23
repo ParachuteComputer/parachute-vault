@@ -2,7 +2,9 @@
 
 **Parachute Vault is a self-hosted knowledge graph that any AI can read and write, over the open [MCP](https://modelcontextprotocol.io) protocol.** Your notes, tags, links, and attachments live on your machine — in plain SQLite databases under `~/.parachute/`, not in a vendor's cloud.
 
-Works with Claude, ChatGPT, Gemini, or any future MCP-capable AI. Switch tools without losing your knowledge. No vendor lock-in, no re-import step when the next model lands. One command to install; one OAuth consent to connect each AI client.
+Today it works with **Claude Code, Codex, Goose, OpenCode, and any other local MCP client** — same endpoint, your vault. Claude Code auto-wires on install; for the rest, point them at `http://127.0.0.1:1940/vault/default/mcp`.
+
+Web AI connectors — **claude.ai**, **ChatGPT**, and **Gemini** — are coming in the next few weeks. Switch tools, keep your knowledge. No vendor lock-in, no re-import step when the next model lands.
 
 ## Quick start
 
@@ -20,7 +22,7 @@ bun install
 bun src/cli.ts vault init
 ```
 
-`vault init` creates a vault, generates an API key, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP — all in one command. Your API key is printed once at init; save it for connecting from other tools.
+`vault init` creates a vault, generates an API key, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP — all in one command. Start a new Claude Code session and your vault's tools show up. For other local MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline, your own agent), point them at `http://127.0.0.1:1940/vault/default/mcp` — the API key is printed once at init; save it for anything that isn't Claude Code.
 
 For remote access from Claude Desktop or mobile apps, see [Deployment](#deployment) below.
 
@@ -90,9 +92,9 @@ The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST,
 
 The `pvt_...` token printed at init is the one baked into `~/.claude.json`. It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Just mint a new one: `parachute-vault tokens create`. Tokens are SHA-256 hashed at rest in each vault's `vault.db`.
 
-### Owner password prompt
+### Owner password (for OAuth, coming soon)
 
-Init pauses for one interactive prompt: "Set an owner password for OAuth consent?" The password is what the consent page asks for when Claude Desktop / Parachute Daily / any browser-OAuth client connects. You can skip it and set it later with `parachute-vault set-password`; without it, the consent page falls back to pasting a vault token. See [Connecting a client → Owner password](#owner-password-needed-for-oauth).
+`vault init` doesn't prompt for an owner password — the password is only needed for OAuth consent, which is what browser-based clients (claude.ai, ChatGPT, Claude Desktop) use, and those paths are coming in the next few weeks. When you're ready to expose the vault publicly, set one with `parachute-vault set-password` (and optionally `parachute-vault 2fa enroll`). See [Connecting a client → Owner password](#owner-password-needed-for-oauth).
 
 ## Connecting a client
 
