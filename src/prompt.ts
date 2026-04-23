@@ -74,35 +74,51 @@ export async function askPassword(question: string): Promise<string> {
       }
     };
 
+    // Batch visible output per data event. On Bun 1.2.x, per-char writes
+    // can appear in bursts (keystrokes echoing late or out of order);
+    // coalescing to a single write per data event keeps the visible
+    // stream in lock-step with the captured input.
     const onData = (data: string) => {
       try {
+        let toWrite = "";
+        let done = false;
+        let aborted = false;
         for (const ch of data) {
           // Enter — done
           if (ch === "\r" || ch === "\n") {
-            process.stdout.write("\n");
-            cleanup();
-            resolve(buf);
-            return;
+            done = true;
+            break;
           }
           // Ctrl-C — abort
           if (ch === "\u0003") {
-            process.stdout.write("\n");
-            cleanup();
-            process.exit(130);
+            aborted = true;
+            break;
           }
           // Backspace / DEL
           if (ch === "\u0008" || ch === "\u007f") {
             if (buf.length > 0) {
               buf = buf.slice(0, -1);
-              process.stdout.write("\b \b");
+              toWrite += "\b \b";
             }
             continue;
           }
           // Printable
           if (ch >= " ") {
             buf += ch;
-            process.stdout.write("*");
+            toWrite += "*";
           }
+        }
+        if (toWrite) process.stdout.write(toWrite);
+        if (done) {
+          process.stdout.write("\n");
+          cleanup();
+          resolve(buf);
+          return;
+        }
+        if (aborted) {
+          process.stdout.write("\n");
+          cleanup();
+          process.exit(130);
         }
       } catch (err) {
         cleanup();
