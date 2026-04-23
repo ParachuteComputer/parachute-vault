@@ -220,10 +220,11 @@ async function cmdInit(args: string[] = []) {
   ensureConfigDirSync();
 
   // Flags: --mcp installs MCP in ~/.claude.json without prompting;
-  // --no-mcp skips it without prompting. Neither → prompt in a TTY,
-  // default-yes in a non-TTY for back-compat with existing scripts.
+  // --no-mcp skips it without prompting. If both passed, --no-mcp wins
+  // (safer default). Neither → prompt in a TTY, default-yes in a
+  // non-TTY for back-compat with existing piped install scripts.
   const flagMcpOn = args.includes("--mcp");
-  const flagMcpOff = args.includes("--no-mcp") || args.includes("--skip-mcp");
+  const flagMcpOff = args.includes("--no-mcp");
 
   const isMac = process.platform === "darwin";
   const isLinux = process.platform === "linux";
@@ -2056,7 +2057,7 @@ data, and debugging.
 ── Standard use ───────────────────────────────────────────────────────
 
 Setup:
-  parachute-vault init                     Set up everything (one command, idempotent)
+  parachute-vault init [--mcp | --no-mcp]  Set up everything (one command, idempotent)
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,
