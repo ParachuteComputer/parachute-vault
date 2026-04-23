@@ -79,6 +79,7 @@ import {
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
+import { resolveCreateTokenFlags, VAULT_SCOPES } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { upsertService, ServicesManifestError } from "./services-manifest.ts";
 import {
@@ -844,7 +845,8 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // parachute-vault tokens create --vault <name> [--permission full|read]
+  // parachute-vault tokens create --vault <name>
+  //   [--scope vault:read,vault:write | --read | --permission full|read]
   //   [--expires <duration>] [--label <label>]
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
@@ -856,15 +858,17 @@ function cmdTokens(args: string[]) {
       process.exit(1);
     }
 
-    // --read shorthand or --permission full|read
-    const isReadShorthand = args.includes("--read");
-    const permFlag = args.indexOf("--permission");
-    const rawPerm = isReadShorthand ? "read" : (permFlag !== -1 ? args[permFlag + 1] : "full");
-    const permission: TokenPermission = rawPerm === "read" ? "read" : "full";
-    if (!["full", "read", "admin", "write"].includes(rawPerm)) {
-      console.error(`Invalid permission: ${rawPerm}. Must be full or read.`);
+    // Combining --scope / --read / --permission is always an error: a
+    // user minting a token expects exactly one narrowing signal, and
+    // silently picking one would mint the opposite of what the other
+    // reading intended. See resolveCreateTokenFlags.
+    const resolved = resolveCreateTokenFlags(args);
+    if (resolved.error) {
+      console.error(resolved.error);
       process.exit(1);
     }
+    const scopes = resolved.scopes;
+    const permission: TokenPermission = resolved.permission;
 
     const expiresFlag = args.indexOf("--expires");
     let expiresAt: string | null = null;
@@ -885,12 +889,15 @@ function cmdTokens(args: string[]) {
     createToken(store.db, fullToken, {
       label,
       permission,
+      scopes,
       expires_at: expiresAt,
     });
 
+    const displayScopes = scopes ?? [...VAULT_SCOPES];
     console.log(`Created token for vault "${vaultName}":`);
     console.log(`  Token:      ${fullToken}`);
     console.log(`  Permission: ${permission}`);
+    console.log(`  Scopes:     ${displayScopes.join(" ")}`);
     if (expiresAt) console.log(`  Expires:    ${expiresAt}`);
     console.log(`  Label:      ${label}`);
     console.log();
@@ -2076,7 +2083,11 @@ Tokens:
   parachute-vault tokens                          List all tokens
   parachute-vault tokens create                   Create a full-access token in the default vault
   parachute-vault tokens create --vault <name>    Create a token in a specific vault
-  parachute-vault tokens create --read            Read-only token
+  parachute-vault tokens create --read            Read-only token (shorthand for --scope vault:read)
+  parachute-vault tokens create --scope vault:write
+                                                  Narrow the token's scopes. Accepts a comma-separated
+                                                  list or repeated --scope flags. Valid scopes:
+                                                  vault:read, vault:write, vault:admin.
   parachute-vault tokens create --label x         Set a label
   parachute-vault tokens create --expires 30d     Expiring token
   parachute-vault tokens revoke <token-id>        Revoke a token (default vault)

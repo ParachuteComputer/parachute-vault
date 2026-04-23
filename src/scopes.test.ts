@@ -10,6 +10,8 @@ import {
   SCOPE_WRITE,
   SCOPE_ADMIN,
   parseScopes,
+  parseScopeFlags,
+  resolveCreateTokenFlags,
   hasScope,
   scopeForMethod,
   legacyPermissionToScopes,
@@ -120,6 +122,162 @@ describe("legacyPermissionToScopes", () => {
     expect(legacyPermissionToScopes("full")).toEqual([SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]);
     expect(legacyPermissionToScopes("admin")).toEqual([SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]);
     expect(legacyPermissionToScopes("write")).toEqual([SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]);
+  });
+});
+
+describe("parseScopeFlags", () => {
+  test("returns null scopes when --scope is absent", () => {
+    expect(parseScopeFlags([])).toEqual({ scopes: null, error: null });
+    expect(parseScopeFlags(["--vault", "default", "--label", "x"]))
+      .toEqual({ scopes: null, error: null });
+  });
+
+  test("single --scope with one value", () => {
+    expect(parseScopeFlags(["--scope", "vault:read"]))
+      .toEqual({ scopes: [SCOPE_READ], error: null });
+  });
+
+  test("single --scope with comma-separated values", () => {
+    expect(parseScopeFlags(["--scope", "vault:read,vault:write"]))
+      .toEqual({ scopes: [SCOPE_READ, SCOPE_WRITE], error: null });
+  });
+
+  test("repeated --scope flags", () => {
+    expect(parseScopeFlags(["--scope", "vault:read", "--scope", "vault:write"]))
+      .toEqual({ scopes: [SCOPE_READ, SCOPE_WRITE], error: null });
+  });
+
+  test("dedupes while preserving first-occurrence order", () => {
+    expect(parseScopeFlags(["--scope", "vault:write,vault:read,vault:write"]))
+      .toEqual({ scopes: [SCOPE_WRITE, SCOPE_READ], error: null });
+  });
+
+  test("trims whitespace around each scope", () => {
+    expect(parseScopeFlags(["--scope", "  vault:read ,  vault:write  "]))
+      .toEqual({ scopes: [SCOPE_READ, SCOPE_WRITE], error: null });
+  });
+
+  test("rejects unknown scopes with a helpful error", () => {
+    const result = parseScopeFlags(["--scope", "vault:frob"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("Unknown scope");
+    expect(result.error).toContain("vault:frob");
+    expect(result.error).toContain("vault:read, vault:write, vault:admin");
+  });
+
+  test("rejects a mixed list with one invalid scope", () => {
+    const result = parseScopeFlags(["--scope", "vault:read,admin"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("admin");
+  });
+
+  test("rejects --scope with no value (end of argv)", () => {
+    const result = parseScopeFlags(["--scope"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("--scope requires a value");
+  });
+
+  test("rejects --scope followed by another flag", () => {
+    const result = parseScopeFlags(["--scope", "--label", "x"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("--scope requires a value");
+  });
+
+  test("rejects --scope with an empty value", () => {
+    const result = parseScopeFlags(["--scope", ""]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("empty");
+  });
+
+  test("rejects --scope with only commas", () => {
+    const result = parseScopeFlags(["--scope", ",,"]);
+    expect(result.scopes).toBeNull();
+    expect(result.error).toContain("empty");
+  });
+});
+
+describe("resolveCreateTokenFlags", () => {
+  test("no flags → full scope, full permission (historical default)", () => {
+    expect(resolveCreateTokenFlags([]))
+      .toEqual({ scopes: undefined, permission: "full", error: null });
+  });
+
+  test("--read alone → [vault:read], read permission", () => {
+    expect(resolveCreateTokenFlags(["--read"]))
+      .toEqual({ scopes: [SCOPE_READ], permission: "read", error: null });
+  });
+
+  test("--scope vault:read alone → read permission", () => {
+    expect(resolveCreateTokenFlags(["--scope", "vault:read"]))
+      .toEqual({ scopes: [SCOPE_READ], permission: "read", error: null });
+  });
+
+  test("--scope vault:write,vault:read → full permission (any write surface → full)", () => {
+    expect(resolveCreateTokenFlags(["--scope", "vault:write,vault:read"]))
+      .toEqual({ scopes: [SCOPE_WRITE, SCOPE_READ], permission: "full", error: null });
+  });
+
+  test("--scope vault:admin alone → full permission", () => {
+    expect(resolveCreateTokenFlags(["--scope", "vault:admin"]))
+      .toEqual({ scopes: [SCOPE_ADMIN], permission: "full", error: null });
+  });
+
+  test("--permission read → no scopes (token-store default), read permission", () => {
+    expect(resolveCreateTokenFlags(["--permission", "read"]))
+      .toEqual({ scopes: undefined, permission: "read", error: null });
+  });
+
+  test("--permission full → no scopes, full permission", () => {
+    expect(resolveCreateTokenFlags(["--permission", "full"]))
+      .toEqual({ scopes: undefined, permission: "full", error: null });
+  });
+
+  test("--scope + --read errors and mentions both flags", () => {
+    const result = resolveCreateTokenFlags(["--scope", "vault:write", "--read"]);
+    expect(result.scopes).toBeUndefined();
+    expect(result.error).toContain("--scope");
+    expect(result.error).toContain("--read");
+    expect(result.error).toContain("cannot be combined");
+  });
+
+  test("--scope + --permission errors", () => {
+    const result = resolveCreateTokenFlags(["--scope", "vault:read", "--permission", "full"]);
+    expect(result.scopes).toBeUndefined();
+    expect(result.error).toContain("--scope");
+    expect(result.error).toContain("--permission");
+    expect(result.error).toContain("cannot be combined");
+  });
+
+  test("--read + --permission errors", () => {
+    const result = resolveCreateTokenFlags(["--read", "--permission", "full"]);
+    expect(result.scopes).toBeUndefined();
+    expect(result.error).toContain("--read");
+    expect(result.error).toContain("--permission");
+    expect(result.error).toContain("cannot be combined");
+  });
+
+  test("invalid --permission value errors with prefer-scope hint", () => {
+    const result = resolveCreateTokenFlags(["--permission", "admin"]);
+    expect(result.scopes).toBeUndefined();
+    expect(result.error).toContain("admin");
+    expect(result.error).toContain("full");
+    expect(result.error).toContain("read");
+    expect(result.error).toContain("--scope");
+  });
+
+  test("--permission with no value errors", () => {
+    expect(resolveCreateTokenFlags(["--permission"]).error).toContain("requires a value");
+    expect(resolveCreateTokenFlags(["--permission", "--label", "x"]).error).toContain("requires a value");
+  });
+
+  test("surfaces parseScopeFlags errors unchanged", () => {
+    const result = resolveCreateTokenFlags(["--scope", "vault:frob"]);
+    expect(result.error).toContain("Unknown scope");
+  });
+
+  test("ignores unrelated flags", () => {
+    const result = resolveCreateTokenFlags(["--vault", "journal", "--label", "r", "--read"]);
+    expect(result).toEqual({ scopes: [SCOPE_READ], permission: "read", error: null });
   });
 });
 

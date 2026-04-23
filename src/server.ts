@@ -24,6 +24,7 @@ import { route } from "./routing.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { assetsDir } from "./routes.ts";
 import { resolveScribeAuthToken } from "./scribe-env.ts";
+import { resolveBindHostname } from "./bind.ts";
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -169,10 +170,11 @@ for (const vaultName of listVaults()) {
 
 const globalConfig = readGlobalConfig();
 const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PORT;
+const hostname = resolveBindHostname();
 
 const server = Bun.serve({
   port,
-  hostname: "0.0.0.0",
+  hostname,
   idleTimeout: 120, // seconds — webhook triggers can take a while
   async fetch(req, server) {
     const url = new URL(req.url);
@@ -218,7 +220,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`Parachute Vault server listening on http://0.0.0.0:${server.port}`);
+console.log(`Parachute Vault server listening on http://${hostname}:${server.port}`);
 
 // Graceful shutdown — best-effort drain of in-flight note-mutation hooks.
 async function shutdown(signal: string): Promise<void> {

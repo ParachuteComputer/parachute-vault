@@ -98,18 +98,25 @@ today (per-vault narrowing is a future phase).
 **CLI:**
 
 ```
-parachute vault tokens create                  # full-access token, default vault
-parachute vault tokens create --read           # vault:read only
-parachute vault tokens create --vault <name>   # target a specific vault
-parachute vault tokens create --label <label>  # label for the `tokens list` output
-parachute vault tokens create --expires 30d    # optional TTL (h/d/w/m/y)
-parachute vault tokens list                    # list across all vaults (shows t_<prefix> IDs, never the plaintext)
-parachute vault tokens revoke <t_…>            # delete by display ID or full hash
+parachute vault tokens create                         # full-access token, default vault
+parachute vault tokens create --read                  # vault:read only (shorthand for --scope vault:read)
+parachute vault tokens create --scope vault:write     # narrow to a specific scope
+parachute vault tokens create --scope vault:read,vault:write
+                                                      # comma-separated or repeated --scope
+parachute vault tokens create --vault <name>          # target a specific vault
+parachute vault tokens create --label <label>         # label for the `tokens list` output
+parachute vault tokens create --expires 30d           # optional TTL (h/d/w/m/y)
+parachute vault tokens list                           # list across all vaults (shows t_<prefix> IDs, never the plaintext)
+parachute vault tokens revoke <t_…>                   # delete by display ID or full hash
 ```
 
-A CLI-created token without `--read` gets the full scope set
-(`vault:read vault:write vault:admin`). There is no finer-grained
-`--scope` flag today.
+With no narrowing flag, a CLI-created token gets the full scope set
+(`vault:read vault:write vault:admin`) — unchanged for back-compat.
+`--scope` accepts any combination of `vault:read`, `vault:write`, and
+`vault:admin`; unrecognized scopes are rejected up front so a token is
+never minted with a scope the server can't enforce. `--scope` and
+`--read` cannot be combined (that ambiguity fails loudly rather than
+silently picking one).
 
 ### Legacy: YAML `api_keys` and `X-API-Key`
 
@@ -223,72 +230,77 @@ Then, in the client:
 ### Path B: "I want a script or agent to use this"
 
 ```
-parachute vault tokens create                   # full-access token in default vault
-parachute vault tokens create --read            # read-only
-parachute vault tokens create --vault <name>    # specific vault
-parachute vault tokens create --expires 30d     # with TTL
+parachute vault tokens create                            # full-access token in default vault
+parachute vault tokens create --read                     # read-only (shorthand for --scope vault:read)
+parachute vault tokens create --scope vault:write        # write-only token
+parachute vault tokens create --scope vault:read,vault:admin
+                                                         # combine scopes with a comma
+parachute vault tokens create --vault <name>             # specific vault
+parachute vault tokens create --expires 30d              # with TTL
 ```
 
 The command prints the plaintext `pvt_…` once. Put it in the client's
 `Authorization: Bearer <token>` header (or `X-API-Key`, or `?key=`).
 Revoke with `parachute vault tokens revoke <t_…>`.
 
-There is no `--scope vault:write` flag today — the choice is
-`--read` (→ `vault:read`) or default (→ `vault:read vault:write vault:admin`).
-Finer scoping is a future addition.
+The default (no narrowing flag) still mints a full-scope token. Pick a
+`--scope` to reduce blast radius; combining `--scope` with `--read` is
+an error (see §1 "API tokens").
 
 ## 4. Default exposure posture
 
-The Bun server is started with `hostname: "0.0.0.0"`
-(`src/server.ts`) — it accepts connections on every interface the host
-exposes. In practice on a laptop that means:
+The Bun server binds **`127.0.0.1`** by default (`src/server.ts`,
+resolved via `src/bind.ts`). The socket itself only accepts connections
+arriving on the loopback interface — LAN and public interfaces are not
+reachable unless the operator opts in. The startup log echoes the
+resolved hostname (`Parachute Vault server listening on
+http://127.0.0.1:1940`) so the bind is always visible.
 
-- **Loopback (`127.0.0.1:1940`)** always reachable — this is what the
-  CLI, MCP clients, and local scripts hit.
-- **LAN interfaces** — reachable from the local network unless the OS
-  firewall blocks inbound on port 1940. macOS prompts the first time an
-  unsigned binary accepts incoming connections; Linux is open by default.
-- **Public interfaces** — reachable from the internet if the host has a
-  public IP and nothing filters it.
+**Overriding the default**: set `VAULT_BIND` to bind a different
+interface. The two common reasons to override:
 
-The CLI copy ("Listening on http://0.0.0.0:1940") reflects this; it is
-not hardened to loopback at the socket level.
+- `VAULT_BIND=0.0.0.0` — accept traffic from every interface. Required
+  for **Docker bridge networking** (the container's virtual interface
+  isn't loopback from the server's perspective) and for intentional
+  **LAN setups** where another machine on the local network needs to
+  reach vault directly.
+- `VAULT_BIND=10.0.0.5` (or similar) — bind one specific interface IP
+  on a multi-homed host.
 
-**The auth model does not change when you run `parachute expose
-tailnet` or `parachute expose public`** (Tailscale, Cloudflare Tunnel,
-etc.). Those commands don't rewrite auth rules — they just change *which
-networks can attempt to reach* an already auth-gated server. Everything
-in §2 still applies: the bearer gate, the scope gate, the OAuth flow,
-the public-by-design endpoints. When you expose, the
-public-by-design endpoints (`/health`, `/vaults/list`,
+Empty or whitespace-only `VAULT_BIND` is treated as unset.
+
+**Supported remote-access paths are unaffected by the loopback
+default.** `parachute expose tailnet` (Tailscale Serve) and `parachute
+expose public` (Cloudflare Tunnel) both proxy *from* loopback — they
+connect to `127.0.0.1:1940` on the local host and forward the decrypted
+traffic in. Neither needs `VAULT_BIND` set. The auth model does not
+change when you expose: those commands don't rewrite auth rules, they
+just change *which networks can attempt to reach* an already
+auth-gated server. Everything in §2 still applies — the bearer gate,
+the scope gate, the OAuth flow, the public-by-design endpoints. When
+you expose, the public-by-design endpoints (`/health`, `/vaults/list`,
 `/.well-known/*`, OAuth discovery, `/.parachute/info`,
-`/.parachute/icon.svg`, `/.parachute/config/schema`,
-published notes at `/view/…`) become reachable from wherever you
-exposed to. Treat that as part of the threat model, not as a bug.
-
-If a deployment truly needs loopback-only, bind the daemon to
-`127.0.0.1` at the process manager level (a reverse proxy, a
-`127.0.0.1`-bound socket on a host that doesn't run Bun with
-`hostname`), or run behind a firewall.
+`/.parachute/icon.svg`, `/.parachute/config/schema`, published notes
+at `/view/…`) become reachable from wherever you exposed to. Treat
+that as part of the threat model, not as a bug.
 
 ## 5. Known rough edges
 
 Honest list. Things a user might trip over, or that the launch copy
 should be careful about.
 
-- **Server binds `0.0.0.0`, not `127.0.0.1`.** See §4. The
-  auth gate protects the data regardless, but don't describe vault as
-  "loopback-only" in marketing copy — it isn't at the socket level.
 - **OAuth does not strictly require an owner password.** If none is set,
   the consent page falls back to asking for a `pvt_…` vault token as
   proof of ownership. This works, but means the "launch flow" is still
   operable without ever running `set-password`. Recommended: require the
   password in docs, even though the server doesn't enforce it.
-- **CLI-created tokens default to full scope.** `parachute vault tokens
-  create` with no flags produces a token with
-  `vault:read vault:write vault:admin`. There is no middle ground today
-  (`--read` is the only narrowing flag). A user who wants a write-only
-  script token has to accept admin-level access.
+- **CLI-created tokens still default to full scope.** `parachute vault
+  tokens create` with no flags produces a token with
+  `vault:read vault:write vault:admin`, unchanged for back-compat.
+  Narrowing is now available via `--scope vault:read`, `--scope
+  vault:read,vault:write`, etc. (see §1 "API tokens") — the scriptwriter
+  who only wants write can now mint exactly that. The *default* is still
+  a footgun for users who don't know to narrow it.
 - **Tokens are per-vault, not vault-wide.** A token lives in one vault's
   SQLite DB. Exception: when presented to the unified `/mcp` endpoint
   (no vault in the URL), auth scans every vault's token table, so an
