@@ -135,7 +135,7 @@ if (!SKIP_MIGRATION.has(command)) {
 
 switch (command) {
   case "init":
-    await cmdInit();
+    await cmdInit(cmdArgs);
     break;
   case "create":
     cmdCreate(cmdArgs);
@@ -216,8 +216,14 @@ switch (command) {
 // Command implementations
 // ---------------------------------------------------------------------------
 
-async function cmdInit() {
+async function cmdInit(args: string[] = []) {
   ensureConfigDirSync();
+
+  // Flags: --mcp installs MCP in ~/.claude.json without prompting;
+  // --no-mcp skips it without prompting. Neither → prompt in a TTY,
+  // default-yes in a non-TTY for back-compat with existing scripts.
+  const flagMcpOn = args.includes("--mcp");
+  const flagMcpOff = args.includes("--no-mcp") || args.includes("--skip-mcp");
 
   const isMac = process.platform === "darwin";
   const isLinux = process.platform === "linux";
@@ -341,9 +347,28 @@ async function cmdInit() {
   }
   console.log(`  Listening on http://0.0.0.0:${globalConfig.port || DEFAULT_PORT}`);
 
-  // 7. Install MCP for Claude Code (with token for auth)
-  installMcpConfig(apiKey);
-  console.log(`  MCP server added to ~/.claude.json`);
+  // 7. Install MCP for Claude Code (with token for auth) — user confirms
+  // unless --mcp / --no-mcp explicitly passed. Writing to ~/.claude.json
+  // is a side effect some users don't want; default-yes in a TTY since
+  // most users installing vault want Claude Code to see it, but ask.
+  let addMcp: boolean;
+  if (flagMcpOff) {
+    addMcp = false;
+  } else if (flagMcpOn) {
+    addMcp = true;
+  } else if (process.stdin.isTTY) {
+    addMcp = await confirm("Add Vault MCP to Claude Code (~/.claude.json)?", true);
+  } else {
+    addMcp = true; // non-interactive: preserve the installable-via-pipe default
+  }
+
+  if (addMcp) {
+    installMcpConfig(apiKey);
+    console.log(`  MCP server added to ~/.claude.json`);
+  } else {
+    console.log("  Skipped adding MCP to ~/.claude.json.");
+    console.log("  Run `parachute-vault mcp-install` later if you want it.");
+  }
 
   // 8. Summary
   console.log("\n---");
