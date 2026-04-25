@@ -82,6 +82,7 @@ import { resolveBindHostname } from "./bind.ts";
 import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import { resolveCreateTokenFlags, VAULT_SCOPES } from "./scopes.ts";
+import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { upsertService, ServicesManifestError } from "./services-manifest.ts";
 import {
@@ -230,10 +231,25 @@ async function cmdInit(args: string[] = []) {
   // --token / --no-token follow the same pattern for whether the API
   // token is surfaced to the user at the end of init (for pasting into
   // other MCP clients, scripts, or curl).
+  //
+  // --vault-name <name> skips the name prompt for non-interactive installs
+  // (validated up front; exits non-zero on invalid input).
   const flagMcpOn = args.includes("--mcp");
   const flagMcpOff = args.includes("--no-mcp");
   const flagTokenOn = args.includes("--token");
   const flagTokenOff = args.includes("--no-token");
+
+  const nameDecision = decideInitVaultName(args, {
+    isTTY: !!process.stdin.isTTY,
+  });
+  if (nameDecision.kind === "error") {
+    console.error(nameDecision.message);
+    process.exit(1);
+  }
+  // Whether the user explicitly supplied --vault-name. We use this both to
+  // pick the chosen name on first init AND to print a friendly notice if
+  // they pass --vault-name on a re-run where vaults already exist.
+  const vaultNameFlagSupplied = args.indexOf("--vault-name") !== -1;
 
   const isMac = process.platform === "darwin";
   const isLinux = process.platform === "linux";
@@ -241,14 +257,23 @@ async function cmdInit(args: string[] = []) {
 
   console.log("Parachute Vault — self-hosted knowledge graph\n");
 
-  // 1. Create default vault if none exist
+  // 1. Create the vault if none exist. The name is decided here — flag wins,
+  // else prompt in a TTY (default "default"), else fall back to "default" so
+  // piped installs keep working unchanged.
   const vaults = listVaults();
   let apiKey: string | undefined;
   if (vaults.length === 0) {
-    console.log("Creating default vault...");
-    apiKey = createVault("default");
-    console.log("  Created vault: default");
+    const chosenName =
+      nameDecision.kind === "name" ? nameDecision.name : await promptVaultName();
+    console.log(`Creating vault "${chosenName}"...`);
+    apiKey = createVault(chosenName);
+    console.log(`  Created vault: ${chosenName}`);
   } else {
+    if (vaultNameFlagSupplied) {
+      console.log(
+        `  --vault-name ignored: ${vaults.length} vault(s) already exist. Use \`parachute-vault create\` to add another.`,
+      );
+    }
     console.log(`Found ${vaults.length} existing vault(s)`);
   }
 
@@ -433,6 +458,16 @@ async function cmdInit(args: string[] = []) {
     mcpUrl,
   });
   for (const line of lines) console.log(line);
+}
+
+
+async function promptVaultName(): Promise<string> {
+  while (true) {
+    const answer = await ask("What would you like to call this vault?", "default");
+    const v = validateVaultName(answer);
+    if (v.ok) return v.name;
+    console.log(`  ${v.error}`);
+  }
 }
 
 
@@ -2103,11 +2138,14 @@ data, and debugging.
 ── Standard use ───────────────────────────────────────────────────────
 
 Setup:
-  parachute-vault init [--mcp|--no-mcp] [--token|--no-token]
+  parachute-vault init [--mcp|--no-mcp] [--token|--no-token] [--vault-name <name>]
                                            Set up everything (one command, idempotent).
                                            --mcp/--no-mcp controls the Claude Code MCP entry;
                                            --token/--no-token controls whether an API token is
                                            printed for pasting into other MCP clients / scripts.
+                                           --vault-name skips the prompt and names the vault
+                                           (lowercase alphanumeric, hyphens, underscores;
+                                           omit to be prompted interactively, default "default").
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,
