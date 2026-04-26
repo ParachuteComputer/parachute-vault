@@ -6,6 +6,14 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-04-26
+
+The rename-aware release. The upstream hub repo was renamed `parachute-cli` → `parachute-hub` and its npm package `@openparachute/cli` → `@openparachute/hub` on 2026-04-26; this release refreshes vault's docs and inline comments to match. No functional changes — `parachute-vault` binary, schemas, source code, and on-disk layout are unchanged. Promoted directly to `@latest` so new installs land on docs that match the current ecosystem naming.
+
+### Changed
+
+- **Stale `@openparachute/cli` / `parachute-cli` references updated to `@openparachute/hub` / `parachute-hub`** in `src/cli.ts` (one source comment, two usage-help blocks) and the `[Unreleased]` CHANGELOG entries that named the forthcoming dispatcher by its old name. Bin name (`parachute-vault`), the `parachute vault <cmd>` alias, and every code path are unchanged.
+
 ### Added
 
 - **Vault is now the scribe context provider: triggers + worker can enrich transcription POSTs with vault notes.** Two surfaces, one shape. (1) Every trigger's `action` gains an `include_context` list — `[{tag, exclude_tag?, include_metadata?}]` — whose predicates pre-fetch matching notes at fire time. `send: "attachment"` attaches them as a multipart `context` JSON part (`{entries: [{name, ...metadata}]}`); `send: "json"` inlines the same payload under a top-level `context` field. `send: "content"` (TTS-out) ignores context. (2) The dedicated transcription worker gains the same surface via a per-vault `transcription.context` section in `vault.yaml`; the worker attaches the resulting `context` multipart part to each scribe POST. In both paths the `name` is the note path's basename (stem) and only whitelisted `include_metadata` keys are surfaced — unrelated metadata (including secrets a vault might carry) never leaks. Fetch failures are isolated per-predicate and logged, so a single bad tag can't block a whole fire or tick. Existing configs without `include_context` / `transcription.context` see no behavior change. (Scribe will drop its own vault client in a follow-up — vault is now the single reader.)
