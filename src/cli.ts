@@ -304,16 +304,16 @@ async function cmdInit(args: string[] = []) {
   }
   writeGlobalConfig(globalConfig);
 
-  // 2a. Register in the shared services manifest so the @openparachute/cli
+  // 2a. Register in the shared services manifest so the @openparachute/hub
   // dispatcher can discover this service and its health endpoint. Upserts
   // by name, preserving entries for other services. Non-fatal on failure —
   // init can complete without the manifest, just with a warning.
   //
-  // `paths[0]` is the canonical mount point — CLI uses it for the
+  // `paths[0]` is the canonical mount point — the hub uses it for the
   // `.well-known/parachute.json` URL and for `parachute expose`. Advertise
   // `/vault/<default_vault>` so MCP clients land at the scoped endpoint.
   // When no default vault exists yet (multi-vault, no fallback), fall back
-  // to "/" — the CLI can detect and prompt.
+  // to "/" — the hub can detect and prompt.
   const servicePath = globalConfig.default_vault
     ? `/vault/${globalConfig.default_vault}`
     : "/";
@@ -2130,7 +2130,7 @@ function usage() {
   console.log(`
 Parachute Vault — self-hosted knowledge graph
 
-If you installed via the Parachute CLI, prefer the wrapper commands for
+If you installed via the Parachute Hub, prefer the wrapper commands for
 lifecycle — \`parachute start vault\`, \`parachute stop vault\`,
 \`parachute status\` — and use the vault-direct commands below for setup,
 data, and debugging.
@@ -2198,9 +2198,9 @@ Import/Export:
 
 ── Advanced / standalone ──────────────────────────────────────────────
 
-Direct daemon controls. For normal use, prefer the Parachute CLI wrappers
+Direct daemon controls. For normal use, prefer the Parachute Hub wrappers
 — they add PID tracking, log rotation, and cross-service \`parachute status\`
-visibility. Use these when running vault without the CLI or when debugging.
+visibility. Use these when running vault without the hub or when debugging.
 
   parachute-vault serve                    Run server in the foreground (no PID tracking).
                                            Prefer \`parachute start vault\` for managed lifecycle.
