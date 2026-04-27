@@ -22,6 +22,7 @@ import type { TokenPermission } from "./token-store.ts";
 import type { Database } from "bun:sqlite";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScope, legacyPermissionToScopes, SCOPE_ADMIN, SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
+import { HubJwtError, looksLikeJwt, validateHubJwt } from "./hub-jwt.ts";
 
 /** Result of a successful auth check. */
 export interface AuthResult {
@@ -128,16 +129,32 @@ function validateKey(keys: StoredKey[], providedKey: string): StoredKey | null {
 
 /**
  * Authenticate for a specific vault.
- * Checks the vault's token DB first, then falls back to legacy YAML keys.
+ *
+ * Token shape decides the path:
+ *   - JWT-shaped (`eyJ…`) → validate against the hub's JWKS. JWT-shaped tokens
+ *     commit to JWT validation; we don't fall through to `pvt_*` lookup on
+ *     failure, since a malformed JWT was never going to be a valid local
+ *     token anyway.
+ *   - Anything else → try the vault's token DB, then legacy YAML keys.
+ *
+ * Dual-validate window: both paths are live during this release cycle so
+ * existing `pvt_*` callers continue to work. A follow-up issue retires the
+ * legacy path.
  */
-export function authenticateVaultRequest(
+export async function authenticateVaultRequest(
   req: Request,
   vaultConfig: VaultConfig,
   vaultDb?: Database,
-): { error: Response } | AuthResult {
+): Promise<{ error: Response } | AuthResult> {
   const key = extractApiKey(req);
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
+  }
+
+  // JWT path: hub-issued tokens. Trust pinned to the hub origin via `iss`
+  // verification inside validateHubJwt; signature checked against hub's JWKS.
+  if (looksLikeJwt(key)) {
+    return await authenticateHubJwt(key);
   }
 
   // Try vault's token DB first
@@ -182,17 +199,47 @@ export function authenticateVaultRequest(
 }
 
 /**
+ * Validate a JWT-shaped bearer and convert the result into an `AuthResult`.
+ * The token's scope claim becomes the granted scopes; permission is derived
+ * for back-compat with code paths that still branch on `permission` (MCP
+ * tool gating, view auth). `legacyDerived` is `false` — JWT-issued scopes
+ * are explicit, never inferred.
+ */
+async function authenticateHubJwt(token: string): Promise<{ error: Response } | AuthResult> {
+  try {
+    const claims = await validateHubJwt(token);
+    const permission: TokenPermission =
+      hasScope(claims.scopes, SCOPE_WRITE) || hasScope(claims.scopes, SCOPE_ADMIN)
+        ? "full"
+        : "read";
+    return { permission, scopes: claims.scopes, legacyDerived: false };
+  } catch (err) {
+    if (err instanceof HubJwtError) {
+      return { error: Response.json({ error: "Unauthorized", message: err.message }, { status: 401 }) };
+    }
+    // Unknown failure shape — surface the message but stay 401.
+    const msg = err instanceof Error ? err.message : "JWT validation failed";
+    return { error: Response.json({ error: "Unauthorized", message: msg }, { status: 401 }) };
+  }
+}
+
+/**
  * Authenticate for the unified /mcp endpoint.
  * Checks legacy global config.yaml keys first, then falls back to checking
  * each vault's token DB. This allows OAuth-minted pvt_ tokens to work on
  * the unified endpoint.
  */
-export function authenticateGlobalRequest(
+export async function authenticateGlobalRequest(
   req: Request,
-): { error: Response } | AuthResult {
+): Promise<{ error: Response } | AuthResult> {
   const key = extractApiKey(req);
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
+  }
+
+  // JWT path: hub-issued tokens validate without a per-vault DB lookup.
+  if (looksLikeJwt(key)) {
+    return await authenticateHubJwt(key);
   }
 
   // Legacy: check global keys from config.yaml

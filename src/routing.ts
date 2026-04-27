@@ -100,15 +100,15 @@ async function withMcpChallenge(
  * Returns true if authenticated, false if not. Never rejects — unauthenticated
  * requests still get public notes.
  */
-function isViewAuthenticated(
+async function isViewAuthenticated(
   req: Request,
   vaultConfig: VaultConfig | null,
   vaultDb?: import("bun:sqlite").Database,
-): boolean {
+): Promise<boolean> {
   if (!vaultConfig) return false;
   const key = extractApiKey(req);
   if (!key) return false;
-  const auth = authenticateVaultRequest(req, vaultConfig, vaultDb);
+  const auth = await authenticateVaultRequest(req, vaultConfig, vaultDb);
   return !("error" in auth);
 }
 
@@ -210,7 +210,7 @@ export async function route(
   // ---------------------------------------------------------------------
 
   if (path === "/health") {
-    const auth = authenticateGlobalRequest(req);
+    const auth = await authenticateGlobalRequest(req);
     if ("error" in auth) {
       return Response.json({ status: "ok" });
     }
@@ -231,7 +231,7 @@ export async function route(
 
   // Authenticated vault metadata list.
   if (path === "/vaults" && req.method === "GET") {
-    const auth = authenticateGlobalRequest(req);
+    const auth = await authenticateGlobalRequest(req);
     if ("error" in auth) return auth.error;
     const names = listVaults();
     const vaults = names.map((name) => {
@@ -277,7 +277,7 @@ export async function route(
   const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
-    const authenticated = isViewAuthenticated(req, vaultConfig, store.db);
+    const authenticated = await isViewAuthenticated(req, vaultConfig, store.db);
     return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
@@ -350,7 +350,7 @@ export async function route(
     // (worker intervals, TTLs, retention policy) but are still configuration
     // an attacker could use to map the deployment. `vault:admin` keeps the
     // hub's loopback workflow intact while locking out read-only tokens.
-    const configAuth = authenticateVaultRequest(req, vaultConfig, getVaultStore(vaultName).db);
+    const configAuth = await authenticateVaultRequest(req, vaultConfig, getVaultStore(vaultName).db);
     if ("error" in configAuth) return configAuth.error;
     if (!requireScope(configAuth, SCOPE_ADMIN)) {
       return Response.json(
@@ -385,7 +385,7 @@ export async function route(
   // ---------------------------------------------------------------------
 
   const store = getVaultStore(vaultName);
-  const auth = authenticateVaultRequest(req, vaultConfig, store.db);
+  const auth = await authenticateVaultRequest(req, vaultConfig, store.db);
   const isScopedMcp = subpath === "/mcp" || subpath.startsWith("/mcp/");
   if ("error" in auth) {
     return isScopedMcp ? withMcpChallenge(auth.error, req, vaultName) : auth.error;
