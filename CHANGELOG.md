@@ -6,7 +6,15 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
-## [0.3.5] — 2026-04-26
+## [0.3.6-rc.1] — 2026-04-26
+
+Vault becomes a pure OAuth resource server: hub-issued JWTs are now accepted alongside legacy `pvt_*` opaque tokens. RC track — promotion to `@latest` follows validation against a real hub.
+
+### Added
+
+- **Hub-issued JWT validation alongside `pvt_*` tokens.** Vault now dual-validates bearer tokens. Tokens whose first three characters are `eyJ` (the base64url encoding of a JWT header's `{"`) route through the new `src/hub-jwt.ts` validator: `jose.createRemoteJWKSet` fetches the hub's `/.well-known/jwks.json` (cached 5min, with a 30s cooldown between failed fetches), `jwtVerify` checks the RS256 signature and claims, and the `iss` claim MUST equal the configured hub origin — the load-bearing trust check that prevents anyone from minting a token against any RSA key. The hub origin comes from `PARACHUTE_HUB_ORIGIN` (set by the hub's `expose` / `start` flow when vault runs behind it) with a `http://127.0.0.1:1939` loopback fallback for dev. The JWT's `scope` claim becomes the granted scopes; `permission` is derived for back-compat with code paths that still branch on `permission` (MCP tool gating, view auth). Audience is parsed but accepted broadly today — the hub issues `aud="operator"` for operator tokens and `aud=<client_id>` for user OAuth tokens, both legitimate vault callers; tightening to a strict allow-list is reserved for the post-cli#59 scope-guard work. Existing `pvt_*` callers (CLI-created tokens, OAuth-minted access tokens, legacy YAML keys) continue to work unchanged — JWT-shaped tokens commit to JWT validation (no fallthrough to `pvt_*` lookup on failure, since a malformed JWT was never going to be a valid local token), and non-JWT tokens follow the existing per-vault DB → vault.yaml → config.yaml resolution chain. `legacyDerived` is `false` for JWT-issued scopes — they're explicit, never inferred. Companion to the hub's Phase B JWKS plumbing; together they make hub-as-issuer Phase B2 functional end-to-end.
+
+
 
 The rename-aware release. The upstream hub repo was renamed `parachute-cli` → `parachute-hub` and its npm package `@openparachute/cli` → `@openparachute/hub` on 2026-04-26; this release refreshes vault's docs and inline comments to match. No functional changes — `parachute-vault` binary, schemas, source code, and on-disk layout are unchanged. Promoted directly to `@latest` so new installs land on docs that match the current ecosystem naming.
 

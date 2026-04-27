@@ -6,6 +6,7 @@
       "name": "parachute-vault",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.12.1",
+        "jose": "^6.2.2",
         "otpauth": "^9.5.0",
         "qrcode-terminal": "^0.12.0",
       },
