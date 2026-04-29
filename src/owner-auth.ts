@@ -88,6 +88,9 @@ interface RateLimitEntry {
  *   - Up to MAX_FAILURES failed attempts within WINDOW_MS → lockout
  *   - Lockout lasts LOCKOUT_MS
  *   - A successful attempt clears the IP's counter
+ *   - Hard cap on entry count — when full, the oldest insertion is evicted
+ *     before a new one is recorded. Prevents memory exhaustion via IP /
+ *     client_id enumeration (#93).
  */
 export class RateLimiter {
   private entries = new Map<string, RateLimitEntry>();
@@ -96,6 +99,7 @@ export class RateLimiter {
     private readonly maxFailures = 10,
     private readonly windowMs = 60_000,
     private readonly lockoutMs = 15 * 60_000,
+    private readonly maxEntries = 10_000,
   ) {}
 
   /**
@@ -130,6 +134,7 @@ export class RateLimiter {
     const entry = this.entries.get(ip);
 
     if (!entry || now - entry.firstFailureAt > this.windowMs) {
+      this.evictIfFull();
       this.entries.set(ip, {
         failures: 1,
         firstFailureAt: now,
@@ -153,7 +158,54 @@ export class RateLimiter {
   reset(): void {
     this.entries.clear();
   }
+
+  /** Current entry count — exposed for tests + observability. */
+  size(): number {
+    return this.entries.size;
+  }
+
+  /**
+   * Evict the oldest insertion(s) until size < maxEntries. Map preserves
+   * insertion order, so `keys().next().value` is the oldest. We re-insert
+   * on window-rollover (delete + new set), so insertion order tracks
+   * recency-of-failure closely enough for FIFO eviction.
+   */
+  private evictIfFull(): void {
+    while (this.entries.size >= this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+  }
 }
 
-/** Singleton rate limiter for the OAuth consent endpoint. */
+/**
+ * Singleton rate limiter — kept for back-compat with callers that don't pass
+ * through per-vault routing. Fresh callers should prefer
+ * `getAuthorizeRateLimiter(vaultName)` so traffic on one vault's consent flow
+ * doesn't lock out IPs on another vault's consent flow (#93).
+ */
 export const authorizeRateLimit = new RateLimiter();
+
+/**
+ * Per-vault rate limiter registry. The vault count is admin-bounded (vaults
+ * are created via CLI, not by clients) so this Map can grow only with operator
+ * action — no attacker-driven growth path. Each instance carries the
+ * default 10,000-entry IP cap, scoped to its vault (#93).
+ */
+const vaultAuthorizeRateLimiters = new Map<string, RateLimiter>();
+
+/** Lazily get-or-create the rate limiter for a given vault. */
+export function getAuthorizeRateLimiter(vaultName: string): RateLimiter {
+  let limiter = vaultAuthorizeRateLimiters.get(vaultName);
+  if (!limiter) {
+    limiter = new RateLimiter();
+    vaultAuthorizeRateLimiters.set(vaultName, limiter);
+  }
+  return limiter;
+}
+
+/** For tests: drop all per-vault limiters. */
+export function resetVaultAuthorizeRateLimiters(): void {
+  vaultAuthorizeRateLimiters.clear();
+}

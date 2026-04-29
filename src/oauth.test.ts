@@ -1809,3 +1809,58 @@ describe("OAuth Phase 0: PARACHUTE_HUB_ORIGIN", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-vault rate limiter + memory cap (#93)
+// ---------------------------------------------------------------------------
+
+describe("OAuth consent — per-vault rate limiting (#93)", () => {
+  test("getAuthorizeRateLimiter returns the same instance for the same vault name", async () => {
+    const { getAuthorizeRateLimiter, resetVaultAuthorizeRateLimiters } =
+      await import("./owner-auth.ts");
+    resetVaultAuthorizeRateLimiters();
+    const a1 = getAuthorizeRateLimiter("alpha");
+    const a2 = getAuthorizeRateLimiter("alpha");
+    expect(a1).toBe(a2);
+  });
+
+  test("getAuthorizeRateLimiter returns distinct instances per vault", async () => {
+    const { getAuthorizeRateLimiter, resetVaultAuthorizeRateLimiters } =
+      await import("./owner-auth.ts");
+    resetVaultAuthorizeRateLimiters();
+    const work = getAuthorizeRateLimiter("work");
+    const personal = getAuthorizeRateLimiter("personal");
+    expect(work).not.toBe(personal);
+  });
+
+  test("a lockout on one vault's limiter does not lock the same IP on another vault's limiter", async () => {
+    const { getAuthorizeRateLimiter, resetVaultAuthorizeRateLimiters } =
+      await import("./owner-auth.ts");
+    resetVaultAuthorizeRateLimiters();
+    const ip = "192.0.2.55";
+    const work = getAuthorizeRateLimiter("work");
+    // Pump enough failures on `work` to trip the default 10-failure threshold.
+    for (let i = 0; i < 10; i++) work.recordFailure(ip);
+    expect(work.check(ip).allowed).toBe(false);
+    // The unrelated vault's limiter should still allow this IP.
+    const personal = getAuthorizeRateLimiter("personal");
+    expect(personal.check(ip).allowed).toBe(true);
+  });
+
+  test("entry count is hard-capped — oldest IP is evicted FIFO when full", async () => {
+    const { RateLimiter } = await import("./owner-auth.ts");
+    // Tiny cap (3) so we don't have to hammer the limiter to prove eviction.
+    const limiter = new RateLimiter(10, 60_000, 60_000, 3);
+    limiter.recordFailure("10.0.0.1");
+    limiter.recordFailure("10.0.0.2");
+    limiter.recordFailure("10.0.0.3");
+    expect(limiter.size()).toBe(3);
+    // Adding a 4th IP must evict the oldest (10.0.0.1) to stay at the cap.
+    limiter.recordFailure("10.0.0.4");
+    expect(limiter.size()).toBe(3);
+    // The evicted IP is treated as untracked → fresh check is allowed.
+    expect(limiter.check("10.0.0.1").allowed).toBe(true);
+    // Newer entries remain locked into their failure state.
+    expect(limiter.check("10.0.0.4").allowed).toBe(true); // still under threshold
+  });
+});
