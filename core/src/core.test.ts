@@ -1341,6 +1341,30 @@ describe("MCP tools", async () => {
     expect(result.content).toBe("header\nbody");
   });
 
+  it("update-note prepend on frontmatter-led content injects after closing --- (#203)", async () => {
+    const original = "---\ntitle: Foo\ntags: [bar]\n---\nbody line 1\n";
+    const note = await store.createNote(original, { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({ id: note.id, prepend: "preamble\n" }) as any;
+    // Frontmatter still at byte 0 — parsers expecting `---\n` will find it.
+    expect(result.content.startsWith("---\ntitle: Foo\ntags: [bar]\n---\n")).toBe(true);
+    // Prepend lands immediately after the closing fence, before the body.
+    expect(result.content).toBe(
+      "---\ntitle: Foo\ntags: [bar]\n---\npreamble\nbody line 1\n",
+    );
+  });
+
+  it("update-note prepend on content lacking frontmatter injects at byte 0", async () => {
+    const note = await store.createNote("# Heading\nbody\n", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({ id: note.id, prepend: "preamble\n" }) as any;
+    expect(result.content).toBe("preamble\n# Heading\nbody\n");
+  });
+
   it("update-note append+prepend in one call lands both contributions", async () => {
     const note = await store.createNote("middle", { id: "n1" });
     const tools = generateMcpTools(store);
