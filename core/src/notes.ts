@@ -259,6 +259,20 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     );
   }
 
+  // ID set filter — used by `near` to push neighborhood scoping into SQL so
+  // that LIMIT applies to the neighborhood, not the whole notes table.
+  if (opts.ids !== undefined) {
+    if (opts.ids.length === 0) {
+      // Caller asked for "in this empty set" — no rows match. Short-circuit
+      // with an always-false condition; building `IN ()` would be a SQL error.
+      conditions.push("0 = 1");
+    } else {
+      const placeholders = opts.ids.map(() => "?").join(", ");
+      conditions.push(`n.id IN (${placeholders})`);
+      params.push(...opts.ids);
+    }
+  }
+
   // Exact path match (case-insensitive)
   if (opts.path) {
     conditions.push("n.path = ? COLLATE NOCASE");

@@ -1529,6 +1529,35 @@ describe("MCP tools", async () => {
     expect(result[0].id).toBe("near");
   });
 
+  it("query-notes near returns neighborhood even when limit is small and unrelated notes were created first (#130)", async () => {
+    // Repro of #130: anchor + linked notes get crowded out by unrelated notes
+    // when the query runs ORDER BY created_at LIMIT 5 BEFORE the
+    // neighborhood filter. With the SQL-pushed ids filter, LIMIT applies to
+    // the neighborhood, not the whole notes table.
+    //
+    // Seed: 10 unrelated notes created first, THEN the anchor + 2 linked
+    // notes. With limit=5 and ORDER BY created_at ASC, the unrelated ten
+    // would fill the slate and the in-neighborhood notes would never appear.
+    for (let i = 0; i < 10; i++) {
+      await store.createNote(`Unrelated ${i}`, { id: `unrelated-${i}` });
+    }
+    await store.createNote("Anchor", { id: "anchor" });
+    await store.createNote("Outbound target", { id: "outbound" });
+    await store.createNote("Inbound source", { id: "inbound" });
+    await store.createLink("anchor", "outbound", "wikilink");
+    await store.createLink("inbound", "anchor", "wikilink");
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      near: { note_id: "anchor", depth: 2 },
+      limit: 5,
+    }) as any[];
+
+    const ids = result.map((n: any) => n.id).sort();
+    expect(ids).toEqual(["anchor", "inbound", "outbound"]);
+  });
+
   it("delete-note accepts path", async () => {
     await store.createNote("To delete", { path: "Temp/note" });
     const tools = generateMcpTools(store);
