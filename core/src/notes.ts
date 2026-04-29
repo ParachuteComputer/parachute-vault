@@ -290,18 +290,35 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const params: unknown[] = [];
   const joins: string[] = [];
 
-  // Include tags — "all" (default): must have ALL tags; "any": must have ANY tag
+  // Include tags — "all" (default): must have ALL tags; "any": must have ANY tag.
+  // The `_tagsExpanded` internal field carries per-input-tag descendant sets
+  // when the tag-hierarchy resolver (see core/src/tag-hierarchy.ts) has
+  // expanded the input — `tags: ["manual"]` becomes the set
+  // `{manual, voice, text, ...}` per declared `_tags/*` config notes. Falls
+  // back to `[opts.tags[i]]` (single-element set) when no expansion is set,
+  // preserving the original semantics.
   if (opts.tags && opts.tags.length > 0) {
+    const tagSets: string[][] = (opts as QueryOpts & { _tagsExpanded?: string[][] })._tagsExpanded
+      ?? opts.tags.map((t) => [t]);
     const match = opts.tagMatch ?? "all";
     if (match === "any") {
-      const placeholders = opts.tags.map(() => "?").join(", ");
-      joins.push(`JOIN note_tags nt_or ON nt_or.note_id = n.id AND nt_or.tag_name IN (${placeholders})`);
-      params.push(...opts.tags);
+      // Flatten all expanded sets and dedupe — a note tagged with any one
+      // matches the input.
+      const flat = Array.from(new Set(tagSets.flat()));
+      if (flat.length > 0) {
+        const placeholders = flat.map(() => "?").join(", ");
+        joins.push(`JOIN note_tags nt_or ON nt_or.note_id = n.id AND nt_or.tag_name IN (${placeholders})`);
+        params.push(...flat);
+      }
     } else {
-      for (let i = 0; i < opts.tags.length; i++) {
+      // "all": one JOIN per input tag, each accepting the input or any descendant.
+      for (let i = 0; i < tagSets.length; i++) {
+        const set = tagSets[i] ?? [];
+        if (set.length === 0) continue;
         const alias = `nt${i}`;
-        joins.push(`JOIN note_tags ${alias} ON ${alias}.note_id = n.id AND ${alias}.tag_name = ?`);
-        params.push(opts.tags[i]);
+        const placeholders = set.map(() => "?").join(", ");
+        joins.push(`JOIN note_tags ${alias} ON ${alias}.note_id = n.id AND ${alias}.tag_name IN (${placeholders})`);
+        params.push(...set);
       }
     }
   }

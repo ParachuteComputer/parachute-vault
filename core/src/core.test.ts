@@ -2482,3 +2482,186 @@ describe("query-notes link expansion", async () => {
     expect(result.content).not.toContain("unsummarized body");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tag hierarchy via `_tags/<name>` config notes — issue #176
+// ---------------------------------------------------------------------------
+
+describe("tag hierarchy (_tags/* config notes)", async () => {
+  it("query for parent tag returns notes tagged with declared child", async () => {
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.createNote("text note", { tags: ["text"] });
+
+    const results = await store.queryNotes({ tags: ["manual"] });
+    expect(results.length).toBe(1);
+    expect(results[0]!.content).toBe("voice note");
+  });
+
+  it("expands transitively across multiple levels", async () => {
+    await store.createNote("", {
+      path: "_tags/manual",
+      metadata: { parents: ["note"] },
+    });
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.createNote("manual-only note", { tags: ["manual"] });
+    await store.createNote("note-only note", { tags: ["note"] });
+
+    // #note matches all three (note + manual + voice).
+    const noteResults = await store.queryNotes({ tags: ["note"] });
+    expect(noteResults.length).toBe(3);
+
+    // #manual matches voice + manual-only, not note-only.
+    const manualResults = await store.queryNotes({ tags: ["manual"] });
+    expect(manualResults.map((n) => n.content).sort()).toEqual([
+      "manual-only note",
+      "voice note",
+    ]);
+  });
+
+  it("query for child does not match parent-tagged notes", async () => {
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    await store.createNote("voice note", { tags: ["voice"] });
+    await store.createNote("manual-only note", { tags: ["manual"] });
+
+    const results = await store.queryNotes({ tags: ["voice"] });
+    expect(results.length).toBe(1);
+    expect(results[0]!.content).toBe("voice note");
+  });
+
+  it("supports multiple parents (diamond inheritance)", async () => {
+    await store.createNote("", {
+      path: "_tags/voice-meeting",
+      metadata: { parents: ["voice", "meeting"] },
+    });
+    await store.createNote("vm", { tags: ["voice-meeting"] });
+    await store.createNote("v", { tags: ["voice"] });
+    await store.createNote("m", { tags: ["meeting"] });
+
+    expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(2); // v + vm
+    expect((await store.queryNotes({ tags: ["meeting"] })).length).toBe(2); // m + vm
+  });
+
+  it("hierarchy is invalidated when a _tags/* note is created", async () => {
+    await store.createNote("voice note", { tags: ["voice"] });
+    // Before the config note exists, #manual matches nothing.
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+
+    // After creation, the cache invalidates and the next query expands.
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+  });
+
+  it("hierarchy is invalidated when a _tags/* note's metadata is updated", async () => {
+    await store.createNote("voice note", { tags: ["voice"] });
+    const config = await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    // Repoint the parent.
+    await store.updateNote(config.id, {
+      metadata: { parents: ["audio"] },
+      force: true,
+    } as any);
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+    expect((await store.queryNotes({ tags: ["audio"] })).length).toBe(1);
+  });
+
+  it("hierarchy is invalidated when a _tags/* note is deleted", async () => {
+    await store.createNote("voice note", { tags: ["voice"] });
+    const config = await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    await store.deleteNote(config.id);
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+  });
+
+  it("tagMatch=any flattens all expansions across input tags", async () => {
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    await store.createNote("v", { tags: ["voice"] });
+    await store.createNote("p", { tags: ["project"] });
+    await store.createNote("o", { tags: ["other"] });
+
+    const results = await store.queryNotes({
+      tags: ["manual", "project"],
+      tagMatch: "any",
+    });
+    expect(results.map((n) => n.content).sort()).toEqual(["p", "v"]);
+  });
+
+  it("tagMatch=all (default) requires each input tag's expanded set to be present", async () => {
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    // Note has both #voice (which satisfies #manual via expansion) AND #project.
+    await store.createNote("vp", { tags: ["voice", "project"] });
+    await store.createNote("p-only", { tags: ["project"] });
+
+    const results = await store.queryNotes({
+      tags: ["manual", "project"], // default tagMatch=all
+    });
+    expect(results.length).toBe(1);
+    expect(results[0]!.content).toBe("vp");
+  });
+
+  it("tolerates a cycle without infinite-looping", async () => {
+    await store.createNote("", {
+      path: "_tags/a",
+      metadata: { parents: ["b"] },
+    });
+    await store.createNote("", {
+      path: "_tags/b",
+      metadata: { parents: ["a"] },
+    });
+    await store.createNote("note-a", { tags: ["a"] });
+
+    // Both a and b should resolve without hanging; both reach the same set {a, b}.
+    expect((await store.queryNotes({ tags: ["a"] })).length).toBe(1);
+    expect((await store.queryNotes({ tags: ["b"] })).length).toBe(1);
+  });
+
+  it("malformed parents metadata is ignored silently", async () => {
+    // `parents` not an array — drops, treated as no parents declared.
+    await store.createNote("", {
+      path: "_tags/voice",
+      metadata: { parents: "manual" }, // wrong type
+    });
+    await store.createNote("v", { tags: ["voice"] });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+    expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
+  });
+
+  it("a config note with no parents declared is a no-op", async () => {
+    await store.createNote("", { path: "_tags/voice" });
+    await store.createNote("v", { tags: ["voice"] });
+    await store.createNote("m", { tags: ["manual"] });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+    expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
+  });
+});

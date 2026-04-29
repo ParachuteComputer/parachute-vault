@@ -7,6 +7,12 @@ import * as tagSchemaOps from "./tag-schemas.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
+import {
+  loadTagHierarchy,
+  getTagDescendants,
+  TAG_CONFIG_PREFIX,
+  type TagHierarchy,
+} from "./tag-hierarchy.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -16,9 +22,40 @@ import { HookRegistry } from "./hooks.js";
 export class BunSqliteStore implements Store {
   public readonly hooks: HookRegistry;
 
+  // Lazy-built caches over `_tags/*` and `_schemas/*` config notes. Null
+  // means "not yet loaded or invalidated"; the next read rebuilds. We
+  // invalidate synchronously inside note mutations (see
+  // `invalidateConfigCachesForPath`) so reads after writes always see
+  // the post-write state.
+  private _tagHierarchy: TagHierarchy | null = null;
+
   constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
     initSchema(db);
     this.hooks = opts?.hooks ?? new HookRegistry();
+  }
+
+  /**
+   * Lazy accessor for the `_tags/*` config-note hierarchy. First call after
+   * boot or after an invalidation does the scan; subsequent calls hit the
+   * cache. Returns the same object until invalidated, so callers can rely
+   * on identity for memoizing per-tag descendant sets.
+   */
+  private getTagHierarchy(): TagHierarchy {
+    if (!this._tagHierarchy) this._tagHierarchy = loadTagHierarchy(this.db);
+    return this._tagHierarchy;
+  }
+
+  /**
+   * Drop config caches if the mutated path is one of the config namespaces.
+   * Called from create/update/delete — old path is passed alongside new for
+   * rename cases (a note moved out of `_tags/` should still invalidate).
+   */
+  private invalidateConfigCachesForPath(path: string | null | undefined, oldPath?: string | null): void {
+    const matches = (p: string | null | undefined): boolean =>
+      typeof p === "string" && p.startsWith(TAG_CONFIG_PREFIX);
+    if (matches(path) || matches(oldPath)) {
+      this._tagHierarchy = null;
+    }
   }
 
   // ---- Notes ----
@@ -34,6 +71,7 @@ export class BunSqliteStore implements Store {
       resolveUnresolvedWikilinks(this.db, note.path, note.id);
     }
 
+    this.invalidateConfigCachesForPath(note.path);
     this.hooks.dispatch("created", note, this);
 
     return note;
@@ -86,6 +124,12 @@ export class BunSqliteStore implements Store {
       resolveUnresolvedWikilinks(this.db, note.path, id);
     }
 
+    // Invalidate before the hook dispatch so any handler that re-queries
+    // the hierarchy from inside its own logic sees post-write state.
+    // `metadata` updates can change the `parents` field on a config note
+    // even when the path didn't change, so always invalidate when the
+    // current path is in a config namespace.
+    this.invalidateConfigCachesForPath(note.path, oldPath);
     this.hooks.dispatch("updated", note, this);
 
     return note;
@@ -127,11 +171,32 @@ export class BunSqliteStore implements Store {
   }
 
   async deleteNote(id: string): Promise<void> {
+    // Read before delete so we can invalidate config caches on the way out.
+    const existing = noteOps.getNote(this.db, id);
     noteOps.deleteNote(this.db, id);
+    if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
   }
 
   async queryNotes(opts: QueryOpts): Promise<Note[]> {
-    return noteOps.queryNotes(this.db, opts);
+    return noteOps.queryNotes(this.db, this.expandQueryTags(opts));
+  }
+
+  /**
+   * If `tags` are present, attach a parallel `_tagsExpanded` array where
+   * each input tag is replaced with `{tag} ∪ descendants(tag)`. The SQL
+   * builder uses this to widen the tag join from `name = ?` to
+   * `name IN (...)`, so a query for `#manual` matches notes tagged with
+   * any descendant declared via `_tags/*` config notes.
+   *
+   * No-op when no `_tags/*` notes exist (empty hierarchy → each tag
+   * expands to just itself, identical to the pre-expansion behavior).
+   */
+  private expandQueryTags(opts: QueryOpts): QueryOpts {
+    if (!opts.tags || opts.tags.length === 0) return opts;
+    const hierarchy = this.getTagHierarchy();
+    if (hierarchy.childrenOf.size === 0) return opts;
+    const expanded = opts.tags.map((t) => Array.from(getTagDescendants(hierarchy, t)));
+    return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
   async searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]> {
