@@ -40,9 +40,8 @@ import {
   authenticateVaultRequest,
   authenticateGlobalRequest,
   extractApiKey,
-  requireScope,
 } from "./auth.ts";
-import { SCOPE_ADMIN, scopeForMethod } from "./scopes.ts";
+import { hasScopeForVault, SCOPE_ADMIN, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
 import {
@@ -352,12 +351,12 @@ export async function route(
     // hub's loopback workflow intact while locking out read-only tokens.
     const configAuth = await authenticateVaultRequest(req, vaultConfig, getVaultStore(vaultName).db);
     if ("error" in configAuth) return configAuth.error;
-    if (!requireScope(configAuth, SCOPE_ADMIN)) {
+    if (!hasScopeForVault(configAuth.scopes, vaultName, "admin")) {
       return Response.json(
         {
           error: "Forbidden",
           error_type: "insufficient_scope",
-          message: `This endpoint requires the '${SCOPE_ADMIN}' scope.`,
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
           required_scope: SCOPE_ADMIN,
           granted_scopes: configAuth.scopes,
         },
@@ -418,14 +417,17 @@ export async function route(
 
   // REST API — scope gate. GET/HEAD/OPTIONS → vault:read,
   // POST/PATCH/PUT/DELETE → vault:write. Inheritance (admin ⊇ write ⊇ read)
-  // is handled inside `requireScope`.
-  const requiredApiScope = scopeForMethod(req.method);
-  if (!requireScope(auth, requiredApiScope)) {
+  // and the broad-vs-narrowed shape (`vault:<verb>` from pvt_*, or
+  // `vault:<vaultName>:<verb>` from hub JWTs) are handled by
+  // `hasScopeForVault`.
+  const requiredVerb = verbForMethod(req.method);
+  if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
+    const requiredApiScope = scopeForMethod(req.method);
     return Response.json(
       {
         error: "Forbidden",
         error_type: "insufficient_scope",
-        message: `This endpoint requires the '${requiredApiScope}' scope.`,
+        message: `This endpoint requires the '${requiredApiScope}' scope (or '${requiredApiScope.replace("vault:", `vault:${vaultName}:`)}').`,
         required_scope: requiredApiScope,
         granted_scopes: auth.scopes,
       },

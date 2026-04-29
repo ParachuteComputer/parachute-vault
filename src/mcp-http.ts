@@ -24,47 +24,48 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { generateScopedMcpTools, getServerInstruction } from "./mcp-tools.ts";
-import { requireScope } from "./auth.ts";
 import type { AuthResult } from "./auth.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
-import { SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
+import { hasScopeForVault } from "./scopes.ts";
+import type { VaultVerb } from "./scopes.ts";
 
 /**
- * Required scope for each MCP tool. Tools that mutate note/tag state require
- * `vault:write`; pure query tools need `vault:read`. `vault-info` is listed as
- * read because read-only callers can fetch stats — the description-update
- * branch inside vault-info performs its own secondary `vault:write` check
- * (see `overrideVaultInfo` in mcp-tools.ts). Do not assume the outer gate
- * alone protects the inner branch.
+ * Required verb for each MCP tool. Tools that mutate note/tag state require
+ * write; pure query tools need read. `vault-info` is listed as read because
+ * read-only callers can fetch stats — the description-update branch inside
+ * vault-info performs its own secondary write check (see `overrideVaultInfo`
+ * in mcp-tools.ts). Do not assume the outer gate alone protects the inner
+ * branch.
  */
-const TOOL_REQUIRED_SCOPE: Record<string, string> = {
-  "query-notes": SCOPE_READ,
-  "list-tags": SCOPE_READ,
-  "find-path": SCOPE_READ,
-  "vault-info": SCOPE_READ,
-  "create-note": SCOPE_WRITE,
-  "update-note": SCOPE_WRITE,
-  "delete-note": SCOPE_WRITE,
-  "update-tag": SCOPE_WRITE,
-  "delete-tag": SCOPE_WRITE,
+const TOOL_REQUIRED_VERB: Record<string, VaultVerb> = {
+  "query-notes": "read",
+  "list-tags": "read",
+  "find-path": "read",
+  "vault-info": "read",
+  "create-note": "write",
+  "update-note": "write",
+  "delete-note": "write",
+  "update-tag": "write",
+  "delete-tag": "write",
 };
 
-function requiredScopeForTool(toolName: string): string {
+function requiredVerbForTool(toolName: string): VaultVerb {
   // Default-deny: unknown tools require write. Keeps accidental reads of
   // a not-yet-mapped mutation tool from slipping past.
-  return TOOL_REQUIRED_SCOPE[toolName] ?? SCOPE_WRITE;
+  return TOOL_REQUIRED_VERB[toolName] ?? "write";
 }
 
 /** Handle scoped MCP at /vault/{name}/mcp (single vault). */
 export async function handleScopedMcp(req: Request, vaultName: string, auth: AuthResult): Promise<Response> {
   const instruction = getServerInstruction(vaultName);
-  return handleMcp(req, () => generateScopedMcpTools(vaultName, auth), `parachute-vault/${vaultName}`, auth, instruction);
+  return handleMcp(req, () => generateScopedMcpTools(vaultName, auth), `parachute-vault/${vaultName}`, vaultName, auth, instruction);
 }
 
 async function handleMcp(
   req: Request,
   getTools: () => McpToolDef[],
   serverName: string,
+  vaultName: string,
   auth: AuthResult,
   instruction: string,
 ): Promise<Response> {
@@ -84,11 +85,11 @@ async function handleMcp(
   const mcpTools = getTools();
 
   // Filter the advertised tool list to what the caller's scopes actually
-  // permit. Callers without `vault:write` don't see mutation tools at all —
-  // matches the prior behavior of the read/full permission model but is now
-  // driven by scope inheritance.
+  // permit for THIS vault. Callers without write don't see mutation tools at
+  // all — matches the prior behavior of the read/full permission model but
+  // now driven by per-vault scope inheritance.
   const visibleTools = mcpTools.filter((t) =>
-    requireScope(auth, requiredScopeForTool(t.name)),
+    hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t.name)),
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -102,12 +103,12 @@ async function handleMcp(
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    const neededScope = requiredScopeForTool(name);
-    if (!requireScope(auth, neededScope)) {
+    const neededVerb = requiredVerbForTool(name);
+    if (!hasScopeForVault(auth.scopes, vaultName, neededVerb)) {
       return {
         content: [{
           type: "text" as const,
-          text: `Forbidden: tool '${name}' requires the '${neededScope}' scope. Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
+          text: `Forbidden: tool '${name}' requires the 'vault:${neededVerb}' scope (or 'vault:${vaultName}:${neededVerb}'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
         }],
         isError: true,
       };

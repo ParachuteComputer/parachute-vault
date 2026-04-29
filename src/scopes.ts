@@ -1,11 +1,20 @@
 /**
- * Scope primitives for Phase 2 enforcement.
+ * Scope primitives for vault enforcement.
  *
- * Tokens carry OAuth-standard whitespace-separated scopes. This module parses,
- * normalizes, and matches them — including the `admin ⊇ write ⊇ read`
- * inheritance rule and the `vault:<name>:<verb>` future-shape synonym
- * (narrowed per-vault scopes are Phase 2+; today we treat them as equivalent
- * to `vault:<verb>`).
+ * Tokens carry OAuth-standard whitespace-separated scopes. Two shapes coexist:
+ *
+ *   - **Broad** `vault:<verb>` — used by `pvt_*` tokens, which are vault-pinned
+ *     by storage (each vault has its own tokens DB; a token only resolves
+ *     against the vault that minted it).
+ *   - **Narrowed** `vault:<name>:<verb>` — used by hub-issued JWTs, which are
+ *     not pinned by storage and so MUST name the resource they grant access
+ *     to. Hub JWTs carrying broad `vault:<verb>` are rejected at validation
+ *     (see `authenticateHubJwt`).
+ *
+ * Inheritance is `admin ⊇ write ⊇ read` for both shapes. `hasScopeForVault`
+ * resolves a (vault, verb) request: broad grants satisfy any vault (the
+ * caller has already pinned the vault via DB lookup), narrowed grants
+ * satisfy only the matching vault.
  *
  * Legacy back-compat: tokens without any `vault:*` scope — but with a
  * 0.2.x-era `permission = "full" | "read"` — are mapped to the appropriate
@@ -21,14 +30,40 @@ export const SCOPE_ADMIN = "vault:admin" as const;
 export const VAULT_SCOPES = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN] as const;
 export type VaultScope = (typeof VAULT_SCOPES)[number];
 
+/** The verb component of a vault scope — `read`, `write`, or `admin`. */
+export type VaultVerb = "read" | "write" | "admin";
+
+const VERB_RANK: Record<VaultVerb, number> = { read: 0, write: 1, admin: 2 };
+
+function isVerb(s: string): s is VaultVerb {
+  return s === "read" || s === "write" || s === "admin";
+}
+
 /**
- * Parse a whitespace-separated scope string into a normalized scope list.
+ * Decompose a scope string into `{ vault?, verb }` if it's a recognized vault
+ * scope; return `null` otherwise. Recognizes both broad (`vault:<verb>`) and
+ * narrowed (`vault:<name>:<verb>`) shapes. The empty-name case
+ * (`vault::read`) is rejected — a hand-crafted DB row with that shape must
+ * not satisfy any vault scope check.
+ */
+function decomposeVaultScope(scope: string): { vault: string | null; verb: VaultVerb } | null {
+  const parts = scope.split(":");
+  if (parts.length === 2 && parts[0] === "vault" && isVerb(parts[1])) {
+    return { vault: null, verb: parts[1] };
+  }
+  if (parts.length === 3 && parts[0] === "vault" && parts[1].length > 0 && isVerb(parts[2])) {
+    return { vault: parts[1], verb: parts[2] };
+  }
+  return null;
+}
+
+/**
+ * Parse a whitespace-separated scope string into a scope list.
  *
- * Normalization:
  *   - Empty / null → []
  *   - Trim + split on any whitespace
- *   - `vault:<name>:<verb>` collapses to `vault:<verb>` (per-vault narrowing
- *     is Phase 2+; today it's treated as a synonym)
+ *   - Both `vault:<verb>` and `vault:<name>:<verb>` shapes are preserved
+ *     verbatim; `hasScope` / `hasScopeForVault` decide what each satisfies.
  *   - Unrecognized scopes are preserved as-is (they just won't match anything)
  */
 export function parseScopes(raw: string | null | undefined): string[] {
@@ -36,38 +71,65 @@ export function parseScopes(raw: string | null | undefined): string[] {
   return raw
     .split(/\s+/)
     .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => normalizeScope(s));
-}
-
-function normalizeScope(scope: string): string {
-  // `vault:<name>:<verb>` → `vault:<verb>` (synonym collapse). Reject an empty
-  // name segment (`vault::read`) — preserve it as-is so it can't accidentally
-  // satisfy a `vault:read` check. Only reachable via direct DB write, but the
-  // one-liner keeps the parser honest.
-  const parts = scope.split(":");
-  if (parts.length === 3 && parts[0] === "vault" && parts[1].length > 0) {
-    const verb = parts[2];
-    if (verb === "read" || verb === "write" || verb === "admin") {
-      return `vault:${verb}`;
-    }
-  }
-  return scope;
+    .filter(Boolean);
 }
 
 /**
- * Return true iff `granted` satisfies `required` under the inheritance rule
- * `admin ⊇ write ⊇ read`. Exact-match required for non-vault scopes.
+ * Broad-query check: does `granted` satisfy `required` (e.g. `vault:read`)?
+ *
+ * Used by code paths that don't have a specific vault in hand — JWT claim
+ * inspection, MCP tool list filtering inside a session that's already pinned
+ * to one vault, the legacy permission-derivation path. For per-request
+ * routing where the URL names a vault, prefer `hasScopeForVault`.
+ *
+ * A `vault:<name>:<verb>` grant DOES satisfy a broad `vault:<verb>` query —
+ * narrowed scopes are strictly more specific. The reverse is not true; broad
+ * grants do not satisfy narrowed queries via this function.
+ *
+ * Inheritance `admin ⊇ write ⊇ read` applies in both forms. Non-vault scopes
+ * require exact match.
  */
 export function hasScope(granted: string[], required: string): boolean {
   if (granted.includes(required)) return true;
 
-  // Inheritance: admin ⊇ write ⊇ read
-  if (required === SCOPE_READ) {
-    return granted.includes(SCOPE_WRITE) || granted.includes(SCOPE_ADMIN);
+  const requiredDecomposed = decomposeVaultScope(required);
+  if (!requiredDecomposed || requiredDecomposed.vault !== null) {
+    // Non-vault scope or narrowed query — exact match only via hasScope.
+    // (Narrowed queries belong on hasScopeForVault.)
+    return false;
   }
-  if (required === SCOPE_WRITE) {
-    return granted.includes(SCOPE_ADMIN);
+  const reqRank = VERB_RANK[requiredDecomposed.verb];
+  for (const s of granted) {
+    const d = decomposeVaultScope(s);
+    if (d && VERB_RANK[d.verb] >= reqRank) return true;
+  }
+  return false;
+}
+
+/**
+ * Per-vault check: does `granted` satisfy a (vault, verb) request? Use this
+ * at request-routing time — the URL names the vault and the method picks
+ * the verb.
+ *
+ * Match rules:
+ *   - Broad `vault:<verb>` in granted satisfies any vault (the broad scope
+ *     has no resource constraint; the caller pins the vault upstream — pvt_*
+ *     resolves only against its issuing vault's DB, hub JWTs reject broad
+ *     scopes at validation).
+ *   - Narrowed `vault:<name>:<verb>` satisfies only the matching `vaultName`.
+ *   - Verb inheritance `admin ⊇ write ⊇ read` applies in both forms.
+ */
+export function hasScopeForVault(
+  granted: string[],
+  vaultName: string,
+  requiredVerb: VaultVerb,
+): boolean {
+  const reqRank = VERB_RANK[requiredVerb];
+  for (const s of granted) {
+    const d = decomposeVaultScope(s);
+    if (!d) continue;
+    if (d.vault !== null && d.vault !== vaultName) continue;
+    if (VERB_RANK[d.verb] >= reqRank) return true;
   }
   return false;
 }
@@ -78,12 +140,33 @@ export function hasScope(granted: string[], required: string): boolean {
  *   - POST/PATCH/PUT/DELETE → write
  *
  * Admin-gated endpoints (like `/.parachute/config`) don't go through this
- * helper — they call `hasScope(auth.scopes, SCOPE_ADMIN)` directly.
+ * helper — they call `hasScopeForVault(auth.scopes, vaultName, "admin")`
+ * directly.
  */
 export function scopeForMethod(method: string): VaultScope {
+  return verbForMethod(method) === "read" ? SCOPE_READ : SCOPE_WRITE;
+}
+
+/** Verb-only variant of `scopeForMethod`, for use with `hasScopeForVault`. */
+export function verbForMethod(method: string): VaultVerb {
   const m = method.toUpperCase();
-  if (m === "GET" || m === "HEAD" || m === "OPTIONS") return SCOPE_READ;
-  return SCOPE_WRITE;
+  if (m === "GET" || m === "HEAD" || m === "OPTIONS") return "read";
+  return "write";
+}
+
+/**
+ * Detect a broad `vault:<verb>` scope in a granted list. Hub-issued JWTs
+ * must NOT carry broad vault scopes — the hub mints `vault:<name>:<verb>` so
+ * the resource is named on the wire. `authenticateHubJwt` calls this to
+ * reject tokens that slipped through with the old shape.
+ */
+export function findBroadVaultScopes(granted: string[]): string[] {
+  const out: string[] = [];
+  for (const s of granted) {
+    const d = decomposeVaultScope(s);
+    if (d && d.vault === null) out.push(s);
+  }
+  return out;
 }
 
 /**

@@ -92,28 +92,41 @@ export function resetJwksCache(): void {
   cachedOrigin = null;
 }
 
+export interface ValidateHubJwtOptions {
+  /**
+   * If set, strict-check the JWT `aud` claim against this exact value. Used
+   * by the per-vault auth path: each request derives the expected audience
+   * from the URL (`vault.<name>`) and rejects tokens stamped for a different
+   * vault. Pass `null` (or omit) to skip — only callers that lack a single
+   * resource binding (e.g. cross-vault routes) should skip.
+   *
+   * The `aud` strict-check is the resource-server backstop. Even if scope
+   * narrowing slips somewhere upstream, `aud=vault.work` cannot reach
+   * `/vault/personal/*` because the audience-mismatch reject fires first.
+   */
+  expectedAudience?: string | null;
+}
+
 /**
  * Verify a presented JWT against the hub's JWKS. Throws `HubJwtError` on any
  * failure (bad signature, wrong issuer, expired, missing kid, JWKS
- * unreachable). On success returns the surfaced claims plus the parsed scope
- * list.
+ * unreachable, audience mismatch). On success returns the surfaced claims
+ * plus the parsed scope list.
  *
- * The `iss` claim MUST equal the configured hub origin — this is the
- * load-bearing trust check. Without it, anyone could mint a token against
- * any RSA key and pass verification.
+ * Trust model:
+ *   - `iss` MUST equal the configured hub origin. Without this, anyone could
+ *     mint a token against any RSA key and pass verification.
+ *   - `aud` is strict-checked against `opts.expectedAudience` when provided
+ *     — the resource-server backstop for per-vault binding.
  *
- * Audience: parsed and returned but not strict-checked. Today's hub-issued
- * tokens carry `aud="operator"` (operator token) or `aud=<client_id>` (user
- * OAuth); both are legitimate vault callers.
- *
- * TODO(post-cli#59): tighten audience validation to accept only
- * {operator, vault, registered-client-ids}. Reject service-specific
- * aud values meant for siblings (e.g. aud="scribe-webhook"). Today
- * the hub doesn't issue narrow service tokens so any aud is safe;
- * once cli#59 scope-guard lib exists and service-to-service moves
- * off shared-secret onto JWTs, tighten this.
+ * Scope-shape policy (e.g. "hub-issued tokens may not carry broad
+ * `vault:<verb>` scopes") is enforced one layer up in `authenticateHubJwt`,
+ * not here — this function stays focused on JWT-level concerns.
  */
-export async function validateHubJwt(token: string): Promise<HubJwtClaims> {
+export async function validateHubJwt(
+  token: string,
+  opts: ValidateHubJwtOptions = {},
+): Promise<HubJwtClaims> {
   const origin = getHubOrigin();
   const getter = getJwksGetter(origin);
 
@@ -121,8 +134,10 @@ export async function validateHubJwt(token: string): Promise<HubJwtClaims> {
   try {
     const verified = await jwtVerify(token, getter, {
       issuer: origin,
-      // Don't pass `audience` — jose enforces strict match if set, and we
-      // accept multiple audiences (see TODO above).
+      // We strict-check audience ourselves below when `expectedAudience` is
+      // provided. Letting jose do it would also work, but keeping the check
+      // local lets us shape a clearer error message and centralize the
+      // "vault.<name>" derivation rule in one place.
     });
     payload = verified.payload;
   } catch (err) {
@@ -134,11 +149,19 @@ export async function validateHubJwt(token: string): Promise<HubJwtClaims> {
     throw new HubJwtError("hub JWT missing required `sub` claim");
   }
 
+  const aud = typeof payload.aud === "string" ? payload.aud : undefined;
+  if (opts.expectedAudience != null) {
+    if (aud !== opts.expectedAudience) {
+      throw new HubJwtError(
+        `hub JWT audience mismatch: expected "${opts.expectedAudience}", got "${aud ?? "(missing)"}"`,
+      );
+    }
+  }
+
   const scopeRaw = (payload as { scope?: unknown }).scope;
   const scopes =
     typeof scopeRaw === "string" ? parseScopes(scopeRaw) : [];
 
-  const aud = typeof payload.aud === "string" ? payload.aud : undefined;
   const jti = typeof payload.jti === "string" ? payload.jti : undefined;
   const clientIdRaw = (payload as { client_id?: unknown }).client_id;
   const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;

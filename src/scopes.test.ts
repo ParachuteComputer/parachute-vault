@@ -13,7 +13,10 @@ import {
   parseScopeFlags,
   resolveCreateTokenFlags,
   hasScope,
+  hasScopeForVault,
+  findBroadVaultScopes,
   scopeForMethod,
+  verbForMethod,
   legacyPermissionToScopes,
   serializeScopes,
 } from "./scopes.ts";
@@ -34,10 +37,10 @@ describe("parseScopes", () => {
     ]);
   });
 
-  test("collapses vault:<name>:<verb> synonym to vault:<verb>", () => {
-    expect(parseScopes("vault:journal:read")).toEqual([SCOPE_READ]);
+  test("preserves vault:<name>:<verb> narrowed shape verbatim", () => {
+    expect(parseScopes("vault:journal:read")).toEqual(["vault:journal:read"]);
     expect(parseScopes("vault:journal:write vault:work:admin")).toEqual([
-      SCOPE_WRITE, SCOPE_ADMIN,
+      "vault:journal:write", "vault:work:admin",
     ]);
   });
 
@@ -46,12 +49,13 @@ describe("parseScopes", () => {
     expect(parseScopes("vault:unknown:frob")).toEqual(["vault:unknown:frob"]);
   });
 
-  test("empty name segment does NOT collapse (vault::read stays literal)", () => {
+  test("empty name segment is treated as unrecognized (vault::read stays literal)", () => {
     // Guard against a hand-crafted DB row with `vault::read` satisfying a
     // `vault:read` check by accident. Only reachable via direct DB write,
     // not API input, but the parser stays honest.
     expect(parseScopes("vault::read")).toEqual(["vault::read"]);
     expect(hasScope(parseScopes("vault::read"), SCOPE_READ)).toBe(false);
+    expect(hasScopeForVault(parseScopes("vault::read"), "", "read")).toBe(false);
   });
 });
 
@@ -91,25 +95,79 @@ describe("hasScope — inheritance admin ⊇ write ⊇ read", () => {
     expect(hasScope(["profile"], "email")).toBe(false);
     expect(hasScope([SCOPE_ADMIN], "profile")).toBe(false);
   });
+
+  test("narrowed grant satisfies broad query (more-specific is at-least-as-strong)", () => {
+    expect(hasScope(["vault:work:write"], SCOPE_READ)).toBe(true);
+    expect(hasScope(["vault:work:write"], SCOPE_WRITE)).toBe(true);
+    expect(hasScope(["vault:work:write"], SCOPE_ADMIN)).toBe(false);
+    expect(hasScope(["vault:work:admin"], SCOPE_ADMIN)).toBe(true);
+  });
+
+  test("broad query against narrowed query returns false (use hasScopeForVault for that)", () => {
+    // hasScope refuses to answer narrowed queries — they need a vault context.
+    expect(hasScope([SCOPE_ADMIN], "vault:work:read")).toBe(false);
+    expect(hasScope(["vault:work:write"], "vault:work:read")).toBe(false);
+  });
 });
 
-describe("scopeForMethod", () => {
-  test("read methods → vault:read", () => {
+describe("hasScopeForVault — per-vault matching with inheritance", () => {
+  test("broad grant satisfies any vault (caller pins via DB lookup / aud check)", () => {
+    expect(hasScopeForVault([SCOPE_READ], "work", "read")).toBe(true);
+    expect(hasScopeForVault([SCOPE_WRITE], "work", "read")).toBe(true);
+    expect(hasScopeForVault([SCOPE_WRITE], "work", "write")).toBe(true);
+    expect(hasScopeForVault([SCOPE_ADMIN], "anything", "admin")).toBe(true);
+  });
+
+  test("narrowed grant satisfies only the matching vault", () => {
+    expect(hasScopeForVault(["vault:work:read"], "work", "read")).toBe(true);
+    expect(hasScopeForVault(["vault:work:read"], "personal", "read")).toBe(false);
+    expect(hasScopeForVault(["vault:work:write"], "work", "read")).toBe(true);
+    expect(hasScopeForVault(["vault:work:admin"], "work", "write")).toBe(true);
+  });
+
+  test("narrowed grant does NOT satisfy a higher verb on its vault", () => {
+    expect(hasScopeForVault(["vault:work:read"], "work", "write")).toBe(false);
+    expect(hasScopeForVault(["vault:work:write"], "work", "admin")).toBe(false);
+  });
+
+  test("mixed grant — narrowed for one vault, broad fallback nowhere", () => {
+    expect(hasScopeForVault(["vault:work:write"], "personal", "read")).toBe(false);
+  });
+
+  test("empty grant fails everywhere", () => {
+    expect(hasScopeForVault([], "any", "read")).toBe(false);
+  });
+});
+
+describe("findBroadVaultScopes", () => {
+  test("returns broad vault scopes only", () => {
+    expect(findBroadVaultScopes([SCOPE_READ, SCOPE_WRITE])).toEqual([SCOPE_READ, SCOPE_WRITE]);
+    expect(findBroadVaultScopes(["vault:work:read"])).toEqual([]);
+    expect(findBroadVaultScopes([SCOPE_READ, "vault:work:write", "profile"])).toEqual([SCOPE_READ]);
+    expect(findBroadVaultScopes([])).toEqual([]);
+  });
+});
+
+describe("scopeForMethod / verbForMethod", () => {
+  test("read methods → vault:read / read", () => {
     expect(scopeForMethod("GET")).toBe(SCOPE_READ);
     expect(scopeForMethod("HEAD")).toBe(SCOPE_READ);
     expect(scopeForMethod("OPTIONS")).toBe(SCOPE_READ);
     expect(scopeForMethod("get")).toBe(SCOPE_READ); // case-insensitive
+    expect(verbForMethod("GET")).toBe("read");
   });
 
-  test("write methods → vault:write", () => {
+  test("write methods → vault:write / write", () => {
     expect(scopeForMethod("POST")).toBe(SCOPE_WRITE);
     expect(scopeForMethod("PATCH")).toBe(SCOPE_WRITE);
     expect(scopeForMethod("PUT")).toBe(SCOPE_WRITE);
     expect(scopeForMethod("DELETE")).toBe(SCOPE_WRITE);
+    expect(verbForMethod("POST")).toBe("write");
   });
 
-  test("unknown method falls back to vault:write (default-deny)", () => {
+  test("unknown method falls back to write (default-deny)", () => {
     expect(scopeForMethod("TRACE")).toBe(SCOPE_WRITE);
+    expect(verbForMethod("TRACE")).toBe("write");
   });
 });
 

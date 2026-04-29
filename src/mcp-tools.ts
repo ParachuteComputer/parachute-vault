@@ -9,7 +9,7 @@ import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { hasScope, SCOPE_WRITE } from "./scopes.ts";
+import { hasScopeForVault } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 
 /**
@@ -64,12 +64,13 @@ function overrideVaultInfo(
 
     if (params.description !== undefined) {
       // Secondary scope check: vault-info is read-gated so read-only callers
-      // can fetch stats, but mutating the vault description requires write.
-      // Without this, a vault:read token could bypass the outer gate by
-      // passing `description` to a tool the outer gate considers read-only.
-      if (!auth || !hasScope(auth.scopes, SCOPE_WRITE)) {
+      // can fetch stats, but mutating the vault description requires write
+      // for THIS vault. Without this, a vault:read token could bypass the
+      // outer gate by passing `description` to a tool the outer gate
+      // considers read-only.
+      if (!auth || !hasScopeForVault(auth.scopes, vaultName, "write")) {
         throw new Error(
-          `Forbidden: updating the vault description requires the '${SCOPE_WRITE}' scope. Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
+          `Forbidden: updating the vault description requires the 'vault:write' scope (or 'vault:${vaultName}:write'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
         );
       }
       config.description = params.description as string;
