@@ -251,6 +251,16 @@ export interface GlobalConfig {
    *   callers.
    */
   discovery?: "enabled" | "disabled";
+  /**
+   * Whether `parachute-vault init` registers the daemon with launchd / systemd
+   * (which then auto-starts on boot AND auto-restarts on crash). Defaults to
+   * `true` (preserve historical behavior). When `false`, init skips daemon
+   * registration AND removes any prior registration — for CI, dev sandboxes,
+   * Docker/K8s setups, or environments where another supervisor manages the
+   * process. The user is expected to run `parachute-vault serve` manually or
+   * point their own supervisor at it.
+   */
+  autostart?: boolean;
   /** Backup configuration: schedule, retention, destinations. */
   backup?: BackupConfig;
 }
@@ -1114,6 +1124,7 @@ export function readGlobalConfig(): GlobalConfig {
       const passwordHashMatch = yaml.match(/^owner_password_hash:\s*"([^"]+)"/m);
       const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
       const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
+      const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
       const config: GlobalConfig = {
         port: portMatch ? parseInt(portMatch[1], 10) : DEFAULT_PORT,
         default_vault: defaultVaultMatch?.[1],
@@ -1122,6 +1133,9 @@ export function readGlobalConfig(): GlobalConfig {
       };
       if (discoveryMatch) {
         config.discovery = discoveryMatch[1] as "enabled" | "disabled";
+      }
+      if (autostartMatch) {
+        config.autostart = autostartMatch[1] === "true";
       }
 
       // Parse backup_codes: a YAML list of quoted bcrypt hashes under
@@ -1180,6 +1194,7 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   const lines = [`port: ${config.port}`];
   if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
   if (config.discovery) lines.push(`discovery: ${config.discovery}`);
+  if (config.autostart !== undefined) lines.push(`autostart: ${config.autostart}`);
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
   }

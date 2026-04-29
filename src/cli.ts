@@ -244,6 +244,14 @@ async function cmdInit(args: string[] = []) {
   const flagMcpOff = args.includes("--no-mcp");
   const flagTokenOn = args.includes("--token");
   const flagTokenOff = args.includes("--no-token");
+  // --autostart / --no-autostart toggle daemon registration. Default is on
+  // (preserves historical behavior). When --no-autostart is passed, init
+  // skips registering with launchd / systemd AND removes any prior
+  // registration — for CI, dev sandboxes, Docker, or any environment where
+  // another supervisor manages the process. --no-autostart wins over
+  // --autostart on the same command line (safer-default precedence).
+  const flagAutostartOn = args.includes("--autostart");
+  const flagAutostartOff = args.includes("--no-autostart");
 
   const nameDecision = decideInitVaultName(args, {
     isTTY: !!process.stdin.isTTY,
@@ -378,20 +386,52 @@ async function cmdInit(args: string[] = []) {
   // 6. Install daemon (platform-aware). Idempotent — safe to re-run after
   // a folder move; this refreshes ~/.parachute/server-path and bounces the
   // daemon so the new location takes effect immediately.
-  console.log("Installing daemon...");
-  let serverPath: string | null = null;
-  if (isMac) {
-    ({ serverPath } = await installAgent());
-  } else if (isLinux && isSystemdAvailable()) {
-    ({ serverPath } = await installSystemdService());
-  } else {
-    console.log("  Auto-start not available on this platform.");
-    console.log("  Run manually: bun src/server.ts");
-    console.log("  Or use Docker: docker compose up -d");
+  //
+  // Autostart precedence (resolved here so the user's prior config is
+  // honored on re-runs that don't pass a flag):
+  //   1. --no-autostart on this run → false (and persisted)
+  //   2. --autostart on this run    → true  (and persisted)
+  //   3. Existing config.autostart  → that value
+  //   4. Default                    → true (historical behavior)
+  // When false: skip register AND uninstall any prior registration so the
+  // flag's intent ("don't auto-start / don't auto-restart") matches reality
+  // even if a previous run had registered a daemon.
+  let autostartEnabled: boolean;
+  if (flagAutostartOff) autostartEnabled = false;
+  else if (flagAutostartOn) autostartEnabled = true;
+  else if (typeof globalConfig.autostart === "boolean") autostartEnabled = globalConfig.autostart;
+  else autostartEnabled = true;
+
+  if (flagAutostartOff || flagAutostartOn) {
+    globalConfig.autostart = autostartEnabled;
+    writeGlobalConfig(globalConfig);
   }
-  if (serverPath) {
-    console.log(`  Server path:  ${serverPath}`);
-    console.log(`  Wrapper:      ~/.parachute/vault/start.sh`);
+
+  let serverPath: string | null = null;
+  if (!autostartEnabled) {
+    console.log("Autostart disabled — skipping daemon registration.");
+    if (isMac) {
+      await uninstallAgent();
+    } else if (isLinux && isSystemdAvailable()) {
+      await uninstallSystemdService();
+    }
+    console.log("  To run vault: parachute-vault serve   (or use your own supervisor)");
+    console.log("  To re-enable: parachute-vault init --autostart");
+  } else {
+    console.log("Installing daemon...");
+    if (isMac) {
+      ({ serverPath } = await installAgent());
+    } else if (isLinux && isSystemdAvailable()) {
+      ({ serverPath } = await installSystemdService());
+    } else {
+      console.log("  Auto-start not available on this platform.");
+      console.log("  Run manually: bun src/server.ts");
+      console.log("  Or use Docker: docker compose up -d");
+    }
+    if (serverPath) {
+      console.log(`  Server path:  ${serverPath}`);
+      console.log(`  Wrapper:      ~/.parachute/vault/start.sh`);
+    }
   }
   const bindHost = resolveBindHostname(process.env);
   console.log(`  Listening on http://${bindHost}:${globalConfig.port || DEFAULT_PORT}`);
@@ -2208,6 +2248,7 @@ data, and debugging.
 
 Setup:
   parachute-vault init [--mcp|--no-mcp] [--token|--no-token] [--vault-name <name>]
+                       [--autostart|--no-autostart]
                                            Set up everything (one command, idempotent).
                                            --mcp/--no-mcp controls the Claude Code MCP entry;
                                            --token/--no-token controls whether an API token is
@@ -2215,6 +2256,13 @@ Setup:
                                            --vault-name skips the prompt and names the vault
                                            (lowercase alphanumeric, hyphens, underscores;
                                            omit to be prompted interactively, default "default").
+                                           --autostart (default) registers vault with launchd /
+                                           systemd so it starts on boot AND auto-restarts on
+                                           crash. --no-autostart skips daemon registration AND
+                                           uninstalls any prior registration — for CI, dev
+                                           sandboxes, Docker, or environments where another
+                                           supervisor manages the process. Persists in
+                                           config.yaml as 'autostart: true|false'.
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,

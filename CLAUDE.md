@@ -75,6 +75,7 @@ Use Bun for everything. No Node.js.
 - **Obsidian interop**: Import/export preserves frontmatter, tags, wikilinks, and file paths.
 - **Unified config**: All env vars in `~/.parachute/vault/.env` (or `$PARACHUTE_HOME/vault/.env` in Docker).
 - **Docker-friendly**: `PARACHUTE_HOME` env var overrides the ecosystem root; vault state lands at `$PARACHUTE_HOME/vault/`. Server auto-creates default vault on first run.
+- **Autostart opt-out**: `parachute-vault init` registers a launchd / systemd daemon by default (boot start + crash restart). Pass `--no-autostart` to skip — init writes `autostart: false` to `config.yaml` and removes any prior registration. The user runs `parachute-vault serve` manually or wires their own supervisor. Use this for CI, dev sandboxes, Docker, or wherever another process manager owns the lifecycle.
 
 ## Config
 
