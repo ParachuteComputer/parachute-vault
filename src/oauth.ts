@@ -47,6 +47,37 @@ export interface AuthorizePostOptions {
 // ---------------------------------------------------------------------------
 
 /**
+ * Today the consent page binds one of two scope strings — "read" or "full" —
+ * with `read ⊂ full`. `narrowerScope` picks the more-restrictive of two
+ * inputs (used to floor `selected` by `requested` at /oauth/authorize),
+ * `isScopeSubset` checks an inbound /oauth/token scope against the bound
+ * scope. Both default to "full" only if **both** inputs allow "full",
+ * otherwise narrow to "read". When the consent vocabulary expands beyond
+ * read/full, both helpers should switch to vault:read|write|admin and the
+ * inheritance rules in scopes.ts (`hasScope`).
+ */
+function normalizeConsentScope(s: string | null | undefined): "read" | "full" {
+  return s === "read" ? "read" : "full";
+}
+
+function narrowerScope(a: string, b: string): "read" | "full" {
+  return normalizeConsentScope(a) === "read" || normalizeConsentScope(b) === "read"
+    ? "read"
+    : "full";
+}
+
+function isScopeSubset(requested: string, bound: string): boolean {
+  // Strict: only "read" / "full" are acceptable on the wire today. Unknown
+  // scope strings are rejected as out-of-bounds rather than silently
+  // normalized — otherwise `scope=vault:admin` would coast through when
+  // bound is "full".
+  if (requested !== "read" && requested !== "full") return false;
+  const bnd = normalizeConsentScope(bound);
+  if (bnd === "full") return requested === "read" || requested === "full";
+  return requested === "read";
+}
+
+/**
  * Public-facing base URL of the server. Honors `x-forwarded-*` headers so a
  * Cloudflare Tunnel / Tailscale Funnel / reverse-proxied deployment advertises
  * the right external origin in discovery documents (RFC 8414, RFC 9728).
@@ -483,7 +514,13 @@ export async function handleAuthorizePost(
 
   if (clientIp) rateLimiter.recordSuccess(clientIp);
 
-  // Generate auth code — persist the user-selected scope (not the requested one)
+  // Generate auth code — bind the NARROWER of (requested, selected). The
+  // user can shrink the requested scope at consent time (e.g. flip "full"
+  // to "read"); they cannot broaden it. Without this floor, a malicious
+  // form could smuggle `selected_scope=full` even when /authorize?scope=read
+  // was the original ask, escalating beyond what the client requested at
+  // authorize time (#94, RFC 6749 §3.3).
+  const boundScope = narrowerScope(requestedScope, selectedScope);
   const code = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes
 
@@ -492,7 +529,7 @@ export async function handleAuthorizePost(
   db.prepare(`
     INSERT INTO oauth_codes (code, client_id, code_challenge, code_challenge_method, scope, redirect_uri, expires_at, created_at, vault_name)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(code, clientId, codeChallenge, codeChallengeMethod, selectedScope, redirectUri, expiresAt, new Date().toISOString(), vaultName ?? null);
+  `).run(code, clientId, codeChallenge, codeChallengeMethod, boundScope, redirectUri, expiresAt, new Date().toISOString(), vaultName ?? null);
 
   redirect.searchParams.set("code", code);
   return Response.redirect(redirect.toString(), 302);
@@ -607,14 +644,35 @@ export async function handleToken(
     return Response.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, { status: 400 });
   }
 
+  // RFC 6749 §3.3 / §6: a `scope` parameter at /oauth/token, if present,
+  // must equal or be a subset of the scope bound to the auth code at
+  // /oauth/authorize. Reject expansion attempts as `invalid_scope` rather
+  // than silently honoring the bound scope (#94). Absent param → use bound.
+  const requestedTokenScopeRaw = params.get("scope");
+  let effectiveScope = authCode.scope;
+  if (requestedTokenScopeRaw !== null && requestedTokenScopeRaw.trim().length > 0) {
+    const requested = requestedTokenScopeRaw.trim();
+    if (!isScopeSubset(requested, authCode.scope)) {
+      return Response.json(
+        {
+          error: "invalid_scope",
+          error_description:
+            "Requested scope exceeds the scope bound at authorization time.",
+        },
+        { status: 400 },
+      );
+    }
+    effectiveScope = requested;
+  }
+
   // Mark code as used
   db.prepare("UPDATE oauth_codes SET used = 1 WHERE code = ?").run(code);
 
-  // Translate the consent-time selected scope into both the legacy permission
-  // column and the OAuth-standard scope list we now persist on the token row.
-  // The consent page only offers read vs full today; full becomes the
-  // admin-inheriting scope set so hub admin operations keep working.
-  const permission: TokenPermission = authCode.scope === "read" ? "read" : "full";
+  // Translate the (possibly-narrowed) effective scope into both the legacy
+  // permission column and the OAuth-standard scope list we persist on the
+  // token row. The consent page only offers read vs full today; full becomes
+  // the admin-inheriting scope set so hub admin operations keep working.
+  const permission: TokenPermission = effectiveScope === "read" ? "read" : "full";
   const scopes = legacyPermissionToScopes(permission);
   const scopeString = serializeScopes(scopes);
 

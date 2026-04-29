@@ -64,6 +64,7 @@ import {
 } from "./oauth.ts";
 import { handleConfigSchema, handleConfig } from "./module-config.ts";
 import { buildAuthStatus } from "./auth-status.ts";
+import { getAuthorizeRateLimiter } from "./owner-auth.ts";
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -320,6 +321,10 @@ export async function route(
           clientIp,
           ownerPasswordHash,
           totpSecret,
+          // Per-vault rate-limit instance — prevents brute-force traffic on
+          // one vault's consent flow from locking out IPs trying to authorize
+          // against an unrelated vault (#93).
+          rateLimiter: getAuthorizeRateLimiter(vaultConfig.name),
         });
       }
       return Response.json({ error: "method_not_allowed" }, { status: 405 });
