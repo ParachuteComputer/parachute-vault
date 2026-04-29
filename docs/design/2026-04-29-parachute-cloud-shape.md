@@ -1,8 +1,8 @@
 # Parachute Cloud — what shape should it take?
 
-**Date:** 2026-04-29 (v2 added 2026-04-29 evening)
+**Date:** 2026-04-29 (v2 added 2026-04-29 evening; v3 added 2026-04-29 night)
 **Author:** vault tentacle (Uni)
-**Status:** Research / decision-driving. Aaron read v1 and pushed back: the framing was vault-in-isolation when the real unit of design is **the hub and its spokes**. Cloud has to be deeply integrated with the self-hosted experience, and the OAuth model is the connective tissue. Section 7 (V2) is the active deliverable; sections 1–6 are kept as historical context for the four-shape exploration.
+**Status:** Research / decision-driving. Aaron read v2 and validated the hub-and-spokes frame; v3 grounds it in the operating reality — cloud is offered through **Parachute Computer LLC** as a paid managed tier, with Claude-login as flagship UX for paraclaw and a multi-provider/multi-IDP backstop against Anthropic-dependency risk. Section 8 (V3) is the active deliverable. §7 (V2) supplies the architectural frame; §§1–6 (V1) are kept as historical context for the original four-shape exploration.
 **Companions:**
 - `parachute.computer/design/2026-04-20-cloud-offering-sketch.md` — the prior north-star sketch.
 - vault PR [#99](https://github.com/ParachuteComputer/parachute-vault/pull/99) — `DoSqliteStore + SqlDb` adapter (parked draft).
@@ -317,11 +317,146 @@ The framing change makes question 1 the load-bearing one. Everything else flows 
 
 ---
 
-## TL;DR (v2)
+## TL;DR (v2 — superseded by §8)
 
 - **The frame**: not "where does vault run?" — but "where does the **hub** live, and how do spokes attach?" Four axes: hub location, spoke location, IDP type, hub reachability.
 - **OAuth is the connective tissue.** JWTs are portable; spokes validate against the hub's JWKS regardless of where either lives. The boundary cost is JWKS reachability + hub-offline-as-system-offline.
 - **Re-derived shapes** (α–η) cover the existing all-local default, hub-cloud + spokes-local (the right reformulation of V1 Shape 3), full SaaS (V1 Shape 1), mixed deployments, BYO-Cloud (tenant-owned Workers), and single-binary VPS.
-- **Recommendation**: ship **Cloud Hub first** (Phase 1 — Fly.io-hosted `parachute-hub` per tenant). Cloud Vault becomes Phase 3 (V1 Shape 1, parked PRs activate). Scribe + BYO-Cloud are intermediate phases.
-- **Why this re-orders the build**: cloud hub is the smallest cloud-able unit and unblocks every other shape. Once it exists, users opt their spokes into cloud individually. Cloud isn't a separate product; it's a re-binding of the four axes.
-- **Six open questions** lead with: cloud-hub-as-v1 vs cloud-vault-as-v1. Aaron's call.
+- **Recommendation (v2, superseded)**: ship **Cloud Hub first** (Phase 1 — Fly.io-hosted `parachute-hub` per tenant). Cloud Vault becomes Phase 3 (V1 Shape 1, parked PRs activate). Scribe + BYO-Cloud are intermediate phases.
+- **What v2 missed**: the question of *who operates* the cloud, *how the user buys it*, and *how Claude-login can be the flagship UX*. v3 grounds this — cloud is shipped through **Parachute Computer LLC** as a managed offering, with provider abstraction (VM-on-cheap-cloud, vendor-portable) and Anthropic-dependency mitigations. **See §8 for the active recommendation.**
+
+---
+
+## 8. V3 — Parachute Computer as managed offering
+
+### 8.1 The product entity and value prop
+
+V2 said "ship Cloud Hub first" and was abstract about *who* runs it and *how the user buys it*. V3 grounds that: the cloud product is offered by **Parachute Computer LLC** as a paid managed tier. The user has **one** billing relationship — with Parachute. The hosting partner underneath (Hetzner, Render, Fly, or whoever's currently cleanest) is an implementation detail.
+
+Aaron's framing: "lots of folks who won't want to go to hetzner and get all this configured. So whether it's hetzner or render or something else, assuming we're just going to do all of this via parachute computer, we want to add some light framing around it so that people can just pay us some money and have all this configured."
+
+The product is two sentences:
+
+> **Pay Parachute, get a working stack.** Hub running, spokes installed, auth wired, scribe pool attached, your URL is `<you>.parachute.computer` (or your custom domain) — credit card and a sign-up form, sixty seconds later you're writing.
+
+This is meaningfully different from "we sell Hetzner-with-extra-steps." It's a managed service whose internal substrate happens to be commodity VMs. The user never names a provider, never picks a region beyond a high-level tier, never installs cloudflared. Their mental model is: "I have Parachute Computer."
+
+Pricing posture (working estimate, not a commitment): a $15/mo Starter tier covers the VM + light scribe quota; metered scribe minutes above quota; $30/mo Pro tier with larger quota and custom domain. Team/Enterprise later. The economics hinge on the underlying VM being cheap (Hetzner CX22 is ~€4/mo for 2 vCPU / 4GB RAM, comfortable headroom on $15) — see §8.5.
+
+### 8.2 Signup → provision → connected (UX sketch)
+
+The flow we want, at the UX level (not impl):
+
+1. User goes to `parachute.computer`, clicks "Get Parachute Cloud."
+2. Sign up: email + password, OR "Continue with Claude" (their Anthropic account becomes their Parachute identity — see §8.3).
+3. Pick a plan, enter payment, choose a subdomain (`<you>.parachute.computer`) or skip for now.
+4. Behind the scenes: Parachute Computer's control plane provisions a VM on the current preferred provider, runs a hardened Bun image, starts `parachute-hub` configured with the user's identity and JWKS, installs the spokes the user picked (vault by default; scribe metered; paraclaw on request).
+5. Within ~60 seconds the user lands on `<you>.parachute.computer/portal` — the hub's portal UI, already authenticated, with their vault waiting.
+6. They open the notes PWA, point it at their hub URL, and they're writing.
+7. paraclaw users: they install paraclaw locally on their dev machine, sign in with Claude, and paraclaw federates to their cloud hub. Their notes/codebase context lives in their cloud vault; LLM compute uses their Anthropic key.
+
+The "magic link" piece Aaron mentioned is the keystone — there's no password to remember if you sign in with Claude; the URL we hand back is the only thing the user needs to bookmark.
+
+### 8.3 Claude login as flagship auth UX (paraclaw)
+
+The deepest UX win lives in the paraclaw path. paraclaw is the Parachute Claude Code distribution — the user is already running Claude Code, already has an Anthropic account, already has Anthropic OAuth working (it's how Claude Code authenticates). Layering Parachute on top:
+
+- User logs into Parachute Computer via Anthropic OAuth (third-party app, redirect to Anthropic's auth, scope grants).
+- Their Anthropic identity is mapped to a Parachute account.
+- Their cloud hub is provisioned tied to that identity.
+- paraclaw running locally federates to the cloud hub via the same Anthropic identity — a token from their Claude session validates against the cloud hub, which knows about the Anthropic federation.
+- The user's Claude API quota powers paraclaw's LLM calls — same as today's self-hosted paraclaw.
+- The user has *one* account end-to-end: Anthropic. Parachute is a thin layer.
+
+That's the killer demo. Aaron's quote captures it: "all they need is an anthropic account and they're good to go." Sign in with Claude → hub + vault provisioned + paraclaw locally federated → Claude has memory.
+
+For vault and scribe specifically, the Anthropic-login path still works (identity is identity), but the **value** is smaller — vault is storage, scribe is transcription, neither calls Claude directly. They benefit from "one less account" but not from "your Claude quota powers this." So the flagship is paraclaw; vault and scribe ride along.
+
+### 8.4 Anthropic-dependency risk + the agent-provider tension
+
+Aaron's TBD: "how long until anthropic shuts us down."
+
+The risk surface, ordered by reach:
+
+- **Anthropic OAuth third-party use.** If Anthropic restricts OAuth to first-party Claude integrations, the "log in with Claude" UX closes. Parachute falls back to email/password or Google/GitHub, but loses the flagship demo.
+- **Claude API access for orchestration.** Even with logins working, Anthropic could rate-limit or revoke API access for orchestration-style use. Self-hosted paraclaw is fine (the user is using their own Claude key); Parachute-orchestrated paraclaw is more visible.
+- **Scope / endpoint changes.** Anthropic could narrow available scopes, breaking specific flows.
+
+Mitigation paths:
+
+**(a) Multi-IDP from day one.** Cloud hub ships with email/password native, Google OAuth, GitHub OAuth, *and* Anthropic federation. The Claude path is the flagship; the others are the safety net. Vault-only and scribe-only customers use one of the others.
+
+**(b) Multi-API-provider for paraclaw — the live tension.** Issue paraclaw#13 was the agent-provider abstraction rip-out, justified as "premature for self-hosted single-Claude users." Cloud changes the calculus: a Parachute-hosted paraclaw operator absolutely wants to swap providers without touching user code. OpenAI, Gemini, OpenRouter, local Ollama on the cloud VM — each a viable backstop if Anthropic becomes unavailable. **The abstraction we just removed is the abstraction cloud needs back.** This is the single most concrete architectural decision v3 surfaces; flag for Aaron's call.
+
+Two paths:
+- **Bring it back, scoped to cloud.** A `provider:` config field in cloud-paraclaw with a runtime switch; self-hosted defaults to Claude with no UX visible. Lighter than the abstraction we removed.
+- **Don't bring it back, bet on Anthropic.** Design for the world where Claude is the substrate; revisit if reality forces it. Faster ship, more risk.
+
+Suggestion: bring it back in the lighter form. The cost is small (env var + a thin LLM-client interface); the optionality is large.
+
+**(c) Independent identity primitive.** Parachute Computer issues its own user accounts that *can be* federated to Anthropic but don't *require* Anthropic. Even if Anthropic OAuth disappears tomorrow, accounts persist and re-bind to a different IDP. This is table stakes and aligns with hub-as-issuer (the hub already has its own user accounts; OAuth federation is an option, not the substrate).
+
+**(d) Self-hosting always works.** If Parachute Computer the company stops shipping cloud, the OSS code keeps running on the user's own infra. This is the open-source promise and a meaningful customer reassurance — "even if Parachute shuts down, your data is yours and your stack runs without us."
+
+### 8.5 Provider abstraction (VM-on-cheap-cloud, not a specific vendor)
+
+The doc explicitly does not pick Hetzner, Render, or Fly. The pattern is **VM-on-cheap-cloud**, with these properties:
+
+- A small Linux VM (~1-2 vCPU, 2-4GB RAM, 10-20GB disk).
+- Bun + the Parachute stack pre-installed (image baked in CI).
+- DNS managed by Parachute (subdomain → VM IP, or custom-domain CNAME).
+- TLS via Cloudflare in front (ACM-style auto-provision) or Caddy on-host.
+- Backups: nightly snapshot to Parachute-managed object storage; per-tenant export-on-demand.
+- Provider currently: TBD. Hetzner is cheapest; Fly is most operationally polished; Render is closer to PaaS. Pick one for v1, hold the option to switch.
+
+The control plane needs:
+- A **provisioner abstraction** (`createInstance(spec) → handle`) with implementations per provider.
+- A **migrator** (`moveInstance(handle, fromProvider, toProvider)`) for backstop migrations and price-driven moves.
+- A **health-check + auto-restart** layer.
+- A **billing integration** (Stripe; track which tenant owns which instance).
+
+Users never see the provider name. They see "your Parachute Computer instance." Migration risk lives entirely on Parachute's side — if Render dies or prices spike, we move users overnight without a UX hiccup.
+
+This is the "Parachute Computer as managed offering" promise made concrete: we absorb provider-switching risk; the user doesn't even know it exists.
+
+### 8.6 Architecture changes v3 flags for Aaron
+
+In rough order of stakes:
+
+1. **Reverse paraclaw#13?** Bring back a lightweight agent-provider abstraction, scoped initially to cloud. The case from §8.4(b). Single largest architectural call v3 forces.
+2. **Cloud hub ships multi-IDP from day one.** Email/password (native), Google, GitHub, Anthropic-federation. Today's hub has native accounts; federation glue is the new work.
+3. **Provisioner control plane.** A small Bun service that orchestrates VM lifecycle across providers, handles billing (Stripe), tracks tenant state, and runs migrations when providers change. New surface area to build — not large, but it's a real service.
+4. **Anthropic-OAuth federation work.** Implementing "login with Claude" requires Anthropic-side OAuth client registration + the federation glue in the hub. Doable; not currently scaffolded.
+5. **Custom-domain support in cloud hub.** Users want `notes.aarongabriel.com`, not just `<aaron>.parachute.computer`. Cloudflare for SaaS or similar.
+
+None of these require code yet — they're follow-on decisions for after Aaron weighs in on §8.4(b) and the phase plan.
+
+### 8.7 Phase plan (revised from v2)
+
+V2's phases stand; v3 layers operating reality on top:
+
+- **Phase 1 — Parachute Computer Cloud Hub (v3-flavored).** Provisioner control plane + pre-baked stack image + signup at parachute.computer + multi-IDP with Anthropic-federation as flagship + Stripe billing. Validation: 5 paying users in 4 weeks; "log in with Claude → working hub → first agent call" under 5 minutes for paraclaw users. **This is the v1 cloud product.** Roughly two stewards × three weeks; dominated by the provisioner + the Anthropic federation.
+- **Phase 2 — Managed scribe pool.** Same as v2.
+- **Phase 3 — Cloud vault (full SaaS).** Same as v2; parked PRs (#99 + #101) activate.
+- **Phase 4 — BYO-Cloud experiment.** Same as v2.
+- **Concurrent (small): paraclaw agent-provider abstraction back.** §8.4(b). Lightweight version, cloud-first; available to self-hosted as opt-in. Pending Aaron's call.
+
+### 8.8 Updated open questions
+
+V2's six are still alive. V3 adds:
+
+7. **Reverse paraclaw#13 for cloud?** The single load-bearing architectural decision. Cloud needs the abstraction; self-hosted didn't. Suggestion is yes-but-lightweight; Aaron's call.
+8. **Anthropic OAuth — how much do we lean on it?** Build the flagship UX around it knowing it's revocable, or hedge from day one with email/password as the primary path? Spectrum, not binary.
+9. **Provider for v1 — Hetzner, Fly, Render, or other?** This is a price/ops/ergonomics tradeoff that needs founder-level input. Doc doesn't recommend; flags as a call.
+10. **Custom domains at what tier?** Pro-only ($30) or universal? CNAME setup is moderate ops cost.
+
+---
+
+## TL;DR (v3)
+
+- **The product entity is Parachute Computer LLC.** The user pays us; we provision a thin VM on whichever provider is currently cleanest (Hetzner, Render, Fly — abstracted); we hand back a working hub + spokes + a URL. One billing relationship, one mental model.
+- **Claude-login is the flagship UX for paraclaw.** Sign in with Anthropic → hub provisioned + paraclaw federated + Claude has memory. "All they need is an Anthropic account." For vault and scribe the value is just "one less account."
+- **Anthropic-dependency risk is real and explicitly mitigated.** Multi-IDP from day one (email + Google + GitHub + Anthropic-federation); independent identity primitive; multi-API-provider in paraclaw if we reverse #13; self-hosting as the always-available backstop.
+- **Provider abstraction (VM-on-cheap-cloud) is a Parachute-side concern, not user-facing.** We migrate users between providers without UX disruption.
+- **The single biggest architectural call v3 surfaces**: reverse paraclaw#13 to bring back a lightweight agent-provider abstraction. Cloud needs it; self-hosted didn't. Aaron's call.
+- **Phase plan**: Phase 1 = Parachute Computer Cloud Hub with Anthropic federation as flagship. Two stewards × three weeks. Phases 2–4 stand from v2.
