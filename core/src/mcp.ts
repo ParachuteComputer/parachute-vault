@@ -213,6 +213,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             hasLinks: params.has_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            // Push the near-scope into the SQL WHERE so that LIMIT and ORDER
+            // BY apply to the neighborhood. Without this, queryNotes would
+            // fetch the first `limit` notes by created_at and then post-
+            // filter to the few in-scope ones — which silently empties the
+            // result whenever the neighborhood lies outside that prefix.
+            ids: nearScope ? [...nearScope] : undefined,
             metadata: params.metadata as Record<string, unknown> | undefined,
             dateFrom: params.date_from as string | undefined,
             dateTo: params.date_to as string | undefined,
@@ -223,8 +229,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           });
         }
 
-        // --- Apply near-scope filter ---
-        if (nearScope) {
+        // For full-text search the post-filter is still the right shape — FTS
+        // owns its own ranked LIMIT and we just narrow to the neighborhood
+        // afterwards. Structured queries already pushed `ids` into SQL above.
+        if (nearScope && params.search) {
           results = results.filter((n) => nearScope!.has(n.id));
         }
 

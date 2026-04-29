@@ -57,6 +57,11 @@ export interface QueryOpts {
   hasLinks?: boolean;
   path?: string;        // exact path match (case-insensitive)
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
+  // Restrict results to a specific set of note IDs. The MCP `near` query uses
+  // this to push graph-neighborhood scoping into the SQL WHERE clause so that
+  // LIMIT and ORDER BY apply to the filtered set, not the whole notes table.
+  // Empty array → no rows match (avoids `IN ()` syntax error).
+  ids?: string[];
   // Per-field metadata filter. Each value is either a primitive (exact
   // match, today's behavior) or an operator object — `{ eq, ne, gt, gte, lt,
   // lte, in, not_in, exists }` — which routes through the generated column

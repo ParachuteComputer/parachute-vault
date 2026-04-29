@@ -217,6 +217,129 @@ describe("GET /vaults/list (public discovery)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// /auth/status — public preflight discovery (issue #163). Tells first-contact
+// clients which bearer format to use and surfaces auth-state bits the hub's
+// post-exposure flow needs without locking us into any auth check.
+// ---------------------------------------------------------------------------
+
+describe("GET /auth/status (public auth preflight)", () => {
+  test("empty server: initialized=false, no vaults, no auth bits", async () => {
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      initialized: boolean;
+      auth_modes: string[];
+      vaults: { name: string; url: string }[];
+      hasOwnerPassword: boolean;
+      hasTotp: boolean;
+      hasTokens: boolean | null;
+    };
+    expect(body.initialized).toBe(false);
+    expect(body.vaults).toEqual([]);
+    expect(body.auth_modes).toEqual(["pvt_token", "hub_jwt"]);
+    expect(body.hasOwnerPassword).toBe(false);
+    expect(body.hasTotp).toBe(false);
+    // No vaults means hasTokens collapses to false (not null), since there's
+    // no DB to fail on.
+    expect(body.hasTokens).toBe(false);
+  });
+
+  test("vault with no tokens: initialized=true, hasTokens=false", async () => {
+    createVault("journal");
+    // getVaultStore opens (and creates) the SQLite file with the tokens
+    // table — without it, the probe falls into the "DB missing" branch and
+    // hasTokens stays false anyway, but we want the table to exist for the
+    // realistic case.
+    getVaultStore("journal");
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      initialized: boolean;
+      vaults: { name: string; url: string }[];
+      hasTokens: boolean | null;
+    };
+    expect(body.initialized).toBe(true);
+    expect(body.vaults).toEqual([{ name: "journal", url: "/vault/journal" }]);
+    expect(body.hasTokens).toBe(false);
+  });
+
+  test("vault with a token: hasTokens=true", async () => {
+    createVault("journal");
+    createAdminToken("journal");
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    const body = (await res.json()) as { hasTokens: boolean | null };
+    expect(body.hasTokens).toBe(true);
+  });
+
+  test("multiple vaults are all listed; hasTokens=true if any has tokens", async () => {
+    createVault("journal");
+    createVault("work");
+    getVaultStore("journal");
+    createAdminToken("work");
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    const body = (await res.json()) as {
+      vaults: { name: string; url: string }[];
+      hasTokens: boolean | null;
+    };
+    expect(new Set(body.vaults.map((v) => v.name))).toEqual(new Set(["journal", "work"]));
+    expect(body.hasTokens).toBe(true);
+  });
+
+  test("owner password / TOTP set in global config surface as true", async () => {
+    createVault("journal");
+    writeGlobalConfig({
+      port: 1940,
+      owner_password_hash: "$2b$10$abcdefghijklmnopqrstuv",
+      totp_secret: "JBSWY3DPEHPK3PXP",
+    });
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    const body = (await res.json()) as { hasOwnerPassword: boolean; hasTotp: boolean };
+    expect(body.hasOwnerPassword).toBe(true);
+    expect(body.hasTotp).toBe(true);
+  });
+
+  test("response never leaks secrets, hashes, descriptions, or token counts", async () => {
+    createVault("journal", "Private journal — must not appear in /auth/status");
+    createAdminToken("journal");
+    writeGlobalConfig({
+      port: 1940,
+      owner_password_hash: "$2b$10$verysecretpasswordhash",
+      totp_secret: "JBSWY3DPEHPK3PXP",
+      backup_codes: ["$2b$10$backup1", "$2b$10$backup2"],
+    });
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    const dump = JSON.stringify(await res.json());
+    expect(dump).not.toContain("Private journal");
+    expect(dump).not.toContain("$2b$10$verysecretpasswordhash");
+    expect(dump).not.toContain("JBSWY3DPEHPK3PXP");
+    expect(dump).not.toContain("backup");
+    // Token-count guard: even with one token created above, no integer count
+    // appears in the dump. `hasTokens` is the only token-derived field.
+    expect(dump).not.toMatch(/"tokenCount"/);
+    expect(dump).not.toMatch(/"token_count"/);
+  });
+
+  test("ignores Authorization header (endpoint is public)", async () => {
+    const req = new Request("http://localhost:1940/auth/status", {
+      headers: { Authorization: "Bearer not-a-real-token" },
+    });
+    const res = await route(req, "/auth/status");
+    expect(res.status).toBe(200);
+  });
+
+  test("rejects non-GET methods (falls through to 404)", async () => {
+    const req = new Request("http://localhost:1940/auth/status", { method: "POST" });
+    const res = await route(req, "/auth/status");
+    expect(res.status).toBe(404);
+  });
+
+  test("response includes CORS allow-origin so first-contact browser clients can read it", async () => {
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Per-vault routing: /vault/<name>/... is the only URL shape for vault
 // resources. Unscoped routes (/mcp, /api/*, /oauth/*) no longer exist.
 // ---------------------------------------------------------------------------
