@@ -1368,6 +1368,43 @@ describe("MCP tools", async () => {
     expect(err?.message).toMatch(/mutually exclusive/);
   });
 
+  it("update-note rejects content + content_edit in same call", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "replace",
+        content_edit: { old_text: "hello", new_text: "hi" },
+        force: true,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note rejects append + content_edit in same call", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        append: " more",
+        content_edit: { old_text: "hello", new_text: "hi" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
   it("update-note append still requires precondition when combined with other fields", async () => {
     const note = await store.createNote("body", { id: "n1" });
     const tools = generateMcpTools(store);
@@ -1434,6 +1471,98 @@ describe("MCP tools", async () => {
 
     const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links.some((l) => l.targetId === target.id && l.relationship === "wikilink")).toBe(true);
+  });
+
+  it("update-note content_edit replaces a single occurrence", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content_edit: { old_text: "hello", new_text: "hi" },
+      if_updated_at: note.updatedAt,
+    }) as any;
+    expect(result.content).toBe("hi world");
+  });
+
+  it("update-note content_edit errors when old_text is not found", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "missing", new_text: "x" },
+        if_updated_at: note.updatedAt,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/not found/);
+    // Note must be untouched.
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("hello world");
+  });
+
+  it("update-note content_edit errors when old_text matches multiple times", async () => {
+    const note = await store.createNote("hello hello", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: note.updatedAt,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/matches multiple times|exactly once/);
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("hello hello");
+  });
+
+  it("update-note content_edit requires precondition by default", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+  });
+
+  it("update-note content_edit conflicts when if_updated_at is stale", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump the note so a stale token will conflict at the SQL layer.
+    await updateNote.execute({ id: note.id, content: "hello world", force: true });
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
   });
 
   it("query-notes single note by id", async () => {

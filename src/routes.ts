@@ -434,11 +434,13 @@ export async function handleNotes(
       // --- Validate mutual exclusion of content modes ---
       const hasContent = body.content !== undefined;
       const hasAppendPrepend = body.append !== undefined || body.prepend !== undefined;
-      if (hasContent && hasAppendPrepend) {
+      const hasContentEdit = body.content_edit !== undefined;
+      const contentModes = (hasContent ? 1 : 0) + (hasAppendPrepend ? 1 : 0) + (hasContentEdit ? 1 : 0);
+      if (contentModes > 1) {
         return json(
           {
             error: "mutually_exclusive",
-            message: "`content` and `append`/`prepend` are mutually exclusive — pick one mode of content update.",
+            message: "`content`, `append`/`prepend`, and `content_edit` are mutually exclusive — pick one mode of content update.",
           },
           400,
         );
@@ -453,6 +455,7 @@ export async function handleNotes(
       // is no-conflict-by-design.
       const isAppendOnly = hasAppendPrepend
         && !hasContent
+        && !hasContentEdit
         && body.path === undefined
         && body.metadata === undefined
         && body.created_at === undefined
@@ -471,10 +474,36 @@ export async function handleNotes(
         );
       }
 
+      // --- Resolve content_edit into a full content string ---
+      let contentOverride = body.content as string | undefined;
+      if (hasContentEdit) {
+        const ce = body.content_edit as { old_text?: unknown; new_text?: unknown };
+        if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
+          return json(
+            { error: "bad_request", message: "`content_edit` requires { old_text: string, new_text: string }." },
+            400,
+          );
+        }
+        const idx = note.content.indexOf(ce.old_text);
+        if (idx < 0) {
+          return json(
+            { error: "not_found", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` },
+            404,
+          );
+        }
+        const second = note.content.indexOf(ce.old_text, idx + 1);
+        if (second >= 0) {
+          return json(
+            { error: "ambiguous", message: `content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context.` },
+            409,
+          );
+        }
+        contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
+      }
+
       // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
       // The actual link deletions happen only after the core UPDATE succeeds,
       // so a conflict leaves the note untouched.
-      let contentOverride = body.content as string | undefined;
       const linksRemove = body.links?.remove as { target: string; relationship: string }[] | undefined;
       const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
       if (linksRemove) {
