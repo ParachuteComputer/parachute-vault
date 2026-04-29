@@ -41,6 +41,7 @@ const TOOL_REQUIRED_VERB: Record<string, VaultVerb> = {
   "query-notes": "read",
   "list-tags": "read",
   "find-path": "read",
+  "synthesize-notes": "read",
   "vault-info": "read",
   "create-note": "write",
   "update-note": "write",

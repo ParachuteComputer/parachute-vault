@@ -1,11 +1,12 @@
 /**
  * REST API route handlers for the multi-vault server.
  *
- * Mirrors the 9 MCP tools:
+ * Mirrors the MCP tools:
  *   /api/notes          — query-notes, create-note, update-note, delete-note
  *   /api/tags           — list-tags, update-tag, delete-tag
  *   /api/find-path      — find-path
  *   /api/vault          — vault-info
+ * (synthesize-notes is MCP-only; agents call it through the MCP transport.)
  *
  * Each handler receives a Store instance (already resolved for the vault)
  * and the Request, and returns a Response.

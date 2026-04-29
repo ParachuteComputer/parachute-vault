@@ -476,9 +476,9 @@ describe("deeper link queries", async () => {
 });
 
 describe("MCP tools", async () => {
-  test("generates all 9 core tools", () => {
+  test("generates all 10 core tools", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(9);
+    expect(tools.length).toBe(10);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -489,6 +489,7 @@ describe("MCP tools", async () => {
     expect(names).toContain("update-tag");
     expect(names).toContain("delete-tag");
     expect(names).toContain("find-path");
+    expect(names).toContain("synthesize-notes");
     expect(names).toContain("vault-info");
   });
 

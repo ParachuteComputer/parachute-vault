@@ -45,13 +45,13 @@ Metadata is a JSON column on notes, links, and attachments. Queryable via `json_
 
 Path is unique (when set), normalized (no .md, no trailing slashes), and used for wikilink resolution.
 
-### MCP Tools (9)
+### MCP Tools (10)
 
 Notes: `query-notes` (single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata merge), `delete-note`
 
 Tags: `list-tags` (with optional schema detail), `update-tag` (upsert schema), `delete-tag`
 
-Graph: `find-path` (BFS shortest path)
+Graph: `find-path` (BFS shortest path), `synthesize-notes` (anchor + neighbors + search → ranked neighborhood, connections, tag distribution, timeline; agent writes the narrative)
 
 Vault: `vault-info` (get/update description + stats)
 
