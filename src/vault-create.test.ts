@@ -53,7 +53,12 @@ describe("vault create --json", () => {
     expect(stderr).toBe("");
 
     // stdout must be exactly one JSON object — single-line, parseable.
-    const payload = JSON.parse(stdout.trim());
+    // Asserting line count first so a regression that prints a banner above
+    // the JSON fails with "expected 1 line, got 2" rather than the much
+    // less actionable "JSON parse error".
+    const lines = stdout.trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const payload = JSON.parse(lines[0]!);
     expect(payload.name).toBe("myvault");
     expect(payload.token).toMatch(/^pvt_/);
     expect(payload.set_as_default).toBe(true);
