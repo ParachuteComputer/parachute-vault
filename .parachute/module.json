@@ -1,0 +1,14 @@
+{
+  "name": "vault",
+  "manifestName": "parachute-vault",
+  "displayName": "Vault",
+  "tagline": "Your owner-authenticated MCP knowledge store.",
+  "kind": "api",
+  "port": 1940,
+  "paths": ["/vault/default"],
+  "health": "/vault/default/health",
+  "startCmd": ["parachute-vault", "serve"],
+  "scopes": {
+    "defines": ["vault:read", "vault:write", "vault:admin"]
+  }
+}
