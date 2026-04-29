@@ -280,6 +280,28 @@ describe("OAuth authorization", () => {
     expect(location.searchParams.get("state")).toBe("mystate");
   });
 
+  test("POST authorize without scope is rejected (no silent default to 'full', #197)", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const req = makeRequest("https://vault.test/oauth/authorize", {
+      method: "POST",
+      body: new URLSearchParams({
+        action: "authorize",
+        client_id: clientId,
+        redirect_uri: "https://example.com/callback",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
+        // No scope field — pre-#197 this silently consented to "full".
+        owner_token: ownerToken,
+      }),
+    });
+    const res = await handleAuthorizePost(req, db);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("invalid_request");
+  });
+
   test("POST authorize (deny) redirects with error", async () => {
     const clientId = await registerClient();
     const { codeChallenge } = generatePkce();

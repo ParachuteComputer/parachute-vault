@@ -394,13 +394,12 @@ export async function handleAuthorizePost(
   const redirectUri = form.get("redirect_uri") as string;
   const codeChallenge = form.get("code_challenge") as string;
   const codeChallengeMethod = form.get("code_challenge_method") as string || "S256";
-  // Requested scope (from hidden field, carried from GET) and selected scope
-  // (from radio button on the consent page). Default selected to requested.
-  const requestedScope = form.get("scope") as string || "full";
+  // Requested scope is carried from the GET via a hidden field on the consent
+  // page; the user's radio-button choice arrives in `selected_scope`. The
+  // required-ness check runs *after* the deny short-circuit below — a deny
+  // POST doesn't mint anything and shouldn't need scope to refuse.
+  const requestedScopeRaw = form.get("scope");
   const selectedScopeRaw = form.get("selected_scope") as string | null;
-  const selectedScope = selectedScopeRaw === "read" || selectedScopeRaw === "full"
-    ? selectedScopeRaw
-    : (requestedScope === "read" ? "read" : "full");
   const state = form.get("state") as string || "";
 
   if (!clientId || !redirectUri || !codeChallenge) {
@@ -434,6 +433,20 @@ export async function handleAuthorizePost(
     redirect.searchParams.set("error", "access_denied");
     return Response.redirect(redirect.toString(), 302);
   }
+
+  // Past this point we're processing consent — scope must be explicitly
+  // present. Defaulting absent scope to "full" would silently cement a
+  // grant the user never confirmed (#197).
+  if (typeof requestedScopeRaw !== "string" || requestedScopeRaw.length === 0) {
+    return Response.json(
+      { error: "invalid_request", error_description: "scope is required" },
+      { status: 400 },
+    );
+  }
+  const requestedScope = requestedScopeRaw;
+  const selectedScope = selectedScopeRaw === "read" || selectedScopeRaw === "full"
+    ? selectedScopeRaw
+    : (requestedScope === "read" ? "read" : "full");
 
   // Rate-limit the owner-auth step. Applied before any credential check so
   // brute-force attempts are capped regardless of which path (password or
