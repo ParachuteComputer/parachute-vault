@@ -180,6 +180,21 @@ describe("config", () => {
     writeGlobalConfig({ port: 1940, discovery: "disabled" });
     expect(readGlobalConfig().discovery).toBe("disabled");
   });
+
+  test("round-trips autostart: true|false (#113)", () => {
+    // Default: absent means autostart-on (init registers the daemon).
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().autostart).toBeUndefined();
+
+    // Explicit true (e.g., user re-enabled after disabling).
+    writeGlobalConfig({ port: 1940, autostart: true });
+    expect(readGlobalConfig().autostart).toBe(true);
+
+    // Explicit false — the opt-out signal init writes when --no-autostart is
+    // passed. Daemon registration is then skipped on this and future inits.
+    writeGlobalConfig({ port: 1940, autostart: false });
+    expect(readGlobalConfig().autostart).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
