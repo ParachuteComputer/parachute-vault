@@ -237,7 +237,14 @@ export async function route(
   // hub's out-of-process filesystem snoop (parachute-hub#86 follow-up).
   // No auth, GET-only, no token counts — `hasTokens` is a yes/no signal
   // only, with `null` for "DB read failed."
+  //
+  // Gated on `discovery: disabled` like /vaults/list — both leak vault
+  // existence (the `vaults` array names them), so an operator who hides
+  // one wants both hidden (#191).
   if (path === "/auth/status" && req.method === "GET") {
+    if (readGlobalConfig().discovery === "disabled") {
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
     return Response.json(buildAuthStatus(), {
       headers: { "Access-Control-Allow-Origin": "*" },
     });

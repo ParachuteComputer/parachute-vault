@@ -280,6 +280,28 @@ describe("OAuth authorization", () => {
     expect(location.searchParams.get("state")).toBe("mystate");
   });
 
+  test("POST authorize without scope is rejected (no silent default to 'full', #197)", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const req = makeRequest("https://vault.test/oauth/authorize", {
+      method: "POST",
+      body: new URLSearchParams({
+        action: "authorize",
+        client_id: clientId,
+        redirect_uri: "https://example.com/callback",
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
+        // No scope field — pre-#197 this silently consented to "full".
+        owner_token: ownerToken,
+      }),
+    });
+    const res = await handleAuthorizePost(req, db);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("invalid_request");
+  });
+
   test("POST authorize (deny) redirects with error", async () => {
     const clientId = await registerClient();
     const { codeChallenge } = generatePkce();
@@ -1983,6 +2005,55 @@ describe("OAuth scope binding (#94, RFC 6749 §3.3 / §6)", () => {
           client_id: clientId,
           redirect_uri: redirectUri,
           scope: "read", // narrower than bound
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = (await tokenRes.json()) as { scope?: string };
+    expect(body.scope).toBe("vault:read");
+  });
+
+  test("/token treats whitespace-only scope as absent and falls through to bound scope (#196)", async () => {
+    // Guard at oauth.ts checks `scope !== null && scope.trim().length > 0`.
+    // A client sending `scope=   ` is the same as omitting `scope` — we
+    // must not run subset enforcement against the whitespace string and
+    // reject it as invalid.
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "read",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          scope: "   ", // whitespace only — should fall through to bound
         }).toString(),
       }),
       db,

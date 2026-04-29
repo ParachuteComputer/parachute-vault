@@ -184,6 +184,10 @@ export class RateLimiter {
  * through per-vault routing. Fresh callers should prefer
  * `getAuthorizeRateLimiter(vaultName)` so traffic on one vault's consent flow
  * doesn't lock out IPs on another vault's consent flow (#93).
+ *
+ * @deprecated Use `getAuthorizeRateLimiter(vaultName)` instead. The singleton
+ * cross-pollutes per-vault consent traffic — one vault under brute-force can
+ * lock out IPs on every other vault's consent page.
  */
 export const authorizeRateLimit = new RateLimiter();
 

@@ -214,8 +214,27 @@ export function updateNote(
     // race window is impossible: each `UPDATE` evaluates `content`
     // under the write lock, so two simultaneous appends both land
     // (in some order) instead of one clobbering the other.
-    sets.push("content = ? || content || ?");
-    values.push(updates.prepend ?? "", updates.append ?? "");
+    //
+    // Frontmatter-aware prepend (#203): if the note opens with a YAML
+    // frontmatter block (`---\n...\n---\n`), the prepend is injected
+    // *after* the closing `---\n` so parsers that expect frontmatter
+    // at byte 0 still find it. Detection uses `instr(content, '\n---\n')`
+    // — the closing fence is whatever `\n---\n` appears after the
+    // opening one. If no frontmatter is detected, prepend goes at
+    // byte 0 as before. Atomicity is preserved: the entire transform
+    // is one UPDATE expression evaluated under the write lock.
+    sets.push(
+      "content = CASE "
+        + "WHEN substr(content, 1, 4) = '---' || char(10) "
+        + "AND instr(content, char(10) || '---' || char(10)) > 0 "
+        + "THEN substr(content, 1, instr(content, char(10) || '---' || char(10)) + 4) || ? "
+        + "|| substr(content, instr(content, char(10) || '---' || char(10)) + 5) || ? "
+        + "ELSE ? || content || ? "
+        + "END",
+    );
+    const prependVal = updates.prepend ?? "";
+    const appendVal = updates.append ?? "";
+    values.push(prependVal, appendVal, prependVal, appendVal);
   }
   if (updates.path !== undefined) {
     sets.push("path = ?");

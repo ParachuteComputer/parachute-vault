@@ -18,7 +18,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from "bun:test";
-import { rmSync, existsSync, mkdirSync } from "fs";
+import { rmSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -42,6 +42,7 @@ const {
 // even when the DB files are already gone.
 const { clearVaultStoreCache, getVaultStore } = await import("./vault-store.ts");
 const { generateToken, createToken } = await import("./token-store.ts");
+const { vaultDbPath } = await import("./config.ts");
 
 function createVault(name: string, description?: string): void {
   writeVaultConfig({
@@ -283,6 +284,24 @@ describe("GET /auth/status (public auth preflight)", () => {
     };
     expect(new Set(body.vaults.map((v) => v.name))).toEqual(new Set(["journal", "work"]));
     expect(body.hasTokens).toBe(true);
+  });
+
+  test("hasTokens degrades to null when one vault has tokens and another DB is unreadable (#192)", async () => {
+    // The probe loop's whole point: a single failed DB read poisons the
+    // overall answer to `null`, even if an earlier vault already proved
+    // tokens exist. Otherwise an operator who locked one DB would see a
+    // misleading `true` and think auth-state is fully observable.
+    createVault("alpha");
+    createAdminToken("alpha");
+    createVault("beta");
+    // Replace beta's DB file with a non-SQLite blob; the readonly Database
+    // open throws at probe time. clearVaultStoreCache so beta's pre-opened
+    // handle (if any) doesn't shadow the on-disk corruption.
+    clearVaultStoreCache();
+    writeFileSync(vaultDbPath("beta"), "not-a-sqlite-file");
+    const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
+    const body = (await res.json()) as { hasTokens: boolean | null };
+    expect(body.hasTokens).toBeNull();
   });
 
   test("owner password / TOTP set in global config surface as true", async () => {

@@ -452,14 +452,18 @@ export async function handleNotes(
       // RFC 6585 status for exactly this case.
       //
       // Append/prepend-only updates are exempt — SQL-atomic concatenation
-      // is no-conflict-by-design.
+      // is no-conflict-by-design. Tag/link mutations are *not* exempt
+      // (#201): they're idempotent set-ops, but still represent a
+      // non-content change the caller should observe before re-asserting.
       const isAppendOnly = hasAppendPrepend
         && !hasContent
         && !hasContentEdit
         && body.path === undefined
         && body.metadata === undefined
         && body.created_at === undefined
-        && body.createdAt === undefined;
+        && body.createdAt === undefined
+        && body.tags === undefined
+        && body.links === undefined;
       if (!isAppendOnly && body.if_updated_at === undefined && body.force !== true) {
         return json(
           {
@@ -486,9 +490,13 @@ export async function handleNotes(
         }
         const idx = note.content.indexOf(ce.old_text);
         if (idx < 0) {
+          // 422 Unprocessable Entity, not 404: the note exists, the request is
+          // syntactically valid, but the search string can't be applied to the
+          // current content. Returning 404 implied "note doesn't exist" and
+          // confused operators chasing a missing record (#202).
           return json(
-            { error: "not_found", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` },
-            404,
+            { error: "unprocessable_content", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` },
+            422,
           );
         }
         const second = note.content.indexOf(ce.old_text, idx + 1);
