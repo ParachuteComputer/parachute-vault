@@ -452,14 +452,18 @@ export async function handleNotes(
       // RFC 6585 status for exactly this case.
       //
       // Append/prepend-only updates are exempt — SQL-atomic concatenation
-      // is no-conflict-by-design.
+      // is no-conflict-by-design. Tag/link mutations are *not* exempt
+      // (#201): they're idempotent set-ops, but still represent a
+      // non-content change the caller should observe before re-asserting.
       const isAppendOnly = hasAppendPrepend
         && !hasContent
         && !hasContentEdit
         && body.path === undefined
         && body.metadata === undefined
         && body.created_at === undefined
-        && body.createdAt === undefined;
+        && body.createdAt === undefined
+        && body.tags === undefined
+        && body.links === undefined;
       if (!isAppendOnly && body.if_updated_at === undefined && body.force !== true) {
         return json(
           {

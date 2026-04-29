@@ -1365,6 +1365,24 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect((await store.getNote("x"))!.content).toBe("seed: A");
   });
 
+  test("PATCH append + tags without precondition is rejected (#201)", async () => {
+    // The append-only exemption is justified by SQL-atomic concat. Tag
+    // mutations don't share that property — they're idempotent, but the
+    // caller should still observe the prior state before re-asserting.
+    await store.createNote("seed:", { id: "x", path: "Inbox/x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { append: " A", tags: { add: ["important"] } }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(428);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("precondition_required");
+    // Unchanged on rejection.
+    expect((await store.getNote("x"))!.content).toBe("seed:");
+  });
+
   test("PATCH content_edit replaces a single occurrence", async () => {
     const note = await store.createNote("hello world", { id: "x" });
 

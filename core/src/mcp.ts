@@ -492,13 +492,18 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           //
           // Append/prepend-only updates are exempt: they're SQL-atomic
           // concatenations that can't lose data on a stale read, so the
-          // precondition would be ceremony for no benefit.
+          // precondition would be ceremony for no benefit. Tag and link
+          // mutations are *not* exempt — they're idempotent set-ops at
+          // the SQL layer but still represent a non-content change the
+          // caller should have observed before re-asserting (#201).
           const isAppendOnly = hasAppendPrepend
             && !hasContent
             && !hasContentEdit
             && item.path === undefined
             && item.metadata === undefined
-            && item.created_at === undefined;
+            && item.created_at === undefined
+            && item.tags === undefined
+            && item.links === undefined;
           if (!isAppendOnly && item.if_updated_at === undefined && item.force !== true) {
             throw new PreconditionRequiredError(note.id, note.path ?? null);
           }
