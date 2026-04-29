@@ -175,8 +175,11 @@ function readDefaultsMapping(metadata: unknown): SchemaDefaults {
  */
 export function loadSchemaConfig(db: Database): ResolvedSchemas {
   const definitions = new Map<string, SchemaDefinition>();
+  // GLOB rather than LIKE — `_` is a single-character wildcard in LIKE, so
+  // `path LIKE '_schemas/%'` would also match `Aschemas/foo`. GLOB takes `_`
+  // as a literal and matches only the intended `_schemas/*` namespace.
   const defRows = db.prepare(
-    `SELECT path, metadata FROM notes WHERE path LIKE '_schemas/%'`,
+    `SELECT path, metadata FROM notes WHERE path GLOB '_schemas/*'`,
   ).all() as { path: string; metadata: string | null }[];
   for (const row of defRows) {
     const name = row.path.slice(SCHEMA_CONFIG_PREFIX.length);

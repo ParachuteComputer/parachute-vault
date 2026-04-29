@@ -233,6 +233,21 @@ export class BunSqliteStore implements Store {
   }
 
   async searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]> {
+    // Same hierarchy-expansion treatment as queryNotes — searching `#manual`
+    // should match notes tagged with any descendant tag. The underlying
+    // FTS path already uses `IN (...)` for tags, so we flatten the
+    // per-input expansions into a single union (search semantics are
+    // "any tag matches").
+    if (opts?.tags && opts.tags.length > 0) {
+      const hierarchy = this.getTagHierarchy();
+      if (hierarchy.childrenOf.size > 0) {
+        const expanded = new Set<string>();
+        for (const t of opts.tags) {
+          for (const x of getTagDescendants(hierarchy, t)) expanded.add(x);
+        }
+        return noteOps.searchNotes(this.db, query, { ...opts, tags: Array.from(expanded) });
+      }
+    }
     return noteOps.searchNotes(this.db, query, opts);
   }
 
@@ -294,6 +309,11 @@ export class BunSqliteStore implements Store {
   async createNotes(inputs: noteOps.BulkNoteInput[]): Promise<Note[]> {
     const notes = noteOps.createNotes(this.db, inputs);
     for (const note of notes) {
+      // Bulk path needs the same config-cache invalidation as singleton
+      // createNote — without it, a batch that includes `_tags/*` or
+      // `_schemas/*` notes would leave the cache stale until the next
+      // singleton write happened to bust it.
+      this.invalidateConfigCachesForPath(note.path);
       this.hooks.dispatch("created", note, this);
     }
     return notes;
@@ -344,9 +364,24 @@ export class BunSqliteStore implements Store {
   /**
    * Create a note without triggering wikilink sync.
    * Use this during bulk imports, then call syncAllWikilinks() after.
+   *
+   * Does **not** invalidate the `_tags/*` / `_schemas/*` config caches —
+   * importers writing config notes through this path must call
+   * `rebuildConfigCaches()` once the import is done. (Default importers
+   * follow `createNoteRaw` with `syncAllWikilinks`, so adding the cache
+   * rebuild there is the natural place.)
    */
   async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
     return noteOps.createNote(this.db, content, opts);
+  }
+
+  /**
+   * Drop the config caches unconditionally. Used by bulk-import paths that
+   * skip per-note invalidation for throughput.
+   */
+  rebuildConfigCaches(): void {
+    this._tagHierarchy = null;
+    this._schemaConfig = null;
   }
 
   /**

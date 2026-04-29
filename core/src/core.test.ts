@@ -2664,6 +2664,34 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
     expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
   });
+
+  it("non-_tags paths starting with arbitrary letter + 'tags/' are NOT picked up as config notes", async () => {
+    // Regression: SQLite LIKE treats `_` as a wildcard, so `path LIKE '_tags/%'`
+    // would silently match `Atags/foo`. We use GLOB to require a literal `_`.
+    await store.createNote("decoy", {
+      path: "Atags/voice",
+      metadata: { parents: ["manual"] },
+    });
+    await store.createNote("voice note", { tags: ["voice"] });
+
+    // The decoy must NOT register voice as a child of manual.
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+  });
+
+  it("bulk createNotes invalidates the hierarchy cache", async () => {
+    // Prime the cache so the empty hierarchy is loaded.
+    await store.queryNotes({ tags: ["manual"] });
+
+    await store.createNotes([
+      { content: "", path: "_tags/voice", metadata: { parents: ["manual"] } },
+      { content: "voice note", tags: ["voice"] },
+    ]);
+
+    // Without invalidation, the cached empty hierarchy would persist and
+    // the next query for #manual would return zero. With invalidation, the
+    // next read rebuilds and the descendant expansion picks up #voice.
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2936,6 +2964,26 @@ describe("default schemas (_schemas/* + _schema_defaults)", async () => {
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
     const result = await create.execute({ content: "anything" }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("non-_schemas paths starting with arbitrary letter + 'schemas/' are NOT picked up as schema notes", async () => {
+    // Regression: same SQLite LIKE-vs-GLOB issue as `_tags/`.
+    await store.createNote("decoy", {
+      path: "Aschemas/task",
+      metadata: { required: ["priority"] },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "x", tags: ["task"] }) as any;
+
+    // `task` schema doesn't exist in `_schemas/*`, so the mapping resolves
+    // to nothing and validation_status is omitted.
     expect(result.validation_status).toBeUndefined();
   });
 });

@@ -59,8 +59,13 @@ function readParents(metadata: unknown): string[] {
  * The tag name comes from the path suffix (e.g. `_tags/voice` → `voice`).
  */
 export function loadTagHierarchy(db: Database): TagHierarchy {
+  // GLOB instead of LIKE: SQLite's LIKE treats `_` as a single-character
+  // wildcard, so `path LIKE '_tags/%'` would also match `Atags/foo`,
+  // `xtags/bar`, etc. — any letter + `tags/` would silently be read as a
+  // tag-config note. GLOB takes `_` as a literal and matches only the
+  // intended `_tags/*` namespace.
   const rows = db.prepare(
-    `SELECT path, metadata FROM notes WHERE path LIKE '_tags/%'`,
+    `SELECT path, metadata FROM notes WHERE path GLOB '_tags/*'`,
   ).all() as { path: string; metadata: string | null }[];
 
   const childrenOf = new Map<string, Set<string>>();
