@@ -1864,3 +1864,222 @@ describe("OAuth consent — per-vault rate limiting (#93)", () => {
     expect(limiter.check("10.0.0.4").allowed).toBe(true); // still under threshold
   });
 });
+
+// ---------------------------------------------------------------------------
+// Server-bound scope at /authorize, subset enforcement at /token (#94)
+// ---------------------------------------------------------------------------
+
+describe("OAuth scope binding (#94, RFC 6749 §3.3 / §6)", () => {
+  test("/authorize floors selected scope to requested — form cannot smuggle a broader scope", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "read",            // requested = read
+          selected_scope: "full",   // smuggled broader value
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    expect(authRes.status).toBe(302);
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    // The bound scope on the issued auth code must be the narrower of the two.
+    const row = db
+      .prepare("SELECT scope FROM oauth_codes WHERE code = ?")
+      .get(code) as { scope: string };
+    expect(row.scope).toBe("read");
+  });
+
+  test("/token rejects requested scope broader than bound (read → full)", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "read",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          scope: "full", // attempt to broaden
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    expect(tokenRes.status).toBe(400);
+    const body = (await tokenRes.json()) as { error?: string };
+    expect(body.error).toBe("invalid_scope");
+  });
+
+  test("/token accepts a narrower requested scope (full → read) and reflects it on the token", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          scope: "read", // narrower than bound
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = (await tokenRes.json()) as { scope?: string };
+    expect(body.scope).toBe("vault:read");
+  });
+
+  test("/token rejects unknown scope strings even when the bound scope is broad", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "full",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          scope: "vault:admin", // not in the consent vocabulary
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    expect(tokenRes.status).toBe(400);
+    const body = (await tokenRes.json()) as { error?: string };
+    expect(body.error).toBe("invalid_scope");
+  });
+
+  test("/token uses the bound scope when no scope param is sent (regression)", async () => {
+    const ownerToken = createOwnerToken();
+    const clientId = await registerClient();
+    const { codeVerifier, codeChallenge } = generatePkce();
+    const redirectUri = "https://example.com/callback";
+
+    const authRes = await handleAuthorizePost(
+      makeRequest("https://vault.test/oauth/authorize", {
+        method: "POST",
+        body: new URLSearchParams({
+          action: "authorize",
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          scope: "read",
+          owner_token: ownerToken,
+        }),
+      }),
+      db,
+      { vaultName: "default" },
+    );
+    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
+
+    const tokenRes = await handleToken(
+      makeRequest("https://vault.test/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          code_verifier: codeVerifier,
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          // no scope param
+        }).toString(),
+      }),
+      db,
+      "default",
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = (await tokenRes.json()) as { scope?: string };
+    expect(body.scope).toBe("vault:read");
+  });
+});
