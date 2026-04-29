@@ -431,11 +431,33 @@ export async function handleNotes(
       if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
       const body = await req.json() as any;
 
+      // --- Validate mutual exclusion of content modes ---
+      const hasContent = body.content !== undefined;
+      const hasAppendPrepend = body.append !== undefined || body.prepend !== undefined;
+      if (hasContent && hasAppendPrepend) {
+        return json(
+          {
+            error: "mutually_exclusive",
+            message: "`content` and `append`/`prepend` are mutually exclusive — pick one mode of content update.",
+          },
+          400,
+        );
+      }
+
       // --- Safety-by-default: refuse mutations without a precondition ---
       // Mirror the MCP tool: require `if_updated_at` unless the caller
       // explicitly sets `force: true`. 428 Precondition Required is the
       // RFC 6585 status for exactly this case.
-      if (body.if_updated_at === undefined && body.force !== true) {
+      //
+      // Append/prepend-only updates are exempt — SQL-atomic concatenation
+      // is no-conflict-by-design.
+      const isAppendOnly = hasAppendPrepend
+        && !hasContent
+        && body.path === undefined
+        && body.metadata === undefined
+        && body.created_at === undefined
+        && body.createdAt === undefined;
+      if (!isAppendOnly && body.if_updated_at === undefined && body.force !== true) {
         return json(
           {
             error_type: "precondition_required",
@@ -461,7 +483,12 @@ export async function handleNotes(
           if (!target) continue;
           resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
           if (link.relationship === "wikilink" && target.path) {
-            const current = contentOverride ?? note.content;
+            // Materialize the prospective content for append/prepend callers
+            // so we don't fight the SQL-atomic path with a JS-level rewrite.
+            const current = contentOverride
+              ?? (hasAppendPrepend
+                ? (body.prepend as string ?? "") + note.content + (body.append as string ?? "")
+                : note.content);
             const cleaned = removeWikilinkBrackets(current, target.path);
             if (cleaned !== current) contentOverride = cleaned;
           }
@@ -470,7 +497,12 @@ export async function handleNotes(
 
       // --- Core update (runs the if_updated_at check atomically) ---
       const updates: any = {};
-      if (contentOverride !== undefined) updates.content = contentOverride;
+      if (contentOverride !== undefined) {
+        updates.content = contentOverride;
+      } else if (hasAppendPrepend) {
+        if (body.append !== undefined) updates.append = body.append;
+        if (body.prepend !== undefined) updates.prepend = body.prepend;
+      }
       if (body.path !== undefined) updates.path = body.path;
       if (body.metadata !== undefined) {
         const existing = (note.metadata as Record<string, unknown>) ?? {};

@@ -1353,6 +1353,29 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect((await store.getNote("x"))!.content).toBe("first");
   });
 
+  test("PATCH append without precondition succeeds (no-conflict-by-design) — #79", async () => {
+    await store.createNote("seed:", { id: "x" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { append: " A" }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    expect((await store.getNote("x"))!.content).toBe("seed: A");
+  });
+
+  test("PATCH rejects content + append combination with 400 — #79", async () => {
+    await store.createNote("seed", { id: "x" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "new", append: "more", force: true }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error).toBe("mutually_exclusive");
+  });
+
   test("DELETE resolves note by path", async () => {
     await store.createNote("x", { path: "Temp/note" });
     const res = await handleNotes(

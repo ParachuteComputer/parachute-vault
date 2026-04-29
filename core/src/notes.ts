@@ -152,6 +152,19 @@ export function updateNote(
   id: string,
   updates: {
     content?: string;
+    /**
+     * Atomic content append. Computed via SQL string concatenation
+     * (`content = content || ?`), so two concurrent appends never
+     * overwrite each other — the second simply lands after the first.
+     * Mutually exclusive with `content`.
+     */
+    append?: string;
+    /**
+     * Atomic content prepend. Same SQL-level guarantee as `append`.
+     * Mutually exclusive with `content`. May be combined with `append`
+     * in a single call (both contributions land).
+     */
+    prepend?: string;
     path?: string;
     metadata?: Record<string, unknown>;
     created_at?: string;
@@ -164,6 +177,12 @@ export function updateNote(
     if_updated_at?: string;
   },
 ): Note {
+  if (updates.content !== undefined && (updates.append !== undefined || updates.prepend !== undefined)) {
+    throw new Error(
+      "update-note: `content` is mutually exclusive with `append`/`prepend`. Pick full-replace or additive — not both in the same call.",
+    );
+  }
+
   const sets: string[] = [];
   const values: unknown[] = [];
 
@@ -188,6 +207,15 @@ export function updateNote(
   if (updates.content !== undefined) {
     sets.push("content = ?");
     values.push(updates.content);
+  }
+  if (updates.append !== undefined || updates.prepend !== undefined) {
+    // Atomic concat at the SQL layer. SQLite's `||` operator on the
+    // existing `content` column means a concurrent reader-then-writer
+    // race window is impossible: each `UPDATE` evaluates `content`
+    // under the write lock, so two simultaneous appends both land
+    // (in some order) instead of one clobbering the other.
+    sets.push("content = ? || content || ?");
+    values.push(updates.prepend ?? "", updates.append ?? "");
   }
   if (updates.path !== undefined) {
     sets.push("path = ?");

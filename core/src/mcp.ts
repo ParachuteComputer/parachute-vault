@@ -363,20 +363,25 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       name: "update-note",
       description: `Update one or more notes. Accepts ID or path. Supports content, path, metadata updates plus tag and link mutations.
 
+- Two content-modification modes (mutually exclusive):
+  - \`content\` — full replace.
+  - \`append\` / \`prepend\` — atomic concatenation at the SQL layer. Multiple agents appending to the same note never overwrite each other. No separator is added; include trailing/leading whitespace yourself if needed. May be combined with each other.
 - \`tags: { add: ["x"], remove: ["y"] }\` — add/remove tags
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
-- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally.`,
+- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).`,
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "string", description: "Note ID or path" },
-          content: { type: "string", description: "New content" },
+          content: { type: "string", description: "New content (full replace). Mutually exclusive with `append`/`prepend`." },
+          append: { type: "string", description: "Text to append to the end of the note. Atomic at the SQL layer — concurrent appends are safe. Mutually exclusive with `content`. No precondition required." },
+          prepend: { type: "string", description: "Text to prepend to the start of the note. Atomic at the SQL layer. Mutually exclusive with `content`. May combine with `append`. No precondition required." },
           path: { type: "string", description: "New path" },
           metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
           created_at: { type: "string", description: "New created_at timestamp" },
-          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set." },
+          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
           force: { type: "boolean", description: "Override the required `if_updated_at` check and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe." },
           tags: {
             type: "object",
@@ -422,10 +427,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               properties: {
                 id: { type: "string" },
                 content: { type: "string" },
+                append: { type: "string" },
+                prepend: { type: "string" },
                 path: { type: "string" },
                 metadata: { type: "object" },
                 created_at: { type: "string" },
-                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item." },
+                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item or the item is `append`/`prepend`-only." },
                 force: { type: "boolean", description: "Override the required `if_updated_at` check for this item." },
                 tags: { type: "object" },
                 links: { type: "object" },
@@ -444,12 +451,30 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         for (const item of items) {
           const note = requireNote(db, item.id as string);
 
+          // --- Validate mutual exclusion of content modes ---
+          const hasContent = item.content !== undefined;
+          const hasAppendPrepend = item.append !== undefined || item.prepend !== undefined;
+          if (hasContent && hasAppendPrepend) {
+            throw new Error(
+              `update-note: \`content\` and \`append\`/\`prepend\` are mutually exclusive — pick one mode of content update for note "${note.id}".`,
+            );
+          }
+
           // --- Safety-by-default: refuse mutations without a precondition ---
           // The caller must either echo the note's last-seen `updated_at`
           // (`if_updated_at`) so the conditional UPDATE can catch lost
           // writes, or explicitly opt out with `force: true`. This runs
           // *before* any DB writes so a rejection leaves the note untouched.
-          if (item.if_updated_at === undefined && item.force !== true) {
+          //
+          // Append/prepend-only updates are exempt: they're SQL-atomic
+          // concatenations that can't lose data on a stale read, so the
+          // precondition would be ceremony for no benefit.
+          const isAppendOnly = hasAppendPrepend
+            && !hasContent
+            && item.path === undefined
+            && item.metadata === undefined
+            && item.created_at === undefined;
+          if (!isAppendOnly && item.if_updated_at === undefined && item.force !== true) {
             throw new PreconditionRequiredError(note.id, note.path ?? null);
           }
 
@@ -466,7 +491,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               if (!target) continue;
               resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
               if (link.relationship === "wikilink" && target.path) {
-                const currentContent = contentOverride ?? note.content;
+                // Wikilink-removal bracket cleanup operates on the prospective
+                // *full* content. For append/prepend callers we pre-materialize
+                // the would-be content (and switch to a `content`-style update
+                // below) so the cleanup doesn't fight the SQL-atomic path.
+                const currentContent = contentOverride
+                  ?? (hasAppendPrepend
+                    ? (item.prepend as string ?? "") + note.content + (item.append as string ?? "")
+                    : note.content);
                 const cleaned = removeWikilinkBrackets(currentContent, target.path);
                 if (cleaned !== currentContent) {
                   contentOverride = cleaned;
@@ -477,7 +509,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
           // --- Core update (content, path, metadata, created_at + concurrency check) ---
           const updates: any = {};
-          if (contentOverride !== undefined) updates.content = contentOverride;
+          if (contentOverride !== undefined) {
+            updates.content = contentOverride;
+          } else if (hasAppendPrepend) {
+            // Route append/prepend down to the SQL-atomic path (no wikilink
+            // pre-materialization fired).
+            if (item.append !== undefined) updates.append = item.append;
+            if (item.prepend !== undefined) updates.prepend = item.prepend;
+          }
           if (item.path !== undefined) updates.path = item.path;
           if (item.metadata !== undefined) {
             // Merge metadata (don't replace wholesale)
