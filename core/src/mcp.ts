@@ -1161,22 +1161,18 @@ function defaultForField(field: { type: string; enum?: string[] }): unknown {
  * Returns the note unchanged when no schemas apply, so callers without
  * `_schemas/*` config see no behavior change.
  */
-function attachValidationStatus(store: Store, db: Database, note: Note): Note {
-  const fresh = noteOps.getNote(db, note.id) ?? note;
-  // Use any cast — Note is the on-disk shape, validation_status is an
-  // additive response-only field. Keeping it off the type means existing
-  // consumers aren't forced to handle it.
-  const fn = (store as any).validateNoteAgainstSchemas as
-    | undefined
-    | ((n: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }) => unknown);
-  if (typeof fn !== "function") return fresh;
-  const status = fn.call(store, {
-    path: fresh.path,
-    tags: fresh.tags,
-    metadata: fresh.metadata as Record<string, unknown> | undefined,
+function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
+  // Short-circuit cheaply: when no `_schemas/*` notes are configured, the
+  // resolver returns null without us paying a re-read of the note. The
+  // re-read used to happen up-front and was wasteful on every write in
+  // vaults that don't use schemas at all.
+  const status = store.validateNoteAgainstSchemas({
+    path: note.path,
+    tags: note.tags,
+    metadata: note.metadata as Record<string, unknown> | undefined,
   });
-  if (!status) return fresh;
-  return { ...fresh, validation_status: status } as Note & { validation_status: unknown };
+  if (!status) return note;
+  return { ...note, validation_status: status } as Note & { validation_status: typeof status };
 }
 
 // ---------------------------------------------------------------------------
