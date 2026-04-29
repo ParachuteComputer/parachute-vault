@@ -949,9 +949,17 @@ export function assetsDir(vault: string): string {
 }
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
+// Storage allowlist policy:
+//   - audio + image + .pdf (knowledge-vault content: papers, scans, receipts)
+//     + .mp4 (mobile capture default; iOS records mp4, not webm).
+//   - .svg and .html are deliberately excluded — both can embed `<script>`
+//     tags, which would turn an upload into a same-origin XSS vector when
+//     the asset is served back from /storage/. If a future use case needs
+//     SVG, sanitize on read (strip <script>/<foreignObject>) and revisit.
 const ALLOWED_EXTENSIONS = new Set([
   ".wav", ".mp3", ".m4a", ".ogg", ".webm",
   ".png", ".jpg", ".jpeg", ".gif", ".webp",
+  ".pdf", ".mp4",
 ]);
 
 const MIME_TYPES: Record<string, string> = {
@@ -965,6 +973,8 @@ const MIME_TYPES: Record<string, string> = {
   ".jpeg": "image/jpeg",
   ".gif": "image/gif",
   ".webp": "image/webp",
+  ".pdf": "application/pdf",
+  ".mp4": "video/mp4",
 };
 
 export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
