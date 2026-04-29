@@ -140,22 +140,22 @@ describe("looksLikeJwt", () => {
 
 describe("validateHubJwt — happy path", () => {
   test("valid JWT with correct iss → claims surface", async () => {
-    const token = await signJwt(kp, { iss: fixture.origin, scope: "vault:read vault:write" });
+    const token = await signJwt(kp, { iss: fixture.origin, scope: "vault:work:read vault:work:write" });
     const claims = await validateHubJwt(token);
     expect(claims.sub).toBe("user-1");
-    expect(claims.scopes).toEqual(["vault:read", "vault:write"]);
+    expect(claims.scopes).toEqual(["vault:work:read", "vault:work:write"]);
     expect(claims.aud).toBe("operator");
     expect(claims.jti).toBe("jti-1");
     expect(claims.clientId).toBe("test-client");
   });
 
-  test("aud=operator accepted", async () => {
+  test("aud=operator accepted when expectedAudience not set", async () => {
     const token = await signJwt(kp, { iss: fixture.origin, aud: "operator" });
     const claims = await validateHubJwt(token);
     expect(claims.aud).toBe("operator");
   });
 
-  test("aud=<client_id> accepted (no strict aud match)", async () => {
+  test("aud=<client_id> accepted when expectedAudience not set", async () => {
     const token = await signJwt(kp, {
       iss: fixture.origin,
       aud: "did:plc:randomclientid",
@@ -169,6 +169,36 @@ describe("validateHubJwt — happy path", () => {
     const token = await signJwt(kp, { iss: fixture.origin, scope: "" });
     const claims = await validateHubJwt(token);
     expect(claims.scopes).toEqual([]);
+  });
+
+  test("audience strict-check passes when expected matches", async () => {
+    const token = await signJwt(kp, { iss: fixture.origin, aud: "vault.work" });
+    const claims = await validateHubJwt(token, { expectedAudience: "vault.work" });
+    expect(claims.aud).toBe("vault.work");
+  });
+});
+
+describe("validateHubJwt — audience strict-check", () => {
+  test("mismatched audience throws with the expected vs got values", async () => {
+    const token = await signJwt(kp, { iss: fixture.origin, aud: "vault.personal" });
+    await expect(
+      validateHubJwt(token, { expectedAudience: "vault.work" }),
+    ).rejects.toThrow(/audience mismatch.*vault\.work.*vault\.personal/);
+  });
+
+  test("missing audience claim throws when expected is set", async () => {
+    // jose's SignJWT requires .setAudience() — provide an unrelated value to
+    // exercise "not the expected one" rather than a literal missing claim.
+    const token = await signJwt(kp, { iss: fixture.origin, aud: "operator" });
+    await expect(
+      validateHubJwt(token, { expectedAudience: "vault.work" }),
+    ).rejects.toThrow(/audience mismatch/);
+  });
+
+  test("expectedAudience: null skips the check (cross-vault path)", async () => {
+    const token = await signJwt(kp, { iss: fixture.origin, aud: "vault.anything" });
+    const claims = await validateHubJwt(token, { expectedAudience: null });
+    expect(claims.aud).toBe("vault.anything");
   });
 });
 

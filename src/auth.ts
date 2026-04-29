@@ -21,7 +21,15 @@ import { resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import type { Database } from "bun:sqlite";
 import { getVaultStore } from "./vault-store.ts";
-import { hasScope, legacyPermissionToScopes, SCOPE_ADMIN, SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
+import {
+  findBroadVaultScopes,
+  hasScope,
+  hasScopeForVault,
+  legacyPermissionToScopes,
+  SCOPE_ADMIN,
+  SCOPE_READ,
+  SCOPE_WRITE,
+} from "./scopes.ts";
 import { HubJwtError, looksLikeJwt, validateHubJwt } from "./hub-jwt.ts";
 
 /** Result of a successful auth check. */
@@ -48,14 +56,6 @@ function legacyAuthResult(permission: TokenPermission): AuthResult {
     scopes: legacyPermissionToScopes(permission),
     legacyDerived: true,
   };
-}
-
-/**
- * Guard: does the authenticated request carry the required scope?
- * Uses `hasScope` inheritance: admin ⊇ write ⊇ read.
- */
-export function requireScope(auth: AuthResult, required: string): boolean {
-  return hasScope(auth.scopes, required);
 }
 
 // One-shot deprecation warning tracker, keyed by token hash / legacy label so
@@ -153,8 +153,10 @@ export async function authenticateVaultRequest(
 
   // JWT path: hub-issued tokens. Trust pinned to the hub origin via `iss`
   // verification inside validateHubJwt; signature checked against hub's JWKS.
+  // Audience strict-checked against `vault.<name>` so a token stamped for
+  // one vault can't reach another.
   if (looksLikeJwt(key)) {
-    return await authenticateHubJwt(key);
+    return await authenticateHubJwt(key, { expectedAudience: `vault.${vaultConfig.name}` });
   }
 
   // Try vault's token DB first
@@ -204,10 +206,31 @@ export async function authenticateVaultRequest(
  * for back-compat with code paths that still branch on `permission` (MCP
  * tool gating, view auth). `legacyDerived` is `false` — JWT-issued scopes
  * are explicit, never inferred.
+ *
+ * Scope-shape policy: hub-issued tokens MUST carry resource-narrowed
+ * `vault:<name>:<verb>` scopes. Broad `vault:<verb>` scopes are rejected
+ * here — Phase B2 settled that hub tokens always name the resource. Per-
+ * vault audience enforcement happens inside `validateHubJwt` via
+ * `opts.expectedAudience`.
  */
-async function authenticateHubJwt(token: string): Promise<{ error: Response } | AuthResult> {
+async function authenticateHubJwt(
+  token: string,
+  opts: { expectedAudience: string | null },
+): Promise<{ error: Response } | AuthResult> {
   try {
-    const claims = await validateHubJwt(token);
+    const claims = await validateHubJwt(token, { expectedAudience: opts.expectedAudience });
+    const broad = findBroadVaultScopes(claims.scopes);
+    if (broad.length > 0) {
+      return {
+        error: Response.json(
+          {
+            error: "Unauthorized",
+            message: `hub JWT carries broad vault scope(s): ${broad.join(" ")}. Hub-issued tokens must use resource-narrowed scopes (vault:<name>:<verb>).`,
+          },
+          { status: 401 },
+        ),
+      };
+    }
     const permission: TokenPermission =
       hasScope(claims.scopes, SCOPE_WRITE) || hasScope(claims.scopes, SCOPE_ADMIN)
         ? "full"
@@ -237,9 +260,24 @@ export async function authenticateGlobalRequest(
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
 
-  // JWT path: hub-issued tokens validate without a per-vault DB lookup.
+  // Hub-issued JWTs are always vault-bound (aud=vault.<name>). The unified
+  // /vaults / /health surface spans every vault and has no single audience to
+  // strict-check against, so JWTs aren't accepted here. Cross-vault listing
+  // for hub-authenticated callers will land alongside the `parachute:host:*`
+  // scope namespace; until then, callers wanting `/vaults` from a JWT
+  // context use a per-vault token at `/vault/<name>` and rely on services.json
+  // for the broader catalog.
   if (looksLikeJwt(key)) {
-    return await authenticateHubJwt(key);
+    return {
+      error: Response.json(
+        {
+          error: "Unauthorized",
+          message:
+            "Hub-issued JWTs are vault-bound; use /vault/<name>/* endpoints. Cross-vault routes accept legacy config.yaml keys or per-vault tokens.",
+        },
+        { status: 401 },
+      ),
+    };
   }
 
   // Legacy: check global keys from config.yaml
