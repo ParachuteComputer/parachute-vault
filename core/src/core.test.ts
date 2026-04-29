@@ -2665,3 +2665,277 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
     expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Default schemas via `_schemas/<name>` + `_schema_defaults` — issue #177
+// ---------------------------------------------------------------------------
+
+describe("default schemas (_schemas/* + _schema_defaults)", async () => {
+  it("returns no validation_status when no schemas are configured", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "plain note" }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("attaches validation_status when a schema matches by tag", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: {
+        description: "A task",
+        fields: { priority: { type: "string", enum: ["high", "medium", "low"] } },
+        required: ["priority"],
+      },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "do thing", tags: ["task"] }) as any;
+
+    expect(result.validation_status).toBeTruthy();
+    expect(result.validation_status.schemas).toEqual(["task"]);
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("missing_required");
+    expect(result.validation_status.warnings[0].field).toBe("priority");
+  });
+
+  it("attaches validation_status when a schema matches by path prefix", async () => {
+    await store.createNote("", {
+      path: "_schemas/journal-entry",
+      metadata: {
+        fields: { mood: { type: "string" } },
+        required: ["mood"],
+      },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { path_prefixes: { "journal/": "journal-entry" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "today", path: "journal/2026-04-29" }) as any;
+
+    expect(result.validation_status.schemas).toEqual(["journal-entry"]);
+    expect(result.validation_status.warnings[0].reason).toBe("missing_required");
+  });
+
+  it("validation passes (empty warnings) when required fields are present and types match", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: {
+        fields: {
+          priority: { type: "string", enum: ["high", "medium", "low"] },
+          done: { type: "boolean" },
+        },
+        required: ["priority"],
+      },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "ok",
+      tags: ["task"],
+      metadata: { priority: "high", done: false },
+    }) as any;
+
+    expect(result.validation_status.schemas).toEqual(["task"]);
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("type_mismatch warning when a field's value is the wrong type", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: {
+        fields: { priority: { type: "string" }, done: { type: "boolean" } },
+      },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high", done: "yes" }, // wrong: should be boolean
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("done");
+  });
+
+  it("enum_mismatch warning when a field's value is outside the declared enum", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: {
+        fields: { priority: { type: "string", enum: ["high", "medium", "low"] } },
+      },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  it("validation never blocks the write — note exists with warnings attached", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: { required: ["priority"] },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "x", tags: ["task"] }) as any;
+
+    expect(result.id).toBeTruthy();
+    expect(result.validation_status.warnings.length).toBe(1);
+
+    // The note really is in the DB — read it back.
+    const fetched = await store.getNote(result.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.content).toBe("x");
+  });
+
+  it("update-note also surfaces validation_status", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: {
+        fields: { priority: { type: "string", enum: ["high", "low"] } },
+        required: ["priority"],
+      },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+    const note = await store.createNote("body", { tags: ["task"], metadata: { priority: "high" } });
+
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: note.id,
+      metadata: { priority: "ULTRA" },
+      if_updated_at: note.updatedAt,
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  it("schema config invalidates when _schemas/* is updated", async () => {
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: { required: ["a"] },
+    });
+    const mapping = await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: { tags: { task: "task" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({ content: "x", tags: ["task"] }) as any;
+    expect(result.validation_status.warnings[0].field).toBe("a");
+
+    // Repoint the mapping so #task no longer maps to a schema.
+    await store.updateNote(mapping.id, {
+      metadata: { tags: {} },
+      force: true,
+    } as any);
+
+    result = await create.execute({ content: "y", tags: ["task"] }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("longest path prefix wins when multiple match", async () => {
+    await store.createNote("", {
+      path: "_schemas/journal-day",
+      metadata: { required: ["mood"] },
+    });
+    await store.createNote("", {
+      path: "_schemas/journal-broad",
+      metadata: { required: ["topic"] },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: {
+        path_prefixes: {
+          "journal/": "journal-broad",
+          "journal/2026/": "journal-day",
+        },
+      },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "x", path: "journal/2026/april" }) as any;
+    expect(result.validation_status.schemas).toEqual(["journal-day"]);
+  });
+
+  it("multiple schemas can apply (path + tag combine warnings)", async () => {
+    await store.createNote("", {
+      path: "_schemas/journal-entry",
+      metadata: { required: ["mood"] },
+    });
+    await store.createNote("", {
+      path: "_schemas/task",
+      metadata: { required: ["priority"] },
+    });
+    await store.createNote("", {
+      path: "_schema_defaults",
+      metadata: {
+        path_prefixes: { "journal/": "journal-entry" },
+        tags: { task: "task" },
+      },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      path: "journal/today",
+      tags: ["task"],
+    }) as any;
+
+    expect(result.validation_status.schemas.sort()).toEqual(["journal-entry", "task"]);
+    expect(result.validation_status.warnings.length).toBe(2);
+  });
+
+  it("a `_schemas/<name>` whose name isn't referenced anywhere is harmless", async () => {
+    await store.createNote("", {
+      path: "_schemas/orphan",
+      metadata: { required: ["x"] },
+    });
+    // No mapping note — `orphan` isn't reachable from any path or tag.
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "anything" }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+});

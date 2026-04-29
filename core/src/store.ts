@@ -13,6 +13,14 @@ import {
   TAG_CONFIG_PREFIX,
   type TagHierarchy,
 } from "./tag-hierarchy.js";
+import {
+  loadSchemaConfig,
+  validateNote as runValidateNote,
+  SCHEMA_CONFIG_PREFIX,
+  SCHEMA_DEFAULTS_PATH,
+  type ResolvedSchemas,
+  type ValidationStatus,
+} from "./schema-defaults.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -28,6 +36,7 @@ export class BunSqliteStore implements Store {
   // `invalidateConfigCachesForPath`) so reads after writes always see
   // the post-write state.
   private _tagHierarchy: TagHierarchy | null = null;
+  private _schemaConfig: ResolvedSchemas | null = null;
 
   constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
     initSchema(db);
@@ -46,15 +55,39 @@ export class BunSqliteStore implements Store {
   }
 
   /**
+   * Lazy accessor for the `_schemas/*` + `_schema_defaults` config-note
+   * resolution. Same lifecycle as the tag hierarchy cache.
+   */
+  private getSchemaConfig(): ResolvedSchemas {
+    if (!this._schemaConfig) this._schemaConfig = loadSchemaConfig(this.db);
+    return this._schemaConfig;
+  }
+
+  /**
+   * Run the resolved schemas against a note and return the resulting
+   * validation status, or null when no schema applies. Public so the MCP
+   * layer can surface `validation_status` on create/update responses
+   * without re-importing the config loader.
+   */
+  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null {
+    return runValidateNote(this.getSchemaConfig(), note);
+  }
+
+  /**
    * Drop config caches if the mutated path is one of the config namespaces.
    * Called from create/update/delete — old path is passed alongside new for
    * rename cases (a note moved out of `_tags/` should still invalidate).
    */
   private invalidateConfigCachesForPath(path: string | null | undefined, oldPath?: string | null): void {
-    const matches = (p: string | null | undefined): boolean =>
+    const isTagConfig = (p: string | null | undefined): boolean =>
       typeof p === "string" && p.startsWith(TAG_CONFIG_PREFIX);
-    if (matches(path) || matches(oldPath)) {
+    const isSchemaConfig = (p: string | null | undefined): boolean =>
+      typeof p === "string" && (p.startsWith(SCHEMA_CONFIG_PREFIX) || p === SCHEMA_DEFAULTS_PATH);
+    if (isTagConfig(path) || isTagConfig(oldPath)) {
       this._tagHierarchy = null;
+    }
+    if (isSchemaConfig(path) || isSchemaConfig(oldPath)) {
+      this._schemaConfig = null;
     }
   }
 

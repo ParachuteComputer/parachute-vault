@@ -352,7 +352,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           }
         }
 
-        return batch ? created : created[0];
+        // Re-read after schema-default population so the response reflects the
+        // final on-disk state, then attach `validation_status` from any
+        // `_schemas/*` config notes that match this note's path or tags.
+        const final = created.map((n) => attachValidationStatus(store, db, n));
+        return batch ? final : final[0];
       },
     },
 
@@ -618,7 +622,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           updated.push(noteOps.getNote(db, note.id) ?? result);
         }
 
-        return batch ? updated : updated[0];
+        const final = updated.map((n) => attachValidationStatus(store, db, n));
+        return batch ? final : final[0];
       },
     },
 
@@ -1140,6 +1145,38 @@ function defaultForField(field: { type: string; enum?: string[] }): unknown {
     case "integer": return 0;
     default: return "";
   }
+}
+
+// ---------------------------------------------------------------------------
+// `_schemas/*` validation — surface validation_status on create/update
+// ---------------------------------------------------------------------------
+
+/**
+ * Attach a `validation_status` field to the response when one or more
+ * `_schemas/*` config notes match this note's path or tags. Validation is
+ * advisory only — writes are never blocked. The agent receives warnings
+ * (missing required, type mismatch, enum mismatch) so it can self-correct
+ * on the next turn.
+ *
+ * Returns the note unchanged when no schemas apply, so callers without
+ * `_schemas/*` config see no behavior change.
+ */
+function attachValidationStatus(store: Store, db: Database, note: Note): Note {
+  const fresh = noteOps.getNote(db, note.id) ?? note;
+  // Use any cast — Note is the on-disk shape, validation_status is an
+  // additive response-only field. Keeping it off the type means existing
+  // consumers aren't forced to handle it.
+  const fn = (store as any).validateNoteAgainstSchemas as
+    | undefined
+    | ((n: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }) => unknown);
+  if (typeof fn !== "function") return fresh;
+  const status = fn.call(store, {
+    path: fresh.path,
+    tags: fresh.tags,
+    metadata: fresh.metadata as Record<string, unknown> | undefined,
+  });
+  if (!status) return fresh;
+  return { ...fresh, validation_status: status } as Note & { validation_status: unknown };
 }
 
 // ---------------------------------------------------------------------------
