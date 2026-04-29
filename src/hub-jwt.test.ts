@@ -70,7 +70,7 @@ function startJwksFixture(): JwksFixture {
 
 interface SignOpts {
   iss?: string;
-  aud?: string;
+  aud?: string | string[];
   sub?: string;
   scope?: string;
   jti?: string;
@@ -199,6 +199,34 @@ describe("validateHubJwt — audience strict-check", () => {
     const token = await signJwt(kp, { iss: fixture.origin, aud: "vault.anything" });
     const claims = await validateHubJwt(token, { expectedAudience: null });
     expect(claims.aud).toBe("vault.anything");
+  });
+
+  test("array aud: passes when expected is one of the entries", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: ["vault.work", "vault.personal", "operator"],
+    });
+    const claims = await validateHubJwt(token, { expectedAudience: "vault.personal" });
+    expect(claims.aud).toBe("vault.personal");
+  });
+
+  test("array aud: rejects when expected is not in the entries", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: ["vault.work", "operator"],
+    });
+    await expect(
+      validateHubJwt(token, { expectedAudience: "vault.personal" }),
+    ).rejects.toThrow(/audience mismatch.*vault\.personal.*vault\.work.*operator/);
+  });
+
+  test("array aud: surfaces the first entry when no expectation is set", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: ["vault.first", "vault.second"],
+    });
+    const claims = await validateHubJwt(token, { expectedAudience: null });
+    expect(claims.aud).toBe("vault.first");
   });
 });
 

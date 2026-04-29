@@ -707,6 +707,11 @@ function cmdCreate(args: string[]) {
   // POST /vaults shells out to this CLI and parses stdout). Errors still go
   // to stderr as plain text and exit nonzero — callers branch on exit code.
   const jsonMode = args.includes("--json");
+  // Greedy strip of any `--*` token to recover the positional vault name.
+  // Today only `--json` is recognized; any other `--foo` is silently dropped.
+  // If a future flag (e.g. `--force`, `--dry-run`) is added, the parsing
+  // here needs to whitelist it — otherwise an invalid flag becomes a silent
+  // no-op rather than a usage error.
   const positional = args.filter((a) => !a.startsWith("--"));
   const name = positional[0];
   if (!name) {
