@@ -1363,6 +1363,47 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.deleted).toBe(true);
     expect(await store.getNoteByPath("Temp/note")).toBeNull();
   });
+
+  test("POST /notes returns 409 path_conflict when path already exists (#126)", async () => {
+    await store.createNote("first", { path: "Inbox/note" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "second", path: "Inbox/note" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("path_conflict");
+    expect(body.error).toBe("path_conflict");
+    expect(body.path).toBe("Inbox/note");
+  });
+
+  test("POST /notes path_conflict — second note never lands in DB (#126)", async () => {
+    await store.createNote("first", { path: "Inbox/note" });
+    const before = (await store.queryNotes({})).length;
+    await handleNotes(
+      mkReq("POST", "/notes", { content: "second", path: "Inbox/note" }),
+      store,
+      "",
+    );
+    expect((await store.queryNotes({})).length).toBe(before);
+  });
+
+  test("PATCH /notes returns 409 path_conflict when renaming onto existing path (#126)", async () => {
+    const a = await store.createNote("first", { id: "a", path: "alpha" });
+    await store.createNote("second", { id: "b", path: "beta" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a", { path: "beta", if_updated_at: a.createdAt }),
+      store,
+      "/a",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("path_conflict");
+    expect(body.path).toBe("beta");
+    // Source note unchanged
+    expect((await store.getNote("a"))!.path).toBe("alpha");
+  });
 });
 
 describe("HTTP /tags", async () => {

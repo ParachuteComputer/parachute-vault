@@ -286,24 +286,35 @@ export async function handleNotes(
       const items: any[] = body.notes ?? [body];
 
       const created: Note[] = [];
-      for (const item of items) {
-        const note = await store.createNote(item.content ?? "", {
-          id: item.id,
-          path: item.path,
-          tags: item.tags,
-          metadata: item.metadata,
-          created_at: item.createdAt ?? item.created_at,
-        });
+      try {
+        for (const item of items) {
+          const note = await store.createNote(item.content ?? "", {
+            id: item.id,
+            path: item.path,
+            tags: item.tags,
+            metadata: item.metadata,
+            created_at: item.createdAt ?? item.created_at,
+          });
 
-        // Create explicit links
-        if (item.links) {
-          for (const link of item.links as { target: string; relationship: string }[]) {
-            const target = await resolveNote(store, link.target);
-            if (target) await store.createLink(note.id, target.id, link.relationship);
+          // Create explicit links
+          if (item.links) {
+            for (const link of item.links as { target: string; relationship: string }[]) {
+              const target = await resolveNote(store, link.target);
+              if (target) await store.createLink(note.id, target.id, link.relationship);
+            }
           }
-        }
 
-        created.push((await store.getNote(note.id)) ?? note);
+          created.push((await store.getNote(note.id)) ?? note);
+        }
+      } catch (e: any) {
+        // Duck-type for module-boundary robustness (matches the PATCH branch).
+        if (e && e.code === "PATH_CONFLICT") {
+          return json(
+            { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
+            409,
+          );
+        }
+        throw e;
       }
 
       // Apply tag schema defaults
@@ -518,6 +529,13 @@ export async function handleNotes(
             error: "conflict",
             expected_updated_at: e.expected_updated_at,
           },
+          409,
+        );
+      }
+      // Path-rename collision — schema's UNIQUE(path) tripped. Issue #126.
+      if (e && e.code === "PATH_CONFLICT") {
+        return json(
+          { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
           409,
         );
       }

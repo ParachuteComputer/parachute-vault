@@ -838,7 +838,7 @@ function normalizeTags(tag: unknown): string[] | undefined {
 
 // Re-exported for backward compat; defined in notes.ts alongside the
 // conditional-UPDATE implementation that raises it.
-export { ConflictError } from "./notes.js";
+export { ConflictError, PathConflictError } from "./notes.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a
