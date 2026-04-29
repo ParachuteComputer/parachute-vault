@@ -86,6 +86,14 @@ export const ERR_PATH = join(LOGS_DIR, "vault.err");
 export const DEFAULT_PORT = 1940;
 export const ASSETS_DIR = join(VAULT_HOME, "assets");
 
+// Filesystem sentinel for graceful shutdown. `parachute-vault stop` writes
+// this file; the running server polls for it and exits cleanly when it
+// appears. Resolved per-call so PARACHUTE_HOME overrides (tests, Docker)
+// match between writer and reader.
+export function stopSignalPath(): string {
+  return join(vaultHomePath(), "stop.signal");
+}
+
 export function vaultDir(name: string): string {
   return join(dataDirPath(), name);
 }

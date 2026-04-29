@@ -136,6 +136,57 @@ describe("notes", async () => {
     await store.deleteNote("a");
     expect(await store.getLinks("b")).toHaveLength(0);
   });
+
+  // ---- PathConflictError: typed 409 on duplicate path (#126) ----
+
+  it("createNote throws PathConflictError when path is taken (#126)", async () => {
+    await store.createNote("First", { path: "Inbox/note" });
+    let caught: any;
+    try {
+      await store.createNote("Second", { path: "Inbox/note" });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeTruthy();
+    expect(caught.code).toBe("PATH_CONFLICT");
+    expect(caught.path).toBe("Inbox/note");
+  });
+
+  it("createNote on path collision does not insert the second note (#126)", async () => {
+    await store.createNote("First", { id: "a", path: "Inbox/note" });
+    try {
+      await store.createNote("Second", { id: "b", path: "Inbox/note" });
+    } catch {}
+    expect(await store.getNote("b")).toBeNull();
+  });
+
+  it("updateNote throws PathConflictError when renaming onto an existing path (#126)", async () => {
+    const a = await store.createNote("First", { path: "a" });
+    await store.createNote("Second", { path: "b" });
+    let caught: any;
+    try {
+      await store.updateNote(a.id, { path: "b", if_updated_at: a.createdAt });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeTruthy();
+    expect(caught.code).toBe("PATH_CONFLICT");
+    expect(caught.path).toBe("b");
+  });
+
+  it("updateNote with no path collision still succeeds (#126 — no false positives)", async () => {
+    const a = await store.createNote("First", { path: "a" });
+    await store.createNote("Second", { path: "b" });
+    const updated = await store.updateNote(a.id, { path: "c", if_updated_at: a.createdAt });
+    expect(updated.path).toBe("c");
+  });
+
+  it("updateNote with no path field is unaffected by the path-conflict guard (#126)", async () => {
+    const a = await store.createNote("First", { path: "a" });
+    const updated = await store.updateNote(a.id, { content: "edited", if_updated_at: a.createdAt });
+    expect(updated.content).toBe("edited");
+    expect(updated.path).toBe("a");
+  });
 });
 
 // ---- Backfill migration: legacy rows with NULL updated_at ----

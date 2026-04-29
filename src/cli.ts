@@ -46,6 +46,7 @@ import {
   LOG_PATH,
   ERR_PATH,
   GLOBAL_CONFIG_PATH,
+  stopSignalPath,
 } from "./config.ts";
 import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
@@ -180,6 +181,9 @@ switch (command) {
     break;
   case "restart":
     await cmdRestart();
+    break;
+  case "stop":
+    await cmdStop();
     break;
   case "uninstall":
     await cmdUninstall(cmdArgs);
@@ -1100,6 +1104,41 @@ async function cmdRestart() {
 
   console.error(`Vault did not come up within 10s — status: ${health.status}${health.error ? ` (${health.error})` : ""}`);
   printErrLogTail(20);
+  process.exit(1);
+}
+
+async function cmdStop() {
+  loadEnvFile();
+  const port = readGlobalConfig().port || DEFAULT_PORT;
+  const sentinel = stopSignalPath();
+
+  // Health check first: avoid leaving a stale sentinel that would kill the
+  // *next* server boot. The server clears any pre-existing sentinel on
+  // startup, but only after it loads — a sentinel written between launch
+  // and the first poll could still win the race. Skipping the write when
+  // nothing is listening is the cheap, obvious guard.
+  const health = await checkHealth(port);
+  if (health.status === "not-listening" || health.status === "error") {
+    console.log(`Vault is not running (${health.status}${health.error ? `: ${health.error}` : ""}).`);
+    return;
+  }
+
+  ensureConfigDirSync();
+  writeFileSync(sentinel, `${new Date().toISOString()}\n`);
+  console.log(`Stop signal written: ${sentinel}`);
+
+  // Wait briefly for the server to pick up the sentinel and stop responding.
+  // Polls match the server's 500ms cadence; give it ~5s before giving up.
+  const start = Date.now();
+  while (Date.now() - start < 5_000) {
+    await new Promise((r) => setTimeout(r, 600));
+    const h = await checkHealth(port);
+    if (h.status === "not-listening" || h.status === "error") {
+      console.log(`Vault stopped (${Math.round((Date.now() - start) / 100) / 10}s).`);
+      return;
+    }
+  }
+  console.error("Vault did not stop within 5s. Check vault logs or `parachute-vault status`.");
   process.exit(1);
 }
 
@@ -2238,5 +2277,9 @@ visibility. Use these when running vault without the hub or when debugging.
                                            Prefer \`parachute status\` for a cross-service view.
   parachute-vault logs                     Stream server logs
   parachute-vault restart                  Restart the daemon
+  parachute-vault stop                     Signal a graceful shutdown of the running server
+                                           (writes \`~/.parachute/vault/stop.signal\` — useful
+                                           when no signal channel is available, e.g. Docker
+                                           exec or unmanaged foreground runs).
 `);
 }

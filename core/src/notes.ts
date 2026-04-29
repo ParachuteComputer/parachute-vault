@@ -41,9 +41,16 @@ export function createNote(
   // value. Hook-style writes with `skipUpdatedAt` preserve this; real user
   // edits bump it strictly upward, so `updated_at > created_at` still means
   // "user-touched since creation."
-  db.prepare(
-    `INSERT INTO notes (id, content, path, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, content, path, metadata, createdAt, createdAt);
+  try {
+    db.prepare(
+      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(id, content, path, metadata, createdAt, createdAt);
+  } catch (err) {
+    if (path !== null && isPathUniqueError(err)) {
+      throw new PathConflictError(path);
+    }
+    throw err;
+  }
 
   if (opts?.tags && opts.tags.length > 0) {
     tagNote(db, id, opts.tags);
@@ -106,6 +113,38 @@ export class ConflictError extends Error {
     this.current_updated_at = current;
     this.expected_updated_at = expected;
   }
+}
+
+/**
+ * Thrown by `createNote` / `updateNote` when the requested path is already
+ * taken by another note. Surfaces as 409 at the HTTP layer so clients can
+ * distinguish "path taken — pick another" from a generic 500.
+ *
+ * Detected by catching SQLite's UNIQUE-constraint error on the
+ * `idx_notes_path_unique` partial index (schema v5+). Matches the tag
+ * "UNIQUE constraint failed: notes.path" rather than a numeric code so
+ * we keep working if bun:sqlite changes its error class hierarchy.
+ */
+export class PathConflictError extends Error {
+  code = "PATH_CONFLICT" as const;
+  path: string;
+
+  constructor(path: string) {
+    super(`path_conflict: another note already uses path "${path}"`);
+    this.name = "PathConflictError";
+    this.path = path;
+  }
+}
+
+/**
+ * Match bun:sqlite's UNIQUE-constraint error on the notes.path index. The
+ * error class is `SQLiteError` but matching on the message is sufficient
+ * here — the index name and column are stable parts of the schema, and
+ * bun:sqlite has carried this exact message text since 1.0.
+ */
+function isPathUniqueError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.message.includes("UNIQUE constraint failed: notes.path");
 }
 
 export function updateNote(
@@ -187,7 +226,15 @@ export function updateNote(
     values.push(updates.if_updated_at);
   }
 
-  const res = db.prepare(sql).run(...values);
+  let res;
+  try {
+    res = db.prepare(sql).run(...values);
+  } catch (err) {
+    if (updates.path !== undefined && isPathUniqueError(err)) {
+      throw new PathConflictError(normalizePath(updates.path) ?? updates.path);
+    }
+    throw err;
+  }
 
   if (updates.if_updated_at !== undefined && res.changes === 0) {
     throwConflictOrMissing(db, id, updates.if_updated_at);

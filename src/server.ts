@@ -15,7 +15,8 @@
  * The request pipeline lives in ./routing.ts (exported for unit testing).
  */
 
-import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey } from "./config.ts";
+import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath } from "./config.ts";
+import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
@@ -240,4 +241,25 @@ async function shutdown(signal: string): Promise<void> {
 }
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// Filesystem-sentinel shutdown: `parachute-vault stop` writes
+// `~/.parachute/vault/stop.signal`; we poll for it and exit cleanly when it
+// appears. Useful when no signal channel is available — Docker exec, foreground
+// runs without a TTY, scripts that can't manage PIDs. Any stale sentinel is
+// removed before we start polling so a previous `stop` can't pre-empt this boot.
+const STOP_POLL_MS = 500;
+try {
+  if (existsSync(stopSignalPath())) rmSync(stopSignalPath(), { force: true });
+} catch (err) {
+  console.warn("[stop-signal] could not clear stale sentinel:", err);
+}
+setInterval(() => {
+  if (!existsSync(stopSignalPath())) return;
+  try {
+    rmSync(stopSignalPath(), { force: true });
+  } catch (err) {
+    console.warn("[stop-signal] could not remove sentinel:", err);
+  }
+  void shutdown("STOP_SIGNAL");
+}, STOP_POLL_MS).unref();
 
