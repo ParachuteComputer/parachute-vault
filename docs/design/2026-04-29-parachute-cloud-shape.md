@@ -1,8 +1,8 @@
 # Parachute Cloud — what shape should it take?
 
-**Date:** 2026-04-29
+**Date:** 2026-04-29 (v2 added 2026-04-29 evening)
 **Author:** vault tentacle (Uni)
-**Status:** Research / decision-driving. Aaron asked for a deep-think before more cloud code lands. This doc lays out four candidate shapes, re-evaluates the parked code (#99 + #101) against them, and recommends one.
+**Status:** Research / decision-driving. Aaron read v1 and pushed back: the framing was vault-in-isolation when the real unit of design is **the hub and its spokes**. Cloud has to be deeply integrated with the self-hosted experience, and the OAuth model is the connective tissue. Section 7 (V2) is the active deliverable; sections 1–6 are kept as historical context for the four-shape exploration.
 **Companions:**
 - `parachute.computer/design/2026-04-20-cloud-offering-sketch.md` — the prior north-star sketch.
 - vault PR [#99](https://github.com/ParachuteComputer/parachute-vault/pull/99) — `DoSqliteStore + SqlDb` adapter (parked draft).
@@ -217,11 +217,111 @@ These I couldn't resolve from canon + current notes alone:
 
 ---
 
-## TL;DR
+## TL;DR (v1 — superseded by §7)
 
 - **What we have**: self-hosted Bun + SQLite + filesystem; hub-on-tailnet; clear async Store seam already in place.
 - **Four shapes**: CF Workers (parked PRs presume this), containerized SaaS, Anthropic-managed control plane + user tunnel, hybrid CRDT.
 - **Parked PRs (#99 + #101) generalize** beyond Shape 1 — they're useful in Shapes 1, 2, and 4. Worth merging as ecosystem hygiene.
-- **Recommendation**: Shape 3 (managed control plane + per-user tunnel) for v1, Shape 1 (managed DO vault) for v2 when there's demand.
-- **Why**: aligns with existing users, preserves the open-source story, low capital outlay, compatible with later Shape 1 via export.
-- **Six open questions** for Aaron — most importantly, "is your machine has to be on a feature or a bug?" That answer reshapes everything.
+- **Recommendation (v1, superseded)**: Shape 3 (managed control plane + per-user tunnel) for v1, Shape 1 (managed DO vault) for v2 when there's demand.
+- **Why this got pushed back**: the framing treated cloud as "where does vault run?" (vault-in-isolation), but the real unit of design is the **hub** and its **spokes** (vault, scribe, notes, paraclaw). Section 7 re-derives the shapes through that lens.
+- **See §7 for the active recommendation.**
+
+---
+
+## 7. V2 — Hub-and-spokes frame
+
+### 7.1 The frame change
+
+V1 asked "where does vault run?" That was the wrong question. Vault is one spoke among several, and Parachute now has a **hub** (formerly `parachute-cli`, the OAuth issuer + service catalog + portal on `:1939`) and four **spokes** that attach to it: vault (`:1940`), scribe (`:1942`), notes (PWA), and paraclaw (Claude Code distribution + vault integration). Each spoke validates JWTs from the hub via the hub's JWKS endpoint, registers itself in the hub's service catalog via `/.well-known/parachute.json`, and is discovered/managed through the hub's portal UI.
+
+The cloud question, properly framed, is therefore four-axis:
+
+1. **Where does the hub live?** Local (laptop, VPS the user owns) or cloud (Parachute infra).
+2. **Where does each spoke live?** Each can independently be local or cloud — vault on the laptop, scribe in cloud, notes static-bundled at `notes.parachute.computer`, paraclaw inherently local.
+3. **How does the hub authenticate the user?** Native (vault's existing user accounts), federated (Google/GitHub via the hub), or device-local (laptop session).
+4. **How do spokes reach the hub for token validation?** LAN/localhost, public DNS, tunnel, or no-network (cached JWKS).
+
+Cloud is not a separate product; it's a re-binding of one or more of these four axes. A self-hosted user who points `SCRIBE_URL` at a Parachute-hosted scribe is *already* mixed-deployment today — one spoke in cloud, the rest local — they just don't think of it as "cloud." The product surface is choosing what to flip and giving the user a hub that can mediate the choices.
+
+### 7.2 Re-deriving candidate shapes through the hub/spokes lens
+
+The original four shapes mapped to the *vault* axis only. Re-derived against the four-axis lens, the cloud surface looks like this:
+
+**(α) All-local (today's shipped product).** Hub on `:1939`, all spokes local. Hub authenticates with native accounts. Spokes reach hub at `127.0.0.1:1939`. JWKS cache is irrelevant — sub-millisecond fetch. This is the baseline; everything else is a re-binding of one axis.
+
+**(β) Hub local, scribe cloud (already operational for some users).** Hub on the user's Mac, `SCRIBE_URL` points at a Parachute-managed scribe. Scribe must reach the hub's JWKS endpoint to validate the user's token — which, on a laptop, requires either a tunnel or token introspection over a different channel. Today's deployments side-step this by having scribe trust a long-lived `pvt_*` token issued by the hub, which works but doesn't compose with hub-as-issuer. Honoring OAuth across this boundary is the v1 work.
+
+**(γ) Hub cloud, all spokes local via tunnel.** Hub at `aaron.parachute.computer`. Spokes (vault, scribe, paraclaw) on the user's Mac, exposed back to the hub via cloudflared tunnel. The hub's portal sees a unified surface; the data stays local; the user gets a stable URL and a reliable IDP. This is V1's "Shape 3" reformulated correctly: it's the **hub** that goes cloud, not the vault. Spokes follow.
+
+**(δ) Hub cloud, vault cloud, scribe cloud (full SaaS).** Everything in Parachute infra. The user has a sign-up flow, a managed vault on Workers/DO (V1 Shape 1), a managed scribe pool, and the notes PWA. JWKS is internal to Parachute infra. This is V1's "Shape 1," but reframed: the vault-in-cloud is a consequence of the hub-in-cloud + "the user has no machine to run a spoke on."
+
+**(ε) Mixed: hub cloud, vault local, scribe cloud.** The user keeps notes on their machine but doesn't want to run scribe (CPU-heavy, mobile-unfriendly). Hub mediates. Vault validates JWTs against the cloud hub via cached JWKS and a tunnel for inbound requests from agents. Scribe validates against the same hub. The user's data plane is local; the auth + heavy-compute planes are cloud.
+
+**(ζ) BYO-Cloud: tenant-owned Workers account.** Aaron's "something different" instantiated. The user signs up at parachute.computer, but the deploy target is *the user's own Cloudflare account*. Parachute provisions a Workers app + DO + R2 bucket *into the user's tenant*. We have a control plane that orchestrates deployments, but we don't *own* the runtime — the user does. This preserves "your data, your machine" in a serverless world: serverless, but the user is the AWS/CF customer.
+
+**(η) Single-binary VPS bundle.** Bun's `--compile` ships hub + vault + scribe (sans heavy ML deps) as one fat binary. Parachute partners with Hetzner/DO/Linode for one-click deploy: $5/mo VPS, the binary auto-updates, DNS + TLS handled. Cloud is "we sell the bundle, not the service." User owns the box.
+
+### 7.3 OAuth across cloud/local boundaries
+
+The architectural keystone is the JWT. The hub signs JWTs with `iss = <hub-origin>`, `aud = <spoke-origin>`, `scope = vault:<name>:read` (etc.), and rotating ECDSA keys exposed at `/.well-known/jwks.json`. A spoke validates by fetching JWKS from the hub origin (typically once per startup + on rotation) and checking iss/aud/scope/exp/sig.
+
+This means the JWT is a **portable bearer credential**. A token issued by a hub on a user's laptop can be presented to a vault running on R2/DO, and vault validates it — *if* it can reach the hub's JWKS endpoint. The cross-boundary question reduces to "is the hub's JWKS reachable from where the spoke runs?"
+
+The implications by axis:
+
+- **Hub on laptop, spokes in cloud (β/ε with tunneled hub).** Cloud spokes need to reach the laptop's JWKS endpoint over the internet — i.e., the hub itself must be tunneled. Laptop sleeps → JWKS cache stays warm for hours, but eventually expires. **Net: hub uptime = auth uptime.** Refresh tokens can't mint new access tokens while the hub is offline.
+- **Hub in cloud, spokes on laptop (γ).** The cloud hub's JWKS is always reachable. Laptop spokes fetch on startup + rotation. Local agents make calls to the laptop spoke with cloud-issued JWTs — works fine. Inbound calls from cloud (e.g., a scheduled agent in Parachute infra calling vault) go via the user's tunnel.
+- **Both in cloud (δ).** JWKS is internal; no boundary problem.
+- **BYO-Cloud (ζ).** The user's hub *is* in their CF tenant; their vault is in their CF tenant; they reach each other via Workers fetch or Service Bindings. Parachute's control plane never sees the JWTs — it provisions and updates code, that's it. Cleanest crypto story; weirdest billing model.
+
+The scope semantics are unchanged across shapes. `vault:default:read` means "this token can read the `default` vault." The vault enforces scope regardless of where it runs. What changes is who *issues* the token (which hub) and what token-binding stories make sense — for example, a cloud hub can bind tokens to a TLS client cert or a CF Access identity, while a laptop hub can't.
+
+The fundamental new failure mode introduced by hub-as-issuer is **hub-offline = system-offline** (after JWKS cache expires). This is mitigated by long cache TTLs (hours), but it's the reason the **hub belongs in cloud** for any deployment that wants reliability — even if all spokes stay local.
+
+### 7.4 What "deeply integrated" means concretely
+
+V1's Shape 3 was directionally right but framed it as "Parachute provides identity + tunnel as a side service to self-hosting." The hub-and-spokes lens sharpens it: **Parachute provides the hub, optionally, in cloud — and the user keeps their spokes wherever**. The hub becoming cloud-able is the cloud product's foundation. Once the hub is cloud-able:
+
+- Self-hosted users can flip a switch and have their hub move to cloud (export `parachute-hub` state, import on `aaron.parachute.computer`). Spokes stay local but auth becomes reliable.
+- Phone-first users get a cloud hub from day one. They can attach a cloud vault (V1 Shape 1) or, later, a local vault on a NAS / mini-PC.
+- Mixed users park scribe in cloud (already doable), vault locally, hub in cloud — the natural shape.
+- BYO-Cloud users point their hub at their own CF tenant and we orchestrate.
+
+This re-orders the build sequence. V1 said "ship the on-ramp (Shape 3), then add managed vault later (Shape 1)." V2 says: **ship cloud hub first**. Cloud hub is small (per-tenant SQLite for user accounts + OAuth state, Bun-on-Fly or Bun-on-Workers, DCR + JWKS + portal UI). Once it exists, every shape (γ, δ, ε, ζ, η) is unblocked. Cloud vault is an optional follow-on for users who need it.
+
+### 7.5 Re-recommendation
+
+**Cloud Hub first. Cloud spokes optional, opt-in, per-user.**
+
+1. **Phase 1 — Cloud Hub MVP.** Host `parachute-hub` (the existing codebase) on Fly.io with per-tenant subdomain `<user>.parachute.computer`. User signs up, gets a hub URL, and a CLI command (`parachute-hub link --cloud`) that flips their local install to delegate identity to the cloud hub. Local spokes continue to run; their auth is now reliable. Hub revenue covers Fly costs ($2/mo idle/tenant). Validation: 5 beta users opt in within 4 weeks. **This is the V1 cloud product.**
+2. **Phase 2 — Managed Scribe.** A Parachute-hosted scribe pool that the user's cloud hub points at. Charge for transcription minutes. Already half-built (operationally).
+3. **Phase 3 — Cloud Vault (V1 Shape 1).** When users say "I want to retire my Mac," ship the Workers + DO vault path. The parked PRs (#99 + #101) become load-bearing. Scope: net-new tenants only at first; migration tool follows.
+4. **Phase 4 — BYO-Cloud (ζ) experiment.** Pick one motivated user, deploy a vault Workers app *into their CF account*, validate the orchestration story. If it works, productize as the "your data, your bill, our code" tier — a real differentiator vs Notion/Reflect/Mem.
+
+Phases are sequential; each is independently shippable. Phase 1 alone would generate revenue and validate the hub-as-cloud-attachment thesis.
+
+The parked PRs (#99 + #101) still merge as ecosystem hygiene — they're load-bearing for Phase 3 and useful before then for Turso/libsql experiments. Recommendation from V1 stands.
+
+### 7.6 Updated open questions
+
+V1's six are subsumed; here are the load-bearing questions for V2:
+
+1. **Cloud hub vs cloud vault as v1.** V2 argues the hub is the right cloud-attachment point. Does Aaron agree? If so, the parked PRs become Phase 3 (a year out), not Phase 1.
+2. **Hub-offline = system-offline.** Is multi-hour JWKS caching + a documented "your hub uptime is your auth uptime" caveat acceptable for self-hosted hubs? Or does this push us toward "hub belongs in cloud" as a hard recommendation?
+3. **BYO-Cloud (ζ) — is it real?** It's a strong fit with the open-source / sovereignty story but operationally it's the most complex shape (we don't control the runtime). Worth a Phase 4 spike, or a distraction?
+4. **Single-binary VPS bundle (η).** Compelling for the homelab / sovereignty audience and architecturally clean, but it's a different product than cloud-hub. Do we explore it as a fifth shape, or park it for the hardware-bundled future?
+5. **What does the cloud hub authenticate with?** Native (email/password), Google/GitHub OAuth federation, or both? Federation is easier to ship; native preserves the "no third-party dependencies" story.
+6. **Pricing posture.** Cloud Hub at $5/mo (covers Fly + margin) is a low-friction entry. Scribe metered on top. Cloud Vault as a $20/mo tier later. Or one bundle. Founding-team conversation; the shape choice doesn't force the answer.
+
+The framing change makes question 1 the load-bearing one. Everything else flows from it.
+
+---
+
+## TL;DR (v2)
+
+- **The frame**: not "where does vault run?" — but "where does the **hub** live, and how do spokes attach?" Four axes: hub location, spoke location, IDP type, hub reachability.
+- **OAuth is the connective tissue.** JWTs are portable; spokes validate against the hub's JWKS regardless of where either lives. The boundary cost is JWKS reachability + hub-offline-as-system-offline.
+- **Re-derived shapes** (α–η) cover the existing all-local default, hub-cloud + spokes-local (the right reformulation of V1 Shape 3), full SaaS (V1 Shape 1), mixed deployments, BYO-Cloud (tenant-owned Workers), and single-binary VPS.
+- **Recommendation**: ship **Cloud Hub first** (Phase 1 — Fly.io-hosted `parachute-hub` per tenant). Cloud Vault becomes Phase 3 (V1 Shape 1, parked PRs activate). Scribe + BYO-Cloud are intermediate phases.
+- **Why this re-orders the build**: cloud hub is the smallest cloud-able unit and unblocks every other shape. Once it exists, users opt their spokes into cloud individually. Cloud isn't a separate product; it's a re-binding of the four axes.
+- **Six open questions** lead with: cloud-hub-as-v1 vs cloud-vault-as-v1. Aaron's call.
