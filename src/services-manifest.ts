@@ -46,7 +46,10 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (typeof version !== "string") {
     throw new ServicesManifestError(`${where}: "version" must be a string`);
   }
-  return { name, port, paths: paths as string[], health, version };
+  // Spread the raw object first so hub-stamped fields (e.g. `installDir` from
+  // parachute-hub#84) ride through the read. The strict fields below pin the
+  // typed shape we promise callers; anything extra survives untouched.
+  return { ...e, name, port, paths: paths as string[], health, version } as ServiceEntry;
 }
 
 function validateManifest(raw: unknown, where: string): ServicesManifest {
@@ -90,7 +93,11 @@ export function upsertService(
   const current = readManifest(path);
   const idx = current.services.findIndex((s) => s.name === entry.name);
   if (idx >= 0) {
-    current.services[idx] = entry;
+    // Merge rather than replace so fields the hub stamps onto the row
+    // (`installDir` from parachute-hub#84, etc.) survive a self-registration
+    // pass. Vault still wins for the fields it owns — port, paths, version,
+    // health — because `entry` spreads last.
+    current.services[idx] = { ...current.services[idx], ...entry };
   } else {
     current.services.push(entry);
   }

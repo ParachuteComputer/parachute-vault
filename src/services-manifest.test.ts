@@ -123,6 +123,26 @@ describe("services-manifest", () => {
     }
   });
 
+  test("preserves hub-stamped fields on the row (e.g. installDir from parachute-hub#84)", () => {
+    const { path, cleanup } = tempPath();
+    try {
+      // Pre-existing row carries `installDir` — a field the hub stamps onto
+      // the entry post-install. Vault's self-registration pass must not drop
+      // it, even though `installDir` isn't part of the typed ServiceEntry.
+      const stamped = { ...vault, installDir: "/Users/test/.parachute/vault" };
+      writeFileSync(path, `${JSON.stringify({ services: [stamped] }, null, 2)}\n`);
+      const updated = { ...vault, version: "0.4.0" };
+      upsertService(updated, path);
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      const row = m.services[0] as ServiceEntry & { installDir?: string };
+      expect(row.version).toBe("0.4.0"); // vault's field wins
+      expect(row.installDir).toBe("/Users/test/.parachute/vault"); // hub's field survives
+    } finally {
+      cleanup();
+    }
+  });
+
   test("default path honors PARACHUTE_HOME set at runtime", () => {
     const dir = mkdtempSync(join(tmpdir(), "pvault-home-"));
     const prior = process.env.PARACHUTE_HOME;
