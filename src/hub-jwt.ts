@@ -10,7 +10,9 @@
  *   - JWKS fetch + verify. `jose.createRemoteJWKSet` does the fetching, kid
  *     lookup, and rotation handling. Tokens MUST have `iss = <hub origin>` —
  *     the load-bearing trust check; without it, anyone could forge tokens
- *     against any RSA key. Audience is parsed but accepted broadly (TODO).
+ *     against any RSA key. `aud` is strict-checked against
+ *     `opts.expectedAudience` when provided (per-vault binding); RFC 7519
+ *     `aud` may be a string or string[], and either shape is supported.
  *
  * Vault#169 / hub-as-issuer Phase B2.
  */
@@ -149,14 +151,28 @@ export async function validateHubJwt(
     throw new HubJwtError("hub JWT missing required `sub` claim");
   }
 
-  const aud = typeof payload.aud === "string" ? payload.aud : undefined;
+  // RFC 7519 §4.1.3: `aud` may be a string OR an array of strings. We unify
+  // into an array internally and check membership; surfacing back to callers
+  // collapses to a single representative value (the matched one when an
+  // expectation was supplied, else the first array element).
+  const audRaw = payload.aud;
+  const auds: string[] =
+    typeof audRaw === "string"
+      ? [audRaw]
+      : Array.isArray(audRaw)
+        ? audRaw.filter((a): a is string => typeof a === "string")
+        : [];
+
   if (opts.expectedAudience != null) {
-    if (aud !== opts.expectedAudience) {
+    if (!auds.includes(opts.expectedAudience)) {
+      const got = auds.length === 0 ? "(missing)" : auds.join(", ");
       throw new HubJwtError(
-        `hub JWT audience mismatch: expected "${opts.expectedAudience}", got "${aud ?? "(missing)"}"`,
+        `hub JWT audience mismatch: expected "${opts.expectedAudience}", got "${got}"`,
       );
     }
   }
+  const aud: string | undefined =
+    opts.expectedAudience != null ? opts.expectedAudience : auds[0];
 
   const scopeRaw = (payload as { scope?: unknown }).scope;
   const scopes =
