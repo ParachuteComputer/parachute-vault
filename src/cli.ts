@@ -360,7 +360,7 @@ async function cmdInit(args: string[] = []) {
     });
   } catch (err) {
     const msg = err instanceof ServicesManifestError ? err.message : String(err);
-    console.log(`  Warning: could not update ~/.parachute/services.json: ${msg}`);
+    console.error(`  Warning: could not update ~/.parachute/services.json: ${msg}`);
   }
 
   // 2b. Migrate existing legacy keys into per-vault token tables
