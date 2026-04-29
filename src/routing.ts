@@ -63,6 +63,7 @@ import {
   getBaseUrl,
 } from "./oauth.ts";
 import { handleConfigSchema, handleConfig } from "./module-config.ts";
+import { buildAuthStatus } from "./auth-status.ts";
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -226,6 +227,18 @@ export async function route(
       return Response.json({ error: "Not found" }, { status: 404 });
     }
     return Response.json({ vaults: listVaults() });
+  }
+
+  // Public auth-state probe. Tells a first-contact client whether the
+  // server has any vaults yet, which bearer formats it accepts, and
+  // whether owner-password / TOTP / tokens are configured. Replaces
+  // hub's out-of-process filesystem snoop (parachute-hub#86 follow-up).
+  // No auth, GET-only, no token counts — `hasTokens` is a yes/no signal
+  // only, with `null` for "DB read failed."
+  if (path === "/auth/status" && req.method === "GET") {
+    return Response.json(buildAuthStatus(), {
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
   }
 
   // Authenticated vault metadata list.
