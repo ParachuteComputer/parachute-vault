@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 
@@ -155,6 +155,60 @@ describe("vault init — --no-autostart (#113)", () => {
       expect(second.stdout).toContain("Autostart disabled");
       expect(readFileSync(configPath, "utf-8")).toContain("autostart: false");
       expect(existsSync(join(parachuteHome, "vault", "start.sh"))).toBe(false);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * #210: re-running `parachute-vault init` is the documented recovery path
+ * for installs whose `services.json` is stale (#208 left some vaults out of
+ * the manifest). The recovery is implicit — init re-registers the full
+ * vault list every run via `buildVaultServicePaths` — so this test pins it
+ * down with an explicit fixture: corrupt the manifest to drop one vault,
+ * re-run init, expect the manifest to grow back.
+ */
+describe("vault init — repairs stale services.json (#210)", () => {
+  test("re-running init rewrites services.json to include every vault on disk", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "vault-init-repair-"));
+    try {
+      const parachuteHome = join(sandbox, ".parachute");
+      const env = { HOME: sandbox, PARACHUTE_HOME: parachuteHome };
+
+      // Use `create` to bootstrap two vaults into a real, healthy state —
+      // this also writes the initial services.json with both vaults so we
+      // have a known-good baseline to corrupt.
+      expect(runCli(["create", "alpha", "--json"], env).exitCode).toBe(0);
+      expect(runCli(["create", "beta", "--json"], env).exitCode).toBe(0);
+
+      const servicesPath = join(parachuteHome, "services.json");
+      const baseline = JSON.parse(readFileSync(servicesPath, "utf-8"));
+      const baselineEntry = baseline.services.find(
+        (s: { name: string }) => s.name === "parachute-vault",
+      );
+      expect(baselineEntry.paths).toEqual(["/vault/alpha", "/vault/beta"]);
+
+      // Corrupt: drop beta from the manifest, mimicking the #208 state where
+      // an older `create` ran without the upsert.
+      baselineEntry.paths = ["/vault/alpha"];
+      writeFileSync(servicesPath, JSON.stringify(baseline, null, 2));
+
+      // Re-run init with no flags that would change vault topology. The
+      // sandbox env keeps launchd / ~/.claude.json side effects out of the
+      // dev environment.
+      const repair = runCli(
+        ["init", "--no-autostart", "--no-mcp", "--no-token"],
+        env,
+      );
+      expect(repair.exitCode).toBe(0);
+
+      const repaired = JSON.parse(readFileSync(servicesPath, "utf-8"));
+      const repairedEntry = repaired.services.find(
+        (s: { name: string }) => s.name === "parachute-vault",
+      );
+      // alpha is still default (created first), so it leads. beta is back.
+      expect(repairedEntry.paths).toEqual(["/vault/alpha", "/vault/beta"]);
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
