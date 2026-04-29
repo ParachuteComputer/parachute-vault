@@ -958,7 +958,7 @@ describe("attachments", async () => {
 // ---- MCP Tools ----
 
 describe("MCP tools", async () => {
-  it("generates all 9 consolidated tools", () => {
+  it("generates all 10 consolidated tools", () => {
     const tools = generateMcpTools(store);
     const names = tools.map((t) => t.name);
 
@@ -970,8 +970,9 @@ describe("MCP tools", async () => {
     expect(names).toContain("update-tag");
     expect(names).toContain("delete-tag");
     expect(names).toContain("find-path");
+    expect(names).toContain("synthesize-notes");
     expect(names).toContain("vault-info");
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(10);
   });
 
   it("create-note tool works", async () => {
@@ -1734,6 +1735,183 @@ describe("MCP tools", async () => {
     expect(result).not.toBeNull();
     expect(result.path).toEqual(["a", "b", "c"]);
     expect(result.relationships).toEqual(["mentions", "related-to"]);
+  });
+
+  // ---- synthesize-notes ----
+
+  it("synthesize-notes rejects when neither anchor nor query is supplied", async () => {
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({}) as any;
+    expect(result.error).toMatch(/at least one of `anchor` or `query`/);
+  });
+
+  it("synthesize-notes rejects an unknown anchor", async () => {
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "does-not-exist" }) as any;
+    expect(result.error).toMatch(/Anchor note not found/);
+  });
+
+  it("synthesize-notes returns anchor + linked neighbors ranked", async () => {
+    await store.createNote("Hub note", { id: "hub", tags: ["topic"] });
+    await store.createNote("Direct neighbor", { id: "n1" });
+    await store.createNote("Two-hop neighbor", { id: "n2" });
+    await store.createNote("Unrelated", { id: "u1" });
+    await store.createLink("hub", "n1", "mentions");
+    await store.createLink("n1", "n2", "mentions");
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "hub", depth: 2 }) as any;
+
+    const ids = result.notes.map((n: any) => n.id);
+    expect(ids).toContain("hub");
+    expect(ids).toContain("n1");
+    expect(ids).toContain("n2");
+    expect(ids).not.toContain("u1");
+    // Anchor ranks first; one-hop beats two-hop.
+    expect(ids[0]).toBe("hub");
+    expect(ids.indexOf("n1")).toBeLessThan(ids.indexOf("n2"));
+    expect(result.notes[0].sources).toContain("anchor");
+    expect(result.notes[0].distance).toBe(0);
+    expect(result.topic.anchor).toEqual({ id: "hub", path: null });
+  });
+
+  it("synthesize-notes returns FTS hits when only query is supplied", async () => {
+    await store.createNote("Octopus thoughts: ink and color", { id: "o1" });
+    await store.createNote("Squid thoughts: deep blue", { id: "s1" });
+    await store.createNote("Recipe for octopus salad", { id: "o2" });
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ query: "octopus" }) as any;
+
+    const ids = result.notes.map((n: any) => n.id);
+    expect(ids).toContain("o1");
+    expect(ids).toContain("o2");
+    expect(ids).not.toContain("s1");
+    expect(result.notes[0].sources).toContain("search");
+    expect(result.notes[0]).toHaveProperty("fts_rank");
+    expect(result.topic.query).toBe("octopus");
+  });
+
+  it("synthesize-notes applies scope.tags filter (any-match)", async () => {
+    await store.createNote("Anchor", { id: "a" });
+    await store.createNote("Tagged neighbor", { id: "t1", tags: ["alpha"] });
+    await store.createNote("Other neighbor", { id: "t2", tags: ["beta"] });
+    await store.createLink("a", "t1", "mentions");
+    await store.createLink("a", "t2", "mentions");
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "a", scope: { tags: ["alpha"] } }) as any;
+
+    const ids = result.notes.map((n: any) => n.id);
+    expect(ids).toContain("t1");
+    expect(ids).not.toContain("t2");
+    expect(ids).not.toContain("a"); // anchor itself has no tags
+  });
+
+  it("synthesize-notes applies scope.path prefix filter", async () => {
+    await store.createNote("Anchor", { id: "a" });
+    await store.createNote("In scope", { id: "p1", path: "Projects/Alpha/notes" });
+    await store.createNote("Out of scope", { id: "p2", path: "People/Bob" });
+    await store.createLink("a", "p1", "mentions");
+    await store.createLink("a", "p2", "mentions");
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "a", scope: { path: "projects/" } }) as any;
+
+    const ids = result.notes.map((n: any) => n.id);
+    expect(ids).toContain("p1");
+    expect(ids).not.toContain("p2");
+  });
+
+  it("synthesize-notes respects limit and sets truncated flag", async () => {
+    await store.createNote("Anchor", { id: "anchor" });
+    for (let i = 0; i < 5; i++) {
+      await store.createNote(`Neighbor ${i}`, { id: `n${i}` });
+      await store.createLink("anchor", `n${i}`, "mentions");
+    }
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "anchor", limit: 3 }) as any;
+
+    expect(result.notes).toHaveLength(3);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("synthesize-notes connections include only links between returned notes", async () => {
+    await store.createNote("Anchor", { id: "a" });
+    await store.createNote("In set", { id: "b" });
+    await store.createNote("Excluded", { id: "c" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("a", "c", "mentions");
+    await store.createLink("b", "c", "related-to");
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "a", depth: 1, limit: 2 }) as any;
+
+    const ids = new Set(result.notes.map((n: any) => n.id));
+    for (const c of result.connections) {
+      expect(ids.has(c.source)).toBe(true);
+      expect(ids.has(c.target)).toBe(true);
+    }
+    expect(result.connections.some((c: any) => c.target === "c")).toBe(false);
+  });
+
+  it("synthesize-notes timeline orders oldest → newest", async () => {
+    await store.createNote("Old", { id: "old", created_at: "2024-01-01T00:00:00.000Z" });
+    await store.createNote("Mid", { id: "mid", created_at: "2025-01-01T00:00:00.000Z" });
+    await store.createNote("New", { id: "new", created_at: "2026-01-01T00:00:00.000Z" });
+    await store.createLink("new", "mid", "mentions");
+    await store.createLink("mid", "old", "mentions");
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "new", depth: 2 }) as any;
+
+    const ids = result.timeline.map((t: any) => t.id);
+    expect(ids).toEqual(["old", "mid", "new"]);
+  });
+
+  it("synthesize-notes tag distribution counts tags across results", async () => {
+    await store.createNote("Anchor", { id: "a", tags: ["alpha", "beta"] });
+    await store.createNote("N1", { id: "n1", tags: ["alpha"] });
+    await store.createNote("N2", { id: "n2", tags: ["alpha", "gamma"] });
+    await store.createLink("a", "n1", "mentions");
+    await store.createLink("a", "n2", "mentions");
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+    const result = await synth.execute({ anchor: "a" }) as any;
+
+    const tagMap = new Map(result.tags.map((t: any) => [t.name, t.count]));
+    expect(tagMap.get("alpha")).toBe(3);
+    expect(tagMap.get("beta")).toBe(1);
+    expect(tagMap.get("gamma")).toBe(1);
+    expect(result.tags[0].name).toBe("alpha");
+  });
+
+  it("synthesize-notes include_content controls snippet vs full body", async () => {
+    const longBody = "x".repeat(500);
+    await store.createNote(longBody, { id: "long", path: "Long" });
+
+    const tools = generateMcpTools(store);
+    const synth = tools.find((t) => t.name === "synthesize-notes")!;
+
+    const snippetResult = await synth.execute({ anchor: "long" }) as any;
+    expect(snippetResult.notes[0]).toHaveProperty("snippet");
+    expect(snippetResult.notes[0]).not.toHaveProperty("content");
+    expect(snippetResult.notes[0].snippet.length).toBeLessThanOrEqual(200);
+
+    const fullResult = await synth.execute({ anchor: "long", include_content: true }) as any;
+    expect(fullResult.notes[0].content).toBe(longBody);
+    expect(fullResult.notes[0]).not.toHaveProperty("snippet");
   });
 
   it("create-note via store triggers wikilink sync", async () => {

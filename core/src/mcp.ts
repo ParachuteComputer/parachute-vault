@@ -68,7 +68,7 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Generate the 9 consolidated MCP tools for a vault.
+ * Generate the 10 consolidated MCP tools for a vault.
  */
 export function generateMcpTools(store: Store): McpToolDef[] {
   const db: Database = (store as any).db;
@@ -756,7 +756,233 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     },
 
     // =====================================================================
-    // 9. vault-info — get/update vault description + stats
+    // 9. synthesize-notes — gather a coherent neighborhood for a topic
+    // =====================================================================
+    {
+      name: "synthesize-notes",
+      description: `Gather the notes that, taken together, tell the story of a topic — for the agent to read and synthesize.
+
+This is the graph-aware sibling of \`query-notes\`. Where \`query-notes\` returns flat matches, \`synthesize-notes\` pulls a *neighborhood*: anchor + linked notes + search hits + tag distribution + an oldest-first timeline, so the agent can write a coherent narrative without needing 4 separate calls.
+
+**Inputs.** Pass at least one of \`anchor\` (note ID/path to seed graph traversal) or \`query\` (FTS search string). Optionally narrow with \`scope.tags\` / \`scope.path\` (path prefix). \`depth\` (1–3, default 2) caps anchor traversal hops. \`limit\` (default 25, max 50) caps the returned note count.
+
+**What you get back.**
+  - \`notes\`: ranked candidates with \`sources\` (which seed brought them in: \`anchor\` / \`neighbor\` / \`search\`), \`distance\` (hops from anchor), and a short \`snippet\`. Pass \`include_content: true\` to inline the full note body.
+  - \`connections\`: direct links between notes in the result set — the edge structure of the neighborhood.
+  - \`tags\`: tag distribution across the result set (count desc) — quickly shows the conceptual axes.
+  - \`timeline\`: the same notes sorted oldest → newest by \`created_at\` — surfaces evolution of the topic.
+  - \`truncated\`: true when more candidates were available than \`limit\` allowed.
+
+**Synthesis is the caller's job.** The vault returns *what to read*; the agent writes the narrative. No LLM call is made server-side.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          anchor: { type: "string", description: "Note ID or path to seed graph traversal. Optional if `query` is set." },
+          query: { type: "string", description: "Full-text search query. Optional if `anchor` is set." },
+          scope: {
+            type: "object",
+            properties: {
+              tags: { type: "array", items: { type: "string" }, description: "Restrict to notes carrying any of these tags." },
+              path: { type: "string", description: "Restrict to notes whose path starts with this prefix (case-insensitive)." },
+            },
+            description: "Optional filters applied after seeding.",
+          },
+          depth: { type: "number", description: "Max graph hops from anchor (1–3, default 2). Ignored when no anchor is set." },
+          limit: { type: "number", description: "Max notes returned (default 25, hard cap 50)." },
+          include_content: { type: "boolean", description: "Inline full note content (default false — only a short snippet is included)." },
+        },
+      },
+      execute: async (params) => {
+        const anchorParam = typeof params.anchor === "string" && params.anchor.trim() ? params.anchor.trim() : null;
+        const queryParam = typeof params.query === "string" && params.query.trim() ? params.query.trim() : null;
+        if (!anchorParam && !queryParam) {
+          return { error: "synthesize-notes requires at least one of `anchor` or `query`." };
+        }
+
+        const depth = Math.max(1, Math.min((params.depth as number | undefined) ?? 2, 3));
+        const limit = Math.max(1, Math.min((params.limit as number | undefined) ?? 25, 50));
+        const includeContent = params.include_content === true;
+        const scope = (params.scope as { tags?: string[]; path?: string } | undefined) ?? {};
+        const scopeTags = Array.isArray(scope.tags) && scope.tags.length > 0 ? scope.tags : null;
+        const scopePathPrefix = typeof scope.path === "string" && scope.path.trim() ? scope.path.trim().toLowerCase() : null;
+
+        // Pre-resolve the anchor so a bad ID/path errors out cheaply.
+        let anchorNote: Note | null = null;
+        if (anchorParam) {
+          anchorNote = resolveNote(db, anchorParam);
+          if (!anchorNote) {
+            return { error: "Anchor note not found", anchor: anchorParam };
+          }
+        }
+
+        // ----- Candidate seeding -----
+        // Each candidate tracks every signal that surfaced it (so the agent
+        // can see whether a note came from the search hit, the graph, or
+        // both) plus enough provenance to score it.
+        type Candidate = {
+          sources: Set<"anchor" | "neighbor" | "search">;
+          distance: number | null;       // hops from anchor; null if not on the graph
+          ftsRank: number | null;        // 0 = best FTS hit; null if not a search hit
+        };
+        const candidates = new Map<string, Candidate>();
+
+        const upsert = (id: string, patch: Partial<Candidate> & { source: "anchor" | "neighbor" | "search" }): void => {
+          const existing = candidates.get(id);
+          if (!existing) {
+            candidates.set(id, {
+              sources: new Set([patch.source]),
+              distance: patch.distance ?? null,
+              ftsRank: patch.ftsRank ?? null,
+            });
+            return;
+          }
+          existing.sources.add(patch.source);
+          if (patch.distance !== undefined && patch.distance !== null) {
+            existing.distance = existing.distance === null ? patch.distance : Math.min(existing.distance, patch.distance);
+          }
+          if (patch.ftsRank !== undefined && patch.ftsRank !== null) {
+            existing.ftsRank = existing.ftsRank === null ? patch.ftsRank : Math.min(existing.ftsRank, patch.ftsRank);
+          }
+        };
+
+        if (anchorNote) {
+          upsert(anchorNote.id, { source: "anchor", distance: 0 });
+          const traversed = linkOps.traverseLinks(db, anchorNote.id, { max_depth: depth });
+          for (const t of traversed) upsert(t.noteId, { source: "neighbor", distance: t.depth });
+        }
+
+        if (queryParam) {
+          // Cap the FTS pull at 2× limit so the post-scope filter still leaves
+          // enough headroom to fill the result set with real hits.
+          const searchHits = noteOps.searchNotes(db, queryParam, { limit: Math.min(limit * 2, 100) });
+          searchHits.forEach((n, idx) => upsert(n.id, { source: "search", ftsRank: idx }));
+        }
+
+        // ----- Hydrate + scope filter -----
+        const ids = [...candidates.keys()];
+        const noteMap = new Map<string, Note>();
+        for (const id of ids) {
+          const n = noteOps.getNote(db, id);
+          if (n) noteMap.set(id, n);
+        }
+
+        const passesScope = (note: Note): boolean => {
+          if (scopeTags) {
+            const tags = note.tags ?? [];
+            if (!scopeTags.some((t) => tags.includes(t))) return false;
+          }
+          if (scopePathPrefix) {
+            const p = (note.path ?? "").toLowerCase();
+            if (!p.startsWith(scopePathPrefix)) return false;
+          }
+          return true;
+        };
+
+        const inScope: { id: string; note: Note; cand: Candidate }[] = [];
+        for (const [id, cand] of candidates) {
+          const note = noteMap.get(id);
+          if (!note) continue;
+          if (!passesScope(note)) continue;
+          inScope.push({ id, note, cand });
+        }
+
+        // ----- Score + rank -----
+        // Heuristic: anchor wins outright (5), search hits decay with FTS rank
+        // toward 0 (max ≈ 3), graph proximity contributes 0–3 (1 hop = 2,
+        // 2 hops = 1). Multi-source notes naturally rise — both axes add up.
+        const scoreOf = (c: Candidate): number => {
+          let s = 0;
+          if (c.sources.has("anchor")) s += 5;
+          if (c.sources.has("search") && c.ftsRank !== null) {
+            const decay = Math.max(0, 1 - c.ftsRank / 50);
+            s += 3 * decay;
+          }
+          if (c.sources.has("neighbor") && c.distance !== null) {
+            s += Math.max(0, 3 - c.distance);
+          }
+          return s;
+        };
+
+        inScope.sort((a, b) => {
+          const sa = scoreOf(a.cand);
+          const sb = scoreOf(b.cand);
+          if (sb !== sa) return sb - sa;
+          // Tie-break on recency so the agent surfaces the freshest take.
+          return (b.note.updatedAt ?? b.note.createdAt).localeCompare(a.note.updatedAt ?? a.note.createdAt);
+        });
+
+        const truncated = inScope.length > limit;
+        const top = inScope.slice(0, limit);
+
+        // ----- Snippet (cheap: first ~200 chars of content, single-line) -----
+        const snippetOf = (content: string): string => {
+          const flat = content.replace(/\s+/g, " ").trim();
+          return flat.length > 200 ? `${flat.slice(0, 197)}...` : flat;
+        };
+
+        const notesOut = top.map(({ id, note, cand }) => {
+          const out: Record<string, unknown> = {
+            id,
+            path: note.path ?? null,
+            tags: note.tags ?? [],
+            created_at: note.createdAt,
+            updated_at: note.updatedAt ?? null,
+            sources: [...cand.sources],
+            score: Number(scoreOf(cand).toFixed(3)),
+          };
+          if (cand.distance !== null) out.distance = cand.distance;
+          if (cand.ftsRank !== null) out.fts_rank = cand.ftsRank;
+          if (includeContent) {
+            out.content = note.content;
+          } else {
+            out.snippet = snippetOf(note.content);
+          }
+          return out;
+        });
+
+        // ----- Connections (direct links among returned notes only) -----
+        const idSet = new Set(top.map((t) => t.id));
+        const connections: { source: string; target: string; relationship: string }[] = [];
+        if (idSet.size > 1) {
+          const placeholders = [...idSet].map(() => "?").join(",");
+          const rows = db.prepare(
+            `SELECT source_id, target_id, relationship FROM links
+             WHERE source_id IN (${placeholders}) AND target_id IN (${placeholders})`,
+          ).all(...idSet, ...idSet) as { source_id: string; target_id: string; relationship: string }[];
+          for (const r of rows) {
+            connections.push({ source: r.source_id, target: r.target_id, relationship: r.relationship });
+          }
+        }
+
+        // ----- Tag distribution + timeline -----
+        const tagCounts = new Map<string, number>();
+        for (const { note } of top) {
+          for (const t of note.tags ?? []) tagCounts.set(t, (tagCounts.get(t) ?? 0) + 1);
+        }
+        const tags = [...tagCounts.entries()]
+          .map(([name, count]) => ({ name, count }))
+          .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+        const timeline = [...top]
+          .sort((a, b) => a.note.createdAt.localeCompare(b.note.createdAt))
+          .map(({ id, note }) => ({ id, created_at: note.createdAt }));
+
+        return {
+          topic: {
+            ...(anchorNote ? { anchor: { id: anchorNote.id, path: anchorNote.path ?? null } } : {}),
+            ...(queryParam ? { query: queryParam } : {}),
+          },
+          notes: notesOut,
+          connections,
+          tags,
+          timeline,
+          truncated,
+        };
+      },
+    },
+
+    // =====================================================================
+    // 10. vault-info — get/update vault description + stats
     // =====================================================================
     {
       name: "vault-info",
