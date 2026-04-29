@@ -37,6 +37,8 @@ import {
   loadEnvFile,
   listVaults,
   vaultDir,
+  vaultDbPath,
+  vaultConfigPath,
   DEFAULT_PORT,
   CONFIG_DIR,
   ASSETS_DIR,
@@ -700,9 +702,15 @@ async function cmd2fa(args: string[]) {
 }
 
 function cmdCreate(args: string[]) {
-  const name = args[0];
+  // --json: emit a single machine-readable object on stdout instead of the
+  // human-friendly multi-line print. Designed for orchestrators (the hub's
+  // POST /vaults shells out to this CLI and parses stdout). Errors still go
+  // to stderr as plain text and exit nonzero — callers branch on exit code.
+  const jsonMode = args.includes("--json");
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const name = positional[0];
   if (!name) {
-    console.error("Usage: parachute-vault create <name>");
+    console.error("Usage: parachute-vault create <name> [--json]");
     process.exit(1);
   }
 
@@ -735,12 +743,29 @@ function cmdCreate(args: string[]) {
   const needsDefault = !globalConfig.default_vault
     || !listVaults().includes(globalConfig.default_vault);
   let defaultNote: string | null = null;
+  let setAsDefault = false;
   if (needsDefault) {
     globalConfig.default_vault = name;
     writeGlobalConfig(globalConfig);
+    setAsDefault = true;
     defaultNote = wasFirst
       ? `Set as default vault (unscoped routes will target "${name}")`
       : `Set as default vault (previous default was missing)`;
+  }
+
+  if (jsonMode) {
+    const payload = {
+      name,
+      token: key,
+      paths: {
+        vault_dir: vaultDir(name),
+        vault_db: vaultDbPath(name),
+        vault_config: vaultConfigPath(name),
+      },
+      set_as_default: setAsDefault,
+    };
+    console.log(JSON.stringify(payload));
+    return;
   }
 
   console.log(`Vault "${name}" created.`);
@@ -2155,7 +2180,7 @@ Setup:
   parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
-  parachute-vault create <name>            Create a new vault
+  parachute-vault create <name> [--json]   Create a new vault (--json: emit { name, token, paths, set_as_default })
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
   parachute-vault mcp-install              Add vault MCP to Claude
