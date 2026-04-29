@@ -7,6 +7,13 @@
   "bin": {
     "parachute-vault": "src/cli.ts"
   },
+  "files": [
+    "src",
+    "core/src",
+    "core/package.json",
+    ".parachute",
+    "tsconfig.json"
+  ],
   "scripts": {
     "start": "bun src/server.ts",
     "cli": "bun src/cli.ts",
