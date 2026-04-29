@@ -1398,7 +1398,9 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect((await store.getNote("x"))!.content).toBe("hi world");
   });
 
-  test("PATCH content_edit returns 404 when old_text is not found", async () => {
+  test("PATCH content_edit returns 422 when old_text is not found (#202)", async () => {
+    // 404 misleadingly read as "note doesn't exist"; 422 says "request is
+    // valid, but old_text doesn't apply to the current content."
     const note = await store.createNote("hello world", { id: "x" });
 
     const res = await handleNotes(
@@ -1409,7 +1411,9 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
       store,
       "/x",
     );
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(422);
+    const body = await res.json() as any;
+    expect(body.error).toBe("unprocessable_content");
     expect((await store.getNote("x"))!.content).toBe("hello world");
   });
 

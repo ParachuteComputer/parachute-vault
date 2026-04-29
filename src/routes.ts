@@ -490,9 +490,13 @@ export async function handleNotes(
         }
         const idx = note.content.indexOf(ce.old_text);
         if (idx < 0) {
+          // 422 Unprocessable Entity, not 404: the note exists, the request is
+          // syntactically valid, but the search string can't be applied to the
+          // current content. Returning 404 implied "note doesn't exist" and
+          // confused operators chasing a missing record (#202).
           return json(
-            { error: "not_found", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` },
-            404,
+            { error: "unprocessable_content", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` },
+            422,
           );
         }
         const second = note.content.indexOf(ce.old_text, idx + 1);
