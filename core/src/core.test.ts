@@ -1319,6 +1319,252 @@ describe("MCP tools", async () => {
     expect((await store.getNote("source"))!.content).toBe("See [[People/Alice]] for details");
   });
 
+  it("update-note append concatenates to end without precondition", async () => {
+    const note = await store.createNote("first line\n", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // No if_updated_at and no force — append-only is precondition-exempt.
+    const result = await updateNote.execute({ id: note.id, append: "second line\n" }) as any;
+    expect(result.content).toBe("first line\nsecond line\n");
+
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("first line\nsecond line\n");
+  });
+
+  it("update-note prepend concatenates to start without precondition", async () => {
+    const note = await store.createNote("body", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({ id: note.id, prepend: "header\n" }) as any;
+    expect(result.content).toBe("header\nbody");
+  });
+
+  it("update-note append+prepend in one call lands both contributions", async () => {
+    const note = await store.createNote("middle", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      prepend: "[start] ",
+      append: " [end]",
+    }) as any;
+    expect(result.content).toBe("[start] middle [end]");
+  });
+
+  it("update-note rejects content + append in same call", async () => {
+    const note = await store.createNote("body", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, content: "new", append: "more", force: true });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note rejects content + content_edit in same call", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content: "replace",
+        content_edit: { old_text: "hello", new_text: "hi" },
+        force: true,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note rejects append + content_edit in same call", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        append: " more",
+        content_edit: { old_text: "hello", new_text: "hi" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/mutually exclusive/);
+  });
+
+  it("update-note append still requires precondition when combined with other fields", async () => {
+    const note = await store.createNote("body", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // append + metadata is NOT precondition-exempt — metadata mutation
+    // can lose data on a stale read, so the safety gate stays in.
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, append: " more", metadata: { x: 1 } });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+  });
+
+  it("update-note append is atomic under concurrent calls — both lands", async () => {
+    const note = await store.createNote("seed:", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Two concurrent appends. SQL-level concat means both contributions
+    // land — neither overwrites the other.
+    const results = await Promise.all([
+      updateNote.execute({ id: note.id, append: " A" }),
+      updateNote.execute({ id: note.id, append: " B" }),
+    ]);
+    expect(results).toHaveLength(2);
+
+    const persisted = await store.getNote(note.id);
+    // Final content is one of "seed: A B" or "seed: B A" — the order
+    // depends on which write got the lock first, but both contributions
+    // are present.
+    expect(persisted!.content === "seed: A B" || persisted!.content === "seed: B A").toBe(true);
+  });
+
+  it("update-note append updates updated_at and respects if_updated_at when supplied", async () => {
+    const note = await store.createNote("seed", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // With if_updated_at — succeeds because we're using the right token.
+    const ok = await updateNote.execute({ id: note.id, append: " A", if_updated_at: note.updatedAt }) as any;
+    expect(ok.content).toBe("seed A");
+    expect(ok.updatedAt).not.toBe(note.updatedAt);
+
+    // Stale token — conflict.
+    let err: any;
+    try {
+      await updateNote.execute({ id: note.id, append: " B", if_updated_at: note.updatedAt });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+  });
+
+  it("update-note append parses new wikilinks introduced via append", async () => {
+    const target = await store.createNote("Alice's note", { id: "alice", path: "People/Alice" });
+    const source = await store.createNote("intro\n", { id: "src" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    await updateNote.execute({ id: source.id, append: "see [[People/Alice]]" });
+
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "wikilink")).toBe(true);
+  });
+
+  it("update-note content_edit replaces a single occurrence", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content_edit: { old_text: "hello", new_text: "hi" },
+      if_updated_at: note.updatedAt,
+    }) as any;
+    expect(result.content).toBe("hi world");
+  });
+
+  it("update-note content_edit errors when old_text is not found", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "missing", new_text: "x" },
+        if_updated_at: note.updatedAt,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/not found/);
+    // Note must be untouched.
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("hello world");
+  });
+
+  it("update-note content_edit errors when old_text matches multiple times", async () => {
+    const note = await store.createNote("hello hello", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: note.updatedAt,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.message).toMatch(/matches multiple times|exactly once/);
+    const persisted = await store.getNote(note.id);
+    expect(persisted!.content).toBe("hello hello");
+  });
+
+  it("update-note content_edit requires precondition by default", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PRECONDITION_REQUIRED");
+  });
+
+  it("update-note content_edit conflicts when if_updated_at is stale", async () => {
+    const note = await store.createNote("hello world", { id: "n1" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Bump the note so a stale token will conflict at the SQL layer.
+    await updateNote.execute({ id: note.id, content: "hello world", force: true });
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        id: note.id,
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: "2020-01-01T00:00:00.000Z",
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+  });
+
   it("query-notes single note by id", async () => {
     const note = await store.createNote("Hello", { path: "test/note" });
     const tools = generateMcpTools(store);

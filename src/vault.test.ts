@@ -1353,6 +1353,76 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect((await store.getNote("x"))!.content).toBe("first");
   });
 
+  test("PATCH append without precondition succeeds (no-conflict-by-design)", async () => {
+    await store.createNote("seed:", { id: "x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { append: " A" }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    expect((await store.getNote("x"))!.content).toBe("seed: A");
+  });
+
+  test("PATCH content_edit replaces a single occurrence", async () => {
+    const note = await store.createNote("hello world", { id: "x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", {
+        content_edit: { old_text: "hello", new_text: "hi" },
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    expect((await store.getNote("x"))!.content).toBe("hi world");
+  });
+
+  test("PATCH content_edit returns 404 when old_text is not found", async () => {
+    const note = await store.createNote("hello world", { id: "x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", {
+        content_edit: { old_text: "missing", new_text: "x" },
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(404);
+    expect((await store.getNote("x"))!.content).toBe("hello world");
+  });
+
+  test("PATCH content_edit returns 409 on multiple matches", async () => {
+    const note = await store.createNote("hi hi", { id: "x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", {
+        content_edit: { old_text: "hi", new_text: "hello" },
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(409);
+    expect((await store.getNote("x"))!.content).toBe("hi hi");
+  });
+
+  test("PATCH rejects content + append combination with 400", async () => {
+    await store.createNote("seed", { id: "x" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "new", append: "more", force: true }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error).toBe("mutually_exclusive");
+  });
+
   test("DELETE resolves note by path", async () => {
     await store.createNote("x", { path: "Temp/note" });
     const res = await handleNotes(

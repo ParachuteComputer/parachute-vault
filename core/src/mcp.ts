@@ -363,20 +363,35 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       name: "update-note",
       description: `Update one or more notes. Accepts ID or path. Supports content, path, metadata updates plus tag and link mutations.
 
+- Three content-modification modes (mutually exclusive):
+  - \`content\` — full replace.
+  - \`append\` / \`prepend\` — atomic concatenation at the SQL layer. Multiple agents appending to the same note never overwrite each other. No separator is added; include trailing/leading whitespace yourself if needed. May be combined with each other.
+  - \`content_edit: { old_text, new_text }\` — surgical find-and-replace. \`old_text\` must occur exactly once; zero or multiple matches return an error. Add surrounding context to disambiguate.
 - \`tags: { add: ["x"], remove: ["y"] }\` — add/remove tags
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
-- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally.`,
+- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).`,
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "string", description: "Note ID or path" },
-          content: { type: "string", description: "New content" },
+          content: { type: "string", description: "New content (full replace). Mutually exclusive with `append`/`prepend` and `content_edit`." },
+          append: { type: "string", description: "Text to append to the end of the note. Atomic at the SQL layer — concurrent appends are safe. Mutually exclusive with `content` and `content_edit`. No precondition required." },
+          prepend: { type: "string", description: "Text to prepend to the start of the note. Atomic at the SQL layer. Mutually exclusive with `content` and `content_edit`. May combine with `append`. No precondition required." },
+          content_edit: {
+            type: "object",
+            properties: {
+              old_text: { type: "string", description: "Exact text to find. Must match exactly once in the note's current content." },
+              new_text: { type: "string", description: "Replacement text." },
+            },
+            required: ["old_text", "new_text"],
+            description: "Find-and-replace one occurrence. Errors if `old_text` is not found or matches multiple locations. Mutually exclusive with `content` and `append`/`prepend`.",
+          },
           path: { type: "string", description: "New path" },
           metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
           created_at: { type: "string", description: "New created_at timestamp" },
-          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set." },
+          if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
           force: { type: "boolean", description: "Override the required `if_updated_at` check and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe." },
           tags: {
             type: "object",
@@ -422,10 +437,20 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               properties: {
                 id: { type: "string" },
                 content: { type: "string" },
+                append: { type: "string" },
+                prepend: { type: "string" },
+                content_edit: {
+                  type: "object",
+                  properties: {
+                    old_text: { type: "string" },
+                    new_text: { type: "string" },
+                  },
+                  required: ["old_text", "new_text"],
+                },
                 path: { type: "string" },
                 metadata: { type: "object" },
                 created_at: { type: "string" },
-                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item." },
+                if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item or the item is `append`/`prepend`-only." },
                 force: { type: "boolean", description: "Override the required `if_updated_at` check for this item." },
                 tags: { type: "object" },
                 links: { type: "object" },
@@ -444,20 +469,70 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         for (const item of items) {
           const note = requireNote(db, item.id as string);
 
+          // --- Validate mutual exclusion of content modes ---
+          const hasContent = item.content !== undefined;
+          const hasAppendPrepend = item.append !== undefined || item.prepend !== undefined;
+          const hasContentEdit = item.content_edit !== undefined;
+          const contentModes = (hasContent ? 1 : 0) + (hasAppendPrepend ? 1 : 0) + (hasContentEdit ? 1 : 0);
+          if (contentModes > 1) {
+            throw new Error(
+              `update-note: \`content\`, \`append\`/\`prepend\`, and \`content_edit\` are mutually exclusive — pick one mode of content update for note "${note.id}".`,
+            );
+          }
+
           // --- Safety-by-default: refuse mutations without a precondition ---
           // The caller must either echo the note's last-seen `updated_at`
           // (`if_updated_at`) so the conditional UPDATE can catch lost
           // writes, or explicitly opt out with `force: true`. This runs
           // *before* any DB writes so a rejection leaves the note untouched.
-          if (item.if_updated_at === undefined && item.force !== true) {
+          //
+          // Append/prepend-only updates are exempt: they're SQL-atomic
+          // concatenations that can't lose data on a stale read, so the
+          // precondition would be ceremony for no benefit.
+          const isAppendOnly = hasAppendPrepend
+            && !hasContent
+            && !hasContentEdit
+            && item.path === undefined
+            && item.metadata === undefined
+            && item.created_at === undefined;
+          if (!isAppendOnly && item.if_updated_at === undefined && item.force !== true) {
             throw new PreconditionRequiredError(note.id, note.path ?? null);
+          }
+
+          // --- Resolve content_edit into a full content string ---
+          // We do the find-and-replace at the JS level (read note.content,
+          // validate occurrence count, replace). The race window between
+          // this read and the UPDATE is closed by `if_updated_at` for
+          // strict callers; without it, content_edit is fail-closed —
+          // a stale read where someone else removed `old_text` produces
+          // a "not found" error instead of silently overwriting.
+          let contentOverride = item.content as string | undefined;
+          if (hasContentEdit) {
+            const ce = item.content_edit as { old_text: string; new_text: string };
+            if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
+              throw new Error(
+                "update-note: `content_edit` requires { old_text: string, new_text: string }.",
+              );
+            }
+            const idx = note.content.indexOf(ce.old_text);
+            if (idx < 0) {
+              throw new Error(
+                `update-note content_edit: \`old_text\` not found in note "${note.id}". The note may have been edited — re-read and retry.`,
+              );
+            }
+            const second = note.content.indexOf(ce.old_text, idx + 1);
+            if (second >= 0) {
+              throw new Error(
+                `update-note content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context to disambiguate.`,
+              );
+            }
+            contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
           }
 
           // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
           // We compute the cleaned content so we can do the core UPDATE first
           // (with if_updated_at atomically) before any link deletions. If the
           // UPDATE fails on a conflict, nothing has been mutated.
-          let contentOverride = item.content as string | undefined;
           const linksRemove = (item.links as any)?.remove as { target: string; relationship: string }[] | undefined;
           const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
           if (linksRemove) {
@@ -466,7 +541,15 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               if (!target) continue;
               resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
               if (link.relationship === "wikilink" && target.path) {
-                const currentContent = contentOverride ?? note.content;
+                // Wikilink-removal bracket cleanup operates on the prospective
+                // *full* content. Coexists with content_edit; would fight
+                // append/prepend (which leave existing content untouched at
+                // the JS layer), so we pre-materialize the would-be content
+                // for those callers and switch to a `content`-style update.
+                const currentContent = contentOverride
+                  ?? (hasAppendPrepend
+                    ? (item.prepend as string ?? "") + note.content + (item.append as string ?? "")
+                    : note.content);
                 const cleaned = removeWikilinkBrackets(currentContent, target.path);
                 if (cleaned !== currentContent) {
                   contentOverride = cleaned;
@@ -477,7 +560,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
           // --- Core update (content, path, metadata, created_at + concurrency check) ---
           const updates: any = {};
-          if (contentOverride !== undefined) updates.content = contentOverride;
+          if (contentOverride !== undefined) {
+            updates.content = contentOverride;
+          } else if (hasAppendPrepend) {
+            // No content_edit and no wikilink-removal pre-materialization —
+            // route the append/prepend down to the SQL-atomic path.
+            if (item.append !== undefined) updates.append = item.append;
+            if (item.prepend !== undefined) updates.prepend = item.prepend;
+          }
           if (item.path !== undefined) updates.path = item.path;
           if (item.metadata !== undefined) {
             // Merge metadata (don't replace wholesale)

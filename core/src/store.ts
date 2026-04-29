@@ -55,6 +55,8 @@ export class BunSqliteStore implements Store {
     id: string,
     updates: {
       content?: string;
+      append?: string;
+      prepend?: string;
       path?: string;
       metadata?: Record<string, unknown>;
       created_at?: string;
@@ -70,8 +72,11 @@ export class BunSqliteStore implements Store {
 
     const note = noteOps.updateNote(this.db, id, updates);
 
-    if (updates.content !== undefined) {
-      syncWikilinks(this.db, id, updates.content);
+    // Wikilink sync runs against the *resulting* content. For append/prepend
+    // we don't have the new value pre-write — read it back off the returned
+    // note so a `[[Foo]]` introduced via append still creates the link.
+    if (updates.content !== undefined || updates.append !== undefined || updates.prepend !== undefined) {
+      syncWikilinks(this.db, id, note.content);
     }
 
     if (updates.path !== undefined && note.path) {
