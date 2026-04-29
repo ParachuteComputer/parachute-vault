@@ -7,6 +7,20 @@ import * as tagSchemaOps from "./tag-schemas.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
+import {
+  loadTagHierarchy,
+  getTagDescendants,
+  TAG_CONFIG_PREFIX,
+  type TagHierarchy,
+} from "./tag-hierarchy.js";
+import {
+  loadSchemaConfig,
+  validateNote as runValidateNote,
+  SCHEMA_CONFIG_PREFIX,
+  SCHEMA_DEFAULTS_PATH,
+  type ResolvedSchemas,
+  type ValidationStatus,
+} from "./schema-defaults.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -16,9 +30,65 @@ import { HookRegistry } from "./hooks.js";
 export class BunSqliteStore implements Store {
   public readonly hooks: HookRegistry;
 
+  // Lazy-built caches over `_tags/*` and `_schemas/*` config notes. Null
+  // means "not yet loaded or invalidated"; the next read rebuilds. We
+  // invalidate synchronously inside note mutations (see
+  // `invalidateConfigCachesForPath`) so reads after writes always see
+  // the post-write state.
+  private _tagHierarchy: TagHierarchy | null = null;
+  private _schemaConfig: ResolvedSchemas | null = null;
+
   constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
     initSchema(db);
     this.hooks = opts?.hooks ?? new HookRegistry();
+  }
+
+  /**
+   * Lazy accessor for the `_tags/*` config-note hierarchy. First call after
+   * boot or after an invalidation does the scan; subsequent calls hit the
+   * cache. Returns the same object until invalidated, so callers can rely
+   * on identity for memoizing per-tag descendant sets.
+   */
+  private getTagHierarchy(): TagHierarchy {
+    if (!this._tagHierarchy) this._tagHierarchy = loadTagHierarchy(this.db);
+    return this._tagHierarchy;
+  }
+
+  /**
+   * Lazy accessor for the `_schemas/*` + `_schema_defaults` config-note
+   * resolution. Same lifecycle as the tag hierarchy cache.
+   */
+  private getSchemaConfig(): ResolvedSchemas {
+    if (!this._schemaConfig) this._schemaConfig = loadSchemaConfig(this.db);
+    return this._schemaConfig;
+  }
+
+  /**
+   * Run the resolved schemas against a note and return the resulting
+   * validation status, or null when no schema applies. Public so the MCP
+   * layer can surface `validation_status` on create/update responses
+   * without re-importing the config loader.
+   */
+  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null {
+    return runValidateNote(this.getSchemaConfig(), note);
+  }
+
+  /**
+   * Drop config caches if the mutated path is one of the config namespaces.
+   * Called from create/update/delete — old path is passed alongside new for
+   * rename cases (a note moved out of `_tags/` should still invalidate).
+   */
+  private invalidateConfigCachesForPath(path: string | null | undefined, oldPath?: string | null): void {
+    const isTagConfig = (p: string | null | undefined): boolean =>
+      typeof p === "string" && p.startsWith(TAG_CONFIG_PREFIX);
+    const isSchemaConfig = (p: string | null | undefined): boolean =>
+      typeof p === "string" && (p.startsWith(SCHEMA_CONFIG_PREFIX) || p === SCHEMA_DEFAULTS_PATH);
+    if (isTagConfig(path) || isTagConfig(oldPath)) {
+      this._tagHierarchy = null;
+    }
+    if (isSchemaConfig(path) || isSchemaConfig(oldPath)) {
+      this._schemaConfig = null;
+    }
   }
 
   // ---- Notes ----
@@ -34,6 +104,7 @@ export class BunSqliteStore implements Store {
       resolveUnresolvedWikilinks(this.db, note.path, note.id);
     }
 
+    this.invalidateConfigCachesForPath(note.path);
     this.hooks.dispatch("created", note, this);
 
     return note;
@@ -86,6 +157,12 @@ export class BunSqliteStore implements Store {
       resolveUnresolvedWikilinks(this.db, note.path, id);
     }
 
+    // Invalidate before the hook dispatch so any handler that re-queries
+    // the hierarchy from inside its own logic sees post-write state.
+    // `metadata` updates can change the `parents` field on a config note
+    // even when the path didn't change, so always invalidate when the
+    // current path is in a config namespace.
+    this.invalidateConfigCachesForPath(note.path, oldPath);
     this.hooks.dispatch("updated", note, this);
 
     return note;
@@ -127,14 +204,50 @@ export class BunSqliteStore implements Store {
   }
 
   async deleteNote(id: string): Promise<void> {
+    // Read before delete so we can invalidate config caches on the way out.
+    const existing = noteOps.getNote(this.db, id);
     noteOps.deleteNote(this.db, id);
+    if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
   }
 
   async queryNotes(opts: QueryOpts): Promise<Note[]> {
-    return noteOps.queryNotes(this.db, opts);
+    return noteOps.queryNotes(this.db, this.expandQueryTags(opts));
+  }
+
+  /**
+   * If `tags` are present, attach a parallel `_tagsExpanded` array where
+   * each input tag is replaced with `{tag} ∪ descendants(tag)`. The SQL
+   * builder uses this to widen the tag join from `name = ?` to
+   * `name IN (...)`, so a query for `#manual` matches notes tagged with
+   * any descendant declared via `_tags/*` config notes.
+   *
+   * No-op when no `_tags/*` notes exist (empty hierarchy → each tag
+   * expands to just itself, identical to the pre-expansion behavior).
+   */
+  private expandQueryTags(opts: QueryOpts): QueryOpts {
+    if (!opts.tags || opts.tags.length === 0) return opts;
+    const hierarchy = this.getTagHierarchy();
+    if (hierarchy.childrenOf.size === 0) return opts;
+    const expanded = opts.tags.map((t) => Array.from(getTagDescendants(hierarchy, t)));
+    return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
   async searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]> {
+    // Same hierarchy-expansion treatment as queryNotes — searching `#manual`
+    // should match notes tagged with any descendant tag. The underlying
+    // FTS path already uses `IN (...)` for tags, so we flatten the
+    // per-input expansions into a single union (search semantics are
+    // "any tag matches").
+    if (opts?.tags && opts.tags.length > 0) {
+      const hierarchy = this.getTagHierarchy();
+      if (hierarchy.childrenOf.size > 0) {
+        const expanded = new Set<string>();
+        for (const t of opts.tags) {
+          for (const x of getTagDescendants(hierarchy, t)) expanded.add(x);
+        }
+        return noteOps.searchNotes(this.db, query, { ...opts, tags: Array.from(expanded) });
+      }
+    }
     return noteOps.searchNotes(this.db, query, opts);
   }
 
@@ -196,6 +309,11 @@ export class BunSqliteStore implements Store {
   async createNotes(inputs: noteOps.BulkNoteInput[]): Promise<Note[]> {
     const notes = noteOps.createNotes(this.db, inputs);
     for (const note of notes) {
+      // Bulk path needs the same config-cache invalidation as singleton
+      // createNote — without it, a batch that includes `_tags/*` or
+      // `_schemas/*` notes would leave the cache stale until the next
+      // singleton write happened to bust it.
+      this.invalidateConfigCachesForPath(note.path);
       this.hooks.dispatch("created", note, this);
     }
     return notes;
@@ -246,9 +364,24 @@ export class BunSqliteStore implements Store {
   /**
    * Create a note without triggering wikilink sync.
    * Use this during bulk imports, then call syncAllWikilinks() after.
+   *
+   * Does **not** invalidate the `_tags/*` / `_schemas/*` config caches —
+   * importers writing config notes through this path must call
+   * `rebuildConfigCaches()` once the import is done. (Default importers
+   * follow `createNoteRaw` with `syncAllWikilinks`, so adding the cache
+   * rebuild there is the natural place.)
    */
   async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
     return noteOps.createNote(this.db, content, opts);
+  }
+
+  /**
+   * Drop the config caches unconditionally. Used by bulk-import paths that
+   * skip per-note invalidation for throughput.
+   */
+  rebuildConfigCaches(): void {
+    this._tagHierarchy = null;
+    this._schemaConfig = null;
   }
 
   /**

@@ -163,6 +163,14 @@ export interface Store {
   deleteTagSchema(tag: string): Promise<boolean>;
   getTagSchemaMap(): Promise<Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>>;
 
+  // Schema validation (notes-as-config — `_schemas/*` + `_schema_defaults`).
+  // Returns null when no schema applies to the given note. Synchronous —
+  // the underlying resolver is in-memory after the first lazy load.
+  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): {
+    schemas: string[];
+    warnings: { field: string; schema: string; reason: "missing_required" | "type_mismatch" | "enum_mismatch"; message: string }[];
+  } | null;
+
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
   getAttachments(noteId: string): Promise<Attachment[]>;
