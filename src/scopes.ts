@@ -155,6 +155,49 @@ export function verbForMethod(method: string): VaultVerb {
 }
 
 /**
+ * Validate scopes requested for token minting on a specific vault.
+ *
+ * Each requested scope must be (a) a recognized vault scope shape, (b) not
+ * naming a different vault (cross-vault rejected), and (c) within the
+ * caller's verb power on `vaultName`. The third check is defense-in-depth:
+ * the REST endpoint already gates on `vault:admin`, but enforcing subset
+ * here means a future loosening of the gate (or a partially-trusted caller)
+ * still cannot mint a token stronger than what they hold.
+ *
+ * Pass-through on success — we don't rewrite scopes, just decide yes/no.
+ */
+export function validateMintedScopes(
+  requested: string[],
+  vaultName: string,
+  callerScopes: string[],
+): { ok: true } | { ok: false; rejected: { scope: string; reason: string }[] } {
+  const rejected: { scope: string; reason: string }[] = [];
+  for (const s of requested) {
+    const d = decomposeVaultScope(s);
+    if (!d) {
+      rejected.push({ scope: s, reason: "unknown or unsupported scope" });
+      continue;
+    }
+    if (d.vault !== null && d.vault !== vaultName) {
+      rejected.push({
+        scope: s,
+        reason: `cross-vault scope not allowed (this endpoint mints for vault '${vaultName}')`,
+      });
+      continue;
+    }
+    if (!hasScopeForVault(callerScopes, vaultName, d.verb)) {
+      rejected.push({
+        scope: s,
+        reason: `caller lacks '${d.verb}' on vault '${vaultName}' — cannot grant a stronger scope than held`,
+      });
+      continue;
+    }
+  }
+  if (rejected.length > 0) return { ok: false, rejected };
+  return { ok: true };
+}
+
+/**
  * Detect a broad `vault:<verb>` scope in a granted list. Hub-issued JWTs
  * must NOT carry broad vault scopes — the hub mints `vault:<name>:<verb>` so
  * the resource is named on the wire. `authenticateHubJwt` calls this to

@@ -53,6 +53,7 @@ import {
   handleStorage,
   handleViewNote,
 } from "./routes.ts";
+import { handleTokens } from "./tokens-routes.ts";
 import {
   handleProtectedResource,
   handleAuthorizationServer,
@@ -426,6 +427,31 @@ export async function route(
       createdAt: vaultConfig.created_at,
       stats,
     });
+  }
+
+  // /tokens — admin-gated REST surface for minting/listing/revoking pvt_*
+  // tokens. Admin gate applies to every method (POST/GET/DELETE) since both
+  // the plaintext mint and the metadata listing are sensitive — knowing
+  // labels and scopes of issued tokens leaks the deployment's auth shape.
+  // The handler's POST path applies a strict subset check on requested
+  // scopes via `validateMintedScopes` (defense-in-depth: cross-vault and
+  // privilege-escalation rejections survive even if this gate is later
+  // relaxed).
+  const tokensMatch = subpath.match(/^\/tokens(\/.*)?$/);
+  if (tokensMatch) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    return handleTokens(req, store.db, vaultName, auth.scopes, tokensMatch[1] ?? "");
   }
 
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
