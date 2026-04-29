@@ -10,7 +10,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { resolve } from "path";
-import { mkdtempSync, rmSync, existsSync } from "fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -113,6 +113,67 @@ describe("vault create --json", () => {
     expect(exitCode).not.toBe(0);
     expect(stdout).toBe("");
     expect(stderr).toContain("already exists");
+  });
+});
+
+/**
+ * Regression tests for #208: `vault create` was not updating
+ * `~/.parachute/services.json`, so vaults created after init were invisible
+ * to the hub well-known endpoint and to paraclaw's attach picker. cmdCreate
+ * now re-registers the parachute-vault entry with the full vault list every
+ * time. The default vault must sort first because the hub uses `paths[0]`
+ * as the canonical mount for `.well-known/parachute.json`.
+ */
+describe("vault create — services.json registration (#208)", () => {
+  function readServices(): { name: string; paths: string[]; port: number }[] {
+    const raw = readFileSync(join(home, "services.json"), "utf-8");
+    return JSON.parse(raw).services;
+  }
+
+  test("create-first-vault registers parachute-vault entry with /vault/<name>", () => {
+    const { exitCode } = runCli(["create", "first", "--json"], {
+      PARACHUTE_HOME: home,
+    });
+    expect(exitCode).toBe(0);
+
+    const services = readServices();
+    const vault = services.find((s) => s.name === "parachute-vault");
+    expect(vault).toBeDefined();
+    expect(vault!.paths).toEqual(["/vault/first"]);
+  });
+
+  test("create-additional-vault grows the paths array (default stays first)", () => {
+    runCli(["create", "alpha", "--json"], { PARACHUTE_HOME: home });
+    runCli(["create", "beta", "--json"], { PARACHUTE_HOME: home });
+
+    const vault = readServices().find((s) => s.name === "parachute-vault");
+    expect(vault).toBeDefined();
+    // alpha is the default (created first), so it must lead. beta follows.
+    expect(vault!.paths).toEqual(["/vault/alpha", "/vault/beta"]);
+  });
+
+  test("create-multiple preserves default-first ordering across N vaults", () => {
+    runCli(["create", "one", "--json"], { PARACHUTE_HOME: home });
+    runCli(["create", "two", "--json"], { PARACHUTE_HOME: home });
+    runCli(["create", "three", "--json"], { PARACHUTE_HOME: home });
+
+    const vault = readServices().find((s) => s.name === "parachute-vault");
+    expect(vault).toBeDefined();
+    expect(vault!.paths[0]).toBe("/vault/one");
+    expect(vault!.paths.slice(1).sort()).toEqual([
+      "/vault/three",
+      "/vault/two",
+    ]);
+    expect(vault!.paths).toHaveLength(3);
+  });
+
+  test("--json mode keeps stdout parseable even when services.json is updated", () => {
+    // Regression guard: warnings from upsertService must go to stderr, not
+    // stdout — otherwise the hub orchestrator's JSON.parse(stdout) breaks.
+    const { stdout } = runCli(["create", "clean", "--json"], {
+      PARACHUTE_HOME: home,
+    });
+    expect(() => JSON.parse(stdout.trim())).not.toThrow();
   });
 });
 
