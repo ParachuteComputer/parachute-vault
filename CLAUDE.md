@@ -97,11 +97,16 @@ PORT=1940
 bun src/cli.ts vault init          # setup everything
 bun src/cli.ts vault status        # check status
 bun src/cli.ts vault config        # view/edit config
+bun src/cli.ts vault stop          # graceful shutdown via filesystem sentinel
 bun src/cli.ts vault import <path> # import Obsidian vault
 bun src/cli.ts vault export <path> # export as Obsidian markdown
 bun test src/                      # run server tests
 bun test core/src/                 # run core tests
 ```
+
+### Graceful shutdown
+
+`parachute-vault stop` writes a sentinel file at `~/.parachute/vault/stop.signal`. The running server polls for it every 500ms and, when it finds one, deletes it and runs the same drain-and-exit shutdown path used for SIGINT/SIGTERM. Stale sentinels are removed at server startup, so a `stop` written while no server was listening can't pre-empt the next boot. This exists for environments where signals are awkward (Docker exec, foreground runs without a managed PID) — when you have a PID, `kill -TERM` still works and is the more direct path.
 
 ## Deployment
 
