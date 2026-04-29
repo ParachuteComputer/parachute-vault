@@ -226,6 +226,27 @@ switch (command) {
 // Command implementations
 // ---------------------------------------------------------------------------
 
+/**
+ * Compute the `paths` array for the parachute-vault entry in services.json.
+ * One entry advertises every vault on this server; `paths[0]` is the
+ * canonical mount the hub stamps into `.well-known/parachute.json`, so the
+ * default vault sorts first when one is set. With no vaults yet, fall back
+ * to "/" so an early-init registration is still well-formed.
+ */
+function buildVaultServicePaths(
+  defaultVault: string | undefined,
+  vaults: string[],
+): string[] {
+  if (vaults.length === 0) return ["/"];
+  if (defaultVault && vaults.includes(defaultVault)) {
+    return [
+      `/vault/${defaultVault}`,
+      ...vaults.filter((v) => v !== defaultVault).map((v) => `/vault/${v}`),
+    ];
+  }
+  return vaults.map((v) => `/vault/${v}`);
+}
+
 async function cmdInit(args: string[] = []) {
   ensureConfigDirSync();
 
@@ -324,18 +345,16 @@ async function cmdInit(args: string[] = []) {
   // init can complete without the manifest, just with a warning.
   //
   // `paths[0]` is the canonical mount point — the hub uses it for the
-  // `.well-known/parachute.json` URL and for `parachute expose`. Advertise
-  // `/vault/<default_vault>` so MCP clients land at the scoped endpoint.
-  // When no default vault exists yet (multi-vault, no fallback), fall back
-  // to "/" — the hub can detect and prompt.
-  const servicePath = globalConfig.default_vault
-    ? `/vault/${globalConfig.default_vault}`
-    : "/";
+  // `.well-known/parachute.json` URL and for `parachute expose`, so the
+  // default vault always sorts first. Remaining vaults follow so the hub
+  // well-known and paraclaw's attach picker see every vault on this server.
+  // Re-running init re-registers the full set; that doubles as the
+  // recovery path for installs whose services.json is stale (#208).
   try {
     upsertService({
       name: "parachute-vault",
       port: globalConfig.port || DEFAULT_PORT,
-      paths: [servicePath],
+      paths: buildVaultServicePaths(globalConfig.default_vault, allVaults),
       health: "/health",
       version: pkg.version,
     });
@@ -800,6 +819,24 @@ function cmdCreate(args: string[]) {
     defaultNote = wasFirst
       ? `Set as default vault (unscoped routes will target "${name}")`
       : `Set as default vault (previous default was missing)`;
+  }
+
+  // Re-register in services.json so the hub well-known and paraclaw's
+  // attach picker see this vault. cmdInit registers on first run; cmdCreate
+  // adds the new path on every subsequent vault. Without this, vaults
+  // created after init were invisible to the hub (#208).
+  // Warnings go to stderr to keep --json stdout clean for the orchestrator.
+  try {
+    upsertService({
+      name: "parachute-vault",
+      port: globalConfig.port || DEFAULT_PORT,
+      paths: buildVaultServicePaths(globalConfig.default_vault, listVaults()),
+      health: "/health",
+      version: pkg.version,
+    });
+  } catch (err) {
+    const msg = err instanceof ServicesManifestError ? err.message : String(err);
+    console.error(`Warning: could not update ~/.parachute/services.json: ${msg}`);
   }
 
   if (jsonMode) {
