@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@openparachute/scope-guard": "^0.1.0-rc.1",
     "jose": "^6.2.2",
     "otpauth": "^9.5.0",
     "qrcode-terminal": "^0.12.0"
