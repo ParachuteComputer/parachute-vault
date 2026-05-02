@@ -218,6 +218,44 @@ describe("GET /vaults/list (public discovery)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// /admin/* — admin SPA static-file mount. Detailed tests live in
+// admin-spa.test.ts (with a tmp dist dir); these only pin the dispatch
+// — i.e. /admin paths reach the SPA layer rather than falling through to
+// the per-vault dispatcher's "Not found".
+// ---------------------------------------------------------------------------
+
+describe("/admin/* SPA mount", () => {
+  test("/admin/ never returns the per-vault dispatcher's 404 JSON", async () => {
+    // dist may or may not be built in CI; the dispatch check just asserts
+    // that we don't fall through to the catch-all. Both 200 (dist present)
+    // and 503 (dist absent) are valid SPA-layer responses.
+    const req = new Request("http://localhost:1940/admin/");
+    const res = await route(req, "/admin/");
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  test("/admin/vault/work (client-routed path) reaches the SPA layer", async () => {
+    const req = new Request("http://localhost:1940/admin/vault/work");
+    const res = await route(req, "/admin/vault/work");
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  test("POST /admin/ returns 405 (no admin SPA writes today)", async () => {
+    const req = new Request("http://localhost:1940/admin/", { method: "POST" });
+    const res = await route(req, "/admin/");
+    expect(res.status).toBe(405);
+  });
+
+  test("/administrative does NOT match the admin mount (falls through to 404)", async () => {
+    const req = new Request("http://localhost:1940/administrative");
+    const res = await route(req, "/administrative");
+    expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // /auth/status — public preflight discovery (issue #163). Tells first-contact
 // clients which bearer format to use and surfaces auth-state bits the hub's
 // post-exposure flow needs without locking us into any auth check.

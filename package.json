@@ -17,7 +17,7 @@
   "scripts": {
     "start": "bun src/server.ts",
     "cli": "bun src/cli.ts",
-    "test": "bun test src/",
+    "test": "bun test ./src/",
     "test:core": "cd core && node --experimental-vm-modules node_modules/vitest/dist/cli.js run"
   },
   "dependencies": {
