@@ -200,17 +200,14 @@ export function VaultDetail() {
  */
 function PermissionsLink({ vaultName }: { vaultName: string }) {
   const issuer = getIssuerOrigin();
-  const description = (
-    <span className="dim">
-      {" "}grants are managed on hub (the OAuth issuer); link is forward-pointing — hub#162 is the
-      destination.
-    </span>
-  );
   if (!issuer) {
     return (
       <li>
         <span>Permissions →</span>
-        {description}
+        <span className="dim">
+          {" "}grants are managed on hub (the OAuth issuer); link will be live when hub ships its
+          permissions UI.
+        </span>
       </li>
     );
   }
@@ -218,7 +215,10 @@ function PermissionsLink({ vaultName }: { vaultName: string }) {
   return (
     <li>
       <a href={href}>Permissions →</a>
-      {description}
+      <span className="dim">
+        {" "}grants are managed on hub (the OAuth issuer); link will be live when hub ships its
+        permissions UI.
+      </span>
     </li>
   );
 }
