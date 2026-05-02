@@ -6,11 +6,15 @@
  * returns all of these in a single round trip. Authenticated — requires a
  * hub-issued JWT carrying `vault:<name>:read` or higher.
  *
- * Phase B (vault#217) adds tokens; Phase C (vault#218) adds permissions.
+ * Phase B (vault#217) added tokens. Phase C (vault#218) surfaces a link to
+ * hub's permissions UI under the "Manage" section — grants live in hub's
+ * grants table (the OAuth issuer is the source of truth), so the modular
+ * play is "vault links to hub" rather than "vault inlines hub data."
  */
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { HttpError, type VaultDetailResult, getVaultDetail } from "../lib/api.ts";
+import { getIssuerOrigin } from "../lib/scope.ts";
 
 type State =
   | { kind: "loading" }
@@ -173,12 +177,48 @@ export function VaultDetail() {
             <Link to={`/vault/${encodeURIComponent(vault.name)}/tokens`}>Tokens →</Link>
             <span className="dim"> mint, list, and revoke <code>pvt_*</code> tokens</span>
           </li>
-          <li className="dim">
-            Permissions editing (Phase C / vault#218) lands here next. For now, mint scope-narrowed
-            tokens above to delegate restricted access.
-          </li>
+          <PermissionsLink vaultName={vault.name} />
         </ul>
       </div>
     </div>
+  );
+}
+
+/**
+ * Forward-pointing link to hub's permissions UI. Hub origin is read from
+ * the JWT's `iss` claim (the OAuth issuer set during token mint), so we
+ * don't need a runtime-config endpoint or hub coordination — the data's
+ * already in hand from the same token that authenticated the page.
+ *
+ * The destination (hub#162 — `GET /hub/permissions?vault=<name>`) doesn't
+ * exist yet; clicks 404 until hub catches up. The copy says so explicitly
+ * so an operator who clicks isn't confused by the empty page.
+ *
+ * Without an `iss` claim (no token, malformed token), we render an
+ * informational line instead of a broken link — same content, no false
+ * affordance.
+ */
+function PermissionsLink({ vaultName }: { vaultName: string }) {
+  const issuer = getIssuerOrigin();
+  const description = (
+    <span className="dim">
+      {" "}grants are managed on hub (the OAuth issuer); link is forward-pointing — hub#162 is the
+      destination.
+    </span>
+  );
+  if (!issuer) {
+    return (
+      <li>
+        <span>Permissions →</span>
+        {description}
+      </li>
+    );
+  }
+  const href = `${issuer}/hub/permissions?vault=${encodeURIComponent(vaultName)}`;
+  return (
+    <li>
+      <a href={href}>Permissions →</a>
+      {description}
+    </li>
   );
 }
