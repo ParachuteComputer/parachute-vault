@@ -286,3 +286,56 @@ describe("OAuth-minted tokens — per-vault coherence", () => {
     expect("error" in crossCheck).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Legacy YAML global keys — scope must round-trip through the parser
+// ---------------------------------------------------------------------------
+
+describe("auth — legacy global YAML keys honor declared scope", () => {
+  test("scope: read on a global config.yaml key resolves to read permission, not full", async () => {
+    // Regression: the global parser used to drop the `scope` field, leaving
+    // `globalKey.scope` undefined. The auth check `=== "read"` then resolved
+    // any undefined value to "full", silently escalating read-only keys.
+    const { fullKey, keyId } = generateApiKey();
+    writeGlobalConfig({
+      port: 1940,
+      api_keys: [
+        {
+          id: keyId,
+          label: "reader",
+          scope: "read",
+          key_hash: hashKey(fullKey),
+          created_at: new Date().toISOString(),
+        },
+      ],
+    });
+
+    const result = await authenticateGlobalRequest(bearer(fullKey));
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("read");
+    }
+  });
+
+  test("scope: write on a global config.yaml key resolves to full permission", async () => {
+    const { fullKey, keyId } = generateApiKey();
+    writeGlobalConfig({
+      port: 1940,
+      api_keys: [
+        {
+          id: keyId,
+          label: "writer",
+          scope: "write",
+          key_hash: hashKey(fullKey),
+          created_at: new Date().toISOString(),
+        },
+      ],
+    });
+
+    const result = await authenticateGlobalRequest(bearer(fullKey));
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+    }
+  });
+});
