@@ -1,5 +1,6 @@
 import { Link, Route, Routes } from "react-router-dom";
 import { VaultDetail } from "./routes/VaultDetail.tsx";
+import { VaultTokens } from "./routes/VaultTokens.tsx";
 import { VaultsList } from "./routes/VaultsList.tsx";
 
 export function App() {
@@ -15,6 +16,7 @@ export function App() {
       <Routes>
         <Route path="/" element={<VaultsList />} />
         <Route path="/vault/:name" element={<VaultDetail />} />
+        <Route path="/vault/:name/tokens" element={<VaultTokens />} />
         <Route
           path="*"
           element={

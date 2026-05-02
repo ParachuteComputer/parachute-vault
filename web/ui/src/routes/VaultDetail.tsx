@@ -167,10 +167,17 @@ export function VaultDetail() {
       </div>
 
       <div className="section">
-        <p className="muted">
-          Token mint/revoke (Phase B / vault#217) and permissions editing (Phase C / vault#218) land here. For now,
-          manage tokens directly with <code>parachute-vault tokens</code> on the host.
-        </p>
+        <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>Manage</h3>
+        <ul className="manage-list">
+          <li>
+            <Link to={`/vault/${encodeURIComponent(vault.name)}/tokens`}>Tokens →</Link>
+            <span className="dim"> mint, list, and revoke <code>pvt_*</code> tokens</span>
+          </li>
+          <li className="dim">
+            Permissions editing (Phase C / vault#218) lands here next. For now, mint scope-narrowed
+            tokens above to delegate restricted access.
+          </li>
+        </ul>
       </div>
     </div>
   );

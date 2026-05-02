@@ -220,3 +220,146 @@ h2 {
   font-weight: 500;
   font-family: var(--font-mono);
 }
+
+button {
+  font: inherit;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+button:hover {
+  background: var(--accent-hover);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.secondary {
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+button.secondary:hover {
+  background: var(--bg-soft);
+}
+
+input,
+select {
+  font: inherit;
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  width: 100%;
+  max-width: 28rem;
+}
+input:focus,
+select:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.form-row {
+  margin-bottom: 1rem;
+}
+.form-row label {
+  display: block;
+  font-size: 0.88rem;
+  color: var(--fg-muted);
+  margin-bottom: 0.3rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.manage-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.95rem;
+}
+.manage-list li {
+  margin-bottom: 0.4rem;
+}
+
+.mint-banner {
+  background: var(--success-soft);
+  border: 1px solid var(--success);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+.mint-banner h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: var(--success);
+}
+.mint-banner .token-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.85rem 0 0.5rem;
+}
+.mint-banner code {
+  flex: 1;
+  font-size: 0.9rem;
+  padding: 0.6rem 0.75rem;
+  background: white;
+  border: 1px solid var(--border);
+  word-break: break-all;
+  user-select: all;
+}
+.mint-banner .warn {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+  color: var(--warn);
+}
+.mint-banner .actions {
+  margin-top: 1rem;
+}
+
+.token-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.token-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.token-row .body {
+  flex: 1;
+  min-width: 0;
+}
+.token-row .name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.3rem;
+}
+.token-row .meta {
+  font-size: 0.85rem;
+  margin-bottom: 0.2rem;
+}
+.token-row .actions {
+  margin-top: 0;
+  flex-shrink: 0;
+}
+.scope-tag {
+  font-size: 0.78rem;
+  padding: 0.1em 0.4em;
+  margin-right: 0.3em;
+}
