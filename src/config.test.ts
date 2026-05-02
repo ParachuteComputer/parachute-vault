@@ -181,6 +181,35 @@ describe("config", () => {
     expect(readGlobalConfig().discovery).toBe("disabled");
   });
 
+  test("global api_keys round-trip scope: read|write and default missing scope to write", () => {
+    // Regression for the silent privilege-escalation bug: the global YAML
+    // parser used to drop the `scope` field, leaving `globalKey.scope`
+    // undefined. Auth then resolved any non-"read" value to "full", so a
+    // user-authored `scope: read` global key would silently get full access.
+    writeGlobalConfig({
+      port: 1940,
+      api_keys: [
+        { id: "k_r", label: "reader", scope: "read", key_hash: "sha256:r", created_at: "2026-01-01T00:00:00.000Z" },
+        { id: "k_w", label: "writer", scope: "write", key_hash: "sha256:w", created_at: "2026-01-01T00:00:00.000Z" },
+      ],
+    });
+    const loaded = readGlobalConfig();
+    expect(loaded.api_keys?.find((k) => k.id === "k_r")?.scope).toBe("read");
+    expect(loaded.api_keys?.find((k) => k.id === "k_w")?.scope).toBe("write");
+
+    // Missing-scope branch: a hand-edited config.yaml entry without a
+    // `scope:` line must default to "write" (matches vault-level parser
+    // and the historical behavior the writer round-trips).
+    const fs = require("fs");
+    const path = `${process.env.PARACHUTE_HOME}/vault/config.yaml`;
+    fs.writeFileSync(
+      path,
+      `port: 1940\napi_keys:\n  - id: k_legacy\n    label: legacy\n    key_hash: sha256:legacy\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    const reloaded = readGlobalConfig();
+    expect(reloaded.api_keys?.find((k) => k.id === "k_legacy")?.scope).toBe("write");
+  });
+
   test("round-trips autostart: true|false (#113)", () => {
     // Default: absent means autostart-on (init registers the daemon).
     writeGlobalConfig({ port: 1940 });
