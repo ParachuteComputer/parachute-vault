@@ -10,12 +10,11 @@
  *     state and lose it on navigation away. Dismissal clears it explicitly.
  *   - **Revoke**   — confirm modal then DELETE.
  *
- * Mutate UI is gated on `hasAdminScope(name)`. A read-scoped token still
- * sees the list (the server allows `vault:<name>:read` for GET on this
- * surface? — actually no, the server requires `:admin` for all three; the
- * gate is defense-in-depth so a read-only token sees a banner directing
- * them to re-auth instead of a 403 toast). When the gate is closed, the
- * mint form and revoke buttons are hidden and a banner explains.
+ * Mutate UI is gated on `hasAdminScope(name)`. The vault server requires
+ * `vault:<name>:admin` for all three verbs (list, mint, revoke), so the
+ * client-side gate is defense-in-depth: a read-scoped session sees a
+ * banner directing them to re-auth instead of getting a 403 toast on
+ * every interaction.
  */
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -100,6 +99,14 @@ export function VaultTokens() {
 
       {minted ? <MintBanner result={minted} onDismiss={() => setMinted(null)} /> : null}
 
+      {/*
+       * MintForm is hidden while the just-minted banner is showing. The
+       * banner is the single point at which the operator copies the
+       * plaintext pvt_*; if a second mint happens before the first is
+       * saved, the first is gone forever (the server can't re-emit). The
+       * dismissal-then-mint sequence makes that loss impossible by
+       * construction. Keep the gate; don't "fix" it back to always-on.
+       */}
       {state.kind === "ok" && isAdmin && !minted ? (
         <MintForm
           vaultName={name}
@@ -188,14 +195,20 @@ function MintForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const trimmedLabel = label.trim();
+  const labelMissing = trimmedLabel.length === 0;
+
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (labelMissing) {
+      setError("label required — give the token a recognizable name");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
-      const trimmedLabel = label.trim();
       const result = await mintToken(vaultName, {
-        label: trimmedLabel.length > 0 ? trimmedLabel : undefined,
+        label: trimmedLabel,
         scopes: [`vault:${vaultName}:${verb}`],
       });
       onMinted(result);
@@ -217,7 +230,9 @@ function MintForm({
         </div>
       ) : null}
       <div className="form-row">
-        <label htmlFor="mint-label">Label</label>
+        <label htmlFor="mint-label">
+          Label <span className="dim">(required)</span>
+        </label>
         <input
           id="mint-label"
           type="text"
@@ -225,6 +240,7 @@ function MintForm({
           onChange={(e) => setLabel(e.target.value)}
           placeholder="e.g. ci, paraclaw-prod, my-laptop"
           maxLength={120}
+          required
         />
       </div>
       <div className="form-row">
@@ -243,7 +259,7 @@ function MintForm({
         </p>
       </div>
       <div className="actions">
-        <button type="submit" disabled={submitting}>
+        <button type="submit" disabled={submitting || labelMissing}>
           {submitting ? "Minting…" : "Mint token"}
         </button>
       </div>
@@ -372,8 +388,8 @@ function TokenRow({
 }
 
 function fmtDate(iso: string): string {
-  // ISO timestamps are fine in monospace; humans skim them with locale
-  // formatting but exact wall-clock time is what an operator usually wants
-  // for incident triage. Keep as-is.
+  // v1 shows ISO timestamps verbatim — exact wall-clock UTC is what an
+  // operator wants for incident triage. Phase C may add a relative +
+  // local-time formatting pass once the broader admin UI gets a date util.
   return iso;
 }

@@ -93,6 +93,24 @@ describe("VaultTokens — admin scope", () => {
     });
   });
 
+  it("rejects mint when label is empty (no API call, error shown)", async () => {
+    vi.mocked(tokensApi.listTokens).mockResolvedValue([]);
+
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /mint token/i })).toBeInTheDocument(),
+    );
+    // Submit button is disabled when label is empty — type then clear to
+    // exercise the form-onSubmit guard rather than the disabled state alone.
+    const labelInput = screen.getByLabelText(/label/i);
+    await user.type(labelInput, "x");
+    await user.clear(labelInput);
+    expect(screen.getByRole("button", { name: /mint token/i })).toBeDisabled();
+    expect(tokensApi.mintToken).not.toHaveBeenCalled();
+  });
+
   it("revoke shows a confirm step before deleting", async () => {
     vi.mocked(tokensApi.listTokens).mockResolvedValue([tokenFixture()]);
     vi.mocked(tokensApi.revokeToken).mockResolvedValue();
