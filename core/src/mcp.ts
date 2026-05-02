@@ -137,8 +137,17 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
           },
           order_by: { type: "string", description: "Sort by an indexed metadata field instead of `created_at`. Field must be declared `indexed: true`; errors otherwise. Direction is taken from `sort` (default 'asc'); `created_at` is appended as a stable tiebreaker." },
-          date_from: { type: "string", description: "Start date (ISO, inclusive)" },
-          date_to: { type: "string", description: "End date (ISO, exclusive)" },
+          date_from: { type: "string", description: "Start date (ISO, inclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', from }`." },
+          date_to: { type: "string", description: "End date (ISO, exclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', to }`." },
+          date_filter: {
+            type: "object",
+            properties: {
+              field: { type: "string", description: "Field to filter on. Defaults to `created_at` (vault ingestion time). Any other field must be declared `indexed: true` in a tag schema — same contract as metadata operator queries and `order_by`." },
+              from: { type: "string", description: "Inclusive lower bound (ISO date)." },
+              to: { type: "string", description: "Exclusive upper bound (ISO date)." },
+            },
+            description: "Generalized date-range filter. Use this when the date that matters is the *content* date (e.g. an email's received date, a meeting's scheduled date), not the vault ingestion time — set `field` to the indexed metadata field that holds it. Mutually exclusive with the top-level `date_from` / `date_to` shorthand.",
+          },
           near: {
             type: "object",
             properties: {
@@ -257,6 +266,9 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             metadata: params.metadata as Record<string, unknown> | undefined,
             dateFrom: params.date_from as string | undefined,
             dateTo: params.date_to as string | undefined,
+            dateFilter: params.date_filter as
+              | { field?: string; from?: string; to?: string }
+              | undefined,
             sort: params.sort as "asc" | "desc" | undefined,
             orderBy: params.order_by as string | undefined,
             limit: (params.limit as number) ?? 50,

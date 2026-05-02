@@ -4,6 +4,7 @@ import { normalizePath } from "./paths.js";
 import {
   buildOperatorClause,
   isOperatorObject,
+  QueryError,
   requireIndexedField,
 } from "./query-operators.js";
 
@@ -416,14 +417,51 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
-  // Date range
-  if (opts.dateFrom) {
-    conditions.push("n.created_at >= ?");
-    params.push(opts.dateFrom);
+  // Date range. Two accepted shapes:
+  //   - Legacy `dateFrom` / `dateTo` — always filters on `n.created_at`
+  //     (vault ingestion time).
+  //   - Generalized `dateFilter: { field, from, to }` — filters on the
+  //     named field. `created_at` (default) maps to `n.created_at`; any
+  //     other field must be declared `indexed: true` so the SQL targets
+  //     a real B-tree index. The two shapes are mutually exclusive — the
+  //     combination would silently AND, which would be surprising.
+  const hasLegacyDate = opts.dateFrom !== undefined || opts.dateTo !== undefined;
+  const hasDateFilter = opts.dateFilter !== undefined;
+  if (hasLegacyDate && hasDateFilter) {
+    throw new QueryError(
+      `cannot combine top-level date_from/date_to with date_filter — pass one or the other`,
+      "INVALID_QUERY",
+    );
   }
-  if (opts.dateTo) {
-    conditions.push("n.created_at < ?");
-    params.push(opts.dateTo);
+  if (hasDateFilter) {
+    const filter = opts.dateFilter!;
+    const field = filter.field ?? "created_at";
+    let column: string;
+    if (field === "created_at") {
+      column = "n.created_at";
+    } else {
+      // Re-uses the same indexed-field gate as `metadata` operator queries
+      // and `orderBy` so the error message and contract are consistent.
+      requireIndexedField(db, field);
+      column = `"meta_${field}"`;
+    }
+    if (filter.from !== undefined) {
+      conditions.push(`${column} >= ?`);
+      params.push(filter.from);
+    }
+    if (filter.to !== undefined) {
+      conditions.push(`${column} < ?`);
+      params.push(filter.to);
+    }
+  } else if (hasLegacyDate) {
+    if (opts.dateFrom) {
+      conditions.push("n.created_at >= ?");
+      params.push(opts.dateFrom);
+    }
+    if (opts.dateTo) {
+      conditions.push("n.created_at < ?");
+      params.push(opts.dateTo);
+    }
   }
 
   const direction = opts.sort === "desc" ? "DESC" : "ASC";

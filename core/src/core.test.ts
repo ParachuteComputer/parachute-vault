@@ -585,6 +585,95 @@ describe("queryNotes", async () => {
     expect(results.length).toBeGreaterThan(0);
   });
 
+  // ---- Generalized date_filter (vault#215) ----
+  //
+  // The legacy `dateFrom` / `dateTo` always filter on `n.created_at` (vault
+  // ingestion time). The new `dateFilter: { field, from, to }` shape lets a
+  // caller filter on any *content* date — an email's received date, a
+  // meeting's scheduled date — by pointing `field` at an indexed metadata
+  // field. `field` defaults to `created_at`, in which case the SQL is
+  // identical to the legacy path.
+  describe("dateFilter (generalized)", () => {
+    async function declareEmailDate() {
+      const { declareField } = await import("./indexed-fields.js");
+      declareField(db, "email_date", "TEXT", "email");
+    }
+
+    it("dateFilter with no field defaults to created_at (matches the legacy shorthand)", async () => {
+      await store.createNote("A", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("B", { created_at: "2026-02-15T00:00:00.000Z" });
+      await store.createNote("C", { created_at: "2026-03-15T00:00:00.000Z" });
+
+      const results = await store.queryNotes({
+        dateFilter: { from: "2026-02-01", to: "2026-03-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["B"]);
+    });
+
+    it("dateFilter on an indexed metadata field filters on content date, not ingestion date", async () => {
+      await declareEmailDate();
+      // Ingestion order doesn't match email_date order — that's the whole
+      // point: the bug was that `dateFrom` returned rows by ingestion time.
+      await store.createNote("recently-synced old email", {
+        metadata: { email_date: "2025-12-01T00:00:00.000Z" },
+      });
+      await store.createNote("recently-synced new email", {
+        metadata: { email_date: "2026-04-25T00:00:00.000Z" },
+      });
+      await store.createNote("recently-synced ancient", {
+        metadata: { email_date: "2024-08-15T00:00:00.000Z" },
+      });
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "email_date", from: "2026-04-01", to: "2026-05-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["recently-synced new email"]);
+    });
+
+    it("dateFilter on a non-indexed field rejects with FIELD_NOT_INDEXED", async () => {
+      await store.createNote("X", { metadata: { meeting_date: "2026-04-25T00:00:00.000Z" } });
+      // Note: not declared via declareField, so the field has no generated
+      // column. The error mirrors the metadata-operator + order_by gate.
+      try {
+        await store.queryNotes({
+          dateFilter: { field: "meeting_date", from: "2026-04-01" },
+        });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("FIELD_NOT_INDEXED");
+        expect(err.message).toContain("meeting_date");
+      }
+    });
+
+    it("dateFilter combined with top-level dateFrom rejects with INVALID_QUERY", async () => {
+      await declareEmailDate();
+      try {
+        await store.queryNotes({
+          dateFrom: "2026-01-01",
+          dateFilter: { field: "email_date", from: "2026-04-01" },
+        });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("INVALID_QUERY");
+        expect(err.message).toMatch(/cannot combine/i);
+      }
+    });
+
+    it("dateFilter with only `from` is open-ended on the upper bound", async () => {
+      await declareEmailDate();
+      await store.createNote("old", { metadata: { email_date: "2025-01-01T00:00:00.000Z" } });
+      await store.createNote("middle", { metadata: { email_date: "2026-04-15T00:00:00.000Z" } });
+      await store.createNote("new", { metadata: { email_date: "2026-05-01T00:00:00.000Z" } });
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "email_date", from: "2026-04-01" },
+      });
+      expect(results.map((n) => n.content).sort()).toEqual(["middle", "new"]);
+    });
+  });
+
   it("sorts ascending and descending", async () => {
     await store.createNote("First", { id: "first" });
     await store.createNote("Second", { id: "second" });
@@ -1757,6 +1846,26 @@ describe("MCP tools", async () => {
       offset: 1,
     }) as any[];
     expect(page).toHaveLength(2);
+  });
+
+  it("query-notes accepts date_filter on an indexed metadata field (vault#215)", async () => {
+    const { declareField } = await import("./indexed-fields.js");
+    declareField(db, "email_date", "TEXT", "email");
+
+    await store.createNote("old email", {
+      metadata: { email_date: "2025-12-01T00:00:00.000Z" },
+    });
+    await store.createNote("recent email", {
+      metadata: { email_date: "2026-04-25T00:00:00.000Z" },
+    });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const results = await query.execute({
+      date_filter: { field: "email_date", from: "2026-04-01", to: "2026-05-01" },
+      include_content: true,
+    }) as any[];
+    expect(results.map((n) => n.content)).toEqual(["recent email"]);
   });
 
   it("query-notes full-text search works", async () => {

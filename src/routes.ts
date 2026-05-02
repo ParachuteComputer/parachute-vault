@@ -202,8 +202,22 @@ export async function handleNotes(
           path: parseQuery(url, "path") ?? undefined,
           pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
           metadata: undefined, // metadata filter not practical in query params
-          dateFrom: parseQuery(url, "date_from") ?? undefined,
-          dateTo: parseQuery(url, "date_to") ?? undefined,
+          // `date_field=<name>&date_from=...&date_to=...` activates the
+          // generalized filter (filters on the named indexed field). Without
+          // `date_field`, `date_from`/`date_to` keep their legacy meaning of
+          // filtering on `created_at` (vault ingestion time).
+          ...(parseQuery(url, "date_field")
+            ? {
+                dateFilter: {
+                  field: parseQuery(url, "date_field")!,
+                  from: parseQuery(url, "date_from") ?? undefined,
+                  to: parseQuery(url, "date_to") ?? undefined,
+                },
+              }
+            : {
+                dateFrom: parseQuery(url, "date_from") ?? undefined,
+                dateTo: parseQuery(url, "date_to") ?? undefined,
+              }),
           sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
           orderBy: parseQuery(url, "order_by") ?? undefined,
           limit: parseInt10(parseQuery(url, "limit")) ?? 50,

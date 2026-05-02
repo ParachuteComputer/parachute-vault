@@ -68,8 +68,22 @@ export interface QueryOpts {
   // for the field. Operator queries require the field to be declared
   // `indexed: true` in a tag schema; undeclared fields error loudly.
   metadata?: Record<string, unknown>;
+  // Legacy shorthand: filters on `n.created_at` (vault ingestion time).
+  // Equivalent to `dateFilter: { field: "created_at", from, to }`. Kept
+  // as the common path; specifying both this and `dateFilter` rejects.
   dateFrom?: string;    // ISO date
   dateTo?: string;      // ISO date
+  // Generalized date range. `field` defaults to `created_at`; any other
+  // field must be declared `indexed: true` in a tag schema (so the SQL
+  // hits a real B-tree index, same contract as `metadata` operator
+  // queries and `orderBy`). Use this to filter on a *content* date — an
+  // email's received date, a meeting's scheduled date — rather than the
+  // ingestion timestamp.
+  dateFilter?: {
+    field?: string;
+    from?: string;
+    to?: string;
+  };
   sort?: "asc" | "desc";
   // Sort by an indexed metadata field instead of `created_at`. Must be
   // declared `indexed: true`; errors loudly otherwise. Direction is taken
