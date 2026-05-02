@@ -4,10 +4,9 @@
  * Two surfaces:
  *   - `GET /vaults/list` — public discovery (no auth). Used to populate the
  *     SPA's vault picker on first load before any token is in hand.
- *   - `GET /vault/<name>/?include_stats=1` — per-vault metadata (auth). The
- *     bare `/vault/<name>` endpoint already returns name, description,
- *     created_at, and stats in a single response. Requires a hub-issued JWT
- *     scoped `vault:<name>:read` (or higher).
+ *   - `GET /vault/<name>/` — per-vault metadata (auth). Returns name,
+ *     description, created_at, and stats in a single response. Requires a
+ *     hub-issued JWT scoped `vault:<name>:read` (or higher).
  *
  * `vault:<name>:admin` is the scope the SPA's eventual mutate-paths (token
  * mint, config edit) will require — Phase A only reads, but the same JWT
