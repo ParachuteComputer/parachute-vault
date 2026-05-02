@@ -15,7 +15,7 @@
  * See `Parachute/Decisions/2026-04-19-metadata-indexing-via-tag-schemas`.
  */
 
-import { Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { getIndexedField, type IndexedField } from "./indexed-fields.js";
 
 export const SUPPORTED_OPS = [
@@ -68,6 +68,22 @@ function validateOperatorObject(field: string, obj: Record<string, unknown>): vo
   }
 }
 
+function toBinding(field: string, op: string, value: unknown): SQLQueryBindings {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return value;
+  }
+  throw new QueryError(
+    `operator "${op}" on metadata field "${field}" expects a primitive value (string, number, boolean, bigint, or null), got ${typeof value}`,
+    "INVALID_OPERATOR_VALUE",
+  );
+}
+
 /**
  * Look up `field` in `indexed_fields` or throw a loud error suggesting the
  * caller declare it via `update-tag` with `indexed: true`.
@@ -91,14 +107,14 @@ export function requireIndexedField(db: Database, field: string): IndexedField {
 export function buildOperatorClause(
   field: string,
   opObj: Record<string, unknown>,
-): { sql: string; params: unknown[] } {
+): { sql: string; params: SQLQueryBindings[] } {
   validateOperatorObject(field, opObj);
   // `field` came from indexed_fields (which validated it via FIELD_NAME_RE
   // when the declaration was recorded), so interpolating it into the column
   // name is safe.
   const col = `"meta_${field}"`;
   const parts: string[] = [];
-  const params: unknown[] = [];
+  const params: SQLQueryBindings[] = [];
 
   for (const [op, value] of Object.entries(opObj)) {
     switch (op as QueryOp) {
@@ -107,7 +123,7 @@ export function buildOperatorClause(
           parts.push(`${col} IS NULL`);
         } else {
           parts.push(`${col} = ?`);
-          params.push(value);
+          params.push(toBinding(field, op, value));
         }
         break;
       case "ne":
@@ -119,7 +135,7 @@ export function buildOperatorClause(
           // that has no value for the field would be silently excluded. Be
           // explicit: either the column is null, or the values differ.
           parts.push(`(${col} IS NULL OR ${col} <> ?)`);
-          params.push(value);
+          params.push(toBinding(field, op, value));
         }
         break;
       case "gt":
@@ -128,7 +144,7 @@ export function buildOperatorClause(
       case "lte": {
         const sym = op === "gt" ? ">" : op === "gte" ? ">=" : op === "lt" ? "<" : "<=";
         parts.push(`${col} ${sym} ?`);
-        params.push(value);
+        params.push(toBinding(field, op, value));
         break;
       }
       case "in":
@@ -152,7 +168,7 @@ export function buildOperatorClause(
         } else {
           parts.push(`(${col} IS NULL OR ${col} NOT IN (${placeholders}))`);
         }
-        for (const v of value) params.push(v);
+        for (const v of value) params.push(toBinding(field, op, v));
         break;
       }
       case "exists":

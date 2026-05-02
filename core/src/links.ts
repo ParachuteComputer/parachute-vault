@@ -61,7 +61,7 @@ export function listLinks(
   },
 ): Link[] {
   const conditions: string[] = [];
-  const params: unknown[] = [];
+  const params: string[] = [];
 
   if (opts?.noteId) {
     const direction = opts.direction ?? "both";
