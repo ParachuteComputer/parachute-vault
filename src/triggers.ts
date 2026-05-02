@@ -132,7 +132,7 @@ function saveAudioToAssets(
     : contentType.includes("mp4") ? ".m4a"
     : ".ogg"; // default to ogg
 
-  const date = new Date().toISOString().split("T")[0];
+  const date = new Date().toISOString().split("T")[0]!;
   const dir = join(assetsRoot, date);
   mkdirSync(dir, { recursive: true });
 

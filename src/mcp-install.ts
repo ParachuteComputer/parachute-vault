@@ -20,7 +20,7 @@ export type McpUrlSource = "hub-origin" | "expose-state" | "loopback";
 export function chooseMcpUrl(
   vaultName: string,
   port: number,
-  env: { PARACHUTE_HUB_ORIGIN?: string } = process.env,
+  env: { PARACHUTE_HUB_ORIGIN?: string | undefined } = process.env as { PARACHUTE_HUB_ORIGIN?: string },
 ): { url: string; source: McpUrlSource } {
   const hub = env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
   if (hub) {

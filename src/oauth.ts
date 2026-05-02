@@ -382,7 +382,7 @@ export async function handleAuthorizePost(
   const { vaultName, clientIp, ownerPasswordHash, totpSecret, rateLimiter = authorizeRateLimit } = opts;
   const totpEnrolled = typeof totpSecret === "string" && totpSecret.length > 0;
 
-  let form: FormData;
+  let form: Awaited<ReturnType<typeof req.formData>>;
   try {
     form = await req.formData();
   } catch {

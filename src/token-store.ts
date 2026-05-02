@@ -196,7 +196,7 @@ export function revokeToken(db: Database, idOrHash: string): boolean {
       "SELECT token_hash FROM tokens WHERE token_hash LIKE ?"
     ).all(`sha256:${hashPrefix}%`) as { token_hash: string }[];
     if (rows.length === 1) {
-      db.prepare("DELETE FROM tokens WHERE token_hash = ?").run(rows[0].token_hash);
+      db.prepare("DELETE FROM tokens WHERE token_hash = ?").run(rows[0]!.token_hash);
       return true;
     }
     if (rows.length > 1) {
