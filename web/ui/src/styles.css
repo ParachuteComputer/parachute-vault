@@ -1,0 +1,222 @@
+/*
+ * Brand tokens lifted from hub's web/ui styles so vault's admin SPA stays
+ * visually continuous with the rest of the Parachute admin surface (the
+ * operator may bounce between hub and vault admin pages in one session).
+ * Don't drift these without updating hub's tokens too.
+ */
+:root {
+  --bg: #faf8f4;
+  --bg-soft: #f3f0ea;
+  --fg: #2c2a26;
+  --fg-muted: #6b6860;
+  --fg-dim: #9a9690;
+  --accent: #4a7c59;
+  --accent-soft: rgba(74, 124, 89, 0.08);
+  --accent-hover: #3d6849;
+  --border: #e4e0d8;
+  --border-light: #ece9e2;
+  --card-bg: #ffffff;
+  --error: #a3392b;
+  --error-soft: rgba(163, 57, 43, 0.08);
+  --warn: #b08023;
+  --warn-soft: rgba(176, 128, 35, 0.08);
+  --success: #3d6849;
+  --success-soft: rgba(61, 104, 73, 0.08);
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+  font-family: var(--font-sans);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--bg-soft);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 6rem;
+}
+
+.nav {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2rem;
+}
+.nav .brand {
+  font-weight: 600;
+  font-family: var(--font-serif);
+  font-size: 1.15rem;
+  margin-right: auto;
+}
+.nav .brand .sub {
+  color: var(--fg-dim);
+  font-size: 0.78rem;
+  font-weight: 400;
+  margin-left: 0.4rem;
+  font-family: var(--font-sans);
+}
+.nav a {
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+}
+.nav a:hover {
+  text-decoration: none;
+  color: var(--fg);
+}
+
+h2 {
+  margin: 0 0 1rem;
+  font-size: 1.4rem;
+  font-weight: 500;
+}
+
+.muted {
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+.dim {
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+}
+
+.error-banner {
+  background: var(--error-soft);
+  border: 1px solid var(--error);
+  color: var(--error);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+.warn-banner {
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.empty {
+  padding: 3rem 1.5rem;
+  text-align: center;
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+  border-radius: 10px;
+}
+
+.list-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.list-header h2 {
+  margin: 0;
+}
+
+.vault-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease;
+}
+.vault-row:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.vault-row .body {
+  flex: 1;
+  min-width: 0;
+}
+.vault-row .name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.vault-row .name code {
+  font-size: 0.95em;
+}
+.vault-row .chev {
+  color: var(--fg-dim);
+  font-size: 1.2rem;
+}
+
+.section {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 8.5rem 1fr;
+  gap: 0.5rem 1rem;
+  font-size: 0.92rem;
+}
+.kv > div:nth-child(odd) {
+  color: var(--fg-muted);
+}
+.kv code {
+  word-break: break-all;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 1rem;
+  font-size: 0.92rem;
+}
+.stat {
+  background: var(--bg-soft);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+.stat .label {
+  color: var(--fg-muted);
+  font-size: 0.82rem;
+  margin-bottom: 0.2rem;
+}
+.stat .value {
+  font-size: 1.4rem;
+  font-weight: 500;
+  font-family: var(--font-mono);
+}

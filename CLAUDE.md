@@ -101,8 +101,8 @@ bun src/cli.ts vault config        # view/edit config
 bun src/cli.ts vault stop          # graceful shutdown via filesystem sentinel
 bun src/cli.ts vault import <path> # import Obsidian vault
 bun src/cli.ts vault export <path> # export as Obsidian markdown
-bun test src/                      # run server tests
-bun test core/src/                 # run core tests
+bun test ./src/                    # run server tests (anchored — excludes web/ui)
+bun test ./core/src/               # run core tests
 ```
 
 ### Graceful shutdown

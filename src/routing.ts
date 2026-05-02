@@ -44,6 +44,7 @@ import {
 import { hasScopeForVault, SCOPE_ADMIN, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
+import { defaultAdminSpaDistDir, isAdminSpaPath, serveAdminSpa } from "./admin-spa.ts";
 import {
   handleNotes,
   handleTags,
@@ -248,6 +249,19 @@ export async function route(
     return Response.json(buildAuthStatus(), {
       headers: { "Access-Control-Allow-Origin": "*" },
     });
+  }
+
+  // Admin SPA — origin-rooted at `/admin/*`. Static-file serving only
+  // (index.html + Vite asset bundle); no auth at this seam since the bundle
+  // reveals nothing privileged. The SPA's data fetches land on existing
+  // per-vault routes that enforce `vault:<name>:read` / `:admin`. GET-only —
+  // POSTs to `/admin/*` aren't a thing the SPA bundle exposes; rejecting
+  // them here keeps surprises out.
+  if (isAdminSpaPath(path)) {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return serveAdminSpa(defaultAdminSpaDistDir(), path);
   }
 
   // Authenticated vault metadata list.
