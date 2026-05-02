@@ -62,3 +62,27 @@ export function hasAdminScope(vaultName: string): boolean {
   const scopes = scopesFromJwt(getToken());
   return scopes.includes(`vault:${vaultName}:admin`);
 }
+
+/**
+ * Hub origin where the cached JWT was issued. Pulled from the `iss` claim
+ * (RFC 7519 §4.1.1) — the hub sets it via `setIssuer()` during token mint
+ * and pins the value to its own origin (see parachute-hub/src/jwt-sign.ts).
+ *
+ * Used to construct cross-origin links from the vault SPA back to hub
+ * surfaces (e.g. the permissions UI at `/hub/permissions`). Pulling from
+ * the token avoids needing a separate runtime-config endpoint or hub
+ * coordination — the data's already in hand.
+ *
+ * Returns `null` when no token is cached, the token is malformed, or the
+ * `iss` claim isn't a string. Callers fall back to "managed on hub" copy
+ * without a link in that case.
+ */
+export function getIssuerOrigin(): string | null {
+  const token = getToken();
+  if (!token) return null;
+  const claims = decodeJwtPayload(token);
+  if (!claims) return null;
+  const iss = claims["iss"];
+  if (typeof iss !== "string" || iss.length === 0) return null;
+  return iss.replace(/\/$/, "");
+}

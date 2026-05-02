@@ -3,7 +3,10 @@
 Vite + React + TypeScript SPA mounted at `/admin/` on the running vault
 server. Phase A (vault#216) ships the scaffold + per-vault detail page;
 Phase B (#217) adds tokens (list / mint / revoke + read-only fallback for
-non-admin sessions); Phase C (#218) adds permissions.
+non-admin sessions); Phase C (#218) surfaces a forward-pointing link from
+each vault's detail page to hub's permissions UI (hub#162; grants live in
+hub's grants table — modular play is "vault links to hub" rather than
+"vault inlines hub data").
 
 ## Mount-aware contract
 

@@ -7,7 +7,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { _setTokenForTest, clearToken } from "./auth.ts";
-import { decodeJwtPayload, hasAdminScope, scopesFromJwt } from "./scope.ts";
+import { decodeJwtPayload, getIssuerOrigin, hasAdminScope, scopesFromJwt } from "./scope.ts";
 
 function makeJwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }))
@@ -86,5 +86,36 @@ describe("hasAdminScope", () => {
   it("false when no token is cached", () => {
     _setTokenForTest(null);
     expect(hasAdminScope("work")).toBe(false);
+  });
+});
+
+describe("getIssuerOrigin", () => {
+  afterEach(() => {
+    clearToken();
+  });
+
+  it("returns the iss claim from the cached token", () => {
+    _setTokenForTest(makeJwt({ iss: "http://127.0.0.1:1939", scope: "vault:work:admin" }));
+    expect(getIssuerOrigin()).toBe("http://127.0.0.1:1939");
+  });
+
+  it("strips a trailing slash so callers don't double up", () => {
+    _setTokenForTest(makeJwt({ iss: "https://hub.example.com/", scope: "vault:work:read" }));
+    expect(getIssuerOrigin()).toBe("https://hub.example.com");
+  });
+
+  it("returns null when no token is cached", () => {
+    _setTokenForTest(null);
+    expect(getIssuerOrigin()).toBeNull();
+  });
+
+  it("returns null when the iss claim is missing", () => {
+    _setTokenForTest(makeJwt({ scope: "vault:work:read" }));
+    expect(getIssuerOrigin()).toBeNull();
+  });
+
+  it("returns null when the iss claim is non-string (defensive)", () => {
+    _setTokenForTest(makeJwt({ iss: 42 as unknown as string }));
+    expect(getIssuerOrigin()).toBeNull();
   });
 });
