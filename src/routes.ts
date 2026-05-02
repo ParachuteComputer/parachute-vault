@@ -190,6 +190,13 @@ export async function handleNotes(
       }
 
       // Structured query
+      //
+      // Surface asymmetry: REST uses three flat query params
+      // (`date_field`, `date_from`, `date_to`) while MCP takes a nested
+      // `date_filter: { field, from, to }` object. Both lower to the same
+      // store-level `dateFilter` shape — the difference is just that query
+      // strings are flat by nature. This mirrors the broader REST/MCP
+      // pattern across the API and is intentional, not a fix-it-up TODO.
       const tags = parseQueryList(url, "tag");
       let results: Note[];
       try {

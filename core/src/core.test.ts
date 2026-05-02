@@ -672,6 +672,37 @@ describe("queryNotes", async () => {
       });
       expect(results.map((n) => n.content).sort()).toEqual(["middle", "new"]);
     });
+
+    it("dateFilter with explicit field='created_at' routes to the legacy SQL path", async () => {
+      // The implicit-default case is covered above; this asserts the explicit
+      // form behaves identically — no indexed-field gate, same n.created_at SQL.
+      await store.createNote("A", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("B", { created_at: "2026-02-15T00:00:00.000Z" });
+      await store.createNote("C", { created_at: "2026-03-15T00:00:00.000Z" });
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "created_at", from: "2026-02-01", to: "2026-03-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["B"]);
+    });
+
+    it("query-notes accepts date_filter on an indexed metadata field (vault#215)", async () => {
+      await declareEmailDate();
+      await store.createNote("old email", {
+        metadata: { email_date: "2025-12-01T00:00:00.000Z" },
+      });
+      await store.createNote("recent email", {
+        metadata: { email_date: "2026-04-25T00:00:00.000Z" },
+      });
+
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const results = await query.execute({
+        date_filter: { field: "email_date", from: "2026-04-01", to: "2026-05-01" },
+        include_content: true,
+      }) as any[];
+      expect(results.map((n) => n.content)).toEqual(["recent email"]);
+    });
   });
 
   it("sorts ascending and descending", async () => {
@@ -1846,26 +1877,6 @@ describe("MCP tools", async () => {
       offset: 1,
     }) as any[];
     expect(page).toHaveLength(2);
-  });
-
-  it("query-notes accepts date_filter on an indexed metadata field (vault#215)", async () => {
-    const { declareField } = await import("./indexed-fields.js");
-    declareField(db, "email_date", "TEXT", "email");
-
-    await store.createNote("old email", {
-      metadata: { email_date: "2025-12-01T00:00:00.000Z" },
-    });
-    await store.createNote("recent email", {
-      metadata: { email_date: "2026-04-25T00:00:00.000Z" },
-    });
-
-    const tools = generateMcpTools(store);
-    const query = tools.find((t) => t.name === "query-notes")!;
-    const results = await query.execute({
-      date_filter: { field: "email_date", from: "2026-04-01", to: "2026-05-01" },
-      include_content: true,
-    }) as any[];
-    expect(results.map((n) => n.content)).toEqual(["recent email"]);
   });
 
   it("query-notes full-text search works", async () => {
