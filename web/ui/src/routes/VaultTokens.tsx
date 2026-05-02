@@ -66,6 +66,21 @@ export function VaultTokens() {
     };
   }, [name, reloadTick]);
 
+  // Belt-and-suspenders for the single-emit contract: while the plaintext
+  // pvt_* is on screen, prompt the browser's "leave site?" confirm on tab
+  // close / refresh / back. Dismissing the banner (the explicit "I've
+  // saved it" path) detaches the listener. Doesn't cover in-SPA navigation
+  // — react-router blocking is a separate, larger surface.
+  useEffect(() => {
+    if (!minted) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [minted]);
+
   if (!name) {
     return (
       <div>

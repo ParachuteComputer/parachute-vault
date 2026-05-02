@@ -93,6 +93,52 @@ describe("VaultTokens — admin scope", () => {
     });
   });
 
+  it("attaches a beforeunload guard while the pvt_* banner is showing and detaches on dismiss", async () => {
+    vi.mocked(tokensApi.listTokens).mockResolvedValue([]);
+    vi.mocked(tokensApi.mintToken).mockResolvedValue({
+      ...tokenFixture({ label: "ci" }),
+      token: "pvt_super_secret",
+    });
+
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const removeSpy = vi.spyOn(window, "removeEventListener");
+
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /mint token/i })).toBeInTheDocument(),
+    );
+    expect(addSpy.mock.calls.some(([type]) => type === "beforeunload")).toBe(false);
+
+    await user.type(screen.getByLabelText(/label/i), "ci");
+    await user.click(screen.getByRole("button", { name: /mint token/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/new token \(shown once\)/i)).toBeInTheDocument(),
+    );
+    const beforeunloadCall = addSpy.mock.calls.find(([type]) => type === "beforeunload");
+    expect(beforeunloadCall).toBeDefined();
+    const handler = beforeunloadCall![1] as (e: BeforeUnloadEvent) => void;
+
+    // The handler must call preventDefault + set returnValue so Chrome /
+    // Firefox actually fire the "leave site?" confirm. Browsers gate the
+    // prompt on both signals; missing either makes the guard a no-op.
+    const fakeEvent = {
+      preventDefault: vi.fn(),
+      returnValue: undefined as unknown as string,
+    } as unknown as BeforeUnloadEvent;
+    handler(fakeEvent);
+    expect(fakeEvent.preventDefault).toHaveBeenCalled();
+    expect(fakeEvent.returnValue).toBe("");
+
+    await user.click(screen.getByRole("button", { name: /done — i've saved the token/i }));
+
+    await waitFor(() =>
+      expect(removeSpy.mock.calls.some(([type, fn]) => type === "beforeunload" && fn === handler)).toBe(true),
+    );
+  });
+
   it("rejects mint when label is empty (no API call, error shown)", async () => {
     vi.mocked(tokensApi.listTokens).mockResolvedValue([]);
 
