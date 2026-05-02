@@ -39,7 +39,7 @@ export function normalizePath(path: string | null | undefined): string | null {
  */
 export function pathTitle(path: string): string {
   const segments = path.split("/");
-  return segments[segments.length - 1];
+  return segments[segments.length - 1]!;
 }
 
 /**

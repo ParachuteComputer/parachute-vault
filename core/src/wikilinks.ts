@@ -44,7 +44,7 @@ export function parseWikilinks(content: string): ParsedWikilink[] {
 
   while ((match = regex.exec(stripped)) !== null) {
     const embed = match[1] === "!";
-    const inner = match[2];
+    const inner = match[2]!;
 
     // Split on | for display text: [[target|display]]
     const pipeIdx = inner.indexOf("|");
@@ -133,7 +133,7 @@ export function resolveWikilink(db: Database, target: string): string | null {
       )
   `).all(target, `%/${target}`) as { id: string }[];
 
-  if (basename.length === 1) return basename[0].id;
+  if (basename.length === 1) return basename[0]!.id;
 
   // Ambiguous or no match
   return null;
@@ -171,7 +171,7 @@ export function resolveWikilinkDetailed(db: Database, target: string): WikilinkR
   `).all(target, `%/${target}`) as { id: string; path: string }[];
 
   if (basename.length === 1) {
-    return { resolved: true, note_id: basename[0].id, path: basename[0].path, candidates: [] };
+    return { resolved: true, note_id: basename[0]!.id, path: basename[0]!.path, candidates: [] };
   }
 
   if (basename.length > 1) {
