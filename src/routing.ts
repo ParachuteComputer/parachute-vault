@@ -191,7 +191,7 @@ export async function route(
     /^\/\.well-known\/oauth-protected-resource\/vault\/([^/]+)(?:\/mcp)?$/,
   );
   if (protectedResourceInsert) {
-    const vaultName = protectedResourceInsert[1];
+    const vaultName = protectedResourceInsert[1]!;
     if (!readVaultConfig(vaultName)) {
       return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
     }
@@ -201,7 +201,7 @@ export async function route(
     /^\/\.well-known\/oauth-authorization-server\/vault\/([^/]+)(?:\/mcp)?$/,
   );
   if (authServerInsert) {
-    const vaultName = authServerInsert[1];
+    const vaultName = authServerInsert[1]!;
     if (!readVaultConfig(vaultName)) {
       return Response.json({ error: "Vault not found", vault: vaultName }, { status: 404 });
     }
@@ -289,7 +289,7 @@ export async function route(
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 
-  const vaultName = vaultMatch[1];
+  const vaultName = vaultMatch[1]!;
   const subpath = vaultMatch[2] ?? "";
 
   const vaultConfig = readVaultConfig(vaultName);
@@ -301,7 +301,7 @@ export async function route(
   // convenience for published-note URLs that predate the /view/ path).
   const vaultPublicMatch = subpath.match(/^\/public\/([^/]+)$/);
   if (vaultPublicMatch && req.method === "GET") {
-    const dest = new URL(`/vault/${vaultName}/view/${vaultPublicMatch[1]}`, req.url);
+    const dest = new URL(`/vault/${vaultName}/view/${vaultPublicMatch[1]!}`, req.url);
     dest.search = new URL(req.url).search;
     return Response.redirect(dest.toString(), 301);
   }
@@ -313,7 +313,7 @@ export async function route(
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
     const authenticated = await isViewAuthenticated(req, vaultConfig, store.db);
-    return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]), {
+    return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]!), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
     });

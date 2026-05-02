@@ -48,11 +48,11 @@ function isVerb(s: string): s is VaultVerb {
  */
 function decomposeVaultScope(scope: string): { vault: string | null; verb: VaultVerb } | null {
   const parts = scope.split(":");
-  if (parts.length === 2 && parts[0] === "vault" && isVerb(parts[1])) {
-    return { vault: null, verb: parts[1] };
+  if (parts.length === 2 && parts[0] === "vault" && isVerb(parts[1]!)) {
+    return { vault: null, verb: parts[1]! as VaultVerb };
   }
-  if (parts.length === 3 && parts[0] === "vault" && parts[1].length > 0 && isVerb(parts[2])) {
-    return { vault: parts[1], verb: parts[2] };
+  if (parts.length === 3 && parts[0] === "vault" && parts[1]!.length > 0 && isVerb(parts[2]!)) {
+    return { vault: parts[1]!, verb: parts[2]! as VaultVerb };
   }
   return null;
 }

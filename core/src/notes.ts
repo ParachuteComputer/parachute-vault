@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
 import {
@@ -185,7 +185,7 @@ export function updateNote(
   }
 
   const sets: string[] = [];
-  const values: unknown[] = [];
+  const values: (string | null)[] = [];
 
   // Hooks and other machine-level writers pass `skipUpdatedAt: true` so
   // their metadata markers don't look like user activity. See issue #44.
@@ -307,7 +307,7 @@ export function deleteNote(db: Database, id: string): void {
 
 export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const conditions: string[] = [];
-  const params: unknown[] = [];
+  const params: SQLQueryBindings[] = [];
   const joins: string[] = [];
 
   // Include tags — "all" (default): must have ALL tags; "any": must have ANY tag.

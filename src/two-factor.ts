@@ -148,7 +148,7 @@ function randomBackupCode(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(BACKUP_CODE_LENGTH));
   let out = "";
   for (let i = 0; i < BACKUP_CODE_LENGTH; i++) {
-    out += alphabet[bytes[i] % alphabet.length];
+    out += alphabet[bytes[i]! % alphabet.length];
   }
   return out;
 }
@@ -208,7 +208,7 @@ async function doVerifyAndConsume(normalized: string): Promise<boolean> {
 
   for (let i = 0; i < hashes.length; i++) {
     try {
-      if (await Bun.password.verify(normalized, hashes[i])) {
+      if (await Bun.password.verify(normalized, hashes[i]!)) {
         // Consume: splice from the snapshot we verified against and persist.
         config.backup_codes = hashes.filter((_, j) => j !== i);
         writeGlobalConfig(config);

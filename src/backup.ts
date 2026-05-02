@@ -97,7 +97,7 @@ export function backupFilename(timestamp: string): string {
 export function parseBackupFilename(name: string): { timestamp: string } | null {
   const m = name.match(/^parachute-backup-(.+)\.tar\.gz$/);
   if (!m) return null;
-  return { timestamp: m[1] };
+  return { timestamp: m[1]! };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,13 +298,10 @@ async function writeToDestination(
       const pruned = pruneRetention(target, retention);
       return { destination: dest, writtenPath: out, pruned };
     }
-    // Exhaustiveness guard — if a future destination kind is added to the
-    // type union but not handled here, the compiler fails the build.
-    default: {
-      const _exhaustive: never = dest;
-      throw new Error(`Unsupported destination kind: ${JSON.stringify(_exhaustive)}`);
-    }
   }
+  // Unreachable while BackupDestination only has "local"; once a second
+  // kind is added, restore an exhaustiveness `never` check here.
+  throw new Error(`Unsupported destination kind: ${JSON.stringify(dest)}`);
 }
 
 // ---------------------------------------------------------------------------

@@ -258,7 +258,7 @@ function migrateToV5(db: Database): void {
     // Keep first, rename the rest
     for (let i = 1; i < ids.length; i++) {
       const newPath = `${dupe.path}-${i}`;
-      db.prepare("UPDATE notes SET path = ? WHERE id = ?").run(newPath, ids[i]);
+      db.prepare("UPDATE notes SET path = ? WHERE id = ?").run(newPath, ids[i]!);
     }
   }
 

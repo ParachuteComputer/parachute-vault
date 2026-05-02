@@ -1036,6 +1036,10 @@ function cmdTokens(args: string[]) {
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
     const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : (readGlobalConfig().default_vault || "default");
+    if (!vaultName) {
+      console.error("--vault requires a value.");
+      process.exit(1);
+    }
 
     const vc = readVaultConfig(vaultName);
     if (!vc) {
@@ -1059,6 +1063,10 @@ function cmdTokens(args: string[]) {
     let expiresAt: string | null = null;
     if (expiresFlag !== -1) {
       const dur = args[expiresFlag + 1];
+      if (!dur) {
+        console.error("--expires requires a value (e.g. 7d, 30d, 24h, 1y).");
+        process.exit(1);
+      }
       expiresAt = parseDuration(dur);
       if (!expiresAt) {
         console.error(`Invalid duration: ${dur}. Use format like 7d, 30d, 24h, 1y.`);
@@ -1067,7 +1075,7 @@ function cmdTokens(args: string[]) {
     }
 
     const labelFlag = args.indexOf("--label");
-    const label = labelFlag !== -1 ? args[labelFlag + 1] : "default";
+    const label = (labelFlag !== -1 ? args[labelFlag + 1] : undefined) ?? "default";
 
     const store = getVaultStore(vaultName);
     const { fullToken } = generateToken();
@@ -1100,6 +1108,10 @@ function cmdTokens(args: string[]) {
 
     const vaultFlag = args.indexOf("--vault");
     const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : (readGlobalConfig().default_vault || "default");
+    if (!vaultName) {
+      console.error("--vault requires a value.");
+      process.exit(1);
+    }
 
     const vc = readVaultConfig(vaultName);
     if (!vc) {
@@ -1125,8 +1137,8 @@ function cmdTokens(args: string[]) {
 function parseDuration(dur: string): string | null {
   const match = dur.match(/^(\d+)(h|d|w|m|y)$/);
   if (!match) return null;
-  const n = parseInt(match[1], 10);
-  const unit = match[2];
+  const n = parseInt(match[1]!, 10);
+  const unit = match[2]!;
   const now = new Date();
   switch (unit) {
     case "h": now.setHours(now.getHours() + n); break;
@@ -2037,16 +2049,27 @@ async function cmdImport(args: string[]) {
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--format") {
-      format = args[++i];
-    } else if (args[i] === "--vault") {
-      vaultName = args[++i];
-    } else if (args[i] === "--dry-run") {
+    const arg = args[i]!;
+    if (arg === "--format") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--format requires a value.");
+        process.exit(1);
+      }
+      format = v;
+    } else if (arg === "--vault") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--vault requires a value.");
+        process.exit(1);
+      }
+      vaultName = v;
+    } else if (arg === "--dry-run") {
       dryRun = true;
-    } else if (args[i] === "--obsidian") {
+    } else if (arg === "--obsidian") {
       format = "obsidian";
     } else {
-      positional.push(args[i]);
+      positional.push(arg);
     }
   }
   sourcePath = positional[0] ?? "";
@@ -2149,10 +2172,16 @@ async function cmdExport(args: string[]) {
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--vault") {
-      vaultName = args[++i];
+    const arg = args[i]!;
+    if (arg === "--vault") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--vault requires a value.");
+        process.exit(1);
+      }
+      vaultName = v;
     } else {
-      positional.push(args[i]);
+      positional.push(arg);
     }
   }
   outputPath = positional[0] ?? "";

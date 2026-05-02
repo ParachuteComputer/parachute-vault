@@ -356,7 +356,7 @@ export async function handleNotes(
   const idMatch = subpath.match(/^\/([^/]+)(\/.*)?$/);
   if (!idMatch) return json({ error: "Not found" }, 404);
 
-  const idOrPath = decodeURIComponent(idMatch[1]);
+  const idOrPath = decodeURIComponent(idMatch[1]!);
   const sub = idMatch[2] ?? "";
 
   // Attachments sub-routes (keep as-is — Daily needs them)
@@ -705,7 +705,7 @@ export async function handleTags(req: Request, store: Store, subpath = ""): Prom
   const renameMatch = subpath.match(/^\/([^/]+)\/rename$/);
   if (renameMatch) {
     if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-    const oldName = decodeURIComponent(renameMatch[1]);
+    const oldName = decodeURIComponent(renameMatch[1]!);
     const body = (await req.json().catch(() => null)) as { new_name?: unknown } | null;
     if (!body) return json({ error: "Invalid JSON body" }, 400);
     const newName = body.new_name;
@@ -732,7 +732,7 @@ export async function handleTags(req: Request, store: Store, subpath = ""): Prom
   // Routes with tag name
   const nameMatch = subpath.match(/^\/([^/]+)$/);
   if (!nameMatch) return json({ error: "Not found" }, 404);
-  const tagName = decodeURIComponent(nameMatch[1]);
+  const tagName = decodeURIComponent(nameMatch[1]!);
 
   // GET /tags/:name — single tag detail
   if (req.method === "GET") {
@@ -898,7 +898,7 @@ function renderMarkdown(md: string): string {
   let inCodeBlock = false;
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+    const line = lines[i]!;
 
     if (line.trimStart().startsWith("```")) {
       if (inCodeBlock) {
@@ -924,15 +924,15 @@ function renderMarkdown(md: string): string {
 
     const headerMatch = trimmed.match(/^(#{1,6})\s+(.+)/);
     if (headerMatch) {
-      const level = headerMatch[1].length;
-      out.push(`<h${level}>${inlineMarkdown(escapeHtml(headerMatch[2]))}</h${level}>`);
+      const level = headerMatch[1]!.length;
+      out.push(`<h${level}>${inlineMarkdown(escapeHtml(headerMatch[2]!))}</h${level}>`);
       continue;
     }
 
     if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
       const items: string[] = [trimmed.slice(2)];
       while (i + 1 < lines.length) {
-        const next = lines[i + 1].trim();
+        const next = lines[i + 1]!.trim();
         if (next.startsWith("- ") || next.startsWith("* ")) {
           items.push(next.slice(2));
           i++;
@@ -1103,7 +1103,7 @@ export async function handleStorage(req: Request, path: string, vault: string): 
       return json({ error: `File type ${ext} not allowed` }, 400);
     }
 
-    const date = new Date().toISOString().split("T")[0];
+    const date = new Date().toISOString().split("T")[0]!;
     const dir = join(assets, date);
     mkdirSync(dir, { recursive: true });
 

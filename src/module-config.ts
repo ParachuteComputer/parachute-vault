@@ -84,7 +84,7 @@ export function buildConfigSchema(): ModuleConfigSchema {
 export function buildConfigValues(
   vaultConfig: VaultConfig,
   globalConfig: GlobalConfig,
-  env: { SCRIBE_URL?: string } = process.env,
+  env: { SCRIBE_URL?: string | undefined } = process.env as { SCRIBE_URL?: string },
 ): Record<string, unknown> {
   return {
     audio_retention: vaultConfig.audio_retention ?? "keep",

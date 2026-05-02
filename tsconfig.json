@@ -25,5 +25,12 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  "exclude": [
+    "node_modules",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "web/ui",
+    "scripts/migrate-audio-to-opus.ts"
+  ]
 }

@@ -199,7 +199,7 @@ const server = Bun.serve({
     const trustProxy = process.env.TRUST_PROXY === "1" || process.env.TRUST_PROXY === "true";
     const forwardedFor = trustProxy ? req.headers.get("x-forwarded-for") : null;
     const clientIp = forwardedFor
-      ? forwardedFor.split(",")[0].trim()
+      ? forwardedFor.split(",")[0]!.trim()
       : server.requestIP(req)?.address;
 
     try {

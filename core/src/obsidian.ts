@@ -82,8 +82,8 @@ export function parseFrontmatter(raw: string): {
     // Key: value pair — keys must be YAML-valid (word chars and hyphens, no spaces)
     const kvMatch = line.match(/^([\w][\w-]*):\s*(.*)/);
     if (kvMatch) {
-      const key = kvMatch[1];
-      const value = kvMatch[2].trim();
+      const key = kvMatch[1]!;
+      const value = kvMatch[2]!.trim();
 
       if (value === "[]") {
         frontmatter[key] = [];
@@ -143,7 +143,7 @@ export function extractInlineTags(content: string): string[] {
   const regex = /(?:^|\s)#([\w][\w/-]*[\w]|[\w])/gm;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(stripped)) !== null) {
-    tags.add(match[1].toLowerCase());
+    tags.add(match[1]!.toLowerCase());
   }
   return [...tags];
 }

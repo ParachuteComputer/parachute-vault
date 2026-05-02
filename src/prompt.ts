@@ -141,17 +141,18 @@ export async function askPassword(question: string): Promise<string> {
 export async function choose(question: string, options: { label: string; value: string; description?: string }[]): Promise<string> {
   console.log(question);
   for (let i = 0; i < options.length; i++) {
-    const desc = options[i].description ? ` — ${options[i].description}` : "";
-    console.log(`  ${i + 1}) ${options[i].label}${desc}`);
+    const opt = options[i]!;
+    const desc = opt.description ? ` — ${opt.description}` : "";
+    console.log(`  ${i + 1}) ${opt.label}${desc}`);
   }
   process.stdout.write(`  Choice [1]: `);
 
   for await (const line of console) {
     const answer = line.trim();
-    if (answer === "") return options[0].value;
+    if (answer === "") return options[0]!.value;
     const idx = parseInt(answer, 10) - 1;
-    if (idx >= 0 && idx < options.length) return options[idx].value;
+    if (idx >= 0 && idx < options.length) return options[idx]!.value;
     process.stdout.write(`  Please enter 1-${options.length}: `);
   }
-  return options[0].value;
+  return options[0]!.value;
 }
