@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/vault",
-  "version": "0.3.6-rc.27",
+  "version": "0.3.6-rc.28",
   "description": "Agent-native knowledge graph. Notes, tags, links over MCP.",
   "module": "src/cli.ts",
   "type": "module",
@@ -18,7 +18,8 @@
     "start": "bun src/server.ts",
     "cli": "bun src/cli.ts",
     "test": "bun test ./src/",
-    "test:core": "cd core && node --experimental-vm-modules node_modules/vitest/dist/cli.js run"
+    "test:core": "cd core && node --experimental-vm-modules node_modules/vitest/dist/cli.js run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
