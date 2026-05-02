@@ -109,6 +109,24 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             ],
             description: "Exclude notes with these tag(s). Accepts a single tag or an array. Aliases `excludeTags` and `exclude_tag` are also accepted.",
           },
+          // The runtime alias-fallback chain accepts these too. Declared
+          // here so schema-introspecting clients (Claude, MCP clients
+          // that surface tool schemas) see them as valid inputs rather
+          // than thinking the canonical is the only option.
+          excludeTags: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Alias for `exclude_tags` (camelCase). Same shape and semantics — pick whichever is more natural for your client.",
+          },
+          exclude_tag: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Alias for `exclude_tags` (singular). Same shape and semantics — accepts a single tag or an array.",
+          },
           has_tags: { type: "boolean", description: "Presence filter: true = only notes with at least one tag; false = only untagged notes. Ignored when `tag` is set." },
           has_links: { type: "boolean", description: "Presence filter: true = only notes with at least one inbound or outbound link; false = only orphaned notes (no links in either direction)." },
           path: { type: "string", description: "Exact path match (case-insensitive)" },
@@ -1203,7 +1221,10 @@ function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
 
 function normalizeTags(tag: unknown): string[] | undefined {
   if (!tag) return undefined;
-  if (Array.isArray(tag)) return tag;
+  // Defensive copy: callers downstream sometimes mutate the array (sort,
+  // splice, push for hierarchy expansion). Returning a fresh array keeps
+  // the original `params` object untouched.
+  if (Array.isArray(tag)) return [...tag];
   return [tag as string];
 }
 
