@@ -231,7 +231,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         if (params.search) {
           // Normalize tag param
           const tags = normalizeTags(params.tag);
-          results = noteOps.searchNotes(db, params.search as string, {
+          // Route through `store.searchNotes` (not `noteOps.searchNotes`) so
+          // tag-hierarchy expansion fires for MCP callers the same as for
+          // HTTP REST callers — `tag: "manual"` matches descendants declared
+          // via `_tags/*` config notes. Mirrors the structured-query fix
+          // from #214; same class of bypass bug (tracked as #227).
+          results = await store.searchNotes(params.search as string, {
             tags,
             limit: (params.limit as number) ?? 50,
           });
@@ -1001,6 +1006,10 @@ This is the graph-aware sibling of \`query-notes\`. Where \`query-notes\` return
         if (queryParam) {
           // Cap the FTS pull at 2× limit so the post-scope filter still leaves
           // enough headroom to fill the result set with real hits.
+          // Direct noteOps.searchNotes (no tag-hierarchy expansion) is intentional
+          // here — synthesize-notes uses the FTS result only as a candidate seed,
+          // and scope filtering happens post-hydration. Don't route through the
+          // store.searchNotes wrapper for this specific tool.
           const searchHits = noteOps.searchNotes(db, queryParam, { limit: Math.min(limit * 2, 100) });
           searchHits.forEach((n, idx) => upsert(n.id, { source: "search", ftsRank: idx }));
         }

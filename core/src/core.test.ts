@@ -2404,6 +2404,26 @@ describe("MCP tools", async () => {
     expect(r.map((n) => n.content).sort()).toEqual(["text memo", "voice memo"]);
   });
 
+  it("query-notes FTS path routes through store.searchNotes so tag-hierarchy expansion fires (vault#227)", async () => {
+    // Same fixture shape as the structured-query hierarchy test above, but
+    // exercising the search branch. Pre-fix the FTS path called
+    // `noteOps.searchNotes` directly and silently dropped descendant matches —
+    // `tag: "manual"` would only return notes literally tagged #manual, not
+    // notes tagged with the declared children #voice / #text.
+    await store.createNote("", { path: "_tags/voice", metadata: { parents: ["manual"] } });
+    await store.createNote("", { path: "_tags/text", metadata: { parents: ["manual"] } });
+    await store.createNote("voice handoff notes", { tags: ["voice"] });
+    await store.createNote("text handoff notes", { tags: ["text"] });
+    await store.createNote("unrelated handoff", { tags: ["other"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ search: "handoff", tag: "manual", include_content: true }) as any[];
+    expect(r).toHaveLength(2);
+    expect(r.map((n) => n.content).sort()).toEqual(["text handoff notes", "voice handoff notes"]);
+    expect(r.map((n) => n.content)).not.toContain("unrelated handoff");
+  });
+
   it("query-notes does not mutate caller's params object across repeated calls", async () => {
     // normalizeTags returns a defensive copy of array inputs so the downstream
     // store layer can sort/dedupe without touching the caller's reference.
