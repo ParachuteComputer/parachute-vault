@@ -231,7 +231,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         if (params.search) {
           // Normalize tag param
           const tags = normalizeTags(params.tag);
-          results = noteOps.searchNotes(db, params.search as string, {
+          // Route through `store.searchNotes` (not `noteOps.searchNotes`) so
+          // tag-hierarchy expansion fires for MCP callers the same as for
+          // HTTP REST callers — `tag: "manual"` matches descendants declared
+          // via `_tags/*` config notes. Mirrors the structured-query fix
+          // from #214; same class of bypass bug (tracked as #227).
+          results = await store.searchNotes(params.search as string, {
             tags,
             limit: (params.limit as number) ?? 50,
           });
