@@ -2283,6 +2283,29 @@ describe("MCP tools", async () => {
     expect(r).toHaveLength(2);
     expect(r.map((n) => n.content).sort()).toEqual(["text memo", "voice memo"]);
   });
+
+  it("query-notes does not mutate caller's params object across repeated calls", async () => {
+    // normalizeTags returns a defensive copy of array inputs so the downstream
+    // store layer can sort/dedupe without touching the caller's reference.
+    // Without the copy, a caller reusing the same params object would see its
+    // exclude_tags array reordered (or worse) on the second call.
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    await store.createNote("c", { tags: ["email", "spam"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const params = { tag: "email", exclude_tags: ["urgent", "spam"], include_content: true };
+
+    const r1 = await queryNotes.execute(params) as any[];
+    expect(params.exclude_tags).toEqual(["urgent", "spam"]);
+
+    const r2 = await queryNotes.execute(params) as any[];
+    expect(params.exclude_tags).toEqual(["urgent", "spam"]);
+
+    expect(r1.map((n) => n.content).sort()).toEqual(["a"]);
+    expect(r2.map((n) => n.content).sort()).toEqual(["a"]);
+  });
 });
 
 // ---- query-notes link expansion ----

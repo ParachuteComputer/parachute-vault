@@ -107,7 +107,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               { type: "string" },
               { type: "array", items: { type: "string" } },
             ],
-            description: "Exclude notes with these tag(s). Accepts a single tag or an array. Aliases `excludeTags` and `exclude_tag` are also accepted.",
+            description: "Exclude notes with these tag(s). Accepts a single tag or an array. Aliases `excludeTags` and `exclude_tag` are also accepted. If multiple alias forms are provided, `exclude_tags` takes precedence (then `excludeTags`, then `exclude_tag`).",
           },
           // The runtime alias-fallback chain accepts these too. Declared
           // here so schema-introspecting clients (Claude, MCP clients
