@@ -30,6 +30,7 @@
     "node_modules",
     "**/*.test.ts",
     "**/*.spec.ts",
-    "web/ui"
+    "web/ui",
+    "scripts/migrate-audio-to-opus.ts"
   ]
 }
