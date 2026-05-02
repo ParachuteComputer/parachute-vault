@@ -2216,6 +2216,96 @@ describe("MCP tools", async () => {
     expect(fresh.metadata.priority).toBe(0);
     expect(fresh.metadata.status).toBe("active");
   });
+
+  // ---- query-notes input-shape tolerance (vault#214) ----
+  //
+  // The MCP framework drops top-level keys not in the inputSchema without
+  // raising — so an LLM caller passing the wrong field name gets a silent
+  // no-op rather than an error. We accept canonical + camelCase + singular
+  // aliases so the most common LLM mistakes still apply the filter, and
+  // we mirror the `tag` param's string-or-array shape so a single excluded
+  // tag doesn't need a wrapping array.
+
+  it("query-notes accepts `excludeTags` (camelCase alias)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", excludeTags: ["urgent"], include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes accepts `exclude_tag` (singular alias)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", exclude_tag: "urgent", include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes `exclude_tags` accepts a single string (mirrors `tag`)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", exclude_tags: "urgent", include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes canonical `exclude_tags: [...]` still works (regression)", async () => {
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "email", exclude_tags: ["urgent"], include_content: true }) as any[];
+    expect(r).toHaveLength(1);
+    expect(r[0].content).toBe("a");
+  });
+
+  it("query-notes routes through store.queryNotes so tag-hierarchy expansion fires", async () => {
+    // `_tags/voice` and `_tags/text` declare "manual" as their parent. A
+    // query for `tag: "manual"` should match notes tagged with either child
+    // — that expansion only happens when the call goes through
+    // `store.queryNotes`, not `noteOps.queryNotes` directly.
+    await store.createNote("", { path: "_tags/voice", metadata: { parents: ["manual"] } });
+    await store.createNote("", { path: "_tags/text", metadata: { parents: ["manual"] } });
+    await store.createNote("voice memo", { tags: ["voice"] });
+    await store.createNote("text memo", { tags: ["text"] });
+    await store.createNote("unrelated", { tags: ["other"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const r = await queryNotes.execute({ tag: "manual", include_content: true }) as any[];
+    expect(r).toHaveLength(2);
+    expect(r.map((n) => n.content).sort()).toEqual(["text memo", "voice memo"]);
+  });
+
+  it("query-notes does not mutate caller's params object across repeated calls", async () => {
+    // normalizeTags returns a defensive copy of array inputs so the downstream
+    // store layer can sort/dedupe without touching the caller's reference.
+    // Without the copy, a caller reusing the same params object would see its
+    // exclude_tags array reordered (or worse) on the second call.
+    await store.createNote("a", { tags: ["email"] });
+    await store.createNote("b", { tags: ["email", "urgent"] });
+    await store.createNote("c", { tags: ["email", "spam"] });
+
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+    const params = { tag: "email", exclude_tags: ["urgent", "spam"], include_content: true };
+
+    const r1 = await queryNotes.execute(params) as any[];
+    expect(params.exclude_tags).toEqual(["urgent", "spam"]);
+
+    const r2 = await queryNotes.execute(params) as any[];
+    expect(params.exclude_tags).toEqual(["urgent", "spam"]);
+
+    expect(r1.map((n) => n.content).sort()).toEqual(["a"]);
+    expect(r2.map((n) => n.content).sort()).toEqual(["a"]);
+  });
 });
 
 // ---- query-notes link expansion ----

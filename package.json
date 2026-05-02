@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/vault",
-  "version": "0.3.6-rc.23",
+  "version": "0.3.6-rc.24",
   "description": "Agent-native knowledge graph. Notes, tags, links over MCP.",
   "module": "src/cli.ts",
   "type": "module",
