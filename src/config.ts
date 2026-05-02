@@ -421,13 +421,13 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   };
 
   const nameMatch = yaml.match(/^name:\s*(.+)/m);
-  if (nameMatch) config.name = nameMatch[1].trim();
+  if (nameMatch) config.name = nameMatch[1]!.trim();
 
   const createdMatch = yaml.match(/^created_at:\s*"?([^"\n]+)"?/m);
-  if (createdMatch) config.created_at = createdMatch[1];
+  if (createdMatch) config.created_at = createdMatch[1]!;
 
   const pubTagMatch = yaml.match(/^published_tag:\s*(\S+)/m);
-  if (pubTagMatch) config.published_tag = pubTagMatch[1];
+  if (pubTagMatch) config.published_tag = pubTagMatch[1]!;
 
   const retentionMatch = yaml.match(/^audio_retention:\s*(\S+)/m);
   if (retentionMatch) {
@@ -438,14 +438,14 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   // Parse description (block scalar)
   const descMatch = yaml.match(/^description:\s*\|\s*\n((?:\s{2}.+\n?)+)/m);
   if (descMatch) {
-    config.description = descMatch[1]
+    config.description = descMatch[1]!
       .split("\n")
       .map((l) => l.replace(/^\s{2}/, ""))
       .join("\n")
       .trim();
   } else {
     const descSimple = yaml.match(/^description:\s*(.+)/m);
-    if (descSimple) config.description = descSimple[1].trim().replace(/^"(.*)"$/, "$1");
+    if (descSimple) config.description = descSimple[1]!.trim().replace(/^"(.*)"$/, "$1");
   }
 
   // Parse api_keys
@@ -460,10 +460,10 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
 
     if (idMatch && hashMatch) {
       config.api_keys.push({
-        id: idMatch[1],
+        id: idMatch[1]!,
         label: (labelMatch?.[1] ?? "default").trim(),
         scope: (scopeMatch?.[1] as KeyScope) ?? "write",
-        key_hash: hashMatch[1],
+        key_hash: hashMatch[1]!,
         created_at: createdAtMatch?.[1] ?? new Date().toISOString(),
         last_used_at: lastUsedMatch?.[1],
       });
@@ -517,12 +517,12 @@ function parseTranscriptionContext(yaml: string): TriggerIncludeContext[] | unde
     if (itemStart) {
       pushCurrent();
       current = { tag: "" };
-      applyContextField(current, itemStart[1], itemStart[2]);
+      applyContextField(current, itemStart[1]!, itemStart[2]!);
       continue;
     }
     const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
     if (fieldMatch && current) {
-      applyContextField(current, fieldMatch[1], fieldMatch[2]);
+      applyContextField(current, fieldMatch[1]!, fieldMatch[2]!);
       continue;
     }
   }
@@ -551,50 +551,52 @@ function parseTagSchemas(yaml: string): Record<string, TagSchema> | undefined {
     if (line.match(/^\S/) && line.trim().length > 0) break;
     if (line.trim().length === 0) continue;
 
-    const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    const indent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
 
     if (indent === 2) {
       // Tag name (e.g., "  person:")
       const tagMatch = line.match(/^\s{2}(\S+):\s*$/);
       if (tagMatch) {
-        currentTag = tagMatch[1];
+        currentTag = tagMatch[1]!;
         currentField = null;
         schemas[currentTag] = {};
       }
     } else if (indent === 4 && currentTag) {
       // Tag-level property (description, fields:)
+      const schema = schemas[currentTag]!;
       const descMatch = line.match(/^\s{4}description:\s*"?([^"]*)"?\s*$/);
       if (descMatch) {
-        schemas[currentTag].description = descMatch[1];
+        schema.description = descMatch[1]!;
         continue;
       }
       const fieldsMatch = line.match(/^\s{4}fields:\s*$/);
       if (fieldsMatch) {
-        schemas[currentTag].fields = schemas[currentTag].fields ?? {};
+        schema.fields = schema.fields ?? {};
         currentField = null;
       }
-    } else if (indent === 6 && currentTag && schemas[currentTag].fields !== undefined) {
+    } else if (indent === 6 && currentTag && schemas[currentTag]?.fields !== undefined) {
       // Field name (e.g., "      first_appeared:")
       const fieldMatch = line.match(/^\s{6}(\S+):\s*$/);
       if (fieldMatch) {
-        currentField = fieldMatch[1];
-        schemas[currentTag].fields![currentField] = { type: "string" };
+        currentField = fieldMatch[1]!;
+        schemas[currentTag]!.fields![currentField] = { type: "string" };
       }
-    } else if (indent === 8 && currentTag && currentField && schemas[currentTag].fields) {
+    } else if (indent === 8 && currentTag && currentField && schemas[currentTag]?.fields) {
       // Field property (type, description, enum)
+      const field = schemas[currentTag]!.fields![currentField]!;
       const typeMatch = line.match(/^\s{8}type:\s*(\S+)/);
       if (typeMatch) {
-        schemas[currentTag].fields![currentField].type = typeMatch[1];
+        field.type = typeMatch[1]!;
         continue;
       }
       const fdescMatch = line.match(/^\s{8}description:\s*"?([^"]*)"?\s*$/);
       if (fdescMatch) {
-        schemas[currentTag].fields![currentField].description = fdescMatch[1];
+        field.description = fdescMatch[1]!;
         continue;
       }
       const enumMatch = line.match(/^\s{8}enum:\s*\[([^\]]*)\]/);
       if (enumMatch) {
-        schemas[currentTag].fields![currentField].enum = enumMatch[1]
+        field.enum = enumMatch[1]!
           .split(",")
           .map((s) => s.trim().replace(/^"(.*)"$/, "$1"));
       }
@@ -628,7 +630,7 @@ function applyContextField(
   if (key === "exclude_tag") { item.exclude_tag = value.replace(/^"(.*)"$/, "$1"); return; }
   if (key === "include_metadata") {
     const listMatch = value.match(/^\[([^\]]*)\]/);
-    if (listMatch) item.include_metadata = parseYamlList(listMatch[1]);
+    if (listMatch) item.include_metadata = parseYamlList(listMatch[1]!);
     return;
   }
 }
@@ -673,7 +675,7 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
           console.warn(`[config] trigger "${current.name}" has no webhook URL — skipping`);
         }
       }
-      current = { name: nameMatch[1].trim(), when: {}, action: undefined as unknown as TriggerAction };
+      current = { name: nameMatch[1]!.trim(), when: {}, action: undefined as unknown as TriggerAction };
       section = "top";
       continue;
     }
@@ -695,37 +697,37 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
     // Top-level trigger field
     const eventsMatch = trimmed.match(/^events:\s*\[([^\]]*)\]/);
     if (eventsMatch) {
-      current.events = parseYamlList(eventsMatch[1]) as Array<"created" | "updated">;
+      current.events = parseYamlList(eventsMatch[1]!) as Array<"created" | "updated">;
       continue;
     }
 
     // When fields
     if (section === "when") {
       const tagsMatch = trimmed.match(/^tags:\s*\[([^\]]*)\]/);
-      if (tagsMatch) { current.when!.tags = parseYamlList(tagsMatch[1]); continue; }
+      if (tagsMatch) { current.when!.tags = parseYamlList(tagsMatch[1]!); continue; }
       const hasContentMatch = trimmed.match(/^has_content:\s*(true|false)/);
       if (hasContentMatch) { current.when!.has_content = hasContentMatch[1] === "true"; continue; }
       const missingMetaMatch = trimmed.match(/^missing_metadata:\s*\[([^\]]*)\]/);
-      if (missingMetaMatch) { current.when!.missing_metadata = parseYamlList(missingMetaMatch[1]); continue; }
+      if (missingMetaMatch) { current.when!.missing_metadata = parseYamlList(missingMetaMatch[1]!); continue; }
       const hasMetaMatch = trimmed.match(/^has_metadata:\s*\[([^\]]*)\]/);
-      if (hasMetaMatch) { current.when!.has_metadata = parseYamlList(hasMetaMatch[1]); continue; }
+      if (hasMetaMatch) { current.when!.has_metadata = parseYamlList(hasMetaMatch[1]!); continue; }
     }
 
     // Action fields
     if (section === "action") {
       const webhookMatch = trimmed.match(/^webhook:\s*(.+)/);
       if (webhookMatch) {
-        current.action = { ...(current.action ?? {}), webhook: webhookMatch[1].trim() } as TriggerAction;
+        current.action = { ...(current.action ?? {}), webhook: webhookMatch[1]!.trim() } as TriggerAction;
         continue;
       }
       const timeoutMatch = trimmed.match(/^timeout:\s*(\d+)/);
       if (timeoutMatch && current.action) {
-        current.action.timeout = parseInt(timeoutMatch[1], 10);
+        current.action.timeout = parseInt(timeoutMatch[1]!, 10);
         continue;
       }
       const sendMatch = trimmed.match(/^send:\s*(\S+)/);
       if (sendMatch && current.action) {
-        current.action.send = sendMatch[1] as TriggerAction["send"];
+        current.action.send = sendMatch[1]! as TriggerAction["send"];
         continue;
       }
     }
@@ -737,12 +739,12 @@ function parseTriggers(yaml: string): TriggerConfig[] | undefined {
       if (itemStart) {
         pushContextItem();
         currentContext = { tag: "" };
-        applyContextField(currentContext, itemStart[1], itemStart[2]);
+        applyContextField(currentContext, itemStart[1]!, itemStart[2]!);
         continue;
       }
       const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
       if (fieldMatch && currentContext) {
-        applyContextField(currentContext, fieldMatch[1], fieldMatch[2]);
+        applyContextField(currentContext, fieldMatch[1]!, fieldMatch[2]!);
         continue;
       }
     }
@@ -861,7 +863,7 @@ function parseBackup(yaml: string): BackupConfig | undefined {
       const tierMatch = trimmed.match(/^(daily|weekly|monthly|yearly):\s*(\S+)/);
       if (tierMatch) {
         const tier = tierMatch[1] as keyof RetentionPolicy;
-        const raw = tierMatch[2].trim();
+        const raw = tierMatch[2]!.trim();
         // "null" / "~" / "unbounded" all mean "keep every year" for the
         // yearly tier. For the other tiers they'd be meaningless; we
         // silently treat them as disabled (0) rather than erroring.
@@ -885,13 +887,13 @@ function parseBackup(yaml: string): BackupConfig | undefined {
         pushDest();
         hasDest = true;
         currentDest = {};
-        (currentDest as Record<string, string>)[itemMatch[1]] = itemMatch[2].trim();
+        (currentDest as Record<string, string>)[itemMatch[1]!] = itemMatch[2]!.trim();
         continue;
       }
       // Continuation line inside the current list item.
       const fieldMatch = trimmed.match(/^(\w+):\s*(.*)$/);
       if (fieldMatch && hasDest) {
-        (currentDest as Record<string, string>)[fieldMatch[1]] = fieldMatch[2].trim();
+        (currentDest as Record<string, string>)[fieldMatch[1]!] = fieldMatch[2]!.trim();
         continue;
       }
     }
@@ -1126,16 +1128,16 @@ export function readGlobalConfig(): GlobalConfig {
       const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
       const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
       const config: GlobalConfig = {
-        port: portMatch ? parseInt(portMatch[1], 10) : DEFAULT_PORT,
+        port: portMatch ? parseInt(portMatch[1]!, 10) : DEFAULT_PORT,
         default_vault: defaultVaultMatch?.[1],
         owner_password_hash: passwordHashMatch?.[1],
         totp_secret: totpSecretMatch?.[1],
       };
       if (discoveryMatch) {
-        config.discovery = discoveryMatch[1] as "enabled" | "disabled";
+        config.discovery = discoveryMatch[1]! as "enabled" | "disabled";
       }
       if (autostartMatch) {
-        config.autostart = autostartMatch[1] === "true";
+        config.autostart = autostartMatch[1]! === "true";
       }
 
       // Parse backup_codes: a YAML list of quoted bcrypt hashes under
@@ -1150,7 +1152,7 @@ export function readGlobalConfig(): GlobalConfig {
         for (const line of lines) {
           if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
           const m = line.match(/^\s+-\s+"([^"]+)"/);
-          if (m) codes.push(m[1]);
+          if (m) codes.push(m[1]!);
         }
         if (codes.length > 0) config.backup_codes = codes;
       }
@@ -1168,10 +1170,10 @@ export function readGlobalConfig(): GlobalConfig {
           const lastUsedMatch = block.match(/last_used_at:\s*"?([^"\n]+)"?/);
           if (idMatch && hashMatch) {
             config.api_keys.push({
-              id: idMatch[1],
+              id: idMatch[1]!,
               label: (labelMatch?.[1] ?? "default").trim(),
               scope: (scopeMatch?.[1] as KeyScope) ?? "write",
-              key_hash: hashMatch[1],
+              key_hash: hashMatch[1]!,
               created_at: createdAtMatch?.[1] ?? new Date().toISOString(),
               last_used_at: lastUsedMatch?.[1],
             });
@@ -1446,7 +1448,7 @@ export function resolveDefaultVault(): string | null {
     return globalConfig.default_vault;
   }
   if (vaults.length === 1) {
-    return vaults[0];
+    return vaults[0]!;
   }
   return null;
 }
