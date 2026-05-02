@@ -102,7 +102,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             description: "Filter by tag(s)",
           },
           tag_match: { type: "string", enum: ["any", "all"], description: "How to match multiple tags: 'any' (OR, default) or 'all' (AND)" },
-          exclude_tags: { type: "array", items: { type: "string" }, description: "Exclude notes with these tags" },
+          exclude_tags: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Exclude notes with these tag(s). Accepts a single tag or an array. Aliases `excludeTags` and `exclude_tag` are also accepted.",
+          },
           has_tags: { type: "boolean", description: "Presence filter: true = only notes with at least one tag; false = only untagged notes. Ignored when `tag` is set." },
           has_links: { type: "boolean", description: "Presence filter: true = only notes with at least one inbound or outbound link; false = only orphaned notes (no links in either direction)." },
           path: { type: "string", description: "Exact path match (case-insensitive)" },
@@ -205,10 +211,21 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         } else {
           // --- Structured query ---
           const tags = normalizeTags(params.tag);
-          results = noteOps.queryNotes(db, {
+          // Accept canonical `exclude_tags` plus camelCase / singular aliases.
+          // LLM callers frequently pick the wrong name (training-data drift
+          // toward camelCase across MCP tools) and the JSON-RPC layer drops
+          // unknown keys silently; aliasing here closes the silent-no-op gap.
+          const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
+          const excludeTags = normalizeTags(excludeTagsRaw);
+          // Route through `store.queryNotes` (not `noteOps.queryNotes`) so
+          // tag-hierarchy expansion fires for MCP callers the same as for
+          // HTTP REST callers — `tag: "manual"` matches descendants declared
+          // via `_tags/*` config notes. The previous direct-noteOps call
+          // bypassed the wrapper and silently dropped hierarchy expansion.
+          results = await store.queryNotes({
             tags,
             tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
-            excludeTags: params.exclude_tags as string[] | undefined,
+            excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
             path: params.path as string | undefined,
