@@ -1006,6 +1006,10 @@ This is the graph-aware sibling of \`query-notes\`. Where \`query-notes\` return
         if (queryParam) {
           // Cap the FTS pull at 2× limit so the post-scope filter still leaves
           // enough headroom to fill the result set with real hits.
+          // Direct noteOps.searchNotes (no tag-hierarchy expansion) is intentional
+          // here — synthesize-notes uses the FTS result only as a candidate seed,
+          // and scope filtering happens post-hydration. Don't route through the
+          // store.searchNotes wrapper for this specific tool.
           const searchHits = noteOps.searchNotes(db, queryParam, { limit: Math.min(limit * 2, 100) });
           searchHits.forEach((n, idx) => upsert(n.id, { source: "search", ftsRank: idx }));
         }

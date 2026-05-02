@@ -2421,6 +2421,7 @@ describe("MCP tools", async () => {
     const r = await queryNotes.execute({ search: "handoff", tag: "manual", include_content: true }) as any[];
     expect(r).toHaveLength(2);
     expect(r.map((n) => n.content).sort()).toEqual(["text handoff notes", "voice handoff notes"]);
+    expect(r.map((n) => n.content)).not.toContain("unrelated handoff");
   });
 
   it("query-notes does not mutate caller's params object across repeated calls", async () => {
