@@ -7,6 +7,7 @@
   "port": 1940,
   "paths": ["/vault/default"],
   "health": "/vault/default/health",
+  "managementUrl": "/admin",
   "startCmd": ["parachute-vault", "serve"],
   "scopes": {
     "defines": ["vault:read", "vault:write", "vault:admin"]
