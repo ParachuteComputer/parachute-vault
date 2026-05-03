@@ -377,7 +377,12 @@ export async function handleNotes(
         }
         if (e && e.code === "EMPTY_NOTE") {
           return json(
-            { error_type: "empty_note", error: "EmptyNoteError", message: e.message },
+            {
+              error_type: "empty_note",
+              error: "EmptyNoteError",
+              message: e.message,
+              item_index: e.item_index ?? null,
+            },
             400,
           );
         }

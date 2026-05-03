@@ -383,7 +383,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // the empty-note case. The Store will throw EmptyNoteError on the
         // empty entry, but in a sequential batch loop the prefix would have
         // already committed before we hit it. Pre-walk so the whole call
-        // either creates everything or nothing.
+        // either creates everything or nothing. The error carries
+        // `item_index` so MCP callers with multi-item batches can pinpoint
+        // the bad entry — parity with the HTTP route's response shape.
+        // TODO: tighten batch input type — `items[i] as any` mirrors the
+        // top-of-call cast at `params.notes as any[]`. A typed McpCreateNoteInput
+        // would let us drop both casts.
         for (let i = 0; i < items.length; i++) {
           const item = items[i] as any;
           const content = ((item?.content as string | undefined) ?? "").toString();
@@ -391,7 +396,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           const pathEmpty = rawPath === undefined || rawPath === null
             || (typeof rawPath === "string" && rawPath.trim() === "");
           if (!content.trim() && pathEmpty) {
-            throw new noteOps.EmptyNoteError();
+            throw new noteOps.EmptyNoteError(null, batch ? i : null);
           }
         }
 

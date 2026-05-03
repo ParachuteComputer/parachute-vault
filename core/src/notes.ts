@@ -167,15 +167,25 @@ export const MAX_BATCH_SIZE = 500;
 export class EmptyNoteError extends Error {
   code = "EMPTY_NOTE" as const;
   note_id: string | null;
+  /**
+   * Zero-based position in a batch call when the empty entry is rejected via
+   * the transport-layer pre-validation pass (HTTP `POST /api/notes` or MCP
+   * `create-note` with `notes: [...]`). `null` for single-update rejections
+   * and for Store-level throws that don't know their batch context.
+   */
+  item_index: number | null;
 
-  constructor(noteId: string | null = null) {
+  constructor(noteId: string | null = null, itemIndex: number | null = null) {
     super(
       noteId
         ? `empty_note: update would leave note "${noteId}" with neither content nor path`
-        : `empty_note: a note must have either content or a path`,
+        : itemIndex !== null
+          ? `empty_note: a note must have either content or a path (item index ${itemIndex})`
+          : `empty_note: a note must have either content or a path`,
     );
     this.name = "EmptyNoteError";
     this.note_id = noteId;
+    this.item_index = itemIndex;
   }
 }
 

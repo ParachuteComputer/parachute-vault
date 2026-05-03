@@ -2521,7 +2521,7 @@ describe("MCP tools", async () => {
     expect(err?.code).toBe("EMPTY_NOTE");
   });
 
-  it("create-note batch rejects when any entry is empty content + no path (atomic)", async () => {
+  it("create-note batch rejects when any entry is empty content + no path (atomic, with item_index)", async () => {
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
     const beforeCount = (await store.queryNotes({ search: "atomic-marker" })).length;
@@ -2542,6 +2542,23 @@ describe("MCP tools", async () => {
     // on every runaway-client burst (#213).
     const afterCount = (await store.queryNotes({ search: "atomic-marker" })).length;
     expect(afterCount).toBe(beforeCount);
+    // Parity with HTTP route: MCP callers with multi-item batches need to
+    // know which entry triggered the rejection. The bad entry is at index 1.
+    expect(err.item_index).toBe(1);
+  });
+
+  it("create-note single empty has null item_index (not a batch position)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    let err: any;
+    try {
+      await createNote.execute({ content: "" });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("EMPTY_NOTE");
+    // Single-call (no `notes` array) — there's no batch position to report.
+    expect(err.item_index).toBeNull();
   });
 
   it("create-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {
