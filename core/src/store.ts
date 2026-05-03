@@ -16,11 +16,10 @@ import {
 import {
   loadSchemaConfig,
   validateNote as runValidateNote,
-  SCHEMA_CONFIG_PREFIX,
-  SCHEMA_DEFAULTS_PATH,
   type ResolvedSchemas,
   type ValidationStatus,
 } from "./schema-defaults.js";
+import * as noteSchemaOps from "./note-schemas.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -30,11 +29,12 @@ import {
 export class BunSqliteStore implements Store {
   public readonly hooks: HookRegistry;
 
-  // Lazy-built caches over `_tags/*` and `_schemas/*` config notes. Null
-  // means "not yet loaded or invalidated"; the next read rebuilds. We
-  // invalidate synchronously inside note mutations (see
-  // `invalidateConfigCachesForPath`) so reads after writes always see
-  // the post-write state.
+  // Lazy-built caches over the post-v14 `tags` table (hierarchy via
+  // parent_names) and the post-v15 `note_schemas` + `schema_mappings`
+  // tables (validation). Null means "not yet loaded or invalidated"; the
+  // next read rebuilds. We invalidate synchronously inside the writers
+  // that mutate the source tables so reads after writes always see the
+  // post-write state.
   private _tagHierarchy: TagHierarchy | null = null;
   private _schemaConfig: ResolvedSchemas | null = null;
 
@@ -55,8 +55,8 @@ export class BunSqliteStore implements Store {
   }
 
   /**
-   * Lazy accessor for the `_schemas/*` + `_schema_defaults` config-note
-   * resolution. Same lifecycle as the tag hierarchy cache.
+   * Lazy accessor for the `note_schemas` + `schema_mappings` resolution.
+   * Same lifecycle as the tag hierarchy cache.
    */
   private getSchemaConfig(): ResolvedSchemas {
     if (!this._schemaConfig) this._schemaConfig = loadSchemaConfig(this.db);
@@ -74,20 +74,20 @@ export class BunSqliteStore implements Store {
   }
 
   /**
-   * Drop config caches if the mutated path is one of the config namespaces.
-   * Called from create/update/delete — old path is passed alongside new for
-   * rename cases (a note moved out of `_tags/` should still invalidate).
+   * Drop the tag-hierarchy cache if the mutated path is in the `_tags/*`
+   * namespace. Called from create/update/delete — old path is passed
+   * alongside new for rename cases (a note moved out of `_tags/` should
+   * still invalidate).
+   *
+   * Post-v15 the schema-config cache is no longer note-driven — its
+   * invalidation hook is on `upsertNoteSchema` / `setSchemaMapping` /
+   * `deleteNoteSchema` / `deleteSchemaMapping` instead.
    */
   private invalidateConfigCachesForPath(path: string | null | undefined, oldPath?: string | null): void {
     const isTagConfig = (p: string | null | undefined): boolean =>
       typeof p === "string" && p.startsWith(TAG_CONFIG_PREFIX);
-    const isSchemaConfig = (p: string | null | undefined): boolean =>
-      typeof p === "string" && (p.startsWith(SCHEMA_CONFIG_PREFIX) || p === SCHEMA_DEFAULTS_PATH);
     if (isTagConfig(path) || isTagConfig(oldPath)) {
       this._tagHierarchy = null;
-    }
-    if (isSchemaConfig(path) || isSchemaConfig(oldPath)) {
-      this._schemaConfig = null;
     }
   }
 
@@ -418,11 +418,11 @@ export class BunSqliteStore implements Store {
    * Create a note without triggering wikilink sync.
    * Use this during bulk imports, then call syncAllWikilinks() after.
    *
-   * Does **not** invalidate the `_tags/*` / `_schemas/*` config caches —
-   * importers writing config notes through this path must call
-   * `rebuildConfigCaches()` once the import is done. (Default importers
-   * follow `createNoteRaw` with `syncAllWikilinks`, so adding the cache
-   * rebuild there is the natural place.)
+   * Does **not** invalidate the `_tags/*` config cache — importers writing
+   * tag-hierarchy notes through this path must call `rebuildConfigCaches()`
+   * once the import is done. (Default importers follow `createNoteRaw` with
+   * `syncAllWikilinks`, so adding the cache rebuild there is the natural
+   * place.)
    */
   async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
     return noteOps.createNote(this.db, content, opts);
@@ -430,11 +430,62 @@ export class BunSqliteStore implements Store {
 
   /**
    * Drop the config caches unconditionally. Used by bulk-import paths that
-   * skip per-note invalidation for throughput.
+   * skip per-note invalidation for throughput, and by importers that
+   * directly populate `note_schemas` / `schema_mappings`.
    */
   rebuildConfigCaches(): void {
     this._tagHierarchy = null;
     this._schemaConfig = null;
+  }
+
+  // ---- Note schemas (post-v15: validation by path-prefix or tag) ----
+
+  async listNoteSchemas() {
+    return noteSchemaOps.listNoteSchemas(this.db);
+  }
+
+  async getNoteSchema(name: string) {
+    return noteSchemaOps.getNoteSchema(this.db, name);
+  }
+
+  /**
+   * Partial-upsert a note schema. Auto-creates the row if missing. Any
+   * patch field left undefined is preserved; pass null to clear. Empty
+   * `required: []` collapses to null. Invalidates the schema-config cache.
+   */
+  async upsertNoteSchema(name: string, patch: noteSchemaOps.NoteSchemaPatch) {
+    const result = noteSchemaOps.upsertNoteSchema(this.db, name, patch);
+    this._schemaConfig = null;
+    return result;
+  }
+
+  async deleteNoteSchema(name: string) {
+    const removed = noteSchemaOps.deleteNoteSchema(this.db, name);
+    if (removed) this._schemaConfig = null;
+    return removed;
+  }
+
+  async listSchemaMappings(opts?: noteSchemaOps.ListMappingsOpts) {
+    return noteSchemaOps.listSchemaMappings(this.db, opts ?? {});
+  }
+
+  async setSchemaMapping(
+    schema_name: string,
+    match_kind: noteSchemaOps.SchemaMappingKind,
+    match_value: string,
+  ) {
+    noteSchemaOps.setSchemaMapping(this.db, schema_name, match_kind, match_value);
+    this._schemaConfig = null;
+  }
+
+  async deleteSchemaMapping(
+    schema_name: string,
+    match_kind: noteSchemaOps.SchemaMappingKind,
+    match_value: string,
+  ) {
+    const removed = noteSchemaOps.deleteSchemaMapping(this.db, schema_name, match_kind, match_value);
+    if (removed) this._schemaConfig = null;
+    return removed;
   }
 
   /**

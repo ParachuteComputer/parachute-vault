@@ -1,53 +1,29 @@
 /**
- * Default schemas resolved from `_schemas/*` and `_schema_defaults` config notes.
+ * Schema validation: resolves which schemas apply to a note (by path prefix
+ * or tag), then validates the note's metadata against each. Writes are
+ * never blocked — schemas are guidance. The MCP/REST layer surfaces a
+ * `validation_status` block on create/update responses with any warnings
+ * the agent can act on (missing required, type mismatch, enum mismatch).
  *
- * A note at path `_schemas/<name>` declares a schema in its metadata:
- *
- *     ---
- *     description: "Task notes"
- *     fields:
- *       priority: { type: string, enum: [high, medium, low] }
- *       due_date: { type: string }
- *     required: [priority]
- *     ---
- *
- * A single note at path `_schema_defaults` maps notes to schemas by path prefix
- * or tag:
- *
- *     ---
- *     path_prefixes:
- *       "tasks/": "task"
- *       "journal/": "journal-entry"
- *     tags:
- *       "meeting": "meeting-notes"
- *     ---
- *
- * On create / update, the store resolves applicable schemas for a note (by
- * matching its path against `path_prefixes` and its tags against `tags`),
- * validates the note's metadata, and surfaces a `validation_status` block on
- * the response. Validation is **never** blocking — schemas are guidance, not
- * gates. Writes always succeed; the response carries warnings the agent can
- * act on (e.g. fill in a missing field on the next turn).
- *
- * Why notes-as-config rather than a SQL table:
- * - Same rationale as `_tags/*`: vault is note-first; the schema travels with
- *   the content; users edit it with the same tools as any note.
- * - Orthogonal to the existing `tag_schemas` table — that one drives indexed
- *   columns and per-tag UI hints. This layer is purely a validation guide
- *   addressed by path or tag rather than tag alone.
+ * Storage (post-v15): schemas live in the `note_schemas` table; mapping
+ * rules live in `schema_mappings`. Authoring is via `update-note-schema`
+ * + `set-schema-mapping` (MCP/REST). The legacy `_schemas/<name>` and
+ * `_schema_defaults` notes are retired but left in place — inert after
+ * v15 (no resolver reads them).
  *
  * Resolution model:
  * - Lazy: rebuilt on first access, cached on the store.
- * - Synchronously invalidated when any note at `_schemas/*` or
- *   `_schema_defaults` is created, updated, or deleted.
- * - When no `_schema_defaults` mapping note exists and no `_schemas/*`
- *   declarations match, validation is a no-op (status omitted).
+ * - Invalidated when `note_schemas` or `schema_mappings` are mutated
+ *   (table writes, not note writes).
+ * - When no mappings exist and nothing else matches, validation is a
+ *   no-op (status omitted).
  */
 
 import { Database } from "bun:sqlite";
 
 // ---------------------------------------------------------------------------
-// Path prefixes
+// Legacy path prefixes — kept exported for any historical caller that still
+// references them. No resolver code reads notes-as-config post-v15.
 // ---------------------------------------------------------------------------
 
 export const SCHEMA_CONFIG_PREFIX = "_schemas/";
@@ -101,100 +77,75 @@ export interface ValidationStatus {
 // Loading
 // ---------------------------------------------------------------------------
 
-function parseMetadata(raw: string | null): unknown {
-  if (!raw || raw === "{}") return null;
+function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
+  if (!raw) return {};
+  let parsed: unknown;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return {};
   }
-}
-
-function readSchemaDefinition(name: string, metadata: unknown): SchemaDefinition | null {
-  if (!metadata || typeof metadata !== "object") return null;
-  const m = metadata as Record<string, unknown>;
-
-  const fieldsRaw = m.fields;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
   const fields: Record<string, SchemaField> = {};
-  if (fieldsRaw && typeof fieldsRaw === "object" && !Array.isArray(fieldsRaw)) {
-    for (const [k, v] of Object.entries(fieldsRaw as Record<string, unknown>)) {
-      if (!v || typeof v !== "object") continue;
-      const f = v as Record<string, unknown>;
-      const field: SchemaField = {};
-      if (typeof f.type === "string") field.type = f.type as SchemaField["type"];
-      if (Array.isArray(f.enum)) field.enum = f.enum.filter((x): x is string => typeof x === "string");
-      if (typeof f.description === "string") field.description = f.description;
-      fields[k] = field;
-    }
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!v || typeof v !== "object") continue;
+    const f = v as Record<string, unknown>;
+    const field: SchemaField = {};
+    if (typeof f.type === "string") field.type = f.type as SchemaField["type"];
+    if (Array.isArray(f.enum)) field.enum = f.enum.filter((x): x is string => typeof x === "string");
+    if (typeof f.description === "string") field.description = f.description;
+    fields[k] = field;
   }
-
-  const required: string[] = Array.isArray(m.required)
-    ? m.required.filter((x): x is string => typeof x === "string")
-    : [];
-
-  const description = typeof m.description === "string" ? m.description : undefined;
-
-  return { name, description, fields, required };
+  return fields;
 }
 
-function readDefaultsMapping(metadata: unknown): SchemaDefaults {
-  const result: SchemaDefaults = {
-    pathPrefixes: [],
-    tagToSchema: new Map(),
-  };
-  if (!metadata || typeof metadata !== "object") return result;
-  const m = metadata as Record<string, unknown>;
-
-  const pathPrefixes = m.path_prefixes;
-  if (pathPrefixes && typeof pathPrefixes === "object" && !Array.isArray(pathPrefixes)) {
-    for (const [prefix, schema] of Object.entries(pathPrefixes as Record<string, unknown>)) {
-      if (typeof schema === "string" && schema.length > 0) {
-        result.pathPrefixes.push({ prefix, schema });
-      }
-    }
-    // Longest prefix wins — sort once at load so resolve is O(n) without re-sorts.
-    result.pathPrefixes.sort((a, b) => b.prefix.length - a.prefix.length);
+function parseRequiredJson(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return [];
   }
-
-  const tags = m.tags;
-  if (tags && typeof tags === "object" && !Array.isArray(tags)) {
-    for (const [tag, schema] of Object.entries(tags as Record<string, unknown>)) {
-      if (typeof schema === "string" && schema.length > 0) {
-        result.tagToSchema.set(tag, schema);
-      }
-    }
-  }
-
-  return result;
 }
 
 /**
- * Scan `_schemas/*` notes and (optionally) `_schema_defaults` to build the
- * full resolution map. Always returns a well-formed `ResolvedSchemas` even
- * when no config notes exist (empty maps).
+ * Build the full resolution map from the `note_schemas` and `schema_mappings`
+ * tables. Always returns a well-formed `ResolvedSchemas` even when the
+ * tables are empty (empty maps).
  */
 export function loadSchemaConfig(db: Database): ResolvedSchemas {
   const definitions = new Map<string, SchemaDefinition>();
-  // GLOB rather than LIKE — `_` is a single-character wildcard in LIKE, so
-  // `path LIKE '_schemas/%'` would also match `Aschemas/foo`. GLOB takes `_`
-  // as a literal and matches only the intended `_schemas/*` namespace.
   const defRows = db.prepare(
-    `SELECT path, metadata FROM notes WHERE path GLOB '_schemas/*'`,
-  ).all() as { path: string; metadata: string | null }[];
+    `SELECT name, description, fields, required FROM note_schemas`,
+  ).all() as { name: string; description: string | null; fields: string | null; required: string | null }[];
   for (const row of defRows) {
-    const name = row.path.slice(SCHEMA_CONFIG_PREFIX.length);
-    if (!name) continue;
-    const def = readSchemaDefinition(name, parseMetadata(row.metadata));
-    if (def) definitions.set(name, def);
+    if (!row.name) continue;
+    definitions.set(row.name, {
+      name: row.name,
+      description: row.description ?? undefined,
+      fields: parseFieldsJson(row.fields),
+      required: parseRequiredJson(row.required),
+    });
   }
 
-  let defaults: SchemaDefaults = { pathPrefixes: [], tagToSchema: new Map() };
-  const mappingRow = db.prepare(
-    `SELECT metadata FROM notes WHERE path = ?`,
-  ).get(SCHEMA_DEFAULTS_PATH) as { metadata: string | null } | undefined;
-  if (mappingRow) {
-    defaults = readDefaultsMapping(parseMetadata(mappingRow.metadata));
+  const defaults: SchemaDefaults = {
+    pathPrefixes: [],
+    tagToSchema: new Map(),
+  };
+  const mappingRows = db.prepare(
+    `SELECT schema_name, match_kind, match_value FROM schema_mappings`,
+  ).all() as { schema_name: string; match_kind: string; match_value: string }[];
+  for (const row of mappingRows) {
+    if (row.match_kind === "path_prefix") {
+      defaults.pathPrefixes.push({ prefix: row.match_value, schema: row.schema_name });
+    } else if (row.match_kind === "tag") {
+      defaults.tagToSchema.set(row.match_value, row.schema_name);
+    }
   }
+  // Longest prefix wins — sort once at load so resolve is O(n) without re-sorts.
+  defaults.pathPrefixes.sort((a, b) => b.prefix.length - a.prefix.length);
 
   return { defaults, definitions };
 }
@@ -206,8 +157,8 @@ export function loadSchemaConfig(db: Database): ResolvedSchemas {
 /**
  * Find the schemas that apply to a note based on its path and tags. Returns
  * schema *names* in the order they were resolved (path-prefix first, then
- * each matching tag in declaration order). Names that don't have a backing
- * `_schemas/<name>` definition are dropped.
+ * each matching tag in declaration order). Names that don't have a row in
+ * `note_schemas` are dropped.
  */
 export function resolveApplicableSchemas(
   resolved: ResolvedSchemas,
