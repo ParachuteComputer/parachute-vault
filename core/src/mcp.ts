@@ -379,6 +379,22 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           throw new BatchTooLargeError(items.length);
         }
 
+        // Empty-note pre-validation (#213): make mixed batches atomic for
+        // the empty-note case. The Store will throw EmptyNoteError on the
+        // empty entry, but in a sequential batch loop the prefix would have
+        // already committed before we hit it. Pre-walk so the whole call
+        // either creates everything or nothing.
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i] as any;
+          const content = ((item?.content as string | undefined) ?? "").toString();
+          const rawPath = item?.path;
+          const pathEmpty = rawPath === undefined || rawPath === null
+            || (typeof rawPath === "string" && rawPath.trim() === "");
+          if (!content.trim() && pathEmpty) {
+            throw new noteOps.EmptyNoteError();
+          }
+        }
+
         const created: Note[] = [];
         for (const item of items) {
           const note = await store.createNote(item.content as string ?? "", {
@@ -1259,7 +1275,7 @@ function normalizeTags(tag: unknown): string[] | undefined {
 
 // Re-exported for backward compat; defined in notes.ts alongside the
 // conditional-UPDATE implementation that raises it.
-export { ConflictError, PathConflictError } from "./notes.js";
+export { ConflictError, PathConflictError, EmptyNoteError } from "./notes.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a

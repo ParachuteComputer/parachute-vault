@@ -325,6 +325,30 @@ export async function handleNotes(
         );
       }
 
+      // Empty-note pre-validation (#213): walk the batch first and reject the
+      // whole request if any item would be content+path empty. This makes
+      // mixed batches atomic for the empty-note case — no caller gets a
+      // half-applied batch where the prefix landed and the empty entry
+      // surfaced the 400. Mirrors the Store-level invariant exactly.
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const content = (item?.content ?? "").toString();
+        const rawPath = item?.path;
+        const pathEmpty = rawPath === undefined || rawPath === null
+          || (typeof rawPath === "string" && rawPath.trim() === "");
+        if (!content.trim() && pathEmpty) {
+          return json(
+            {
+              error_type: "empty_note",
+              error: "EmptyNoteError",
+              message: `empty_note: a note must have either content or a path (item index ${i})`,
+              item_index: i,
+            },
+            400,
+          );
+        }
+      }
+
       const created: Note[] = [];
       try {
         for (const item of items) {

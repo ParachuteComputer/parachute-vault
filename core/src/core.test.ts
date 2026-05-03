@@ -2521,14 +2521,15 @@ describe("MCP tools", async () => {
     expect(err?.code).toBe("EMPTY_NOTE");
   });
 
-  it("create-note batch rejects when any entry is empty content + no path", async () => {
+  it("create-note batch rejects when any entry is empty content + no path (atomic)", async () => {
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
+    const beforeCount = (await store.queryNotes({ search: "atomic-marker" })).length;
     let err: any;
     try {
       await createNote.execute({
         notes: [
-          { content: "ok" },
+          { content: "atomic-marker first" },
           { content: "" },
         ],
       });
@@ -2536,6 +2537,11 @@ describe("MCP tools", async () => {
       err = e;
     }
     expect(err?.code).toBe("EMPTY_NOTE");
+    // The first item must NOT have been created — pre-validation rolls
+    // the whole batch back atomically. Partial-create would leak prefixes
+    // on every runaway-client burst (#213).
+    const afterCount = (await store.queryNotes({ search: "atomic-marker" })).length;
+    expect(afterCount).toBe(beforeCount);
   });
 
   it("create-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {

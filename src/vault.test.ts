@@ -1160,7 +1160,12 @@ describe("HTTP /notes", async () => {
       expect(body.error).toBe("EmptyNoteError");
     });
 
-    test("POST batch with one empty entry → 400 EmptyNoteError (atomic reject)", async () => {
+    test("POST batch with one empty entry → 400 EmptyNoteError, NOTHING created (atomic)", async () => {
+      // Pre-validate the batch before any DB writes so a mixed batch with one
+      // bad entry rolls back the whole call. The runaway-client signature
+      // (#213) is "thousands of empties" — partial-create semantics would
+      // still leak the prefix on every burst. Atomic is the only safe shape.
+      const beforeCount = (await store.queryNotes({ path: "ok-1" })).length;
       const res = await handleNotes(
         mkReq("POST", "/notes", { notes: [{ path: "ok-1" }, {}] }),
         store,
@@ -1169,9 +1174,10 @@ describe("HTTP /notes", async () => {
       expect(res.status).toBe(400);
       const body = await res.json() as any;
       expect(body.error_type).toBe("empty_note");
-      // The first item may have been created before the loop hit the empty
-      // entry — that's acceptable, the cap is defense-in-depth and the
-      // 400 surfaces the bug to the caller.
+      expect(body.item_index).toBe(1);
+      // ok-1 must NOT have been created — atomic rollback.
+      const afterCount = (await store.queryNotes({ path: "ok-1" })).length;
+      expect(afterCount).toBe(beforeCount);
     });
 
     test("POST single content-only (path absent) → 201", async () => {
