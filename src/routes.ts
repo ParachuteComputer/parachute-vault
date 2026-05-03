@@ -910,6 +910,24 @@ export async function handleTags(
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
+    // Same dependency check as DELETE / merge — until vault#240 ships the
+    // rename→token cascade, fail-closed on referenced names so the rename
+    // can't silently orphan a token's allowlist (the JSON-stored old name
+    // would no longer match anything). When the cascade lands this becomes
+    // an unconditional cascade + audit log entry per patterns#26 §Lifecycle.
+    const referenced_by = findTokensReferencingTag((store as any).db, oldName);
+    if (referenced_by.length > 0) {
+      return json(
+        {
+          error: "TagInUseByTokens",
+          error_type: "tag_in_use_by_tokens",
+          message: `Tag "${oldName}" is referenced by ${referenced_by.length} tag-scoped token(s); revoke or re-mint them before renaming. (vault#240 will replace this with an automatic cascade.)`,
+          tag: oldName,
+          referenced_by,
+        },
+        409,
+      );
+    }
     const result = await store.renameTag(oldName, newName);
     if ("error" in result) {
       if (result.error === "not_found") return json({ error: "not_found", tag: oldName }, 404);

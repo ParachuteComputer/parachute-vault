@@ -1514,6 +1514,37 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(200);
   });
 
+  test("POST /api/tags/:name/rename → 409 when a tag-scoped token references the old name", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("h", { tags: ["health"] });
+    mintTagScopedToken("journal", ["vault:read"], ["health"]);
+    const admin = createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/health/rename";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" },
+        body: JSON.stringify({ new_name: "wellness" }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error_type?: string;
+      tag?: string;
+      referenced_by?: { id: string; label: string }[];
+    };
+    expect(body.error_type).toBe("tag_in_use_by_tokens");
+    expect(body.tag).toBe("health");
+    expect(body.referenced_by?.length).toBe(1);
+
+    // Tag was not renamed.
+    expect((await store.listTags()).find((t) => t.name === "health")).toBeTruthy();
+    expect((await store.listTags()).find((t) => t.name === "wellness")).toBeFalsy();
+  });
+
   test("POST /api/tags/merge → 409 when a tag-scoped token references a source", async () => {
     createVault("journal");
     const store = getVaultStore("journal");
