@@ -543,15 +543,17 @@ function migrateToV14(db: Database): void {
 function migrateToV15(db: Database): void {
   if (!hasTable(db, "note_schemas") || !hasTable(db, "notes")) return;
 
-  // Short-circuit: if the destination tables already have data, the
-  // migration has run before. Don't re-scan notes.
+  // Short-circuit: if either destination table already has data, the
+  // migration has run before. `||` not `&&` — a vault with schemas but zero
+  // mappings (or mappings but zero schemas) is a valid post-v15 state, and
+  // re-scanning notes on every boot would be wasted I/O.
   const hasSchemas = (db.prepare(
     "SELECT 1 FROM note_schemas LIMIT 1",
   ).get()) !== null;
   const hasMappings = (db.prepare(
     "SELECT 1 FROM schema_mappings LIMIT 1",
   ).get()) !== null;
-  if (hasSchemas && hasMappings) return;
+  if (hasSchemas || hasMappings) return;
 
   db.exec("BEGIN IMMEDIATE");
   try {

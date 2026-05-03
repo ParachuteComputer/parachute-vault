@@ -3865,6 +3865,31 @@ describe("schema migration v14 → v15", async () => {
 
     db.close();
   });
+
+  // Short-circuit uses `||` not `&&`: a vault with schemas-but-no-mappings
+  // is a valid post-v15 state. Legacy `_schemas/*` notes left around from
+  // a prior import shouldn't get re-folded on every boot. (The mirror case —
+  // mappings-but-no-schemas — is structurally impossible because the
+  // schema_mappings FK to note_schemas has ON DELETE CASCADE.)
+  it("doesn't re-run when only one destination table is non-empty", async () => {
+    const db = await buildV14ShapeWithLegacyNotes();
+    const { initSchema } = await import("./schema.ts");
+    initSchema(db);
+
+    // After first run: tables populated, legacy notes still in `notes`.
+    expect((db.prepare("SELECT COUNT(*) as c FROM note_schemas").get() as any).c).toBeGreaterThan(0);
+    expect((db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c).toBeGreaterThan(0);
+    expect((db.prepare("SELECT COUNT(*) as c FROM notes WHERE path GLOB '_schemas/*'").get() as any).c).toBeGreaterThan(0);
+
+    // Wipe mappings only; schemas remain non-empty. With the buggy `&&`
+    // short-circuit, the migration would re-scan `_schema_defaults` and
+    // rebuild the mappings table. With `||` it correctly no-ops.
+    db.exec("DELETE FROM schema_mappings");
+    initSchema(db);
+    expect((db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c).toBe(0);
+
+    db.close();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -1094,14 +1094,24 @@ export async function handleNoteSchemas(
   req: Request,
   store: Store,
   subpath = "",
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
   const url = new URL(req.url);
+
+  // Tag-scope filter for `tag`-kind mappings. `path_prefix` mappings carry no
+  // tag-axis information so they're always visible/writable. The single-tag
+  // check delegates to `tagsWithinScope` so the string-form fallback in
+  // patterns/tag-scoped-tokens.md §Storage details is honored end-to-end.
+  const mappingInScope = (m: { match_kind: SchemaMappingKind; match_value: string }): boolean => {
+    if (m.match_kind !== "tag") return true;
+    return tagsWithinScope([m.match_value], tagScope.allowed, tagScope.raw);
+  };
 
   // GET /note-schemas — list all
   if (req.method === "GET" && subpath === "") {
     const schemas = await store.listNoteSchemas();
     if (parseBool(parseQuery(url, "include_mappings"), false)) {
-      const allMappings = await store.listSchemaMappings();
+      const allMappings = (await store.listSchemaMappings()).filter(mappingInScope);
       const byName = new Map<string, typeof allMappings>();
       for (const m of allMappings) {
         const list = byName.get(m.schema_name) ?? [];
@@ -1120,7 +1130,7 @@ export async function handleNoteSchemas(
 
     // GET /note-schemas/:name/mappings
     if (req.method === "GET") {
-      const mappings = await store.listSchemaMappings({ schema_name: schemaName });
+      const mappings = (await store.listSchemaMappings({ schema_name: schemaName })).filter(mappingInScope);
       return json(mappings);
     }
 
@@ -1140,6 +1150,12 @@ export async function handleNoteSchemas(
       }
       if (typeof match_value !== "string" || match_value.length === 0) {
         return json({ error: "match_value must be a non-empty string" }, 400);
+      }
+      // Tag-scope write gate: a tag mapping for an out-of-scope tag would let
+      // a tag-scoped token bind a schema to a tag it can't see. Mirrors the
+      // vault#241 write-gate shape (403 + tag_scope_violation envelope).
+      if (!mappingInScope({ match_kind: match_kind as SchemaMappingKind, match_value })) {
+        return tagScopeForbidden(tagScope.raw ?? []);
       }
       // Validate FK explicitly so a bad schema_name surfaces as 404 (not a
       // raw SQLITE_CONSTRAINT 500).
@@ -1165,6 +1181,9 @@ export async function handleNoteSchemas(
       if (!match_value) {
         return json({ error: "match_value query parameter is required" }, 400);
       }
+      if (!mappingInScope({ match_kind: match_kind as SchemaMappingKind, match_value })) {
+        return tagScopeForbidden(tagScope.raw ?? []);
+      }
       const deleted = await store.deleteSchemaMapping(
         schemaName,
         match_kind as SchemaMappingKind,
@@ -1185,7 +1204,7 @@ export async function handleNoteSchemas(
   if (req.method === "GET") {
     const schema = await store.getNoteSchema(name);
     if (!schema) return json({ error: "Schema not found", name }, 404);
-    const mappings = await store.listSchemaMappings({ schema_name: name });
+    const mappings = (await store.listSchemaMappings({ schema_name: name })).filter(mappingInScope);
     return json({ ...schema, mappings });
   }
 

@@ -157,8 +157,8 @@ export function loadSchemaConfig(db: Database): ResolvedSchemas {
 /**
  * Find the schemas that apply to a note based on its path and tags. Returns
  * schema *names* in the order they were resolved (path-prefix first, then
- * each matching tag in declaration order). Names that don't have a backing
- * `_schemas/<name>` definition are dropped.
+ * each matching tag in declaration order). Names that don't have a row in
+ * `note_schemas` are dropped.
  */
 export function resolveApplicableSchemas(
   resolved: ResolvedSchemas,
