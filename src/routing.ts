@@ -53,7 +53,9 @@ import {
   handleUnresolvedWikilinks,
   handleStorage,
   handleViewNote,
+  type TagScopeCtx,
 } from "./routes.ts";
+import { expandTokenTagScope } from "./tag-scope.ts";
 import { handleTokens } from "./tokens-routes.ts";
 import {
   handleProtectedResource,
@@ -472,7 +474,7 @@ export async function route(
         { status: 403 },
       );
     }
-    return handleTokens(req, store.db, vaultName, auth.scopes, tokensMatch[1] ?? "");
+    return handleTokens(req, store, vaultName, auth.scopes, auth.scoped_tags, tokensMatch[1] ?? "");
   }
 
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
@@ -502,9 +504,20 @@ export async function route(
 
   const apiPath = apiMatch[1] ?? "";
 
-  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName);
-  if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5));
-  if (apiPath === "/find-path") return handleFindPath(req, store);
+  // Tag-scoped tokens (patterns/tag-scoped-tokens.md): expand the token's
+  // root-tag allowlist into `{root} ∪ descendants(root)` once per request,
+  // so handlers can intersect against the note's tag set without re-walking
+  // the `_tags/<name>` hierarchy on every check. `tagScope.allowed` is null
+  // for unscoped tokens — the no-op fast path leaves the pre-tag-scope
+  // behavior identical.
+  const tagScope: TagScopeCtx = {
+    allowed: await expandTokenTagScope(store, auth.scoped_tags),
+    raw: auth.scoped_tags,
+  };
+
+  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope);
+  if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
+  if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
     return handleVault(req, store, vaultConfig, () => {
       writeVaultConfig(vaultConfig);

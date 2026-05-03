@@ -43,6 +43,13 @@ export interface AuthResult {
    * one-time deprecation warning when they encounter `legacyDerived: true`.
    */
   legacyDerived: boolean;
+  /**
+   * Tag-allowlist (root tag names) for tag-scoped tokens. NULL = unscoped
+   * (current full-vault behavior). Hub-issued JWTs and legacy YAML keys
+   * always have null — tag scoping is a per-token vault-DB attribute, not
+   * an OAuth-claim concern. See patterns/tag-scoped-tokens.md.
+   */
+  scoped_tags: string[] | null;
 }
 
 /**
@@ -55,6 +62,7 @@ function legacyAuthResult(permission: TokenPermission): AuthResult {
     permission,
     scopes: legacyPermissionToScopes(permission),
     legacyDerived: true,
+    scoped_tags: null,
   };
 }
 
@@ -171,6 +179,7 @@ export async function authenticateVaultRequest(
           permission: resolved.permission,
           scopes: resolved.scopes,
           legacyDerived: resolved.legacyDerived,
+          scoped_tags: resolved.scoped_tags,
         };
       }
     } catch {
@@ -235,7 +244,7 @@ async function authenticateHubJwt(
       hasScope(claims.scopes, SCOPE_WRITE) || hasScope(claims.scopes, SCOPE_ADMIN)
         ? "full"
         : "read";
-    return { permission, scopes: claims.scopes, legacyDerived: false };
+    return { permission, scopes: claims.scopes, legacyDerived: false, scoped_tags: null };
   } catch (err) {
     if (err instanceof HubJwtError) {
       return { error: Response.json({ error: "Unauthorized", message: err.message }, { status: 401 }) };
@@ -306,6 +315,7 @@ export async function authenticateGlobalRequest(
           permission: resolved.permission,
           scopes: resolved.scopes,
           legacyDerived: resolved.legacyDerived,
+          scoped_tags: resolved.scoped_tags,
         };
       }
     } catch {

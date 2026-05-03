@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 -- one-release-cycle back-compat window and will be dropped in a future
 -- migration.
 --
+-- scoped_tags is a JSON-encoded array of root tag names that constrain the
+-- token's effective access (intersection with the scopes column). NULL
+-- means unscoped — full vault access per scopes. Introduced in v13 per
+-- patterns/tag-scoped-tokens.md. Hierarchy expansion is applied at auth
+-- time via getTagDescendants; the column stores root names only.
+--
 -- scope_tag / scope_path_prefix are deprecated Phase-0 columns — never
 -- enforced at runtime, kept only for schema stability.
 CREATE TABLE IF NOT EXISTS tokens (
@@ -80,6 +86,7 @@ CREATE TABLE IF NOT EXISTS tokens (
   label TEXT NOT NULL,
   permission TEXT NOT NULL DEFAULT 'admin',
   scopes TEXT,
+  scoped_tags TEXT,
   scope_tag TEXT,
   scope_path_prefix TEXT,
   expires_at TEXT,
@@ -193,6 +200,9 @@ export function initSchema(db: Database): void {
 
   // Migrate v11 → v12: add `scopes` column to tokens for Phase 2 enforcement.
   migrateToV12(db);
+
+  // Migrate v12 → v13: add `scoped_tags` column to tokens for tag-scoped tokens.
+  migrateToV13(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -334,6 +344,19 @@ function migrateToV11(db: Database): void {
 function migrateToV12(db: Database): void {
   if (hasTable(db, "tokens") && !hasColumn(db, "tokens", "scopes")) {
     db.exec("ALTER TABLE tokens ADD COLUMN scopes TEXT");
+  }
+}
+
+/**
+ * Migrate v12 → v13: add `scoped_tags` column to tokens. NULL means unscoped
+ * (current full-vault behavior); a JSON array of root tag names narrows the
+ * token's access to notes carrying one of those tags or a sub-tag thereof
+ * (hierarchy expansion via getTagDescendants at auth time). See
+ * parachute-patterns/patterns/tag-scoped-tokens.md.
+ */
+function migrateToV13(db: Database): void {
+  if (hasTable(db, "tokens") && !hasColumn(db, "tokens", "scoped_tags")) {
+    db.exec("ALTER TABLE tokens ADD COLUMN scoped_tags TEXT");
   }
 }
 

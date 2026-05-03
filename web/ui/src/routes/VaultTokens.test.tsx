@@ -23,6 +23,7 @@ const tokenFixture = (over: Partial<tokensApi.TokenSummary> = {}): tokensApi.Tok
   label: "ci",
   permission: "full",
   scopes: ["vault:work:write"],
+  scoped_tags: null,
   expires_at: null,
   created_at: "2026-05-01T00:00:00Z",
   last_used_at: null,
@@ -42,6 +43,9 @@ function renderRoute() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default the tag-picker fetch to "no tags" so existing tests don't need
+  // to mock it. Per-test cases override this when checking picker behavior.
+  vi.mocked(tokensApi.listVaultTags).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -90,6 +94,7 @@ describe("VaultTokens — admin scope", () => {
     expect(tokensApi.mintToken).toHaveBeenCalledWith("work", {
       label: "new-token",
       scopes: ["vault:work:admin"],
+      tags: null,
     });
   });
 

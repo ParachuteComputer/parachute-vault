@@ -18,6 +18,12 @@ export interface TokenSummary {
   label: string;
   permission: "read" | "full";
   scopes: string[];
+  /**
+   * Tag-allowlist (root tags). `null` = unscoped (sees the whole vault).
+   * Sub-tags inherit at request time via the `_tags/<name>` hierarchy —
+   * see patterns/tag-scoped-tokens.md.
+   */
+  scoped_tags: string[] | null;
   expires_at: string | null;
   created_at: string;
   last_used_at: string | null;
@@ -32,7 +38,30 @@ export interface MintTokenInput {
   label?: string;
   /** Optional narrowing. Omit to inherit caller's full scope set. */
   scopes?: string[];
+  /**
+   * Optional tag-allowlist. Each entry must be an existing root-tag name
+   * (no `/`). Omit (or pass null) for an unscoped token. The server
+   * enforces a subset rule against the minter's own allowlist.
+   */
+  tags?: string[] | null;
   expires_at?: string | null;
+}
+
+/**
+ * Tag listing for the mint form's tag-picker. Hits `GET /vault/<name>/api/tags`
+ * — the same endpoint that backs `query-notes`-adjacent tag UIs. The mint
+ * picker only needs root-tag names (the picker filters out anything with a
+ * `/` since the server only accepts root tags in the `tags` field).
+ */
+export async function listVaultTags(vaultName: string): Promise<{ name: string; count: number }[]> {
+  const res = await fetch(`/vault/${encodeURIComponent(vaultName)}/api/tags`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  const body = (await res.json()) as { name: string; count: number }[];
+  return Array.isArray(body) ? body : [];
 }
 
 function authHeaders(): Record<string, string> {
@@ -75,6 +104,9 @@ export async function mintToken(vaultName: string, input: MintTokenInput): Promi
   const body: Record<string, unknown> = {};
   if (input.label && input.label.length > 0) body["label"] = input.label;
   if (input.scopes && input.scopes.length > 0) body["scopes"] = input.scopes;
+  // `tags: []` would be rejected by the server (non-empty required) — we
+  // either send a populated array or omit the field entirely (= unscoped).
+  if (input.tags && input.tags.length > 0) body["tags"] = input.tags;
   if (input.expires_at !== undefined) body["expires_at"] = input.expires_at;
 
   const res = await fetch(`/vault/${encodeURIComponent(vaultName)}/tokens`, {
