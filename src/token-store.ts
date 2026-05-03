@@ -45,6 +45,14 @@ export interface Token {
   scope_tag: string | null;
   /** @deprecated Scope columns exist in DB but are not enforced at runtime. */
   scope_path_prefix: string | null;
+  /**
+   * Tag-allowlist (root tag names). When non-null, the token's effective
+   * access is the intersection of `scopes` and notes carrying one of these
+   * tags or a sub-tag thereof (hierarchy expansion via getTagDescendants).
+   * NULL = unscoped, full vault access per `scopes`. See
+   * patterns/tag-scoped-tokens.md.
+   */
+  scoped_tags: string[] | null;
   expires_at: string | null;
   created_at: string;
   last_used_at: string | null;
@@ -61,6 +69,29 @@ export interface ResolvedToken {
   scopes: string[];
   /** True iff `scopes` was derived from the legacy `permission` column. */
   legacyDerived: boolean;
+  /**
+   * Tag-allowlist for tag-scoped tokens (root tag names). NULL = unscoped.
+   * See `Token.scoped_tags`.
+   */
+  scoped_tags: string[] | null;
+}
+
+/**
+ * Parse the JSON-encoded `scoped_tags` column. Returns null for NULL/empty
+ * input. Defensive: malformed JSON or non-array shapes degrade to null
+ * (treat as unscoped) rather than throwing — a corrupt column value
+ * shouldn't take down auth; it just means the token loses its tag scope.
+ */
+export function parseScopedTags(raw: string | null): string[] | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const tags = parsed.filter((t): t is string => typeof t === "string" && t.length > 0);
+    return tags.length === 0 ? null : tags;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +120,13 @@ export function createToken(
     scope_tag?: string | null;
     /** @deprecated Written to DB but not enforced at runtime. */
     scope_path_prefix?: string | null;
+    /**
+     * Tag-allowlist (root tag names). null/undefined → unscoped (full vault
+     * access per `scopes`). When provided, must be already-validated root tag
+     * names per patterns/tag-scoped-tokens.md (no path separators); the mint
+     * endpoint validates against existing tags before passing through.
+     */
+    scoped_tags?: string[] | null;
     expires_at?: string | null;
   },
 ): Token {
@@ -97,15 +135,18 @@ export function createToken(
   const permission = opts.permission ?? "full";
   const scopes = opts.scopes ?? legacyPermissionToScopes(permission);
   const scopesStr = serializeScopes(scopes);
+  const scopedTags = opts.scoped_tags && opts.scoped_tags.length > 0 ? opts.scoped_tags : null;
+  const scopedTagsStr = scopedTags ? JSON.stringify(scopedTags) : null;
 
   db.prepare(`
-    INSERT INTO tokens (token_hash, label, permission, scopes, scope_tag, scope_path_prefix, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, scope_tag, scope_path_prefix, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     tokenHash,
     opts.label,
     permission,
     scopesStr,
+    scopedTagsStr,
     opts.scope_tag ?? null,
     opts.scope_path_prefix ?? null,
     opts.expires_at ?? null,
@@ -118,6 +159,7 @@ export function createToken(
     permission,
     scope_tag: opts.scope_tag ?? null,
     scope_path_prefix: opts.scope_path_prefix ?? null,
+    scoped_tags: scopedTags,
     expires_at: opts.expires_at ?? null,
     created_at: now,
     last_used_at: null,
@@ -135,12 +177,13 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const candidateHash = hashKey(providedToken);
 
   const row = db.prepare(`
-    SELECT token_hash, permission, scopes, expires_at
+    SELECT token_hash, permission, scopes, scoped_tags, expires_at
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
     permission: string;
     scopes: string | null;
+    scoped_tags: string | null;
     expires_at: string | null;
   } | null;
 
@@ -160,8 +203,9 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const hasVaultScope = parsed.some((s) => s.startsWith("vault:"));
   const scopes = hasVaultScope ? parsed : legacyPermissionToScopes(permission);
   const legacyDerived = !hasVaultScope;
+  const scoped_tags = parseScopedTags(row.scoped_tags);
 
-  return { permission, scopes, legacyDerived };
+  return { permission, scopes, legacyDerived, scoped_tags };
 }
 
 /**
@@ -171,13 +215,14 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
 export function listTokens(db: Database): (Token & { id: string })[] {
   const rows = db.prepare(`
     SELECT token_hash, label, permission, scope_tag, scope_path_prefix,
-           expires_at, created_at, last_used_at
+           scoped_tags, expires_at, created_at, last_used_at
     FROM tokens ORDER BY created_at DESC
-  `).all() as Token[];
+  `).all() as (Omit<Token, "scoped_tags"> & { scoped_tags: string | null })[];
 
   return rows.map((r) => ({
     ...r,
     permission: normalizePermission(r.permission),
+    scoped_tags: parseScopedTags(r.scoped_tags),
     // Derive a short display ID from the hash (first 12 chars after "sha256:")
     id: `t_${r.token_hash.slice(7, 19)}`,
   }));

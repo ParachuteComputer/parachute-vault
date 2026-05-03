@@ -261,6 +261,16 @@ export class BunSqliteStore implements Store {
     noteOps.untagNote(this.db, noteId, tags);
   }
 
+  async expandTagsWithDescendants(tags: string[]): Promise<Set<string>> {
+    const expanded = new Set<string>();
+    if (tags.length === 0) return expanded;
+    const hierarchy = this.getTagHierarchy();
+    for (const t of tags) {
+      for (const x of getTagDescendants(hierarchy, t)) expanded.add(x);
+    }
+    return expanded;
+  }
+
   async listTags(): Promise<{ name: string; count: number }[]> {
     return noteOps.listTags(this.db);
   }

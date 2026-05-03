@@ -3389,3 +3389,38 @@ describe("default schemas (_schemas/* + _schema_defaults)", async () => {
     expect(result.validation_status).toBeUndefined();
   });
 });
+
+describe("expandTagsWithDescendants (tag-scoped tokens — patterns/tag-scoped-tokens.md)", async () => {
+  it("returns the union of root + every descendant per the _tags/* hierarchy", async () => {
+    await store.createNote("", { path: "_tags/health/food", metadata: { parents: ["health"] } });
+    await store.createNote("", { path: "_tags/health/food/breakfast", metadata: { parents: ["health/food"] } });
+    await store.createNote("", { path: "_tags/work", metadata: {} });
+
+    const expanded = await store.expandTagsWithDescendants(["health"]);
+    expect(expanded.has("health")).toBe(true);
+    expect(expanded.has("health/food")).toBe(true);
+    expect(expanded.has("health/food/breakfast")).toBe(true);
+    expect(expanded.has("work")).toBe(false);
+  });
+
+  it("returns an empty set for an empty input (no allowlist = nothing to expand)", async () => {
+    const expanded = await store.expandTagsWithDescendants([]);
+    expect(expanded.size).toBe(0);
+  });
+
+  it("includes the root verbatim even when the tag has no declared descendants", async () => {
+    await store.createNote("solo", { tags: ["loner"] });
+    const expanded = await store.expandTagsWithDescendants(["loner"]);
+    expect([...expanded]).toEqual(["loner"]);
+  });
+
+  it("unions descendants from multiple roots", async () => {
+    await store.createNote("", { path: "_tags/health/food", metadata: { parents: ["health"] } });
+    await store.createNote("", { path: "_tags/work/standup", metadata: { parents: ["work"] } });
+    const expanded = await store.expandTagsWithDescendants(["health", "work"]);
+    expect(expanded.has("health")).toBe(true);
+    expect(expanded.has("health/food")).toBe(true);
+    expect(expanded.has("work")).toBe(true);
+    expect(expanded.has("work/standup")).toBe(true);
+  });
+});

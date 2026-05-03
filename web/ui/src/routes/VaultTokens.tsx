@@ -24,6 +24,7 @@ import {
   type MintTokenResult,
   type TokenSummary,
   listTokens,
+  listVaultTags,
   mintToken,
   revokeToken,
 } from "../lib/tokens-api.ts";
@@ -209,9 +210,44 @@ function MintForm({
   const [verb, setVerb] = useState<(typeof KNOWN_SCOPE_VERBS)[number]>("admin");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Tag-allowlist (root tags only). Empty = unscoped (full vault). The
+  // server enforces (a) each tag exists, (b) subset of caller's allowlist,
+  // (c) no path separators — see patterns/tag-scoped-tokens.md.
+  const [availableTags, setAvailableTags] = useState<string[]>([]);
+  const [tagsLoadError, setTagsLoadError] = useState<string | null>(null);
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    let cancelled = false;
+    listVaultTags(vaultName)
+      .then((rows) => {
+        if (cancelled) return;
+        // Picker only offers root tags — sub-tags inherit at enforcement
+        // time via the `_tags/<name>` hierarchy. The server rejects any
+        // value containing `/`, so filtering here keeps the UI honest.
+        const roots = rows.map((t) => t.name).filter((n) => !n.includes("/")).sort();
+        setAvailableTags(roots);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setTagsLoadError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultName]);
 
   const trimmedLabel = label.trim();
   const labelMissing = trimmedLabel.length === 0;
+
+  const toggleTag = (name: string) => {
+    setSelectedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -222,13 +258,16 @@ function MintForm({
     setSubmitting(true);
     setError(null);
     try {
+      const tagList = [...selectedTags];
       const result = await mintToken(vaultName, {
         label: trimmedLabel,
         scopes: [`vault:${vaultName}:${verb}`],
+        tags: tagList.length > 0 ? tagList : null,
       });
       onMinted(result);
       setLabel("");
       setVerb("admin");
+      setSelectedTags(new Set());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -272,6 +311,40 @@ function MintForm({
         <p className="dim" style={{ margin: "0.35rem 0 0" }}>
           Issued as <code>vault:{vaultName}:{verb}</code>. Lower scopes inherit narrower powers.
         </p>
+      </div>
+      <div className="form-row">
+        <label>
+          Tag scope <span className="dim">(optional)</span>
+        </label>
+        {tagsLoadError ? (
+          <p className="dim" style={{ margin: "0.35rem 0 0" }}>
+            Couldn't load tags: <code>{tagsLoadError}</code>. Token will be unscoped.
+          </p>
+        ) : availableTags.length === 0 ? (
+          <p className="dim" style={{ margin: "0.35rem 0 0" }}>
+            No root tags in this vault yet — token will see the full vault.
+          </p>
+        ) : (
+          <>
+            <div className="tag-picker">
+              {availableTags.map((t) => (
+                <label key={t} className="tag-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={selectedTags.has(t)}
+                    onChange={() => toggleTag(t)}
+                  />
+                  <code>{t}</code>
+                </label>
+              ))}
+            </div>
+            <p className="dim" style={{ margin: "0.35rem 0 0" }}>
+              {selectedTags.size === 0
+                ? "Nothing selected — token sees the full vault (unscoped)."
+                : `Token limited to: ${[...selectedTags].join(", ")}. Sub-tags (e.g. health/food) are reachable when their root is selected.`}
+            </p>
+          </>
+        )}
       </div>
       <div className="actions">
         <button type="submit" disabled={submitting || labelMissing}>
@@ -366,6 +439,16 @@ function TokenRow({
             <span className="dim">(legacy — {token.permission})</span>
           )}
         </div>
+        {token.scoped_tags && token.scoped_tags.length > 0 ? (
+          <div className="meta">
+            <span className="dim">tags:</span>{" "}
+            {token.scoped_tags.map((t) => (
+              <code key={t} className="scope-tag tag-pill">
+                #{t}
+              </code>
+            ))}
+          </div>
+        ) : null}
         <div className="meta dim">
           created {fmtDate(token.created_at)}
           {token.last_used_at ? ` · last used ${fmtDate(token.last_used_at)}` : " · never used"}

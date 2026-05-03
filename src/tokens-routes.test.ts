@@ -470,6 +470,132 @@ describe("DELETE /vault/<name>/tokens/<id> — revoke", () => {
   });
 });
 
+describe("POST /vault/<name>/tokens — tag-allowlist", () => {
+  // Helpers for the tag fixture: seed `_tags/health` so descendant expansion
+  // is exercised, plus a `health` and `work` note so listTags surfaces them
+  // as known root tags. The mint endpoint validates against listTags rather
+  // than against `_tags/*` config notes alone — keeps the picker UX honest.
+  async function seedTags(vaultName: string): Promise<void> {
+    const store = getVaultStore(vaultName);
+    await store.createNote("h", { tags: ["health"] });
+    await store.createNote("w", { tags: ["work"] });
+  }
+
+  function mintTagScopedAdmin(vaultName: string, allowlist: string[]): string {
+    const store = getVaultStore(vaultName);
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
+      label: "scoped-admin",
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      scoped_tags: allowlist,
+    });
+    return fullToken;
+  }
+
+  test("unscoped admin mints with `tags: ['health']` → 201; response carries scoped_tags", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintAdminToken("journal");
+    const res = await postTokens("journal", admin, { label: "h-bot", tags: ["health"] });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { scoped_tags: string[] | null };
+    expect(body.scoped_tags).toEqual(["health"]);
+  });
+
+  test("unscoped admin omitting `tags` mints an unscoped token (back-compat)", async () => {
+    createVault("journal");
+    const admin = mintAdminToken("journal");
+    const res = await postTokens("journal", admin, { label: "no-tags" });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { scoped_tags: string[] | null };
+    expect(body.scoped_tags).toBeNull();
+  });
+
+  test("unknown tag → 400 with `unknown_tags` field", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintAdminToken("journal");
+    const res = await postTokens("journal", admin, { label: "bad", tags: ["nope"] });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { unknown_tags?: string[] };
+    expect(body.unknown_tags).toEqual(["nope"]);
+  });
+
+  test("path-separator tag (`health/food`) → 400", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintAdminToken("journal");
+    const res = await postTokens("journal", admin, { label: "bad", tags: ["health/food"] });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { message: string };
+    expect(body.message).toContain("root-tag");
+  });
+
+  test("empty `tags` array → 400 (omit instead for unscoped)", async () => {
+    createVault("journal");
+    const admin = mintAdminToken("journal");
+    const res = await postTokens("journal", admin, { label: "bad", tags: [] });
+    expect(res.status).toBe(400);
+  });
+
+  test("non-array `tags` → 400", async () => {
+    createVault("journal");
+    const admin = mintAdminToken("journal");
+    const res = await postTokens("journal", admin, { label: "bad", tags: "health" as unknown as string[] });
+    expect(res.status).toBe(400);
+  });
+
+  test("tag-scoped admin mints within own allowlist → 201", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintTagScopedAdmin("journal", ["health"]);
+    const res = await postTokens("journal", admin, { label: "child", tags: ["health"] });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { scoped_tags: string[] | null };
+    expect(body.scoped_tags).toEqual(["health"]);
+  });
+
+  test("tag-scoped admin minting outside own allowlist → 403 with rejected_tags", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintTagScopedAdmin("journal", ["health"]);
+    const res = await postTokens("journal", admin, { label: "escalate", tags: ["work"] });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { rejected_tags?: string[]; error_type?: string };
+    expect(body.error_type).toBe("tag_scope_violation");
+    expect(body.rejected_tags).toEqual(["work"]);
+  });
+
+  test("tag-scoped admin omitting `tags` → 403 (cannot widen to unscoped)", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintTagScopedAdmin("journal", ["health"]);
+    const res = await postTokens("journal", admin, { label: "would-be-universe" });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; minter_scoped_tags?: string[] };
+    expect(body.error_type).toBe("tag_scope_violation");
+    expect(body.minter_scoped_tags).toEqual(["health"]);
+  });
+
+  test("GET /tokens surfaces scoped_tags for listed entries", async () => {
+    createVault("journal");
+    await seedTags("journal");
+    const admin = mintAdminToken("journal");
+    await postTokens("journal", admin, { label: "scoped", tags: ["health"] });
+    await postTokens("journal", admin, { label: "unscoped" });
+    const res = await getTokens("journal", admin);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      tokens: { label: string; scoped_tags: string[] | null }[];
+    };
+    const scoped = body.tokens.find((t) => t.label === "scoped");
+    const unscoped = body.tokens.find((t) => t.label === "unscoped");
+    expect(scoped?.scoped_tags).toEqual(["health"]);
+    expect(unscoped?.scoped_tags).toBeNull();
+  });
+});
+
 describe("/vault/<name>/tokens — method handling", () => {
   test("PUT on collection → 405", async () => {
     createVault("journal");

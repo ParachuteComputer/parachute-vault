@@ -1326,6 +1326,123 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(401);
   });
 
+  // ----- tag-scoped tokens (patterns/tag-scoped-tokens.md) -----------------
+
+  /**
+   * Mint a tag-scoped token. Mirrors `mintToken` above but threads
+   * `scoped_tags` through to the token row so `resolveToken` returns the
+   * allowlist on the AuthResult and routing.ts feeds it into the per-request
+   * TagScopeCtx that handlers consult.
+   */
+  function mintTagScopedToken(
+    vaultName: string,
+    scopes: string[],
+    scopedTags: string[],
+  ): string {
+    const store = getVaultStore(vaultName);
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
+      label: `test-tag-scoped`,
+      permission: scopes.includes("vault:write") || scopes.includes("vault:admin") ? "full" : "read",
+      scopes,
+      scoped_tags: scopedTags,
+    });
+    return fullToken;
+  }
+
+  test("tag-scoped read token: GET /api/notes/:id 404s on out-of-scope note (no existence leak)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const inScope = await store.createNote("h", { tags: ["health"] });
+    const outOfScope = await store.createNote("w", { tags: ["work"] });
+    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+
+    const ok = `/vault/journal/api/notes/${inScope.id}`;
+    expect((await route(authed(token, "GET", ok), ok)).status).toBe(200);
+
+    const notFound = `/vault/journal/api/notes/${outOfScope.id}`;
+    expect((await route(authed(token, "GET", notFound), notFound)).status).toBe(404);
+  });
+
+  test("tag-scoped read token: GET /api/notes filters list to in-scope notes only", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("h", { tags: ["health"] });
+    await store.createNote("w", { tags: ["work"] });
+    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+
+    const path = "/vault/journal/api/notes";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { tags: string[] }[] } | { tags: string[] }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    expect(list.every((n) => n.tags.includes("health"))).toBe(true);
+    expect(list.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("tag-scoped read token: GET /api/tags filters to allowlisted tags", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("h", { tags: ["health"] });
+    await store.createNote("w", { tags: ["work"] });
+    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+
+    const path = "/vault/journal/api/tags";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { name: string }[];
+    const names = body.map((t) => t.name);
+    expect(names).toContain("health");
+    expect(names).not.toContain("work");
+  });
+
+  test("tag-scoped write token: POST /api/notes with in-scope tag → 201", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("seed", { tags: ["health"] });
+    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "ok", tags: ["health"] }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(201);
+  });
+
+  test("tag-scoped write token: POST /api/notes outside allowlist → 403 tag_scope_violation", async () => {
+    createVault("journal");
+    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "denied", tags: ["work"] }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string };
+    expect(body.error_type).toBe("tag_scope_violation");
+  });
+
+  test("tag-scoped write token: DELETE on out-of-scope note → 404 (no leak)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const outOfScope = await store.createNote("w", { tags: ["work"] });
+    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+
+    const path = `/vault/journal/api/notes/${outOfScope.id}`;
+    const res = await route(authed(token, "DELETE", path), path);
+    expect(res.status).toBe(404);
+  });
+
   test("CLI --read equivalent token (permission='read', scopes=[vault:read]) is read-only at the HTTP boundary", async () => {
     // This pins the end-to-end contract: a token minted the way
     // `parachute-vault tokens create --read` mints them actually refuses

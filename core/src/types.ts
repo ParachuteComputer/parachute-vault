@@ -141,6 +141,13 @@ export interface Store {
   // Tags
   tagNote(noteId: string, tags: string[]): Promise<void>;
   untagNote(noteId: string, tags: string[]): Promise<void>;
+  /**
+   * Expand a set of tag names to the union of `{tag} ∪ descendants(tag)` for
+   * each input, using the `_tags/<name>` config-note hierarchy. Always
+   * includes each input tag in the result. Used by tag-scoped tokens to
+   * compute the effective allowlisted tag-set at auth time.
+   */
+  expandTagsWithDescendants(tags: string[]): Promise<Set<string>>;
   listTags(): Promise<{ name: string; count: number }[]>;
   deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
   renameTag(
