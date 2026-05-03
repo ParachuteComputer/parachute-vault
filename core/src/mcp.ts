@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
-import { filterMetadata } from "./notes.js";
+import { filterMetadata, MAX_BATCH_SIZE } from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -1275,7 +1275,7 @@ function normalizeTags(tag: unknown): string[] | undefined {
 
 // Re-exported for backward compat; defined in notes.ts alongside the
 // conditional-UPDATE implementation that raises it.
-export { ConflictError, PathConflictError, EmptyNoteError } from "./notes.js";
+export { ConflictError, PathConflictError, EmptyNoteError, MAX_BATCH_SIZE } from "./notes.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a
@@ -1299,14 +1299,12 @@ export class PreconditionRequiredError extends Error {
   }
 }
 
-/** Per-call item cap on `create-note` and `update-note` batches (#213). */
-export const MAX_BATCH_SIZE = 500;
-
 /**
  * Thrown by `create-note` / `update-note` when a batch exceeds
- * `MAX_BATCH_SIZE`. The cap exists to bound the blast radius of a runaway
- * client — see #213, where one MCP burst created 7,453 empty notes in
- * minutes. Surfaces as 413 at the HTTP layer.
+ * `MAX_BATCH_SIZE` (re-exported from `./notes.js` — single source of truth).
+ * Bounds the blast radius of a runaway client — see #213, where one MCP
+ * burst created 7,453 empty notes in minutes. Surfaces as 413 at the HTTP
+ * layer.
  */
 export class BatchTooLargeError extends Error {
   code = "BATCH_TOO_LARGE" as const;

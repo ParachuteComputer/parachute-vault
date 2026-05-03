@@ -14,7 +14,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex, filterMetadata } from "../core/src/notes.ts";
+import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import {
@@ -123,9 +123,6 @@ class NotFoundError extends Error {
     this.name = "NotFoundError";
   }
 }
-
-/** Per-request item cap on POST /notes batches (#213). */
-const MAX_BATCH_SIZE = 500;
 
 // ---------------------------------------------------------------------------
 // Notes — GET/POST/PATCH/DELETE /api/notes[/:idOrPath]

@@ -148,6 +148,15 @@ export class PathConflictError extends Error {
 }
 
 /**
+ * Per-call item cap on `createNote`/`updateNote` batch entry points
+ * (MCP `create-note` / `update-note` and HTTP `POST /api/notes`).
+ * Single source of truth — both transports import from here so the cap
+ * can never silently drift between them. See #213 for the runaway-client
+ * incident that motivated the cap (7,453 empty notes in one MCP burst).
+ */
+export const MAX_BATCH_SIZE = 500;
+
+/**
  * Thrown by `createNote` / `updateNote` when the proposed note state has
  * neither content nor path. The vault accepts un-pathed jots (content only)
  * and path-only placeholders (wikilink stubs, `_schemas/*`), but a note
