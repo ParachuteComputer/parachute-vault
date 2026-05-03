@@ -738,39 +738,50 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "list-tags",
-      description: `List tags with usage counts. Pass \`tag\` to get a single tag's details including its schema (description + fields). Pass \`include_schema: true\` to include schemas for all tags.`,
+      description: `List tags with usage counts. Pass \`tag\` to get a single tag's full record (description, fields, relationships, parent_names, timestamps). Pass \`include_schema: true\` to include the full record for every tag.`,
       inputSchema: {
         type: "object",
         properties: {
           tag: { type: "string", description: "Get details for a single tag" },
-          include_schema: { type: "boolean", description: "Include schema (description + fields) for each tag (default: false)" },
+          include_schema: { type: "boolean", description: "Include full tag record (description, fields, relationships, parent_names, timestamps) for each tag (default: false)" },
         },
       },
       execute: (params) => {
         const singleTag = params.tag as string | undefined;
 
         if (singleTag) {
-          // Single tag detail
           const allTags = noteOps.listTags(db);
           const found = allTags.find((t) => t.name === singleTag);
-          const schema = tagSchemaOps.getTagSchema(db, singleTag);
+          const record = tagSchemaOps.getTagRecord(db, singleTag);
           return {
             name: singleTag,
             count: found?.count ?? 0,
-            description: schema?.description ?? null,
-            fields: schema?.fields ?? null,
+            description: record?.description ?? null,
+            fields: record?.fields ?? null,
+            relationships: record?.relationships ?? null,
+            parent_names: record?.parent_names ?? null,
+            created_at: record?.created_at ?? null,
+            updated_at: record?.updated_at ?? null,
           };
         }
 
-        // All tags
         const tags = noteOps.listTags(db);
         if (params.include_schema) {
-          const schemas = tagSchemaOps.getTagSchemaMap(db);
-          return tags.map((t) => ({
-            ...t,
-            description: schemas[t.name]?.description ?? null,
-            fields: schemas[t.name]?.fields ?? null,
-          }));
+          const records = new Map(
+            tagSchemaOps.listTagRecords(db).map((r) => [r.tag, r] as const),
+          );
+          return tags.map((t) => {
+            const r = records.get(t.name);
+            return {
+              ...t,
+              description: r?.description ?? null,
+              fields: r?.fields ?? null,
+              relationships: r?.relationships ?? null,
+              parent_names: r?.parent_names ?? null,
+              created_at: r?.created_at ?? null,
+              updated_at: r?.updated_at ?? null,
+            };
+          });
         }
         return tags;
       },
@@ -781,7 +792,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "update-tag",
-      description: "Create or update a tag's description and schema fields. If the tag doesn't exist, it's created. Fields are merged — new keys are added, existing keys are replaced.",
+      description: "Create or update a tag's identity row: description, indexed-field schemas, typed-link relationships, and hierarchy parents. If the tag doesn't exist, it's created. Fields are merged (new keys added, existing keys replaced); relationships and parent_names are replaced wholesale when provided. Pass null for fields/relationships/parent_names to clear that column. See parachute-patterns/patterns/tag-data-model.md.",
       inputSchema: {
         type: "object",
         properties: {
@@ -801,12 +812,32 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               required: ["type"],
             },
           },
+          relationships: {
+            type: "object",
+            description: 'Typed-link declarations. Each value declares { target_tag, cardinality, description? }. Cardinality is one of: one | optional | many | many-required. Phase 1: informational, not enforced at write time. E.g., { "lives_in": { "target_tag": "place", "cardinality": "one" } }',
+            additionalProperties: {
+              type: "object",
+              properties: {
+                target_tag: { type: "string", description: "Tag the relationship points at" },
+                cardinality: { type: "string", enum: ["one", "optional", "many", "many-required"], description: "How many targets this relationship may have" },
+                description: { type: "string", description: "Why this relationship exists; surfaced to AI clients" },
+              },
+              required: ["target_tag", "cardinality"],
+            },
+          },
+          parent_names: {
+            type: "array",
+            items: { type: "string" },
+            description: "Tag names this tag is a child of, for the query-time hierarchy. Replaces any prior parent list. Pass [] (empty array) or null to clear. E.g., parent_names: [\"manual\", \"note\"] makes this tag a descendant of both.",
+          },
         },
         required: ["tag"],
       },
-      execute: (params) => {
+      execute: async (params) => {
         const tag = params.tag as string;
-        const existing = tagSchemaOps.getTagSchema(db, tag);
+        const existing = tagSchemaOps.getTagRecord(db, tag);
+
+        // ---- fields: shallow-merge into existing (preserves prior keys).
         const incomingFields = (params.fields as Record<string, TagFieldSchema> | undefined) ?? {};
         const mergedFields: Record<string, TagFieldSchema> = {
           ...(existing?.fields ?? {}),
@@ -815,7 +846,6 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
         // Validate cross-tag consistency on fields being (re)declared in this
         // call. `type` and `indexed` are global — all declarers must agree.
-        // `description` and `enum` are per-tag, so we don't compare them.
         const otherSchemas = tagSchemaOps
           .listTagSchemas(db)
           .filter((s) => s.tag !== tag);
@@ -846,15 +876,47 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           }
         }
 
-        // Persist the schema first, then reconcile indexing lifecycle. An
-        // error here would leave the on-disk schema untouched, matching
-        // prior behavior.
-        const result = tagSchemaOps.upsertTagSchema(db, tag, {
-          description: (params.description as string | undefined) ?? existing?.description,
-          fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
+        // ---- relationships: replace wholesale when provided. Validate
+        // shape + cardinality vocabulary before persisting so a malformed
+        // payload can't leave the row in an inconsistent state.
+        let relationshipsPatch: Record<string, tagSchemaOps.TagRelationship> | null | undefined;
+        if (params.relationships === null) {
+          relationshipsPatch = null;
+        } else if (params.relationships !== undefined) {
+          relationshipsPatch = tagSchemaOps.validateRelationships(params.relationships);
+        }
+
+        // ---- parent_names: replace wholesale when provided. Empty array
+        // collapses to null (clear) — a tag with `parent_names = []` and
+        // a tag with `parent_names = null` are indistinguishable at the
+        // hierarchy layer.
+        let parentNamesPatch: string[] | null | undefined;
+        if (params.parent_names === null) {
+          parentNamesPatch = null;
+        } else if (params.parent_names !== undefined) {
+          if (!Array.isArray(params.parent_names)) {
+            throw new Error("parent_names must be an array of tag names");
+          }
+          const cleaned = (params.parent_names as unknown[])
+            .filter((p): p is string => typeof p === "string" && p.length > 0);
+          parentNamesPatch = cleaned.length > 0 ? cleaned : null;
+        }
+
+        // ---- Persist via the store wrapper so the hierarchy cache is
+        // invalidated when parent_names is touched.
+        const fieldsPatch = Object.keys(mergedFields).length > 0
+          ? mergedFields
+          : (params.fields !== undefined ? null : undefined);
+        const descriptionPatch =
+          params.description === undefined ? undefined : (params.description as string);
+        const result = await store.upsertTagRecord(tag, {
+          ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
+          ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
+          ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
+          ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
         });
 
-        // Diff indexed state for this tag: what it indexed before vs. now.
+        // ---- Reconcile indexed-field lifecycle for this tag.
         const priorIndexed = new Set(
           Object.entries(existing?.fields ?? {})
             .filter(([, v]) => v.indexed === true)
@@ -895,9 +957,9 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       },
       execute: async (params) => {
         const tag = params.tag as string;
-        // Release any indexed fields this tag declared before the schema
-        // row disappears. releaseField drops the generated column + index
-        // when the declarer set empties.
+        // Release any indexed fields this tag declared before the row
+        // drops. releaseField drops the generated column + index when the
+        // declarer set empties.
         const schema = tagSchemaOps.getTagSchema(db, tag);
         if (schema?.fields) {
           for (const [fieldName, spec] of Object.entries(schema.fields)) {
@@ -906,8 +968,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             }
           }
         }
-        // Delete schema first (FK cascade would handle it, but be explicit)
-        tagSchemaOps.deleteTagSchema(db, tag);
+        // Drop the row outright — description/fields/relationships/parents
+        // travel with it. (No more sidecar table to clear separately.)
         return await store.deleteTag(tag);
       },
     },

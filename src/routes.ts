@@ -814,19 +814,23 @@ export async function handleTags(
 
     if (singleTag) {
       // Tag-scope: a tag-scoped token can only see tags reachable from its
-      // allowlist (root + descendants per the `_tags/*` hierarchy). Anything
-      // else 404s — same "no leak" stance as note reads.
+      // allowlist (root + descendants per the parent_names hierarchy).
+      // Anything else 404s — same "no leak" stance as note reads.
       if (tagScope.allowed && !tagScope.allowed.has(singleTag)) {
         return json({ error: "Tag not found", tag: singleTag }, 404);
       }
       const allTags = await store.listTags();
       const found = allTags.find((t) => t.name === singleTag);
-      const schema = await store.getTagSchema(singleTag);
+      const record = await store.getTagRecord(singleTag);
       return json({
         name: singleTag,
         count: found?.count ?? 0,
-        description: schema?.description ?? null,
-        fields: schema?.fields ?? null,
+        description: record?.description ?? null,
+        fields: record?.fields ?? null,
+        relationships: record?.relationships ?? null,
+        parent_names: record?.parent_names ?? null,
+        created_at: record?.created_at ?? null,
+        updated_at: record?.updated_at ?? null,
       });
     }
 
@@ -835,12 +839,21 @@ export async function handleTags(
       ? tags.filter((t) => tagScope.allowed!.has(t.name))
       : tags;
     if (parseBool(parseQuery(url, "include_schema"), false)) {
-      const schemas = await store.getTagSchemaMap();
-      return json(filtered.map((t) => ({
-        ...t,
-        description: schemas[t.name]?.description ?? null,
-        fields: schemas[t.name]?.fields ?? null,
-      })));
+      const records = new Map(
+        (await store.listTagRecords()).map((r) => [r.tag, r] as const),
+      );
+      return json(filtered.map((t) => {
+        const r = records.get(t.name);
+        return {
+          ...t,
+          description: r?.description ?? null,
+          fields: r?.fields ?? null,
+          relationships: r?.relationships ?? null,
+          parent_names: r?.parent_names ?? null,
+          created_at: r?.created_at ?? null,
+          updated_at: r?.updated_at ?? null,
+        };
+      }));
     }
     return json(filtered);
   }
@@ -950,38 +963,96 @@ export async function handleTags(
   if (!nameMatch) return json({ error: "Not found" }, 404);
   const tagName = decodeURIComponent(nameMatch[1]!);
 
-  // GET /tags/:name — single tag detail
+  // GET /tags/:name — single tag detail (full record)
   if (req.method === "GET") {
     if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
       return json({ error: "Tag not found", tag: tagName }, 404);
     }
     const allTags = await store.listTags();
     const found = allTags.find((t) => t.name === tagName);
-    const schema = await store.getTagSchema(tagName);
+    const record = await store.getTagRecord(tagName);
     return json({
       name: tagName,
       count: found?.count ?? 0,
-      description: schema?.description ?? null,
-      fields: schema?.fields ?? null,
+      description: record?.description ?? null,
+      fields: record?.fields ?? null,
+      relationships: record?.relationships ?? null,
+      parent_names: record?.parent_names ?? null,
+      created_at: record?.created_at ?? null,
+      updated_at: record?.updated_at ?? null,
     });
   }
 
-  // PUT /tags/:name — upsert tag schema (description + fields)
+  // PUT /tags/:name — upsert tag identity row. Body accepts any combination
+  // of { description, fields, relationships, parent_names }; omitted keys
+  // are preserved, explicit null clears. See patterns/tag-data-model.md.
   if (req.method === "PUT") {
     if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
-    const body = await req.json() as { description?: string; fields?: Record<string, unknown> };
-    const existing = await store.getTagSchema(tagName);
-    const mergedFields = { ...existing?.fields, ...(body.fields as any) };
-    const schema = await store.upsertTagSchema(tagName, {
-      description: body.description ?? existing?.description,
-      fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
+    const body = (await req.json()) as {
+      description?: string | null;
+      fields?: Record<string, unknown> | null;
+      relationships?: Record<string, unknown> | null;
+      parent_names?: unknown;
+    };
+
+    // Validate relationships shape + cardinality vocabulary up front so
+    // a bad payload returns 400, not a thrown 500.
+    let relationshipsPatch:
+      | Record<string, tagSchemaOps.TagRelationship>
+      | null
+      | undefined;
+    if (body.relationships === null) {
+      relationshipsPatch = null;
+    } else if (body.relationships !== undefined) {
+      try {
+        relationshipsPatch = tagSchemaOps.validateRelationships(body.relationships);
+      } catch (err) {
+        return json({ error: (err as Error).message }, 400);
+      }
+    }
+
+    let parentNamesPatch: string[] | null | undefined;
+    if (body.parent_names === null) {
+      parentNamesPatch = null;
+    } else if (body.parent_names !== undefined) {
+      if (!Array.isArray(body.parent_names)) {
+        return json({ error: "parent_names must be an array of tag names" }, 400);
+      }
+      const cleaned = (body.parent_names as unknown[]).filter(
+        (p): p is string => typeof p === "string" && p.length > 0,
+      );
+      parentNamesPatch = cleaned.length > 0 ? cleaned : null;
+    }
+
+    // Field merge mirrors MCP update-tag — preserves prior keys when the
+    // payload only declares new ones.
+    let fieldsPatch:
+      | Record<string, tagSchemaOps.TagFieldSchema>
+      | null
+      | undefined;
+    if (body.fields === null) {
+      fieldsPatch = null;
+    } else if (body.fields !== undefined) {
+      const existing = await store.getTagSchema(tagName);
+      const merged: Record<string, tagSchemaOps.TagFieldSchema> = {
+        ...(existing?.fields ?? {}),
+        ...(body.fields as Record<string, tagSchemaOps.TagFieldSchema>),
+      };
+      fieldsPatch = Object.keys(merged).length > 0 ? merged : null;
+    }
+
+    const result = await store.upsertTagRecord(tagName, {
+      ...(body.description !== undefined ? { description: body.description } : {}),
+      ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
+      ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
+      ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
     });
-    return json(schema);
+    return json(result);
   }
 
-  // DELETE /tags/:name — delete tag + schema from all notes
+  // DELETE /tags/:name — delete tag + identity row + remove from all notes
   if (req.method === "DELETE") {
     if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
       return tagScopeForbidden(tagScope.raw ?? []);
@@ -1003,7 +1074,6 @@ export async function handleTags(
         409,
       );
     }
-    await store.deleteTagSchema(tagName);
     return json(await store.deleteTag(tagName));
   }
 

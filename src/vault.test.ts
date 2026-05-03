@@ -776,7 +776,7 @@ describe("scoped MCP wrapper", async () => {
     const vaultName = `tagscope-tags-${Date.now()}`;
     writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
     const store = getVaultStore(vaultName);
-    await store.createNote("", { path: "_tags/health/food", metadata: { parents: ["health"] } });
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
     await store.createNote("h", { tags: ["health"] });
     await store.createNote("hf", { tags: ["health/food"] });
     await store.createNote("w", { tags: ["work"] });

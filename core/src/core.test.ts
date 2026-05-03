@@ -2447,12 +2447,13 @@ describe("MCP tools", async () => {
   });
 
   it("query-notes routes through store.queryNotes so tag-hierarchy expansion fires", async () => {
-    // `_tags/voice` and `_tags/text` declare "manual" as their parent. A
-    // query for `tag: "manual"` should match notes tagged with either child
-    // — that expansion only happens when the call goes through
-    // `store.queryNotes`, not `noteOps.queryNotes` directly.
-    await store.createNote("", { path: "_tags/voice", metadata: { parents: ["manual"] } });
-    await store.createNote("", { path: "_tags/text", metadata: { parents: ["manual"] } });
+    // `voice` and `text` declare "manual" as their parent via the v14
+    // tags.parent_names column. A query for `tag: "manual"` should match
+    // notes tagged with either child — that expansion only happens when
+    // the call goes through `store.queryNotes`, not `noteOps.queryNotes`
+    // directly.
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.upsertTagRecord("text", { parent_names: ["manual"] });
     await store.createNote("voice memo", { tags: ["voice"] });
     await store.createNote("text memo", { tags: ["text"] });
     await store.createNote("unrelated", { tags: ["other"] });
@@ -2470,8 +2471,8 @@ describe("MCP tools", async () => {
     // `noteOps.searchNotes` directly and silently dropped descendant matches —
     // `tag: "manual"` would only return notes literally tagged #manual, not
     // notes tagged with the declared children #voice / #text.
-    await store.createNote("", { path: "_tags/voice", metadata: { parents: ["manual"] } });
-    await store.createNote("", { path: "_tags/text", metadata: { parents: ["manual"] } });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.upsertTagRecord("text", { parent_names: ["manual"] });
     await store.createNote("voice handoff notes", { tags: ["voice"] });
     await store.createNote("text handoff notes", { tags: ["text"] });
     await store.createNote("unrelated handoff", { tags: ["other"] });
@@ -2886,15 +2887,12 @@ describe("query-notes link expansion", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tag hierarchy via `_tags/<name>` config notes — issue #176
+// Tag hierarchy via tags.parent_names (post-v14, patterns/tag-data-model.md)
 // ---------------------------------------------------------------------------
 
-describe("tag hierarchy (_tags/* config notes)", async () => {
+describe("tag hierarchy (tags.parent_names)", async () => {
   it("query for parent tag returns notes tagged with declared child", async () => {
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     await store.createNote("voice note", { tags: ["voice"] });
     await store.createNote("text note", { tags: ["text"] });
 
@@ -2904,14 +2902,8 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
   });
 
   it("expands transitively across multiple levels", async () => {
-    await store.createNote("", {
-      path: "_tags/manual",
-      metadata: { parents: ["note"] },
-    });
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("manual", { parent_names: ["note"] });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     await store.createNote("voice note", { tags: ["voice"] });
     await store.createNote("manual-only note", { tags: ["manual"] });
     await store.createNote("note-only note", { tags: ["note"] });
@@ -2929,10 +2921,7 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
   });
 
   it("query for child does not match parent-tagged notes", async () => {
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     await store.createNote("voice note", { tags: ["voice"] });
     await store.createNote("manual-only note", { tags: ["manual"] });
 
@@ -2942,10 +2931,7 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
   });
 
   it("supports multiple parents (diamond inheritance)", async () => {
-    await store.createNote("", {
-      path: "_tags/voice-meeting",
-      metadata: { parents: ["voice", "meeting"] },
-    });
+    await store.upsertTagRecord("voice-meeting", { parent_names: ["voice", "meeting"] });
     await store.createNote("vm", { tags: ["voice-meeting"] });
     await store.createNote("v", { tags: ["voice"] });
     await store.createNote("m", { tags: ["meeting"] });
@@ -2954,55 +2940,51 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
     expect((await store.queryNotes({ tags: ["meeting"] })).length).toBe(2); // m + vm
   });
 
-  it("hierarchy is invalidated when a _tags/* note is created", async () => {
+  it("hierarchy is invalidated when parent_names is set", async () => {
     await store.createNote("voice note", { tags: ["voice"] });
-    // Before the config note exists, #manual matches nothing.
+    // Before the parents are declared, #manual matches nothing.
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
 
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
 
-    // After creation, the cache invalidates and the next query expands.
+    // After upsert, the cache invalidates and the next query expands.
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
   });
 
-  it("hierarchy is invalidated when a _tags/* note's metadata is updated", async () => {
+  it("hierarchy is invalidated when parent_names is repointed", async () => {
     await store.createNote("voice note", { tags: ["voice"] });
-    const config = await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
 
     // Repoint the parent.
-    await store.updateNote(config.id, {
-      metadata: { parents: ["audio"] },
-      force: true,
-    } as any);
+    await store.upsertTagRecord("voice", { parent_names: ["audio"] });
 
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
     expect((await store.queryNotes({ tags: ["audio"] })).length).toBe(1);
   });
 
-  it("hierarchy is invalidated when a _tags/* note is deleted", async () => {
+  it("hierarchy is invalidated when parent_names is cleared", async () => {
     await store.createNote("voice note", { tags: ["voice"] });
-    const config = await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
 
-    await store.deleteNote(config.id);
+    await store.upsertTagRecord("voice", { parent_names: null });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+  });
+
+  it("hierarchy is invalidated when a parent tag is deleted", async () => {
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await store.createNote("voice note", { tags: ["voice"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    // Drop the child tag — the row holding the parent_names declaration
+    // disappears, so the hierarchy edge goes with it.
+    await store.deleteTag("voice");
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
   });
 
   it("tagMatch=any flattens all expansions across input tags", async () => {
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     await store.createNote("v", { tags: ["voice"] });
     await store.createNote("p", { tags: ["project"] });
     await store.createNote("o", { tags: ["other"] });
@@ -3015,10 +2997,7 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
   });
 
   it("tagMatch=all (default) requires each input tag's expanded set to be present", async () => {
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: ["manual"] },
-    });
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
     // Note has both #voice (which satisfies #manual via expansion) AND #project.
     await store.createNote("vp", { tags: ["voice", "project"] });
     await store.createNote("p-only", { tags: ["project"] });
@@ -3031,14 +3010,8 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
   });
 
   it("tolerates a cycle without infinite-looping", async () => {
-    await store.createNote("", {
-      path: "_tags/a",
-      metadata: { parents: ["b"] },
-    });
-    await store.createNote("", {
-      path: "_tags/b",
-      metadata: { parents: ["a"] },
-    });
+    await store.upsertTagRecord("a", { parent_names: ["b"] });
+    await store.upsertTagRecord("b", { parent_names: ["a"] });
     await store.createNote("note-a", { tags: ["a"] });
 
     // Both a and b should resolve without hanging; both reach the same set {a, b}.
@@ -3046,20 +3019,22 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
     expect((await store.queryNotes({ tags: ["b"] })).length).toBe(1);
   });
 
-  it("malformed parents metadata is ignored silently", async () => {
-    // `parents` not an array — drops, treated as no parents declared.
-    await store.createNote("", {
-      path: "_tags/voice",
-      metadata: { parents: "manual" }, // wrong type
-    });
+  it("malformed parent_names JSON is ignored silently", async () => {
+    // Stuff a malformed value into the column directly to simulate an
+    // out-of-band write. The resolver should drop it without throwing.
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    (store as any).db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?")
+      .run("not valid json {{{", "voice");
+    // Force cache reload.
+    (store as any)._tagHierarchy = null;
     await store.createNote("v", { tags: ["voice"] });
 
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
     expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
   });
 
-  it("a config note with no parents declared is a no-op", async () => {
-    await store.createNote("", { path: "_tags/voice" });
+  it("a tag with no parent_names is a hierarchy no-op", async () => {
+    await store.upsertTagRecord("voice", { description: "voice notes" });
     await store.createNote("v", { tags: ["voice"] });
     await store.createNote("m", { tags: ["manual"] });
 
@@ -3067,32 +3042,16 @@ describe("tag hierarchy (_tags/* config notes)", async () => {
     expect((await store.queryNotes({ tags: ["voice"] })).length).toBe(1);
   });
 
-  it("non-_tags paths starting with arbitrary letter + 'tags/' are NOT picked up as config notes", async () => {
-    // Regression: SQLite LIKE treats `_` as a wildcard, so `path LIKE '_tags/%'`
-    // would silently match `Atags/foo`. We use GLOB to require a literal `_`.
-    await store.createNote("decoy", {
-      path: "Atags/voice",
+  it("legacy `_tags/<name>` notes left in place do not affect the hierarchy", async () => {
+    // Post-v14, the resolver reads tags.parent_names — not notes. A leftover
+    // `_tags/*` note from a pre-v14 vault is harmless historical record.
+    await store.createNote("legacy", {
+      path: "_tags/voice",
       metadata: { parents: ["manual"] },
     });
     await store.createNote("voice note", { tags: ["voice"] });
 
-    // The decoy must NOT register voice as a child of manual.
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
-  });
-
-  it("bulk createNotes invalidates the hierarchy cache", async () => {
-    // Prime the cache so the empty hierarchy is loaded.
-    await store.queryNotes({ tags: ["manual"] });
-
-    await store.createNotes([
-      { content: "", path: "_tags/voice", metadata: { parents: ["manual"] } },
-      { content: "voice note", tags: ["voice"] },
-    ]);
-
-    // Without invalidation, the cached empty hierarchy would persist and
-    // the next query for #manual would return zero. With invalidation, the
-    // next read rebuilds and the descendant expansion picks up #voice.
-    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
   });
 });
 
@@ -3391,10 +3350,10 @@ describe("default schemas (_schemas/* + _schema_defaults)", async () => {
 });
 
 describe("expandTagsWithDescendants (tag-scoped tokens — patterns/tag-scoped-tokens.md)", async () => {
-  it("returns the union of root + every descendant per the _tags/* hierarchy", async () => {
-    await store.createNote("", { path: "_tags/health/food", metadata: { parents: ["health"] } });
-    await store.createNote("", { path: "_tags/health/food/breakfast", metadata: { parents: ["health/food"] } });
-    await store.createNote("", { path: "_tags/work", metadata: {} });
+  it("returns the union of root + every descendant per tags.parent_names", async () => {
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
+    await store.upsertTagRecord("health/food/breakfast", { parent_names: ["health/food"] });
+    await store.upsertTagRecord("work", { description: "work things" });
 
     const expanded = await store.expandTagsWithDescendants(["health"]);
     expect(expanded.has("health")).toBe(true);
@@ -3415,12 +3374,314 @@ describe("expandTagsWithDescendants (tag-scoped tokens — patterns/tag-scoped-t
   });
 
   it("unions descendants from multiple roots", async () => {
-    await store.createNote("", { path: "_tags/health/food", metadata: { parents: ["health"] } });
-    await store.createNote("", { path: "_tags/work/standup", metadata: { parents: ["work"] } });
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
+    await store.upsertTagRecord("work/standup", { parent_names: ["work"] });
     const expanded = await store.expandTagsWithDescendants(["health", "work"]);
     expect(expanded.has("health")).toBe(true);
     expect(expanded.has("health/food")).toBe(true);
     expect(expanded.has("work")).toBe(true);
     expect(expanded.has("work/standup")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tag record API — patterns/tag-data-model.md
+// ---------------------------------------------------------------------------
+
+describe("tag record API (patterns/tag-data-model.md)", async () => {
+  it("upsertTagRecord persists description + fields + relationships + parent_names", async () => {
+    await store.upsertTagRecord("project", {
+      description: "long-running deliverable",
+      fields: { status: { type: "string", enum: ["active", "shipped"] } },
+      relationships: {
+        owned_by: { target_tag: "person", cardinality: "one", description: "DRI" },
+      },
+      parent_names: ["work"],
+    });
+    const r = await store.getTagRecord("project");
+    expect(r?.description).toBe("long-running deliverable");
+    expect(r?.fields?.status?.type).toBe("string");
+    expect(r?.relationships?.owned_by?.target_tag).toBe("person");
+    expect(r?.relationships?.owned_by?.cardinality).toBe("one");
+    expect(r?.parent_names).toEqual(["work"]);
+    expect(r?.created_at).toBeDefined();
+    expect(r?.updated_at).toBeDefined();
+  });
+
+  it("upsertTagRecord preserves columns left undefined in the patch", async () => {
+    await store.upsertTagRecord("project", {
+      description: "first",
+      fields: { status: { type: "string" } },
+      parent_names: ["work"],
+    });
+    await store.upsertTagRecord("project", { description: "second" });
+    const r = await store.getTagRecord("project");
+    expect(r?.description).toBe("second");
+    expect(r?.fields?.status?.type).toBe("string");
+    expect(r?.parent_names).toEqual(["work"]);
+  });
+
+  it("upsertTagRecord clears a column when patch passes null", async () => {
+    await store.upsertTagRecord("project", {
+      description: "deliverable",
+      parent_names: ["work"],
+    });
+    await store.upsertTagRecord("project", { parent_names: null });
+    const r = await store.getTagRecord("project");
+    expect(r?.description).toBe("deliverable");
+    expect(r?.parent_names).toBeUndefined();
+  });
+
+  it("listTagRecords returns every tag row, sorted by name", async () => {
+    await store.upsertTagRecord("zebra", { description: "z" });
+    await store.upsertTagRecord("alpha", { description: "a" });
+    const records = await store.listTagRecords();
+    const names = records.map((r) => r.tag);
+    const idxAlpha = names.indexOf("alpha");
+    const idxZebra = names.indexOf("zebra");
+    expect(idxAlpha).toBeGreaterThanOrEqual(0);
+    expect(idxZebra).toBeGreaterThan(idxAlpha);
+  });
+
+  it("update-tag MCP rejects an invalid cardinality", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    await expect(
+      update.execute({
+        tag: "project",
+        relationships: {
+          owned_by: { target_tag: "person", cardinality: "bogus" },
+        },
+      }),
+    ).rejects.toThrow(/cardinality/);
+  });
+
+  it("update-tag MCP accepts every cardinality in the named vocabulary", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    for (const card of ["one", "optional", "many", "many-required"]) {
+      await update.execute({
+        tag: `tag-${card}`,
+        relationships: {
+          rel: { target_tag: "other", cardinality: card },
+        },
+      });
+      const r = await store.getTagRecord(`tag-${card}`);
+      expect(r?.relationships?.rel?.cardinality).toBe(card);
+    }
+  });
+
+  it("update-tag MCP rejects a relationship missing target_tag", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    await expect(
+      update.execute({
+        tag: "project",
+        relationships: { owned_by: { cardinality: "one" } },
+      }),
+    ).rejects.toThrow(/target_tag/);
+  });
+
+  it("update-tag MCP sets parent_names and the hierarchy invalidates", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+
+    await store.createNote("v note", { tags: ["voice"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+
+    await update.execute({
+      tag: "voice",
+      parent_names: ["manual"],
+    });
+
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+  });
+
+  it("update-tag MCP empty parent_names array clears the column", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    await store.upsertTagRecord("voice", { parent_names: ["manual"] });
+    await update.execute({ tag: "voice", parent_names: [] });
+    const r = await store.getTagRecord("voice");
+    expect(r?.parent_names).toBeUndefined();
+  });
+
+  it("list-tags MCP single-tag detail includes relationships + parent_names", async () => {
+    await store.upsertTagRecord("project", {
+      description: "p",
+      relationships: { owned_by: { target_tag: "person", cardinality: "one" } },
+      parent_names: ["work"],
+    });
+    const tools = generateMcpTools(store);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const result = await listTags.execute({ tag: "project" }) as any;
+    expect(result.relationships?.owned_by?.target_tag).toBe("person");
+    expect(result.parent_names).toEqual(["work"]);
+    expect(result.created_at).toBeDefined();
+  });
+
+  it("list-tags MCP include_schema returns relationships + parent_names per tag", async () => {
+    await store.upsertTagRecord("project", {
+      relationships: { owned_by: { target_tag: "person", cardinality: "one" } },
+      parent_names: ["work"],
+    });
+    await store.createNote("p note", { tags: ["project"] });
+    const tools = generateMcpTools(store);
+    const listTags = tools.find((t) => t.name === "list-tags")!;
+    const all = await listTags.execute({ include_schema: true }) as any[];
+    const project = all.find((t) => t.name === "project")!;
+    expect(project.relationships?.owned_by?.target_tag).toBe("person");
+    expect(project.parent_names).toEqual(["work"]);
+  });
+
+  it("renameTag carries description + fields + relationships + parent_names onto the new row", async () => {
+    await store.upsertTagRecord("old-name", {
+      description: "before",
+      fields: { status: { type: "string" } },
+      relationships: { owned_by: { target_tag: "person", cardinality: "one" } },
+      parent_names: ["work"],
+    });
+    const result = await store.renameTag("old-name", "new-name");
+    expect("renamed" in result).toBe(true);
+
+    const renamed = await store.getTagRecord("new-name");
+    expect(renamed?.description).toBe("before");
+    expect(renamed?.fields?.status?.type).toBe("string");
+    expect(renamed?.relationships?.owned_by?.target_tag).toBe("person");
+    expect(renamed?.parent_names).toEqual(["work"]);
+
+    const old = await store.getTagRecord("old-name");
+    expect(old).toBeNull();
+  });
+
+  it("deleteTag drops the identity row + invalidates the hierarchy", async () => {
+    await store.upsertTagRecord("voice", {
+      description: "voice notes",
+      parent_names: ["manual"],
+    });
+    await store.createNote("v", { tags: ["voice"] });
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(1);
+
+    await store.deleteTag("voice");
+    expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
+    expect(await store.getTagRecord("voice")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema migration v13 → v14 — patterns/tag-data-model.md
+// ---------------------------------------------------------------------------
+
+describe("schema migration v13 → v14", async () => {
+  it("backfills tags.parent_names from `_tags/<name>` notes", async () => {
+    // Simulate a pre-v14 vault by writing a `_tags/<name>` note + the
+    // legacy tag_schemas row directly via a fresh DB at v13 shape.
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(":memory:");
+
+    // Build the v13 shape inline: tags(name PK only), separate tag_schemas
+    // table, plus a notes row at `_tags/voice`.
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec(`CREATE TABLE notes (
+      id TEXT PRIMARY KEY, content TEXT DEFAULT '', path TEXT,
+      metadata TEXT DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT
+    )`);
+    db.exec(`CREATE TABLE tags (name TEXT PRIMARY KEY)`);
+    db.exec(`CREATE TABLE tag_schemas (
+      tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
+      description TEXT, fields TEXT
+    )`);
+
+    db.prepare("INSERT INTO tags (name) VALUES (?)").run("voice");
+    db.prepare("INSERT INTO tag_schemas (tag_name, description, fields) VALUES (?, ?, ?)")
+      .run("voice", "voice notes", '{"recorded_at":{"type":"string"}}');
+    db.prepare(`INSERT INTO notes (id, path, metadata, created_at) VALUES (?, ?, ?, ?)`)
+      .run("n1", "_tags/voice", JSON.stringify({ parents: ["manual"] }), new Date().toISOString());
+
+    // Now run initSchema — it should add the v14 columns, copy schema +
+    // hierarchy data onto the tags row, and drop tag_schemas.
+    const { initSchema } = await import("./schema.ts");
+    initSchema(db);
+
+    // tag_schemas should be gone.
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tableExists).toBeNull();
+
+    // tags row should carry the migrated fields.
+    const row = db.prepare(
+      "SELECT name, description, fields, parent_names FROM tags WHERE name = 'voice'",
+    ).get() as any;
+    expect(row.description).toBe("voice notes");
+    expect(JSON.parse(row.fields).recorded_at.type).toBe("string");
+    expect(JSON.parse(row.parent_names)).toEqual(["manual"]);
+
+    // The `_tags/voice` note is left in place as harmless historical record.
+    const note = db.prepare("SELECT id FROM notes WHERE path = '_tags/voice'").get();
+    expect(note).toBeDefined();
+
+    db.close();
+  });
+
+  it("is idempotent — running initSchema twice is a no-op the second time", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+    const db = new Database(":memory:");
+    initSchema(db);
+    db.prepare(`
+      INSERT INTO tags (name, description, parent_names, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      "voice",
+      "voice notes",
+      JSON.stringify(["manual"]),
+      new Date().toISOString(),
+      new Date().toISOString(),
+    );
+
+    // Second run must not throw, must not perturb the row, must not
+    // reintroduce tag_schemas.
+    initSchema(db);
+
+    const row = db.prepare("SELECT description, parent_names FROM tags WHERE name = 'voice'").get() as any;
+    expect(row.description).toBe("voice notes");
+    expect(JSON.parse(row.parent_names)).toEqual(["manual"]);
+
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tableExists).toBeNull();
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tag-scope auth post-v14 — patterns/tag-scoped-tokens.md
+// ---------------------------------------------------------------------------
+
+describe("tag-scope auth (post-v14 hierarchy)", async () => {
+  it("token allowlisted for `health` matches descendants declared via parent_names", async () => {
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
+    await store.upsertTagRecord("health/food/breakfast", { parent_names: ["health/food"] });
+
+    const expanded = await store.expandTagsWithDescendants(["health"]);
+    expect(expanded.has("health")).toBe(true);
+    expect(expanded.has("health/food")).toBe(true);
+    expect(expanded.has("health/food/breakfast")).toBe(true);
+  });
+
+  it("orphan sub-tag fallback: token for `health` still sees `#health/food` even with no declared hierarchy", async () => {
+    // Per patterns/tag-scoped-tokens.md §Storage details, the auth check
+    // also splits on '/' and matches the root verbatim against the raw
+    // allowlist. This survives the v14 source-of-truth swap because the
+    // fallback lives in src/tag-scope.ts, not in the resolver.
+    const { noteWithinTagScope } = await import("../../src/tag-scope.ts");
+    const note = { id: "x", content: "", createdAt: "", tags: ["health/food"] };
+    const allowed = await store.expandTagsWithDescendants(["health"]);
+    // No declared hierarchy — the expansion returns just `health`.
+    expect(allowed.has("health/food")).toBe(false);
+    // But the string-form fallback still matches.
+    expect(noteWithinTagScope(note, allowed, ["health"])).toBe(true);
   });
 });
