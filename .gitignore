@@ -5,6 +5,8 @@ node_modules
 out
 dist
 *.tgz
+# `npm pack --dry-run` and `bun publish` scratch directory — local-only artifact
+package
 
 # code coverage
 coverage
