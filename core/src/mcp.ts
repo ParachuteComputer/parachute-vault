@@ -6,6 +6,7 @@ import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
 import * as indexedFieldOps from "./indexed-fields.js";
+import { MAPPING_KINDS, type SchemaMappingKind, type NoteSchemaField } from "./note-schemas.js";
 import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
@@ -971,6 +972,180 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // Drop the row outright — description/fields/relationships/parents
         // travel with it. (No more sidecar table to clear separately.)
         return await store.deleteTag(tag);
+      },
+    },
+
+    // =====================================================================
+    // 7a. list-note-schemas — read note_schemas + their mappings
+    // =====================================================================
+    {
+      name: "list-note-schemas",
+      description: "List note schemas (description, fields, required, timestamps). Pass `name` to get a single schema with its applied mapping rules. Schemas drive the validation_status warnings surfaced on create-note / update-note.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Get a single schema by name (with its mappings)" },
+          include_mappings: { type: "boolean", description: "When listing all schemas, include each schema's mappings (default: false)" },
+        },
+      },
+      execute: async (params) => {
+        const single = params.name as string | undefined;
+        if (single) {
+          const schema = await store.getNoteSchema(single);
+          if (!schema) return null;
+          const mappings = await store.listSchemaMappings({ schema_name: single });
+          return { ...schema, mappings };
+        }
+        const schemas = await store.listNoteSchemas();
+        if (params.include_mappings) {
+          const allMappings = await store.listSchemaMappings();
+          const byName = new Map<string, typeof allMappings>();
+          for (const m of allMappings) {
+            const list = byName.get(m.schema_name) ?? [];
+            list.push(m);
+            byName.set(m.schema_name, list);
+          }
+          return schemas.map((s) => ({ ...s, mappings: byName.get(s.name) ?? [] }));
+        }
+        return schemas;
+      },
+    },
+
+    // =====================================================================
+    // 7b. update-note-schema — partial-upsert a schema definition
+    // =====================================================================
+    {
+      name: "update-note-schema",
+      description: "Create or update a note schema's definition: description, allowed/expected fields (type + enum + description), and a list of required field names. Auto-creates the schema row if missing. Pass null for description/fields/required to clear that column. Empty `required: []` collapses to null.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Schema name (e.g., 'meeting', 'project')" },
+          description: { type: "string", description: "Human-readable description of what this schema describes" },
+          fields: {
+            type: "object",
+            description: 'Field declarations. E.g., { "title": { "type": "string" }, "status": { "type": "string", "enum": ["active", "done"] } }. Replaces fields wholesale when provided.',
+            additionalProperties: {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["string", "number", "boolean", "array", "object"], description: "Expected JS type for this field" },
+                enum: { type: "array", items: { type: "string" }, description: "Allowed values (string fields only)" },
+                description: { type: "string" },
+              },
+            },
+          },
+          required: {
+            type: "array",
+            items: { type: "string" },
+            description: "Field names that must be present on a note matching this schema. Pass [] or null to clear.",
+          },
+        },
+        required: ["name"],
+      },
+      execute: async (params) => {
+        const name = params.name as string;
+        const patch: { description?: string | null; fields?: Record<string, NoteSchemaField> | null; required?: string[] | null } = {};
+        if (params.description === null) patch.description = null;
+        else if (params.description !== undefined) patch.description = params.description as string;
+        if (params.fields === null) patch.fields = null;
+        else if (params.fields !== undefined) patch.fields = params.fields as Record<string, NoteSchemaField>;
+        if (params.required === null) patch.required = null;
+        else if (params.required !== undefined) {
+          if (!Array.isArray(params.required)) {
+            throw new Error("required must be an array of field names");
+          }
+          patch.required = (params.required as unknown[]).filter((x): x is string => typeof x === "string");
+        }
+        return await store.upsertNoteSchema(name, patch);
+      },
+    },
+
+    // =====================================================================
+    // 7c. delete-note-schema — drop schema + cascade its mappings
+    // =====================================================================
+    {
+      name: "delete-note-schema",
+      description: "Delete a note schema. Cascades: any schema_mappings pointing at it are removed via FK ON DELETE CASCADE. Notes themselves are untouched.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Schema name to delete" },
+        },
+        required: ["name"],
+      },
+      execute: async (params) => {
+        const name = params.name as string;
+        const deleted = await store.deleteNoteSchema(name);
+        return { deleted, name };
+      },
+    },
+
+    // =====================================================================
+    // 7d. list-schema-mappings — read mapping rules
+    // =====================================================================
+    {
+      name: "list-schema-mappings",
+      description: "List schema mapping rules (path_prefix or tag → schema_name). Optionally filter by `schema_name` or `match_kind`. Mappings decide which schemas apply to a note at validation time.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          schema_name: { type: "string", description: "Restrict to mappings for this schema" },
+          match_kind: { type: "string", enum: [...MAPPING_KINDS], description: "Restrict to one match kind" },
+        },
+      },
+      execute: async (params) => {
+        const opts: { schema_name?: string; match_kind?: SchemaMappingKind } = {};
+        if (typeof params.schema_name === "string") opts.schema_name = params.schema_name;
+        if (typeof params.match_kind === "string") opts.match_kind = params.match_kind as SchemaMappingKind;
+        return await store.listSchemaMappings(opts);
+      },
+    },
+
+    // =====================================================================
+    // 7e. set-schema-mapping — add a mapping rule
+    // =====================================================================
+    {
+      name: "set-schema-mapping",
+      description: "Bind a schema to a path-prefix or tag. Idempotent — re-setting the same triple is a no-op. The schema must already exist (FK enforced). E.g., {schema_name: 'meeting', match_kind: 'path_prefix', match_value: 'Meetings/'} or {schema_name: 'project', match_kind: 'tag', match_value: 'project'}.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          schema_name: { type: "string", description: "Schema name to bind" },
+          match_kind: { type: "string", enum: [...MAPPING_KINDS], description: "Match by path prefix or by tag" },
+          match_value: { type: "string", description: "The path prefix or tag value to match" },
+        },
+        required: ["schema_name", "match_kind", "match_value"],
+      },
+      execute: async (params) => {
+        const schema_name = params.schema_name as string;
+        const match_kind = params.match_kind as SchemaMappingKind;
+        const match_value = params.match_value as string;
+        await store.setSchemaMapping(schema_name, match_kind, match_value);
+        return { ok: true, schema_name, match_kind, match_value };
+      },
+    },
+
+    // =====================================================================
+    // 7f. delete-schema-mapping — remove a mapping rule
+    // =====================================================================
+    {
+      name: "delete-schema-mapping",
+      description: "Remove a single schema mapping rule. The schema definition is untouched.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          schema_name: { type: "string", description: "Schema name" },
+          match_kind: { type: "string", enum: [...MAPPING_KINDS], description: "Match kind" },
+          match_value: { type: "string", description: "The path prefix or tag value to remove" },
+        },
+        required: ["schema_name", "match_kind", "match_value"],
+      },
+      execute: async (params) => {
+        const schema_name = params.schema_name as string;
+        const match_kind = params.match_kind as SchemaMappingKind;
+        const match_value = params.match_value as string;
+        const deleted = await store.deleteSchemaMapping(schema_name, match_kind, match_value);
+        return { deleted, schema_name, match_kind, match_value };
       },
     },
 

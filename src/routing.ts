@@ -48,6 +48,7 @@ import { defaultAdminSpaDistDir, isAdminSpaPath, serveAdminSpa } from "./admin-s
 import {
   handleNotes,
   handleTags,
+  handleNoteSchemas,
   handleFindPath,
   handleVault,
   handleUnresolvedWikilinks,
@@ -517,6 +518,7 @@ export async function route(
 
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope);
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
+  if (apiPath.startsWith("/note-schemas")) return handleNoteSchemas(req, store, apiPath.slice(13));
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
     return handleVault(req, store, vaultConfig, () => {

@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -69,6 +69,37 @@ CREATE TABLE IF NOT EXISTS links (
 -- tags row directly. The CREATE TABLE was removed from SCHEMA_SQL after the
 -- v14 data migration drops the table; existing v6+ vaults pick up the
 -- migration on next boot. See migrateToV14.
+
+-- Note schemas (v15): schema definitions used to validate notes by path
+-- prefix or tag. Replaces the v6-era _schemas/NAME notes-as-config
+-- convention. Validation is non-blocking — schemas surface warnings on
+-- create/update responses, never reject the write. See
+-- core/src/schema-defaults.ts and patterns/tag-data-model.md §Note schemas.
+--
+-- name        — primary key; the schema identifier referenced by mappings.
+-- description — human-readable blurb (markdown).
+-- fields      — JSON: { fieldName: { type?, enum?, description? } }.
+-- required    — JSON: string[] of required field names.
+CREATE TABLE IF NOT EXISTS note_schemas (
+  name TEXT PRIMARY KEY,
+  description TEXT,
+  fields TEXT,
+  required TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+-- Schema mappings (v15): replaces the singleton _schema_defaults note. One
+-- row per match rule; the resolver walks the table at note-write time.
+-- match_kind is constrained to 'path_prefix' or 'tag'. Composite PK so
+-- (schema, kind, value) is naturally unique without an extra surrogate id.
+-- ON DELETE CASCADE: dropping a schema cleans up its mappings.
+CREATE TABLE IF NOT EXISTS schema_mappings (
+  schema_name TEXT NOT NULL REFERENCES note_schemas(name) ON DELETE CASCADE,
+  match_kind TEXT NOT NULL CHECK (match_kind IN ('path_prefix', 'tag')),
+  match_value TEXT NOT NULL,
+  PRIMARY KEY (schema_name, match_kind, match_value)
+);
 
 -- Indexed fields: SSOT for generated columns and indexes on notes derived
 -- from tag-declared fields with indexed=true. One row per indexed metadata
@@ -170,6 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_name, note_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
+CREATE INDEX IF NOT EXISTS idx_schema_mappings_match ON schema_mappings(match_kind, match_value);
 `;
 
 /**
@@ -225,6 +257,13 @@ export function initSchema(db: Database): void {
   // from the v6-era tag_schemas sidecar and from `_tags/<name>` config
   // notes; drop tag_schemas after copy. See patterns/tag-data-model.md.
   migrateToV14(db);
+
+  // Migrate v14 → v15: retire the `_schemas/<name>` and `_schema_defaults`
+  // notes-as-config sidecars. Copy each `_schemas/<name>` note into the
+  // new `note_schemas` table and the `_schema_defaults` mappings into
+  // `schema_mappings`. The legacy notes are LEFT IN PLACE — they are
+  // inert post-v15 (no resolver reads them) and serve as audit trail.
+  migrateToV15(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -486,6 +525,122 @@ function migrateToV14(db: Database): void {
     console.log(
       `[vault] migrated to schema v14: copied ${copiedSchemas} tag_schemas + ${copiedHierarchy} _tags/* hierarchies onto tags rows`,
     );
+  }
+}
+
+/**
+ * Migrate v14 → v15: retire `_schemas/<name>` + `_schema_defaults` notes
+ * as the canonical source for schema definitions and mapping rules. After
+ * this migration the resolver reads from `note_schemas` and
+ * `schema_mappings` tables. The legacy notes are LEFT IN PLACE — they're
+ * harmless historical record and a user might have other content there.
+ *
+ * Idempotent: SCHEMA_SQL creates the tables before this runs (CREATE TABLE
+ * IF NOT EXISTS); the data copy uses INSERT OR IGNORE so re-running on a
+ * post-v15 DB is a no-op. Wrapped in BEGIN/COMMIT so a crash mid-migration
+ * leaves the DB in either pre-v15 or post-v15 state, never partial.
+ */
+function migrateToV15(db: Database): void {
+  if (!hasTable(db, "note_schemas") || !hasTable(db, "notes")) return;
+
+  // Short-circuit: if the destination tables already have data, the
+  // migration has run before. Don't re-scan notes.
+  const hasSchemas = (db.prepare(
+    "SELECT 1 FROM note_schemas LIMIT 1",
+  ).get()) !== null;
+  const hasMappings = (db.prepare(
+    "SELECT 1 FROM schema_mappings LIMIT 1",
+  ).get()) !== null;
+  if (hasSchemas && hasMappings) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const now = new Date().toISOString();
+    let copiedSchemas = 0;
+    let copiedMappings = 0;
+
+    // 1. Copy `_schemas/<name>` notes → note_schemas.
+    const defRows = db.prepare(
+      "SELECT path, metadata FROM notes WHERE path GLOB '_schemas/*'",
+    ).all() as { path: string; metadata: string | null }[];
+    const insertSchema = db.prepare(
+      "INSERT OR IGNORE INTO note_schemas (name, description, fields, required, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    for (const row of defRows) {
+      const name = row.path.slice("_schemas/".length);
+      if (!name) continue;
+      let description: string | null = null;
+      let fields: string | null = null;
+      let required: string | null = null;
+      try {
+        const meta = row.metadata ? JSON.parse(row.metadata) : {};
+        if (typeof meta?.description === "string") description = meta.description;
+        if (meta?.fields && typeof meta.fields === "object" && !Array.isArray(meta.fields)) {
+          fields = JSON.stringify(meta.fields);
+        }
+        if (Array.isArray(meta?.required)) {
+          const cleaned = meta.required.filter((x: unknown): x is string => typeof x === "string");
+          if (cleaned.length > 0) required = JSON.stringify(cleaned);
+        }
+      } catch {
+        // Malformed metadata — skip; the note is left alone.
+        continue;
+      }
+      insertSchema.run(name, description, fields, required, now, now);
+      copiedSchemas++;
+    }
+
+    // 2. Copy `_schema_defaults` note → schema_mappings.
+    const mappingNote = db.prepare(
+      "SELECT metadata FROM notes WHERE path = '_schema_defaults'",
+    ).get() as { metadata: string | null } | undefined;
+    if (mappingNote?.metadata) {
+      const insertMapping = db.prepare(
+        "INSERT OR IGNORE INTO schema_mappings (schema_name, match_kind, match_value) VALUES (?, ?, ?)",
+      );
+      const ensureSchemaRow = db.prepare(
+        "INSERT OR IGNORE INTO note_schemas (name, created_at, updated_at) VALUES (?, ?, ?)",
+      );
+      try {
+        const meta = JSON.parse(mappingNote.metadata);
+        const pathPrefixes = meta?.path_prefixes;
+        if (pathPrefixes && typeof pathPrefixes === "object" && !Array.isArray(pathPrefixes)) {
+          for (const [prefix, schema] of Object.entries(pathPrefixes as Record<string, unknown>)) {
+            if (typeof schema === "string" && schema.length > 0 && prefix.length > 0) {
+              // Foreign key requires the schema row to exist; create a stub
+              // if the user mapped to a name with no _schemas/<name> note.
+              ensureSchemaRow.run(schema, now, now);
+              insertMapping.run(schema, "path_prefix", prefix);
+              copiedMappings++;
+            }
+          }
+        }
+        const tags = meta?.tags;
+        if (tags && typeof tags === "object" && !Array.isArray(tags)) {
+          for (const [tag, schema] of Object.entries(tags as Record<string, unknown>)) {
+            if (typeof schema === "string" && schema.length > 0 && tag.length > 0) {
+              ensureSchemaRow.run(schema, now, now);
+              insertMapping.run(schema, "tag", tag);
+              copiedMappings++;
+            }
+          }
+        }
+      } catch {
+        // Malformed _schema_defaults — leave both note and table empty;
+        // user can fix and re-run.
+      }
+    }
+
+    db.exec("COMMIT");
+
+    if (copiedSchemas > 0 || copiedMappings > 0) {
+      console.log(
+        `[vault] migrated to schema v15: copied ${copiedSchemas} _schemas/* + ${copiedMappings} _schema_defaults mappings into note_schemas/schema_mappings`,
+      );
+    }
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
   }
 }
 

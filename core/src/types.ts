@@ -1,8 +1,23 @@
 import type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+import type {
+  NoteSchemaField,
+  NoteSchemaRecord,
+  NoteSchemaPatch,
+  SchemaMappingKind,
+  SchemaMappingRecord,
+  ListMappingsOpts,
+} from "./note-schemas.js";
 
 // ---- Re-exports ----
 
 export type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+export type {
+  NoteSchemaField,
+  NoteSchemaRecord,
+  NoteSchemaPatch,
+  SchemaMappingKind,
+  SchemaMappingRecord,
+} from "./note-schemas.js";
 
 // ---- Note ----
 
@@ -212,13 +227,29 @@ export interface Store {
     },
   ): Promise<TagRecord>;
 
-  // Schema validation (notes-as-config — `_schemas/*` + `_schema_defaults`).
-  // Returns null when no schema applies to the given note. Synchronous —
-  // the underlying resolver is in-memory after the first lazy load.
+  // Schema validation (post-v15: backed by `note_schemas` + `schema_mappings`
+  // tables). Returns null when no schema applies to the given note. The
+  // underlying resolver is in-memory after the first lazy load.
   validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): {
     schemas: string[];
     warnings: { field: string; schema: string; reason: "missing_required" | "type_mismatch" | "enum_mismatch"; message: string }[];
   } | null;
+
+  // Note schemas (post-v15 — the writable surface that drives validation).
+  listNoteSchemas(): Promise<NoteSchemaRecord[]>;
+  getNoteSchema(name: string): Promise<NoteSchemaRecord | null>;
+  /**
+   * Partial-upsert. Auto-creates the row if missing. Any patch field left
+   * undefined is preserved; pass null to clear. Empty `required: []`
+   * collapses to null.
+   */
+  upsertNoteSchema(name: string, patch: NoteSchemaPatch): Promise<NoteSchemaRecord>;
+  deleteNoteSchema(name: string): Promise<boolean>;
+
+  // Schema mappings (post-v15 — replaces the singleton `_schema_defaults`).
+  listSchemaMappings(opts?: ListMappingsOpts): Promise<SchemaMappingRecord[]>;
+  setSchemaMapping(schema_name: string, match_kind: SchemaMappingKind, match_value: string): Promise<void>;
+  deleteSchemaMapping(schema_name: string, match_kind: SchemaMappingKind, match_value: string): Promise<boolean>;
 
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
