@@ -1,3 +1,9 @@
+import type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+
+// ---- Re-exports ----
+
+export type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+
 // ---- Note ----
 
 export interface Note {
@@ -177,12 +183,34 @@ export interface Store {
   traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
   findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): Promise<{ path: string[]; relationships: string[] } | null>;
 
-  // Tag schemas
-  listTagSchemas(): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }[]>;
-  getTagSchema(tag: string): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> } | null>;
-  upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>;
+  // Tag schemas — schema-only facade (description + fields). Back-compat
+  // surface for v13-and-earlier callers; reads/writes route through the
+  // post-v14 `tags` row directly.
+  listTagSchemas(): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }[]>;
+  getTagSchema(tag: string): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> } | null>;
+  upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }>;
   deleteTagSchema(tag: string): Promise<boolean>;
-  getTagSchemaMap(): Promise<Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[] }> }>>;
+  getTagSchemaMap(): Promise<Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }>>;
+
+  // Tag records — full v14 identity row (description + fields + typed
+  // relationships + parent_names + timestamps). See
+  // parachute-patterns/patterns/tag-data-model.md.
+  listTagRecords(): Promise<TagRecord[]>;
+  getTagRecord(tag: string): Promise<TagRecord | null>;
+  /**
+   * Partial upsert. Any patch field left undefined is preserved; pass
+   * null to clear. Touching `parent_names` invalidates the tag-hierarchy
+   * cache. Returns the post-write row.
+   */
+  upsertTagRecord(
+    tag: string,
+    patch: {
+      description?: string | null;
+      fields?: Record<string, TagFieldSchema> | null;
+      relationships?: Record<string, TagRelationship> | null;
+      parent_names?: string[] | null;
+    },
+  ): Promise<TagRecord>;
 
   // Schema validation (notes-as-config — `_schemas/*` + `_schema_defaults`).
   // Returns null when no schema applies to the given note. Synchronous —

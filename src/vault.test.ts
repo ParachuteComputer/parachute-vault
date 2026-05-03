@@ -776,7 +776,7 @@ describe("scoped MCP wrapper", async () => {
     const vaultName = `tagscope-tags-${Date.now()}`;
     writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
     const store = getVaultStore(vaultName);
-    await store.createNote("", { path: "_tags/health/food", metadata: { parents: ["health"] } });
+    await store.upsertTagRecord("health/food", { parent_names: ["health"] });
     await store.createNote("h", { tags: ["health"] });
     await store.createNote("hf", { tags: ["health/food"] });
     await store.createNote("w", { tags: ["work"] });
@@ -1912,6 +1912,21 @@ describe("HTTP /tags", async () => {
     const body = await res.json() as any;
     expect(body.tag).toBe("person");
     expect(body.description).toBe("A person");
+  });
+
+  test("PUT /tags/:name returns 400 with error_type: invalid_relationships on bad shape", async () => {
+    const res = await handleTags(
+      mkReq("PUT", "/tags/person", {
+        relationships: { mentions: { target_tag: "topic", cardinality: "infinite" } },
+      }),
+      store,
+      "/person",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_relationships");
+    expect(typeof body.error).toBe("string");
+    expect(body.error.length).toBeGreaterThan(0);
   });
 
   test("DELETE /tags/:name removes tag and schema", async () => {

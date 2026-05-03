@@ -1,23 +1,22 @@
 /**
- * Tag hierarchy resolution from `_tags/<name>` config notes.
+ * Tag hierarchy resolution from the `tags.parent_names` column.
  *
- * A note at path `_tags/voice` declaring `metadata.parents = ["manual", "note"]`
+ * A `tags` row named `voice` with `parent_names = ["manual", "note"]`
  * registers `voice` as a child of `manual` and `note`. Queries that ask for
  * `tags: ["manual"]` then transparently match notes tagged `#voice` (or any
  * other transitive descendant of `#manual`).
  *
- * Why notes-as-config rather than a SQL table:
- * - Vault is note-first. Configuration-as-data is more vault-native.
- * - Users edit the hierarchy with the same tools they use for any other note.
- * - Exports/imports of the vault carry the hierarchy with the content.
- * - Survives DB schema evolution without migrations.
+ * History: pre-v14 vaults stored hierarchy in notes-as-config at
+ * `_tags/<name>`. The v14 migration (see core/src/schema.ts:migrateToV14)
+ * lifts those parent declarations onto the tags row and the resolver here
+ * was swapped accordingly. See parachute-patterns/patterns/tag-data-model.md.
  *
  * Resolution model:
  * - Lazy: built on first access, cached on the store.
- * - Invalidated synchronously when any note at `_tags/*` is created, updated,
- *   or deleted (see `BunSqliteStore.invalidateConfigCaches`).
- * - Tags not declared at `_tags/<name>` are treated as root-level (no parents,
- *   no children). They still match queries by their own name.
+ * - Invalidated synchronously when a tag's parent_names changes (see
+ *   `BunSqliteStore.invalidateTagCaches`).
+ * - Tags without parent_names are treated as root-level (no parents, no
+ *   children). They still match queries by their own name.
  *
  * Cycle handling:
  * - Cycles in declared parents are tolerated at load — we don't reject the
@@ -36,57 +35,48 @@ export interface TagHierarchy {
 }
 
 /**
- * Path prefix that marks a note as a tag-hierarchy declaration. The remainder
- * of the path (after `_tags/`) is the tag name.
+ * Pre-v14 path prefix that marked a note as a tag-hierarchy declaration.
+ * Retained as an exported constant so call-sites that still need to know
+ * about historical `_tags/*` notes (cache-invalidation, importers) can
+ * reference a single source of truth.
  */
 export const TAG_CONFIG_PREFIX = "_tags/";
 
 /**
- * Read a `parents` array from a note's metadata, defending against malformed
- * input. Non-string entries are dropped silently — config notes are
- * expected to be well-formed but we don't want a single bad row to break
- * the whole hierarchy resolution.
+ * Decode a JSON-encoded `parent_names` column value, defending against
+ * malformed input. Non-string entries are dropped silently — the column
+ * is expected to be well-formed (we control all writers) but a single bad
+ * row shouldn't break the whole hierarchy resolution.
  */
-function readParents(metadata: unknown): string[] {
-  if (!metadata || typeof metadata !== "object") return [];
-  const raw = (metadata as Record<string, unknown>).parents;
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((x): x is string => typeof x === "string" && x.length > 0);
+function readParentNames(raw: string | null): string[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return []; }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter((x): x is string => typeof x === "string" && x.length > 0);
 }
 
 /**
- * Scan all `_tags/*` notes and build the parent→children adjacency map.
- * The tag name comes from the path suffix (e.g. `_tags/voice` → `voice`).
+ * Scan the `tags` table and build the parent→children adjacency map.
+ * Each row's `parent_names` JSON array contributes one edge per parent.
  */
 export function loadTagHierarchy(db: Database): TagHierarchy {
-  // GLOB instead of LIKE: SQLite's LIKE treats `_` as a single-character
-  // wildcard, so `path LIKE '_tags/%'` would also match `Atags/foo`,
-  // `xtags/bar`, etc. — any letter + `tags/` would silently be read as a
-  // tag-config note. GLOB takes `_` as a literal and matches only the
-  // intended `_tags/*` namespace.
   const rows = db.prepare(
-    `SELECT path, metadata FROM notes WHERE path GLOB '_tags/*'`,
-  ).all() as { path: string; metadata: string | null }[];
+    `SELECT name, parent_names FROM tags WHERE parent_names IS NOT NULL`,
+  ).all() as { name: string; parent_names: string | null }[];
 
   const childrenOf = new Map<string, Set<string>>();
 
   for (const row of rows) {
-    const tagName = row.path.slice(TAG_CONFIG_PREFIX.length);
-    if (!tagName) continue;
-
-    let metadata: unknown = null;
-    if (row.metadata && row.metadata !== "{}") {
-      try { metadata = JSON.parse(row.metadata); } catch {}
-    }
-    const parents = readParents(metadata);
-
+    if (!row.name) continue;
+    const parents = readParentNames(row.parent_names);
     for (const parent of parents) {
       let children = childrenOf.get(parent);
       if (!children) {
         children = new Set();
         childrenOf.set(parent, children);
       }
-      children.add(tagName);
+      children.add(row.name);
     }
   }
 

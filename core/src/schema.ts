@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -15,9 +15,27 @@ CREATE TABLE IF NOT EXISTS notes (
   updated_at TEXT
 );
 
--- Tags: flat labels
+-- Tags: first-class identity carrying schema, hierarchy, and typed-link
+-- declarations. One row per tag; no notes-as-config sidecars for these
+-- concerns. See parachute-patterns/patterns/tag-data-model.md.
+--
+-- description    — human-readable blurb (markdown).
+-- fields         — JSON: indexed metadata field declarations per
+--                  query-operators.md. Replaces v6-era tag_schemas.fields.
+-- relationships  — JSON: typed-link declarations
+--                  ({ "rel": { target_tag, cardinality, description? } }).
+--                  Cardinality vocabulary: one | optional | many | many-required.
+--                  Phase 1 informational — declared but not enforced at write.
+-- parent_names   — JSON array of parent tag names. Replaces the v6-era
+--                  _tags/NAME config-note hierarchy.
 CREATE TABLE IF NOT EXISTS tags (
-  name TEXT PRIMARY KEY
+  name TEXT PRIMARY KEY,
+  description TEXT,
+  fields TEXT,
+  relationships TEXT,
+  parent_names TEXT,
+  created_at TEXT,
+  updated_at TEXT
 );
 
 -- Note-Tag join
@@ -47,12 +65,10 @@ CREATE TABLE IF NOT EXISTS links (
   UNIQUE(source_id, target_id, relationship)
 );
 
--- Tag schemas: optional metadata schema per tag
-CREATE TABLE IF NOT EXISTS tag_schemas (
-  tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
-  description TEXT,
-  fields TEXT -- JSON: { "field_name": { "type": "string", "description": "..." }, ... }
-);
+-- tag_schemas (v6) was retired in v14; description + fields lifted onto the
+-- tags row directly. The CREATE TABLE was removed from SCHEMA_SQL after the
+-- v14 data migration drops the table; existing v6+ vaults pick up the
+-- migration on next boot. See migrateToV14.
 
 -- Indexed fields: SSOT for generated columns and indexes on notes derived
 -- from tag-declared fields with indexed=true. One row per indexed metadata
@@ -203,6 +219,12 @@ export function initSchema(db: Database): void {
 
   // Migrate v12 → v13: add `scoped_tags` column to tokens for tag-scoped tokens.
   migrateToV13(db);
+
+  // Migrate v13 → v14: tag-data-model reshape. Augment `tags` row with
+  // description/fields/relationships/parent_names/timestamps; copy data
+  // from the v6-era tag_schemas sidecar and from `_tags/<name>` config
+  // notes; drop tag_schemas after copy. See patterns/tag-data-model.md.
+  migrateToV14(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -357,6 +379,113 @@ function migrateToV12(db: Database): void {
 function migrateToV13(db: Database): void {
   if (hasTable(db, "tokens") && !hasColumn(db, "tokens", "scoped_tags")) {
     db.exec("ALTER TABLE tokens ADD COLUMN scoped_tags TEXT");
+  }
+}
+
+/**
+ * Migrate v13 → v14: tag-data-model reshape (patterns/tag-data-model.md).
+ *
+ * Augments the `tags` table with five new columns and one timestamp pair,
+ * then copies pre-existing data from two notes-as-config sidecars:
+ *
+ *   - tag_schemas (v6 sidecar) → tags.{description,fields}
+ *   - notes at path `_tags/<name>` → tags.parent_names (from metadata.parents)
+ *
+ * After the copy lands, `tag_schemas` is dropped. The `_tags/<name>` notes
+ * are LEFT IN PLACE — they're harmless historical record and a user might
+ * have other content there. Future writes go to the tags row directly.
+ *
+ * Idempotent: ALTER TABLE adds are guarded by hasColumn; the data copy
+ * only runs when tag_schemas / `_tags/*` notes still exist; running the
+ * migration twice on the same DB is a no-op the second time.
+ */
+function migrateToV14(db: Database): void {
+  if (!hasTable(db, "tags")) return;
+
+  // 1. ALTER TABLE — additive, idempotent.
+  const cols: [string, string][] = [
+    ["description", "TEXT"],
+    ["fields", "TEXT"],
+    ["relationships", "TEXT"],
+    ["parent_names", "TEXT"],
+    ["created_at", "TEXT"],
+    ["updated_at", "TEXT"],
+  ];
+  for (const [col, type] of cols) {
+    if (!hasColumn(db, "tags", col)) {
+      db.exec(`ALTER TABLE tags ADD COLUMN ${col} ${type}`);
+    }
+  }
+
+  const now = new Date().toISOString();
+  let copiedSchemas = 0;
+  let copiedHierarchy = 0;
+
+  // 2. Copy tag_schemas → tags.{description,fields}.
+  if (hasTable(db, "tag_schemas")) {
+    const rows = db.prepare(
+      "SELECT tag_name, description, fields FROM tag_schemas",
+    ).all() as { tag_name: string; description: string | null; fields: string | null }[];
+    const upsert = db.prepare(
+      "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",
+    );
+    const update = db.prepare(
+      "UPDATE tags SET description = ?, fields = ?, updated_at = ? WHERE name = ?",
+    );
+    for (const row of rows) {
+      upsert.run(row.tag_name, now, now);
+      update.run(row.description, row.fields, now, row.tag_name);
+      copiedSchemas++;
+    }
+  }
+
+  // 3. Copy `_tags/<name>` notes' metadata.parents → tags.parent_names.
+  // Only runs if the notes table exists (it always does post-SCHEMA_SQL,
+  // but stay defensive — initSchema runs SCHEMA_SQL first so this is true).
+  if (hasTable(db, "notes")) {
+    const tagNotes = db.prepare(
+      "SELECT path, metadata FROM notes WHERE path GLOB '_tags/*'",
+    ).all() as { path: string; metadata: string | null }[];
+    const upsert = db.prepare(
+      "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",
+    );
+    const update = db.prepare(
+      "UPDATE tags SET parent_names = ?, updated_at = ? WHERE name = ?",
+    );
+    for (const note of tagNotes) {
+      const tagName = note.path.slice("_tags/".length);
+      if (!tagName) continue;
+      let parents: string[] | null = null;
+      try {
+        const meta = note.metadata ? JSON.parse(note.metadata) : {};
+        const raw = meta?.parents;
+        if (Array.isArray(raw) && raw.length > 0) {
+          const cleaned = raw.filter((p: unknown): p is string => typeof p === "string" && p.length > 0);
+          if (cleaned.length > 0) parents = cleaned;
+        }
+      } catch {
+        // Malformed metadata — skip; the note is left untouched.
+        continue;
+      }
+      if (!parents) continue;
+      upsert.run(tagName, now, now);
+      update.run(JSON.stringify(parents), now, tagName);
+      copiedHierarchy++;
+    }
+  }
+
+  // 4. Backfill timestamps for rows the copies didn't touch.
+  db.exec(`UPDATE tags SET created_at = '${now}' WHERE created_at IS NULL`);
+
+  // 5. Drop the sidecar after the copy is complete.
+  if (hasTable(db, "tag_schemas")) {
+    db.exec("DROP TABLE tag_schemas");
+  }
+
+  if (copiedSchemas > 0 || copiedHierarchy > 0) {
+    console.log(
+      `[vault] migrated to schema v14: copied ${copiedSchemas} tag_schemas + ${copiedHierarchy} _tags/* hierarchies onto tags rows`,
+    );
   }
 }
 

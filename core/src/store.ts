@@ -276,18 +276,30 @@ export class BunSqliteStore implements Store {
   }
 
   async deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }> {
-    return noteOps.deleteTag(this.db, name);
+    const result = noteOps.deleteTag(this.db, name);
+    // The deleted tag may have been a parent or child in the hierarchy.
+    this._tagHierarchy = null;
+    return result;
   }
 
   async renameTag(oldName: string, newName: string): Promise<noteOps.RenameTagResult> {
-    return noteOps.renameTag(this.db, oldName, newName);
+    const result = noteOps.renameTag(this.db, oldName, newName);
+    // Other tags' parent_names may reference oldName — though we don't
+    // rewrite those, the hierarchy cache should be rebuilt to pick up the
+    // new row identity.
+    this._tagHierarchy = null;
+    return result;
   }
 
   async mergeTags(
     sources: string[],
     target: string,
   ): Promise<{ merged: Record<string, number>; target: string }> {
-    return noteOps.mergeTags(this.db, sources, target);
+    const result = noteOps.mergeTags(this.db, sources, target);
+    // Source tags drop out of the hierarchy; downstream callers asking
+    // for descendants of target should pick up any merged children.
+    this._tagHierarchy = null;
+    return result;
   }
 
   // ---- Vault Stats ----
@@ -367,6 +379,37 @@ export class BunSqliteStore implements Store {
 
   async getTagSchemaMap() {
     return tagSchemaOps.getTagSchemaMap(this.db);
+  }
+
+  // ---- Tag Records (post-v14: full identity row) ----
+
+  async listTagRecords() {
+    return tagSchemaOps.listTagRecords(this.db);
+  }
+
+  async getTagRecord(tag: string) {
+    return tagSchemaOps.getTagRecord(this.db, tag);
+  }
+
+  /**
+   * Partial upsert of the full tag record. Any patch field left undefined
+   * is preserved; pass null to clear. Invalidates the tag-hierarchy cache
+   * when `parent_names` is touched.
+   */
+  async upsertTagRecord(
+    tag: string,
+    patch: {
+      description?: string | null;
+      fields?: Record<string, tagSchemaOps.TagFieldSchema> | null;
+      relationships?: Record<string, tagSchemaOps.TagRelationship> | null;
+      parent_names?: string[] | null;
+    },
+  ) {
+    const result = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
+    if (patch.parent_names !== undefined) {
+      this._tagHierarchy = null;
+    }
+    return result;
   }
 
   // ---- Batch Wikilink Sync ----

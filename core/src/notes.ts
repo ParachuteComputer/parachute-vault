@@ -699,11 +699,28 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
 
   db.exec("BEGIN");
   try {
-    // Order matters: the note_tags FK points at tags(name), and tag_schemas'
-    // FK cascades on delete. Seed the new row, move the schema + note_tags
-    // onto it, then drop the old row.
-    db.prepare("INSERT INTO tags (name) VALUES (?)").run(newName);
-    db.prepare("UPDATE tag_schemas SET tag_name = ? WHERE tag_name = ?").run(newName, oldName);
+    // Order matters: note_tags' FK points at tags(name). Copy the old row's
+    // identity columns onto a new row keyed by `newName`, repoint note_tags,
+    // then drop the old row. Description/fields/relationships/parent_names
+    // travel with the rename — they're tag-identity data.
+    const old = db.prepare(
+      "SELECT description, fields, relationships, parent_names, created_at FROM tags WHERE name = ?",
+    ).get(oldName) as
+      | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null }
+      | undefined;
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      newName,
+      old?.description ?? null,
+      old?.fields ?? null,
+      old?.relationships ?? null,
+      old?.parent_names ?? null,
+      old?.created_at ?? now,
+      now,
+    );
     const updated = db.prepare("UPDATE note_tags SET tag_name = ? WHERE tag_name = ?").run(newName, oldName);
     db.prepare("DELETE FROM tags WHERE name = ?").run(oldName);
     db.exec("COMMIT");
@@ -746,8 +763,9 @@ export function mergeTags(
       const before = (countStmt.get(source) as { c: number }).c;
       retagStmt.run(target, source);
       deleteNoteTagsStmt.run(source);
-      // tag_schemas has ON DELETE CASCADE from tags(name), so dropping the
-      // tag row also drops its schema — which is what we want for a merge.
+      // Dropping the tag row drops its identity (description, fields,
+      // relationships, parent_names) along with it — which is what we want
+      // for a merge: the source's identity is consumed by the target.
       deleteTagStmt.run(source);
       merged[source] = before;
     }
