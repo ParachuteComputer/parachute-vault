@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
-import { filterMetadata } from "./notes.js";
+import { filterMetadata, MAX_BATCH_SIZE } from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -375,6 +375,31 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
 
+        if (items.length > MAX_BATCH_SIZE) {
+          throw new BatchTooLargeError(items.length);
+        }
+
+        // Empty-note pre-validation (#213): make mixed batches atomic for
+        // the empty-note case. The Store will throw EmptyNoteError on the
+        // empty entry, but in a sequential batch loop the prefix would have
+        // already committed before we hit it. Pre-walk so the whole call
+        // either creates everything or nothing. The error carries
+        // `item_index` so MCP callers with multi-item batches can pinpoint
+        // the bad entry — parity with the HTTP route's response shape.
+        // TODO: tighten batch input type — `items[i] as any` mirrors the
+        // top-of-call cast at `params.notes as any[]`. A typed McpCreateNoteInput
+        // would let us drop both casts.
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i] as any;
+          const content = ((item?.content as string | undefined) ?? "").toString();
+          const rawPath = item?.path;
+          const pathEmpty = rawPath === undefined || rawPath === null
+            || (typeof rawPath === "string" && rawPath.trim() === "");
+          if (!content.trim() && pathEmpty) {
+            throw new noteOps.EmptyNoteError(null, batch ? i : null);
+          }
+        }
+
         const created: Note[] = [];
         for (const item of items) {
           const note = await store.createNote(item.content as string ?? "", {
@@ -520,6 +545,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       execute: async (params) => {
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
+
+        if (items.length > MAX_BATCH_SIZE) {
+          throw new BatchTooLargeError(items.length);
+        }
 
         const updated: Note[] = [];
         for (const item of items) {
@@ -1251,7 +1280,7 @@ function normalizeTags(tag: unknown): string[] | undefined {
 
 // Re-exported for backward compat; defined in notes.ts alongside the
 // conditional-UPDATE implementation that raises it.
-export { ConflictError, PathConflictError } from "./notes.js";
+export { ConflictError, PathConflictError, EmptyNoteError, MAX_BATCH_SIZE } from "./notes.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a
@@ -1272,6 +1301,26 @@ export class PreconditionRequiredError extends Error {
     this.name = "PreconditionRequiredError";
     this.note_id = noteId;
     this.note_path = notePath;
+  }
+}
+
+/**
+ * Thrown by `create-note` / `update-note` when a batch exceeds
+ * `MAX_BATCH_SIZE` (re-exported from `./notes.js` — single source of truth).
+ * Bounds the blast radius of a runaway client — see #213, where one MCP
+ * burst created 7,453 empty notes in minutes. Surfaces as 413 at the HTTP
+ * layer.
+ */
+export class BatchTooLargeError extends Error {
+  code = "BATCH_TOO_LARGE" as const;
+  limit: number;
+  got: number;
+
+  constructor(got: number) {
+    super(`batch_too_large: max ${MAX_BATCH_SIZE} notes per call, got ${got}`);
+    this.name = "BatchTooLargeError";
+    this.limit = MAX_BATCH_SIZE;
+    this.got = got;
   }
 }
 

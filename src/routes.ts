@@ -14,7 +14,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex, filterMetadata } from "../core/src/notes.ts";
+import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import {
@@ -307,6 +307,45 @@ export async function handleNotes(
       const body = await req.json() as any;
       const items: any[] = body.notes ?? [body];
 
+      // Batch cap (#213): refuse oversized batches before doing any work. 500
+      // is the cap (Benjamin's number) — tighter blast radius than 1000 for
+      // the runaway-client case that flooded a deployment with 7,453 notes.
+      if (items.length > MAX_BATCH_SIZE) {
+        return json(
+          {
+            error_type: "batch_too_large",
+            error: "BatchTooLarge",
+            message: `max ${MAX_BATCH_SIZE} notes per request, got ${items.length}`,
+            limit: MAX_BATCH_SIZE,
+          },
+          413,
+        );
+      }
+
+      // Empty-note pre-validation (#213): walk the batch first and reject the
+      // whole request if any item would be content+path empty. This makes
+      // mixed batches atomic for the empty-note case — no caller gets a
+      // half-applied batch where the prefix landed and the empty entry
+      // surfaced the 400. Mirrors the Store-level invariant exactly.
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const content = (item?.content ?? "").toString();
+        const rawPath = item?.path;
+        const pathEmpty = rawPath === undefined || rawPath === null
+          || (typeof rawPath === "string" && rawPath.trim() === "");
+        if (!content.trim() && pathEmpty) {
+          return json(
+            {
+              error_type: "empty_note",
+              error: "EmptyNoteError",
+              message: `empty_note: a note must have either content or a path (item index ${i})`,
+              item_index: i,
+            },
+            400,
+          );
+        }
+      }
+
       const created: Note[] = [];
       try {
         for (const item of items) {
@@ -334,6 +373,17 @@ export async function handleNotes(
           return json(
             { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
             409,
+          );
+        }
+        if (e && e.code === "EMPTY_NOTE") {
+          return json(
+            {
+              error_type: "empty_note",
+              error: "EmptyNoteError",
+              message: e.message,
+              item_index: e.item_index ?? null,
+            },
+            400,
           );
         }
         throw e;
@@ -628,6 +678,20 @@ export async function handleNotes(
         return json(
           { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
           409,
+        );
+      }
+      // Empty-note guard from the Store boundary (#213) — the proposed update
+      // would clear both content AND path. Surface as 400 so callers can fix
+      // the request without retrying.
+      if (e && e.code === "EMPTY_NOTE") {
+        return json(
+          {
+            error_type: "empty_note",
+            error: "EmptyNoteError",
+            message: e.message,
+            note_id: e.note_id ?? null,
+          },
+          400,
         );
       }
       throw e;

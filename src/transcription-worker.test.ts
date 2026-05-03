@@ -126,8 +126,13 @@ describe("transcription worker", () => {
   });
 
   test("no placeholder: replaces full body when stub is set", async () => {
+    // Voice memos have a path in production, so the empty-content path is
+    // legitimate (paired with the stub marker, the worker fills the body
+    // when the transcript lands). The Store's empty-note invariant (#213)
+    // requires content OR path; this is the path-only case.
     await store.createNote("", {
       id: "n3",
+      path: "memos/n3",
       metadata: { transcribe_stub: true },
     });
     seedAudio("memos/c.webm");

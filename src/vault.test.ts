@@ -1146,6 +1146,120 @@ describe("HTTP /notes", async () => {
       expect(res.status).toBe(405);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Empty-note guard + batch cap (#213) — runaway-client protection
+  // -------------------------------------------------------------------------
+
+  describe("empty-note guard (#213)", async () => {
+    test("POST bare {} body → 400 EmptyNoteError", async () => {
+      const res = await handleNotes(mkReq("POST", "/notes", {}), store, "");
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("empty_note");
+      expect(body.error).toBe("EmptyNoteError");
+    });
+
+    test("POST batch with one empty entry → 400 EmptyNoteError, NOTHING created (atomic)", async () => {
+      // Pre-validate the batch before any DB writes so a mixed batch with one
+      // bad entry rolls back the whole call. The runaway-client signature
+      // (#213) is "thousands of empties" — partial-create semantics would
+      // still leak the prefix on every burst. Atomic is the only safe shape.
+      const beforeCount = (await store.queryNotes({ path: "ok-1" })).length;
+      const res = await handleNotes(
+        mkReq("POST", "/notes", { notes: [{ path: "ok-1" }, {}] }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("empty_note");
+      expect(body.item_index).toBe(1);
+      // ok-1 must NOT have been created — atomic rollback.
+      const afterCount = (await store.queryNotes({ path: "ok-1" })).length;
+      expect(afterCount).toBe(beforeCount);
+    });
+
+    test("POST single content-only (path absent) → 201", async () => {
+      const res = await handleNotes(
+        mkReq("POST", "/notes", { content: "un-pathed jot" }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(201);
+    });
+
+    test("POST single path-only (content absent) → 201, no warning log", async () => {
+      // Path-only is a wikilink placeholder / `_schemas/*` shape — must
+      // remain accepted (per #223 design Q3).
+      const res = await handleNotes(
+        mkReq("POST", "/notes", { path: "wiki/placeholder" }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(201);
+    });
+
+    test("PATCH that would clear both content and path → 400 EmptyNoteError", async () => {
+      const note = await store.createNote("starts with content", { id: "ep1" });
+      const updated = await store.getNote("ep1");
+      const res = await handleNotes(
+        mkReq("PATCH", "/notes/ep1", {
+          content: "",
+          path: "",
+          if_updated_at: updated!.updatedAt,
+        }),
+        store,
+        "/ep1",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("empty_note");
+      expect(body.note_id).toBe("ep1");
+    });
+
+    test("PATCH that clears content but preserves path → 200", async () => {
+      const note = await store.createNote("body", { id: "ep2", path: "p2" });
+      const updated = await store.getNote("ep2");
+      const res = await handleNotes(
+        mkReq("PATCH", "/notes/ep2", {
+          content: "",
+          if_updated_at: updated!.updatedAt,
+        }),
+        store,
+        "/ep2",
+      );
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("batch cap (#213)", async () => {
+    test("POST with 501-item batch → 413 BatchTooLarge", async () => {
+      const oversized = Array.from({ length: 501 }, (_, i) => ({ content: `n${i}` }));
+      const res = await handleNotes(
+        mkReq("POST", "/notes", { notes: oversized }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(413);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("batch_too_large");
+      expect(body.error).toBe("BatchTooLarge");
+      expect(body.limit).toBe(500);
+    });
+
+    test("POST with exactly 500-item batch → 201 (boundary)", async () => {
+      const exactly500 = Array.from({ length: 500 }, (_, i) => ({ content: `n${i}` }));
+      const res = await handleNotes(
+        mkReq("POST", "/notes", { notes: exactly500 }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(201);
+      const body = await res.json() as any[];
+      expect(body).toHaveLength(500);
+    });
+  });
 });
 
 describe("HTTP GET /notes?format=graph", async () => {
