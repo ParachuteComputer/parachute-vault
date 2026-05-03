@@ -1009,7 +1009,10 @@ export async function handleTags(
       try {
         relationshipsPatch = tagSchemaOps.validateRelationships(body.relationships);
       } catch (err) {
-        return json({ error: (err as Error).message }, 400);
+        return json(
+          { error: (err as Error).message, error_type: "invalid_relationships" },
+          400,
+        );
       }
     }
 
