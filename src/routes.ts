@@ -23,6 +23,7 @@ import {
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
+import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
  * Tag-scope context threaded through handlers. `allowed` is the
@@ -170,7 +171,7 @@ export async function handleNotes(
         // Tag-scope: a token can't see what its allowlist excludes. Surface
         // as 404 (not 403) — the existence of the note is itself information
         // we shouldn't leak across the scope boundary.
-        if (!noteWithinTagScope(note, tagScope.allowed)) {
+        if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
           return json({ error: "Note not found", id }, 404);
         }
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
@@ -198,7 +199,7 @@ export async function handleNotes(
         // Tag-scope: drop any result the token isn't permitted to see. Filter
         // happens after the store query so an empty post-filter list still
         // returns 200 [] (consistent with "no matches"), not 403.
-        const results = filterNotesByTagScope(rawResults, tagScope.allowed);
+        const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const inclMeta = parseIncludeMetadata(url);
         let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
@@ -274,7 +275,7 @@ export async function handleNotes(
         const anchor = await resolveNote(store, nearNoteId);
         if (!anchor) return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
         // Tag-scope: anchor must itself be visible to this token.
-        if (!noteWithinTagScope(anchor, tagScope.allowed)) {
+        if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
           return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
         }
         const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
@@ -287,7 +288,7 @@ export async function handleNotes(
       // Tag-scope: drop any result outside the allowlist before shaping
       // output. Same semantics as the search path — empty result is 200 [],
       // not 403.
-      results = filterNotesByTagScope(results, tagScope.allowed);
+      results = filterNotesByTagScope(results, tagScope.allowed, tagScope.raw);
 
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
@@ -390,7 +391,7 @@ export async function handleNotes(
       // batch with an in-scope prefix.
       if (tagScope.allowed) {
         for (let i = 0; i < items.length; i++) {
-          if (!tagsWithinScope(items[i]?.tags, tagScope.allowed)) {
+          if (!tagsWithinScope(items[i]?.tags, tagScope.allowed, tagScope.raw)) {
             return tagScopeForbidden(tagScope.raw ?? []);
           }
         }
@@ -464,7 +465,7 @@ export async function handleNotes(
     if (method === "POST") {
       const note = await resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
-      if (!noteWithinTagScope(note, tagScope.allowed)) {
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found" }, 404);
       }
       const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
@@ -497,7 +498,7 @@ export async function handleNotes(
     if (method === "GET") {
       const note = await resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
-      if (!noteWithinTagScope(note, tagScope.allowed)) {
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found" }, 404);
       }
       return json(await store.getAttachments(note.id));
@@ -511,7 +512,7 @@ export async function handleNotes(
     if (method === "DELETE") {
       const note = await resolveNote(store, idOrPath);
       if (!note) return json({ error: "Not found" }, 404);
-      if (!noteWithinTagScope(note, tagScope.allowed)) {
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found" }, 404);
       }
       const result = await store.deleteAttachment(note.id, attId);
@@ -537,7 +538,7 @@ export async function handleNotes(
   if (method === "GET") {
     const note = await resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
-    if (!noteWithinTagScope(note, tagScope.allowed)) {
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found" }, 404);
     }
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
@@ -565,7 +566,7 @@ export async function handleNotes(
       // Tag-scope: existing note must be in scope. Mirror the read-side
       // 404-not-403 stance — a token can't see (and therefore can't
       // discover-then-modify) notes outside its allowlist.
-      if (!noteWithinTagScope(note, tagScope.allowed)) {
+      if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         throw new NotFoundError(`Note not found: "${idOrPath}"`);
       }
       const body = await req.json() as any;
@@ -577,7 +578,7 @@ export async function handleNotes(
         const removed = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
         const projected = new Set<string>((note.tags ?? []).filter((t) => !removed.has(t)));
         for (const t of (body.tags?.add as string[] | undefined) ?? []) projected.add(t);
-        if (!tagsWithinScope([...projected], tagScope.allowed)) {
+        if (!tagsWithinScope([...projected], tagScope.allowed, tagScope.raw)) {
           return tagScopeForbidden(tagScope.raw ?? []);
         }
       }
@@ -784,7 +785,7 @@ export async function handleNotes(
     if (!note) return json({ error: "Not found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the
     // same no-leak reason as the read paths.
-    if (!noteWithinTagScope(note, tagScope.allowed)) {
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
       return json({ error: "Not found" }, 404);
     }
     await store.deleteNote(note.id);
@@ -870,6 +871,27 @@ export async function handleTags(
         }
       }
     }
+    // Same dependency check as DELETE /tags/:name — merging consumes every
+    // source tag, so a source referenced by a tag-scoped token would orphan
+    // that token's allowlist. Aggregate matches across sources for a single
+    // 409 envelope.
+    const referenced: { source: string; tokens: { id: string; label: string }[] }[] = [];
+    const db = (store as any).db;
+    for (const src of sources) {
+      const tokens = findTokensReferencingTag(db, src as string);
+      if (tokens.length > 0) referenced.push({ source: src as string, tokens });
+    }
+    if (referenced.length > 0) {
+      return json(
+        {
+          error: "TagInUseByTokens",
+          error_type: "tag_in_use_by_tokens",
+          message: `Cannot merge: ${referenced.length} source tag(s) referenced by tag-scoped token(s); revoke or re-mint them first.`,
+          referenced_by: referenced,
+        },
+        409,
+      );
+    }
     const result = await store.mergeTags(sources, target);
     return json(result);
   }
@@ -946,6 +968,23 @@ export async function handleTags(
     if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
+    // Tag-scoped tokens reference root tags by name; deleting a referenced
+    // tag would silently orphan the token's allowlist. Fail closed (409)
+    // and name the offending tokens so the operator can revoke or re-mint
+    // before retrying. patterns/tag-scoped-tokens.md §Dependencies.
+    const referenced_by = findTokensReferencingTag((store as any).db, tagName);
+    if (referenced_by.length > 0) {
+      return json(
+        {
+          error: "TagInUseByTokens",
+          error_type: "tag_in_use_by_tokens",
+          message: `Tag "${tagName}" is referenced by ${referenced_by.length} tag-scoped token(s); revoke or re-mint them before deleting.`,
+          tag: tagName,
+          referenced_by,
+        },
+        409,
+      );
+    }
     await store.deleteTagSchema(tagName);
     return json(await store.deleteTag(tagName));
   }
@@ -973,12 +1012,12 @@ export async function handleFindPath(
   try {
     const sourceNote = await resolveNote(store, source);
     if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
-    if (!noteWithinTagScope(sourceNote, tagScope.allowed)) {
+    if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) {
       return json({ error: `Note not found: "${source}"` }, 404);
     }
     const targetNote = await resolveNote(store, target);
     if (!targetNote) return json({ error: `Note not found: "${target}"` }, 404);
-    if (!noteWithinTagScope(targetNote, tagScope.allowed)) {
+    if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) {
       return json({ error: `Note not found: "${target}"` }, 404);
     }
     const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
@@ -990,7 +1029,7 @@ export async function handleFindPath(
     if (result && tagScope.allowed) {
       for (const id of result.path) {
         const hop = await store.getNote(id);
-        if (!hop || !noteWithinTagScope(hop, tagScope.allowed)) {
+        if (!hop || !noteWithinTagScope(hop, tagScope.allowed, tagScope.raw)) {
           return json(null);
         }
       }

@@ -229,6 +229,36 @@ export function listTokens(db: Database): (Token & { id: string })[] {
 }
 
 /**
+ * Find tokens whose `scoped_tags` allowlist references the given root tag.
+ * Used by tag-delete and tag-merge to fail-closed (409) when removing a
+ * tag would silently orphan a tag-scoped token's allowlist entry.
+ *
+ * Returns display ID + label pairs (no token-hash exposure) so error
+ * envelopes can name the offending tokens for the operator. The match is
+ * exact on the root name — `scoped_tags` only ever stores roots per
+ * patterns/tag-scoped-tokens.md.
+ */
+export function findTokensReferencingTag(
+  db: Database,
+  tag: string,
+): { id: string; label: string }[] {
+  const rows = db.prepare(`
+    SELECT token_hash, label, scoped_tags
+    FROM tokens
+    WHERE scoped_tags IS NOT NULL
+  `).all() as { token_hash: string; label: string; scoped_tags: string | null }[];
+
+  const matches: { id: string; label: string }[] = [];
+  for (const row of rows) {
+    const tags = parseScopedTags(row.scoped_tags);
+    if (tags && tags.includes(tag)) {
+      matches.push({ id: `t_${row.token_hash.slice(7, 19)}`, label: row.label });
+    }
+  }
+  return matches;
+}
+
+/**
  * Revoke (delete) a token by its display ID or full hash.
  * Returns true if exactly one token was deleted.
  * If a display ID prefix matches multiple tokens, returns false (ambiguous).

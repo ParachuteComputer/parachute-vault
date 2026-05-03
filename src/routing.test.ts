@@ -1443,6 +1443,104 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(404);
   });
 
+  // ----- Q6: orphan-sub-tag fail-open ------------------------------------
+  // patterns/tag-scoped-tokens.md §Storage: when a sub-tag has no declared
+  // schema, the string-form root authorizes. Token allowlisted for `health`
+  // must see `#health/food` even when no `_tags/health/food` schema exists.
+
+  test("tag-scoped read token: orphan sub-tag is in scope via string-form root", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    // No `_tags/health/food` schema is created — this is the orphan case.
+    const orphan = await store.createNote("orphan", { tags: ["health/food"] });
+    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+
+    const path = `/vault/journal/api/notes/${orphan.id}`;
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("tag-scoped write token: orphan sub-tag write succeeds via string-form root", async () => {
+    createVault("journal");
+    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+
+    const path = "/vault/journal/api/notes";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "ok", tags: ["health/food"] }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(201);
+  });
+
+  // ----- Q5: tag-delete dependency check ---------------------------------
+  // Deleting a tag referenced by any token's scoped_tags would silently
+  // orphan the token's allowlist; fail closed with 409 + referenced_by.
+
+  test("DELETE /api/tags/:name → 409 when a tag-scoped token references it", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("h", { tags: ["health"] });
+    // Mint a tag-scoped token that references `health`, then try to delete
+    // `health` with an admin token.
+    mintTagScopedToken("journal", ["vault:read"], ["health"]);
+    const admin = createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/health";
+    const res = await route(authed(admin, "DELETE", path), path);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error_type?: string;
+      tag?: string;
+      referenced_by?: { id: string; label: string }[];
+    };
+    expect(body.error_type).toBe("tag_in_use_by_tokens");
+    expect(body.tag).toBe("health");
+    expect(body.referenced_by?.length).toBe(1);
+    expect(body.referenced_by?.[0]?.label).toBe("test-tag-scoped");
+  });
+
+  test("DELETE /api/tags/:name → 200 when no tag-scoped token references it", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("h", { tags: ["health"] });
+    const admin = createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/health";
+    const res = await route(authed(admin, "DELETE", path), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("POST /api/tags/merge → 409 when a tag-scoped token references a source", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("a", { tags: ["alpha"] });
+    await store.createNote("b", { tags: ["beta"] });
+    mintTagScopedToken("journal", ["vault:read"], ["alpha"]);
+    const admin = createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/merge";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" },
+        body: JSON.stringify({ sources: ["alpha"], target: "beta" }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error_type?: string;
+      referenced_by?: { source: string; tokens: { id: string; label: string }[] }[];
+    };
+    expect(body.error_type).toBe("tag_in_use_by_tokens");
+    expect(body.referenced_by?.[0]?.source).toBe("alpha");
+    expect(body.referenced_by?.[0]?.tokens?.length).toBe(1);
+  });
+
   test("CLI --read equivalent token (permission='read', scopes=[vault:read]) is read-only at the HTTP boundary", async () => {
     // This pins the end-to-end contract: a token minted the way
     // `parachute-vault tokens create --read` mints them actually refuses

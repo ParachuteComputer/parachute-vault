@@ -882,6 +882,105 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  // -- Q6: orphan sub-tag fail-open via string-form root ------------------
+
+  test("scoped query-notes sees orphan sub-tag via string-form root (no schema)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-orphan-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    // No `_tags/health/food` schema is created — the hierarchy is implicit.
+    const orphan = await store.createNote("orphan", { tags: ["health/food"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["health"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const res = await query.execute({ id: orphan.id }) as any;
+    // String-form fallback: `health/food` → root `health` → in allowlist.
+    expect(res.error).toBeUndefined();
+    expect(res.id).toBe(orphan.id);
+
+    closeAllStores();
+  });
+
+  test("scoped create-note allows orphan sub-tag via string-form root", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-orphan-write-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    getVaultStore(vaultName);
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["health"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+
+    const res = await create.execute({ content: "ok", tags: ["health/food"] }) as any;
+    expect(res.error).toBeUndefined();
+    expect(res.id).toBeDefined();
+
+    closeAllStores();
+  });
+
+  // -- Q5: MCP delete-tag dependency check -------------------------------
+
+  test("MCP delete-tag returns tag_in_use_by_tokens when a tag-scoped token references the tag", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+    const { generateToken, createToken } = await import("./token-store.ts");
+
+    const vaultName = `tagscope-dep-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("h", { tags: ["health"] });
+
+    // Mint a tag-scoped token that references "health".
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
+      label: "health-claw",
+      permission: "read",
+      scopes: ["vault:read"],
+      scoped_tags: ["health"],
+    });
+
+    // Unscoped admin attempts to delete `health` via MCP — should 409.
+    const tools = generateScopedMcpTools(vaultName);
+    const del = tools.find((t) => t.name === "delete-tag")!;
+    const res = await del.execute({ tag: "health" }) as any;
+    expect(res.error).toBe("TagInUseByTokens");
+    expect(res.error_type).toBe("tag_in_use_by_tokens");
+    expect(res.tag).toBe("health");
+    expect(res.referenced_by?.length).toBe(1);
+    expect(res.referenced_by?.[0]?.label).toBe("health-claw");
+
+    // Tag is still attached to its note.
+    expect((await store.listTags()).find((t) => t.name === "health")).toBeTruthy();
+
+    closeAllStores();
+  });
+
+  test("MCP delete-tag proceeds when no token references the tag", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-nodep-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("h", { tags: ["health"] });
+
+    const tools = generateScopedMcpTools(vaultName);
+    const del = tools.find((t) => t.name === "delete-tag")!;
+    const res = await del.execute({ tag: "health" }) as any;
+    expect(res.error).toBeUndefined();
+
+    closeAllStores();
+  });
+
   test("update-note tags.add auto-populate does not bump updatedAt", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");

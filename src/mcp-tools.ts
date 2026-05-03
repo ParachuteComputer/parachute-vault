@@ -16,6 +16,7 @@ import {
   noteWithinTagScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
+import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
  * Get the MCP server instruction for a vault.
@@ -51,9 +52,37 @@ export function generateScopedMcpTools(vaultName: string, auth?: AuthResult): Mc
   const tools = generateMcpTools(store);
 
   overrideVaultInfo(tools, vaultName, auth);
+  applyTagDependencyGuards(tools, vaultName);
   applyTagScopeWrappers(tools, vaultName, auth);
 
   return tools;
+}
+
+/**
+ * Tag-delete and (future) tag-merge always check for tag-scoped tokens
+ * referencing the doomed tag — regardless of whether the *deleter* is
+ * itself tag-scoped. A successful delete that orphans an allowlist would
+ * silently widen surface area downstream. Mirrors the REST 409
+ * `tag_in_use_by_tokens` envelope.
+ */
+function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void {
+  const store = getVaultStore(vaultName);
+  wrapReadTool(tools, "delete-tag", async (orig, params) => {
+    const tag = (params as any).tag ?? (params as any).name;
+    if (typeof tag === "string") {
+      const referenced_by = findTokensReferencingTag(store.db, tag);
+      if (referenced_by.length > 0) {
+        return {
+          error: "TagInUseByTokens",
+          error_type: "tag_in_use_by_tokens",
+          message: `Tag "${tag}" is referenced by ${referenced_by.length} tag-scoped token(s); revoke or re-mint them before deleting.`,
+          tag,
+          referenced_by,
+        };
+      }
+    }
+    return await orig(params);
+  });
 }
 
 /**
@@ -95,10 +124,10 @@ function applyTagScopeWrappers(
     if (!allowed) return result;
     // Single-note shape (`{...note}` with `id`) vs list shape (array).
     if (Array.isArray(result)) {
-      return result.filter((n: any) => noteWithinTagScope(n, allowed));
+      return result.filter((n: any) => noteWithinTagScope(n, allowed, rawTags));
     }
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
-      return noteWithinTagScope(result as any, allowed)
+      return noteWithinTagScope(result as any, allowed, rawTags)
         ? result
         : { error: "Note not found", id: (result as any).id };
     }
@@ -119,7 +148,7 @@ function applyTagScopeWrappers(
     const ids = (result as any).path as string[];
     for (const id of ids) {
       const note = await store.getNote(id);
-      if (!note || !noteWithinTagScope(note, allowed)) {
+      if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
         return null;
       }
     }
@@ -134,7 +163,7 @@ function applyTagScopeWrappers(
     const anchorId = (params as any).id ?? (params as any).note_id;
     if (anchorId) {
       const anchor = await store.getNote(anchorId as string);
-      if (!anchor || !noteWithinTagScope(anchor, allowed)) {
+      if (!anchor || !noteWithinTagScope(anchor, allowed, rawTags)) {
         return { error: "Note not found", id: anchorId };
       }
     }
@@ -144,7 +173,7 @@ function applyTagScopeWrappers(
     // filter pattern here.
     if (result && typeof result === "object" && Array.isArray((result as any).neighbors)) {
       (result as any).neighbors = (result as any).neighbors.filter((n: any) =>
-        noteWithinTagScope(n, allowed),
+        noteWithinTagScope(n, allowed, rawTags),
       );
     }
     return result;
@@ -174,7 +203,7 @@ function applyTagScopeWrappers(
       : [params];
     for (const item of items) {
       const itemTags = Array.isArray((item as any).tags) ? ((item as any).tags as string[]) : [];
-      if (!tagsWithinScope(itemTags, allowed)) {
+      if (!tagsWithinScope(itemTags, allowed, rawTags)) {
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
       }
     }
@@ -191,13 +220,13 @@ function applyTagScopeWrappers(
       const id = (item as any).id ?? (item as any).note_id;
       if (!id) continue;
       const existing = await store.getNote(id as string);
-      if (!existing || !noteWithinTagScope(existing, allowed)) {
+      if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
         return { error: "Note not found", id };
       }
       const removed = new Set<string>((item as any).tags?.remove ?? []);
       const projected = new Set<string>((existing.tags ?? []).filter((t) => !removed.has(t)));
       for (const t of ((item as any).tags?.add ?? []) as string[]) projected.add(t);
-      if (!tagsWithinScope([...projected], allowed)) {
+      if (!tagsWithinScope([...projected], allowed, rawTags)) {
         return forbidden("update-note: post-update tag set must satisfy the token's allowlist");
       }
     }
@@ -210,7 +239,7 @@ function applyTagScopeWrappers(
     const id = (params as any).id ?? (params as any).note_id;
     if (id) {
       const existing = await store.getNote(id as string);
-      if (!existing || !noteWithinTagScope(existing, allowed)) {
+      if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
         return { error: "Note not found", id };
       }
     }

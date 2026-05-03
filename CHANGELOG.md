@@ -22,6 +22,11 @@ Tag-scoped tokens land — Phase 1 per `parachute-patterns/patterns/tag-scoped-t
 
 - **Schema bumped 12 → 13.** Migration is `ALTER TABLE tokens ADD COLUMN scoped_tags TEXT` on every per-vault DB. Existing rows are untouched (= unscoped). Verified safe on byte-identical copies of three production vault DBs — idempotent, all existing tokens migrated cleanly with `NULL scoped_tags`.
 
+### Fixed (post-PR fold)
+
+- **Orphan sub-tag fail-open: a token allowlisted for `health` now sees `#health/food` even when no `_tags/health/food` schema declares the hierarchy.** The Phase 1 enforcement only matched via the schema-driven `expandTagsWithDescendants` set, which fails closed for the common case where a sub-tag exists in the wild without an explicit `_tags/<sub>` config note. `noteWithinTagScope` and `tagsWithinScope` now take a third parameter, the raw root allowlist, and check `tagOnNote.split("/")[0] ∈ rawRoots` as a fallback. Schema-driven matches still win first (cheap `Set.has`); the string-form fallback only runs when the expanded set misses. Mirrors patterns#26's §Storage canonical contract.
+- **Tag-delete and tag-merge now fail closed (409) when a tag-scoped token references the doomed tag.** Previously a successful `DELETE /vault/<name>/api/tags/:name` (or a `POST /api/tags/merge` consuming the source) would silently orphan the token's allowlist — the row would still match the tag string but no notes would carry it. New `findTokensReferencingTag(db, tag)` helper walks the tokens table; the REST DELETE handler, the `/tags/merge` handler (per source), and the MCP `delete-tag` wrapper return `{error: "TagInUseByTokens", error_type: "tag_in_use_by_tokens", tag, referenced_by: [{id, label}, ...]}` with a `409`. The MCP wrapper runs unconditionally (not gated on the deleter being scoped) — any token deleting a referenced tag is the orphan case. Operator must revoke or re-mint the offending tokens before retrying.
+
 ## [0.3.6-rc.1] — 2026-04-26
 
 Vault becomes a pure OAuth resource server: hub-issued JWTs are now accepted alongside legacy `pvt_*` opaque tokens. RC track — promotion to `@latest` follows validation against a real hub.
