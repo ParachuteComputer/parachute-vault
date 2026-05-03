@@ -36,6 +36,16 @@ export function createNote(
   const metadata = opts?.metadata ? JSON.stringify(opts.metadata) : "{}";
   const path = normalizePath(opts?.path);
 
+  // Empty-note invariant (#213): reject `content+path both absent`. Three
+  // legit shapes — content-only, path-only, both — only the empty+empty
+  // combo is the runaway-client signature that flooded a deployment with
+  // 7,453 pathless empty notes in one MCP burst. `content` only is a
+  // legitimate un-pathed jot; `path` only is a wikilink placeholder or
+  // `_schemas/*` config note.
+  if (!content.trim() && path === null) {
+    throw new EmptyNoteError();
+  }
+
   // `updated_at` is set to `created_at` on insert so a client whose optimistic
   // concurrency check falls back to `createdAt` on a never-updated note
   // (the common shape: `note.updatedAt ?? note.createdAt`) matches the stored
@@ -138,6 +148,29 @@ export class PathConflictError extends Error {
 }
 
 /**
+ * Thrown by `createNote` / `updateNote` when the proposed note state has
+ * neither content nor path. The vault accepts un-pathed jots (content only)
+ * and path-only placeholders (wikilink stubs, `_schemas/*`), but a note
+ * with neither is the runaway-client signature flagged in #213 — one MCP
+ * burst flooded a deployment with 7,453 empty pathless rows. Surfaces as
+ * 400 at the HTTP layer.
+ */
+export class EmptyNoteError extends Error {
+  code = "EMPTY_NOTE" as const;
+  note_id: string | null;
+
+  constructor(noteId: string | null = null) {
+    super(
+      noteId
+        ? `empty_note: update would leave note "${noteId}" with neither content nor path`
+        : `empty_note: a note must have either content or a path`,
+    );
+    this.name = "EmptyNoteError";
+    this.note_id = noteId;
+  }
+}
+
+/**
  * Match bun:sqlite's UNIQUE-constraint error on the notes.path index. The
  * error class is `SQLiteError` but matching on the message is sufficient
  * here — the index name and column are stable parts of the schema, and
@@ -182,6 +215,37 @@ export function updateNote(
     throw new Error(
       "update-note: `content` is mutually exclusive with `append`/`prepend`. Pick full-replace or additive — not both in the same call.",
     );
+  }
+
+  // Empty-note invariant (#213): when this update touches content or path,
+  // reject if the post-state would be empty content + null path. We only
+  // enforce on transitions that actually touch the relevant fields, so
+  // metadata-only or tag-only updates against legacy empty rows still pass.
+  // Hook-style writes (skipUpdatedAt) are exempted — they're machine-level
+  // marker writes that legitimately may run against any shape of row.
+  const touchesContent = updates.content !== undefined
+    || updates.append !== undefined
+    || updates.prepend !== undefined;
+  const touchesPath = updates.path !== undefined;
+  if ((touchesContent || touchesPath) && !updates.skipUpdatedAt) {
+    const current = getNote(db, id);
+    if (current) {
+      let finalContent: string;
+      if (updates.content !== undefined) {
+        finalContent = updates.content;
+      } else if (touchesContent) {
+        finalContent = (updates.prepend ?? "") + current.content + (updates.append ?? "");
+      } else {
+        finalContent = current.content;
+      }
+      const finalPath = touchesPath ? normalizePath(updates.path) : (current.path ?? null);
+      if (!finalContent.trim() && !finalPath) {
+        throw new EmptyNoteError(id);
+      }
+    }
+    // If `current` is null we fall through — existing code paths handle the
+    // missing-row case downstream (the conditional UPDATE returns 0 rows;
+    // OC throws ConflictError; non-OC returns silently).
   }
 
   const sets: string[] = [];

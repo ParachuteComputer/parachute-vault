@@ -187,6 +187,66 @@ describe("notes", async () => {
     expect(updated.content).toBe("edited");
     expect(updated.path).toBe("a");
   });
+
+  // -------------------------------------------------------------------------
+  // Empty-note invariant at the Store boundary (#213)
+  // -------------------------------------------------------------------------
+
+  it("createNote rejects content+path both absent → EmptyNoteError", async () => {
+    await expect(store.createNote("")).rejects.toMatchObject({ code: "EMPTY_NOTE" });
+    await expect(store.createNote("   ")).rejects.toMatchObject({ code: "EMPTY_NOTE" });
+    await expect(store.createNote("", { metadata: { x: 1 } })).rejects.toMatchObject({
+      code: "EMPTY_NOTE",
+    });
+  });
+
+  it("createNote accepts content-only (un-pathed jot)", async () => {
+    const n = await store.createNote("just a jot");
+    expect(n.content).toBe("just a jot");
+    expect(n.path).toBeUndefined();
+  });
+
+  it("createNote accepts path-only (wikilink placeholder / _schemas/* shape)", async () => {
+    const n = await store.createNote("", { path: "wiki/placeholder" });
+    expect(n.content).toBe("");
+    expect(n.path).toBe("wiki/placeholder");
+  });
+
+  it("updateNote rejects clearing both content and path → EmptyNoteError", async () => {
+    const n = await store.createNote("body", { path: "p" });
+    await expect(
+      store.updateNote(n.id, { content: "", path: "", if_updated_at: n.createdAt }),
+    ).rejects.toMatchObject({ code: "EMPTY_NOTE", note_id: n.id });
+  });
+
+  it("updateNote rejects clearing content when path is already null", async () => {
+    const n = await store.createNote("body");
+    await expect(
+      store.updateNote(n.id, { content: "", if_updated_at: n.createdAt }),
+    ).rejects.toMatchObject({ code: "EMPTY_NOTE" });
+  });
+
+  it("updateNote allows clearing content when path is set (or being set)", async () => {
+    const n = await store.createNote("body", { path: "p" });
+    const updated = await store.updateNote(n.id, { content: "", if_updated_at: n.createdAt });
+    expect(updated.content).toBe("");
+    expect(updated.path).toBe("p");
+  });
+
+  it("updateNote with metadata-only update against a (legacy) empty row passes", async () => {
+    // Tag/metadata-only updates don't touch content or path, so they don't
+    // trigger the new guard — important so any pre-existing empty rows
+    // (from before #213) can still be cleaned up via metadata operations.
+    const n = await store.createNote("seed", { path: "x" });
+    // Simulate a legacy row by directly clearing content via SQL (bypasses
+    // the guard); this mirrors what an old data row could look like.
+    db.prepare("UPDATE notes SET content = '', path = NULL WHERE id = ?").run(n.id);
+    const updated = await store.updateNote(n.id, {
+      metadata: { tag: "cleanup" },
+      if_updated_at: n.createdAt,
+    });
+    expect(updated.metadata).toMatchObject({ tag: "cleanup" });
+  });
 });
 
 // ---- Backfill migration: legacy rows with NULL updated_at ----
@@ -2445,6 +2505,71 @@ describe("MCP tools", async () => {
 
     expect(r1.map((n) => n.content).sort()).toEqual(["a"]);
     expect(r2.map((n) => n.content).sort()).toEqual(["a"]);
+  });
+
+  // ---- empty-note + batch-cap MCP regressions (#213) ----
+
+  it("create-note rejects bare empty content with no path (EMPTY_NOTE)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    let err: any;
+    try {
+      await createNote.execute({ content: "" });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("EMPTY_NOTE");
+  });
+
+  it("create-note batch rejects when any entry is empty content + no path", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    let err: any;
+    try {
+      await createNote.execute({
+        notes: [
+          { content: "ok" },
+          { content: "" },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("EMPTY_NOTE");
+  });
+
+  it("create-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const notes = Array.from({ length: 501 }, (_, i) => ({ content: `n${i}` }));
+    let err: any;
+    try {
+      await createNote.execute({ notes });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("BATCH_TOO_LARGE");
+    expect(err.limit).toBe(500);
+    expect(err.got).toBe(501);
+  });
+
+  it("update-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const notes = Array.from({ length: 501 }, (_, i) => ({
+      id: `id${i}`,
+      content: "x",
+      force: true,
+    }));
+    let err: any;
+    try {
+      await updateNote.execute({ notes });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("BATCH_TOO_LARGE");
+    expect(err.limit).toBe(500);
+    expect(err.got).toBe(501);
   });
 });
 

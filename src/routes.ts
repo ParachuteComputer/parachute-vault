@@ -124,6 +124,9 @@ class NotFoundError extends Error {
   }
 }
 
+/** Per-request item cap on POST /notes batches (#213). */
+const MAX_BATCH_SIZE = 500;
+
 // ---------------------------------------------------------------------------
 // Notes — GET/POST/PATCH/DELETE /api/notes[/:idOrPath]
 // ---------------------------------------------------------------------------
@@ -307,6 +310,21 @@ export async function handleNotes(
       const body = await req.json() as any;
       const items: any[] = body.notes ?? [body];
 
+      // Batch cap (#213): refuse oversized batches before doing any work. 500
+      // is the cap (Benjamin's number) — tighter blast radius than 1000 for
+      // the runaway-client case that flooded a deployment with 7,453 notes.
+      if (items.length > MAX_BATCH_SIZE) {
+        return json(
+          {
+            error_type: "batch_too_large",
+            error: "BatchTooLarge",
+            message: `max ${MAX_BATCH_SIZE} notes per request, got ${items.length}`,
+            limit: MAX_BATCH_SIZE,
+          },
+          413,
+        );
+      }
+
       const created: Note[] = [];
       try {
         for (const item of items) {
@@ -334,6 +352,12 @@ export async function handleNotes(
           return json(
             { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
             409,
+          );
+        }
+        if (e && e.code === "EMPTY_NOTE") {
+          return json(
+            { error_type: "empty_note", error: "EmptyNoteError", message: e.message },
+            400,
           );
         }
         throw e;
@@ -628,6 +652,20 @@ export async function handleNotes(
         return json(
           { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
           409,
+        );
+      }
+      // Empty-note guard from the Store boundary (#213) — the proposed update
+      // would clear both content AND path. Surface as 400 so callers can fix
+      // the request without retrying.
+      if (e && e.code === "EMPTY_NOTE") {
+        return json(
+          {
+            error_type: "empty_note",
+            error: "EmptyNoteError",
+            message: e.message,
+            note_id: e.note_id ?? null,
+          },
+          400,
         );
       }
       throw e;

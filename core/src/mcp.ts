@@ -375,6 +375,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
 
+        if (items.length > MAX_BATCH_SIZE) {
+          throw new BatchTooLargeError(items.length);
+        }
+
         const created: Note[] = [];
         for (const item of items) {
           const note = await store.createNote(item.content as string ?? "", {
@@ -520,6 +524,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       execute: async (params) => {
         const batch = params.notes as any[] | undefined;
         const items = batch ?? [params];
+
+        if (items.length > MAX_BATCH_SIZE) {
+          throw new BatchTooLargeError(items.length);
+        }
 
         const updated: Note[] = [];
         for (const item of items) {
@@ -1272,6 +1280,28 @@ export class PreconditionRequiredError extends Error {
     this.name = "PreconditionRequiredError";
     this.note_id = noteId;
     this.note_path = notePath;
+  }
+}
+
+/** Per-call item cap on `create-note` and `update-note` batches (#213). */
+export const MAX_BATCH_SIZE = 500;
+
+/**
+ * Thrown by `create-note` / `update-note` when a batch exceeds
+ * `MAX_BATCH_SIZE`. The cap exists to bound the blast radius of a runaway
+ * client — see #213, where one MCP burst created 7,453 empty notes in
+ * minutes. Surfaces as 413 at the HTTP layer.
+ */
+export class BatchTooLargeError extends Error {
+  code = "BATCH_TOO_LARGE" as const;
+  limit: number;
+  got: number;
+
+  constructor(got: number) {
+    super(`batch_too_large: max ${MAX_BATCH_SIZE} notes per call, got ${got}`);
+    this.name = "BatchTooLargeError";
+    this.limit = MAX_BATCH_SIZE;
+    this.got = got;
   }
 }
 
