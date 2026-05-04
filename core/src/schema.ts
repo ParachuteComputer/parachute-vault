@@ -210,7 +210,12 @@ CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
 CREATE INDEX IF NOT EXISTS idx_schema_mappings_match ON schema_mappings(match_kind, match_value);
-CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name);
+-- idx_tokens_vault_name is created in migrateToV16, not here. SCHEMA_SQL
+-- runs BEFORE migrations; an upgrading v15 vault doesn't yet have the
+-- vault_name column when this section evaluates, so the index has to
+-- live downstream of the ALTER TABLE that adds the column. Fresh vaults
+-- (column already present from this CREATE TABLE) still get the index
+-- because migrateToV16 also runs the unconditional CREATE INDEX path.
 `;
 
 /**
@@ -691,17 +696,29 @@ function migrateToV15(db: Database): void {
  */
 function migrateToV16(db: Database): void {
   if (!hasTable(db, "tokens")) return;
-  if (hasColumn(db, "tokens", "vault_name")) return;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    db.exec("ALTER TABLE tokens ADD COLUMN vault_name TEXT");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name)");
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
+  // Two responsibilities, separated so the index lands for both fresh
+  // vaults (SCHEMA_SQL already created the column) and upgrading v15
+  // vaults (column missing). Index creation lives outside the wrapped
+  // ALTER block so a fresh vault — where the column exists but the index
+  // doesn't — still gets it.
+  if (!hasColumn(db, "tokens", "vault_name")) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec("ALTER TABLE tokens ADD COLUMN vault_name TEXT");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name)");
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    return;
   }
+
+  // Column exists (fresh vault from SCHEMA_SQL, or post-upgrade vault).
+  // Make sure the index exists too. IF NOT EXISTS makes this a no-op on
+  // the steady-state path.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name)");
 }
 
 function hasTable(db: Database, name: string): boolean {

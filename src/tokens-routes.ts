@@ -7,7 +7,10 @@
  * narrowed). POST mints a new pvt_* token with caller-narrowed scopes and
  * returns the plaintext exactly once. GET lists existing tokens (metadata
  * only — no plaintext, no hash). DELETE revokes by display id (`t_…`); a
- * non-existent id still returns 200 to avoid leaking which ids exist.
+ * non-existent id returns 404; an id that resolves to a different
+ * vault's binding returns **403** (per #257 spec — silent 200 on
+ * cross-vault revoke would let an operator believe a token was
+ * revoked while it kept working from its owning vault).
  *
  * Scope narrowing is enforced as a strict subset check via
  * `validateMintedScopes` — defense-in-depth even with the admin gate, so a
@@ -321,19 +324,56 @@ function parseScopedTagsJSON(raw: string | null): string[] | null {
 }
 
 function revokeHandler(db: Database, vaultName: string, id: string): Response {
-  // Always 200, never leak whether the id existed. Ambiguous prefix matches
-  // are treated the same (revokeToken returns false; we ignore it). The 12-
-  // char hex prefix collision space is large enough that organic ambiguity
-  // is effectively impossible, and security-significant ambiguity would
-  // require a chosen-prefix attack against SHA-256.
+  // Per-vault scope (v16, per #257 spec): pre-check the row's vault binding
+  // before deleting so we can distinguish three cases:
   //
-  // Per-vault scope (v16): only revoke when the row belongs to THIS vault
-  // (or is legacy NULL / server-wide — the operator can revoke those from
-  // any vault's admin surface, since they authenticate cross-vault). A
-  // crafted DELETE for a token bound to a different vault is a no-op,
-  // mirroring the "always 200" behavior. The list endpoint already
-  // filters out cross-vault rows, so this is defense-in-depth against
-  // direct API use.
+  //   - row missing entirely → 404 (the id never existed in this vault's DB)
+  //   - row exists, vault_name = <other> → 403 with descriptive error
+  //   - row exists, vault_name = <this> OR NULL → DELETE + 200
+  //
+  // The non-leakage argument for "always 200" doesn't hold given that GET
+  // /vault/<name>/tokens already exposes the full vault-scoped + legacy-NULL
+  // listing — so existence isn't being protected. 403 over silent 200 is the
+  // operator-debuggable shape: clicking "revoke" and seeing success while the
+  // token still works (because it's bound to a different vault) is the worst
+  // UX. Tell the operator which vault owns it.
+  //
+  // Ambiguous prefix matches: the pre-check uses the same prefix shape as the
+  // DELETE, so a prefix that hits multiple rows is treated as "found" if any
+  // row matches the calling vault. The 12-char hex prefix collision space is
+  // large enough that organic ambiguity is effectively impossible, and
+  // security-significant ambiguity would require a chosen-prefix attack
+  // against SHA-256.
+  let row: { vault_name: string | null } | null;
+  if (id.startsWith("t_")) {
+    const hashPrefix = id.slice(2);
+    row = db.prepare(`
+      SELECT vault_name FROM tokens
+      WHERE token_hash LIKE ?
+      LIMIT 1
+    `).get(`sha256:${hashPrefix}%`) as { vault_name: string | null } | null;
+  } else {
+    row = db.prepare(`
+      SELECT vault_name FROM tokens
+      WHERE token_hash = ?
+      LIMIT 1
+    `).get(id) as { vault_name: string | null } | null;
+  }
+
+  if (!row) {
+    return Response.json({ error: "Not found", message: "no token with that id" }, { status: 404 });
+  }
+
+  if (row.vault_name !== null && row.vault_name !== vaultName) {
+    return Response.json(
+      {
+        error: "Forbidden",
+        message: `token belongs to vault '${row.vault_name}', not '${vaultName}'; revoke it from that vault's admin surface`,
+      },
+      { status: 403 },
+    );
+  }
+
   if (id.startsWith("t_")) {
     const hashPrefix = id.slice(2);
     db.prepare(`
