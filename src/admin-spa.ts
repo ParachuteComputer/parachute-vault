@@ -104,6 +104,21 @@ export async function serveAdminSpa(spaDistDir: string, pathname: string): Promi
   //   /vault/foo/admin/      → "/"
   //   /vault/foo/admin/x.js  → "/x.js"
   const sub = pathname.replace(ADMIN_SPA_MOUNT_RE, "");
+
+  // Canonicalize the bare mount → trailing-slash form. Vite emits
+  // *relative* asset URLs (`./assets/index-abc.js`) since `<name>` isn't
+  // known at build time, and browsers resolve relative URLs against the
+  // **directory** of the current document — not the document itself. So:
+  //   /vault/foo/admin/  → asset resolves to /vault/foo/admin/assets/...  ✓
+  //   /vault/foo/admin   → asset resolves to /vault/foo/assets/...        ✗
+  // Without this redirect, the bare-form URL hub#162 generates (per
+  // `resolveManagementUrl` — strip trailing slash, append `/admin`)
+  // would 404 every asset against the per-vault auth wall, and the SPA
+  // would never boot. Same canonicalization the notes-server `--mount`
+  // path does for the same reason.
+  if (sub === "") {
+    return Response.redirect(`${pathname}/`, 301);
+  }
   const indexPath = join(spaDistDir, "index.html");
 
   // Empty / mount-root / any non-asset request → SPA shell. The router

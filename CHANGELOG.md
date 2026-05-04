@@ -21,6 +21,10 @@ vault#252 — remount the admin SPA from origin-rooted `/admin/*` to per-vault `
 - **`web/ui/scripts/verify-base.mjs` asserts `./assets/` (was `/admin/assets/`).** Same drift check, adapted to the new relative-base contract; the override skip-condition now matches `VITE_BASE_PATH=./`.
 - **`web/ui/CLAUDE.md` mount-aware contract section + lib/auth.ts JSDoc** updated to document the per-vault mount, runtime basename detection, and the new "Manage" link shape (`<hub-origin>/vault/<name>/admin#token=…`).
 
+### Fixed
+
+- **`serveAdminSpa` redirects bare `/vault/<name>/admin` → `/vault/<name>/admin/` (301).** Browsers resolve relative URLs against the **directory** of the current document, not the document URL itself — so Vite's `./assets/index-abc.js` resolves correctly only when the SPA is loaded with a trailing slash. Hub's `resolveManagementUrl` (`web/ui/src/lib/api.ts`) generates the bare form (strip trailing slash, append `/admin`), which means without this canonicalization the SPA bundle's asset URLs would resolve to `/vault/<name>/assets/...` and 404 against the per-vault auth wall — the SPA would never boot. Same shape the notes-server uses for its `--mount` canonicalization. Reviewer-caught blocker on the initial #252 push; the redirect ships in the same PR. New regression test in `admin-spa.test.ts` pins the 301 + Location header so future refactors can't silently regress the asset-resolution contract.
+
 ### Tests
 
 - `src/admin-spa.test.ts` — 8 new cases for the per-vault regex (matches `/vault/<name>/admin[/...]`, rejects `/vault/<name>/admin-foo`, `/vault/<name>`, origin-rooted `/admin/*`, percent-encoded vault names strip cleanly).

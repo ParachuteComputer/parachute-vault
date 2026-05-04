@@ -70,17 +70,22 @@ describe("serveAdminSpa", () => {
     expect(body).toContain("bun run build");
   });
 
-  test("/vault/<name>/admin returns the SPA index", async () => {
+  test("bare /vault/<name>/admin redirects to trailing-slash form (301)", async () => {
+    // Vite's relative asset URLs (./assets/...) resolve against the
+    // *directory* of the current document — without a trailing slash,
+    // /vault/foo/admin's directory is /vault/foo/ and assets 404 against
+    // the per-vault auth wall. Hub's resolveManagementUrl generates the
+    // bare form, so this redirect is the load-bearing canonicalization.
     const res = await serveAdminSpa(fixtureDir, "/vault/work/admin");
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/html");
-    expect(await res.text()).toContain("shell");
+    expect(res.status).toBe(301);
+    expect(res.headers.get("Location")).toBe("/vault/work/admin/");
   });
 
   test("/vault/<name>/admin/ returns the SPA index", async () => {
     const res = await serveAdminSpa(fixtureDir, "/vault/work/admin/");
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("shell");
   });
 
   test("client-routed path (no extension) falls through to index.html", async () => {

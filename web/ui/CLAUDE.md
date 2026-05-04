@@ -1,14 +1,15 @@
 # Vault admin web UI
 
 Vite + React + TypeScript SPA mounted per-vault at `/vault/<name>/admin/`
-on the running vault server. Phase A (vault#216) ships the scaffold +
-per-vault detail page; Phase B (#217) adds tokens (list / mint / revoke
-+ read-only fallback for non-admin sessions); Phase C (#218) surfaces a
-forward-pointing link from each vault's detail page to hub's permissions
-UI (hub#162; grants live in hub's grants table — modular play is "vault
-links to hub" rather than "vault inlines hub data"). Vault#252 moved the
-mount from origin-rooted `/admin/*` to `/vault/<name>/admin/*` so the
-SPA is reachable through hub's `/vault/<name>/*` proxy.
+on the running vault server. Phase A (vault#219, closes #216) ships the
+scaffold + per-vault detail page; Phase B (vault#220, closes #217) adds
+tokens (list / mint / revoke + read-only fallback for non-admin sessions);
+Phase C (vault#222, closes #218) surfaces a forward-pointing link from
+each vault's detail page to hub's permissions UI (hub#162; grants live in
+hub's grants table — modular play is "vault links to hub" rather than
+"vault inlines hub data"). Vault#252 moved the mount from origin-rooted
+`/admin/*` to `/vault/<name>/admin/*` so the SPA is reachable through
+hub's `/vault/<name>/*` proxy.
 
 ## Mount-aware contract
 
@@ -48,10 +49,14 @@ consumes a hub-issued JWT that carries a `vault:<name>:admin` scope —
 the canonical token shape per scope-narrowing-and-audience.
 
 The token reaches the SPA via URL fragment (`#token=…`), which the hub
-appends when its directory page renders the "Manage" link to vault's
-`managementUrl: "/admin"` (relative to `/vault/<name>` per the module
-protocol — so the full URL is `/vault/<name>/admin#token=…`). On
-bootstrap (`main.tsx`) the SPA calls
+appends when its directory page renders the "Manage" link. Vault's
+module info declares `managementUrl: "/admin"`; per the module protocol
+that string is interpreted **relative to** the module URL `/vault/<name>`
+— hub's `resolveManagementUrl` joins them — so the resulting click
+target is `/vault/<name>/admin#token=…`. (Vault doesn't expose an
+origin-rooted `/admin` route post-vault#252; the literal `/admin` only
+lives in the module-info string and gets resolved against the per-vault
+module URL.) On bootstrap (`main.tsx`) the SPA calls
 `lib/auth.ts:captureTokenFromFragment()`:
 
 1. Read `window.location.hash`, parse `token`.
