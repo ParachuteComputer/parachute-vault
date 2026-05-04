@@ -6,6 +6,14 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.6-rc.34] — 2026-05-04
+
+vault#248 — wrap the v13 → v14 migration in an explicit `BEGIN IMMEDIATE / COMMIT` transaction so a crash mid-migration leaves the DB in either pre-v14 or post-v14 state, never half-migrated. Surfaced during review of vault#245: every step in `migrateToV14` is individually idempotent (ALTER TABLE adds are guarded by `hasColumn`, data copies are upsert-and-update, the final `DROP TABLE tag_schemas` is guarded by `hasTable`), but the failure mode wasn't specified — a future reader could remove the guards thinking "we have transactions now." Wrapping the body makes the guarantee explicit; the idempotent guards become belt-and-suspenders.
+
+### Fixed
+
+- **`migrateToV14` body wrapped in `BEGIN IMMEDIATE / COMMIT` with try/catch ROLLBACK.** Mirrors the v15 transaction wrap that landed in rc.32. The early-return guard (`if (!hasTable(db, "tags")) return`) stays outside the envelope — if there's no `tags` table at all, there's nothing to roll back. Inside: ALTERs, two data copies (`tag_schemas` → `tags`; `_tags/<name>` notes → `tags.parent_names`), the timestamp backfill, and the final `DROP TABLE tag_schemas` all live inside one envelope; a thrown exception in any step rolls back the whole migration. Modern SQLite (3.6+ via bun:sqlite) supports DDL inside transactions, so ALTER and DROP both honor the rollback. New regression test (`crash mid-migration rolls back to pre-migration state, then retry succeeds`) injects a throw on `DROP TABLE tag_schemas`, asserts the DB returns to pre-v13 shape (tag_schemas table present with rows intact, tags has `(name)` only, `_tags/voice` note untouched), then drops the injection and re-runs `initSchema` — convergence to the same final post-v14 state as a clean run.
+
 ## [0.3.6-rc.33] — 2026-05-03
 
 vault#249 reviewer-fold pass: tighten the auth boundary on the new `/api/note-schemas` (+ matching MCP tools) so tag-scoped tokens can't enumerate or write `tag`-kind `schema_mappings` outside their allowlist, fix the `migrateToV15` short-circuit to use `||` instead of `&&` (a vault with schemas but zero mappings is a valid state — the buggy condition re-scanned `_schema_defaults` on every boot), and refresh the `resolveApplicableSchemas` JSDoc to point at `note_schemas` instead of the retired `_schemas/<name>` convention. No data shape or version-bump trigger; rc.33 carries the reviewer feedback only.
