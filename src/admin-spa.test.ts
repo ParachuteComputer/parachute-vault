@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { isAdminSpaPath, serveAdminSpa } from "./admin-spa.ts";
@@ -127,5 +127,35 @@ describe("serveAdminSpa", () => {
     const body = await res.text();
     expect(body).toContain("shell");
     expect(body).not.toContain("root:");
+  });
+});
+
+describe("hub <-> vault managementUrl contract", () => {
+  // Browsers drop the URL fragment when following a 301 (RFC 7231 SHOULD
+  // preserve, but Chrome/Firefox/Safari are inconsistent in practice). The
+  // hub-issued JWT travels in `#token=...`, so a redirected click loses the
+  // token and the SPA boots unauthenticated. Hub's resolveManagementUrl joins
+  // the per-vault module URL with module.json's `managementUrl` verbatim — if
+  // it ends with "/" the canonical click target is `/vault/<name>/admin/`
+  // (no redirect, fragment preserved). Without the trailing slash hub emits
+  // `/vault/<name>/admin`, the server 301s, and the fragment is gone.
+  test("module.json managementUrl ends with '/' so hub emits the no-redirect form", () => {
+    const moduleJson = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", ".parachute", "module.json"), "utf8"),
+    );
+    expect(moduleJson.managementUrl).toMatch(/\/$/);
+  });
+
+  test("the canonical hub-emitted URL serves the SPA shell directly (no 301)", async () => {
+    // Mirror hub's resolveManagementUrl shape: per-vault module URL +
+    // managementUrl. With managementUrl="/admin/" the result is
+    // /vault/<name>/admin/ — which serveAdminSpa returns as 200, not 301.
+    const moduleJson = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", ".parachute", "module.json"), "utf8"),
+    );
+    const canonical = `/vault/work${moduleJson.managementUrl}`;
+    const res = await serveAdminSpa(fixtureDir, canonical);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Location")).toBeNull();
   });
 });
