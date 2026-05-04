@@ -6,6 +6,20 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.6-rc.36] — 2026-05-04
+
+vault#252 follow-up — fix URL doubling under per-vault mount. The rc.35 SPA used `<Navigate to="/vault/<name>" replace />` from the `/` route to jump operators landing at `/vault/<name>/admin/` straight to the vault detail page. Under React Router v6 with `<BrowserRouter basename="/vault/<name>/admin">`, paths in `<Navigate to>` and `<Link to>` are basename-relative absolute paths — so the redirect resolved to `/vault/<name>/admin/vault/<name>` (basename + path), and the operator landed on a doubled URL with no matching route, falling through to the auth-required shell. The redirect was the wrong shape: the SPA needs different routes per mount mode, not a clever redirect.
+
+### Fixed
+
+- **`web/ui/src/App.tsx` switches the route table on mount mode instead of redirecting.** When `getMountedVaultName()` returns a name (per-vault mount), the route table is `{ "/" → VaultDetail, "/tokens" → VaultTokens }` with the mounted vault name passed as a prop. When it returns null (legacy `/admin/*` or stand-alone), the table is the original picker tree (`{ "/" → VaultsList, "/vault/:name" → VaultDetail, "/vault/:name/tokens" → VaultTokens }`). No `<Navigate>` anywhere — the route table answers the URL directly. Nav-bar's vault-name link points at `/` under per-vault mount (was `/vault/<name>` — the same doubling).
+- **`VaultDetail` and `VaultTokens` accept an optional `vaultName` prop, fall back to `useParams()`.** Per-vault mount passes the prop straight through (no `:name` segment exists under `basename="/vault/<name>/admin"`); stand-alone reads it from the URL params. The presence of the prop also picks the inner-Link shape — `/tokens` vs `/vault/<name>/tokens` from VaultDetail's Manage section, `/` vs `/vault/<name>` for VaultTokens's "← Vault detail" back-link. Picking the wrong shape re-introduces the doubled-URL bug, so the choice is local to where the link is emitted.
+- **Back-to-vaults links suppressed under per-vault mount.** The hub doesn't proxy `/vaults/list`, so a "← Back to vaults" link under per-vault mount would land on a broken picker. The auth-required banner already directs the operator back to the hub directory; that's the actual remediation path.
+
+### Tests
+
+- `web/ui/src/App.test.tsx` (new) — 8 cases pinning the mount-mode split: per-vault mount renders `VaultDetail` directly at `/` (no redirect, no doubled URL), emits the Tokens link as `/tokens` (NOT `/vault/<name>/tokens`), and renders `VaultTokens` at `/tokens`; stand-alone mount keeps the picker-then-detail tree with the full `/vault/<name>` shape. The Tokens-link href assertion is the explicit regression pin — under `<BrowserRouter basename="/vault/<name>/admin">` the wrong shape would re-introduce the bug.
+
 ## [0.3.6-rc.35] — 2026-05-03
 
 vault#252 — remount the admin SPA from origin-rooted `/admin/*` to per-vault `/vault/<name>/admin/*` so it's reachable through hub's `/vault/<name>/*` proxy. The hub doesn't proxy origin-rooted paths, which left an operator clicking "Manage Vault" on the hub directory landing on a 401-walled vault metadata endpoint instead of the SPA. Three layers move in lockstep — the server's static-file dispatch, the React Router runtime basename, and Vite's asset-base — so the same compiled bundle works at any per-vault mount without a rebuild.

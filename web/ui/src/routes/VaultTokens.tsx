@@ -37,8 +37,15 @@ type LoadState =
 
 const KNOWN_SCOPE_VERBS = ["read", "write", "admin"] as const;
 
-export function VaultTokens() {
-  const { name } = useParams<{ name: string }>();
+export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
+  // Per-vault mount passes `vaultName` directly (no `:name` segment under
+  // `basename="/vault/<name>/admin"`); stand-alone `/vault/:name/tokens`
+  // reads it from useParams. The presence of the prop also picks the
+  // detail-link shape — `/` under per-vault, `/vault/<name>` stand-alone.
+  const params = useParams<{ name: string }>();
+  const name = vaultName ?? params.name;
+  const isPerVaultMount = vaultName !== undefined;
+  const detailHref = isPerVaultMount ? "/" : `/vault/${encodeURIComponent(name ?? "")}`;
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [minted, setMinted] = useState<MintTokenResult | null>(null);
   const [confirmingRevokeId, setConfirmingRevokeId] = useState<string | null>(null);
@@ -87,7 +94,7 @@ export function VaultTokens() {
       <div>
         <h2>Tokens</h2>
         <p className="muted">Missing vault name.</p>
-        <Link to="/">← Back to vaults</Link>
+        {isPerVaultMount ? null : <Link to="/">← Back to vaults</Link>}
       </div>
     );
   }
@@ -100,7 +107,7 @@ export function VaultTokens() {
         <h2>
           Tokens for <code>{name}</code>
         </h2>
-        <Link to={`/vault/${encodeURIComponent(name)}`} className="muted">
+        <Link to={detailHref} className="muted">
           ← Vault detail
         </Link>
       </div>

@@ -23,8 +23,18 @@ type State =
   | { kind: "missing" }
   | { kind: "error"; message: string };
 
-export function VaultDetail() {
-  const { name } = useParams<{ name: string }>();
+export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
+  // Two callers: the per-vault mount passes `vaultName` straight through
+  // (no `:name` segment exists under `basename="/vault/<name>/admin"`);
+  // the stand-alone `/vault/:name` route reads it from useParams. The
+  // presence of the prop also tells us which Link shape to emit — under
+  // per-vault mount the tokens sub-route is `/tokens`; under stand-alone
+  // it's `/vault/<name>/tokens`. Picking the wrong one re-introduces the
+  // doubled-URL bug that motivated this refactor.
+  const params = useParams<{ name: string }>();
+  const name = vaultName ?? params.name;
+  const isPerVaultMount = vaultName !== undefined;
+  const tokensHref = isPerVaultMount ? "/tokens" : `/vault/${encodeURIComponent(name ?? "")}/tokens`;
   const [state, setState] = useState<State>({ kind: "loading" });
 
   useEffect(() => {
@@ -79,7 +89,7 @@ export function VaultDetail() {
           Open this page from the hub's directory — the "Manage" link supplies the admin token. Direct loads of{" "}
           <code>/vault/{name}/admin</code> can't see protected vault data.
         </div>
-        <Link to="/">← Back to vaults</Link>
+        {isPerVaultMount ? null : <Link to="/">← Back to vaults</Link>}
       </div>
     );
   }
@@ -91,7 +101,7 @@ export function VaultDetail() {
         <p className="muted">
           No vault named <code>{name}</code> is registered on this server.
         </p>
-        <Link to="/">← Back to vaults</Link>
+        {isPerVaultMount ? null : <Link to="/">← Back to vaults</Link>}
       </div>
     );
   }
@@ -105,7 +115,7 @@ export function VaultDetail() {
         <div className="error-banner">
           <code>{state.message}</code>
         </div>
-        <Link to="/">← Back to vaults</Link>
+        {isPerVaultMount ? null : <Link to="/">← Back to vaults</Link>}
       </div>
     );
   }
@@ -118,9 +128,11 @@ export function VaultDetail() {
         <h2>
           Vault <code>{vault.name}</code>
         </h2>
-        <Link to="/" className="muted">
-          ← All vaults
-        </Link>
+        {isPerVaultMount ? null : (
+          <Link to="/" className="muted">
+            ← All vaults
+          </Link>
+        )}
       </div>
 
       <div className="kv section">
@@ -174,7 +186,7 @@ export function VaultDetail() {
         <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>Manage</h3>
         <ul className="manage-list">
           <li>
-            <Link to={`/vault/${encodeURIComponent(vault.name)}/tokens`}>Tokens →</Link>
+            <Link to={tokensHref}>Tokens →</Link>
             <span className="dim"> mint, list, and revoke <code>pvt_*</code> tokens</span>
           </li>
           <PermissionsLink vaultName={vault.name} />
