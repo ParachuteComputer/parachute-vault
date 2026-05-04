@@ -218,40 +218,79 @@ describe("GET /vaults/list (public discovery)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// /admin/* — admin SPA static-file mount. Detailed tests live in
-// admin-spa.test.ts (with a tmp dist dir); these only pin the dispatch
-// — i.e. /admin paths reach the SPA layer rather than falling through to
-// the per-vault dispatcher's "Not found".
+// /vault/<name>/admin/* — admin SPA static-file mount. Detailed tests live
+// in admin-spa.test.ts (with a tmp dist dir); these pin the dispatch — i.e.
+// the SPA layer fires *before* the per-vault dispatcher swallows the path.
+// Per-vault mount (vault#252): the SPA used to live at /admin/* but is now
+// scoped under each vault so it's reachable through hub's /vault/<name>/*
+// proxy.
 // ---------------------------------------------------------------------------
 
-describe("/admin/* SPA mount", () => {
-  test("/admin/ never returns the per-vault dispatcher's 404 JSON", async () => {
+describe("/vault/<name>/admin/* SPA mount", () => {
+  test("/vault/<name>/admin/ never returns the per-vault dispatcher's 404 JSON", async () => {
     // dist may or may not be built in CI; the dispatch check just asserts
     // that we don't fall through to the catch-all. Both 200 (dist present)
     // and 503 (dist absent) are valid SPA-layer responses.
-    const req = new Request("http://localhost:1940/admin/");
-    const res = await route(req, "/admin/");
+    createVault("work");
+    const req = new Request("http://localhost:1940/vault/work/admin/");
+    const res = await route(req, "/vault/work/admin/");
     expect(res.status === 200 || res.status === 503).toBe(true);
     expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
   });
 
-  test("/admin/vault/work (client-routed path) reaches the SPA layer", async () => {
-    const req = new Request("http://localhost:1940/admin/vault/work");
-    const res = await route(req, "/admin/vault/work");
+  test("/vault/<name>/admin/tokens (client-routed path) reaches the SPA layer", async () => {
+    createVault("work");
+    const req = new Request("http://localhost:1940/vault/work/admin/tokens");
+    const res = await route(req, "/vault/work/admin/tokens");
     expect(res.status === 200 || res.status === 503).toBe(true);
     expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
   });
 
-  test("POST /admin/ returns 405 (no admin SPA writes today)", async () => {
-    const req = new Request("http://localhost:1940/admin/", { method: "POST" });
-    const res = await route(req, "/admin/");
+  test("/vault/<name>/admin fires the SPA layer even when the vault doesn't exist", async () => {
+    // Admin-spa dispatch sits *before* the per-vault config check — the SPA
+    // shell is static and surfaces its own auth-required state, so 404'ing
+    // here would just hide the operator's typo behind the SPA layer's own
+    // empty-state. Belt-and-braces: the SPA layer never reads vault config.
+    const req = new Request("http://localhost:1940/vault/ghost/admin/");
+    const res = await route(req, "/vault/ghost/admin/");
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  test("POST /vault/<name>/admin/ returns 405 (no admin SPA writes today)", async () => {
+    createVault("work");
+    const req = new Request("http://localhost:1940/vault/work/admin/", { method: "POST" });
+    const res = await route(req, "/vault/work/admin/");
     expect(res.status).toBe(405);
   });
 
-  test("/administrative does NOT match the admin mount (falls through to 404)", async () => {
-    const req = new Request("http://localhost:1940/administrative");
-    const res = await route(req, "/administrative");
+  test("/vault/<name>/admin-foo does NOT match the admin mount", async () => {
+    // Falls through to the per-vault dispatcher; the auth wall there 401s
+    // before any route lookup runs, which is exactly the signal that the
+    // SPA layer didn't swallow this path. (Same shape as /api/notes below.)
+    createVault("work");
+    const req = new Request("http://localhost:1940/vault/work/admin-foo");
+    const res = await route(req, "/vault/work/admin-foo");
+    expect(res.status).toBe(401);
+  });
+
+  test("origin-rooted /admin (legacy mount retired) returns 404", async () => {
+    // Pre-vault#252 the SPA was at /admin/*. Routing now lets that fall
+    // through to the catch-all — hub's directory page should link to
+    // /vault/<name>/admin instead.
+    const req = new Request("http://localhost:1940/admin/");
+    const res = await route(req, "/admin/");
     expect(res.status).toBe(404);
+  });
+
+  test("/vault/<name>/api/notes still reaches the per-vault API (not the SPA)", async () => {
+    // Regression: the SPA mount must not shadow the existing API surface.
+    // No auth here — the per-vault dispatcher 401s, which is exactly the
+    // signal that the request reached the API layer rather than the SPA.
+    createVault("work");
+    const req = new Request("http://localhost:1940/vault/work/api/notes");
+    const res = await route(req, "/vault/work/api/notes");
+    expect(res.status).toBe(401);
   });
 });
 

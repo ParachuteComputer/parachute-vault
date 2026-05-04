@@ -1,10 +1,17 @@
 /**
- * Admin SPA mount. Serves `web/ui/dist/` under `/admin/*`.
+ * Admin SPA mount. Serves `web/ui/dist/` under `/vault/<name>/admin/*`.
  *
  * The vault HTTP server hosts an admin SPA (vault#216) co-located in the
  * source tree at `web/ui/`. Vite produces the bundle in `web/ui/dist/`
  * (gitignored — built locally before publish, or by a release pipeline).
  * This module turns the bundle into a static-file response.
+ *
+ * Per-vault mount (vault#252): the SPA lives under `/vault/<name>/admin/*`
+ * rather than the origin-rooted `/admin/*` it shipped with. The hub only
+ * proxies `/vault/<name>/*` paths (per parachute-patterns/module-protocol),
+ * so an origin-rooted SPA is unreachable through the hub. Asset URLs are
+ * relative (Vite `base: "./"`), so the same bundle works at any mount
+ * point — no rebuild per vault.
  *
  * Mirrors `parachute-hub/src/hub-server.ts:serveSpa` — the conventions
  * (strip mount, asset-shape filter, `.html` fallthrough for client routes)
@@ -14,7 +21,12 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const ADMIN_SPA_MOUNT = "/admin";
+/**
+ * Regex anchoring the per-vault SPA mount. Matches `/vault/<name>/admin`
+ * exactly and any subpath under it. The `<name>` capture is reused by the
+ * prefix-strip below — keep the two in sync if this regex moves.
+ */
+const ADMIN_SPA_MOUNT_RE = /^\/vault\/([^/]+)\/admin(?=\/|$)/;
 
 /**
  * Resolve the default SPA bundle dir. Anchored to this file's location so
@@ -87,8 +99,11 @@ export async function serveAdminSpa(spaDistDir: string, pathname: string): Promi
       { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }
-  // Strip the mount prefix; "/admin" → "", "/admin/" → "/", "/admin/x" → "/x".
-  const sub = pathname === ADMIN_SPA_MOUNT ? "" : pathname.slice(ADMIN_SPA_MOUNT.length);
+  // Strip the mount prefix:
+  //   /vault/foo/admin       → ""
+  //   /vault/foo/admin/      → "/"
+  //   /vault/foo/admin/x.js  → "/x.js"
+  const sub = pathname.replace(ADMIN_SPA_MOUNT_RE, "");
   const indexPath = join(spaDistDir, "index.html");
 
   // Empty / mount-root / any non-asset request → SPA shell. The router
@@ -122,9 +137,10 @@ export async function serveAdminSpa(spaDistDir: string, pathname: string): Promi
 }
 
 /**
- * Match `/admin` or `/admin/...`. Bare `/administrative-thing` must not
- * trigger this — only the mount root and its true subpaths.
+ * Match `/vault/<name>/admin` or `/vault/<name>/admin/...`. Bare
+ * `/vault/<name>/admin-foo` and `/vault/<name>` (the metadata endpoint)
+ * must NOT trigger this — only the SPA mount root and its true subpaths.
  */
 export function isAdminSpaPath(pathname: string): boolean {
-  return pathname === ADMIN_SPA_MOUNT || pathname.startsWith(`${ADMIN_SPA_MOUNT}/`);
+  return ADMIN_SPA_MOUNT_RE.test(pathname);
 }

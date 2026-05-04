@@ -254,12 +254,14 @@ export async function route(
     });
   }
 
-  // Admin SPA — origin-rooted at `/admin/*`. Static-file serving only
-  // (index.html + Vite asset bundle); no auth at this seam since the bundle
-  // reveals nothing privileged. The SPA's data fetches land on existing
-  // per-vault routes that enforce `vault:<name>:read` / `:admin`. GET-only —
-  // POSTs to `/admin/*` aren't a thing the SPA bundle exposes; rejecting
-  // them here keeps surprises out.
+  // Admin SPA — per-vault at `/vault/<name>/admin/*` (vault#252). Static-
+  // file serving only (index.html + Vite asset bundle); no auth at this
+  // seam since the bundle reveals nothing privileged. The SPA's data
+  // fetches land on existing per-vault routes that enforce
+  // `vault:<name>:read` / `:admin`. GET-only — POSTs to `.../admin/*` aren't
+  // a thing the SPA bundle exposes; rejecting them here keeps surprises
+  // out. Must fire BEFORE the per-vault dispatch below or the auth wall
+  // there would short-circuit the static-asset response.
   if (isAdminSpaPath(path)) {
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
