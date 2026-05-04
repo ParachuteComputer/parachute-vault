@@ -433,6 +433,11 @@ function TokenRow({
         <div className="name">
           <strong>{token.label}</strong>
           <code className="dim">{token.id}</code>
+          {token.vault_name === null ? (
+            <code className="scope-tag" title="Pre-v16 token, not bound to any vault. Usable across vaults this session can see.">
+              server-wide
+            </code>
+          ) : null}
         </div>
         <div className="meta">
           <span className="dim">scopes:</span>{" "}

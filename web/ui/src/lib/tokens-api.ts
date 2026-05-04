@@ -24,6 +24,12 @@ export interface TokenSummary {
    * see patterns/tag-scoped-tokens.md.
    */
   scoped_tags: string[] | null;
+  /**
+   * Vault binding (schema v16). `null` = legacy server-wide token (pre-v16
+   * mint or explicitly minted with `--all`). Non-null = bound to that
+   * single vault; the server rejects cross-vault use.
+   */
+  vault_name: string | null;
   expires_at: string | null;
   created_at: string;
   last_used_at: string | null;
