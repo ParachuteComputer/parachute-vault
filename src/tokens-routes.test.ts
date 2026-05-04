@@ -425,6 +425,60 @@ describe("GET /vault/<name>/tokens — list", () => {
     const res = await getTokens("journal", reader);
     expect(res.status).toBe(403);
   });
+
+  test("v16: list returns vault-bound tokens + legacy NULL, never tokens bound to other vaults", async () => {
+    // Per the per-vault token storage migration (vault#257): the SPA at
+    // /vault/<name>/admin/tokens must show only THIS vault's tokens. Mixing
+    // tokens from sibling vaults — the bug Aaron flagged — would re-introduce
+    // the cross-vault leak the migration is meant to close.
+    createVault("journal");
+    createVault("work");
+    const journalAdmin = mintAdminToken("journal");
+
+    // Mint a vault-bound token via the endpoint (so it carries vault_name="journal").
+    const journalMint = (await (await postTokens("journal", journalAdmin, {
+      label: "journal-bound",
+    })).json()) as { id: string };
+
+    // Plant a cross-vault token directly in journal's DB (vault_name="work").
+    // This shouldn't happen via normal mint paths after #257, but the filter
+    // must still hide it — defense-in-depth against future bugs / manual
+    // SQL.
+    const journalStore = getVaultStore("journal");
+    const { fullToken: crossBound } = generateToken();
+    createToken(journalStore.db, crossBound, {
+      label: "work-bound-leak",
+      permission: "full",
+      scopes: ["vault:read"],
+      vault_name: "work",
+    });
+
+    // Plant a legacy NULL-bound token (pre-v16 / YAML-imported shape).
+    const { fullToken: legacy } = generateToken();
+    createToken(journalStore.db, legacy, {
+      label: "legacy-server-wide",
+      permission: "read",
+      scopes: ["vault:read"],
+      // vault_name omitted → NULL.
+    });
+
+    const res = await getTokens("journal", journalAdmin);
+    const body = (await res.json()) as {
+      tokens: Array<{ id: string; label: string; vault_name: string | null }>;
+    };
+    const labels = body.tokens.map((t) => t.label).sort();
+    expect(labels).toContain("journal-bound");
+    expect(labels).toContain("legacy-server-wide");
+    expect(labels).toContain("test-admin"); // the mintAdminToken seed
+    expect(labels).not.toContain("work-bound-leak");
+
+    // Each surfaced row carries its vault_name (null for legacy, "journal"
+    // for the bound one) so the SPA can render a "server-wide" badge.
+    const journalRow = body.tokens.find((t) => t.id === journalMint.id);
+    expect(journalRow!.vault_name).toBe("journal");
+    const legacyRow = body.tokens.find((t) => t.label === "legacy-server-wide");
+    expect(legacyRow!.vault_name).toBeNull();
+  });
 });
 
 describe("DELETE /vault/<name>/tokens/<id> — revoke", () => {

@@ -28,7 +28,6 @@ import type { SqliteStore } from "../core/src/store.ts";
 import {
   generateToken,
   createToken,
-  revokeToken,
   normalizePermission,
   type TokenPermission,
 } from "./token-store.ts";
@@ -76,13 +75,13 @@ export async function handleTokens(
   subpath: string,
 ): Promise<Response> {
   if (subpath === "" || subpath === "/") {
-    if (req.method === "GET") return listHandler(store.db);
+    if (req.method === "GET") return listHandler(store.db, vaultName);
     if (req.method === "POST") return mintHandler(req, store, vaultName, callerScopes, callerScopedTags);
     return methodNotAllowed();
   }
   const idMatch = subpath.match(/^\/([^/]+)$/);
   if (idMatch && idMatch[1]) {
-    if (req.method === "DELETE") return revokeHandler(store.db, idMatch[1]);
+    if (req.method === "DELETE") return revokeHandler(store.db, vaultName, idMatch[1]);
     return methodNotAllowed();
   }
   return Response.json({ error: "Not found" }, { status: 404 });
@@ -234,6 +233,11 @@ async function mintHandler(
     scopes: requested,
     scoped_tags: scopedTags,
     expires_at: expiresAt,
+    // Per-vault binding (v16): tokens minted via /vault/<name>/tokens are
+    // pinned to that vault. authenticateVaultRequest rejects them at any
+    // other vault. NULL would be legacy / server-wide; reserved for the
+    // YAML-import path and explicit --all CLI mints (see vault#257).
+    vault_name: vaultName,
   });
 
   // Display id mirrors `listTokens`: `t_` + first 12 chars of the SHA-256
@@ -248,6 +252,7 @@ async function mintHandler(
       permission: created.permission,
       scopes: requested,
       scoped_tags: scopedTags,
+      vault_name: created.vault_name,
       expires_at: created.expires_at,
       created_at: created.created_at,
     },
@@ -255,19 +260,28 @@ async function mintHandler(
   );
 }
 
-function listHandler(db: Database): Response {
+function listHandler(db: Database, vaultName: string): Response {
   // Direct SELECT (rather than reusing `listTokens`) so we can include the
   // `scopes` and `scoped_tags` columns without changing the existing
   // CLI-facing shape that goes through `listTokens`.
+  //
+  // Per-vault filter (v16): rows where vault_name matches THIS vault, plus
+  // legacy server-wide rows (vault_name IS NULL). The latter authenticate
+  // cross-vault by design; the operator should see them in any vault's
+  // admin UI to revoke. Tokens bound to a different vault never appear
+  // here — this is the SPA-side fix for vault#257.
   const rows = db.prepare(`
-    SELECT token_hash, label, permission, scopes, scoped_tags, expires_at, created_at, last_used_at
-    FROM tokens ORDER BY created_at DESC
-  `).all() as {
+    SELECT token_hash, label, permission, scopes, scoped_tags, vault_name, expires_at, created_at, last_used_at
+    FROM tokens
+    WHERE vault_name = ? OR vault_name IS NULL
+    ORDER BY created_at DESC
+  `).all(vaultName) as {
     token_hash: string;
     label: string;
     permission: string;
     scopes: string | null;
     scoped_tags: string | null;
+    vault_name: string | null;
     expires_at: string | null;
     created_at: string;
     last_used_at: string | null;
@@ -280,6 +294,7 @@ function listHandler(db: Database): Response {
       permission: normalizePermission(r.permission),
       scopes: parseScopes(r.scopes),
       scoped_tags: parseScopedTagsJSON(r.scoped_tags),
+      vault_name: r.vault_name,
       expires_at: r.expires_at,
       created_at: r.created_at,
       last_used_at: r.last_used_at,
@@ -305,12 +320,33 @@ function parseScopedTagsJSON(raw: string | null): string[] | null {
   }
 }
 
-function revokeHandler(db: Database, id: string): Response {
+function revokeHandler(db: Database, vaultName: string, id: string): Response {
   // Always 200, never leak whether the id existed. Ambiguous prefix matches
   // are treated the same (revokeToken returns false; we ignore it). The 12-
   // char hex prefix collision space is large enough that organic ambiguity
   // is effectively impossible, and security-significant ambiguity would
   // require a chosen-prefix attack against SHA-256.
-  revokeToken(db, id);
+  //
+  // Per-vault scope (v16): only revoke when the row belongs to THIS vault
+  // (or is legacy NULL / server-wide — the operator can revoke those from
+  // any vault's admin surface, since they authenticate cross-vault). A
+  // crafted DELETE for a token bound to a different vault is a no-op,
+  // mirroring the "always 200" behavior. The list endpoint already
+  // filters out cross-vault rows, so this is defense-in-depth against
+  // direct API use.
+  if (id.startsWith("t_")) {
+    const hashPrefix = id.slice(2);
+    db.prepare(`
+      DELETE FROM tokens
+      WHERE token_hash LIKE ?
+        AND (vault_name = ? OR vault_name IS NULL)
+    `).run(`sha256:${hashPrefix}%`, vaultName);
+  } else {
+    db.prepare(`
+      DELETE FROM tokens
+      WHERE token_hash = ?
+        AND (vault_name = ? OR vault_name IS NULL)
+    `).run(id, vaultName);
+  }
   return Response.json({ revoked: true });
 }
