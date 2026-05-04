@@ -8,7 +8,10 @@
  * directory page renders the "Manage" link to vault's managementUrl.
  *
  * Flow:
- *   1. Hub renders "Manage" → navigates to `<vault-origin>/admin/#token=<jwt>`.
+ *   1. Hub renders "Manage" → navigates to
+ *      `<hub-origin>/vault/<name>/admin/#token=<jwt>` (vault#252 per-vault
+ *      mount; the bundle is reachable through hub's `/vault/<name>/*`
+ *      proxy).
  *   2. SPA bootstrap calls `captureTokenFromFragment()`, which reads the
  *      fragment, stashes the token in module-scoped state, and rewrites the
  *      URL with `history.replaceState` so a refresh / copy-paste / screenshot

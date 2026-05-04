@@ -6,6 +6,31 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.6-rc.35] — 2026-05-03
+
+vault#252 — remount the admin SPA from origin-rooted `/admin/*` to per-vault `/vault/<name>/admin/*` so it's reachable through hub's `/vault/<name>/*` proxy. The hub doesn't proxy origin-rooted paths, which left an operator clicking "Manage Vault" on the hub directory landing on a 401-walled vault metadata endpoint instead of the SPA. Three layers move in lockstep — the server's static-file dispatch, the React Router runtime basename, and Vite's asset-base — so the same compiled bundle works at any per-vault mount without a rebuild.
+
+### Changed
+
+- **`src/admin-spa.ts:isAdminSpaPath` regex + `serveAdminSpa` strip.** New mount regex `/^\/vault\/([^/]+)\/admin(?=\/|$)/` matches `/vault/<name>/admin` and any subpath under it (assets, client-routed paths). The strip-prefix collapses to `pathname.replace(MOUNT_RE, "")` so `/vault/foo/admin/assets/x.js` maps to `/assets/x.js` against the same `dist/` directory. Bare `/vault/<name>/admin-foo` and `/vault/<name>` (the metadata endpoint) explicitly do not trigger the SPA — only the mount root and its true subpaths. Routing test `/vault/<name>/api/notes` still reaches the per-vault API (regression pin).
+- **`src/routing.ts` admin-spa dispatch must fire BEFORE per-vault dispatch.** Already the case, but the comment block now spells out why — the per-vault auth wall would otherwise short-circuit static-asset responses with a 401 JSON body. The legacy origin-rooted `/admin/*` no longer matches anything; falls through to the catch-all 404. Hub's directory page links to `/vault/<name>/admin#token=…` post-hub#162-realignment.
+- **`web/ui/src/lib/mount.ts` (new): runtime basename detection.** `getMountedVaultName()` extracts `<name>` from `window.location.pathname`; `getBasename()` returns the matching React Router basename (`/vault/<name>/admin`, with percent-encoding preserved so it matches the URL byte-for-byte). Legacy fallback to `/admin` for dev served at the old mount; empty string for stand-alone root. Mirrors hub#173's dual-mount basename detection on the hub side.
+- **`web/ui/src/main.tsx` BrowserRouter basename pulled from `getBasename()`.** No longer reads `import.meta.env.BASE_URL` since the build base is now relative — and the runtime mount is per-vault anyway, which can't be baked at build time.
+- **`web/ui/src/App.tsx` redirects `/` to `/vault/<name>` when mounted under a specific vault.** The generic vault picker (`VaultsList`) calls `/vaults/list`, which hub doesn't proxy — so when reached via the hub proxy the picker would show an empty/erroring list. Per-vault mount jumps straight to the detail page using `<Navigate to="/vault/<name>" replace />`. Nav-bar label switches to the vault name (`<code>boulder</code>`) under per-vault mount instead of the generic "Vaults" link. Legacy `/admin/*` and stand-alone root mounts still get the picker.
+- **`web/ui/vite.config.ts` `base: "./"` (was `/admin/`).** Asset URLs resolve relative to wherever `index.html` was served, so the same bundle works at any `/vault/<name>/admin/` mount without a rebuild. `VITE_BASE_PATH` override still works for stand-alone dev (`VITE_BASE_PATH=/`).
+- **`web/ui/scripts/verify-base.mjs` asserts `./assets/` (was `/admin/assets/`).** Same drift check, adapted to the new relative-base contract; the override skip-condition now matches `VITE_BASE_PATH=./`.
+- **`web/ui/CLAUDE.md` mount-aware contract section + lib/auth.ts JSDoc** updated to document the per-vault mount, runtime basename detection, and the new "Manage" link shape (`<hub-origin>/vault/<name>/admin#token=…`).
+
+### Fixed
+
+- **`serveAdminSpa` redirects bare `/vault/<name>/admin` → `/vault/<name>/admin/` (301).** Browsers resolve relative URLs against the **directory** of the current document, not the document URL itself — so Vite's `./assets/index-abc.js` resolves correctly only when the SPA is loaded with a trailing slash. Hub's `resolveManagementUrl` (`web/ui/src/lib/api.ts`) generates the bare form (strip trailing slash, append `/admin`), which means without this canonicalization the SPA bundle's asset URLs would resolve to `/vault/<name>/assets/...` and 404 against the per-vault auth wall — the SPA would never boot. Same shape the notes-server uses for its `--mount` canonicalization. Reviewer-caught blocker on the initial #252 push; the redirect ships in the same PR. New regression test in `admin-spa.test.ts` pins the 301 + Location header so future refactors can't silently regress the asset-resolution contract.
+
+### Tests
+
+- `src/admin-spa.test.ts` — 8 new cases for the per-vault regex (matches `/vault/<name>/admin[/...]`, rejects `/vault/<name>/admin-foo`, `/vault/<name>`, origin-rooted `/admin/*`, percent-encoded vault names strip cleanly).
+- `src/routing.test.ts` — 7 new cases for the dispatch (per-vault SPA mount fires before per-vault dispatch, even when the vault doesn't exist — the SPA shell is static; POST 405; `/vault/<name>/admin-foo` falls through to per-vault auth wall; legacy `/admin/*` returns 404; `/vault/<name>/api/notes` regression pin).
+- `web/ui/src/lib/mount.test.ts` — 11 new cases covering vault-name extraction (per-vault mount, deep client-routed paths, percent-decoded names), null cases (legacy `/admin/`, stand-alone root, per-vault metadata path, `/vault/<name>/admin-foo`), and basename construction (preserves percent-encoding for byte-for-byte React Router matching).
+
 ## [0.3.6-rc.34] — 2026-05-04
 
 vault#248 — wrap the v13 → v14 migration in an explicit `BEGIN IMMEDIATE / COMMIT` transaction so a crash mid-migration leaves the DB in either pre-v14 or post-v14 state, never half-migrated. Surfaced during review of vault#245: every step in `migrateToV14` is individually idempotent (ALTER TABLE adds are guarded by `hasColumn`, data copies are upsert-and-update, the final `DROP TABLE tag_schemas` is guarded by `hasTable`), but the failure mode wasn't specified — a future reader could remove the guards thinking "we have transactions now." Wrapping the body makes the guarantee explicit; the idempotent guards become belt-and-suspenders.

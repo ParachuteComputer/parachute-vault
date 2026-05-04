@@ -77,7 +77,7 @@ export function VaultDetail() {
         </h2>
         <div className="warn-banner">
           Open this page from the hub's directory — the "Manage" link supplies the admin token. Direct loads of{" "}
-          <code>/admin/vault/{name}</code> can't see protected vault data.
+          <code>/vault/{name}/admin</code> can't see protected vault data.
         </div>
         <Link to="/">← Back to vaults</Link>
       </div>
