@@ -53,6 +53,13 @@ export interface Token {
    * patterns/tag-scoped-tokens.md.
    */
   scoped_tags: string[] | null;
+  /**
+   * Per-vault binding (v16). Non-null = token can only authenticate against
+   * this vault; cross-vault presentation rejects in
+   * `authenticateVaultRequest`. NULL = legacy / server-wide token, accepted
+   * for any vault. See vault#257.
+   */
+  vault_name: string | null;
   expires_at: string | null;
   created_at: string;
   last_used_at: string | null;
@@ -74,6 +81,13 @@ export interface ResolvedToken {
    * See `Token.scoped_tags`.
    */
   scoped_tags: string[] | null;
+  /**
+   * Per-vault binding (v16). Non-null = token is bound to this vault;
+   * `authenticateVaultRequest` rejects when the bound vault doesn't match
+   * the request's vault. NULL = legacy / server-wide, accepted for any
+   * vault. See vault#257.
+   */
+  vault_name: string | null;
 }
 
 /**
@@ -127,6 +141,13 @@ export function createToken(
      * endpoint validates against existing tags before passing through.
      */
     scoped_tags?: string[] | null;
+    /**
+     * Per-vault binding (v16). Non-null = token can only authenticate
+     * against this vault. NULL = legacy / server-wide; auth accepts the
+     * token for any vault. New mints via per-vault routes set this; the
+     * legacy YAML-import path leaves it NULL. See vault#257.
+     */
+    vault_name?: string | null;
     expires_at?: string | null;
   },
 ): Token {
@@ -137,10 +158,11 @@ export function createToken(
   const scopesStr = serializeScopes(scopes);
   const scopedTags = opts.scoped_tags && opts.scoped_tags.length > 0 ? opts.scoped_tags : null;
   const scopedTagsStr = scopedTags ? JSON.stringify(scopedTags) : null;
+  const vaultName = opts.vault_name ?? null;
 
   db.prepare(`
-    INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, scope_tag, scope_path_prefix, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, scope_tag, scope_path_prefix, expires_at, created_at, vault_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     tokenHash,
     opts.label,
@@ -151,6 +173,7 @@ export function createToken(
     opts.scope_path_prefix ?? null,
     opts.expires_at ?? null,
     now,
+    vaultName,
   );
 
   return {
@@ -160,6 +183,7 @@ export function createToken(
     scope_tag: opts.scope_tag ?? null,
     scope_path_prefix: opts.scope_path_prefix ?? null,
     scoped_tags: scopedTags,
+    vault_name: vaultName,
     expires_at: opts.expires_at ?? null,
     created_at: now,
     last_used_at: null,
@@ -177,7 +201,7 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const candidateHash = hashKey(providedToken);
 
   const row = db.prepare(`
-    SELECT token_hash, permission, scopes, scoped_tags, expires_at
+    SELECT token_hash, permission, scopes, scoped_tags, expires_at, vault_name
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
@@ -185,6 +209,7 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
     scopes: string | null;
     scoped_tags: string | null;
     expires_at: string | null;
+    vault_name: string | null;
   } | null;
 
   if (!row) return null;
@@ -205,19 +230,32 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const legacyDerived = !hasVaultScope;
   const scoped_tags = parseScopedTags(row.scoped_tags);
 
-  return { permission, scopes, legacyDerived, scoped_tags };
+  return { permission, scopes, legacyDerived, scoped_tags, vault_name: row.vault_name };
 }
 
 /**
- * List all tokens (for CLI display). Never exposes the hash directly —
- * shows a truncated prefix for identification.
+ * List tokens (for CLI display + admin SPA). Never exposes the hash
+ * directly — shows a truncated prefix for identification.
+ *
+ * Filtering (v16): pass `{ vaultName }` to scope the result to tokens
+ * bound to that vault. The filter is `vault_name = $vaultName OR
+ * vault_name IS NULL` — legacy server-wide tokens (NULL) remain visible
+ * inside every per-vault listing, since they authenticate cross-vault
+ * by design and the operator should see them in any vault's admin UI
+ * to revoke. Pass no filter (or `vaultName: null`) to list everything.
  */
-export function listTokens(db: Database): (Token & { id: string })[] {
+export function listTokens(
+  db: Database,
+  opts: { vaultName?: string | null } = {},
+): (Token & { id: string })[] {
+  const where = opts.vaultName ? "WHERE vault_name = ? OR vault_name IS NULL" : "";
+  const params = opts.vaultName ? [opts.vaultName] : [];
   const rows = db.prepare(`
     SELECT token_hash, label, permission, scope_tag, scope_path_prefix,
-           scoped_tags, expires_at, created_at, last_used_at
-    FROM tokens ORDER BY created_at DESC
-  `).all() as (Omit<Token, "scoped_tags"> & { scoped_tags: string | null })[];
+           scoped_tags, vault_name, expires_at, created_at, last_used_at
+    FROM tokens ${where}
+    ORDER BY created_at DESC
+  `).all(...params) as (Omit<Token, "scoped_tags"> & { scoped_tags: string | null })[];
 
   return rows.map((r) => ({
     ...r,

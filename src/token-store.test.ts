@@ -157,6 +157,53 @@ describe("token CRUD", () => {
   });
 });
 
+describe("per-vault binding (v16)", () => {
+  test("createToken without vault_name leaves the column NULL (legacy / server-wide)", () => {
+    const { fullToken } = generateToken();
+    createToken(db, fullToken, { label: "legacy" });
+
+    const resolved = resolveToken(db, fullToken);
+    expect(resolved!.vault_name).toBeNull();
+
+    const [row] = listTokens(db);
+    expect(row!.vault_name).toBeNull();
+  });
+
+  test("createToken with vault_name binds the token to that vault", () => {
+    const { fullToken } = generateToken();
+    createToken(db, fullToken, { label: "boulder-bound", vault_name: "boulder" });
+
+    const resolved = resolveToken(db, fullToken);
+    expect(resolved!.vault_name).toBe("boulder");
+
+    const [row] = listTokens(db);
+    expect(row!.vault_name).toBe("boulder");
+  });
+
+  test("listTokens with vaultName filter returns matching + legacy NULL tokens", () => {
+    // Per the contract: per-vault listings show tokens bound to THIS vault
+    // plus any server-wide (NULL) tokens. The latter authenticate cross-vault
+    // by design, so the operator should be able to see + revoke them in any
+    // vault's admin UI. Tokens bound to OTHER vaults are excluded.
+    const { fullToken: tA } = generateToken();
+    const { fullToken: tB } = generateToken();
+    const { fullToken: tLegacy } = generateToken();
+    createToken(db, tA, { label: "boulder", vault_name: "boulder" });
+    createToken(db, tB, { label: "default-vault", vault_name: "default" });
+    createToken(db, tLegacy, { label: "server-wide" });
+
+    const boulderTokens = listTokens(db, { vaultName: "boulder" });
+    expect(boulderTokens.map((t) => t.label).sort()).toEqual(["boulder", "server-wide"]);
+
+    const defaultTokens = listTokens(db, { vaultName: "default" });
+    expect(defaultTokens.map((t) => t.label).sort()).toEqual(["default-vault", "server-wide"]);
+
+    // No filter → everything.
+    const all = listTokens(db);
+    expect(all.length).toBe(3);
+  });
+});
+
 describe("token generation", () => {
   test("generated tokens have pvt_ prefix", () => {
     const { fullToken, tokenHash } = generateToken();
