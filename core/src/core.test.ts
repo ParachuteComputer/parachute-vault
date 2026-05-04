@@ -3691,6 +3691,94 @@ describe("schema migration v13 → v14", async () => {
     expect(tableExists).toBeNull();
     db.close();
   });
+
+  // vault#248 — the migration body is wrapped in BEGIN IMMEDIATE / COMMIT
+  // with a try/catch ROLLBACK. A crash mid-migration must leave the DB in
+  // its pre-migration state (NOT half-migrated), and a retry must converge
+  // to the same final state as a clean run. The transaction wrap is what
+  // makes that guarantee — the `hasColumn` / `hasTable` idempotency guards
+  // are belt-and-suspenders, not load-bearing.
+  it("crash mid-migration rolls back to pre-migration state, then retry succeeds", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+
+    const db = new Database(":memory:");
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec(`CREATE TABLE notes (
+      id TEXT PRIMARY KEY, content TEXT DEFAULT '', path TEXT,
+      metadata TEXT DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT
+    )`);
+    db.exec(`CREATE TABLE tags (name TEXT PRIMARY KEY)`);
+    db.exec(`CREATE TABLE tag_schemas (
+      tag_name TEXT PRIMARY KEY REFERENCES tags(name) ON DELETE CASCADE,
+      description TEXT, fields TEXT
+    )`);
+
+    db.prepare("INSERT INTO tags (name) VALUES (?)").run("voice");
+    db.prepare("INSERT INTO tag_schemas (tag_name, description, fields) VALUES (?, ?, ?)")
+      .run("voice", "voice notes", '{"recorded_at":{"type":"string"}}');
+    db.prepare(`INSERT INTO notes (id, path, metadata, created_at) VALUES (?, ?, ?, ?)`)
+      .run("n1", "_tags/voice", JSON.stringify({ parents: ["manual"] }), new Date().toISOString());
+
+    // Patch db.exec to simulate a crash on the final DROP TABLE step. That's
+    // the right injection point: every ALTER + data copy has already landed
+    // inside the transaction, so a successful rollback proves the wrap
+    // covers the full migration body — not just the tail.
+    const origExec = db.exec.bind(db);
+    let crashOnDrop: boolean = true;
+    (db as any).exec = function (sql: string) {
+      if (crashOnDrop && sql.includes("DROP TABLE tag_schemas")) {
+        throw new Error("simulated crash mid-migration");
+      }
+      return origExec(sql);
+    };
+
+    expect(() => initSchema(db)).toThrow("simulated crash mid-migration");
+
+    // Pre-migration shape: tag_schemas table still exists with its row,
+    // tags table back to (name) only — none of the v14 columns landed,
+    // `_tags/voice` note untouched, schema_version row not yet written.
+    const tagSchemasStill = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tagSchemasStill).toBeTruthy();
+    const schemaRow = db.prepare(
+      "SELECT description, fields FROM tag_schemas WHERE tag_name = 'voice'",
+    ).get() as any;
+    expect(schemaRow.description).toBe("voice notes");
+
+    const tagsCols = db.prepare("PRAGMA table_info(tags)").all() as { name: string }[];
+    const colNames = tagsCols.map((c) => c.name).sort();
+    expect(colNames).toEqual(["name"]);
+
+    const note = db.prepare("SELECT path, metadata FROM notes WHERE id = 'n1'").get() as any;
+    expect(note.path).toBe("_tags/voice");
+    expect(JSON.parse(note.metadata).parents).toEqual(["manual"]);
+
+    // No lingering open transaction — a SELECT after rollback succeeds, and
+    // a fresh BEGIN IMMEDIATE doesn't fail with "cannot start a transaction
+    // within a transaction".
+    db.exec("BEGIN IMMEDIATE");
+    db.exec("ROLLBACK");
+
+    // Retry: drop the crash injection, run initSchema again. It must
+    // converge to the same final post-v14 state as a clean run.
+    crashOnDrop = false;
+    initSchema(db);
+
+    const tableGone = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_schemas'",
+    ).get();
+    expect(tableGone).toBeNull();
+    const post = db.prepare(
+      "SELECT description, fields, parent_names FROM tags WHERE name = 'voice'",
+    ).get() as any;
+    expect(post.description).toBe("voice notes");
+    expect(JSON.parse(post.fields).recorded_at.type).toBe("string");
+    expect(JSON.parse(post.parent_names)).toEqual(["manual"]);
+
+    db.close();
+  });
 });
 
 // ---------------------------------------------------------------------------

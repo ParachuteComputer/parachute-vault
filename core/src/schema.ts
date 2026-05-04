@@ -434,97 +434,108 @@ function migrateToV13(db: Database): void {
  * are LEFT IN PLACE — they're harmless historical record and a user might
  * have other content there. Future writes go to the tags row directly.
  *
- * Idempotent: ALTER TABLE adds are guarded by hasColumn; the data copy
- * only runs when tag_schemas / `_tags/*` notes still exist; running the
- * migration twice on the same DB is a no-op the second time.
+ * Wrapped in BEGIN IMMEDIATE / COMMIT (with a try/catch ROLLBACK) so a
+ * crash mid-migration leaves the DB in either pre-v14 or post-v14 state,
+ * never half-migrated. Each step remains individually idempotent — the
+ * transaction wrap is belt-and-suspenders, not load-bearing — so a future
+ * reader who removes the `hasColumn` / `hasTable` guards still gets correct
+ * behavior on retry.
  */
 function migrateToV14(db: Database): void {
   if (!hasTable(db, "tags")) return;
 
-  // 1. ALTER TABLE — additive, idempotent.
-  const cols: [string, string][] = [
-    ["description", "TEXT"],
-    ["fields", "TEXT"],
-    ["relationships", "TEXT"],
-    ["parent_names", "TEXT"],
-    ["created_at", "TEXT"],
-    ["updated_at", "TEXT"],
-  ];
-  for (const [col, type] of cols) {
-    if (!hasColumn(db, "tags", col)) {
-      db.exec(`ALTER TABLE tags ADD COLUMN ${col} ${type}`);
-    }
-  }
-
-  const now = new Date().toISOString();
-  let copiedSchemas = 0;
-  let copiedHierarchy = 0;
-
-  // 2. Copy tag_schemas → tags.{description,fields}.
-  if (hasTable(db, "tag_schemas")) {
-    const rows = db.prepare(
-      "SELECT tag_name, description, fields FROM tag_schemas",
-    ).all() as { tag_name: string; description: string | null; fields: string | null }[];
-    const upsert = db.prepare(
-      "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",
-    );
-    const update = db.prepare(
-      "UPDATE tags SET description = ?, fields = ?, updated_at = ? WHERE name = ?",
-    );
-    for (const row of rows) {
-      upsert.run(row.tag_name, now, now);
-      update.run(row.description, row.fields, now, row.tag_name);
-      copiedSchemas++;
-    }
-  }
-
-  // 3. Copy `_tags/<name>` notes' metadata.parents → tags.parent_names.
-  // Only runs if the notes table exists (it always does post-SCHEMA_SQL,
-  // but stay defensive — initSchema runs SCHEMA_SQL first so this is true).
-  if (hasTable(db, "notes")) {
-    const tagNotes = db.prepare(
-      "SELECT path, metadata FROM notes WHERE path GLOB '_tags/*'",
-    ).all() as { path: string; metadata: string | null }[];
-    const upsert = db.prepare(
-      "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",
-    );
-    const update = db.prepare(
-      "UPDATE tags SET parent_names = ?, updated_at = ? WHERE name = ?",
-    );
-    for (const note of tagNotes) {
-      const tagName = note.path.slice("_tags/".length);
-      if (!tagName) continue;
-      let parents: string[] | null = null;
-      try {
-        const meta = note.metadata ? JSON.parse(note.metadata) : {};
-        const raw = meta?.parents;
-        if (Array.isArray(raw) && raw.length > 0) {
-          const cleaned = raw.filter((p: unknown): p is string => typeof p === "string" && p.length > 0);
-          if (cleaned.length > 0) parents = cleaned;
-        }
-      } catch {
-        // Malformed metadata — skip; the note is left untouched.
-        continue;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    // 1. ALTER TABLE — additive, idempotent.
+    const cols: [string, string][] = [
+      ["description", "TEXT"],
+      ["fields", "TEXT"],
+      ["relationships", "TEXT"],
+      ["parent_names", "TEXT"],
+      ["created_at", "TEXT"],
+      ["updated_at", "TEXT"],
+    ];
+    for (const [col, type] of cols) {
+      if (!hasColumn(db, "tags", col)) {
+        db.exec(`ALTER TABLE tags ADD COLUMN ${col} ${type}`);
       }
-      if (!parents) continue;
-      upsert.run(tagName, now, now);
-      update.run(JSON.stringify(parents), now, tagName);
-      copiedHierarchy++;
     }
-  }
 
-  // 4. Backfill timestamps for rows the copies didn't touch.
-  db.exec(`UPDATE tags SET created_at = '${now}' WHERE created_at IS NULL`);
+    const now = new Date().toISOString();
+    let copiedSchemas = 0;
+    let copiedHierarchy = 0;
 
-  // 5. Drop the sidecar after the copy is complete.
-  if (hasTable(db, "tag_schemas")) {
-    db.exec("DROP TABLE tag_schemas");
-  }
+    // 2. Copy tag_schemas → tags.{description,fields}.
+    if (hasTable(db, "tag_schemas")) {
+      const rows = db.prepare(
+        "SELECT tag_name, description, fields FROM tag_schemas",
+      ).all() as { tag_name: string; description: string | null; fields: string | null }[];
+      const upsert = db.prepare(
+        "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",
+      );
+      const update = db.prepare(
+        "UPDATE tags SET description = ?, fields = ?, updated_at = ? WHERE name = ?",
+      );
+      for (const row of rows) {
+        upsert.run(row.tag_name, now, now);
+        update.run(row.description, row.fields, now, row.tag_name);
+        copiedSchemas++;
+      }
+    }
 
-  if (copiedSchemas > 0 || copiedHierarchy > 0) {
-    console.log(
-      `[vault] migrated to schema v14: copied ${copiedSchemas} tag_schemas + ${copiedHierarchy} _tags/* hierarchies onto tags rows`,
-    );
+    // 3. Copy `_tags/<name>` notes' metadata.parents → tags.parent_names.
+    // Only runs if the notes table exists (it always does post-SCHEMA_SQL,
+    // but stay defensive — initSchema runs SCHEMA_SQL first so this is true).
+    if (hasTable(db, "notes")) {
+      const tagNotes = db.prepare(
+        "SELECT path, metadata FROM notes WHERE path GLOB '_tags/*'",
+      ).all() as { path: string; metadata: string | null }[];
+      const upsert = db.prepare(
+        "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",
+      );
+      const update = db.prepare(
+        "UPDATE tags SET parent_names = ?, updated_at = ? WHERE name = ?",
+      );
+      for (const note of tagNotes) {
+        const tagName = note.path.slice("_tags/".length);
+        if (!tagName) continue;
+        let parents: string[] | null = null;
+        try {
+          const meta = note.metadata ? JSON.parse(note.metadata) : {};
+          const raw = meta?.parents;
+          if (Array.isArray(raw) && raw.length > 0) {
+            const cleaned = raw.filter((p: unknown): p is string => typeof p === "string" && p.length > 0);
+            if (cleaned.length > 0) parents = cleaned;
+          }
+        } catch {
+          // Malformed metadata — skip; the note is left untouched.
+          continue;
+        }
+        if (!parents) continue;
+        upsert.run(tagName, now, now);
+        update.run(JSON.stringify(parents), now, tagName);
+        copiedHierarchy++;
+      }
+    }
+
+    // 4. Backfill timestamps for rows the copies didn't touch.
+    db.exec(`UPDATE tags SET created_at = '${now}' WHERE created_at IS NULL`);
+
+    // 5. Drop the sidecar after the copy is complete.
+    if (hasTable(db, "tag_schemas")) {
+      db.exec("DROP TABLE tag_schemas");
+    }
+
+    db.exec("COMMIT");
+
+    if (copiedSchemas > 0 || copiedHierarchy > 0) {
+      console.log(
+        `[vault] migrated to schema v14: copied ${copiedSchemas} tag_schemas + ${copiedHierarchy} _tags/* hierarchies onto tags rows`,
+      );
+    }
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
   }
 }
 
