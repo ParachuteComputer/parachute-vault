@@ -1,18 +1,19 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
-// Vault mounts this SPA at `/admin/` (see src/admin-spa.ts dispatch). Build
-// default IS the canonical mount so asset URLs resolve under the admin path
-// when the bundle is served by the vault server — same drift paraclaw#25
-// codified in mount-path-convention.md. Override with `VITE_BASE_PATH=/` for
-// stand-alone dev served at the origin root.
-const basePath = normalizeBase(process.env.VITE_BASE_PATH ?? "/admin/");
-
-function normalizeBase(input: string): string {
-  let b = input.startsWith("/") ? input : `/${input}`;
-  if (!b.endsWith("/")) b += "/";
-  return b;
-}
+// Vault#252 moves the SPA from origin-rooted `/admin/*` to per-vault
+// `/vault/<name>/admin/*`. The vault name isn't known at build time, so we
+// can't bake an absolute base path into asset URLs the way hub does. The
+// build default is RELATIVE (`./`): asset references in `dist/index.html`
+// look like `./assets/index-abc.js` and resolve correctly under whichever
+// `/vault/<name>/admin/` mount served the HTML.
+//
+// Dev (`bun run dev`) still serves under `/admin/` to mirror the legacy
+// origin-rooted mount — the proxy below forwards `/vault/*` and `/vaults/*`
+// to the running vault server so SPA fetches land on real per-vault APIs.
+// Override with `VITE_BASE_PATH=/` for stand-alone dev served at the
+// origin root.
+const basePath = process.env.VITE_BASE_PATH ?? "./";
 
 export default defineConfig({
   base: basePath,
@@ -20,8 +21,8 @@ export default defineConfig({
   server: {
     port: 5175,
     proxy: {
-      // Dev server runs under /admin/ to mirror production. Vault's own
-      // surfaces — per-vault metadata, public discovery — live under
+      // Dev server runs under /admin/ to mirror the legacy mount. Vault's
+      // own surfaces — per-vault metadata, public discovery — live under
       // /vault/* and /vaults/* on the origin; proxy those so SPA fetches
       // hit the running vault server (default http://127.0.0.1:1940).
       "/vault": {
