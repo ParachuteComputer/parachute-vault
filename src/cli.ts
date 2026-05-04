@@ -998,20 +998,38 @@ async function cmdConfig(args: string[]) {
 function cmdTokens(args: string[]) {
   const subcmd = args[0];
 
-  // parachute-vault tokens — list all tokens (across all vaults)
+  // parachute-vault tokens [list] [--vault <name>]
+  //   Default: every vault's tokens, grouped by vault.
+  //   --vault <name>: only that vault.
   if (!subcmd || subcmd === "list") {
-    const vaults = listVaults();
+    const vaultFlag = args.indexOf("--vault");
+    const onlyVault = vaultFlag !== -1 ? args[vaultFlag + 1] : null;
+    if (vaultFlag !== -1 && !onlyVault) {
+      console.error("--vault requires a value.");
+      process.exit(1);
+    }
+    const vaults = onlyVault ? [onlyVault] : listVaults();
     let anyTokens = false;
 
     for (const vaultName of vaults) {
       const vc = readVaultConfig(vaultName);
-      if (!vc) continue;
+      if (!vc) {
+        if (onlyVault) {
+          console.error(`Vault "${vaultName}" not found.`);
+          process.exit(1);
+        }
+        continue;
+      }
       const store = getVaultStore(vaultName);
       // Ensure legacy keys are migrated
       const globalCfg = readGlobalConfig();
       migrateVaultKeys(store.db, vc.api_keys, globalCfg.api_keys);
 
-      const tokens = listTokens(store.db);
+      // Per-vault filter (v16): only tokens bound to this vault, plus
+      // legacy NULL-bound (server-wide) rows. The `[server-wide]` annotation
+      // surfaces the latter so an operator listing one vault still sees
+      // tokens that authenticate cross-vault.
+      const tokens = listTokens(store.db, { vaultName });
       if (tokens.length === 0) continue;
       anyTokens = true;
 
@@ -1019,7 +1037,8 @@ function cmdTokens(args: string[]) {
       for (const t of tokens) {
         const expiry = t.expires_at ? ` (expires: ${t.expires_at})` : "";
         const lastUsed = t.last_used_at ? ` (last used: ${t.last_used_at})` : "";
-        console.log(`  ${t.id}  ${t.label}  [${t.permission}]${expiry}${lastUsed}`);
+        const serverWide = t.vault_name === null ? " [server-wide]" : "";
+        console.log(`  ${t.id}  ${t.label}  [${t.permission}]${serverWide}${expiry}${lastUsed}`);
       }
       console.log();
     }
@@ -1030,11 +1049,21 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // parachute-vault tokens create --vault <name>
+  // parachute-vault tokens create [--vault <name> | --all]
   //   [--scope vault:read,vault:write | --read | --permission full|read]
   //   [--expires <duration>] [--label <label>]
+  //
+  // Per-vault binding (v16): the minted token is pinned to <vaultName>
+  // unless --all is passed, in which case the token is server-wide
+  // (vault_name = NULL) and authenticates against any vault. --all is
+  // the explicit opt-out — there's no implicit fall-through to server-wide.
   if (subcmd === "create") {
     const vaultFlag = args.indexOf("--vault");
+    const allFlag = args.includes("--all");
+    if (allFlag && vaultFlag !== -1) {
+      console.error("--vault and --all are mutually exclusive.");
+      process.exit(1);
+    }
     const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : (readGlobalConfig().default_vault || "default");
     if (!vaultName) {
       console.error("--vault requires a value.");
@@ -1084,15 +1113,22 @@ function cmdTokens(args: string[]) {
       permission,
       scopes,
       expires_at: expiresAt,
+      // v16 binding: pin to the vault we minted in unless --all was passed
+      // (which leaves vault_name NULL = legacy server-wide).
+      vault_name: allFlag ? null : vaultName,
     });
 
     const displayScopes = scopes ?? [...VAULT_SCOPES];
-    console.log(`Created token for vault "${vaultName}":`);
+    const heading = allFlag
+      ? `Created server-wide token (authenticates against any vault):`
+      : `Created token for vault "${vaultName}":`;
+    console.log(heading);
     console.log(`  Token:      ${fullToken}`);
     console.log(`  Permission: ${permission}`);
     console.log(`  Scopes:     ${displayScopes.join(" ")}`);
     if (expiresAt) console.log(`  Expires:    ${expiresAt}`);
     console.log(`  Label:      ${label}`);
+    if (!allFlag) console.log(`  Vault:      ${vaultName}`);
     console.log();
     console.log("Save this token — it will not be shown again.");
     return;
@@ -2344,9 +2380,13 @@ Vaults:
   parachute-vault mcp-install              Add vault MCP to Claude
 
 Tokens:
-  parachute-vault tokens                          List all tokens
-  parachute-vault tokens create                   Create a full-access token in the default vault
-  parachute-vault tokens create --vault <name>    Create a token in a specific vault
+  parachute-vault tokens                          List tokens (every vault)
+  parachute-vault tokens list --vault <name>      List tokens for one vault only
+  parachute-vault tokens create                   Create a vault-bound token in the default vault
+  parachute-vault tokens create --vault <name>    Create a token bound to a specific vault
+  parachute-vault tokens create --all             Create a server-wide token (vault_name=NULL).
+                                                  Authenticates against any vault — use sparingly,
+                                                  for cross-vault automation only.
   parachute-vault tokens create --read            Read-only token (shorthand for --scope vault:read)
   parachute-vault tokens create --scope vault:write
                                                   Narrow the token's scopes. Accepts a comma-separated

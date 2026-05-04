@@ -7,7 +7,10 @@
  * narrowed). POST mints a new pvt_* token with caller-narrowed scopes and
  * returns the plaintext exactly once. GET lists existing tokens (metadata
  * only — no plaintext, no hash). DELETE revokes by display id (`t_…`); a
- * non-existent id still returns 200 to avoid leaking which ids exist.
+ * non-existent id returns 404; an id that resolves to a different
+ * vault's binding returns **403** (per #257 spec — silent 200 on
+ * cross-vault revoke would let an operator believe a token was
+ * revoked while it kept working from its owning vault).
  *
  * Scope narrowing is enforced as a strict subset check via
  * `validateMintedScopes` — defense-in-depth even with the admin gate, so a
@@ -28,7 +31,6 @@ import type { SqliteStore } from "../core/src/store.ts";
 import {
   generateToken,
   createToken,
-  revokeToken,
   normalizePermission,
   type TokenPermission,
 } from "./token-store.ts";
@@ -76,13 +78,13 @@ export async function handleTokens(
   subpath: string,
 ): Promise<Response> {
   if (subpath === "" || subpath === "/") {
-    if (req.method === "GET") return listHandler(store.db);
+    if (req.method === "GET") return listHandler(store.db, vaultName);
     if (req.method === "POST") return mintHandler(req, store, vaultName, callerScopes, callerScopedTags);
     return methodNotAllowed();
   }
   const idMatch = subpath.match(/^\/([^/]+)$/);
   if (idMatch && idMatch[1]) {
-    if (req.method === "DELETE") return revokeHandler(store.db, idMatch[1]);
+    if (req.method === "DELETE") return revokeHandler(store.db, vaultName, idMatch[1]);
     return methodNotAllowed();
   }
   return Response.json({ error: "Not found" }, { status: 404 });
@@ -234,6 +236,11 @@ async function mintHandler(
     scopes: requested,
     scoped_tags: scopedTags,
     expires_at: expiresAt,
+    // Per-vault binding (v16): tokens minted via /vault/<name>/tokens are
+    // pinned to that vault. authenticateVaultRequest rejects them at any
+    // other vault. NULL would be legacy / server-wide; reserved for the
+    // YAML-import path and explicit --all CLI mints (see vault#257).
+    vault_name: vaultName,
   });
 
   // Display id mirrors `listTokens`: `t_` + first 12 chars of the SHA-256
@@ -248,6 +255,7 @@ async function mintHandler(
       permission: created.permission,
       scopes: requested,
       scoped_tags: scopedTags,
+      vault_name: created.vault_name,
       expires_at: created.expires_at,
       created_at: created.created_at,
     },
@@ -255,19 +263,28 @@ async function mintHandler(
   );
 }
 
-function listHandler(db: Database): Response {
+function listHandler(db: Database, vaultName: string): Response {
   // Direct SELECT (rather than reusing `listTokens`) so we can include the
   // `scopes` and `scoped_tags` columns without changing the existing
   // CLI-facing shape that goes through `listTokens`.
+  //
+  // Per-vault filter (v16): rows where vault_name matches THIS vault, plus
+  // legacy server-wide rows (vault_name IS NULL). The latter authenticate
+  // cross-vault by design; the operator should see them in any vault's
+  // admin UI to revoke. Tokens bound to a different vault never appear
+  // here — this is the SPA-side fix for vault#257.
   const rows = db.prepare(`
-    SELECT token_hash, label, permission, scopes, scoped_tags, expires_at, created_at, last_used_at
-    FROM tokens ORDER BY created_at DESC
-  `).all() as {
+    SELECT token_hash, label, permission, scopes, scoped_tags, vault_name, expires_at, created_at, last_used_at
+    FROM tokens
+    WHERE vault_name = ? OR vault_name IS NULL
+    ORDER BY created_at DESC
+  `).all(vaultName) as {
     token_hash: string;
     label: string;
     permission: string;
     scopes: string | null;
     scoped_tags: string | null;
+    vault_name: string | null;
     expires_at: string | null;
     created_at: string;
     last_used_at: string | null;
@@ -280,6 +297,7 @@ function listHandler(db: Database): Response {
       permission: normalizePermission(r.permission),
       scopes: parseScopes(r.scopes),
       scoped_tags: parseScopedTagsJSON(r.scoped_tags),
+      vault_name: r.vault_name,
       expires_at: r.expires_at,
       created_at: r.created_at,
       last_used_at: r.last_used_at,
@@ -305,12 +323,70 @@ function parseScopedTagsJSON(raw: string | null): string[] | null {
   }
 }
 
-function revokeHandler(db: Database, id: string): Response {
-  // Always 200, never leak whether the id existed. Ambiguous prefix matches
-  // are treated the same (revokeToken returns false; we ignore it). The 12-
-  // char hex prefix collision space is large enough that organic ambiguity
-  // is effectively impossible, and security-significant ambiguity would
-  // require a chosen-prefix attack against SHA-256.
-  revokeToken(db, id);
+function revokeHandler(db: Database, vaultName: string, id: string): Response {
+  // Per-vault scope (v16, per #257 spec): pre-check the row's vault binding
+  // before deleting so we can distinguish three cases:
+  //
+  //   - row missing entirely → 404 (the id never existed in this vault's DB)
+  //   - row exists, vault_name = <other> → 403 with descriptive error
+  //   - row exists, vault_name = <this> OR NULL → DELETE + 200
+  //
+  // The non-leakage argument for "always 200" doesn't hold given that GET
+  // /vault/<name>/tokens already exposes the full vault-scoped + legacy-NULL
+  // listing — so existence isn't being protected. 403 over silent 200 is the
+  // operator-debuggable shape: clicking "revoke" and seeing success while the
+  // token still works (because it's bound to a different vault) is the worst
+  // UX. Tell the operator which vault owns it.
+  //
+  // Ambiguous prefix matches: the pre-check uses the same prefix shape as the
+  // DELETE, so a prefix that hits multiple rows is treated as "found" if any
+  // row matches the calling vault. The 12-char hex prefix collision space is
+  // large enough that organic ambiguity is effectively impossible, and
+  // security-significant ambiguity would require a chosen-prefix attack
+  // against SHA-256.
+  let row: { vault_name: string | null } | null;
+  if (id.startsWith("t_")) {
+    const hashPrefix = id.slice(2);
+    row = db.prepare(`
+      SELECT vault_name FROM tokens
+      WHERE token_hash LIKE ?
+      LIMIT 1
+    `).get(`sha256:${hashPrefix}%`) as { vault_name: string | null } | null;
+  } else {
+    row = db.prepare(`
+      SELECT vault_name FROM tokens
+      WHERE token_hash = ?
+      LIMIT 1
+    `).get(id) as { vault_name: string | null } | null;
+  }
+
+  if (!row) {
+    return Response.json({ error: "Not found", message: "no token with that id" }, { status: 404 });
+  }
+
+  if (row.vault_name !== null && row.vault_name !== vaultName) {
+    return Response.json(
+      {
+        error: "Forbidden",
+        message: `token belongs to vault '${row.vault_name}', not '${vaultName}'; revoke it from that vault's admin surface`,
+      },
+      { status: 403 },
+    );
+  }
+
+  if (id.startsWith("t_")) {
+    const hashPrefix = id.slice(2);
+    db.prepare(`
+      DELETE FROM tokens
+      WHERE token_hash LIKE ?
+        AND (vault_name = ? OR vault_name IS NULL)
+    `).run(`sha256:${hashPrefix}%`, vaultName);
+  } else {
+    db.prepare(`
+      DELETE FROM tokens
+      WHERE token_hash = ?
+        AND (vault_name = ? OR vault_name IS NULL)
+    `).run(id, vaultName);
+  }
   return Response.json({ revoked: true });
 }

@@ -3993,6 +3993,98 @@ describe("schema migration v14 → v15", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Schema migration v15 → v16 — vault#257 (tokens.vault_name binding)
+// ---------------------------------------------------------------------------
+
+describe("schema migration v15 → v16", async () => {
+  // vault#257 — the v16 migration body (ALTER TABLE ADD COLUMN + CREATE
+  // INDEX) is wrapped in BEGIN IMMEDIATE / COMMIT with a try/catch
+  // ROLLBACK, mirroring the v14/v15 wrap shape from vault#251. The
+  // individual statements are atomic in SQLite, so the wrap is mostly
+  // belt-and-suspenders for THIS migration — but the test mirrors v14's
+  // crash-rollback shape so anyone touching migrations finds the same
+  // regression-pin pattern across versions.
+  it("crash mid-migration rolls back to pre-v16 state, then retry succeeds", async () => {
+    const { Database } = await import("bun:sqlite");
+    const { initSchema } = await import("./schema.ts");
+
+    // Build the full post-v16 shape, plant a row, then drop the v16
+    // additions so initSchema's migrateToV16 fires on the next call.
+    const db = new Database(":memory:");
+    db.exec("PRAGMA journal_mode = WAL");
+    initSchema(db);
+
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO tokens (token_hash, label, created_at, vault_name) VALUES (?, ?, ?, ?)",
+    ).run("sha256:abc123def456", "pre-existing", now, "work");
+
+    db.exec("DROP INDEX IF EXISTS idx_tokens_vault_name");
+    db.exec("ALTER TABLE tokens DROP COLUMN vault_name");
+
+    // Pre-condition: the column is gone but the row is still there
+    // (DROP COLUMN strips the column from existing rows).
+    const preCols = db.prepare("PRAGMA table_info(tokens)").all() as { name: string }[];
+    expect(preCols.map((c) => c.name)).not.toContain("vault_name");
+    const preRow = db.prepare("SELECT label FROM tokens WHERE token_hash = ?")
+      .get("sha256:abc123def456") as { label: string } | null;
+    expect(preRow?.label).toBe("pre-existing");
+
+    // Patch db.exec to crash on CREATE INDEX — the second statement inside
+    // the v16 transaction body. Crashing here proves the wrap covers the
+    // post-ALTER state, not just the tail. The injection deliberately
+    // doesn't match BEGIN/COMMIT/ROLLBACK so the catch's ROLLBACK still
+    // runs through the patched exec.
+    const origExec = db.exec.bind(db);
+    let crashOnIndex: boolean = true;
+    (db as any).exec = function (sql: string) {
+      if (crashOnIndex && sql.includes("CREATE INDEX") && sql.includes("idx_tokens_vault_name")) {
+        throw new Error("simulated crash mid-v16-migration");
+      }
+      return origExec(sql);
+    };
+
+    expect(() => initSchema(db)).toThrow("simulated crash mid-v16-migration");
+
+    // Pre-v16 shape after rollback: vault_name column must not exist; the
+    // pre-existing row must be untouched.
+    const colsAfterRollback = db.prepare("PRAGMA table_info(tokens)").all() as { name: string }[];
+    expect(colsAfterRollback.map((c) => c.name)).not.toContain("vault_name");
+    const idxAfterRollback = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tokens_vault_name'",
+    ).get();
+    expect(idxAfterRollback).toBeNull();
+    const rowAfterRollback = db.prepare("SELECT label FROM tokens WHERE token_hash = ?")
+      .get("sha256:abc123def456") as { label: string } | null;
+    expect(rowAfterRollback?.label).toBe("pre-existing");
+
+    // No lingering open transaction — a fresh BEGIN IMMEDIATE + ROLLBACK
+    // doesn't fail with "cannot start a transaction within a transaction".
+    db.exec("BEGIN IMMEDIATE");
+    db.exec("ROLLBACK");
+
+    // Retry: drop the crash injection, run initSchema again. Must converge
+    // to post-v16 shape (column added, index created, lenient NULL backfill
+    // on the pre-existing row per the migration spec).
+    crashOnIndex = false;
+    initSchema(db);
+
+    const colsPost = db.prepare("PRAGMA table_info(tokens)").all() as { name: string }[];
+    expect(colsPost.map((c) => c.name)).toContain("vault_name");
+    const idxPost = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tokens_vault_name'",
+    ).get();
+    expect(idxPost).toBeTruthy();
+    const rowPost = db.prepare("SELECT label, vault_name FROM tokens WHERE token_hash = ?")
+      .get("sha256:abc123def456") as { label: string; vault_name: string | null };
+    expect(rowPost.label).toBe("pre-existing");
+    expect(rowPost.vault_name).toBeNull();
+
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tag-scope auth post-v14 — patterns/tag-scoped-tokens.md
 // ---------------------------------------------------------------------------
 

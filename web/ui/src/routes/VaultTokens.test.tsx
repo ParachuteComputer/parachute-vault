@@ -24,6 +24,7 @@ const tokenFixture = (over: Partial<tokensApi.TokenSummary> = {}): tokensApi.Tok
   permission: "full",
   scopes: ["vault:work:write"],
   scoped_tags: null,
+  vault_name: "work",
   expires_at: null,
   created_at: "2026-05-01T00:00:00Z",
   last_used_at: null,

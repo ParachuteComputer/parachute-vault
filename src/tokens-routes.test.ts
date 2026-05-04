@@ -11,7 +11,8 @@
  *   - Scope subset enforcement: minted scopes must be ≤ caller's vault
  *     verb power. Cross-vault scopes (`vault:other:*`) rejected.
  *   - Admin gate: read/write callers cannot reach the endpoint at all.
- *   - DELETE is intentionally non-leaky — non-existent ids return 200.
+ *   - DELETE: 200 on success, 404 when the id doesn't exist, **403** when
+ *     the id resolves to a different vault's binding (per #257 spec).
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -425,6 +426,60 @@ describe("GET /vault/<name>/tokens — list", () => {
     const res = await getTokens("journal", reader);
     expect(res.status).toBe(403);
   });
+
+  test("v16: list returns vault-bound tokens + legacy NULL, never tokens bound to other vaults", async () => {
+    // Per the per-vault token storage migration (vault#257): the SPA at
+    // /vault/<name>/admin/tokens must show only THIS vault's tokens. Mixing
+    // tokens from sibling vaults — the bug Aaron flagged — would re-introduce
+    // the cross-vault leak the migration is meant to close.
+    createVault("journal");
+    createVault("work");
+    const journalAdmin = mintAdminToken("journal");
+
+    // Mint a vault-bound token via the endpoint (so it carries vault_name="journal").
+    const journalMint = (await (await postTokens("journal", journalAdmin, {
+      label: "journal-bound",
+    })).json()) as { id: string };
+
+    // Plant a cross-vault token directly in journal's DB (vault_name="work").
+    // This shouldn't happen via normal mint paths after #257, but the filter
+    // must still hide it — defense-in-depth against future bugs / manual
+    // SQL.
+    const journalStore = getVaultStore("journal");
+    const { fullToken: crossBound } = generateToken();
+    createToken(journalStore.db, crossBound, {
+      label: "work-bound-leak",
+      permission: "full",
+      scopes: ["vault:read"],
+      vault_name: "work",
+    });
+
+    // Plant a legacy NULL-bound token (pre-v16 / YAML-imported shape).
+    const { fullToken: legacy } = generateToken();
+    createToken(journalStore.db, legacy, {
+      label: "legacy-server-wide",
+      permission: "read",
+      scopes: ["vault:read"],
+      // vault_name omitted → NULL.
+    });
+
+    const res = await getTokens("journal", journalAdmin);
+    const body = (await res.json()) as {
+      tokens: Array<{ id: string; label: string; vault_name: string | null }>;
+    };
+    const labels = body.tokens.map((t) => t.label).sort();
+    expect(labels).toContain("journal-bound");
+    expect(labels).toContain("legacy-server-wide");
+    expect(labels).toContain("test-admin"); // the mintAdminToken seed
+    expect(labels).not.toContain("work-bound-leak");
+
+    // Each surfaced row carries its vault_name (null for legacy, "journal"
+    // for the bound one) so the SPA can render a "server-wide" badge.
+    const journalRow = body.tokens.find((t) => t.id === journalMint.id);
+    expect(journalRow!.vault_name).toBe("journal");
+    const legacyRow = body.tokens.find((t) => t.label === "legacy-server-wide");
+    expect(legacyRow!.vault_name).toBeNull();
+  });
 });
 
 describe("DELETE /vault/<name>/tokens/<id> — revoke", () => {
@@ -446,14 +501,52 @@ describe("DELETE /vault/<name>/tokens/<id> — revoke", () => {
     expect(resolveToken(store.db, minted.token)).toBeNull();
   });
 
-  test("non-existent id → 200 with revoked:true (no existence leak)", async () => {
+  test("non-existent id → 404", async () => {
+    // Per vault#257 spec: silent 200 on missing id is misleading once the
+    // list endpoint already exposes the full vault-scoped + legacy-NULL
+    // listing — existence isn't being protected, so 404 is the honest shape.
     createVault("journal");
     const admin = mintAdminToken("journal");
 
     const res = await deleteToken("journal", "t_doesnotexist", admin);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { revoked: boolean };
-    expect(body.revoked).toBe(true);
+    expect(res.status).toBe(404);
+  });
+
+  test("v16: cross-vault binding revoke → 403 with descriptive error", async () => {
+    // Per vault#257 spec: an admin in vault A attempting to revoke a token
+    // bound to vault B must get 403, not silent 200. Silent 200 would tell
+    // the operator the token was revoked while it kept working from vault B.
+    createVault("journal");
+    createVault("work");
+    const journalAdmin = mintAdminToken("journal");
+
+    // Plant a token in journal's DB but bound to "work" (the cross-vault
+    // shape — same row layout the v16 list-filter test uses).
+    const journalStore = getVaultStore("journal");
+    const { fullToken, tokenHash } = generateToken();
+    createToken(journalStore.db, fullToken, {
+      label: "work-bound",
+      permission: "full",
+      scopes: ["vault:admin"],
+      vault_name: "work",
+    });
+    // Display id mirrors `t_${tokenHash.slice(7, 19)}` (the first 12 hex
+    // chars after `sha256:`) — same shape that listTokens emits.
+    const id = `t_${tokenHash.slice(7, 19)}`;
+
+    const res = await deleteToken("journal", id, journalAdmin);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toBe("Forbidden");
+    expect(body.message).toContain("'work'");
+    expect(body.message).toContain("'journal'");
+
+    // Defense-in-depth: the row is still there (revoke was rejected, not
+    // silently no-op'd into deletion).
+    const stillThere = journalStore.db
+      .prepare("SELECT 1 FROM tokens WHERE token_hash = ?")
+      .get(tokenHash);
+    expect(stillThere).not.toBeNull();
   });
 
   test("read-only token cannot revoke → 403", async () => {
