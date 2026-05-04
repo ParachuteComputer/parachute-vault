@@ -6,6 +6,18 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.6-rc.37] — 2026-05-04
+
+vault#252 second follow-up — fix the actual root cause of Aaron's no-token error after rc.36 closed the URL-doubling bug. Browsers drop URL fragments when following a 301 redirect (RFC 7231 says SHOULD preserve, but Chrome/Firefox/Safari behavior is inconsistent in practice — WebKit historically drops, Chrome sometimes preserves). The hub-issued JWT travels in `#token=…`, so the redirect rc.35 added (`/vault/<name>/admin` → `/vault/<name>/admin/`) was dropping the token before the SPA could capture it. The SPA then booted unauthenticated and rendered the no-token error — even though the operator clicked through hub correctly.
+
+### Fixed
+
+- **`.parachute/module.json` `managementUrl: "/admin"` → `"/admin/"`.** Hub's `resolveManagementUrl` (parachute-hub `web/ui/src/lib/api.ts`) joins the per-vault module URL with this string verbatim. With the trailing slash the canonical click target is `/vault/<name>/admin/` directly — no redirect, no fragment loss, browser preserves `#token=…` end-to-end. The server-side 301 from rc.35 stays as defense-in-depth (covers manual URL typing and old bookmarks), but it's no longer load-bearing for the hub flow. Establishes the contract: SPA-style `managementUrl`s should end with `/` so the URL the operator's browser sees is the same URL the server serves.
+
+### Tests
+
+- `src/admin-spa.test.ts` (2 new) — pin the hub↔vault `managementUrl` contract: (a) `module.json`'s `managementUrl` ends with `/`, (b) the canonical hub-emitted URL (per-vault module URL joined with `managementUrl` à la `resolveManagementUrl`) serves the SPA shell with status 200 and no `Location` header. The "no Location header" assertion is the explicit regression pin — if a future change re-introduces a 301 on the canonical form, fragments would silently drop again.
+
 ## [0.3.6-rc.36] — 2026-05-04
 
 vault#252 follow-up — fix URL doubling under per-vault mount. The rc.35 SPA used `<Navigate to="/vault/<name>" replace />` from the `/` route to jump operators landing at `/vault/<name>/admin/` straight to the vault detail page. Under React Router v6 with `<BrowserRouter basename="/vault/<name>/admin">`, paths in `<Navigate to>` and `<Link to>` are basename-relative absolute paths — so the redirect resolved to `/vault/<name>/admin/vault/<name>` (basename + path), and the operator landed on a doubled URL with no matching route, falling through to the auth-required shell. The redirect was the wrong shape: the SPA needs different routes per mount mode, not a clever redirect.
