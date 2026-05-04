@@ -165,19 +165,19 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
         <div className="stats">
           <div className="stat">
             <div className="label">Notes</div>
-            <div className="value">{vault.stats.notes}</div>
+            <div className="value">{vault.stats.totalNotes}</div>
           </div>
           <div className="stat">
             <div className="label">Tags</div>
-            <div className="value">{vault.stats.tags}</div>
+            <div className="value">{vault.stats.tagCount}</div>
           </div>
           <div className="stat">
             <div className="label">Attachments</div>
-            <div className="value">{vault.stats.attachments}</div>
+            <div className="value">{vault.stats.attachmentCount}</div>
           </div>
           <div className="stat">
             <div className="label">Links</div>
-            <div className="value">{vault.stats.links}</div>
+            <div className="value">{vault.stats.linkCount}</div>
           </div>
         </div>
       </div>

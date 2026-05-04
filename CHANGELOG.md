@@ -6,6 +6,22 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.6-rc.38] — 2026-05-04
+
+vault#252 third follow-up — fix the empty-stats render Aaron caught after rc.37 unblocked the auth flow. The Stats section on the per-vault detail page rendered all four labels (Notes / Tags / Attachments / Links) but the values next to them were blank. Two contributing bugs: the SPA's `VaultStats` interface used short names (`notes`, `tags`, `attachments`, `links`) that don't exist in the wire payload, and the server-side `VaultStats` had no attachment count at all. Every read coerced `undefined` → `""` and rendered blank.
+
+### Changed
+
+- **`core/src/types.ts:VaultStats` adds `attachmentCount: number`.** Single `SELECT COUNT(*) FROM attachments` in `core/src/notes.ts:getVaultStats`. Cheap query against a small table — same shape as the existing `tagCount` / `linkCount` adjacent counters. Non-breaking addition: `vault-info` MCP tool, `/api/vault?include_stats=true`, and the bare `/vault/<name>/` detail endpoint all surface the new field automatically. Fills the gap between the documented four-stat UI and the previously-three-stat server payload.
+- **`web/ui/src/lib/api.ts:VaultStats` field names align with the server.** `notes` → `totalNotes`, `tags` → `tagCount`, `attachments` → `attachmentCount`, `links` → `linkCount`. The wire payload's keys are the canonical source — the SPA used to shadow them with shorter names, which silently failed. New JSDoc documents the contract: SPA's interface mirrors `core/src/types.ts:VaultStats` byte-for-byte for the fields it reads.
+- **`web/ui/src/routes/VaultDetail.tsx` reads the wire-shape field names directly.** No transform layer — the server returns what the SPA renders, so a future field rename trips the typechecker, not the user.
+
+### Tests
+
+- `core/src/core.test.ts` — new `getVaultStats counts attachments` case (creates two notes, attaches three files across them, asserts `attachmentCount === 3`); existing `getVaultStats returns correct stats` case extended to assert `attachmentCount === 0` for the no-attachments baseline.
+- `web/ui/src/App.test.tsx` — new `renders the actual stat counts from the wire payload` case under per-vault mount: mocks `getVaultDetail` with `{totalNotes: 12, tagCount: 3, attachmentCount: 1, linkCount: 4}` and asserts every value renders. Explicit regression pin against the field-name drift that motivated this fix; future rename on either side trips this test.
+- `web/ui/src/lib/api.test.ts` — fixture migrated to wire-shape names (was the source of the silent drift — the test passed even when the SPA was reading nonexistent keys, because the test fixture matched the SPA's reads, not the server's writes).
+
 ## [0.3.6-rc.37] — 2026-05-04
 
 vault#252 second follow-up — fix the actual root cause of Aaron's no-token error after rc.36 closed the URL-doubling bug. Browsers drop URL fragments when following a 301 redirect (RFC 7231 says SHOULD preserve, but Chrome/Firefox/Safari behavior is inconsistent in practice — WebKit historically drops, Chrome sometimes preserves). The hub-issued JWT travels in `#token=…`, so the redirect rc.35 added (`/vault/<name>/admin` → `/vault/<name>/admin/`) was dropping the token before the SPA could capture it. The SPA then booted unauthenticated and rendered the no-token error — even though the operator clicked through hub correctly.
