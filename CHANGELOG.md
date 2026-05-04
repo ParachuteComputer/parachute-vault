@@ -6,6 +6,26 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.3.6-rc.39] — 2026-05-04
+
+vault#257 — per-vault token storage migration. Tokens now bind to the vault they were minted from, and cross-vault use is rejected at the auth layer. Pre-v16 tokens carry a `NULL` `vault_name` and remain server-wide (legacy compatibility), so existing deployments keep working unchanged; new mints default to vault-bound. The cross-vault leak surface was small in practice (per-vault DBs already scope storage; only `authenticateGlobalRequest` at `/mcp` iterated across vaults), but the explicit `vault_name` column closes the gap with defense-in-depth at every per-vault auth path.
+
+### Changed
+
+- **Schema v15 → v16: `tokens` table grows `vault_name TEXT` + `idx_tokens_vault_name` index.** `core/src/schema.ts:migrateToV16` runs an idempotent `ALTER TABLE … ADD COLUMN` inside `BEGIN IMMEDIATE` / `COMMIT` (ROLLBACK on failure) — same shape as v14/v15 from vault#251. Lenient backfill: existing rows get `NULL` (= legacy server-wide). New rows default to the minting vault's name. Index keeps the per-vault `WHERE vault_name = ? OR vault_name IS NULL` filter cheap on large token sets.
+- **`src/auth.ts:authenticateVaultRequest` rejects cross-vault token use with 403.** When a `pvt_*` resolves to `vault_name = <other>` and the request is for `<this>`, the response is `403 Unauthorized` with a message naming both vaults. `NULL`-bound (legacy) tokens still pass — the migration is additive, not breaking. Hub-issued JWTs continue to use `vault:<name>:<verb>` scope narrowing as the audience-binding mechanism (JWTs aren't per-token-DB rows, so `vault_name` doesn't apply).
+- **`src/token-store.ts` surfaces `vault_name` end-to-end.** `Token` and `ResolvedToken` carry the field; `createToken` accepts an optional `vault_name` (default null = server-wide); `listTokens` accepts `{ vaultName }` and filters with `WHERE vault_name = ? OR vault_name IS NULL` so legacy NULL-bound rows remain visible alongside the bound set.
+- **`src/tokens-routes.ts` per-vault endpoints filter by `vault_name`.** `GET /vault/<name>/tokens` returns vault-bound + legacy NULL-bound rows; `POST` mints with `vault_name = <name>`; `DELETE` only revokes rows that belong to the calling vault (or are NULL-bound). The implicit cross-vault listing surface in the SPA is now closed at the route layer, not just the SPA layer.
+- **`src/cli.ts tokens` gains `--vault <name>` and `--all` flags.** `tokens list --vault <name>` mirrors the SPA's per-vault filter from the command line. `tokens create --all` is the explicit opt-in for a server-wide mint (prints a warning since that's no longer the default); `tokens create --vault <name>` binds explicitly; `tokens create` with neither defaults to the active vault. List output annotates legacy rows with `[server-wide]` so operators can spot pre-v16 tokens at a glance.
+- **`web/ui/src/lib/tokens-api.ts:TokenSummary` adds `vault_name: string | null`.** The SPA's wire-shape interface mirrors the server's `tokens-routes.ts` response. `web/ui/src/routes/VaultTokens.tsx` renders a `server-wide` badge next to NULL-bound rows so legacy tokens are visually distinct from per-vault mints — matches the issue's UI guidance.
+
+### Tests
+
+- `src/token-store.test.ts` — new `per-vault binding (v16)` describe (3 cases): NULL when `vault_name` omitted, binding when set, `listTokens({ vaultName })` returns vault-bound + legacy NULL but excludes other-vault-bound rows. Doubles as a v16-migration pin since the test creates fresh DBs through `initSchema` (current SCHEMA_VERSION) and operates on the new column.
+- `src/auth.test.ts` — new `auth — cross-vault isolation` describe (3 cases): cross-vault binding rejects 403, matched binding accepts, NULL-bound legacy tokens still authenticate.
+- `src/tokens-routes.test.ts` — new v16 list-filter case: plants a token in another vault's DB and a legacy NULL-bound row in the calling vault's DB; asserts the foreign-vault row is excluded from the response, the legacy row is present, and the response surfaces the new `vault_name` field.
+- `web/ui/src/routes/VaultTokens.test.tsx` — fixture migrated to include `vault_name: "work"` so the typecheck pins the field's presence on the wire.
+
 ## [0.3.6-rc.38] — 2026-05-04
 
 vault#252 third follow-up — fix the empty-stats render Aaron caught after rc.37 unblocked the auth flow. The Stats section on the per-vault detail page rendered all four labels (Notes / Tags / Attachments / Links) but the values next to them were blank. Two contributing bugs: the SPA's `VaultStats` interface used short names (`notes`, `tags`, `attachments`, `links`) that don't exist in the wire payload, and the server-side `VaultStats` had no attachment count at all. Every read coerced `undefined` → `""` and rendered blank.
