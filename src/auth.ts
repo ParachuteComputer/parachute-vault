@@ -50,6 +50,14 @@ export interface AuthResult {
    * an OAuth-claim concern. See patterns/tag-scoped-tokens.md.
    */
   scoped_tags: string[] | null;
+  /**
+   * Per-vault binding (v16). Non-null = token can only authenticate against
+   * this vault. authenticateVaultRequest enforces the match before this
+   * result returns; callers downstream can read it for additional scoping
+   * (e.g. cross-vault filtering at the unified /mcp endpoint). NULL =
+   * legacy / server-wide / hub JWT — no per-vault binding. See vault#257.
+   */
+  vault_name: string | null;
 }
 
 /**
@@ -63,6 +71,7 @@ function legacyAuthResult(permission: TokenPermission): AuthResult {
     scopes: legacyPermissionToScopes(permission),
     legacyDerived: true,
     scoped_tags: null,
+    vault_name: null,
   };
 }
 
@@ -172,6 +181,24 @@ export async function authenticateVaultRequest(
     try {
       const resolved = resolveToken(vaultDb, key);
       if (resolved) {
+        // Per-vault binding (v16): tokens minted via /vault/<name>/tokens
+        // carry vault_name = <name>. Reject if presented at a different
+        // vault. NULL = legacy / server-wide; accept anywhere. The DB
+        // lookup itself already filters by per-vault DB scoping (resolve
+        // only succeeds if the token row lives in this vault's DB), so
+        // a mismatch here would only happen if a token row was copied
+        // across vault DBs out-of-band — defense-in-depth.
+        if (resolved.vault_name !== null && resolved.vault_name !== vaultConfig.name) {
+          return {
+            error: Response.json(
+              {
+                error: "Unauthorized",
+                message: `token is bound to vault '${resolved.vault_name}'; cannot be used against vault '${vaultConfig.name}'`,
+              },
+              { status: 403 },
+            ),
+          };
+        }
         if (resolved.legacyDerived) {
           warnLegacyOnce(`vault-token:${vaultConfig.name ?? ""}`, "vault token without scopes column");
         }
@@ -180,6 +207,7 @@ export async function authenticateVaultRequest(
           scopes: resolved.scopes,
           legacyDerived: resolved.legacyDerived,
           scoped_tags: resolved.scoped_tags,
+          vault_name: resolved.vault_name,
         };
       }
     } catch {
@@ -244,7 +272,7 @@ async function authenticateHubJwt(
       hasScope(claims.scopes, SCOPE_WRITE) || hasScope(claims.scopes, SCOPE_ADMIN)
         ? "full"
         : "read";
-    return { permission, scopes: claims.scopes, legacyDerived: false, scoped_tags: null };
+    return { permission, scopes: claims.scopes, legacyDerived: false, scoped_tags: null, vault_name: null };
   } catch (err) {
     if (err instanceof HubJwtError) {
       return { error: Response.json({ error: "Unauthorized", message: err.message }, { status: 401 }) };
@@ -302,7 +330,12 @@ export async function authenticateGlobalRequest(
 
   // Fall through to vault token DBs — check each vault for the token.
   // This enables OAuth-minted pvt_ tokens and CLI-created tokens to
-  // authenticate against the unified /mcp endpoint.
+  // authenticate against the unified /mcp endpoint. The token's vault
+  // binding (if any) is propagated via AuthResult.vault_name; downstream
+  // handlers that operate on a specific vault are responsible for
+  // checking that binding matches their target. The unified surface
+  // itself doesn't reject here — a vault-bound token authenticating to
+  // call back into its own vault via /mcp is legitimate.
   for (const vaultName of listVaults()) {
     try {
       const store = getVaultStore(vaultName);
@@ -316,6 +349,7 @@ export async function authenticateGlobalRequest(
           scopes: resolved.scopes,
           legacyDerived: resolved.legacyDerived,
           scoped_tags: resolved.scoped_tags,
+          vault_name: resolved.vault_name,
         };
       }
     } catch {

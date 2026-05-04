@@ -174,6 +174,65 @@ describe("auth — cross-vault isolation", () => {
     const res = await authenticateVaultRequest(bearer(workToken), journalConfig, journalStore.db);
     expect("error" in res).toBe(true);
   });
+
+  test("v16 vault_name binding rejects with 403 when the row is cross-vault", async () => {
+    // Per-vault DB scoping is the first line of defense (a token only
+    // resolves against the DB it was minted in). The v16 vault_name column
+    // is defense-in-depth: if a token row somehow lives in vault A's DB
+    // but its vault_name says "B" (e.g. an out-of-band copy, or a future
+    // mistake in the mint path), the binding mismatch must reject. We
+    // simulate that by minting into journal's DB with vault_name="work".
+    seedVault("journal", { isDefault: true });
+    seedVault("work");
+    const journalStore = getVaultStore("journal");
+    const { fullToken } = generateToken();
+    createToken(journalStore.db, fullToken, {
+      label: "mis-bound",
+      permission: "full",
+      vault_name: "work",
+    });
+    const journalConfig = readVaultConfig("journal")!;
+
+    const res = await authenticateVaultRequest(bearer(fullToken), journalConfig, journalStore.db);
+    expect("error" in res).toBe(true);
+    if ("error" in res) {
+      expect(res.error.status).toBe(403);
+    }
+  });
+
+  test("v16 vault_name binding accepts when token is bound to the requested vault", async () => {
+    seedVault("work");
+    const workStore = getVaultStore("work");
+    const { fullToken } = generateToken();
+    createToken(workStore.db, fullToken, {
+      label: "bound",
+      permission: "full",
+      vault_name: "work",
+    });
+    const workConfig = readVaultConfig("work")!;
+
+    const res = await authenticateVaultRequest(bearer(fullToken), workConfig, workStore.db);
+    expect("error" in res).toBe(false);
+    if (!("error" in res)) {
+      expect(res.vault_name).toBe("work");
+    }
+  });
+
+  test("legacy NULL-bound tokens still authenticate against any vault", async () => {
+    // Backwards compatibility: pre-v16 tokens (and legacy YAML keys, and
+    // hub JWTs) all carry vault_name = null. They keep working at any
+    // vault — the migration is lenient by design.
+    seedVault("work");
+    const workToken = mintTokenInVault("work");
+    const workConfig = readVaultConfig("work")!;
+    const workStore = getVaultStore("work");
+
+    const res = await authenticateVaultRequest(bearer(workToken), workConfig, workStore.db);
+    expect("error" in res).toBe(false);
+    if (!("error" in res)) {
+      expect(res.vault_name).toBeNull();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
