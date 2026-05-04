@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -126,6 +126,13 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 -- patterns/tag-scoped-tokens.md. Hierarchy expansion is applied at auth
 -- time via getTagDescendants; the column stores root names only.
 --
+-- vault_name (v16) binds the token to a single vault. NULL means the
+-- token is server-wide / legacy (pre-v16 rows backfill to NULL on the
+-- migration; auth treats NULL as accept-any-vault for back-compat).
+-- New tokens minted via per-vault routes write the column explicitly so
+-- cross-vault presentation rejects in authenticateVaultRequest. See
+-- vault#257.
+--
 -- scope_tag / scope_path_prefix are deprecated Phase-0 columns — never
 -- enforced at runtime, kept only for schema stability.
 CREATE TABLE IF NOT EXISTS tokens (
@@ -138,7 +145,8 @@ CREATE TABLE IF NOT EXISTS tokens (
   scope_path_prefix TEXT,
   expires_at TEXT,
   created_at TEXT NOT NULL,
-  last_used_at TEXT
+  last_used_at TEXT,
+  vault_name TEXT
 );
 
 -- OAuth: registered clients (Dynamic Client Registration)
@@ -202,6 +210,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
 CREATE INDEX IF NOT EXISTS idx_schema_mappings_match ON schema_mappings(match_kind, match_value);
+CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name);
 `;
 
 /**
@@ -264,6 +273,12 @@ export function initSchema(db: Database): void {
   // `schema_mappings`. The legacy notes are LEFT IN PLACE — they are
   // inert post-v15 (no resolver reads them) and serve as audit trail.
   migrateToV15(db);
+
+  // Migrate v15 → v16: add `vault_name` column to tokens. Existing rows
+  // backfill to NULL ("server-wide / legacy" semantic) — auth accepts
+  // NULL for any vault, so today's pvt_* tokens keep working unchanged.
+  // New mints via per-vault routes write the column explicitly. See vault#257.
+  migrateToV16(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -651,6 +666,38 @@ function migrateToV15(db: Database): void {
         `[vault] migrated to schema v15: copied ${copiedSchemas} _schemas/* + ${copiedMappings} _schema_defaults mappings into note_schemas/schema_mappings`,
       );
     }
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+/**
+ * Migrate v15 → v16: per-vault token storage (vault#257).
+ *
+ * Adds `tokens.vault_name TEXT` (nullable). Existing rows stay NULL —
+ * "server-wide / legacy" semantic — and `authenticateVaultRequest`
+ * accepts NULL for any vault, so today's pvt_* tokens keep working
+ * unchanged. New mints via `/vault/<name>/tokens` write the column
+ * explicitly; cross-vault presentation rejects on the row's vault_name
+ * mismatch. The complementary index speeds the per-vault listTokens
+ * filter in the admin SPA.
+ *
+ * Wrapped in BEGIN IMMEDIATE / COMMIT (with try/catch ROLLBACK) per the
+ * v14/v15 wrap pattern from vault#251 — the column add and index create
+ * are individually idempotent (`hasColumn` / IF NOT EXISTS), but the
+ * transaction means a crash mid-migration leaves either pre-v16 or
+ * post-v16 state, never partial.
+ */
+function migrateToV16(db: Database): void {
+  if (!hasTable(db, "tokens")) return;
+  if (hasColumn(db, "tokens", "vault_name")) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec("ALTER TABLE tokens ADD COLUMN vault_name TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name)");
+    db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
