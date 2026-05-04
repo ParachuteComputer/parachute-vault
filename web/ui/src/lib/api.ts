@@ -14,11 +14,22 @@
  */
 import { getToken } from "./auth.ts";
 
+/**
+ * Counts surface in `VaultDetail.tsx`'s Stats section. Field names mirror
+ * the server's `core/src/types.ts:VaultStats` shape so the JSON parses
+ * straight in — historically the SPA shadowed the server with shorter
+ * names (`notes`, `tags`, `attachments`, `links`) which silently rendered
+ * as empty strings since none of those keys actually exist on the wire.
+ *
+ * The wire payload carries more fields than this (timeline, top tags,
+ * earliest/latest note); we only declare the ones the SPA reads, since
+ * adding the rest just buys drift surface.
+ */
 export interface VaultStats {
-  notes: number;
-  tags: number;
-  attachments: number;
-  links: number;
+  totalNotes: number;
+  tagCount: number;
+  attachmentCount: number;
+  linkCount: number;
 }
 
 export interface VaultDetailResult {

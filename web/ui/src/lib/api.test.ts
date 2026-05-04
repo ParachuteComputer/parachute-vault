@@ -69,7 +69,7 @@ describe("getVaultDetail", () => {
           name: "work",
           description: null,
           createdAt: "2026-04-01T00:00:00Z",
-          stats: { notes: 12, tags: 3, attachments: 1, links: 4 },
+          stats: { totalNotes: 12, tagCount: 3, attachmentCount: 1, linkCount: 4 },
         }),
         { status: 200 },
       );
@@ -78,7 +78,7 @@ describe("getVaultDetail", () => {
     const detail = await getVaultDetail("work");
 
     expect(detail.name).toBe("work");
-    expect(detail.stats.notes).toBe(12);
+    expect(detail.stats.totalNotes).toBe(12);
     expect(calls[0]?.url).toBe("/vault/work/");
     expect(calls[0]?.auth).toBe("Bearer jwt-here");
   });

@@ -587,11 +587,23 @@ describe("vault stats", async () => {
     const result = await store.getVaultStats();
     expect(result.totalNotes).toBe(2);
     expect(result.tagCount).toBe(2);
+    expect(result.attachmentCount).toBe(0);
     expect(result.topTags[0].tag).toBe("x");
     expect(result.topTags[0].count).toBe(2);
     expect(result.notesByMonth).toHaveLength(2);
     expect(result.earliestNote!.createdAt).toBe("2025-05-01T00:00:00.000Z");
     expect(result.latestNote!.createdAt).toBe("2025-06-01T00:00:00.000Z");
+  });
+
+  it("getVaultStats counts attachments", async () => {
+    const n1 = await store.createNote("one");
+    const n2 = await store.createNote("two");
+    await store.addAttachment(n1.id, "/tmp/a1.mp3", "audio/mp3");
+    await store.addAttachment(n1.id, "/tmp/i1.png", "image/png");
+    await store.addAttachment(n2.id, "/tmp/a2.mp3", "audio/mp3");
+
+    const result = await store.getVaultStats();
+    expect(result.attachmentCount).toBe(3);
   });
 });
 

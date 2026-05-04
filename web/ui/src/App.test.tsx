@@ -31,7 +31,7 @@ const detailFixture = (over: Partial<api.VaultDetailResult> = {}): api.VaultDeta
   name: "boulder",
   description: "ops vault",
   createdAt: "2026-05-01T00:00:00Z",
-  stats: { notes: 0, tags: 0, attachments: 0, links: 0 },
+  stats: { totalNotes: 0, tagCount: 0, attachmentCount: 0, linkCount: 0 },
   ...over,
 });
 
@@ -48,6 +48,31 @@ describe("App — per-vault mount", () => {
   beforeEach(() => {
     vi.mocked(mount.getMountedVaultName).mockReturnValue("boulder");
     vi.mocked(api.getVaultDetail).mockResolvedValue(detailFixture());
+  });
+
+  it("renders the actual stat counts from the wire payload (regression: empty values)", async () => {
+    // Aaron caught this in the rc.37 ship: labels rendered (Notes / Tags /
+    // Attachments / Links) but the values were empty because the SPA's old
+    // VaultStats interface used short names (`notes`, `tags`, `attachments`,
+    // `links`) that don't exist on the wire — the server returns
+    // `totalNotes`, `tagCount`, `attachmentCount`, `linkCount` per
+    // `core/src/types.ts:VaultStats`. Every read coerced undefined → "" and
+    // rendered blank. Pin the four values explicitly so a future drift on
+    // either side trips this test.
+    vi.mocked(api.getVaultDetail).mockResolvedValue(
+      detailFixture({
+        stats: { totalNotes: 12, tagCount: 3, attachmentCount: 1, linkCount: 4 },
+      }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText("12")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("4")).toBeInTheDocument();
   });
 
   it("renders VaultDetail at `/` (no redirect, no doubled URL)", async () => {
