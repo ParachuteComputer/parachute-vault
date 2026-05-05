@@ -2675,6 +2675,54 @@ describe("MCP tools", async () => {
     expect(aAfter!.content).toBe(aBefore!.content);
     expect(aAfter!.tags ?? []).not.toContain("should-rollback");
   });
+
+  it("update-note batch rolls back prefix mutation when a later item if_updated_at-conflicts (#261)", async () => {
+    // The companion to the PATH_CONFLICT test above. Item 1's stale
+    // `if_updated_at` must surface as a ConflictError so the batch's
+    // BEGIN/COMMIT wrap can roll back item 0's mutation.
+    //
+    // Pre-fix (vault#261): `noteOps.updateNote` checked `res.changes === 0`
+    // to detect the precondition miss. Inside this multi-statement batch
+    // transaction, `.changes` reported a stale non-zero value from prior
+    // writes, so the conflict was silently missed and item 0's mutation
+    // committed with item 1 ignored.
+    //
+    // Post-fix: the conditional UPDATE uses `RETURNING id` and detects the
+    // miss directly from row presence. ConflictError fires; batch rolls back.
+    //
+    // Standalone bun:sqlite repro is pending — six attempted reductions
+    // (basic txn, async/microtask, prepared-statement reuse, mcp-loop
+    // mirror, hook-dispatch mirror, syncWikilinks-style writes) failed to
+    // hit the .changes-stale path outside the full BunStore plumbing. The
+    // bug surfaces only through `BunStore.updateNote` → hook dispatch.
+    // See vault#261 for the audit trail.
+    await store.createNote("A", { id: "a261" });
+    await store.createNote("B", { id: "b261" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const aBefore = await store.getNote("a261");
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        notes: [
+          // Item 0 mutates a261's content + adds a tag (force, no precondition).
+          { id: "a261", content: "A mutated", force: true, tags: { add: ["should-rollback"] } },
+          // Item 1 has a stale if_updated_at on b261 — should ConflictError.
+          { id: "b261", content: "B should-not-land", if_updated_at: "2020-01-01T00:00:00.000Z" },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CONFLICT");
+
+    // Item 0's tag-add + content change must be rolled back.
+    const aAfter = await store.getNote("a261");
+    expect(aAfter!.content).toBe(aBefore!.content);
+    expect(aAfter!.tags ?? []).not.toContain("should-rollback");
+  });
 });
 
 // ---- query-notes link expansion ----
