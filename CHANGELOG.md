@@ -6,6 +6,93 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-05
+
+First minor bump since `0.3.3` on `@latest`. The work that accumulated across
+the `0.3.6-rc.*` line plus the two `0.4.0-rc.*` cuts ships together. Release-RC
+detail is preserved in the entries below for granular history; this entry is
+the operator-facing summary.
+
+### Schema
+
+- **v14 — single-row tag identity (#244, #245).** Tag schemas (description,
+  fields, relationships, parent_names) are columns on `tags` rather than
+  `_tags/<name>` notes. One name = one row.
+- **v15 — `note_schemas` + `schema_mappings` (#249).** Retire `_schemas/*` notes
+  for first-class tables; clearer ownership, cheaper queries.
+- **v16 — per-vault token storage (#258).** `tokens.vault_name` column +
+  `idx_tokens_vault_name`. Legacy `NULL`-bound rows continue to authenticate as
+  server-wide for back-compat; new mints default to vault-bound.
+
+All three migrations idempotent under `BEGIN IMMEDIATE` / `COMMIT` /
+`ROLLBACK` (#251 pinned the v14 wrap; v15 + v16 follow the same shape).
+
+### Admin SPA
+
+- **Scaffold + Phase A/B/C — vault detail, tokens, permissions** (#218 chain,
+  #222, others). Per-vault dashboard is now a real surface — no more
+  shell-only token administration.
+- **Per-vault mount at `/vault/<name>/admin/`** (#252, #254, #255, #256).
+  SPA boots under a runtime basename matching the mount; `module.json`'s
+  `managementUrl` carries a trailing slash so hub-issued JWT fragments survive
+  the click-through (browsers drop `#fragment` across 301s).
+
+### Auth
+
+- **Cross-vault token rejection at the auth boundary** (#258). When a `pvt_*`
+  resolves to a different `vault_name` than the request's vault, `403` with
+  both names in the message. Closes the implicit cross-vault listing surface.
+- **JWT audience: per-vault `aud: vault.<name>`** (was hardcoded `"hub"`).
+  Hub-issued JWTs scope-bind to the vault they were minted for, so a token
+  for `vault.work` can't be replayed at `vault.personal`.
+- **`config.yaml` scope-field parsing fix (priv-esc)** (#233). Pre-fix,
+  legacy `permissions` keys silently inflated effective scope.
+
+### Correctness
+
+- **Batch operations transactionally atomic (vault#236, PR #260).**
+  Multi-item batch entry points (`POST /api/notes`, `create-note`,
+  `update-note`) wrap loops in `BEGIN` / `COMMIT` / `ROLLBACK`. A mid-batch
+  failure no longer leaves prefix items written. Single-item paths skip the
+  wrap to avoid colliding with concurrent callers on the shared bun:sqlite
+  connection.
+- **`.changes`-based conflict detection migrated to `RETURNING`
+  (vault#261, PR #262).** Inside a multi-statement transaction with
+  intervening writes, `Statement.run().changes` could carry stale values,
+  silently bypassing the `if_updated_at` precondition check. Six sites
+  migrated to detect row presence via SQLite's `RETURNING` clause.
+
+### Smaller fixes worth naming
+
+- `query-notes` routes FTS through `store.searchNotes` (#231) and accepts
+  camelCase / singular aliases (#224); generalized `date_filter` on indexed
+  metadata (#230).
+- Empty-note pre-validation + 500-cap batches (#235, vault#213) — closes the
+  "7,453 empty pathless rows in one MCP burst" runaway-client surface.
+- Tag-scoped tokens Phase 1 (#241).
+- `cli init` autostart opt-out via `--no-autostart` (#207, #211).
+- `parachute-vault create` re-registers vaults in `services.json` (#209).
+- `bun run typecheck` canonical script (#232).
+- Hub-issued scope-guard adoption (#212) — common scope-narrowing primitive
+  shared with `parachute-hub`.
+- `web/ui` per-vault mount routing fixes (#252, #253, #254 — see SPA section).
+
+### Migration notes
+
+- Schema v14, v15, v16 run in sequence on first boot of `0.4.0`. Each is
+  idempotent and self-rolls-back on failure.
+- Existing tokens minted before v16 carry `vault_name = NULL` and
+  authenticate as server-wide. New mints default to vault-bound; pass
+  `--all` to `tokens create` to opt back into a server-wide mint (warning
+  printed).
+- Hub-issued JWTs with the old `aud: "hub"` claim continue to validate
+  during the rolling-update window; new mints emit per-vault `aud`.
+
+### Closed without code change
+
+- vault#102 (publish `@openparachute/core` to npm) — `core/` ships bundled
+  in the vault tarball; no external consumer needs the standalone package.
+
 ## [0.4.0-rc.2] — 2026-05-04
 
 A correctness fix on top of rc.1. The atomicity wrap landed in rc.1 made a
