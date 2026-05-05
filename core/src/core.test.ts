@@ -2613,6 +2613,68 @@ describe("MCP tools", async () => {
     expect(err.limit).toBe(500);
     expect(err.got).toBe(501);
   });
+
+  it("create-note batch where mid-item triggers PATH_CONFLICT rolls back prefix items (#236)", async () => {
+    // The empty-note pre-walk (#213) catches `{}` before any DB write; a
+    // path-conflict can only surface on the actual INSERT, mid-loop. Without
+    // the BEGIN/COMMIT wrap the prefix items would have already landed.
+    await store.createNote("seed", { path: "taken-236" });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const beforeIds = (await store.queryNotes({})).map((n) => n.id).sort();
+
+    let err: any;
+    try {
+      await createNote.execute({
+        notes: [
+          { content: "ok-1", path: "fresh-236-1" },
+          { content: "ok-2", path: "fresh-236-2" },
+          { content: "boom", path: "taken-236" },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+
+    // The two prefix items must NOT have been created — atomic rollback.
+    const afterIds = (await store.queryNotes({})).map((n) => n.id).sort();
+    expect(afterIds).toEqual(beforeIds);
+    expect(await store.queryNotes({ path: "fresh-236-1" })).toHaveLength(0);
+    expect(await store.queryNotes({ path: "fresh-236-2" })).toHaveLength(0);
+  });
+
+  it("update-note batch rolls back prefix tag mutation when a later item path-conflicts (#236)", async () => {
+    await store.createNote("A", { id: "a236" });
+    await store.createNote("B", { id: "b236" });
+    await store.createNote("C", { id: "c236", path: "occupied-236" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const aBefore = await store.getNote("a236");
+
+    let err: any;
+    try {
+      await updateNote.execute({
+        notes: [
+          // Item 0 mutates a236's content + adds a tag. force=true skips
+          // the if_updated_at precondition.
+          { id: "a236", content: "A mutated", force: true, tags: { add: ["should-rollback"] } },
+          // Item 1 tries to take a path already owned by c236 — PATH_CONFLICT.
+          { id: "b236", path: "occupied-236", force: true },
+        ],
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("PATH_CONFLICT");
+
+    // Item 0's tag-add + content change must be rolled back — the batch
+    // transaction reverted them when item 1 path-conflicted (#236).
+    const aAfter = await store.getNote("a236");
+    expect(aAfter!.content).toBe(aBefore!.content);
+    expect(aAfter!.tags ?? []).not.toContain("should-rollback");
+  });
 });
 
 // ---- query-notes link expansion ----
