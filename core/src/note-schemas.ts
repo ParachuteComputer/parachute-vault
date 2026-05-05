@@ -164,8 +164,10 @@ export function upsertNoteSchema(
  * Returns true if the row existed.
  */
 export function deleteNoteSchema(db: Database, name: string): boolean {
-  const result = db.prepare("DELETE FROM note_schemas WHERE name = ?").run(name);
-  return result.changes > 0;
+  const deleted = db.prepare(
+    "DELETE FROM note_schemas WHERE name = ? RETURNING name",
+  ).get(name) as { name: string } | null;
+  return deleted !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +225,8 @@ export function deleteSchemaMapping(
   match_kind: SchemaMappingKind,
   match_value: string,
 ): boolean {
-  const result = db.prepare(
-    "DELETE FROM schema_mappings WHERE schema_name = ? AND match_kind = ? AND match_value = ?",
-  ).run(schema_name, match_kind, match_value);
-  return result.changes > 0;
+  const deleted = db.prepare(
+    "DELETE FROM schema_mappings WHERE schema_name = ? AND match_kind = ? AND match_value = ? RETURNING schema_name",
+  ).get(schema_name, match_kind, match_value) as { schema_name: string } | null;
+  return deleted !== null;
 }
