@@ -1508,6 +1508,38 @@ describe("HTTP /notes", async () => {
     });
   });
 
+  describe("batch atomicity (#236)", async () => {
+    test("POST batch where mid-item triggers PATH_CONFLICT → 409, NOTHING created", async () => {
+      // The empty-note pre-walk catches `{}` before any DB write (#213); a
+      // path-conflict only surfaces on the actual INSERT, mid-loop. Without
+      // the BEGIN/COMMIT wrap the prefix would have already landed by then.
+      await store.createNote("existing", { path: "taken" });
+      const beforeIds = (await store.queryNotes({})).map((n) => n.id).sort();
+
+      const res = await handleNotes(
+        mkReq("POST", "/notes", {
+          notes: [
+            { content: "ok-1", path: "fresh-1" },
+            { content: "ok-2", path: "fresh-2" },
+            { content: "boom", path: "taken" },
+            { content: "ok-3", path: "fresh-3" },
+          ],
+        }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(409);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("path_conflict");
+
+      // The two prefix items must NOT have been created — atomic rollback.
+      const afterIds = (await store.queryNotes({})).map((n) => n.id).sort();
+      expect(afterIds).toEqual(beforeIds);
+      expect(await store.queryNotes({ path: "fresh-1" })).toHaveLength(0);
+      expect(await store.queryNotes({ path: "fresh-2" })).toHaveLength(0);
+    });
+  });
+
   describe("batch cap (#213)", async () => {
     test("POST with 501-item batch → 413 BatchTooLarge", async () => {
       const oversized = Array.from({ length: 501 }, (_, i) => ({ content: `n${i}` }));

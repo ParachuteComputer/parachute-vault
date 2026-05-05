@@ -400,6 +400,15 @@ export async function handleNotes(
       }
 
       const created: Note[] = [];
+      // Wrap multi-item batches in a SQLite transaction so a mid-batch
+      // failure (path conflict, etc.) rolls back every prior insert. Without
+      // this, callers got half-applied batches where the prefix landed and
+      // the offending entry surfaced the 409 — see #236. Single-item posts
+      // are already atomic at the store layer and skip the wrap so they
+      // don't collide with concurrent single-item callers on the shared
+      // bun:sqlite connection.
+      const batched = items.length > 1;
+      if (batched) db.exec("BEGIN");
       try {
         for (const item of items) {
           const note = await store.createNote(item.content ?? "", {
@@ -420,7 +429,9 @@ export async function handleNotes(
 
           created.push((await store.getNote(note.id)) ?? note);
         }
+        if (batched) db.exec("COMMIT");
       } catch (e: any) {
+        if (batched) db.exec("ROLLBACK");
         // Duck-type for module-boundary robustness (matches the PATCH branch).
         if (e && e.code === "PATH_CONFLICT") {
           return json(

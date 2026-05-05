@@ -402,25 +402,39 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         }
 
         const created: Note[] = [];
-        for (const item of items) {
-          const note = await store.createNote(item.content as string ?? "", {
-            path: item.path as string | undefined,
-            tags: item.tags as string[] | undefined,
-            metadata: item.metadata as Record<string, unknown> | undefined,
-            created_at: item.created_at as string | undefined,
-          });
+        // Wrap multi-item batches in a SQLite transaction so a mid-batch
+        // failure rolls back every prior insert — see #236. The pre-walk
+        // above catches empty-note cases; this guards anything thrown from
+        // store.createNote / createLink (path conflict, etc.). Single-item
+        // calls skip the wrap to avoid colliding with concurrent callers
+        // on the shared bun:sqlite connection.
+        const batched = items.length > 1;
+        if (batched) db.exec("BEGIN");
+        try {
+          for (const item of items) {
+            const note = await store.createNote(item.content as string ?? "", {
+              path: item.path as string | undefined,
+              tags: item.tags as string[] | undefined,
+              metadata: item.metadata as Record<string, unknown> | undefined,
+              created_at: item.created_at as string | undefined,
+            });
 
-          // Create explicit links (not wikilinks — those are automatic)
-          if (item.links) {
-            for (const link of item.links as { target: string; relationship: string }[]) {
-              const target = resolveNote(db, link.target);
-              if (target) {
-                await store.createLink(note.id, target.id, link.relationship);
+            // Create explicit links (not wikilinks — those are automatic)
+            if (item.links) {
+              for (const link of item.links as { target: string; relationship: string }[]) {
+                const target = resolveNote(db, link.target);
+                if (target) {
+                  await store.createLink(note.id, target.id, link.relationship);
+                }
               }
             }
-          }
 
-          created.push(noteOps.getNote(db, note.id) ?? note);
+            created.push(noteOps.getNote(db, note.id) ?? note);
+          }
+          if (batched) db.exec("COMMIT");
+        } catch (e) {
+          if (batched) db.exec("ROLLBACK");
+          throw e;
         }
 
         // Apply tag schema effects
@@ -552,6 +566,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         }
 
         const updated: Note[] = [];
+        // Wrap multi-item batches in a SQLite transaction so any mid-batch
+        // failure (precondition error, content_edit miss, ConflictError, …)
+        // rolls back every prior mutation in the batch — see #236.
+        // Single-item calls skip the wrap so concurrent callers don't
+        // collide on the shared bun:sqlite connection.
+        const batched = items.length > 1;
+        if (batched) db.exec("BEGIN");
+        try {
         for (const item of items) {
           const note = requireNote(db, item.id as string);
 
@@ -707,6 +729,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
           // Re-read for final state
           updated.push(noteOps.getNote(db, note.id) ?? result);
+        }
+          if (batched) db.exec("COMMIT");
+        } catch (e) {
+          if (batched) db.exec("ROLLBACK");
+          throw e;
         }
 
         const final = updated.map((n) => attachValidationStatus(store, db, n));

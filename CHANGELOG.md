@@ -6,6 +6,39 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] — 2026-05-04
+
+Release-prep cut for the `0.4.0` `@latest` publish. The minor bump signals
+the meaningful surface change accumulated across 39 RCs on `0.3.6`: admin
+SPA mounted per-vault, per-vault token storage with cross-vault binding,
+schema migrations through v16, and the auth-boundary rewrite. This RC
+itself folds one correctness fix — vault#236 — and clears housekeeping.
+
+### Fixed
+
+- **vault#236 — batch operations are now transactionally atomic.** Wrap
+  multi-item batch loops in `BEGIN` / `COMMIT` / `ROLLBACK` at the three
+  public batch entry points (`src/routes.ts` `POST /api/notes`,
+  `core/src/mcp.ts` `create-note`, `core/src/mcp.ts` `update-note`). Mirrors
+  the existing `core/src/notes.ts:createNotes` pattern. Without this, a
+  mid-batch failure (path conflict, conditional-update conflict) left the
+  prefix items already written. Single-item calls skip the wrap so
+  concurrent callers don't collide on the shared bun:sqlite connection —
+  single-note paths are already atomic at the store layer.
+
+### Tests
+
+- `src/vault.test.ts` — HTTP `POST /notes` batch where mid-item triggers
+  `PATH_CONFLICT`: assert nothing from the prefix lands.
+- `core/src/core.test.ts` — MCP `create-note` batch + `update-note` batch
+  with mid-batch `PATH_CONFLICT`: assert prefix items rolled back.
+
+### Closed without code change
+
+- vault#102 (publish `@openparachute/core` to npm) — mooted; `core/` is
+  bundled into the vault tarball via `package.json` `files`. No external
+  consumer needs the standalone publish today; revisit if that changes.
+
 ## [0.3.6-rc.39] — 2026-05-04
 
 vault#257 — per-vault token storage migration. Tokens now bind to the vault they were minted from, and cross-vault use is rejected at the auth layer. Pre-v16 tokens carry a `NULL` `vault_name` and remain server-wide (legacy compatibility), so existing deployments keep working unchanged; new mints default to vault-bound. The cross-vault leak surface was small in practice (per-vault DBs already scope storage; only `authenticateGlobalRequest` at `/mcp` iterated across vaults), but the explicit `vault_name` column closes the gap with defense-in-depth at every per-vault auth path.
