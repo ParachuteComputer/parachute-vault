@@ -6,6 +6,32 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.0-rc.2] — 2026-05-04
+
+A correctness fix on top of rc.1. The atomicity wrap landed in rc.1 made a
+latent bun:sqlite quirk reachable through `if_updated_at`-based optimistic
+concurrency; this RC migrates conflict / existence detection off
+`Statement.run().changes` to `UPDATE...RETURNING` / `DELETE...RETURNING`
+across every site that reads it.
+
+### Fixed
+
+- **vault#261 — `.changes`-based conflict detection migrated to
+  `RETURNING`.** Inside a multi-statement transaction with intervening
+  writes, `Statement.run().changes` could carry stale values, silently
+  skipping the `if_updated_at` precondition check in `noteOps.updateNote`.
+  Six sites migrated to detect row presence via SQLite's `RETURNING` clause
+  instead of row-count: `core/src/notes.ts` (main + sets-empty conditional
+  UPDATE, `renameTag` count), `core/src/note-schemas.ts` (`deleteNoteSchema`,
+  `deleteSchemaMapping`), `src/token-store.ts` (`revokeToken`).
+
+### Tests
+
+- `core/src/core.test.ts` — MCP `update-note` batch where item 1's stale
+  `if_updated_at` triggers a `ConflictError`: assert item 0's prefix
+  mutation rolled back. Pre-fix this test silently passes (the bug class);
+  post-fix it asserts the conflict surfaces and the batch unwinds.
+
 ## [0.4.0-rc.1] — 2026-05-04
 
 Release-prep cut for the `0.4.0` `@latest` publish. The minor bump signals
