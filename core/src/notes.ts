@@ -337,13 +337,15 @@ export function updateNote(
   // need to validate the precondition; a conditional UPDATE that sets
   // updated_at to itself does exactly that atomically — even a no-net-
   // change UPDATE takes the write lock in WAL mode, so it still serializes
-  // with other writers and `.changes` reflects whether the WHERE matched.
+  // with other writers. `RETURNING id` reports the row only when WHERE
+  // matched — `.changes` is unreliable inside multi-statement transactions
+  // (vault#261).
   if (sets.length === 0) {
     if (updates.if_updated_at !== undefined) {
       const probe = db.prepare(
-        "UPDATE notes SET updated_at = updated_at WHERE id = ? AND updated_at IS ?",
-      ).run(id, updates.if_updated_at);
-      if (probe.changes === 0) {
+        "UPDATE notes SET updated_at = updated_at WHERE id = ? AND updated_at IS ? RETURNING id",
+      ).get(id, updates.if_updated_at) as { id: string } | null;
+      if (probe === null) {
         throwConflictOrMissing(db, id, updates.if_updated_at);
       }
     }
@@ -357,9 +359,15 @@ export function updateNote(
     values.push(updates.if_updated_at);
   }
 
-  let res;
+  let matched: { id: string } | null = null;
   try {
-    res = db.prepare(sql).run(...values);
+    if (updates.if_updated_at !== undefined) {
+      matched = db.prepare(`${sql} RETURNING id`).get(...values) as
+        | { id: string }
+        | null;
+    } else {
+      db.prepare(sql).run(...values);
+    }
   } catch (err) {
     if (updates.path !== undefined && isPathUniqueError(err)) {
       throw new PathConflictError(normalizePath(updates.path) ?? updates.path);
@@ -367,7 +375,7 @@ export function updateNote(
     throw err;
   }
 
-  if (updates.if_updated_at !== undefined && res.changes === 0) {
+  if (updates.if_updated_at !== undefined && matched === null) {
     throwConflictOrMissing(db, id, updates.if_updated_at);
   }
 
@@ -721,10 +729,12 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       old?.created_at ?? now,
       now,
     );
-    const updated = db.prepare("UPDATE note_tags SET tag_name = ? WHERE tag_name = ?").run(newName, oldName);
+    const renamed = db.prepare(
+      "UPDATE note_tags SET tag_name = ? WHERE tag_name = ? RETURNING note_id",
+    ).all(newName, oldName) as { note_id: string }[];
     db.prepare("DELETE FROM tags WHERE name = ?").run(oldName);
     db.exec("COMMIT");
-    return { renamed: Number(updated.changes) };
+    return { renamed: renamed.length };
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;

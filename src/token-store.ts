@@ -319,8 +319,10 @@ export function revokeToken(db: Database, idOrHash: string): boolean {
   }
 
   // Try matching by full hash
-  const result = db.prepare("DELETE FROM tokens WHERE token_hash = ?").run(idOrHash);
-  return result.changes > 0;
+  const deleted = db.prepare(
+    "DELETE FROM tokens WHERE token_hash = ? RETURNING token_hash",
+  ).get(idOrHash) as { token_hash: string } | null;
+  return deleted !== null;
 }
 
 // ---------------------------------------------------------------------------
