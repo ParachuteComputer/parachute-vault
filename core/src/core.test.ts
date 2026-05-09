@@ -684,6 +684,28 @@ describe("renameTag cascade (vault#240 + #247)", async () => {
     expect(subFresh?.path).toBe("_tags/new/nested/leaf");
   });
 
+  it("14. sub-tag discovery escapes LIKE wildcards — `task_` rename doesn't pull `taskX/sub` into the cascade (#275 re-review)", async () => {
+    // Pre-fold: the discovery query was `LIKE 'task_/%'` which matches
+    // `taskX/sub` because `_` is a single-char wildcard. `taskX/sub`
+    // would then enter `renames` and get rewritten to `<new>/sub` — a
+    // write the caller never asked for.
+    await store.upsertTagRecord("task_", {});
+    await store.upsertTagRecord("taskX/sub", {});
+    const stray = await store.createNote("stray", { tags: ["taskX/sub"] });
+
+    const result = await store.renameTag("task_", "todo_");
+    // Only the actual root rename — no spurious sub-tag pulled in.
+    expect(result).toMatchObject({ sub_tags_renamed: 0 });
+
+    expect(await store.getTagRecord("task_")).toBeNull();
+    expect(await store.getTagRecord("todo_")).toBeTruthy();
+
+    // `taskX/sub` is untouched: row still present, the note tagged with
+    // it still carries the original tag.
+    expect(await store.getTagRecord("taskX/sub")).toBeTruthy();
+    expect((await store.getNote(stray.id))!.tags).toEqual(["taskX/sub"]);
+  });
+
   it("13. LIKE wildcard escape — a tag literally named `task_` doesn't false-match `taskX` (#275 fold N1)", async () => {
     // `task_` and `taskX` are unrelated tags. Pre-fold N1 the LIKE
     // pre-filter would have considered `taskX` rows as candidates for

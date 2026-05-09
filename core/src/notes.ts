@@ -756,9 +756,15 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
   // entry under `<newName>/`. Sorted by length DESC so we update the
   // deepest path first if any later step needs deterministic ordering
   // (the SQL we run is order-independent, but it costs nothing here).
+  //
+  // `escapeLikePattern` neutralizes `%` and `_` inside the operator-
+  // supplied tag name so a tag literally named `task_` doesn't pull
+  // `taskX/sub` into the rename transaction (that would be a write the
+  // caller never asked for — far worse than a downstream false-positive
+  // candidate). `ESCAPE '\\'` is required for the escape to take effect.
   const subRows = db
-    .prepare("SELECT name FROM tags WHERE name LIKE ? ORDER BY length(name) DESC")
-    .all(`${oldName}/%`) as { name: string }[];
+    .prepare("SELECT name FROM tags WHERE name LIKE ? ESCAPE '\\' ORDER BY length(name) DESC")
+    .all(`${escapeLikePattern(oldName)}/%`) as { name: string }[];
   const renames: { from: string; to: string }[] = [
     { from: oldName, to: newName },
     ...subRows.map((r) => ({ from: r.name, to: `${newName}${r.name.slice(oldName.length)}` })),

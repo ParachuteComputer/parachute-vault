@@ -22,10 +22,12 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
      load-bearing on this integrity).
   4. `tokens.scoped_tags` JSON arrays — the rename→token cascade
      replaces the previous fail-closed 409 (`tag_in_use_by_tokens`) on
-     `POST /api/tags/:name/rename`. **Breaking for API consumers** who
-     relied on that 409 to detect token-referenced tags as
-     rename-blockers. The cascade now rewrites those tokens' allowlists
-     transparently and returns 200 with cascade stats.
+     `POST /api/tags/:name/rename`.
+
+     > **Breaking** for API consumers who relied on that 409 to detect
+     > token-referenced tags as rename-blockers. The cascade now
+     > rewrites those tokens' allowlists transparently and returns 200
+     > with cascade stats.
   5. `indexed_fields.declarer_tags` JSON arrays.
   6. Note body `content`: `#oldname` and `#oldname/...` references
      rewrite to `#newname` / `#newname/...`. `[[_tags/oldname]]`
@@ -66,6 +68,20 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 - **`indexed_fields.declarer_tags` filter gains an `IS NOT NULL`
   guard** to match the consistency of the parent_names + scoped_tags
   filters.
+
+### Fixed (folded from PR #275 re-review)
+
+- **Sub-tag discovery query escapes LIKE wildcards (load-bearing).**
+  The upstream discovery query that populates the `renames` list
+  (`SELECT name FROM tags WHERE name LIKE ? ORDER BY length(name) DESC`)
+  was missed in the prior fold pass. With raw `oldName`, a tag named
+  `task_` produced `LIKE 'task_/%'` which matches `taskX/sub` (because
+  `_` is a single-char wildcard) — `taskX/sub` would have entered the
+  rename transaction and been rewritten to `<new>/sub`, a write the
+  caller never requested. Worse than downstream false-positives
+  because this is what *populates* the rename set, not just a
+  candidate filter. Now uses `escapeLikePattern(oldName)` + `ESCAPE
+  '\\'`. Pinned by test #14.
 
 ### Notes
 
