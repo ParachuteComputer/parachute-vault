@@ -32,6 +32,14 @@ weren't earning their keep — both retired in this RC.
   warning naming any dropped schemas/mappings if rows existed so the
   operator can re-create on `tags.fields` if needed.
 
+  *Pre-v15 vault upgrade caveat.* A vault created before v15 shipped
+  that never upgraded to v15 will skip the `_schemas/*` notes-as-config
+  port path when migrating to v17 (the v14→v15 step ran the port; v17
+  drops the destination tables). Any `_schemas/*` config notes in such
+  a vault remain as harmless data but are no longer interpreted by
+  validation. Operators with such vaults can recreate schemas on
+  `tags.fields` directly via `update-tag`.
+
 - **`synthesize-notes` MCP tool (closes #268).** 229 LOC + 160 test LOC,
   zero production invocations. Replicable with `query-notes(near={...})`
   + `find-path` + agent-side aggregation.

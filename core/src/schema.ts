@@ -553,6 +553,10 @@ function migrateToV14(db: Database): void {
  * leaves the DB in either pre-v15 or post-v15 state, never partial.
  */
 function migrateToV15(db: Database): void {
+  // note_schemas was dropped in v17; on any v17+ vault (or a v14→v17 skip),
+  // this guard returns immediately and the function is effectively dead code.
+  // Left in place rather than deleted because removing it would change initSchema's
+  // migration call ordering. Safe to delete in a future cleanup.
   if (!hasTable(db, "note_schemas") || !hasTable(db, "notes")) return;
 
   // Short-circuit: if either destination table already has data, the

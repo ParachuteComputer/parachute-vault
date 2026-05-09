@@ -447,7 +447,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
         // Re-read after schema-default population so the response reflects the
         // final on-disk state, then attach `validation_status` from any
-        // `_schemas/*` config notes that match this note's path or tags.
+        // tag's `fields` declaration that applies to this note.
         const final = created.map((n) => attachValidationStatus(store, db, n));
         return batch ? final : final[0];
       },
