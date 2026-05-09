@@ -4,10 +4,8 @@
  * Mirrors the MCP tools:
  *   /api/notes          — query-notes, create-note, update-note, delete-note
  *   /api/tags           — list-tags, update-tag, delete-tag
- *   /api/note-schemas   — list/upsert/delete note_schemas + nested mappings
  *   /api/find-path      — find-path
  *   /api/vault          — vault-info
- * (synthesize-notes is MCP-only; agents call it through the MCP transport.)
  *
  * Each handler receives a Store instance (already resolved for the vault)
  * and the Request, and returns a Response.
@@ -18,7 +16,6 @@ import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE } from "../core/src/notes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
-import { MAPPING_KINDS, type SchemaMappingKind, type NoteSchemaField } from "../core/src/note-schemas.ts";
 import {
   filterNotesByTagScope,
   noteWithinTagScope,
@@ -1091,166 +1088,6 @@ export async function handleTags(
       );
     }
     return json(await store.deleteTag(tagName));
-  }
-
-  return json({ error: "Method not allowed" }, 405);
-}
-
-// ---------------------------------------------------------------------------
-// Note schemas — GET/PUT/DELETE /api/note-schemas[/:name],
-//                GET/POST/DELETE /api/note-schemas/:name/mappings
-// ---------------------------------------------------------------------------
-
-export async function handleNoteSchemas(
-  req: Request,
-  store: Store,
-  subpath = "",
-  tagScope: TagScopeCtx = NO_TAG_SCOPE,
-): Promise<Response> {
-  const url = new URL(req.url);
-
-  // Tag-scope filter for `tag`-kind mappings. `path_prefix` mappings carry no
-  // tag-axis information so they're always visible/writable. The single-tag
-  // check delegates to `tagsWithinScope` so the string-form fallback in
-  // patterns/tag-scoped-tokens.md §Storage details is honored end-to-end.
-  const mappingInScope = (m: { match_kind: SchemaMappingKind; match_value: string }): boolean => {
-    if (m.match_kind !== "tag") return true;
-    return tagsWithinScope([m.match_value], tagScope.allowed, tagScope.raw);
-  };
-
-  // GET /note-schemas — list all
-  if (req.method === "GET" && subpath === "") {
-    const schemas = await store.listNoteSchemas();
-    if (parseBool(parseQuery(url, "include_mappings"), false)) {
-      const allMappings = (await store.listSchemaMappings()).filter(mappingInScope);
-      const byName = new Map<string, typeof allMappings>();
-      for (const m of allMappings) {
-        const list = byName.get(m.schema_name) ?? [];
-        list.push(m);
-        byName.set(m.schema_name, list);
-      }
-      return json(schemas.map((s) => ({ ...s, mappings: byName.get(s.name) ?? [] })));
-    }
-    return json(schemas);
-  }
-
-  // /note-schemas/:name(/mappings)
-  const mappingsMatch = subpath.match(/^\/([^/]+)\/mappings$/);
-  if (mappingsMatch) {
-    const schemaName = decodeURIComponent(mappingsMatch[1]!);
-
-    // GET /note-schemas/:name/mappings
-    if (req.method === "GET") {
-      const mappings = (await store.listSchemaMappings({ schema_name: schemaName })).filter(mappingInScope);
-      return json(mappings);
-    }
-
-    // POST /note-schemas/:name/mappings — body: { match_kind, match_value }
-    if (req.method === "POST") {
-      const body = (await req.json().catch(() => null)) as
-        | { match_kind?: unknown; match_value?: unknown }
-        | null;
-      if (!body) return json({ error: "Invalid JSON body" }, 400);
-      const match_kind = body.match_kind;
-      const match_value = body.match_value;
-      if (typeof match_kind !== "string" || !MAPPING_KINDS.includes(match_kind as SchemaMappingKind)) {
-        return json(
-          { error: `match_kind must be one of: ${MAPPING_KINDS.join(", ")}`, error_type: "invalid_match_kind" },
-          400,
-        );
-      }
-      if (typeof match_value !== "string" || match_value.length === 0) {
-        return json({ error: "match_value must be a non-empty string" }, 400);
-      }
-      // Tag-scope write gate: a tag mapping for an out-of-scope tag would let
-      // a tag-scoped token bind a schema to a tag it can't see. Mirrors the
-      // vault#241 write-gate shape (403 + tag_scope_violation envelope).
-      if (!mappingInScope({ match_kind: match_kind as SchemaMappingKind, match_value })) {
-        return tagScopeForbidden(tagScope.raw ?? []);
-      }
-      // Validate FK explicitly so a bad schema_name surfaces as 404 (not a
-      // raw SQLITE_CONSTRAINT 500).
-      if (!(await store.getNoteSchema(schemaName))) {
-        return json({ error: "Schema not found", schema_name: schemaName }, 404);
-      }
-      await store.setSchemaMapping(schemaName, match_kind as SchemaMappingKind, match_value);
-      return json({ ok: true, schema_name: schemaName, match_kind, match_value }, 201);
-    }
-
-    // DELETE /note-schemas/:name/mappings?match_kind=...&match_value=...
-    // Query params (not URL segments) because match_value can contain slashes
-    // for path-prefix mappings.
-    if (req.method === "DELETE") {
-      const match_kind = parseQuery(url, "match_kind");
-      const match_value = parseQuery(url, "match_value");
-      if (!match_kind || !MAPPING_KINDS.includes(match_kind as SchemaMappingKind)) {
-        return json(
-          { error: `match_kind must be one of: ${MAPPING_KINDS.join(", ")}`, error_type: "invalid_match_kind" },
-          400,
-        );
-      }
-      if (!match_value) {
-        return json({ error: "match_value query parameter is required" }, 400);
-      }
-      if (!mappingInScope({ match_kind: match_kind as SchemaMappingKind, match_value })) {
-        return tagScopeForbidden(tagScope.raw ?? []);
-      }
-      const deleted = await store.deleteSchemaMapping(
-        schemaName,
-        match_kind as SchemaMappingKind,
-        match_value,
-      );
-      return json({ deleted, schema_name: schemaName, match_kind, match_value });
-    }
-
-    return json({ error: "Method not allowed" }, 405);
-  }
-
-  // /note-schemas/:name (no nested segment)
-  const nameMatch = subpath.match(/^\/([^/]+)$/);
-  if (!nameMatch) return json({ error: "Not found" }, 404);
-  const name = decodeURIComponent(nameMatch[1]!);
-
-  // GET /note-schemas/:name — single (with mappings)
-  if (req.method === "GET") {
-    const schema = await store.getNoteSchema(name);
-    if (!schema) return json({ error: "Schema not found", name }, 404);
-    const mappings = (await store.listSchemaMappings({ schema_name: name })).filter(mappingInScope);
-    return json({ ...schema, mappings });
-  }
-
-  // PUT /note-schemas/:name — partial-upsert (mirrors update-tag shape)
-  if (req.method === "PUT") {
-    const body = (await req.json().catch(() => null)) as {
-      description?: string | null;
-      fields?: Record<string, unknown> | null;
-      required?: unknown;
-    } | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
-
-    const patch: { description?: string | null; fields?: Record<string, NoteSchemaField> | null; required?: string[] | null } = {};
-    if (body.description === null) patch.description = null;
-    else if (body.description !== undefined) patch.description = body.description;
-    if (body.fields === null) patch.fields = null;
-    else if (body.fields !== undefined) patch.fields = body.fields as Record<string, NoteSchemaField>;
-    if (body.required === null) patch.required = null;
-    else if (body.required !== undefined) {
-      if (!Array.isArray(body.required)) {
-        return json({ error: "required must be an array of field names" }, 400);
-      }
-      patch.required = (body.required as unknown[]).filter(
-        (x): x is string => typeof x === "string",
-      );
-    }
-
-    const result = await store.upsertNoteSchema(name, patch);
-    return json(result);
-  }
-
-  // DELETE /note-schemas/:name — drop schema; FK CASCADE drops its mappings.
-  if (req.method === "DELETE") {
-    const deleted = await store.deleteNoteSchema(name);
-    return json({ deleted, name });
   }
 
   return json({ error: "Method not allowed" }, 405);

@@ -92,10 +92,9 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
  * unscoped sessions retain identical pre-tag-scope behavior.
  *
  * Read tools handled here:
- *   - query-notes:      filter single-note returns + result lists
- *   - list-tags:        filter to allowlisted tags + descendants
- *   - find-path:        require both endpoints (and every hop) in scope
- *   - synthesize-notes: anchor + neighbors all gated by scope
+ *   - query-notes: filter single-note returns + result lists
+ *   - list-tags:   filter to allowlisted tags + descendants
+ *   - find-path:   require both endpoints (and every hop) in scope
  *
  * Write-tool gating happens in handleScopedMcp at the verb-scope layer
  * AND inside each tool's wrapper here (so a tag-scoped `vault:write`
@@ -151,30 +150,6 @@ function applyTagScopeWrappers(
       if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
         return null;
       }
-    }
-    return result;
-  });
-
-  wrapReadTool(tools, "synthesize-notes", async (orig, params) => {
-    const allowed = await getAllowed();
-    if (!allowed) return await orig(params);
-    // Verify the anchor is in scope first — out-of-scope anchor 404s as if
-    // the note doesn't exist, mirroring the REST find-path semantics.
-    const anchorId = (params as any).id ?? (params as any).note_id;
-    if (anchorId) {
-      const anchor = await store.getNote(anchorId as string);
-      if (!anchor || !noteWithinTagScope(anchor, allowed, rawTags)) {
-        return { error: "Note not found", id: anchorId };
-      }
-    }
-    const result = await orig(params);
-    // Filter neighbors to those in scope. The synthesize-notes shape exposes
-    // `neighbors` (array of note objects with tags) — mirror the query-notes
-    // filter pattern here.
-    if (result && typeof result === "object" && Array.isArray((result as any).neighbors)) {
-      (result as any).neighbors = (result as any).neighbors.filter((n: any) =>
-        noteWithinTagScope(n, allowed, rawTags),
-      );
     }
     return result;
   });
@@ -266,59 +241,6 @@ function applyTagScopeWrappers(
     return await orig(params);
   });
 
-  // Note-schemas mappings — same auth boundary as REST `handleNoteSchemas`.
-  // `tag`-kind mappings are tag-scoped data; `path_prefix`-kind mappings carry
-  // no tag-axis information and stay visible/writable. The single-tag check
-  // delegates to `tagsWithinScope` so the string-form fallback is honored.
-
-  wrapReadTool(tools, "list-note-schemas", async (orig, params) => {
-    const allowed = await getAllowed();
-    if (!allowed) return await orig(params);
-    const result = await orig(params);
-    const filterMappings = (mappings: any[]): any[] =>
-      mappings.filter(
-        (m: any) => m.match_kind !== "tag" || tagsWithinScope([m.match_value], allowed, rawTags),
-      );
-    if (Array.isArray(result)) {
-      return result.map((s: any) =>
-        Array.isArray(s.mappings) ? { ...s, mappings: filterMappings(s.mappings) } : s,
-      );
-    }
-    if (result && typeof result === "object" && Array.isArray((result as any).mappings)) {
-      return { ...(result as any), mappings: filterMappings((result as any).mappings) };
-    }
-    return result;
-  });
-
-  wrapReadTool(tools, "set-schema-mapping", async (orig, params) => {
-    const allowed = await getAllowed();
-    if (!allowed) return await orig(params);
-    const match_kind = (params as any).match_kind;
-    const match_value = (params as any).match_value;
-    if (
-      match_kind === "tag" &&
-      typeof match_value === "string" &&
-      !tagsWithinScope([match_value], allowed, rawTags)
-    ) {
-      return forbidden(`set-schema-mapping: tag "${match_value}" is outside the token's allowlist`);
-    }
-    return await orig(params);
-  });
-
-  wrapReadTool(tools, "delete-schema-mapping", async (orig, params) => {
-    const allowed = await getAllowed();
-    if (!allowed) return await orig(params);
-    const match_kind = (params as any).match_kind;
-    const match_value = (params as any).match_value;
-    if (
-      match_kind === "tag" &&
-      typeof match_value === "string" &&
-      !tagsWithinScope([match_value], allowed, rawTags)
-    ) {
-      return forbidden(`delete-schema-mapping: tag "${match_value}" is outside the token's allowlist`);
-    }
-    return await orig(params);
-  });
 }
 
 function wrapReadTool(

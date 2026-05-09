@@ -6,6 +6,55 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.1] — 2026-05-09
+
+Audit-driven cleanup. The vault MCP surface had two subsystems that
+weren't earning their keep — both retired in this RC.
+
+### Removed
+
+- **`note_schemas` + `schema_mappings` + 6 MCP tools (closes #267).** The
+  v15 standalone validation subsystem turned out to be a parallel path to
+  `tags.fields` with zero rows in the operator vault. Schema migration
+  v17 drops both tables wholesale and the six MCP tools they backed
+  (`list-note-schemas`, `update-note-schema`, `delete-note-schema`,
+  `list-schema-mappings`, `set-schema-mapping`, `delete-schema-mapping`)
+  retire alongside. REST endpoints under `/api/note-schemas` go away
+  too. Validation now reads `tags.fields` exclusively — same shape
+  (`{ type, enum, description }` per field), tag-axis only, advisory
+  warnings only. The standalone `required` field-list concept retires
+  with the table; declarations are guidance, not enforcement.
+
+  *Migration note.* If your vault used path-prefix-mapped schemas (e.g.
+  `match_kind: 'path_prefix'`), file an issue against vault#267
+  describing the use case. Tag-mapped schemas continue working as
+  `tags.fields` (unchanged for the operator). The migration logs a
+  warning naming any dropped schemas/mappings if rows existed so the
+  operator can re-create on `tags.fields` if needed.
+
+  *Pre-v15 vault upgrade caveat.* A vault created before v15 shipped
+  that never upgraded to v15 will skip the `_schemas/*` notes-as-config
+  port path when migrating to v17 (the v14→v15 step ran the port; v17
+  drops the destination tables). Any `_schemas/*` config notes in such
+  a vault remain as harmless data but are no longer interpreted by
+  validation. Operators with such vaults can recreate schemas on
+  `tags.fields` directly via `update-tag`.
+
+- **`synthesize-notes` MCP tool (closes #268).** 229 LOC + 160 test LOC,
+  zero production invocations. Replicable with `query-notes(near={...})`
+  + `find-path` + agent-side aggregation.
+
+  *Migration note.* Agents wanting a ranked-neighborhood view can
+  compose `query-notes(near={ note_id, depth: 2 })` + `find-path` +
+  their own aggregation. If the optimization (one call vs. multiple)
+  becomes load-bearing for a real use case, file an issue.
+
+### Surface
+
+- **MCP tool count: 16 → 9.** Remaining tools: `query-notes`,
+  `create-note`, `update-note`, `delete-note`, `list-tags`, `update-tag`,
+  `delete-tag`, `find-path`, `vault-info`.
+
 ## [0.4.0] — 2026-05-05
 
 First minor bump since `0.3.3` on `@latest`. The work that accumulated across

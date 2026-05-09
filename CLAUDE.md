@@ -37,7 +37,7 @@ links       (source_id, target_id, relationship, metadata, created_at)
 ```
 
 Additional tables:
-- `tag_schemas` — tag description + metadata field definitions (JSON)
+- `tags` — first-class identity row carrying description, fields (the schema-validation surface), relationships, parent_names
 - `unresolved_wikilinks` — pending wikilink resolution
 - `schema_version` — migration tracking
 
@@ -45,13 +45,13 @@ Metadata is a JSON column on notes, links, and attachments. Queryable via `json_
 
 Path is unique (when set), normalized (no .md, no trailing slashes), and used for wikilink resolution.
 
-### MCP Tools (10)
+### MCP Tools (9)
 
 Notes: `query-notes` (single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata merge), `delete-note`
 
 Tags: `list-tags` (with optional schema detail), `update-tag` (upsert schema), `delete-tag`
 
-Graph: `find-path` (BFS shortest path), `synthesize-notes` (anchor + neighbors + search → ranked neighborhood, connections, tag distribution, timeline; agent writes the narrative)
+Graph: `find-path` (BFS shortest path)
 
 Vault: `vault-info` (get/update description + stats)
 

@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
-import { handleNotes, handleTags, handleNoteSchemas, handleFindPath, handleVault } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
 
 let db: Database;
@@ -478,7 +478,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(16);
+    expect(tools.length).toBe(9);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -488,15 +488,14 @@ describe("MCP tools", async () => {
     expect(names).toContain("list-tags");
     expect(names).toContain("update-tag");
     expect(names).toContain("delete-tag");
-    expect(names).toContain("list-note-schemas");
-    expect(names).toContain("update-note-schema");
-    expect(names).toContain("delete-note-schema");
-    expect(names).toContain("list-schema-mappings");
-    expect(names).toContain("set-schema-mapping");
-    expect(names).toContain("delete-schema-mapping");
     expect(names).toContain("find-path");
-    expect(names).toContain("synthesize-notes");
     expect(names).toContain("vault-info");
+    // Six note-schema MCP tools (list/update/delete-note-schema +
+    // list/set/delete-schema-mapping) retired in v17 — vault#267.
+    expect(names).not.toContain("list-note-schemas");
+    expect(names).not.toContain("set-schema-mapping");
+    // synthesize-notes retired in v17 — vault#268.
+    expect(names).not.toContain("synthesize-notes");
   });
 
   test("query-notes by id works", async () => {
@@ -2086,293 +2085,6 @@ describe("HTTP /tags", async () => {
   });
 });
 
-describe("HTTP /note-schemas", async () => {
-  test("PUT /note-schemas/:name creates a schema", async () => {
-    const res = await handleNoteSchemas(
-      mkReq("PUT", "/note-schemas/task", {
-        description: "A task",
-        fields: { priority: { type: "string", enum: ["high", "low"] } },
-        required: ["priority"],
-      }),
-      store,
-      "/task",
-    );
-    expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.name).toBe("task");
-    expect(body.description).toBe("A task");
-    expect(body.required).toEqual(["priority"]);
-  });
-
-  test("GET /note-schemas lists all schemas", async () => {
-    await store.upsertNoteSchema("task", { description: "t" });
-    await store.upsertNoteSchema("project", { description: "p" });
-    const res = await handleNoteSchemas(mkReq("GET", "/note-schemas"), store);
-    const body = await res.json() as any[];
-    const names = body.map((s) => s.name).sort();
-    expect(names).toEqual(["project", "task"]);
-  });
-
-  test("GET /note-schemas?include_mappings=true inlines mappings per schema", async () => {
-    await store.upsertNoteSchema("task", {});
-    await store.setSchemaMapping("task", "tag", "task");
-    const res = await handleNoteSchemas(
-      mkReq("GET", "/note-schemas?include_mappings=true"),
-      store,
-    );
-    const body = await res.json() as any[];
-    const task = body.find((s) => s.name === "task");
-    expect(task.mappings).toEqual([{ schema_name: "task", match_kind: "tag", match_value: "task" }]);
-  });
-
-  test("GET /note-schemas/:name returns the schema and its mappings", async () => {
-    await store.upsertNoteSchema("task", { description: "A task" });
-    await store.setSchemaMapping("task", "tag", "task");
-    const res = await handleNoteSchemas(mkReq("GET", "/note-schemas/task"), store, "/task");
-    expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.name).toBe("task");
-    expect(body.mappings.length).toBe(1);
-  });
-
-  test("GET /note-schemas/:name returns 404 when missing", async () => {
-    const res = await handleNoteSchemas(mkReq("GET", "/note-schemas/missing"), store, "/missing");
-    expect(res.status).toBe(404);
-  });
-
-  test("PUT /note-schemas/:name with required: [] clears required", async () => {
-    await store.upsertNoteSchema("task", { required: ["a"] });
-    const res = await handleNoteSchemas(
-      mkReq("PUT", "/note-schemas/task", { required: [] }),
-      store,
-      "/task",
-    );
-    const body = await res.json() as any;
-    expect(body.required).toBeNull();
-  });
-
-  test("PUT /note-schemas/:name returns 400 when required isn't an array", async () => {
-    const res = await handleNoteSchemas(
-      mkReq("PUT", "/note-schemas/task", { required: "priority" }),
-      store,
-      "/task",
-    );
-    expect(res.status).toBe(400);
-  });
-
-  test("DELETE /note-schemas/:name removes schema (and cascades mappings)", async () => {
-    await store.upsertNoteSchema("task", {});
-    await store.setSchemaMapping("task", "tag", "task");
-    const res = await handleNoteSchemas(mkReq("DELETE", "/note-schemas/task"), store, "/task");
-    expect(res.status).toBe(200);
-    expect(await store.getNoteSchema("task")).toBeNull();
-    expect(await store.listSchemaMappings({ schema_name: "task" })).toEqual([]);
-  });
-
-  test("POST /note-schemas/:name/mappings adds a mapping", async () => {
-    await store.upsertNoteSchema("task", {});
-    const res = await handleNoteSchemas(
-      mkReq("POST", "/note-schemas/task/mappings", { match_kind: "tag", match_value: "task" }),
-      store,
-      "/task/mappings",
-    );
-    expect(res.status).toBe(201);
-    expect((await store.listSchemaMappings({ schema_name: "task" })).length).toBe(1);
-  });
-
-  test("POST /note-schemas/:name/mappings returns 400 on bad match_kind", async () => {
-    await store.upsertNoteSchema("task", {});
-    const res = await handleNoteSchemas(
-      mkReq("POST", "/note-schemas/task/mappings", { match_kind: "BOGUS", match_value: "x" }),
-      store,
-      "/task/mappings",
-    );
-    expect(res.status).toBe(400);
-    const body = await res.json() as any;
-    expect(body.error_type).toBe("invalid_match_kind");
-  });
-
-  test("POST /note-schemas/:name/mappings returns 404 when schema doesn't exist", async () => {
-    const res = await handleNoteSchemas(
-      mkReq("POST", "/note-schemas/missing/mappings", { match_kind: "tag", match_value: "x" }),
-      store,
-      "/missing/mappings",
-    );
-    expect(res.status).toBe(404);
-  });
-
-  test("GET /note-schemas/:name/mappings lists mappings for a schema", async () => {
-    await store.upsertNoteSchema("task", {});
-    await store.setSchemaMapping("task", "tag", "task");
-    await store.setSchemaMapping("task", "path_prefix", "Tasks/");
-    const res = await handleNoteSchemas(
-      mkReq("GET", "/note-schemas/task/mappings"),
-      store,
-      "/task/mappings",
-    );
-    const body = await res.json() as any[];
-    expect(body.length).toBe(2);
-  });
-
-  test("DELETE /note-schemas/:name/mappings?match_kind=...&match_value=... removes one", async () => {
-    await store.upsertNoteSchema("task", {});
-    await store.setSchemaMapping("task", "tag", "task");
-    await store.setSchemaMapping("task", "path_prefix", "Tasks/");
-    const res = await handleNoteSchemas(
-      mkReq("DELETE", "/note-schemas/task/mappings?match_kind=tag&match_value=task"),
-      store,
-      "/task/mappings",
-    );
-    expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.deleted).toBe(true);
-    const remaining = await store.listSchemaMappings({ schema_name: "task" });
-    expect(remaining).toEqual([{ schema_name: "task", match_kind: "path_prefix", match_value: "Tasks/" }]);
-  });
-
-  test("DELETE /note-schemas/:name/mappings handles slash-containing path prefixes via query string", async () => {
-    await store.upsertNoteSchema("journal", {});
-    await store.setSchemaMapping("journal", "path_prefix", "journal/2026/");
-    const res = await handleNoteSchemas(
-      mkReq(
-        "DELETE",
-        `/note-schemas/journal/mappings?match_kind=path_prefix&match_value=${encodeURIComponent("journal/2026/")}`,
-      ),
-      store,
-      "/journal/mappings",
-    );
-    expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.deleted).toBe(true);
-  });
-
-  // Tag-scoped tokens enumerate `schema_mappings` through the same handler.
-  // Without these gates, a token allowlisted for `health` can both see and
-  // create `tag` mappings for tags outside its scope (e.g. `finance`). The
-  // path_prefix kind carries no tag-axis info and stays visible/writable.
-  describe("tag-scope", async () => {
-    const healthScope = { allowed: new Set(["health"]), raw: ["health"] };
-
-    test("GET /note-schemas?include_mappings filters out-of-scope tag mappings", async () => {
-      await store.upsertNoteSchema("task", {});
-      await store.setSchemaMapping("task", "tag", "health");
-      await store.setSchemaMapping("task", "tag", "finance");
-      await store.setSchemaMapping("task", "path_prefix", "Tasks/");
-      const res = await handleNoteSchemas(
-        mkReq("GET", "/note-schemas?include_mappings=true"),
-        store,
-        "",
-        healthScope,
-      );
-      const body = await res.json() as any[];
-      const task = body.find((s) => s.name === "task");
-      const kinds = task.mappings.map((m: any) => `${m.match_kind}:${m.match_value}`).sort();
-      expect(kinds).toEqual(["path_prefix:Tasks/", "tag:health"]);
-    });
-
-    test("GET /note-schemas/:name filters out-of-scope tag mappings", async () => {
-      await store.upsertNoteSchema("task", {});
-      await store.setSchemaMapping("task", "tag", "health");
-      await store.setSchemaMapping("task", "tag", "finance");
-      const res = await handleNoteSchemas(
-        mkReq("GET", "/note-schemas/task"),
-        store,
-        "/task",
-        healthScope,
-      );
-      const body = await res.json() as any;
-      expect(body.mappings.map((m: any) => m.match_value)).toEqual(["health"]);
-    });
-
-    test("GET /note-schemas/:name/mappings filters out-of-scope tag mappings", async () => {
-      await store.upsertNoteSchema("task", {});
-      await store.setSchemaMapping("task", "tag", "health");
-      await store.setSchemaMapping("task", "tag", "finance");
-      const res = await handleNoteSchemas(
-        mkReq("GET", "/note-schemas/task/mappings"),
-        store,
-        "/task/mappings",
-        healthScope,
-      );
-      const body = await res.json() as any[];
-      expect(body.map((m) => m.match_value)).toEqual(["health"]);
-    });
-
-    test("POST /:name/mappings rejects out-of-scope tag with 403", async () => {
-      await store.upsertNoteSchema("task", {});
-      const res = await handleNoteSchemas(
-        mkReq("POST", "/note-schemas/task/mappings", { match_kind: "tag", match_value: "finance" }),
-        store,
-        "/task/mappings",
-        healthScope,
-      );
-      expect(res.status).toBe(403);
-      const body = await res.json() as any;
-      expect(body.error_type).toBe("tag_scope_violation");
-      expect(await store.listSchemaMappings({ schema_name: "task" })).toEqual([]);
-    });
-
-    test("POST /:name/mappings accepts in-scope tag and string-form fallback descendant", async () => {
-      await store.upsertNoteSchema("task", {});
-      const inScope = await handleNoteSchemas(
-        mkReq("POST", "/note-schemas/task/mappings", { match_kind: "tag", match_value: "health" }),
-        store,
-        "/task/mappings",
-        healthScope,
-      );
-      expect(inScope.status).toBe(201);
-      // String-form fallback: `health/food` has root `health`, which is in
-      // the raw allowlist, so it's permitted even when no `_tags/health/food`
-      // schema declares the descendant relationship.
-      const descendant = await handleNoteSchemas(
-        mkReq("POST", "/note-schemas/task/mappings", { match_kind: "tag", match_value: "health/food" }),
-        store,
-        "/task/mappings",
-        healthScope,
-      );
-      expect(descendant.status).toBe(201);
-    });
-
-    test("POST /:name/mappings allows path_prefix regardless of tag-scope", async () => {
-      await store.upsertNoteSchema("task", {});
-      const res = await handleNoteSchemas(
-        mkReq("POST", "/note-schemas/task/mappings", { match_kind: "path_prefix", match_value: "Tasks/" }),
-        store,
-        "/task/mappings",
-        healthScope,
-      );
-      expect(res.status).toBe(201);
-    });
-
-    test("DELETE /:name/mappings rejects out-of-scope tag with 403", async () => {
-      await store.upsertNoteSchema("task", {});
-      await store.setSchemaMapping("task", "tag", "finance");
-      const res = await handleNoteSchemas(
-        mkReq("DELETE", "/note-schemas/task/mappings?match_kind=tag&match_value=finance"),
-        store,
-        "/task/mappings",
-        healthScope,
-      );
-      expect(res.status).toBe(403);
-      // Mapping still present — write was denied.
-      expect((await store.listSchemaMappings({ schema_name: "task" })).length).toBe(1);
-    });
-
-    test("unscoped tokens see and write everything (regression of fast-path)", async () => {
-      await store.upsertNoteSchema("task", {});
-      await store.setSchemaMapping("task", "tag", "finance");
-      await store.setSchemaMapping("task", "tag", "health");
-      const res = await handleNoteSchemas(
-        mkReq("GET", "/note-schemas/task/mappings"),
-        store,
-        "/task/mappings",
-        // default tagScope (unscoped) — omitted parameter
-      );
-      const body = await res.json() as any[];
-      expect(body.length).toBe(2);
-    });
-  });
-});
 
 describe("HTTP /find-path", async () => {
   test("finds path between two notes", async () => {
