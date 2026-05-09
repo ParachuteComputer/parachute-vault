@@ -215,11 +215,15 @@ export interface Store {
 
   // Schema validation (post-v17: backed by `tags.fields` only — the
   // standalone note_schemas + schema_mappings subsystem retired in v17, see
-  // vault#267). Returns null when no tag on the note declares any fields.
-  // The underlying resolver is in-memory after the first lazy load.
+  // vault#267). Post vault#270 the resolver walks `parent_names` so a note's
+  // effective fields include all ancestors' declarations (first-in-walk wins
+  // on conflict, surfaced as `schema_conflict` warnings); a tag named
+  // `_default` is the implicit universal parent. Returns null when no
+  // ancestor declares any fields. The underlying resolver is in-memory after
+  // the first lazy load.
   validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): {
     schemas: string[];
-    warnings: { field: string; schema: string; reason: "type_mismatch" | "enum_mismatch"; message: string }[];
+    warnings: { field: string; schema: string; reason: "type_mismatch" | "enum_mismatch" | "schema_conflict"; message: string }[];
   } | null;
 
   // Attachments

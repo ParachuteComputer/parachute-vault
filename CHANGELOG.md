@@ -6,6 +6,35 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.2] — 2026-05-09
+
+### Added
+
+- **Tag schema inheritance via `parent_names` + `_default` universal parent
+  (closes #270).** A tag's `parent_names` column already drove query
+  expansion (a query for `#manual` matched any descendant). It now also
+  drives **schema inheritance**: a child tag's effective `fields` map = its
+  own ∪ all ancestors' (recursive walk, cycle-safe). Multi-inheritance is
+  supported — list multiple parents in `parent_names`.
+
+  A tag named `_default` is treated as the implicit universal parent of
+  every note, tagged or not. Its `fields` declarations apply everywhere.
+  Modeling: magic at resolve time only — `tags.parent_names` is never
+  auto-mutated. Removable by deleting the `_default` tag row. The
+  symmetric query expansion: `query-notes { tag: "_default" }` returns
+  every note in the vault (including untagged).
+
+  Conflict resolution for multi-inheritance is **first-in-walk wins**:
+  the child's own `fields` take precedence over inherited specs; among
+  parents, earlier entries in `parent_names` outrank later ones. When
+  ancestors disagree on a field's spec, the loser surfaces as a
+  `schema_conflict` advisory warning on `validation_status` — no write
+  blocking, consistent with the rest of the schema-validation model.
+
+  Cache hygiene: the schema-config cache invalidates on `parent_names`
+  changes (in addition to the existing `fields` mutations) since
+  inheritance now walks parent chains.
+
 ## [0.4.1-rc.1] — 2026-05-09
 
 Audit-driven cleanup. The vault MCP surface had two subsystems that
