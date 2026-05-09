@@ -636,6 +636,78 @@ describe("renameTag cascade (vault#240 + #247)", async () => {
       true,
     );
   });
+
+  it("11. rewrites indexed_fields.declarer_tags JSON arrays (#275 fold N3)", async () => {
+    // Drive through the update-tag MCP tool — it owns indexed-field
+    // lifecycle (see mcp.ts §update-tag); store.upsertTagRecord does
+    // not populate the `indexed_fields` table.
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      fields: { status: { type: "string", indexed: true } },
+    });
+
+    const beforeRow = db
+      .prepare("SELECT declarer_tags FROM indexed_fields WHERE field = ?")
+      .get("status") as { declarer_tags: string };
+    expect(JSON.parse(beforeRow.declarer_tags).sort()).toEqual(["project", "task"]);
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ indexed_field_declarers_updated: 1 });
+
+    const afterRow = db
+      .prepare("SELECT declarer_tags FROM indexed_fields WHERE field = ?")
+      .get("status") as { declarer_tags: string };
+    const declarers = JSON.parse(afterRow.declarer_tags) as string[];
+    expect(declarers).toContain("todo");
+    expect(declarers).toContain("project");
+    expect(declarers).not.toContain("task");
+  });
+
+  it("12. rewrites `_tags/<path>` config-note paths via rewriteTagConfigPath (#275 fold N3)", async () => {
+    await store.upsertTagRecord("old", {});
+    const root = await store.createNote("root config", { path: "_tags/old" });
+    const sub = await store.createNote("sub config", { path: "_tags/old/nested/leaf" });
+
+    const result = await store.renameTag("old", "new");
+    expect(result).toMatchObject({ paths_renamed: 2 });
+
+    const rootFresh = await store.getNote(root.id);
+    expect(rootFresh?.path).toBe("_tags/new");
+
+    const subFresh = await store.getNote(sub.id);
+    expect(subFresh?.path).toBe("_tags/new/nested/leaf");
+  });
+
+  it("13. LIKE wildcard escape — a tag literally named `task_` doesn't false-match `taskX` (#275 fold N1)", async () => {
+    // `task_` and `taskX` are unrelated tags. Pre-fold N1 the LIKE
+    // pre-filter would have considered `taskX` rows as candidates for
+    // `task_`'s rewrite (LIKE `%"task_"%` matches `"taskX"` in JSON
+    // because `_` is a single-char wildcard). The cascade's downstream
+    // remapJsonArray would have rejected the row, so no data
+    // corruption — but the wasted scan + bad hygiene is what fold N1
+    // closes. This test pins the behavior end-to-end.
+    await store.upsertTagRecord("task_", {});
+    await store.upsertTagRecord("taskX", {});
+    await store.upsertTagRecord("voice", {
+      parent_names: ["taskX"],
+    });
+
+    await store.renameTag("task_", "renamed_task");
+
+    // taskX-rooted parent_names must be untouched — the escape stops
+    // taskX from being a candidate for the `task_` rewrite.
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["taskX"]);
+    // Sanity: the actual rename did happen.
+    expect(await store.getTagRecord("task_")).toBeNull();
+    expect(await store.getTagRecord("renamed_task")).toBeTruthy();
+  });
 });
 
 describe("mergeTags", async () => {

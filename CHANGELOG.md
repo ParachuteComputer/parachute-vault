@@ -22,7 +22,10 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
      load-bearing on this integrity).
   4. `tokens.scoped_tags` JSON arrays — the rename→token cascade
      replaces the previous fail-closed 409 (`tag_in_use_by_tokens`) on
-     `POST /api/tags/:name/rename`.
+     `POST /api/tags/:name/rename`. **Breaking for API consumers** who
+     relied on that 409 to detect token-referenced tags as
+     rename-blockers. The cascade now rewrites those tokens' allowlists
+     transparently and returns 200 with cascade stats.
   5. `indexed_fields.declarer_tags` JSON arrays.
   6. Note body `content`: `#oldname` and `#oldname/...` references
      rewrite to `#newname` / `#newname/...`. `[[_tags/oldname]]`
@@ -49,6 +52,20 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
   Audit log: a single `[vault] tag rename cascade: <old> → <new>` line
   is emitted to stderr per cascade for forensic correlation.
+
+### Fixed (folded from PR #275 review)
+
+- **LIKE wildcards (`%`, `_`) inside tag names are now escaped at every
+  pre-filter call site.** Pre-fold, a tag literally named `task_` would
+  produce `LIKE '%"task_"%'` — and SQLite's LIKE engine treats `_` as
+  "any single character," so `taskX` rows surfaced as false-positive
+  candidates. The downstream JSON-array remap rejected the row so no
+  data corruption — but the wasted scan + bad hygiene was worth
+  closing. Each call site now uses `ESCAPE '\\'` paired with a
+  pre-escaped pattern.
+- **`indexed_fields.declarer_tags` filter gains an `IS NOT NULL`
+  guard** to match the consistency of the parent_names + scoped_tags
+  filters.
 
 ### Notes
 

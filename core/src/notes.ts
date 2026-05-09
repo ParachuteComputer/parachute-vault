@@ -830,12 +830,15 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     // candidates that mention any of the renamed names.
     //
     // Each call site supplies its own column name for the filter — SQL
-    // doesn't expand `column LIKE (a OR b)` into a disjunction.
+    // doesn't expand `column LIKE (a OR b)` into a disjunction. We also
+    // escape LIKE wildcards (`%`, `_`) inside tag names and append
+    // `ESCAPE '\\'` to every clause so a tag literally named `task_`
+    // doesn't match `taskX` as a false-positive candidate.
     const renameMap = new Map(renames.map((r) => [r.from, r.to]));
     const remap = (s: string): string => renameMap.get(s) ?? s;
     const likeClauseFor = (column: string): string =>
       renames
-        .map((r) => `${column} LIKE '%"${escapeJsonLike(r.from)}"%'`)
+        .map((r) => `${column} LIKE '%"${escapeJsonLike(r.from)}"%' ESCAPE '\\'`)
         .join(" OR ");
 
     let parentRefsUpdated = 0;
@@ -875,7 +878,7 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     let declarersUpdated = 0;
     if (hasTable(db, "indexed_fields")) {
       const rows = db
-        .prepare(`SELECT field, declarer_tags FROM indexed_fields WHERE ${likeClauseFor("declarer_tags")}`)
+        .prepare(`SELECT field, declarer_tags FROM indexed_fields WHERE declarer_tags IS NOT NULL AND (${likeClauseFor("declarer_tags")})`)
         .all() as { field: string; declarer_tags: string }[];
       const updateStmt = db.prepare("UPDATE indexed_fields SET declarer_tags = ? WHERE field = ?");
       for (const row of rows) {
@@ -896,12 +899,18 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     // pointing at the right path).
     let notesRewritten = 0;
     {
+      // Each pair of LIKE clauses uses ESCAPE '\\' so the bound pattern
+      // can carry a literal `%` or `_` from a tag name without the LIKE
+      // engine treating them as wildcards. The middle of the bound
+      // string is `escapeLikePattern(from)`; the leading/trailing `%` we
+      // wrap in are still our actual wildcards.
       const orClauses = renames
-        .map(() => "(content LIKE ? OR content LIKE ?)")
+        .map(() => "(content LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')")
         .join(" OR ");
       const params: string[] = [];
       for (const { from } of renames) {
-        params.push(`%#${from}%`, `%[[_tags/${from}%`);
+        const safe = escapeLikePattern(from);
+        params.push(`%#${safe}%`, `%[[_tags/${safe}%`);
       }
       const candidates = db
         .prepare(`SELECT id, content FROM notes WHERE content IS NOT NULL AND content != '' AND (${orClauses})`)
@@ -920,8 +929,8 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     // Renaming the path keeps the vault internally consistent for any
     // operator who still inspects them by hand.
     {
-      const orClauses = renames.map(() => "path LIKE ?").join(" OR ");
-      const params = renames.map((r) => `_tags/${r.from}%`);
+      const orClauses = renames.map(() => "path LIKE ? ESCAPE '\\'").join(" OR ");
+      const params = renames.map((r) => `_tags/${escapeLikePattern(r.from)}%`);
       const candidates = db
         .prepare(`SELECT id, path FROM notes WHERE path IS NOT NULL AND (${orClauses})`)
         .all(...params) as { id: string; path: string }[];
@@ -1054,11 +1063,35 @@ function hasTable(db: Database, name: string): boolean {
   return !!row;
 }
 
+/**
+ * Escape a tag name for inline interpolation into a SQL LIKE pattern.
+ * Doubles `'` for SQL-string safety AND backslash-prefixes the LIKE
+ * wildcards (`%`, `_`) so a tag literally named `task_` doesn't match
+ * `taskX` as a false-positive candidate. The escape character `\` is
+ * declared at each call site via `ESCAPE '\\'`.
+ *
+ * Order matters: escape `\` first so a tag containing a backslash gets
+ * its backslash doubled before we add our own escape prefixes for the
+ * wildcards.
+ */
 function escapeJsonLike(s: string): string {
-  // `'` is the only character LIKE cares about — JSON-encoded tag names
-  // can't contain unescaped quotes, but the operator-facing `tag` name
-  // could in principle. SQLite escapes `'` by doubling.
-  return s.replace(/'/g, "''");
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "''")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
+
+/**
+ * Escape a tag name destined for a parameterized LIKE binding. No SQL
+ * quote escape (param-binding handles that); just the wildcard
+ * neutralization. Pair with `LIKE ? ESCAPE '\\'`.
+ */
+function escapeLikePattern(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
 }
 
 function escapeRegex(s: string): string {
