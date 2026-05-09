@@ -6,6 +6,60 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.4] — 2026-05-09
+
+### Added
+
+- **Tag rename cascade (closes #240, #247).** `renameTag(old, new)` now
+  rewrites every surface where the old name was referenced, in a single
+  `BEGIN IMMEDIATE` transaction:
+
+  1. `tags` PK row — and recursively for sub-tag rows whose name starts
+     with `<old>/`.
+  2. `note_tags.tag_name` FK references for every renamed name.
+  3. `tags.parent_names` JSON arrays in OTHER tag rows (vault#247's
+     specific piece — the inheritance resolver from #270 is now
+     load-bearing on this integrity).
+  4. `tokens.scoped_tags` JSON arrays — the rename→token cascade
+     replaces the previous fail-closed 409 (`tag_in_use_by_tokens`) on
+     `POST /api/tags/:name/rename`.
+  5. `indexed_fields.declarer_tags` JSON arrays.
+  6. Note body `content`: `#oldname` and `#oldname/...` references
+     rewrite to `#newname` / `#newname/...`. `[[_tags/oldname]]`
+     wikilinks rewrite to `[[_tags/newname]]`.
+  7. `_tags/<oldname>...` config-note paths rewrite to `_tags/<newname>...`
+     for vault hygiene (post-v14 these are inert breadcrumbs).
+
+  Pre-flight collision check covers root + every sub-tag path so a
+  partway-through abort can't happen on a UNIQUE-constraint violation.
+  `target_exists` errors now carry a `conflicting: string[]` listing
+  the colliding names.
+
+  Return shape is augmented with per-surface counts:
+  `{ renamed, sub_tags_renamed, parent_refs_updated, tokens_updated,
+  indexed_field_declarers_updated, notes_rewritten, paths_renamed }`.
+  REST `POST /api/tags/:name/rename` returns this shape on success.
+  Existing callers using `result.renamed` continue to work; the field
+  semantics are unchanged (count of `note_tags` rows repointed,
+  cumulative across self + sub-tags).
+
+  The store invalidates both `_tagHierarchy` and `_schemaConfig`
+  caches after the cascade since parent_names and the tag set both
+  change.
+
+  Audit log: a single `[vault] tag rename cascade: <old> → <new>` line
+  is emitted to stderr per cascade for forensic correlation.
+
+### Notes
+
+- **`name TEXT PRIMARY KEY` stays.** Aaron green-lit the multi-table
+  cascade cost over a stable-ID rewrite (2026-05-09). The cascade is
+  the load-bearing surface that makes natural-key tag identity
+  workable across the schema.
+- **Surfaces NOT touched.** Indexed-metadata column names derive from
+  field names, not tag names, so `meta_<field>` stays stable across a
+  tag rename. Cross-vault rename federation is out of scope.
+
 ## [0.4.1-rc.3] — 2026-05-09
 
 ### Added

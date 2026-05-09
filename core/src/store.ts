@@ -321,10 +321,11 @@ export class BunSqliteStore implements Store {
 
   async renameTag(oldName: string, newName: string): Promise<noteOps.RenameTagResult> {
     const result = noteOps.renameTag(this.db, oldName, newName);
-    // Other tags' parent_names may reference oldName — though we don't
-    // rewrite those, the hierarchy cache should be rebuilt to pick up the
-    // new row identity. The schema-config cache is keyed by tag name, so
-    // bust it too.
+    // Vault#240: the cascade rewrites parent_names in OTHER tag rows as
+    // part of the same transaction, plus tokens.scoped_tags and
+    // indexed_fields.declarer_tags. Both caches are tag-keyed, so they
+    // must be rebuilt regardless — the hierarchy by tag-set identity,
+    // the schema-config by parent_names + fields content.
     this._tagHierarchy = null;
     this._schemaConfig = null;
     return result;
