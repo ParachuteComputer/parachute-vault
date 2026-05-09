@@ -3482,6 +3482,94 @@ describe("schema inheritance via parent_names (vault#270)", async () => {
     expect(result.validation_status).toBeUndefined();
   });
 
+  it("`_default` + `tagMatch: 'any'` drops the tag filter entirely (every note matches)", async () => {
+    // Folded from PR #272 review (N1). With OR-semantics, `_default` matches
+    // everything → the disjunction collapses regardless of what else is in
+    // the list. Pre-fold this would have narrowed to `task`-tagged notes.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    const b = await store.createNote("beta", { tags: ["project"] });
+    const g = await store.createNote("gamma"); // untagged
+
+    const results = await store.queryNotes({ tags: ["_default", "task"], tagMatch: "any" });
+    const ids = results.map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id, g.id].sort());
+  });
+
+  it("`_default` + `tagMatch: 'all'` drops only `_default` from the AND-set", async () => {
+    // Symmetric guard for N1: AND-semantics should NOT collapse — `_default`
+    // is universally satisfied so it can be dropped, but other tags still
+    // narrow the result set.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    await store.createNote("beta", { tags: ["project"] });
+    await store.createNote("gamma"); // untagged
+
+    const results = await store.queryNotes({ tags: ["_default", "task"], tagMatch: "all" });
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe(a.id);
+  });
+
+  it("`searchNotes` with `_default` returns matches from every note (including untagged)", async () => {
+    // Folded from PR #272 review (N2). FTS-backed search now short-circuits
+    // the tag filter when `_default` is requested, matching `queryNotes`.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("findme alpha", { tags: ["task"] });
+    const b = await store.createNote("findme beta"); // untagged
+
+    const results = await store.searchNotes("findme", { tags: ["_default"] });
+    const ids = results.map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id].sort());
+  });
+
+  it("`schema_conflict` warning carries structured `loser_schema`", async () => {
+    // Folded from PR #272 review (N3). Agents shouldn't have to regex
+    // `message` to find the overridden tag — surface it structurally.
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string", enum: ["todo", "done"] } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { status: { type: "string", enum: ["draft", "published"] } },
+    });
+    await store.upsertTagRecord("article_task", {
+      parent_names: ["task", "publication"],
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["article_task"],
+      metadata: { status: "todo" },
+    }) as any;
+
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.schema).toBe("task"); // winner
+    expect(conflict.loser_schema).toBe("publication"); // overridden
+  });
+
+  it("non-conflict warnings (type/enum mismatch) don't carry `loser_schema`", async () => {
+    // Symmetric guard for N3: `loser_schema` is only meaningful for
+    // schema_conflict; absent on type/enum mismatches.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(result.validation_status.warnings[0].loser_schema).toBeUndefined();
+  });
+
   it("invalidates schema cache when only parent_names changes (no fields touched)", async () => {
     // Regression guard: pre-vault#270, parent_names changes only invalidated
     // the hierarchy cache. Now they must also invalidate the schema cache,

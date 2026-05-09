@@ -223,7 +223,14 @@ export interface Store {
   // the first lazy load.
   validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): {
     schemas: string[];
-    warnings: { field: string; schema: string; reason: "type_mismatch" | "enum_mismatch" | "schema_conflict"; message: string }[];
+    warnings: {
+      field: string;
+      schema: string;
+      reason: "type_mismatch" | "enum_mismatch" | "schema_conflict";
+      message: string;
+      /** Set only on `schema_conflict` — the tag whose declaration was overridden. */
+      loser_schema?: string;
+    }[];
   } | null;
 
   // Attachments

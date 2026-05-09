@@ -28,6 +28,10 @@
  *   so "first-in-`parent_names`-array wins" is the operator-controlled
  *   precedence. Conflicts surface as advisory `schema_conflict` warnings; no
  *   write blocking.
+ * - `_default` can technically carry its own `parent_names` and the resolver
+ *   handles it (cycle guard + visited Set), but the resulting interaction is
+ *   non-obvious — `_default` is usually appended last, so its ancestors
+ *   become low-precedence. Treat `_default` as a root tag in normal use.
  *
  * Resolution model:
  * - Lazy: rebuilt on first access, cached on the store.
@@ -75,6 +79,13 @@ export interface ValidationWarning {
    */
   reason: "type_mismatch" | "enum_mismatch" | "schema_conflict";
   message: string;
+  /**
+   * `schema_conflict` only — the tag whose declaration was overridden. Set
+   * when `reason === "schema_conflict"`; absent on type/enum mismatches.
+   * Surfaces structurally so agents don't have to regex `message` to find
+   * the loser.
+   */
+  loser_schema?: string;
 }
 
 export interface ValidationStatus {
@@ -219,6 +230,7 @@ export function resolveNoteSchemas(
       conflicts.push({
         field: fieldName,
         schema: existing.sourceTag,
+        loser_schema: tagName,
         reason: "schema_conflict",
         message: `field '${fieldName}' has conflicting specs in ancestor tags '${existing.sourceTag}' (kept) and '${tagName}' (ignored)`,
       });
