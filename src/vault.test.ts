@@ -565,6 +565,181 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  test("vault-info projection includes tags-with-schemas + indexed_fields + query_hints (vault#271)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `proj-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "vault for #271",
+    });
+
+    const vaultStore = getVaultStore(vaultName);
+    await vaultStore.upsertTagRecord("_default", {
+      fields: { created_by: { type: "string", description: "Origin" } },
+    });
+
+    // Indexed-field lifecycle is owned by the update-tag MCP tool — go
+    // through the tool, not the store, so indexed_fields gets populated.
+    const tools = generateScopedMcpTools(vaultName);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "employee",
+      description: "Employee",
+      fields: { title: { type: "string" } },
+      parent_names: ["person"],
+    });
+
+    const vaultInfo = tools.find((t) => t.name === "vault-info")!;
+    const result = await vaultInfo.execute({}) as any;
+
+    expect(result.name).toBe(vaultName);
+    expect(result.description).toBe("vault for #271");
+
+    // tags array — only schema-bearing rows, with effective inheritance
+    const byName = Object.fromEntries(
+      (result.tags as any[]).map((t) => [t.name, t]),
+    );
+    expect(byName.person).toBeTruthy();
+    expect(byName.person.effective_parents).toEqual(["_default"]);
+    expect(Object.keys(byName.person.effective_fields).sort()).toEqual([
+      "created_by",
+      "email",
+    ]);
+    expect(byName.employee.effective_parents).toEqual(["person", "_default"]);
+    expect(Object.keys(byName.employee.effective_fields).sort()).toEqual([
+      "created_by",
+      "email",
+      "title",
+    ]);
+
+    // indexed_fields catalog
+    const indexed = result.indexed_fields as any[];
+    const emailEntry = indexed.find((f) => f.name === "email");
+    expect(emailEntry).toBeTruthy();
+    expect(emailEntry.type).toBe("string");
+    expect(emailEntry.tags).toEqual(["person"]);
+
+    // query_hints — static catalog, present even without include_stats
+    expect(Array.isArray(result.query_hints)).toBe(true);
+    expect((result.query_hints as string[]).length).toBeGreaterThan(0);
+
+    // stats omitted unless requested
+    expect(result.stats).toBeUndefined();
+
+    const withStats = await vaultInfo.execute({ include_stats: true }) as any;
+    expect(withStats.stats).toBeTruthy();
+
+    closeAllStores();
+  });
+
+  test("getServerInstruction renders projection markdown for a populated vault (vault#271)", async () => {
+    const { getServerInstruction } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+
+    const vaultName = `instr-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "Working notebook for the daily team.",
+    });
+
+    const vaultStore = getVaultStore(vaultName);
+    await vaultStore.createNote("A", { tags: ["person"] });
+
+    const tools = generateScopedMcpTools(vaultName);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+
+    const md = getServerInstruction(vaultName);
+
+    expect(md).toContain(`Parachute Vault "${vaultName}"`);
+    expect(md).toContain("Working notebook for the daily team.");
+    expect(md).toContain("1 notes, 1 tags");
+    expect(md).toContain("1 tag with schemas: person");
+    expect(md).toContain("Indexed metadata fields");
+    expect(md).toContain("email");
+    expect(md).toContain("#person");
+    expect(md).toContain("Querying");
+    expect(md).toContain("vault-info");
+    expect(md).toContain("list-tags { include_schema: true }");
+
+    closeAllStores();
+  });
+
+  test("getServerInstruction degrades gracefully on an empty vault (vault#271)", async () => {
+    const { getServerInstruction } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `instr-empty-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+
+    const md = getServerInstruction(vaultName);
+
+    expect(md).toContain(`Parachute Vault "${vaultName}"`);
+    expect(md).toContain("0 notes, 0 tags");
+    expect(md).toContain("No tag schemas declared");
+    expect(md).toContain("No indexed metadata fields");
+    // Refresh hints surface both pointers so the agent knows where to look.
+    expect(md).toContain("vault-info");
+    expect(md).toContain("list-tags");
+
+    closeAllStores();
+  });
+
+  test("getServerInstruction stays under ~5K tokens at 50 tags-with-schemas (vault#271)", async () => {
+    const { getServerInstruction } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `instr-big-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "Stress-test fixture for the connect-time projection size.",
+    });
+
+    const vaultStore = getVaultStore(vaultName);
+    for (let i = 0; i < 50; i++) {
+      await vaultStore.upsertTagRecord(`schema_tag_${i}`, {
+        description: `Description for tag ${i} — covers a meaningful chunk of the vault's domain.`,
+        fields: {
+          [`field_${i}_a`]: { type: "string" },
+          [`field_${i}_b`]: { type: "integer" },
+        },
+      });
+    }
+
+    const md = getServerInstruction(vaultName);
+    // Rough token approximation: 1 token ≈ 4 chars. Budget: 5K tokens.
+    const approxTokens = md.length / 4;
+    expect(approxTokens).toBeLessThan(5000);
+
+    closeAllStores();
+  });
+
   test("list-tags with schema returns per-tag detail", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");

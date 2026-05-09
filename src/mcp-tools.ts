@@ -7,6 +7,10 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import {
+  buildVaultProjection,
+  projectionToMarkdown,
+} from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault } from "./scopes.ts";
@@ -20,20 +24,26 @@ import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
  * Get the MCP server instruction for a vault.
- * Sent once at session init — not per tool.
+ *
+ * Sent once at session init via the MCP `initialize` response — not per
+ * tool. The body is a markdown brief composed from the same vault projection
+ * `vault-info` returns, so an agent has everything it needs to orient
+ * itself before issuing a single query. Stats are included so the count
+ * line ("N notes, M tags") is always populated.
+ *
+ * Returns the orientation block even when the vault has no description or
+ * schemas — empty vaults still get the query-hint catalog and refresh
+ * pointers.
  */
 export function getServerInstruction(vaultName: string): string {
   const config = readVaultConfig(vaultName);
-
-  const parts: string[] = [
-    `You are connected to Parachute Vault "${vaultName}".`,
-  ];
-
-  if (config?.description) {
-    parts.push("", config.description);
-  }
-
-  return parts.join("\n");
+  const store = getVaultStore(vaultName);
+  const projection = buildVaultProjection(store.db, { includeStats: true });
+  return projectionToMarkdown({
+    vaultName,
+    description: config?.description ?? null,
+    projection,
+  });
 }
 
 /**
@@ -286,14 +296,20 @@ function overrideVaultInfo(
       writeVaultConfig(config);
     }
 
-    const result: any = {
+    const store = getVaultStore(vaultName);
+    const includeStats = Boolean(params.include_stats);
+    const projection = buildVaultProjection(store.db, { includeStats });
+
+    const result: Record<string, unknown> = {
       name: config.name,
       description: config.description ?? null,
+      tags: projection.tags,
+      indexed_fields: projection.indexed_fields,
+      query_hints: projection.query_hints,
     };
 
-    if (params.include_stats) {
-      const store = getVaultStore(vaultName);
-      result.stats = await store.getVaultStats();
+    if (projection.stats) {
+      result.stats = projection.stats;
     }
 
     return result;
