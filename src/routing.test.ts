@@ -1553,7 +1553,7 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(200);
   });
 
-  test("POST /api/tags/:name/rename → 409 when a tag-scoped token references the old name", async () => {
+  test("POST /api/tags/:name/rename → 200 cascades token allowlists (vault#240)", async () => {
     createVault("journal");
     const store = getVaultStore("journal");
     await store.createNote("h", { tags: ["health"] });
@@ -1569,19 +1569,19 @@ describe("scope enforcement on /api/*", () => {
       }),
       path,
     );
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      error_type?: string;
-      tag?: string;
-      referenced_by?: { id: string; label: string }[];
+      renamed?: number;
+      tokens_updated?: number;
     };
-    expect(body.error_type).toBe("tag_in_use_by_tokens");
-    expect(body.tag).toBe("health");
-    expect(body.referenced_by?.length).toBe(1);
+    // The cascade reports per-surface counts so callers can see what shifted.
+    expect(body.renamed).toBe(1);
+    expect(body.tokens_updated).toBe(1);
 
-    // Tag was not renamed.
-    expect((await store.listTags()).find((t) => t.name === "health")).toBeTruthy();
-    expect((await store.listTags()).find((t) => t.name === "wellness")).toBeFalsy();
+    // Tag is renamed; the previously-409-blocking token's scoped_tags
+    // rewrites alongside.
+    expect((await store.listTags()).find((t) => t.name === "health")).toBeFalsy();
+    expect((await store.listTags()).find((t) => t.name === "wellness")).toBeTruthy();
   });
 
   test("POST /api/tags/merge → 409 when a tag-scoped token references a source", async () => {

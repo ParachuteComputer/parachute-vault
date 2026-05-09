@@ -2411,7 +2411,7 @@ describe("HTTP /tags", async () => {
     );
     expect(res.status).toBe(200);
     const body = await res.json() as any;
-    expect(body).toEqual({ renamed: 2 });
+    expect(body).toMatchObject({ renamed: 2, sub_tags_renamed: 0 });
     expect((await store.getNote(n1.id))!.tags).toEqual(["memo"]);
     expect((await store.getNote(n2.id))!.tags?.sort()).toEqual(["keeper", "memo"]);
   });

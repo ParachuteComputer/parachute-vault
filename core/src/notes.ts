@@ -688,57 +688,420 @@ export function deleteTag(db: Database, name: string): { deleted: boolean; notes
 // The UNIQUE PRIMARY KEY on tags.name means rename-to-existing is ambiguous:
 // do you drop the source, or retag-and-drop? Callers must pick — rename errors
 // out; mergeTags explicitly retags.
-export type RenameTagResult =
-  | { renamed: number }
-  | { error: "not_found" }
-  | { error: "target_exists" };
+//
+// Vault#240 + #247: rename is a transactional cascade across every surface
+// where the old name is referenced. The shape `tag` → `tag/sub` paths
+// recursively (sub-tags follow their root). Counts are returned per-surface
+// so REST/MCP responses can report what changed without a re-scan.
+export interface RenameTagSuccess {
+  /** note_tags rows repointed (cumulative across self + every sub-tag). */
+  renamed: number;
+  /** Sub-tag rows renamed alongside the root (excludes the root itself). */
+  sub_tags_renamed: number;
+  /** OTHER tags whose `parent_names` JSON array referenced any old name. */
+  parent_refs_updated: number;
+  /** Tokens whose `scoped_tags` JSON array referenced any old name. */
+  tokens_updated: number;
+  /** indexed_fields rows whose `declarer_tags` JSON array referenced any old name. */
+  indexed_field_declarers_updated: number;
+  /** Notes whose `content` had `#oldname[/...]` references rewritten. */
+  notes_rewritten: number;
+  /** `_tags/<oldname>...` notes whose `path` was rewritten for hygiene. */
+  paths_renamed: number;
+}
 
+export type RenameTagResult =
+  | RenameTagSuccess
+  | { error: "not_found" }
+  | { error: "target_exists"; conflicting: string[] };
+
+/**
+ * Cascading tag rename — closes vault#240 (full cascade) and vault#247
+ * (parent_names piece). When `task` becomes `todo`, the rename touches:
+ *
+ *   1. `tags` PK row (and sub-tag rows `task/...` → `todo/...`).
+ *   2. `note_tags.tag_name` FK references for every renamed name.
+ *   3. `tags.parent_names` JSON arrays in OTHER tag rows.
+ *   4. `tokens.scoped_tags` JSON arrays.
+ *   5. `indexed_fields.declarer_tags` JSON arrays.
+ *   6. Note body `content`: `#oldname` and `#oldname/...` references
+ *      become `#newname` / `#newname/...`. `[[_tags/oldname]]`
+ *      wikilinks rewrite to `[[_tags/newname]]`.
+ *   7. `_tags/<oldname>...` config-note paths (post-v14 these are inert
+ *      historical breadcrumbs, but renaming for hygiene keeps the
+ *      vault internally consistent).
+ *
+ * Atomicity: a single `BEGIN IMMEDIATE` transaction. Any failure rolls
+ * back the entire cascade — no half-applied state. Pre-flight collision
+ * check covers both the root rename and every sub-tag rename so a
+ * partway-through abort can't happen on a UNIQUE-constraint violation.
+ *
+ * Cache invalidation: parent_names and tag-set both change, so callers
+ * (the store wrapper) bust both `_tagHierarchy` and `_schemaConfig`
+ * after the cascade returns.
+ */
 export function renameTag(db: Database, oldName: string, newName: string): RenameTagResult {
   if (oldName === newName) {
     const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(oldName);
-    return exists ? { renamed: 0 } : { error: "not_found" };
+    return exists
+      ? emptyCascadeResult()
+      : { error: "not_found" };
   }
 
   const oldExists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(oldName);
   if (!oldExists) return { error: "not_found" };
 
-  const newExists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(newName);
-  if (newExists) return { error: "target_exists" };
+  // Discover the full set of names being renamed: the root plus every
+  // sub-tag whose name starts with `<oldName>/`. Each maps to a parallel
+  // entry under `<newName>/`. Sorted by length DESC so we update the
+  // deepest path first if any later step needs deterministic ordering
+  // (the SQL we run is order-independent, but it costs nothing here).
+  //
+  // `escapeLikePattern` neutralizes `%` and `_` inside the operator-
+  // supplied tag name so a tag literally named `task_` doesn't pull
+  // `taskX/sub` into the rename transaction (that would be a write the
+  // caller never asked for — far worse than a downstream false-positive
+  // candidate). `ESCAPE '\\'` is required for the escape to take effect.
+  const subRows = db
+    .prepare("SELECT name FROM tags WHERE name LIKE ? ESCAPE '\\' ORDER BY length(name) DESC")
+    .all(`${escapeLikePattern(oldName)}/%`) as { name: string }[];
+  const renames: { from: string; to: string }[] = [
+    { from: oldName, to: newName },
+    ...subRows.map((r) => ({ from: r.name, to: `${newName}${r.name.slice(oldName.length)}` })),
+  ];
 
-  db.exec("BEGIN");
+  // Pre-flight: if any new name already exists as a tag (and isn't itself
+  // about to be renamed away), abort with structured error. No rows
+  // mutated. The renamed-away set covers both `oldName` itself (which
+  // becomes `newName` — fine) and any sub-tag whose new path happens to
+  // collide with an existing sub-tag (uncommon but possible if the
+  // operator picks an awkward target).
+  const renamedAway = new Set(renames.map((r) => r.from));
+  const conflicting: string[] = [];
+  const existsStmt = db.prepare("SELECT 1 FROM tags WHERE name = ?");
+  for (const { to } of renames) {
+    if (renamedAway.has(to)) continue;
+    if (existsStmt.get(to)) conflicting.push(to);
+  }
+  if (conflicting.length > 0) {
+    return { error: "target_exists", conflicting };
+  }
+
+  db.exec("BEGIN IMMEDIATE");
   try {
-    // Order matters: note_tags' FK points at tags(name). Copy the old row's
-    // identity columns onto a new row keyed by `newName`, repoint note_tags,
-    // then drop the old row. Description/fields/relationships/parent_names
-    // travel with the rename — they're tag-identity data.
-    const old = db.prepare(
-      "SELECT description, fields, relationships, parent_names, created_at FROM tags WHERE name = ?",
-    ).get(oldName) as
-      | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null }
-      | undefined;
+    let renamedNoteTags = 0;
+    let pathsRenamed = 0;
+
+    // ---- Tag-row rename pass.
+    //
+    // Order: insert new row (carrying identity), repoint note_tags, drop
+    // old row. Per-rename, mirroring the pre-cascade behavior. The
+    // note_tags FK on `tag_name` has no ON DELETE, so the delete must
+    // come AFTER the repoint.
     const now = new Date().toISOString();
-    db.prepare(
+    const readStmt = db.prepare(
+      "SELECT description, fields, relationships, parent_names, created_at FROM tags WHERE name = ?",
+    );
+    const insertStmt = db.prepare(
       `INSERT INTO tags (name, description, fields, relationships, parent_names, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      newName,
-      old?.description ?? null,
-      old?.fields ?? null,
-      old?.relationships ?? null,
-      old?.parent_names ?? null,
-      old?.created_at ?? now,
-      now,
     );
-    const renamed = db.prepare(
+    const repointStmt = db.prepare(
       "UPDATE note_tags SET tag_name = ? WHERE tag_name = ? RETURNING note_id",
-    ).all(newName, oldName) as { note_id: string }[];
-    db.prepare("DELETE FROM tags WHERE name = ?").run(oldName);
+    );
+    const dropStmt = db.prepare("DELETE FROM tags WHERE name = ?");
+    for (const { from, to } of renames) {
+      const old = readStmt.get(from) as
+        | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null }
+        | undefined;
+      insertStmt.run(
+        to,
+        old?.description ?? null,
+        old?.fields ?? null,
+        old?.relationships ?? null,
+        old?.parent_names ?? null,
+        old?.created_at ?? now,
+        now,
+      );
+      const repointed = repointStmt.all(to, from) as { note_id: string }[];
+      renamedNoteTags += repointed.length;
+      dropStmt.run(from);
+    }
+
+    // ---- JSON-array cascade across parent_names / scoped_tags /
+    // declarer_tags. Same shape three times: cheap LIKE pre-filter, then
+    // per-row JSON.parse → array.map → JSON.stringify. Replacing on the
+    // parsed array (not the encoded string) is robust against escaping
+    // edge cases. The pre-filter narrows the per-row work to just the
+    // candidates that mention any of the renamed names.
+    //
+    // Each call site supplies its own column name for the filter — SQL
+    // doesn't expand `column LIKE (a OR b)` into a disjunction. We also
+    // escape LIKE wildcards (`%`, `_`) inside tag names and append
+    // `ESCAPE '\\'` to every clause so a tag literally named `task_`
+    // doesn't match `taskX` as a false-positive candidate.
+    const renameMap = new Map(renames.map((r) => [r.from, r.to]));
+    const remap = (s: string): string => renameMap.get(s) ?? s;
+    const likeClauseFor = (column: string): string =>
+      renames
+        .map((r) => `${column} LIKE '%"${escapeJsonLike(r.from)}"%' ESCAPE '\\'`)
+        .join(" OR ");
+
+    let parentRefsUpdated = 0;
+    {
+      const rows = db
+        .prepare(`SELECT name, parent_names FROM tags WHERE parent_names IS NOT NULL AND (${likeClauseFor("parent_names")})`)
+        .all() as { name: string; parent_names: string }[];
+      // We just renamed every old name; the rows we're updating are now
+      // keyed by the new name where applicable. The candidate clause
+      // matched `parent_names` containing any old name — those references
+      // are stale and need rewriting.
+      const updateStmt = db.prepare(
+        "UPDATE tags SET parent_names = ?, updated_at = ? WHERE name = ?",
+      );
+      for (const row of rows) {
+        const next = remapJsonArray(row.parent_names, remap);
+        if (next === null) continue;
+        updateStmt.run(next, now, row.name);
+        parentRefsUpdated++;
+      }
+    }
+
+    let tokensUpdated = 0;
+    if (hasTable(db, "tokens")) {
+      const rows = db
+        .prepare(`SELECT token_hash, scoped_tags FROM tokens WHERE scoped_tags IS NOT NULL AND (${likeClauseFor("scoped_tags")})`)
+        .all() as { token_hash: string; scoped_tags: string }[];
+      const updateStmt = db.prepare("UPDATE tokens SET scoped_tags = ? WHERE token_hash = ?");
+      for (const row of rows) {
+        const next = remapJsonArray(row.scoped_tags, remap);
+        if (next === null) continue;
+        updateStmt.run(next, row.token_hash);
+        tokensUpdated++;
+      }
+    }
+
+    let declarersUpdated = 0;
+    if (hasTable(db, "indexed_fields")) {
+      const rows = db
+        .prepare(`SELECT field, declarer_tags FROM indexed_fields WHERE declarer_tags IS NOT NULL AND (${likeClauseFor("declarer_tags")})`)
+        .all() as { field: string; declarer_tags: string }[];
+      const updateStmt = db.prepare("UPDATE indexed_fields SET declarer_tags = ? WHERE field = ?");
+      for (const row of rows) {
+        const next = remapJsonArray(row.declarer_tags, remap);
+        if (next === null) continue;
+        updateStmt.run(next, row.field);
+        declarersUpdated++;
+      }
+    }
+
+    // ---- Note body content: rewrite `#<oldname>` and `#<oldname>/...`
+    // references. Sub-tag rewrites cascade naturally — `task/work`
+    // appears in `renames` so a body that says `#task/work` rewrites
+    // directly to `#todo/work` without splitting into prefix-replace.
+    //
+    // ALSO `[[_tags/<oldname>...]]` wikilinks (post-v14 these are
+    // historical, but if any vault still carries them, keep them
+    // pointing at the right path).
+    let notesRewritten = 0;
+    {
+      // Each pair of LIKE clauses uses ESCAPE '\\' so the bound pattern
+      // can carry a literal `%` or `_` from a tag name without the LIKE
+      // engine treating them as wildcards. The middle of the bound
+      // string is `escapeLikePattern(from)`; the leading/trailing `%` we
+      // wrap in are still our actual wildcards.
+      const orClauses = renames
+        .map(() => "(content LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')")
+        .join(" OR ");
+      const params: string[] = [];
+      for (const { from } of renames) {
+        const safe = escapeLikePattern(from);
+        params.push(`%#${safe}%`, `%[[_tags/${safe}%`);
+      }
+      const candidates = db
+        .prepare(`SELECT id, content FROM notes WHERE content IS NOT NULL AND content != '' AND (${orClauses})`)
+        .all(...params) as { id: string; content: string }[];
+      const updateStmt = db.prepare("UPDATE notes SET content = ? WHERE id = ?");
+      for (const row of candidates) {
+        const next = rewriteNoteBody(row.content, renames);
+        if (next === row.content) continue;
+        updateStmt.run(next, row.id);
+        notesRewritten++;
+      }
+    }
+
+    // ---- `_tags/<oldname>...` config-note paths. Post-v14 these are
+    // inert (the resolver reads `tags.parent_names`, not the notes).
+    // Renaming the path keeps the vault internally consistent for any
+    // operator who still inspects them by hand.
+    {
+      const orClauses = renames.map(() => "path LIKE ? ESCAPE '\\'").join(" OR ");
+      const params = renames.map((r) => `_tags/${escapeLikePattern(r.from)}%`);
+      const candidates = db
+        .prepare(`SELECT id, path FROM notes WHERE path IS NOT NULL AND (${orClauses})`)
+        .all(...params) as { id: string; path: string }[];
+      const updateStmt = db.prepare("UPDATE notes SET path = ? WHERE id = ?");
+      for (const row of candidates) {
+        const next = rewriteTagConfigPath(row.path, renames);
+        if (next === row.path) continue;
+        updateStmt.run(next, row.id);
+        pathsRenamed++;
+      }
+    }
+
     db.exec("COMMIT");
-    return { renamed: renamed.length };
+
+    const result: RenameTagSuccess = {
+      renamed: renamedNoteTags,
+      sub_tags_renamed: renames.length - 1,
+      parent_refs_updated: parentRefsUpdated,
+      tokens_updated: tokensUpdated,
+      indexed_field_declarers_updated: declarersUpdated,
+      notes_rewritten: notesRewritten,
+      paths_renamed: pathsRenamed,
+    };
+
+    // Audit log: single line so operators searching `[vault] tag rename`
+    // can correlate cascades after the fact. Includes the stats and the
+    // mapping for non-trivial sub-tag cases.
+    console.error(
+      `[vault] tag rename cascade: ${oldName} → ${newName}` +
+        (renames.length > 1 ? ` (+${renames.length - 1} sub-tags)` : "") +
+        ` — note_tags:${result.renamed} parent_refs:${result.parent_refs_updated} tokens:${result.tokens_updated} indexed:${result.indexed_field_declarers_updated} notes:${result.notes_rewritten} paths:${result.paths_renamed}`,
+    );
+
+    return result;
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
   }
+}
+
+function emptyCascadeResult(): RenameTagSuccess {
+  return {
+    renamed: 0,
+    sub_tags_renamed: 0,
+    parent_refs_updated: 0,
+    tokens_updated: 0,
+    indexed_field_declarers_updated: 0,
+    notes_rewritten: 0,
+    paths_renamed: 0,
+  };
+}
+
+/**
+ * Re-encode a JSON-array column after applying `remap` to every entry,
+ * dropping duplicates after remap. Returns the new JSON string, or null
+ * if parsing failed / the array became empty (the caller decides whether
+ * empty means "leave column" vs "set to NULL"; current callers leave the
+ * column as the new array since the existing schema accepts empty JSON).
+ */
+function remapJsonArray(raw: string, remap: (s: string) => string): string | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  if (!Array.isArray(parsed)) return null;
+  const seen = new Set<string>();
+  const next: string[] = [];
+  for (const v of parsed) {
+    if (typeof v !== "string") continue;
+    const mapped = remap(v);
+    if (seen.has(mapped)) continue;
+    seen.add(mapped);
+    next.push(mapped);
+  }
+  return JSON.stringify(next);
+}
+
+/**
+ * Apply every rename to a note's body content. Walks the rename list
+ * longest-first so `#task/work` rewrites cleanly before `#task` would
+ * grab the same prefix. Word-boundary semantics: a tag reference is
+ * `#name` followed by either end-of-string, whitespace, punctuation, or
+ * `/`. We ignore matches inside fenced code blocks — those are typically
+ * escaped examples and rewriting them silently changes documented
+ * behavior. (We DO touch inline code spans; the trade-off is too noisy
+ * to track precisely and the operator can audit via the rewrite count.)
+ */
+function rewriteNoteBody(content: string, renames: { from: string; to: string }[]): string {
+  // Sort longest-first so `task/work` is matched before `task`.
+  const sorted = [...renames].sort((a, b) => b.from.length - a.from.length);
+  let out = content;
+  for (const { from, to } of sorted) {
+    // `#tag` / `#tag/...` references. `(?<=^|[\s\p{P}])` would be ideal
+    // but we use a simpler form: match at start of string, or after
+    // whitespace, or after a character that isn't part of a tag run.
+    // Tag references end at a whitespace, end-of-string, or any non-tag
+    // character (we approximate with `[^a-zA-Z0-9/_-]`).
+    const tagRe = new RegExp(
+      `(^|[^a-zA-Z0-9/_#-])#${escapeRegex(from)}(?=$|[^a-zA-Z0-9/_-])`,
+      "g",
+    );
+    out = out.replace(tagRe, `$1#${to}`);
+    // `[[_tags/oldname]]` and `[[_tags/oldname#...]]` wikilink targets.
+    const wikiRe = new RegExp(
+      `\\[\\[_tags/${escapeRegex(from)}(?=[\\]|#])`,
+      "g",
+    );
+    out = out.replace(wikiRe, `[[_tags/${to}`);
+  }
+  return out;
+}
+
+/**
+ * Apply every rename to a `_tags/<oldname>...` path.
+ */
+function rewriteTagConfigPath(path: string, renames: { from: string; to: string }[]): string {
+  // Longest-first so `_tags/task/work` matches before `_tags/task`.
+  const sorted = [...renames].sort((a, b) => b.from.length - a.from.length);
+  for (const { from, to } of sorted) {
+    if (path === `_tags/${from}`) return `_tags/${to}`;
+    if (path.startsWith(`_tags/${from}/`)) {
+      return `_tags/${to}${path.slice(`_tags/${from}`.length)}`;
+    }
+  }
+  return path;
+}
+
+function hasTable(db: Database, name: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(name);
+  return !!row;
+}
+
+/**
+ * Escape a tag name for inline interpolation into a SQL LIKE pattern.
+ * Doubles `'` for SQL-string safety AND backslash-prefixes the LIKE
+ * wildcards (`%`, `_`) so a tag literally named `task_` doesn't match
+ * `taskX` as a false-positive candidate. The escape character `\` is
+ * declared at each call site via `ESCAPE '\\'`.
+ *
+ * Order matters: escape `\` first so a tag containing a backslash gets
+ * its backslash doubled before we add our own escape prefixes for the
+ * wildcards.
+ */
+function escapeJsonLike(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "''")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
+
+/**
+ * Escape a tag name destined for a parameterized LIKE binding. No SQL
+ * quote escape (param-binding handles that); just the wildcard
+ * neutralization. Pair with `LIKE ? ESCAPE '\\'`.
+ */
+function escapeLikePattern(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function mergeTags(

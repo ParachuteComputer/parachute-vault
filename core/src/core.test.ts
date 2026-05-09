@@ -357,7 +357,7 @@ describe("renameTag", async () => {
     const n2 = await store.createNote("B", { tags: ["voice", "keeper"] });
 
     const result = await store.renameTag("voice", "memo");
-    expect(result).toEqual({ renamed: 2 });
+    expect(result).toMatchObject({ renamed: 2, sub_tags_renamed: 0 });
 
     expect((await store.getNote(n1.id))!.tags).toEqual(["memo"]);
     expect((await store.getNote(n2.id))!.tags?.sort()).toEqual(["keeper", "memo"]);
@@ -386,7 +386,7 @@ describe("renameTag", async () => {
     await store.untagNote((await store.queryNotes({}))[0].id, ["doomed"]);
 
     const result = await store.renameTag("doomed", "archived");
-    expect(result).toEqual({ renamed: 0 });
+    expect(result).toMatchObject({ renamed: 0, sub_tags_renamed: 0 });
     const tags = await store.listTags();
     expect(tags.some((t) => t.name === "doomed")).toBe(false);
     expect(tags.some((t) => t.name === "archived")).toBe(true);
@@ -397,7 +397,7 @@ describe("renameTag", async () => {
     await store.createNote("B", { tags: ["new"] });
 
     const result = await store.renameTag("old", "new");
-    expect(result).toEqual({ error: "target_exists" });
+    expect(result).toMatchObject({ error: "target_exists", conflicting: ["new"] });
 
     // No bleed — both tags still present with their original counts.
     const tags = await store.listTags();
@@ -413,8 +413,322 @@ describe("renameTag", async () => {
   it("same-name rename is a no-op on an existing tag", async () => {
     await store.createNote("A", { tags: ["voice"] });
     const result = await store.renameTag("voice", "voice");
-    expect(result).toEqual({ renamed: 0 });
+    expect(result).toMatchObject({ renamed: 0, sub_tags_renamed: 0 });
     expect((await store.listTags()).find((t) => t.name === "voice")!.count).toBe(1);
+  });
+});
+
+// ---- Tag rename cascade (vault#240 + #247) ----
+
+describe("renameTag cascade (vault#240 + #247)", async () => {
+  it("1. rewrites note bodies with #tag references", async () => {
+    const note = await store.createNote(
+      "Today's #task is important. Also see #task/work and the #other tag.",
+      { tags: ["task"] },
+    );
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ renamed: 1, notes_rewritten: 1 });
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.content).toContain("#todo");
+    expect(fresh!.content).not.toContain("#task ");
+    expect(fresh!.content).toContain("#other"); // untouched
+  });
+
+  it("2. cascades sub-tags recursively (task → todo, task/work → todo/work, task/work/client → todo/work/client)", async () => {
+    await store.createNote("a", { tags: ["task"] });
+    await store.createNote("b", { tags: ["task/work"] });
+    await store.createNote("c", { tags: ["task/work/client"] });
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ renamed: 3, sub_tags_renamed: 2 });
+
+    const tags = (await store.listTags()).map((t) => t.name).sort();
+    expect(tags).toContain("todo");
+    expect(tags).toContain("todo/work");
+    expect(tags).toContain("todo/work/client");
+    expect(tags.some((t) => t.startsWith("task"))).toBe(false);
+  });
+
+  it("3. rewrites parent_names refs in OTHER tag rows (closes #247)", async () => {
+    await store.upsertTagRecord("task", { description: "tasks" });
+    await store.upsertTagRecord("voice", {
+      parent_names: ["manual", "task"],
+    });
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ renamed: 0, parent_refs_updated: 1 });
+
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["manual", "todo"]);
+  });
+
+  it("4. rewrites tokens.scoped_tags JSON arrays", async () => {
+    await store.upsertTagRecord("task", {});
+    await store.upsertTagRecord("project", {});
+
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("h_one", "tok-1", "full", "vault:read", JSON.stringify(["task"]), now);
+    db.prepare(
+      `INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("h_two", "tok-2", "full", "vault:read", JSON.stringify(["project"]), now);
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ tokens_updated: 1 });
+
+    const refreshed = db
+      .prepare("SELECT token_hash, scoped_tags FROM tokens ORDER BY token_hash")
+      .all() as { token_hash: string; scoped_tags: string }[];
+    expect(JSON.parse(refreshed[0]!.scoped_tags)).toEqual(["todo"]);
+    // Untouched.
+    expect(JSON.parse(refreshed[1]!.scoped_tags)).toEqual(["project"]);
+  });
+
+  it("5. rewrites #tag and [[_tags/...]] references in note bodies (incl. sub-tags)", async () => {
+    await store.upsertTagRecord("task/work", {});
+    await store.upsertTagRecord("task", {});
+    const a = await store.createNote(
+      "#task is important #task/work and a wikilink: [[_tags/task]]",
+      { tags: ["task"] },
+    );
+
+    const result = await store.renameTag("task", "todo");
+    expect(result.renamed).toBeGreaterThan(0);
+    if ("notes_rewritten" in result) expect(result.notes_rewritten).toBe(1);
+
+    const fresh = await store.getNote(a.id);
+    expect(fresh!.content).toContain("#todo is important");
+    expect(fresh!.content).toContain("#todo/work");
+    expect(fresh!.content).toContain("[[_tags/todo]]");
+    expect(fresh!.content).not.toContain("#task ");
+    expect(fresh!.content).not.toContain("[[_tags/task]");
+  });
+
+  it("6. pre-flight collision aborts without mutation when target exists", async () => {
+    await store.createNote("t", { tags: ["task"] });
+    await store.createNote("p", { tags: ["project"] });
+
+    const result = await store.renameTag("task", "project");
+    expect(result).toMatchObject({ error: "target_exists", conflicting: ["project"] });
+
+    // Both tags still present, untouched counts.
+    const tags = await store.listTags();
+    expect(tags.find((t) => t.name === "task")?.count).toBe(1);
+    expect(tags.find((t) => t.name === "project")?.count).toBe(1);
+  });
+
+  it("7. transactional rollback leaves the original state intact on mid-cascade failure", async () => {
+    await store.createNote("a", { tags: ["task"] });
+    await store.createNote("b", { tags: ["task/work"] });
+
+    // Inject failure: drop the tags table mid-transaction by intercepting
+    // the JSON cascade pass. Easiest reliable hook: corrupt the
+    // tokens.scoped_tags column with a value that will fail the JSON
+    // cascade's UPDATE (use a token_hash that violates a constraint when
+    // the cascade rewrites it). Simpler: spy on noteOps via monkey-patch.
+    //
+    // We use the simplest reliable approach: a row lock conflict. Two
+    // statements writing the same row in a deferred transaction would
+    // require two connections; instead we drop a required table at the
+    // SQL layer to force a SQL error on a downstream UPDATE inside the
+    // cascade. Restore after the test.
+    const originalDeleteTag = (db as any).prepare;
+    let dropOnce = false;
+    (db as any).prepare = function (sql: string) {
+      // Force the tag-row pass to fail on the DELETE step by dropping
+      // the tags table out from under it after the first INSERT.
+      if (!dropOnce && sql.startsWith("DELETE FROM tags WHERE name = ?")) {
+        dropOnce = true;
+        const stmt = originalDeleteTag.call(this, sql);
+        const wrapped = {
+          run: (...args: any[]) => {
+            (db as any).prepare = originalDeleteTag;
+            throw new Error("synthetic mid-cascade failure");
+          },
+        };
+        return wrapped;
+      }
+      return originalDeleteTag.call(this, sql);
+    };
+
+    let threw = false;
+    try {
+      await store.renameTag("task", "todo");
+    } catch {
+      threw = true;
+    }
+    (db as any).prepare = originalDeleteTag;
+    expect(threw).toBe(true);
+
+    // Original state intact: task tags still present, todo absent.
+    const tags = (await store.listTags()).map((t) => t.name);
+    expect(tags).toContain("task");
+    expect(tags).toContain("task/work");
+    expect(tags).not.toContain("todo");
+    expect(tags).not.toContain("todo/work");
+  });
+
+  it("8. invalidates hierarchy + schema caches after rename", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string" } },
+    });
+    await store.upsertTagRecord("task/work", { parent_names: ["task"] });
+    await store.createNote("a", { tags: ["task/work"] });
+
+    // Prime the caches by querying via the hierarchy-aware path.
+    await store.queryNotes({ tags: ["task"] });
+
+    await store.renameTag("task", "todo");
+
+    // queryNotes via the new tag must find the note that's now tagged
+    // todo/work (descendant of todo via parent_names rewrite).
+    const found = await store.queryNotes({ tags: ["todo"] });
+    expect(found.length).toBe(1);
+
+    // validateNoteAgainstSchemas must surface fields under the new tag —
+    // proves the schema-config cache was busted (otherwise the resolver
+    // would still be keyed on `task`).
+    const status = store.validateNoteAgainstSchemas({
+      tags: ["todo"],
+      metadata: { status: 123 },
+    });
+    expect(status?.warnings.some((w) => w.reason === "type_mismatch")).toBe(true);
+  });
+
+  it("9. self-rename is a structured no-op when the source exists", async () => {
+    await store.createNote("a", { tags: ["task"] });
+    const result = await store.renameTag("task", "task");
+    expect(result).toMatchObject({ renamed: 0, sub_tags_renamed: 0 });
+    expect((await store.listTags()).find((t) => t.name === "task")?.count).toBe(1);
+  });
+
+  it("10. preserves transitive inheritance through the cascade (manual extends note; voice extends manual; renaming manual → instruction keeps voice's effective fields)", async () => {
+    await store.upsertTagRecord("note", {
+      fields: { topic: { type: "string" } },
+    });
+    await store.upsertTagRecord("manual", {
+      fields: { author: { type: "string" } },
+      parent_names: ["note"],
+    });
+    await store.upsertTagRecord("voice", {
+      parent_names: ["manual"],
+    });
+
+    const result = await store.renameTag("manual", "instruction");
+    expect(result.renamed).toBe(0); // no notes
+    if ("parent_refs_updated" in result) expect(result.parent_refs_updated).toBe(1);
+
+    // Voice's parent_names now references `instruction` (the renamed parent).
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["instruction"]);
+
+    // Voice's effective fields still inherit through instruction → note.
+    const status = store.validateNoteAgainstSchemas({
+      tags: ["voice"],
+      metadata: { topic: 123, author: "ok" },
+    });
+    expect(status?.warnings.some((w) => w.field === "topic" && w.reason === "type_mismatch")).toBe(
+      true,
+    );
+  });
+
+  it("11. rewrites indexed_fields.declarer_tags JSON arrays (#275 fold N3)", async () => {
+    // Drive through the update-tag MCP tool — it owns indexed-field
+    // lifecycle (see mcp.ts §update-tag); store.upsertTagRecord does
+    // not populate the `indexed_fields` table.
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      fields: { status: { type: "string", indexed: true } },
+    });
+
+    const beforeRow = db
+      .prepare("SELECT declarer_tags FROM indexed_fields WHERE field = ?")
+      .get("status") as { declarer_tags: string };
+    expect(JSON.parse(beforeRow.declarer_tags).sort()).toEqual(["project", "task"]);
+
+    const result = await store.renameTag("task", "todo");
+    expect(result).toMatchObject({ indexed_field_declarers_updated: 1 });
+
+    const afterRow = db
+      .prepare("SELECT declarer_tags FROM indexed_fields WHERE field = ?")
+      .get("status") as { declarer_tags: string };
+    const declarers = JSON.parse(afterRow.declarer_tags) as string[];
+    expect(declarers).toContain("todo");
+    expect(declarers).toContain("project");
+    expect(declarers).not.toContain("task");
+  });
+
+  it("12. rewrites `_tags/<path>` config-note paths via rewriteTagConfigPath (#275 fold N3)", async () => {
+    await store.upsertTagRecord("old", {});
+    const root = await store.createNote("root config", { path: "_tags/old" });
+    const sub = await store.createNote("sub config", { path: "_tags/old/nested/leaf" });
+
+    const result = await store.renameTag("old", "new");
+    expect(result).toMatchObject({ paths_renamed: 2 });
+
+    const rootFresh = await store.getNote(root.id);
+    expect(rootFresh?.path).toBe("_tags/new");
+
+    const subFresh = await store.getNote(sub.id);
+    expect(subFresh?.path).toBe("_tags/new/nested/leaf");
+  });
+
+  it("14. sub-tag discovery escapes LIKE wildcards — `task_` rename doesn't pull `taskX/sub` into the cascade (#275 re-review)", async () => {
+    // Pre-fold: the discovery query was `LIKE 'task_/%'` which matches
+    // `taskX/sub` because `_` is a single-char wildcard. `taskX/sub`
+    // would then enter `renames` and get rewritten to `<new>/sub` — a
+    // write the caller never asked for.
+    await store.upsertTagRecord("task_", {});
+    await store.upsertTagRecord("taskX/sub", {});
+    const stray = await store.createNote("stray", { tags: ["taskX/sub"] });
+
+    const result = await store.renameTag("task_", "todo_");
+    // Only the actual root rename — no spurious sub-tag pulled in.
+    expect(result).toMatchObject({ sub_tags_renamed: 0 });
+
+    expect(await store.getTagRecord("task_")).toBeNull();
+    expect(await store.getTagRecord("todo_")).toBeTruthy();
+
+    // `taskX/sub` is untouched: row still present, the note tagged with
+    // it still carries the original tag.
+    expect(await store.getTagRecord("taskX/sub")).toBeTruthy();
+    expect((await store.getNote(stray.id))!.tags).toEqual(["taskX/sub"]);
+  });
+
+  it("13. LIKE wildcard escape — a tag literally named `task_` doesn't false-match `taskX` (#275 fold N1)", async () => {
+    // `task_` and `taskX` are unrelated tags. Pre-fold N1 the LIKE
+    // pre-filter would have considered `taskX` rows as candidates for
+    // `task_`'s rewrite (LIKE `%"task_"%` matches `"taskX"` in JSON
+    // because `_` is a single-char wildcard). The cascade's downstream
+    // remapJsonArray would have rejected the row, so no data
+    // corruption — but the wasted scan + bad hygiene is what fold N1
+    // closes. This test pins the behavior end-to-end.
+    await store.upsertTagRecord("task_", {});
+    await store.upsertTagRecord("taskX", {});
+    await store.upsertTagRecord("voice", {
+      parent_names: ["taskX"],
+    });
+
+    await store.renameTag("task_", "renamed_task");
+
+    // taskX-rooted parent_names must be untouched — the escape stops
+    // taskX from being a candidate for the `task_` rewrite.
+    const voice = await store.getTagRecord("voice");
+    expect(voice?.parent_names).toEqual(["taskX"]);
+    // Sanity: the actual rename did happen.
+    expect(await store.getTagRecord("task_")).toBeNull();
+    expect(await store.getTagRecord("renamed_task")).toBeTruthy();
   });
 });
 

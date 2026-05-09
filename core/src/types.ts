@@ -160,7 +160,19 @@ export interface Store {
   renameTag(
     oldName: string,
     newName: string,
-  ): Promise<{ renamed: number } | { error: "not_found" } | { error: "target_exists" }>;
+  ): Promise<
+    | {
+        renamed: number;
+        sub_tags_renamed: number;
+        parent_refs_updated: number;
+        tokens_updated: number;
+        indexed_field_declarers_updated: number;
+        notes_rewritten: number;
+        paths_renamed: number;
+      }
+    | { error: "not_found" }
+    | { error: "target_exists"; conflicting: string[] }
+  >;
   mergeTags(
     sources: string[],
     target: string,
