@@ -1,33 +1,29 @@
 /**
- * Schema validation: resolves which schemas apply to a note (by path prefix
- * or tag), then validates the note's metadata against each. Writes are
- * never blocked — schemas are guidance. The MCP/REST layer surfaces a
- * `validation_status` block on create/update responses with any warnings
- * the agent can act on (missing required, type mismatch, enum mismatch).
+ * Schema validation: walk the tags carried by a note, look up each tag's
+ * `fields` declaration, and validate the note's metadata against the
+ * collected field declarations. Writes are never blocked — schemas are
+ * guidance. The MCP/REST layer surfaces a `validation_status` block on
+ * create/update responses with any warnings the agent can act on (type
+ * mismatch, enum mismatch).
  *
- * Storage (post-v15): schemas live in the `note_schemas` table; mapping
- * rules live in `schema_mappings`. Authoring is via `update-note-schema`
- * + `set-schema-mapping` (MCP/REST). The legacy `_schemas/<name>` and
- * `_schema_defaults` notes are retired but left in place — inert after
- * v15 (no resolver reads them).
+ * Storage: schemas live as `fields` columns on the `tags` table — same row
+ * that already carries description, relationships, and parent_names. Authoring
+ * is via `update-tag` (MCP) or PATCH /api/tags/:name (REST).
+ *
+ * This was a two-table subsystem (`note_schemas` + `schema_mappings`) prior
+ * to v17 — see vault#267. Removed in v17 because zero operator vaults used
+ * the path-prefix mapping kind, and tag-mapped schemas were fully redundant
+ * with `tags.fields`. The single-axis tag-driven validation lives here.
  *
  * Resolution model:
  * - Lazy: rebuilt on first access, cached on the store.
- * - Invalidated when `note_schemas` or `schema_mappings` are mutated
- *   (table writes, not note writes).
- * - When no mappings exist and nothing else matches, validation is a
- *   no-op (status omitted).
+ * - Invalidated when `tags.fields` is mutated (upsert/delete tag schema or
+ *   tag record).
+ * - When no tag on the note declares fields, validation is a no-op (status
+ *   omitted).
  */
 
 import { Database } from "bun:sqlite";
-
-// ---------------------------------------------------------------------------
-// Legacy path prefixes — kept exported for any historical caller that still
-// references them. No resolver code reads notes-as-config post-v15.
-// ---------------------------------------------------------------------------
-
-export const SCHEMA_CONFIG_PREFIX = "_schemas/";
-export const SCHEMA_DEFAULTS_PATH = "_schema_defaults";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,35 +35,25 @@ export interface SchemaField {
   description?: string;
 }
 
-export interface SchemaDefinition {
-  name: string;
-  description?: string;
-  fields: Record<string, SchemaField>;
-  required: string[];
-}
-
-export interface SchemaDefaults {
-  /** Path prefix → schema name. Longest prefix wins on tie. */
-  pathPrefixes: Array<{ prefix: string; schema: string }>;
-  /** Tag → schema name. */
-  tagToSchema: Map<string, string>;
-}
-
+/**
+ * Per-tag field map: { tagName: { fieldName: SchemaField } }. Empty when no
+ * tag declares any fields.
+ */
 export interface ResolvedSchemas {
-  defaults: SchemaDefaults;
-  definitions: Map<string, SchemaDefinition>;
+  tagToFields: Map<string, Record<string, SchemaField>>;
 }
 
 export interface ValidationWarning {
   field: string;
+  /** Tag whose schema declared the violated field. */
   schema: string;
-  /** "missing_required" | "type_mismatch" | "enum_mismatch" */
-  reason: "missing_required" | "type_mismatch" | "enum_mismatch";
+  /** "type_mismatch" | "enum_mismatch" */
+  reason: "type_mismatch" | "enum_mismatch";
   message: string;
 }
 
 export interface ValidationStatus {
-  /** Schema names that matched the note (for transparency). */
+  /** Tag names whose schemas applied (for transparency). */
   schemas: string[];
   /** Empty when all checks pass. */
   warnings: ValidationWarning[];
@@ -99,55 +85,22 @@ function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
   return fields;
 }
 
-function parseRequiredJson(raw: string | null): string[] {
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((x): x is string => typeof x === "string");
-  } catch {
-    return [];
-  }
-}
-
 /**
- * Build the full resolution map from the `note_schemas` and `schema_mappings`
- * tables. Always returns a well-formed `ResolvedSchemas` even when the
- * tables are empty (empty maps).
+ * Build a resolution map from the `tags` table. Returns a well-formed
+ * `ResolvedSchemas` even when no tag declares fields (empty map).
  */
 export function loadSchemaConfig(db: Database): ResolvedSchemas {
-  const definitions = new Map<string, SchemaDefinition>();
-  const defRows = db.prepare(
-    `SELECT name, description, fields, required FROM note_schemas`,
-  ).all() as { name: string; description: string | null; fields: string | null; required: string | null }[];
-  for (const row of defRows) {
+  const tagToFields = new Map<string, Record<string, SchemaField>>();
+  const rows = db.prepare(
+    `SELECT name, fields FROM tags WHERE fields IS NOT NULL`,
+  ).all() as { name: string; fields: string | null }[];
+  for (const row of rows) {
     if (!row.name) continue;
-    definitions.set(row.name, {
-      name: row.name,
-      description: row.description ?? undefined,
-      fields: parseFieldsJson(row.fields),
-      required: parseRequiredJson(row.required),
-    });
+    const fields = parseFieldsJson(row.fields);
+    if (Object.keys(fields).length === 0) continue;
+    tagToFields.set(row.name, fields);
   }
-
-  const defaults: SchemaDefaults = {
-    pathPrefixes: [],
-    tagToSchema: new Map(),
-  };
-  const mappingRows = db.prepare(
-    `SELECT schema_name, match_kind, match_value FROM schema_mappings`,
-  ).all() as { schema_name: string; match_kind: string; match_value: string }[];
-  for (const row of mappingRows) {
-    if (row.match_kind === "path_prefix") {
-      defaults.pathPrefixes.push({ prefix: row.match_value, schema: row.schema_name });
-    } else if (row.match_kind === "tag") {
-      defaults.tagToSchema.set(row.match_value, row.schema_name);
-    }
-  }
-  // Longest prefix wins — sort once at load so resolve is O(n) without re-sorts.
-  defaults.pathPrefixes.sort((a, b) => b.prefix.length - a.prefix.length);
-
-  return { defaults, definitions };
+  return { tagToFields };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,40 +108,23 @@ export function loadSchemaConfig(db: Database): ResolvedSchemas {
 // ---------------------------------------------------------------------------
 
 /**
- * Find the schemas that apply to a note based on its path and tags. Returns
- * schema *names* in the order they were resolved (path-prefix first, then
- * each matching tag in declaration order). Names that don't have a row in
- * `note_schemas` are dropped.
+ * Find the tags on this note whose schemas declare at least one field.
+ * Returns tag *names* in note-tag order.
  */
 export function resolveApplicableSchemas(
   resolved: ResolvedSchemas,
-  note: { path?: string | null; tags?: string[] },
+  note: { tags?: string[] },
 ): string[] {
   const names: string[] = [];
   const seen = new Set<string>();
-
-  if (note.path) {
-    for (const { prefix, schema } of resolved.defaults.pathPrefixes) {
-      if (note.path.startsWith(prefix)) {
-        if (!seen.has(schema) && resolved.definitions.has(schema)) {
-          names.push(schema);
-          seen.add(schema);
-        }
-        break; // longest match wins (sorted at load)
-      }
+  if (!note.tags) return names;
+  for (const tag of note.tags) {
+    if (seen.has(tag)) continue;
+    if (resolved.tagToFields.has(tag)) {
+      names.push(tag);
+      seen.add(tag);
     }
   }
-
-  if (note.tags) {
-    for (const tag of note.tags) {
-      const schema = resolved.defaults.tagToSchema.get(tag);
-      if (schema && !seen.has(schema) && resolved.definitions.has(schema)) {
-        names.push(schema);
-        seen.add(schema);
-      }
-    }
-  }
-
   return names;
 }
 
@@ -209,17 +145,18 @@ function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
 }
 
 /**
- * Validate a note's metadata against each applicable schema and collect
- * warnings. Validation is non-blocking — the caller decides what to do with
- * the warnings (currently: surface them on the create/update response).
+ * Validate a note's metadata against each applicable tag's `fields` and
+ * collect warnings. Validation is non-blocking — the caller decides what to
+ * do with the warnings (currently: surface them on the create/update
+ * response).
  *
  * Rules per field:
- * - In `required` and absent → `missing_required`
  * - Present and `type` declared and value's type doesn't match → `type_mismatch`
  * - Present and `enum` declared and value not in enum → `enum_mismatch`
  *
- * Fields not declared in the schema are ignored entirely (this isn't a
- * "strict" validator — it's a guide).
+ * Fields not declared by any applicable tag's schema are ignored entirely
+ * (this isn't a "strict" validator — it's a guide). There is no `required`
+ * concept on `tags.fields` (post-v17); declarations are advisory only.
  */
 export function validateMetadata(
   resolved: ResolvedSchemas,
@@ -230,21 +167,10 @@ export function validateMetadata(
   const m = metadata ?? {};
 
   for (const name of schemaNames) {
-    const def = resolved.definitions.get(name);
-    if (!def) continue;
+    const fields = resolved.tagToFields.get(name);
+    if (!fields) continue;
 
-    for (const requiredField of def.required) {
-      if (!(requiredField in m) || m[requiredField] === undefined || m[requiredField] === null) {
-        warnings.push({
-          field: requiredField,
-          schema: name,
-          reason: "missing_required",
-          message: `'${requiredField}' is required by schema '${name}'`,
-        });
-      }
-    }
-
-    for (const [fieldName, field] of Object.entries(def.fields)) {
+    for (const [fieldName, field] of Object.entries(fields)) {
       if (!(fieldName in m)) continue;
       const value = m[fieldName];
       if (value === undefined || value === null) continue;
@@ -254,7 +180,7 @@ export function validateMetadata(
           field: fieldName,
           schema: name,
           reason: "type_mismatch",
-          message: `'${fieldName}' should be ${field.type} (schema '${name}')`,
+          message: `'${fieldName}' should be ${field.type} (tag '${name}')`,
         });
       }
 
@@ -263,7 +189,7 @@ export function validateMetadata(
           field: fieldName,
           schema: name,
           reason: "enum_mismatch",
-          message: `'${fieldName}' must be one of [${field.enum.join(", ")}] (schema '${name}')`,
+          message: `'${fieldName}' must be one of [${field.enum.join(", ")}] (tag '${name}')`,
         });
       }
     }
@@ -274,8 +200,8 @@ export function validateMetadata(
 
 /**
  * Convenience: combine resolve + validate for a note. Returns null when no
- * schemas apply (so the caller can decide whether to omit the field on the
- * response or surface an empty status).
+ * tag on the note declares any fields (so the caller can decide whether to
+ * omit the field on the response or surface an empty status).
  */
 export function validateNote(
   resolved: ResolvedSchemas,

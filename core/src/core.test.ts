@@ -1161,16 +1161,20 @@ describe("MCP tools", async () => {
     expect(names).toContain("list-tags");
     expect(names).toContain("update-tag");
     expect(names).toContain("delete-tag");
-    expect(names).toContain("list-note-schemas");
-    expect(names).toContain("update-note-schema");
-    expect(names).toContain("delete-note-schema");
-    expect(names).toContain("list-schema-mappings");
-    expect(names).toContain("set-schema-mapping");
-    expect(names).toContain("delete-schema-mapping");
     expect(names).toContain("find-path");
     expect(names).toContain("synthesize-notes");
     expect(names).toContain("vault-info");
-    expect(tools).toHaveLength(16);
+    // Six note-schema tools (list/update/delete-note-schema +
+    // list/set/delete-schema-mapping) retired in v17 — the standalone
+    // note_schemas + schema_mappings subsystem was a parallel path to
+    // tags.fields with zero operator usage. See vault#267.
+    expect(names).not.toContain("list-note-schemas");
+    expect(names).not.toContain("update-note-schema");
+    expect(names).not.toContain("delete-note-schema");
+    expect(names).not.toContain("list-schema-mappings");
+    expect(names).not.toContain("set-schema-mapping");
+    expect(names).not.toContain("delete-schema-mapping");
+    expect(tools).toHaveLength(10);
   });
 
   it("create-note tool works", async () => {
@@ -3184,64 +3188,42 @@ describe("tag hierarchy (tags.parent_names)", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Note schemas — table-driven (post-v15: `note_schemas` + `schema_mappings`)
+// Schema validation — driven by `tags.fields` (post-v17, vault#267)
 // ---------------------------------------------------------------------------
 // Originally written against the `_schemas/<name>` + `_schema_defaults`
-// notes-as-config convention (issue #177). Rewritten for vault#246: the
-// authoring surface is now `store.upsertNoteSchema` + `store.setSchemaMapping`
-// and the legacy notes are inert (left in place as audit trail).
+// notes-as-config convention (issue #177); rewritten for vault#246 against
+// the standalone `note_schemas` + `schema_mappings` tables; rewritten again
+// for vault#267 against `tags.fields` after the standalone subsystem retired.
+// The validation surface is intentionally smaller now — schemas are tag-axis
+// only (no path_prefix) and advisory only (no `required` concept).
 
-describe("note schemas (note_schemas + schema_mappings)", async () => {
-  it("returns no validation_status when no schemas are configured", async () => {
+describe("schema validation (tags.fields)", async () => {
+  it("returns no validation_status when no tag declares fields", async () => {
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
     const result = await create.execute({ content: "plain note" }) as any;
     expect(result.validation_status).toBeUndefined();
   });
 
-  it("attaches validation_status when a schema matches by tag", async () => {
-    await store.upsertNoteSchema("task", {
-      description: "A task",
-      fields: { priority: { type: "string", enum: ["high", "medium", "low"] } },
-      required: ["priority"],
+  it("returns no validation_status when no tag on the note declares fields", async () => {
+    // A different tag has fields, but the note isn't tagged with it.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" } },
     });
-    await store.setSchemaMapping("task", "tag", "task");
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
-    const result = await create.execute({ content: "do thing", tags: ["task"] }) as any;
-
-    expect(result.validation_status).toBeTruthy();
-    expect(result.validation_status.schemas).toEqual(["task"]);
-    expect(result.validation_status.warnings.length).toBe(1);
-    expect(result.validation_status.warnings[0].reason).toBe("missing_required");
-    expect(result.validation_status.warnings[0].field).toBe("priority");
+    const result = await create.execute({ content: "plain note", tags: ["other"] }) as any;
+    expect(result.validation_status).toBeUndefined();
   });
 
-  it("attaches validation_status when a schema matches by path prefix", async () => {
-    await store.upsertNoteSchema("journal-entry", {
-      fields: { mood: { type: "string" } },
-      required: ["mood"],
-    });
-    await store.setSchemaMapping("journal-entry", "path_prefix", "journal/");
-
-    const tools = generateMcpTools(store);
-    const create = tools.find((t) => t.name === "create-note")!;
-    const result = await create.execute({ content: "today", path: "journal/2026-04-29" }) as any;
-
-    expect(result.validation_status.schemas).toEqual(["journal-entry"]);
-    expect(result.validation_status.warnings[0].reason).toBe("missing_required");
-  });
-
-  it("validation passes (empty warnings) when required fields are present and types match", async () => {
-    await store.upsertNoteSchema("task", {
+  it("validation passes (empty warnings) when fields match types", async () => {
+    await store.upsertTagSchema("task", {
       fields: {
         priority: { type: "string", enum: ["high", "medium", "low"] },
         done: { type: "boolean" },
       },
-      required: ["priority"],
     });
-    await store.setSchemaMapping("task", "tag", "task");
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
@@ -3256,10 +3238,9 @@ describe("note schemas (note_schemas + schema_mappings)", async () => {
   });
 
   it("type_mismatch warning when a field's value is the wrong type", async () => {
-    await store.upsertNoteSchema("task", {
+    await store.upsertTagSchema("task", {
       fields: { priority: { type: "string" }, done: { type: "boolean" } },
     });
-    await store.setSchemaMapping("task", "tag", "task");
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
@@ -3275,10 +3256,9 @@ describe("note schemas (note_schemas + schema_mappings)", async () => {
   });
 
   it("enum_mismatch warning when a field's value is outside the declared enum", async () => {
-    await store.upsertNoteSchema("task", {
+    await store.upsertTagSchema("task", {
       fields: { priority: { type: "string", enum: ["high", "medium", "low"] } },
     });
-    await store.setSchemaMapping("task", "tag", "task");
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
@@ -3292,12 +3272,17 @@ describe("note schemas (note_schemas + schema_mappings)", async () => {
   });
 
   it("validation never blocks the write — note exists with warnings attached", async () => {
-    await store.upsertNoteSchema("task", { required: ["priority"] });
-    await store.setSchemaMapping("task", "tag", "task");
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "boolean" } },
+    });
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
-    const result = await create.execute({ content: "x", tags: ["task"] }) as any;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high" }, // wrong type, but the write still lands
+    }) as any;
 
     expect(result.id).toBeTruthy();
     expect(result.validation_status.warnings.length).toBe(1);
@@ -3308,11 +3293,9 @@ describe("note schemas (note_schemas + schema_mappings)", async () => {
   });
 
   it("update-note also surfaces validation_status", async () => {
-    await store.upsertNoteSchema("task", {
+    await store.upsertTagSchema("task", {
       fields: { priority: { type: "string", enum: ["high", "low"] } },
-      required: ["priority"],
     });
-    await store.setSchemaMapping("task", "tag", "task");
     const note = await store.createNote("body", { tags: ["task"], metadata: { priority: "high" } });
 
     const tools = generateMcpTools(store);
@@ -3326,98 +3309,83 @@ describe("note schemas (note_schemas + schema_mappings)", async () => {
     expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
   });
 
-  it("cache invalidates when a schema mapping is removed", async () => {
-    await store.upsertNoteSchema("task", { required: ["a"] });
-    await store.setSchemaMapping("task", "tag", "task");
+  it("cache invalidates when a tag schema is updated", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "boolean" } },
+    });
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
-    let result = await create.execute({ content: "x", tags: ["task"] }) as any;
-    expect(result.validation_status.warnings[0].field).toBe("a");
+    let result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status.warnings[0].field).toBe("priority");
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
 
-    await store.deleteSchemaMapping("task", "tag", "task");
+    // Re-declare with a string type; cache must reflect the change.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" } },
+    });
+    result = await create.execute({
+      content: "y",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status.warnings).toEqual([]);
+  });
 
-    result = await create.execute({ content: "y", tags: ["task"] }) as any;
+  it("cache invalidates when a tag schema is deleted", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "boolean" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+
+    await store.deleteTagSchema("task");
+
+    result = await create.execute({
+      content: "y",
+      tags: ["task"],
+      metadata: { priority: "high" },
+    }) as any;
     expect(result.validation_status).toBeUndefined();
   });
 
-  it("cache invalidates when a schema is updated", async () => {
-    await store.upsertNoteSchema("task", { required: ["a"] });
-    await store.setSchemaMapping("task", "tag", "task");
-
-    const tools = generateMcpTools(store);
-    const create = tools.find((t) => t.name === "create-note")!;
-    let result = await create.execute({ content: "x", tags: ["task"] }) as any;
-    expect(result.validation_status.warnings[0].field).toBe("a");
-
-    // Re-declare with a different required field; cache must reflect the change.
-    await store.upsertNoteSchema("task", { required: ["b"] });
-    result = await create.execute({ content: "y", tags: ["task"] }) as any;
-    expect(result.validation_status.warnings[0].field).toBe("b");
-  });
-
-  it("cache invalidates when a schema is deleted (cascades mappings)", async () => {
-    await store.upsertNoteSchema("task", { required: ["a"] });
-    await store.setSchemaMapping("task", "tag", "task");
-
-    const tools = generateMcpTools(store);
-    const create = tools.find((t) => t.name === "create-note")!;
-    let result = await create.execute({ content: "x", tags: ["task"] }) as any;
-    expect(result.validation_status.warnings[0].field).toBe("a");
-
-    await store.deleteNoteSchema("task");
-    // FK CASCADE drops the mapping too.
-    expect(await store.listSchemaMappings({ schema_name: "task" })).toEqual([]);
-
-    result = await create.execute({ content: "y", tags: ["task"] }) as any;
-    expect(result.validation_status).toBeUndefined();
-  });
-
-  it("longest path prefix wins when multiple match", async () => {
-    await store.upsertNoteSchema("journal-day", { required: ["mood"] });
-    await store.upsertNoteSchema("journal-broad", { required: ["topic"] });
-    await store.setSchemaMapping("journal-broad", "path_prefix", "journal/");
-    await store.setSchemaMapping("journal-day", "path_prefix", "journal/2026/");
-
-    const tools = generateMcpTools(store);
-    const create = tools.find((t) => t.name === "create-note")!;
-    const result = await create.execute({ content: "x", path: "journal/2026/april" }) as any;
-    expect(result.validation_status.schemas).toEqual(["journal-day"]);
-  });
-
-  it("multiple schemas can apply (path + tag combine warnings)", async () => {
-    await store.upsertNoteSchema("journal-entry", { required: ["mood"] });
-    await store.upsertNoteSchema("task", { required: ["priority"] });
-    await store.setSchemaMapping("journal-entry", "path_prefix", "journal/");
-    await store.setSchemaMapping("task", "tag", "task");
+  it("multiple tag schemas combine warnings", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string" } },
+    });
+    await store.upsertTagSchema("project", {
+      fields: { status: { type: "string", enum: ["active", "done"] } },
+    });
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;
     const result = await create.execute({
       content: "x",
-      path: "journal/today",
-      tags: ["task"],
+      tags: ["task", "project"],
+      metadata: { priority: 7, status: "WIP" }, // bad: wrong type, bad enum
     }) as any;
 
-    expect(result.validation_status.schemas.sort()).toEqual(["journal-entry", "task"]);
+    expect(result.validation_status.schemas.sort()).toEqual(["project", "task"]);
     expect(result.validation_status.warnings.length).toBe(2);
   });
 
-  it("a schema with no mappings is harmless (no validation)", async () => {
-    await store.upsertNoteSchema("orphan", { required: ["x"] });
-
-    const tools = generateMcpTools(store);
-    const create = tools.find((t) => t.name === "create-note")!;
-    const result = await create.execute({ content: "anything" }) as any;
-    expect(result.validation_status).toBeUndefined();
-  });
-
-  it("legacy `_schemas/<name>` notes are inert post-v15", async () => {
+  it("legacy `_schemas/<name>` notes are inert post-v17", async () => {
     // The notes still write/read fine — they're just no longer interpreted
-    // as schema config. Nothing in note_schemas/schema_mappings → no validation.
+    // as schema config. Nothing in tags.fields → no validation.
     await store.createNote("", {
       path: "_schemas/task",
-      metadata: { required: ["priority"] },
+      metadata: { fields: { priority: { type: "string" } } },
     });
     await store.createNote("", {
       path: "_schema_defaults",
@@ -3428,83 +3396,6 @@ describe("note schemas (note_schemas + schema_mappings)", async () => {
     const create = tools.find((t) => t.name === "create-note")!;
     const result = await create.execute({ content: "x", tags: ["task"] }) as any;
     expect(result.validation_status).toBeUndefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// note_schemas + schema_mappings — direct CRUD (vault#246)
-// ---------------------------------------------------------------------------
-
-describe("note_schemas / schema_mappings CRUD", async () => {
-  it("upsertNoteSchema partial-merge: undefined preserves, null clears", async () => {
-    await store.upsertNoteSchema("task", {
-      description: "A task",
-      fields: { priority: { type: "string" } },
-      required: ["priority"],
-    });
-
-    // description omitted → preserved
-    await store.upsertNoteSchema("task", { required: ["priority", "due"] });
-    let row = await store.getNoteSchema("task");
-    expect(row?.description).toBe("A task");
-    expect(row?.required).toEqual(["priority", "due"]);
-
-    // description null → cleared
-    await store.upsertNoteSchema("task", { description: null });
-    row = await store.getNoteSchema("task");
-    expect(row?.description).toBeNull();
-    expect(row?.required).toEqual(["priority", "due"]); // still preserved
-  });
-
-  it("empty `required: []` collapses to null", async () => {
-    await store.upsertNoteSchema("task", { required: ["a", "b"] });
-    await store.upsertNoteSchema("task", { required: [] });
-    const row = await store.getNoteSchema("task");
-    expect(row?.required).toBeNull();
-  });
-
-  it("setSchemaMapping is idempotent (composite PK)", async () => {
-    await store.upsertNoteSchema("task", {});
-    await store.setSchemaMapping("task", "tag", "task");
-    await store.setSchemaMapping("task", "tag", "task"); // re-set same triple
-    const mappings = await store.listSchemaMappings({ schema_name: "task" });
-    expect(mappings.length).toBe(1);
-  });
-
-  it("setSchemaMapping rejects unknown match_kind", async () => {
-    await store.upsertNoteSchema("task", {});
-    await expect(
-      store.setSchemaMapping("task", "BOGUS" as any, "task"),
-    ).rejects.toThrow(/match_kind/);
-  });
-
-  it("setSchemaMapping fails (FK) when schema doesn't exist", async () => {
-    await expect(
-      store.setSchemaMapping("missing", "tag", "x"),
-    ).rejects.toThrow();
-  });
-
-  it("deleteNoteSchema cascades schema_mappings (FK ON DELETE CASCADE)", async () => {
-    await store.upsertNoteSchema("task", {});
-    await store.setSchemaMapping("task", "tag", "task");
-    await store.setSchemaMapping("task", "path_prefix", "Tasks/");
-    expect((await store.listSchemaMappings({ schema_name: "task" })).length).toBe(2);
-
-    expect(await store.deleteNoteSchema("task")).toBe(true);
-    expect(await store.listSchemaMappings({ schema_name: "task" })).toEqual([]);
-    expect(await store.deleteNoteSchema("task")).toBe(false); // already gone
-  });
-
-  it("listSchemaMappings filters by schema_name and match_kind", async () => {
-    await store.upsertNoteSchema("a", {});
-    await store.upsertNoteSchema("b", {});
-    await store.setSchemaMapping("a", "tag", "a-tag");
-    await store.setSchemaMapping("a", "path_prefix", "A/");
-    await store.setSchemaMapping("b", "tag", "b-tag");
-
-    expect((await store.listSchemaMappings({ schema_name: "a" })).length).toBe(2);
-    expect((await store.listSchemaMappings({ match_kind: "tag" })).length).toBe(2);
-    expect((await store.listSchemaMappings({ schema_name: "a", match_kind: "tag" })).length).toBe(1);
   });
 });
 
@@ -3904,199 +3795,111 @@ describe("schema migration v13 → v14", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Schema migration v14 → v15 — vault#246 (_schemas/* + _schema_defaults retired)
+// Schema migration v16 → v17 — vault#267 (note_schemas + schema_mappings rip)
 // ---------------------------------------------------------------------------
 
-describe("schema migration v14 → v15", async () => {
-  // Build a v14-shape DB by:
-  //   1. Calling initSchema (so we get the full v15 shape, including
-  //      note_schemas / schema_mappings tables).
-  //   2. Manually wiping the new tables, then writing the legacy
-  //      `_schemas/<name>` and `_schema_defaults` notes.
-  //   3. Re-running initSchema — the migration's short-circuit (empty
-  //      destination tables) should kick in and copy the data over.
-  async function buildV14ShapeWithLegacyNotes(): Promise<Database> {
+describe("schema migration v16 → v17", async () => {
+  // Build a v16-shape DB with the standalone note_schemas + schema_mappings
+  // tables and a couple of rows, then run initSchema again. The v17 migration
+  // should drop both tables.
+  async function buildV16ShapeWithLegacyTables(): Promise<Database> {
     const { Database } = await import("bun:sqlite");
-    const { initSchema } = await import("./schema.ts");
     const db = new Database(":memory:");
-    initSchema(db);
 
-    // Write the legacy notes that the v14 vaults stored config in.
+    // Create the v16-era schema fragments by hand. We can't call the post-v17
+    // initSchema to do this — SCHEMA_SQL no longer creates the dropped
+    // tables. Build them manually here so the migration test exercises the
+    // "upgrading from v16" path.
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(`CREATE TABLE note_schemas (
+      name TEXT PRIMARY KEY,
+      description TEXT,
+      fields TEXT,
+      required TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    )`);
+    db.exec(`CREATE TABLE schema_mappings (
+      schema_name TEXT NOT NULL REFERENCES note_schemas(name) ON DELETE CASCADE,
+      match_kind TEXT NOT NULL CHECK (match_kind IN ('path_prefix', 'tag')),
+      match_value TEXT NOT NULL,
+      PRIMARY KEY (schema_name, match_kind, match_value)
+    )`);
+    db.exec("CREATE INDEX idx_schema_mappings_match ON schema_mappings(match_kind, match_value)");
+
     const now = new Date().toISOString();
-    const insertNote = db.prepare(
-      "INSERT INTO notes (id, content, path, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-    );
-    insertNote.run(
-      "s1",
-      "",
-      "_schemas/task",
-      JSON.stringify({
-        description: "A task",
-        fields: { priority: { type: "string", enum: ["high", "low"] } },
-        required: ["priority"],
-      }),
-      now,
-    );
-    insertNote.run(
-      "s2",
-      "",
-      "_schemas/journal-entry",
-      JSON.stringify({ fields: { mood: { type: "string" } } }),
-      now,
-    );
-    insertNote.run(
-      "d1",
-      "",
-      "_schema_defaults",
-      JSON.stringify({
-        path_prefixes: { "journal/": "journal-entry" },
-        tags: { task: "task", "follow-up": "task" },
-      }),
-      now,
-    );
-
-    // Wipe the destination tables so the migration short-circuit doesn't
-    // fire (otherwise initSchema treats them as already migrated).
-    db.exec("DELETE FROM schema_mappings");
-    db.exec("DELETE FROM note_schemas");
+    db.prepare(
+      "INSERT INTO note_schemas (name, description, fields, required, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("task", "A task", '{"priority":{"type":"string"}}', '["priority"]', now, now);
+    db.prepare(
+      "INSERT INTO note_schemas (name, created_at, updated_at) VALUES (?, ?, ?)",
+    ).run("journal-entry", now, now);
+    db.prepare(
+      "INSERT INTO schema_mappings (schema_name, match_kind, match_value) VALUES (?, ?, ?)",
+    ).run("task", "tag", "task");
+    db.prepare(
+      "INSERT INTO schema_mappings (schema_name, match_kind, match_value) VALUES (?, ?, ?)",
+    ).run("journal-entry", "path_prefix", "journal/");
 
     return db;
   }
 
-  it("copies `_schemas/<name>` notes → note_schemas with description / fields / required", async () => {
-    const db = await buildV14ShapeWithLegacyNotes();
+  it("drops note_schemas + schema_mappings tables on upgrade", async () => {
+    const db = await buildV16ShapeWithLegacyTables();
     const { initSchema } = await import("./schema.ts");
     initSchema(db);
 
-    const taskRow = db.prepare(
-      "SELECT description, fields, required FROM note_schemas WHERE name = 'task'",
-    ).get() as any;
-    expect(taskRow.description).toBe("A task");
-    expect(JSON.parse(taskRow.fields).priority.enum).toEqual(["high", "low"]);
-    expect(JSON.parse(taskRow.required)).toEqual(["priority"]);
-
-    const journalRow = db.prepare(
-      "SELECT description, fields FROM note_schemas WHERE name = 'journal-entry'",
-    ).get() as any;
-    expect(journalRow.description).toBeNull();
-    expect(JSON.parse(journalRow.fields).mood.type).toBe("string");
+    const tables = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_schemas','schema_mappings')",
+    ).all() as { name: string }[];
+    expect(tables).toEqual([]);
 
     db.close();
   });
 
-  it("copies `_schema_defaults` → schema_mappings (path_prefixes + tags)", async () => {
-    const db = await buildV14ShapeWithLegacyNotes();
-    const { initSchema } = await import("./schema.ts");
-    initSchema(db);
-
-    const mappings = db.prepare(
-      "SELECT schema_name, match_kind, match_value FROM schema_mappings ORDER BY match_kind, match_value",
-    ).all() as { schema_name: string; match_kind: string; match_value: string }[];
-    expect(mappings).toEqual([
-      { schema_name: "journal-entry", match_kind: "path_prefix", match_value: "journal/" },
-      { schema_name: "task", match_kind: "tag", match_value: "follow-up" },
-      { schema_name: "task", match_kind: "tag", match_value: "task" },
-    ]);
-
-    db.close();
-  });
-
-  it("auto-creates a stub schema row when a mapping references an undeclared schema (FK)", async () => {
+  it("idempotent — running on an already-v17 vault is a no-op", async () => {
     const { Database } = await import("bun:sqlite");
     const { initSchema } = await import("./schema.ts");
     const db = new Database(":memory:");
+    initSchema(db); // First run: fresh v17 shape.
+
+    // Sanity: the dropped tables don't exist on a fresh vault.
+    let tables = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_schemas','schema_mappings')",
+    ).all() as { name: string }[];
+    expect(tables).toEqual([]);
+
+    // Second run shouldn't crash and the tables stay absent.
     initSchema(db);
-
-    // Only a defaults note — no `_schemas/orphan` definition.
-    db.prepare(
-      "INSERT INTO notes (id, content, path, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(
-      "d",
-      "",
-      "_schema_defaults",
-      JSON.stringify({ tags: { orphan: "orphan" } }),
-      new Date().toISOString(),
-    );
-    db.exec("DELETE FROM schema_mappings");
-    db.exec("DELETE FROM note_schemas");
-
-    initSchema(db);
-
-    // Stub schema row was created so the FK on schema_mappings holds.
-    const stub = db.prepare("SELECT name FROM note_schemas WHERE name = 'orphan'").get();
-    expect(stub).toBeTruthy();
-    const mapping = db.prepare(
-      "SELECT match_kind, match_value FROM schema_mappings WHERE schema_name = 'orphan'",
-    ).get() as any;
-    expect(mapping).toEqual({ match_kind: "tag", match_value: "orphan" });
+    tables = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('note_schemas','schema_mappings')",
+    ).all() as { name: string }[];
+    expect(tables).toEqual([]);
 
     db.close();
   });
 
-  it("legacy `_schemas/*` and `_schema_defaults` notes are left in place (audit trail)", async () => {
-    const db = await buildV14ShapeWithLegacyNotes();
+  it("preserves notes + tags + tokens across the rip", async () => {
+    const db = await buildV16ShapeWithLegacyTables();
+
+    // Bring the rest of the schema up to v16 baseline so notes/tags/tokens
+    // exist, then re-run initSchema (which finishes the v17 migration).
     const { initSchema } = await import("./schema.ts");
     initSchema(db);
 
-    const schemaNote = db.prepare("SELECT id FROM notes WHERE path = '_schemas/task'").get();
-    expect(schemaNote).toBeTruthy();
-    const defaultsNote = db.prepare("SELECT id FROM notes WHERE path = '_schema_defaults'").get();
-    expect(defaultsNote).toBeTruthy();
-
-    db.close();
-  });
-
-  it("is idempotent — second initSchema doesn't re-copy or duplicate rows", async () => {
-    const db = await buildV14ShapeWithLegacyNotes();
-    const { initSchema } = await import("./schema.ts");
+    // Populate some unrelated state and re-run; nothing else should move.
+    await import("./store.ts").then(async ({ SqliteStore }) => {
+      const s = new SqliteStore(db);
+      await s.createNote("hello", { id: "n1", tags: ["task"] });
+      await s.upsertTagRecord("task", { description: "still here" });
+    });
     initSchema(db);
 
-    const schemaCount1 = (db.prepare("SELECT COUNT(*) as c FROM note_schemas").get() as any).c;
-    const mappingCount1 = (db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c;
-
-    initSchema(db);
-
-    const schemaCount2 = (db.prepare("SELECT COUNT(*) as c FROM note_schemas").get() as any).c;
-    const mappingCount2 = (db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c;
-    expect(schemaCount2).toBe(schemaCount1);
-    expect(mappingCount2).toBe(mappingCount1);
-
-    db.close();
-  });
-
-  it("no legacy notes → migration is a no-op (empty tables)", async () => {
-    const { Database } = await import("bun:sqlite");
-    const { initSchema } = await import("./schema.ts");
-    const db = new Database(":memory:");
-    initSchema(db);
-
-    expect((db.prepare("SELECT COUNT(*) as c FROM note_schemas").get() as any).c).toBe(0);
-    expect((db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c).toBe(0);
-
-    db.close();
-  });
-
-  // Short-circuit uses `||` not `&&`: a vault with schemas-but-no-mappings
-  // is a valid post-v15 state. Legacy `_schemas/*` notes left around from
-  // a prior import shouldn't get re-folded on every boot. (The mirror case —
-  // mappings-but-no-schemas — is structurally impossible because the
-  // schema_mappings FK to note_schemas has ON DELETE CASCADE.)
-  it("doesn't re-run when only one destination table is non-empty", async () => {
-    const db = await buildV14ShapeWithLegacyNotes();
-    const { initSchema } = await import("./schema.ts");
-    initSchema(db);
-
-    // After first run: tables populated, legacy notes still in `notes`.
-    expect((db.prepare("SELECT COUNT(*) as c FROM note_schemas").get() as any).c).toBeGreaterThan(0);
-    expect((db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c).toBeGreaterThan(0);
-    expect((db.prepare("SELECT COUNT(*) as c FROM notes WHERE path GLOB '_schemas/*'").get() as any).c).toBeGreaterThan(0);
-
-    // Wipe mappings only; schemas remain non-empty. With the buggy `&&`
-    // short-circuit, the migration would re-scan `_schema_defaults` and
-    // rebuild the mappings table. With `||` it correctly no-ops.
-    db.exec("DELETE FROM schema_mappings");
-    initSchema(db);
-    expect((db.prepare("SELECT COUNT(*) as c FROM schema_mappings").get() as any).c).toBe(0);
+    const note = db.prepare("SELECT id, content FROM notes WHERE id = ?").get("n1") as any;
+    expect(note?.content).toBe("hello");
+    const tag = db.prepare("SELECT description FROM tags WHERE name = ?").get("task") as any;
+    expect(tag?.description).toBe("still here");
 
     db.close();
   });

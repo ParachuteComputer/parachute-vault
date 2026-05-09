@@ -19,7 +19,6 @@ import {
   type ResolvedSchemas,
   type ValidationStatus,
 } from "./schema-defaults.js";
-import * as noteSchemaOps from "./note-schemas.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -29,12 +28,11 @@ import * as noteSchemaOps from "./note-schemas.js";
 export class BunSqliteStore implements Store {
   public readonly hooks: HookRegistry;
 
-  // Lazy-built caches over the post-v14 `tags` table (hierarchy via
-  // parent_names) and the post-v15 `note_schemas` + `schema_mappings`
-  // tables (validation). Null means "not yet loaded or invalidated"; the
-  // next read rebuilds. We invalidate synchronously inside the writers
-  // that mutate the source tables so reads after writes always see the
-  // post-write state.
+  // Lazy-built caches over the post-v14 `tags` table — hierarchy via
+  // parent_names, schema validation via `fields`. Null means "not yet
+  // loaded or invalidated"; the next read rebuilds. We invalidate
+  // synchronously inside the writers that mutate the source rows so reads
+  // after writes always see the post-write state.
   private _tagHierarchy: TagHierarchy | null = null;
   private _schemaConfig: ResolvedSchemas | null = null;
 
@@ -55,8 +53,8 @@ export class BunSqliteStore implements Store {
   }
 
   /**
-   * Lazy accessor for the `note_schemas` + `schema_mappings` resolution.
-   * Same lifecycle as the tag hierarchy cache.
+   * Lazy accessor for the per-tag `fields` resolution. Same lifecycle as
+   * the tag hierarchy cache.
    */
   private getSchemaConfig(): ResolvedSchemas {
     if (!this._schemaConfig) this._schemaConfig = loadSchemaConfig(this.db);
@@ -79,9 +77,9 @@ export class BunSqliteStore implements Store {
    * alongside new for rename cases (a note moved out of `_tags/` should
    * still invalidate).
    *
-   * Post-v15 the schema-config cache is no longer note-driven — its
-   * invalidation hook is on `upsertNoteSchema` / `setSchemaMapping` /
-   * `deleteNoteSchema` / `deleteSchemaMapping` instead.
+   * Post-v17 the schema-config cache is purely tag-driven — its
+   * invalidation hook is on `upsertTagSchema` / `upsertTagRecord` /
+   * `deleteTagSchema` / `deleteTag` (mutations of `tags.fields`).
    */
   private invalidateConfigCachesForPath(path: string | null | undefined, oldPath?: string | null): void {
     const isTagConfig = (p: string | null | undefined): boolean =>
@@ -277,8 +275,10 @@ export class BunSqliteStore implements Store {
 
   async deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }> {
     const result = noteOps.deleteTag(this.db, name);
-    // The deleted tag may have been a parent or child in the hierarchy.
+    // The deleted tag may have been a parent or child in the hierarchy
+    // and may have declared `fields` powering schema validation.
     this._tagHierarchy = null;
+    this._schemaConfig = null;
     return result;
   }
 
@@ -286,8 +286,10 @@ export class BunSqliteStore implements Store {
     const result = noteOps.renameTag(this.db, oldName, newName);
     // Other tags' parent_names may reference oldName — though we don't
     // rewrite those, the hierarchy cache should be rebuilt to pick up the
-    // new row identity.
+    // new row identity. The schema-config cache is keyed by tag name, so
+    // bust it too.
     this._tagHierarchy = null;
+    this._schemaConfig = null;
     return result;
   }
 
@@ -297,8 +299,10 @@ export class BunSqliteStore implements Store {
   ): Promise<{ merged: Record<string, number>; target: string }> {
     const result = noteOps.mergeTags(this.db, sources, target);
     // Source tags drop out of the hierarchy; downstream callers asking
-    // for descendants of target should pick up any merged children.
+    // for descendants of target should pick up any merged children. Also
+    // bust the schema cache — `fields` declarations follow tag identity.
     this._tagHierarchy = null;
+    this._schemaConfig = null;
     return result;
   }
 
@@ -332,9 +336,9 @@ export class BunSqliteStore implements Store {
     const notes = noteOps.createNotes(this.db, inputs);
     for (const note of notes) {
       // Bulk path needs the same config-cache invalidation as singleton
-      // createNote — without it, a batch that includes `_tags/*` or
-      // `_schemas/*` notes would leave the cache stale until the next
-      // singleton write happened to bust it.
+      // createNote — without it, a batch that includes `_tags/*` notes
+      // would leave the hierarchy cache stale until the next singleton
+      // write happened to bust it.
       this.invalidateConfigCachesForPath(note.path);
       this.hooks.dispatch("created", note, this);
     }
@@ -370,11 +374,17 @@ export class BunSqliteStore implements Store {
   }
 
   async upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, tagSchemaOps.TagFieldSchema> }) {
-    return tagSchemaOps.upsertTagSchema(this.db, tag, schema);
+    const result = tagSchemaOps.upsertTagSchema(this.db, tag, schema);
+    // `fields` drives validation — bust the schema cache so the next
+    // create/update sees the new declarations.
+    this._schemaConfig = null;
+    return result;
   }
 
   async deleteTagSchema(tag: string) {
-    return tagSchemaOps.deleteTagSchema(this.db, tag);
+    const result = tagSchemaOps.deleteTagSchema(this.db, tag);
+    if (result) this._schemaConfig = null;
+    return result;
   }
 
   async getTagSchemaMap() {
@@ -409,6 +419,9 @@ export class BunSqliteStore implements Store {
     if (patch.parent_names !== undefined) {
       this._tagHierarchy = null;
     }
+    if (patch.fields !== undefined) {
+      this._schemaConfig = null;
+    }
     return result;
   }
 
@@ -431,61 +444,12 @@ export class BunSqliteStore implements Store {
   /**
    * Drop the config caches unconditionally. Used by bulk-import paths that
    * skip per-note invalidation for throughput, and by importers that
-   * directly populate `note_schemas` / `schema_mappings`.
+   * directly mutate `tags` / `tags.fields` outside the singleton write
+   * methods.
    */
   rebuildConfigCaches(): void {
     this._tagHierarchy = null;
     this._schemaConfig = null;
-  }
-
-  // ---- Note schemas (post-v15: validation by path-prefix or tag) ----
-
-  async listNoteSchemas() {
-    return noteSchemaOps.listNoteSchemas(this.db);
-  }
-
-  async getNoteSchema(name: string) {
-    return noteSchemaOps.getNoteSchema(this.db, name);
-  }
-
-  /**
-   * Partial-upsert a note schema. Auto-creates the row if missing. Any
-   * patch field left undefined is preserved; pass null to clear. Empty
-   * `required: []` collapses to null. Invalidates the schema-config cache.
-   */
-  async upsertNoteSchema(name: string, patch: noteSchemaOps.NoteSchemaPatch) {
-    const result = noteSchemaOps.upsertNoteSchema(this.db, name, patch);
-    this._schemaConfig = null;
-    return result;
-  }
-
-  async deleteNoteSchema(name: string) {
-    const removed = noteSchemaOps.deleteNoteSchema(this.db, name);
-    if (removed) this._schemaConfig = null;
-    return removed;
-  }
-
-  async listSchemaMappings(opts?: noteSchemaOps.ListMappingsOpts) {
-    return noteSchemaOps.listSchemaMappings(this.db, opts ?? {});
-  }
-
-  async setSchemaMapping(
-    schema_name: string,
-    match_kind: noteSchemaOps.SchemaMappingKind,
-    match_value: string,
-  ) {
-    noteSchemaOps.setSchemaMapping(this.db, schema_name, match_kind, match_value);
-    this._schemaConfig = null;
-  }
-
-  async deleteSchemaMapping(
-    schema_name: string,
-    match_kind: noteSchemaOps.SchemaMappingKind,
-    match_value: string,
-  ) {
-    const removed = noteSchemaOps.deleteSchemaMapping(this.db, schema_name, match_kind, match_value);
-    if (removed) this._schemaConfig = null;
-    return removed;
   }
 
   /**

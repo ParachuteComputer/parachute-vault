@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record
@@ -69,37 +69,12 @@ CREATE TABLE IF NOT EXISTS links (
 -- tags row directly. The CREATE TABLE was removed from SCHEMA_SQL after the
 -- v14 data migration drops the table; existing v6+ vaults pick up the
 -- migration on next boot. See migrateToV14.
-
--- Note schemas (v15): schema definitions used to validate notes by path
--- prefix or tag. Replaces the v6-era _schemas/NAME notes-as-config
--- convention. Validation is non-blocking — schemas surface warnings on
--- create/update responses, never reject the write. See
--- core/src/schema-defaults.ts and patterns/tag-data-model.md §Note schemas.
 --
--- name        — primary key; the schema identifier referenced by mappings.
--- description — human-readable blurb (markdown).
--- fields      — JSON: { fieldName: { type?, enum?, description? } }.
--- required    — JSON: string[] of required field names.
-CREATE TABLE IF NOT EXISTS note_schemas (
-  name TEXT PRIMARY KEY,
-  description TEXT,
-  fields TEXT,
-  required TEXT,
-  created_at TEXT,
-  updated_at TEXT
-);
-
--- Schema mappings (v15): replaces the singleton _schema_defaults note. One
--- row per match rule; the resolver walks the table at note-write time.
--- match_kind is constrained to 'path_prefix' or 'tag'. Composite PK so
--- (schema, kind, value) is naturally unique without an extra surrogate id.
--- ON DELETE CASCADE: dropping a schema cleans up its mappings.
-CREATE TABLE IF NOT EXISTS schema_mappings (
-  schema_name TEXT NOT NULL REFERENCES note_schemas(name) ON DELETE CASCADE,
-  match_kind TEXT NOT NULL CHECK (match_kind IN ('path_prefix', 'tag')),
-  match_value TEXT NOT NULL,
-  PRIMARY KEY (schema_name, match_kind, match_value)
-);
+-- note_schemas + schema_mappings (v15) were retired in v17 (vault#267).
+-- The two-table validation subsystem turned out to be a parallel path to
+-- the per-tag fields column with zero operator usage; v17 drops both
+-- tables and the six MCP tools that managed them. Validation now reads
+-- tags.fields exclusively — see core/src/schema-defaults.ts.
 
 -- Indexed fields: SSOT for generated columns and indexes on notes derived
 -- from tag-declared fields with indexed=true. One row per indexed metadata
@@ -209,7 +184,6 @@ CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_name, note_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
-CREATE INDEX IF NOT EXISTS idx_schema_mappings_match ON schema_mappings(match_kind, match_value);
 -- idx_tokens_vault_name is created in migrateToV16, not here. SCHEMA_SQL
 -- runs BEFORE migrations; an upgrading v15 vault doesn't yet have the
 -- vault_name column when this section evaluates, so the index has to
@@ -284,6 +258,13 @@ export function initSchema(db: Database): void {
   // NULL for any vault, so today's pvt_* tokens keep working unchanged.
   // New mints via per-vault routes write the column explicitly. See vault#257.
   migrateToV16(db);
+
+  // Migrate v16 → v17: rip the standalone `note_schemas` + `schema_mappings`
+  // subsystem. Validation now reads `tags.fields` exclusively. The two
+  // tables are dropped wholesale; if a vault carried rows we log a warning
+  // naming the dropped schemas/mappings so the operator can recreate them
+  // as `tags.fields` if needed. See vault#267.
+  migrateToV17(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -719,6 +700,93 @@ function migrateToV16(db: Database): void {
   // Make sure the index exists too. IF NOT EXISTS makes this a no-op on
   // the steady-state path.
   db.exec("CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name)");
+}
+
+/**
+ * Migrate v16 → v17: rip `note_schemas` + `schema_mappings` (vault#267).
+ *
+ * The two-table validation subsystem from v15 turned out to be a parallel
+ * path to `tags.fields` with zero operator usage. v17 drops both tables
+ * outright. Fresh vaults never see them; upgrading vaults lose them.
+ *
+ * If an upgrading vault DID carry rows (which Aaron's didn't, but a future
+ * operator's might), the migration logs the dropped names + mapping rules
+ * so the operator can re-create them as `tags.fields` declarations on the
+ * relevant tag rows. We don't try to auto-migrate path_prefix mappings —
+ * the new validation surface is tag-axis only, and a path_prefix → tag
+ * translation has no faithful one-to-one shape.
+ *
+ * Wrapped in BEGIN IMMEDIATE / COMMIT / ROLLBACK per the v14/v15/v16
+ * pattern from vault#251 — DROP TABLE statements are individually atomic,
+ * but the wrap means a crash mid-migration leaves either pre-v17 or
+ * post-v17 state, never partial.
+ */
+function migrateToV17(db: Database): void {
+  const hasNoteSchemas = hasTable(db, "note_schemas");
+  const hasSchemaMappings = hasTable(db, "schema_mappings");
+  if (!hasNoteSchemas && !hasSchemaMappings) return;
+
+  // Snapshot any data so the operator can recreate as `tags.fields` if
+  // needed. Read BEFORE the transaction so we don't lose the warning if
+  // the DROP fails (the COMMIT below atomically swaps state).
+  let droppedSchemas: { name: string; description: string | null }[] = [];
+  let droppedMappings: { schema_name: string; match_kind: string; match_value: string }[] = [];
+  if (hasNoteSchemas) {
+    droppedSchemas = db.prepare(
+      "SELECT name, description FROM note_schemas",
+    ).all() as { name: string; description: string | null }[];
+  }
+  if (hasSchemaMappings) {
+    droppedMappings = db.prepare(
+      "SELECT schema_name, match_kind, match_value FROM schema_mappings",
+    ).all() as { schema_name: string; match_kind: string; match_value: string }[];
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    // Drop the index first — the index references the table; SQLite would
+    // tear it down on DROP TABLE but the explicit DROP keeps the order
+    // obvious if a future migration reads from sqlite_master mid-flight.
+    db.exec("DROP INDEX IF EXISTS idx_schema_mappings_match");
+    // schema_mappings has an FK to note_schemas — drop it first.
+    if (hasSchemaMappings) {
+      db.exec("DROP TABLE schema_mappings");
+    }
+    if (hasNoteSchemas) {
+      db.exec("DROP TABLE note_schemas");
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  if (droppedSchemas.length > 0 || droppedMappings.length > 0) {
+    const schemaNames = droppedSchemas.map((s) => s.name).join(", ");
+    const tagMappings = droppedMappings.filter((m) => m.match_kind === "tag");
+    const pathMappings = droppedMappings.filter((m) => m.match_kind === "path_prefix");
+    const lines: string[] = [
+      `[vault] migrated to schema v17 (vault#267): note_schemas + schema_mappings retired.`,
+    ];
+    if (droppedSchemas.length > 0) {
+      lines.push(`  dropped schemas (${droppedSchemas.length}): ${schemaNames}`);
+    }
+    if (tagMappings.length > 0) {
+      const list = tagMappings.map((m) => `${m.match_value}→${m.schema_name}`).join(", ");
+      lines.push(
+        `  dropped tag mappings (${tagMappings.length}): ${list}`,
+        `  recreate as \`tags.fields\` declarations on the relevant tag rows.`,
+      );
+    }
+    if (pathMappings.length > 0) {
+      const list = pathMappings.map((m) => `${m.match_value}→${m.schema_name}`).join(", ");
+      lines.push(
+        `  dropped path_prefix mappings (${pathMappings.length}): ${list}`,
+        `  no path-prefix-driven validation in v17 — file vault#267 if you need this.`,
+      );
+    }
+    console.log(lines.join("\n"));
+  }
 }
 
 function hasTable(db: Database, name: string): boolean {
