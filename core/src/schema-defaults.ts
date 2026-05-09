@@ -160,8 +160,13 @@ export function loadSchemaConfig(db: Database): ResolvedSchemas {
  * through `parent_names` in declaration order, cycle-protected via a visited
  * Set. The output array preserves first-encounter order so the field-merge
  * pass can apply first-wins precedence.
+ *
+ * Exported so other consumers (vault projection, future hierarchy
+ * inspectors) can reuse the exact walk semantics rather than carrying
+ * their own copy. Mutating walks (push to `out`, add to `visited`) keep
+ * the implementation cheap; callers pass fresh accumulators.
  */
-function walkAncestors(
+export function walkAncestors(
   startTag: string,
   resolved: ResolvedSchemas,
   visited: Set<string>,

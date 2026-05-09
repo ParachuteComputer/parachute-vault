@@ -7,6 +7,11 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import {
+  buildVaultProjection,
+  projectionToMarkdown,
+  type VaultProjection,
+} from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { hasScopeForVault } from "./scopes.ts";
@@ -19,21 +24,71 @@ import {
 import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
- * Get the MCP server instruction for a vault.
- * Sent once at session init — not per tool.
+ * Filter a vault projection to entries an in-scope tag contributes to.
+ *
+ * Mirrors the JSON `vault-info` wrapper exactly so the connect-time
+ * markdown brief and the JSON tool surface identical scope shapes:
+ *
+ *   - `tags` array → drop entries whose name isn't in `allowed`.
+ *   - `indexed_fields` array → for each entry, intersect `tags` (the
+ *     declarer list) with `allowed`. Drop the entry entirely when no
+ *     declarer survives.
+ *
+ * Aggregate stats and the static `query_hints` catalog pass through
+ * unchanged — counts are aggregate (already pre-#271 behavior) and hints
+ * are pure documentation.
  */
-export function getServerInstruction(vaultName: string): string {
+function filterProjectionByScope(
+  projection: VaultProjection,
+  allowed: Set<string>,
+): VaultProjection {
+  return {
+    ...projection,
+    tags: projection.tags.filter((t) => allowed.has(t.name)),
+    indexed_fields: projection.indexed_fields
+      .map((f) => ({ ...f, tags: f.tags.filter((t) => allowed.has(t)) }))
+      .filter((f) => f.tags.length > 0),
+  };
+}
+
+/**
+ * Get the MCP server instruction for a vault.
+ *
+ * Sent once at session init via the MCP `initialize` response — not per
+ * tool. The body is a markdown brief composed from the same vault projection
+ * `vault-info` returns, so an agent has everything it needs to orient
+ * itself before issuing a single query. Stats are included so the count
+ * line ("N notes, M tags") is always populated.
+ *
+ * When `auth` carries `scoped_tags`, the projection is filtered to those
+ * tags + descendants before rendering — symmetric with the JSON
+ * `vault-info` wrapper, so a tag-scoped token never learns about
+ * out-of-scope tags via the connect-time brief either. Aggregate counts
+ * pass through unchanged (they were pre-existing leak surface; not new).
+ *
+ * Async because expanding the tag-scope allowlist hits the store's
+ * hierarchy resolver. Returns the orientation block even when the vault
+ * has no description or schemas — empty vaults still get the query-hint
+ * catalog and refresh pointers.
+ */
+export async function getServerInstruction(
+  vaultName: string,
+  auth?: AuthResult,
+): Promise<string> {
   const config = readVaultConfig(vaultName);
+  const store = getVaultStore(vaultName);
+  let projection = buildVaultProjection(store.db, { includeStats: true });
 
-  const parts: string[] = [
-    `You are connected to Parachute Vault "${vaultName}".`,
-  ];
-
-  if (config?.description) {
-    parts.push("", config.description);
+  if (auth?.scoped_tags && auth.scoped_tags.length > 0) {
+    const allowed = await expandTokenTagScope(store, auth.scoped_tags);
+    if (allowed) projection = filterProjectionByScope(projection, allowed);
   }
 
-  return parts.join("\n");
+  return projectionToMarkdown({
+    vaultName,
+    description: config?.description ?? null,
+    projection,
+  });
 }
 
 /**
@@ -95,6 +150,8 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
  *   - query-notes: filter single-note returns + result lists
  *   - list-tags:   filter to allowlisted tags + descendants
  *   - find-path:   require both endpoints (and every hop) in scope
+ *   - vault-info:  filter projection.tags + projection.indexed_fields
+ *                  to entries an in-scope tag contributes to
  *
  * Write-tool gating happens in handleScopedMcp at the verb-scope layer
  * AND inside each tool's wrapper here (so a tag-scoped `vault:write`
@@ -152,6 +209,32 @@ function applyTagScopeWrappers(
       }
     }
     return result;
+  });
+
+  // vault-info projection (#271): filter the tags catalog to in-scope tags
+  // and the indexed_fields catalog to fields with at least one in-scope
+  // declarer. Within each surviving indexed_fields entry, also drop
+  // out-of-scope declarer names from the `tags` array — a token scoped to
+  // `task` shouldn't learn that `project` declares `status` too. Other
+  // top-level keys (name, description, query_hints, stats) pass through:
+  // counts are aggregate and existing pre-#271 behavior already returned
+  // them to scoped tokens. The same `filterProjectionByScope` helper backs
+  // `getServerInstruction` so the JSON tool and the connect-time markdown
+  // brief stay in lockstep.
+  wrapReadTool(tools, "vault-info", async (orig, params) => {
+    const allowed = await getAllowed();
+    const result = await orig(params);
+    if (!allowed || !result || typeof result !== "object") return result;
+    const r = result as Record<string, unknown> & Partial<VaultProjection>;
+    const partial: VaultProjection = {
+      tags: Array.isArray(r.tags) ? r.tags : [],
+      indexed_fields: Array.isArray(r.indexed_fields) ? r.indexed_fields : [],
+      query_hints: Array.isArray(r.query_hints) ? r.query_hints : [],
+    };
+    const filtered = filterProjectionByScope(partial, allowed);
+    r.tags = filtered.tags;
+    r.indexed_fields = filtered.indexed_fields;
+    return r;
   });
 
   // ---- Write-side guards ----
@@ -286,14 +369,20 @@ function overrideVaultInfo(
       writeVaultConfig(config);
     }
 
-    const result: any = {
+    const store = getVaultStore(vaultName);
+    const includeStats = Boolean(params.include_stats);
+    const projection = buildVaultProjection(store.db, { includeStats });
+
+    const result: Record<string, unknown> = {
       name: config.name,
       description: config.description ?? null,
+      tags: projection.tags,
+      indexed_fields: projection.indexed_fields,
+      query_hints: projection.query_hints,
     };
 
-    if (params.include_stats) {
-      const store = getVaultStore(vaultName);
-      result.stats = await store.getVaultStats();
+    if (projection.stats) {
+      result.stats = projection.stats;
     }
 
     return result;

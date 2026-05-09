@@ -1032,11 +1032,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "vault-info",
-      description: "Get vault description and optionally stats (note/tag/link counts, distribution). Pass `description` to update the vault description (changes how AI agents behave in future sessions).",
+      description: "Get a comprehensive vault projection: name, description, tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, and query hints. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution. Pass `description` to update the vault description (changes how AI agents behave in future sessions). Call this anytime mid-session to refresh schema context.",
       inputSchema: {
         type: "object",
         properties: {
-          include_stats: { type: "boolean", description: "Include note count, tag count, distribution by month (default: false)" },
+          include_stats: { type: "boolean", description: "Include note count, tag count, attachment/link counts, and the monthly note distribution (default: false)" },
           description: { type: "string", description: "If provided, updates the vault description" },
         },
       },

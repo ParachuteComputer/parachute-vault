@@ -4229,3 +4229,194 @@ describe("tag-scope auth (post-v14 hierarchy)", async () => {
     expect(noteWithinTagScope(note, allowed, ["health"])).toBe(true);
   });
 });
+
+// ---- Vault projection (vault#271) ----
+
+describe("vault projection (vault#271)", async () => {
+  it("projects tags-with-schemas with effective inheritance", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+
+    // Universal `_default` parent declares `created_by`.
+    await store.upsertTagRecord("_default", {
+      fields: { created_by: { type: "string", description: "Origin agent" } },
+    });
+    // `person` declares `email` and inherits `created_by`.
+    await store.upsertTagRecord("person", {
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+    // `employee` extends `person` — should inherit BOTH `email` and `created_by`.
+    await store.upsertTagRecord("employee", {
+      description: "Person who works here",
+      fields: { title: { type: "string" } },
+      parent_names: ["person"],
+    });
+
+    const projection = buildVaultProjection(db);
+
+    const byName = Object.fromEntries(projection.tags.map((t) => [t.name, t]));
+
+    // _default appears (has fields).
+    expect(byName._default).toBeTruthy();
+    expect(byName._default.parents).toEqual([]);
+    expect(byName._default.effective_parents).toEqual([]);
+
+    // person inherits _default's universal field.
+    expect(byName.person.parents).toEqual([]);
+    expect(byName.person.effective_parents).toEqual(["_default"]);
+    expect(Object.keys(byName.person.effective_fields).sort()).toEqual([
+      "created_by",
+      "email",
+    ]);
+    // own fields stay separate
+    expect(Object.keys(byName.person.fields ?? {})).toEqual(["email"]);
+
+    // employee walks person → _default.
+    expect(byName.employee.parents).toEqual(["person"]);
+    expect(byName.employee.effective_parents).toEqual(["person", "_default"]);
+    expect(Object.keys(byName.employee.effective_fields).sort()).toEqual([
+      "created_by",
+      "email",
+      "title",
+    ]);
+  });
+
+  it("catalogs indexed fields across declarers", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+
+    // Indexed-field lifecycle is owned by the update-tag MCP tool, not
+    // store.upsertTagRecord — go through the tool so the indexed_fields
+    // table actually gets populated.
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      fields: {
+        status: { type: "string", indexed: true },
+        priority: { type: "integer", indexed: true },
+      },
+    });
+
+    const projection = buildVaultProjection(db);
+    const byName = Object.fromEntries(projection.indexed_fields.map((f) => [f.name, f]));
+
+    expect(byName.status).toBeTruthy();
+    expect(byName.status.type).toBe("string");
+    expect(byName.status.tags.sort()).toEqual(["project", "task"]);
+
+    expect(byName.priority).toBeTruthy();
+    expect(byName.priority.type).toBe("integer");
+    expect(byName.priority.tags).toEqual(["project"]);
+  });
+
+  it("includes the static query-hint catalog", async () => {
+    const { buildVaultProjection, QUERY_HINTS } = await import("./vault-projection.ts");
+    const projection = buildVaultProjection(db);
+    expect(projection.query_hints.length).toBe(QUERY_HINTS.length);
+    expect(projection.query_hints.some((h) => h.startsWith("query-notes { tag:"))).toBe(true);
+    expect(projection.query_hints.some((h) => h.includes("near:"))).toBe(true);
+  });
+
+  it("includes stats only when requested", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+    await store.createNote("a", { tags: ["x"] });
+    await store.createNote("b", { tags: ["x", "y"] });
+
+    const without = buildVaultProjection(db);
+    expect(without.stats).toBeUndefined();
+
+    const withStats = buildVaultProjection(db, { includeStats: true });
+    expect(withStats.stats).toBeTruthy();
+    expect(withStats.stats!.totalNotes).toBe(2);
+    expect(withStats.stats!.tagCount).toBe(2);
+  });
+
+  it("degrades gracefully on an empty vault", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+    const projection = buildVaultProjection(db);
+    expect(projection.tags).toEqual([]);
+    expect(projection.indexed_fields).toEqual([]);
+    // Query hints are static — present even on a blank vault.
+    expect(projection.query_hints.length).toBeGreaterThan(0);
+  });
+
+  it("renders a markdown brief listing tags-with-schemas and indexed fields", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    await store.createNote("a", { tags: ["person"] });
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "test",
+      description: "My vault",
+      projection,
+    });
+
+    expect(md).toContain('You are connected to Parachute Vault "test"');
+    expect(md).toContain("My vault");
+    expect(md).toContain("1 tag with schemas: person");
+    expect(md).toContain("Indexed metadata fields");
+    expect(md).toContain("email");
+    expect(md).toContain("#person");
+    expect(md).toContain("vault-info");
+    expect(md).toContain("list-tags { include_schema: true }");
+  });
+
+  it("markdown brief degrades gracefully when no schemas declared", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "fresh",
+      description: null,
+      projection,
+    });
+
+    expect(md).toContain('Parachute Vault "fresh"');
+    expect(md).toContain("No tag schemas declared");
+    expect(md).toContain("No indexed metadata fields");
+    expect(md).toContain("Querying");
+  });
+
+  it("markdown brief stays under ~5K tokens for a 50-tags-with-schemas vault", async () => {
+    const { buildVaultProjection, projectionToMarkdown } = await import(
+      "./vault-projection.ts"
+    );
+
+    for (let i = 0; i < 50; i++) {
+      await store.upsertTagRecord(`schema_tag_${i}`, {
+        description: `Description for tag ${i} — covers what this tag is used for in the vault.`,
+        fields: {
+          [`field_${i}_a`]: { type: "string", indexed: i % 3 === 0 },
+          [`field_${i}_b`]: { type: "integer" },
+        },
+      });
+    }
+
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "big",
+      description: "Big test vault",
+      projection,
+    });
+
+    // Rough token approximation: 1 token ≈ 4 chars. Budget: 5K tokens.
+    const approxTokens = md.length / 4;
+    expect(approxTokens).toBeLessThan(5000);
+  });
+});

@@ -6,6 +6,55 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.3] — 2026-05-09
+
+### Added
+
+- **`vault-info` projection + structured connect-time MCP instruction
+  (closes #271).** `vault-info` now returns a comprehensive vault
+  description that an agent can use to self-orient: `name`, `description`,
+  `tags` (schema-bearing tag records with own `fields`/`parents` plus
+  resolved `effective_fields`/`effective_parents` from the #270
+  inheritance walk), `indexed_fields` catalog (one entry per
+  `indexed_fields` row, listing every declarer tag), and a static
+  `query_hints` array describing the `query-notes` interface. Stats
+  remain gated by `include_stats: true` — when set, the existing
+  `getVaultStats` shape is appended unchanged.
+
+  The MCP `initialize` response now carries a markdown projection
+  rendered from the same vault state (rather than just vault name +
+  description). Agents see the schema landscape, the indexed-field
+  catalog, and the query-hint catalog at session start, plus explicit
+  pointers to call `vault-info` (full refresh) or `list-tags
+  { include_schema: true }` (tag-only refresh) mid-session if state
+  shifts. Token budget verified: under ~5K tokens at 50
+  tags-with-schemas; ~600 for typical small vaults.
+
+  Tool count stays at 9 — the projection rides on the existing
+  `vault-info` surface; no new MCP tool added.
+
+  Effective inheritance is computed by reusing #270's
+  `resolveNoteSchemas` walk for each tag, so the per-tag projection's
+  `effective_*` fields match runtime validation precedence (first-in-walk
+  wins; `_default` is the implicit universal parent). Per-tag descriptions
+  are surfaced in `vault-info` JSON only — the connect-time markdown
+  brief lists tag *names* to keep the token budget tight.
+
+### Fixed (folded from PR #273 review)
+
+- **`vault-info` honors tag-scoped tokens (JSON tool + connect-time
+  markdown).** Pre-fold, a token scoped to `task` got the full vault's
+  `tags` catalog and `indexed_fields` table (every declarer surfaced).
+  Now `vault-info` filters both arrays to entries an in-scope tag
+  contributes to, and drops out-of-scope declarer names from each
+  `indexed_fields` entry's `tags` field. The connect-time markdown brief
+  rendered by `getServerInstruction` (sent via MCP `initialize`) is
+  filtered to the token's allowlist via the same shared helper, so the
+  JSON tool and the markdown brief stay in lockstep. Symmetric with the
+  existing `list-tags` tag-scope wrapper. Aggregate stats (counts,
+  monthly distribution) continue to flow through unchanged — pre-#271
+  behavior.
+
 ## [0.4.1-rc.2] — 2026-05-09
 
 ### Added
