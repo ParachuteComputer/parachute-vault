@@ -92,11 +92,9 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
  * unscoped sessions retain identical pre-tag-scope behavior.
  *
  * Read tools handled here:
- *   - query-notes:      filter single-note returns + result lists
- *   - list-tags:        filter to allowlisted tags + descendants
- *   - find-path:        require both endpoints (and every hop) in scope
- *   - synthesize-notes: anchor + neighbors all gated by scope (will retire
- *                       with vault#268)
+ *   - query-notes: filter single-note returns + result lists
+ *   - list-tags:   filter to allowlisted tags + descendants
+ *   - find-path:   require both endpoints (and every hop) in scope
  *
  * Write-tool gating happens in handleScopedMcp at the verb-scope layer
  * AND inside each tool's wrapper here (so a tag-scoped `vault:write`
@@ -152,30 +150,6 @@ function applyTagScopeWrappers(
       if (!note || !noteWithinTagScope(note, allowed, rawTags)) {
         return null;
       }
-    }
-    return result;
-  });
-
-  wrapReadTool(tools, "synthesize-notes", async (orig, params) => {
-    const allowed = await getAllowed();
-    if (!allowed) return await orig(params);
-    // Verify the anchor is in scope first — out-of-scope anchor 404s as if
-    // the note doesn't exist, mirroring the REST find-path semantics.
-    const anchorId = (params as any).id ?? (params as any).note_id;
-    if (anchorId) {
-      const anchor = await store.getNote(anchorId as string);
-      if (!anchor || !noteWithinTagScope(anchor, allowed, rawTags)) {
-        return { error: "Note not found", id: anchorId };
-      }
-    }
-    const result = await orig(params);
-    // Filter neighbors to those in scope. The synthesize-notes shape exposes
-    // `neighbors` (array of note objects with tags) — mirror the query-notes
-    // filter pattern here.
-    if (result && typeof result === "object" && Array.isArray((result as any).neighbors)) {
-      (result as any).neighbors = (result as any).neighbors.filter((n: any) =>
-        noteWithinTagScope(n, allowed, rawTags),
-      );
     }
     return result;
   });

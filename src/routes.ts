@@ -6,7 +6,6 @@
  *   /api/tags           — list-tags, update-tag, delete-tag
  *   /api/find-path      — find-path
  *   /api/vault          — vault-info
- * (synthesize-notes is MCP-only; agents call it through the MCP transport.)
  *
  * Each handler receives a Store instance (already resolved for the vault)
  * and the Request, and returns a Response.

@@ -478,7 +478,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(10);
+    expect(tools.length).toBe(9);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -489,12 +489,13 @@ describe("MCP tools", async () => {
     expect(names).toContain("update-tag");
     expect(names).toContain("delete-tag");
     expect(names).toContain("find-path");
-    expect(names).toContain("synthesize-notes");
     expect(names).toContain("vault-info");
     // Six note-schema MCP tools (list/update/delete-note-schema +
     // list/set/delete-schema-mapping) retired in v17 — vault#267.
     expect(names).not.toContain("list-note-schemas");
     expect(names).not.toContain("set-schema-mapping");
+    // synthesize-notes retired in v17 — vault#268.
+    expect(names).not.toContain("synthesize-notes");
   });
 
   test("query-notes by id works", async () => {
