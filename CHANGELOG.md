@@ -36,9 +36,23 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
   Effective inheritance is computed by reusing #270's
   `resolveNoteSchemas` walk for each tag, so the per-tag projection's
   `effective_*` fields match runtime validation precedence (first-in-walk
-  wins; `_default` is the implicit universal parent).
+  wins; `_default` is the implicit universal parent). Per-tag descriptions
+  are surfaced in `vault-info` JSON only — the connect-time markdown
+  brief lists tag *names* to keep the token budget tight.
 
+### Fixed (folded from PR #273 review)
 
+- **`vault-info` honors tag-scoped tokens.** Pre-fold, a token scoped to
+  `task` got the full vault's `tags` catalog and `indexed_fields` table
+  (every declarer surfaced). Now `vault-info` filters both arrays to
+  entries an in-scope tag contributes to, and drops out-of-scope declarer
+  names from each `indexed_fields` entry's `tags` field. Symmetric with
+  the existing `list-tags` tag-scope wrapper. Aggregate stats (counts,
+  monthly distribution) continue to flow through unchanged — pre-#271
+  behavior. The connect-time markdown projection (sent via MCP
+  `initialize`) is not yet scope-filtered; tracked for follow-up.
+
+## [0.4.1-rc.2] — 2026-05-09
 
 ### Added
 

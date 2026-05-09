@@ -671,7 +671,7 @@ describe("scoped MCP wrapper", async () => {
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
     expect(md).toContain("Working notebook for the daily team.");
-    expect(md).toContain("1 notes, 1 tags");
+    expect(md).toContain("1 note, 1 tag");
     expect(md).toContain("1 tag with schemas: person");
     expect(md).toContain("Indexed metadata fields");
     expect(md).toContain("email");
@@ -698,7 +698,7 @@ describe("scoped MCP wrapper", async () => {
     const md = getServerInstruction(vaultName);
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
-    expect(md).toContain("0 notes, 0 tags");
+    expect(md).toContain("0 notes, 0 tags");  // 0 is plural per English convention
     expect(md).toContain("No tag schemas declared");
     expect(md).toContain("No indexed metadata fields");
     // Refresh hints surface both pointers so the agent knows where to look.
@@ -968,6 +968,93 @@ describe("scoped MCP wrapper", async () => {
     expect(names).toContain("health");
     expect(names).toContain("health/food");
     expect(names).not.toContain("work");
+
+    closeAllStores();
+  });
+
+  test("scoped vault-info filters projection.tags + indexed_fields to the allowlist (vault#271 fold)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vault-info-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    // Seed two schema-bearing tags. `task` and `project` BOTH declare a
+    // shared indexed `status` field — this exercises the cross-declarer
+    // case the reviewer called out: a token scoped to `task` should see
+    // `status` (because task is a declarer) but the entry's `tags` array
+    // must list only `task`, not `project`.
+    const unscopedTools = generateScopedMcpTools(vaultName);
+    const updateTag = unscopedTools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      description: "A task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      description: "A project",
+      fields: {
+        status: { type: "string", indexed: true },
+        priority: { type: "integer", indexed: true },
+      },
+    });
+
+    // Now mint scoped tools, scoped to `task` only.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["task"]) as any);
+    const vaultInfo = tools.find((t) => t.name === "vault-info")!;
+    const result = await vaultInfo.execute({}) as any;
+
+    // tags array: only `task`, not `project`.
+    const tagNames = (result.tags as { name: string }[]).map((t) => t.name);
+    expect(tagNames).toContain("task");
+    expect(tagNames).not.toContain("project");
+
+    // indexed_fields: `status` survives (task is a declarer), `priority`
+    // dropped entirely (only project declared it).
+    const indexedNames = (result.indexed_fields as { name: string }[]).map((f) => f.name);
+    expect(indexedNames).toContain("status");
+    expect(indexedNames).not.toContain("priority");
+
+    // Cross-declarer attribution leak: `status` lists declarer tags. The
+    // scoped response must show only `task`, never the out-of-scope
+    // `project`.
+    const status = (result.indexed_fields as { name: string; tags: string[] }[]).find(
+      (f) => f.name === "status",
+    )!;
+    expect(status.tags).toEqual(["task"]);
+
+    // Top-level passthrough sanity: name, description, and query_hints are
+    // not tag-scoped surfaces — they must still flow through.
+    expect(result.name).toBe(vaultName);
+    expect(Array.isArray(result.query_hints)).toBe(true);
+    expect((result.query_hints as string[]).length).toBeGreaterThan(0);
+
+    closeAllStores();
+  });
+
+  test("unscoped vault-info still sees the full projection (vault#271 fold)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vault-info-unscoped-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const tools0 = generateScopedMcpTools(vaultName);
+    const updateTag = tools0.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({ tag: "task", description: "T", fields: { status: { type: "string", indexed: true } } });
+    await updateTag.execute({ tag: "project", description: "P", fields: { status: { type: "string", indexed: true } } });
+
+    // No `auth` and no `scoped_tags` — unscoped path must remain
+    // identical to pre-fold behavior (full projection).
+    const tools = generateScopedMcpTools(vaultName);
+    const result = await tools.find((t) => t.name === "vault-info")!.execute({}) as any;
+    const tagNames = (result.tags as { name: string }[]).map((t) => t.name);
+    expect(tagNames.sort()).toEqual(["project", "task"]);
+    const status = (result.indexed_fields as { name: string; tags: string[] }[]).find((f) => f.name === "status")!;
+    expect(status.tags.sort()).toEqual(["project", "task"]);
 
     closeAllStores();
   });

@@ -105,6 +105,8 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
  *   - query-notes: filter single-note returns + result lists
  *   - list-tags:   filter to allowlisted tags + descendants
  *   - find-path:   require both endpoints (and every hop) in scope
+ *   - vault-info:  filter projection.tags + projection.indexed_fields
+ *                  to entries an in-scope tag contributes to
  *
  * Write-tool gating happens in handleScopedMcp at the verb-scope layer
  * AND inside each tool's wrapper here (so a tag-scoped `vault:write`
@@ -162,6 +164,30 @@ function applyTagScopeWrappers(
       }
     }
     return result;
+  });
+
+  // vault-info projection (#271): filter the tags catalog to in-scope tags
+  // and the indexed_fields catalog to fields with at least one in-scope
+  // declarer. Within each surviving indexed_fields entry, also drop
+  // out-of-scope declarer names from the `tags` array — a token scoped to
+  // `task` shouldn't learn that `project` declares `status` too. Other
+  // top-level keys (name, description, query_hints, stats) pass through:
+  // counts are aggregate and existing pre-#271 behavior already returned
+  // them to scoped tokens.
+  wrapReadTool(tools, "vault-info", async (orig, params) => {
+    const allowed = await getAllowed();
+    const result = await orig(params);
+    if (!allowed || !result || typeof result !== "object") return result;
+    const r = result as Record<string, unknown>;
+    if (Array.isArray(r.tags)) {
+      r.tags = (r.tags as { name: string }[]).filter((t) => allowed.has(t.name));
+    }
+    if (Array.isArray(r.indexed_fields)) {
+      r.indexed_fields = (r.indexed_fields as { name: string; type: string; tags: string[] }[])
+        .map((f) => ({ ...f, tags: f.tags.filter((t) => allowed.has(t)) }))
+        .filter((f) => f.tags.length > 0);
+    }
+    return r;
   });
 
   // ---- Write-side guards ----

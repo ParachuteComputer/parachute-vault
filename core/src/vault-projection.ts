@@ -20,6 +20,7 @@ import { Database } from "bun:sqlite";
 import {
   loadSchemaConfig,
   resolveNoteSchemas,
+  walkAncestors,
   type ResolvedSchemas,
   type SchemaField,
 } from "./schema-defaults.ts";
@@ -102,12 +103,13 @@ export function resolveTagInheritance(
   const resolution = resolveNoteSchemas(resolved, { tags: [tag] });
 
   // resolveNoteSchemas returns effectiveTags (only fields-contributing tags).
-  // We need the full walk for effective_parents — recompute it locally.
+  // We need the full walk for effective_parents — replay using the same
+  // resolver helper so walk-order semantics stay in lockstep with #270.
   const visited = new Set<string>();
   const order: string[] = [];
-  walk(tag, resolved, visited, order);
+  walkAncestors(tag, resolved, visited, order);
   if (resolved.allTags.has(DEFAULT_TAG_NAME) && !visited.has(DEFAULT_TAG_NAME)) {
-    walk(DEFAULT_TAG_NAME, resolved, visited, order);
+    walkAncestors(DEFAULT_TAG_NAME, resolved, visited, order);
   }
   const effective_parents = order.filter((t) => t !== tag);
 
@@ -117,20 +119,6 @@ export function resolveTagInheritance(
   }
 
   return { effective_parents, effective_fields };
-}
-
-function walk(
-  startTag: string,
-  resolved: ResolvedSchemas,
-  visited: Set<string>,
-  out: string[],
-): void {
-  if (visited.has(startTag)) return;
-  visited.add(startTag);
-  out.push(startTag);
-  const parents = resolved.tagToParents.get(startTag);
-  if (!parents) return;
-  for (const p of parents) walk(p, resolved, visited, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +258,9 @@ export function projectionToMarkdown(args: {
   lines.push("");
 
   if (stats) {
-    lines.push(`- ${stats.totalNotes} notes, ${stats.tagCount} tags`);
+    lines.push(
+      `- ${stats.totalNotes} ${stats.totalNotes === 1 ? "note" : "notes"}, ${stats.tagCount} ${stats.tagCount === 1 ? "tag" : "tags"}`,
+    );
   } else {
     lines.push(`- (call \`vault-info { include_stats: true }\` for note/tag counts)`);
   }
