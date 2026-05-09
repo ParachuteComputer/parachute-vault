@@ -42,15 +42,18 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ### Fixed (folded from PR #273 review)
 
-- **`vault-info` honors tag-scoped tokens.** Pre-fold, a token scoped to
-  `task` got the full vault's `tags` catalog and `indexed_fields` table
-  (every declarer surfaced). Now `vault-info` filters both arrays to
-  entries an in-scope tag contributes to, and drops out-of-scope declarer
-  names from each `indexed_fields` entry's `tags` field. Symmetric with
-  the existing `list-tags` tag-scope wrapper. Aggregate stats (counts,
+- **`vault-info` honors tag-scoped tokens (JSON tool + connect-time
+  markdown).** Pre-fold, a token scoped to `task` got the full vault's
+  `tags` catalog and `indexed_fields` table (every declarer surfaced).
+  Now `vault-info` filters both arrays to entries an in-scope tag
+  contributes to, and drops out-of-scope declarer names from each
+  `indexed_fields` entry's `tags` field. The connect-time markdown brief
+  rendered by `getServerInstruction` (sent via MCP `initialize`) is
+  filtered to the token's allowlist via the same shared helper, so the
+  JSON tool and the markdown brief stay in lockstep. Symmetric with the
+  existing `list-tags` tag-scope wrapper. Aggregate stats (counts,
   monthly distribution) continue to flow through unchanged — pre-#271
-  behavior. The connect-time markdown projection (sent via MCP
-  `initialize`) is not yet scope-filtered; tracked for follow-up.
+  behavior.
 
 ## [0.4.1-rc.2] — 2026-05-09
 

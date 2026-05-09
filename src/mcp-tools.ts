@@ -10,6 +10,7 @@ import type { McpToolDef } from "../core/src/mcp.ts";
 import {
   buildVaultProjection,
   projectionToMarkdown,
+  type VaultProjection,
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
@@ -23,6 +24,34 @@ import {
 import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
+ * Filter a vault projection to entries an in-scope tag contributes to.
+ *
+ * Mirrors the JSON `vault-info` wrapper exactly so the connect-time
+ * markdown brief and the JSON tool surface identical scope shapes:
+ *
+ *   - `tags` array → drop entries whose name isn't in `allowed`.
+ *   - `indexed_fields` array → for each entry, intersect `tags` (the
+ *     declarer list) with `allowed`. Drop the entry entirely when no
+ *     declarer survives.
+ *
+ * Aggregate stats and the static `query_hints` catalog pass through
+ * unchanged — counts are aggregate (already pre-#271 behavior) and hints
+ * are pure documentation.
+ */
+function filterProjectionByScope(
+  projection: VaultProjection,
+  allowed: Set<string>,
+): VaultProjection {
+  return {
+    ...projection,
+    tags: projection.tags.filter((t) => allowed.has(t.name)),
+    indexed_fields: projection.indexed_fields
+      .map((f) => ({ ...f, tags: f.tags.filter((t) => allowed.has(t)) }))
+      .filter((f) => f.tags.length > 0),
+  };
+}
+
+/**
  * Get the MCP server instruction for a vault.
  *
  * Sent once at session init via the MCP `initialize` response — not per
@@ -31,14 +60,30 @@ import { findTokensReferencingTag } from "./token-store.ts";
  * itself before issuing a single query. Stats are included so the count
  * line ("N notes, M tags") is always populated.
  *
- * Returns the orientation block even when the vault has no description or
- * schemas — empty vaults still get the query-hint catalog and refresh
- * pointers.
+ * When `auth` carries `scoped_tags`, the projection is filtered to those
+ * tags + descendants before rendering — symmetric with the JSON
+ * `vault-info` wrapper, so a tag-scoped token never learns about
+ * out-of-scope tags via the connect-time brief either. Aggregate counts
+ * pass through unchanged (they were pre-existing leak surface; not new).
+ *
+ * Async because expanding the tag-scope allowlist hits the store's
+ * hierarchy resolver. Returns the orientation block even when the vault
+ * has no description or schemas — empty vaults still get the query-hint
+ * catalog and refresh pointers.
  */
-export function getServerInstruction(vaultName: string): string {
+export async function getServerInstruction(
+  vaultName: string,
+  auth?: AuthResult,
+): Promise<string> {
   const config = readVaultConfig(vaultName);
   const store = getVaultStore(vaultName);
-  const projection = buildVaultProjection(store.db, { includeStats: true });
+  let projection = buildVaultProjection(store.db, { includeStats: true });
+
+  if (auth?.scoped_tags && auth.scoped_tags.length > 0) {
+    const allowed = await expandTokenTagScope(store, auth.scoped_tags);
+    if (allowed) projection = filterProjectionByScope(projection, allowed);
+  }
+
   return projectionToMarkdown({
     vaultName,
     description: config?.description ?? null,
@@ -173,20 +218,22 @@ function applyTagScopeWrappers(
   // `task` shouldn't learn that `project` declares `status` too. Other
   // top-level keys (name, description, query_hints, stats) pass through:
   // counts are aggregate and existing pre-#271 behavior already returned
-  // them to scoped tokens.
+  // them to scoped tokens. The same `filterProjectionByScope` helper backs
+  // `getServerInstruction` so the JSON tool and the connect-time markdown
+  // brief stay in lockstep.
   wrapReadTool(tools, "vault-info", async (orig, params) => {
     const allowed = await getAllowed();
     const result = await orig(params);
     if (!allowed || !result || typeof result !== "object") return result;
-    const r = result as Record<string, unknown>;
-    if (Array.isArray(r.tags)) {
-      r.tags = (r.tags as { name: string }[]).filter((t) => allowed.has(t.name));
-    }
-    if (Array.isArray(r.indexed_fields)) {
-      r.indexed_fields = (r.indexed_fields as { name: string; type: string; tags: string[] }[])
-        .map((f) => ({ ...f, tags: f.tags.filter((t) => allowed.has(t)) }))
-        .filter((f) => f.tags.length > 0);
-    }
+    const r = result as Record<string, unknown> & Partial<VaultProjection>;
+    const partial: VaultProjection = {
+      tags: Array.isArray(r.tags) ? r.tags : [],
+      indexed_fields: Array.isArray(r.indexed_fields) ? r.indexed_fields : [],
+      query_hints: Array.isArray(r.query_hints) ? r.query_hints : [],
+    };
+    const filtered = filterProjectionByScope(partial, allowed);
+    r.tags = filtered.tags;
+    r.indexed_fields = filtered.indexed_fields;
     return r;
   });
 

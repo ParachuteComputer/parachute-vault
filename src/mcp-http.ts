@@ -57,7 +57,10 @@ function requiredVerbForTool(toolName: string): VaultVerb {
 
 /** Handle scoped MCP at /vault/{name}/mcp (single vault). */
 export async function handleScopedMcp(req: Request, vaultName: string, auth: AuthResult): Promise<Response> {
-  const instruction = getServerInstruction(vaultName);
+  // Auth flows through to getServerInstruction so the connect-time
+  // markdown brief is filtered by `scoped_tags` — symmetric with the
+  // JSON `vault-info` wrapper.
+  const instruction = await getServerInstruction(vaultName, auth);
   return handleMcp(req, () => generateScopedMcpTools(vaultName, auth), `parachute-vault/${vaultName}`, vaultName, auth, instruction);
 }
 

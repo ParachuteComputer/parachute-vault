@@ -667,7 +667,7 @@ describe("scoped MCP wrapper", async () => {
       fields: { email: { type: "string", indexed: true } },
     });
 
-    const md = getServerInstruction(vaultName);
+    const md = await getServerInstruction(vaultName);
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
     expect(md).toContain("Working notebook for the daily team.");
@@ -695,7 +695,7 @@ describe("scoped MCP wrapper", async () => {
       created_at: new Date().toISOString(),
     });
 
-    const md = getServerInstruction(vaultName);
+    const md = await getServerInstruction(vaultName);
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
     expect(md).toContain("0 notes, 0 tags");  // 0 is plural per English convention
@@ -732,10 +732,174 @@ describe("scoped MCP wrapper", async () => {
       });
     }
 
-    const md = getServerInstruction(vaultName);
+    const md = await getServerInstruction(vaultName);
     // Rough token approximation: 1 token ≈ 4 chars. Budget: 5K tokens.
     const approxTokens = md.length / 4;
     expect(approxTokens).toBeLessThan(5000);
+
+    closeAllStores();
+  });
+
+  test("getServerInstruction filters projection by tag-scoped allowlist (vault#271 fold 5)", async () => {
+    const { getServerInstruction, generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `instr-scoped-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "Scoped session brief.",
+    });
+
+    // Seed three schema-bearing tags. Cross-declarer indexed `status`
+    // exercises the same shape the JSON wrapper test pinned: scoped to
+    // `task`, the brief should mention `status` via `task` but never
+    // surface `project` or `person`.
+    const tools = generateScopedMcpTools(vaultName);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      description: "A task",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      description: "A project",
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await updateTag.execute({
+      tag: "person",
+      description: "A person",
+      fields: { email: { type: "string", indexed: true } },
+    });
+
+    const auth = {
+      permission: "full" as const,
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+      scoped_tags: ["task"],
+    };
+    const md = await getServerInstruction(vaultName, auth as any);
+
+    // Allowlisted tag surfaces; out-of-scope tags do not. Use word-boundary
+    // regex — the static refresh-pointer text mentions "full projection"
+    // which contains the substring "project".
+    expect(md).toMatch(/\btask\b/);
+    expect(md).not.toMatch(/\bproject\b/);
+    expect(md).not.toMatch(/\bperson\b/);
+
+    // Indexed-field catalog: `status` survives (declared by `task`);
+    // `email` (person-only) is filtered out entirely.
+    expect(md).toMatch(/\bstatus\b/);
+    expect(md).not.toMatch(/\bemail\b/);
+
+    // Aggregate stats line still flows through unchanged — counts are
+    // pre-existing leak surface (per the rc.3 design discussion).
+    expect(md).toMatch(/\d+ note/);
+
+    closeAllStores();
+  });
+
+  test("getServerInstruction passes the full projection through for unscoped tokens (vault#271 fold 5)", async () => {
+    const { getServerInstruction, generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `instr-unscoped-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const tools = generateScopedMcpTools(vaultName);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      description: "A task",
+      fields: { status: { type: "string" } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      description: "A project",
+      fields: { priority: { type: "integer" } },
+    });
+
+    // No `auth` arg → no scoping applied, full projection rendered.
+    const md = await getServerInstruction(vaultName);
+    expect(md).toContain("task");
+    expect(md).toContain("project");
+    expect(md).toContain("tags with schemas");
+    // Same for explicit auth with `scoped_tags: null`.
+    const mdNullScoped = await getServerInstruction(vaultName, {
+      permission: "full",
+      scopes: ["vault:read"],
+      legacyDerived: false,
+      scoped_tags: null,
+    } as any);
+    expect(mdNullScoped).toContain("task");
+    expect(mdNullScoped).toContain("project");
+
+    closeAllStores();
+  });
+
+  test("MCP initialize response carries scope-filtered instructions for tag-scoped tokens (vault#271 fold 5)", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `init-scoped-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    // Same fixture shape as the unit test, but driven through the actual
+    // `handleScopedMcp` initialize path the MCP client invokes at session
+    // start. The reviewer asked for an integration assertion on the
+    // `instructions` field carried in the `initialize` response.
+    const tools = generateScopedMcpTools(vaultName);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "task",
+      description: "A task",
+      fields: { status: { type: "string" } },
+    });
+    await updateTag.execute({
+      tag: "project",
+      description: "A project",
+      fields: { priority: { type: "integer" } },
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1.0" },
+        },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+      scoped_tags: ["task"],
+    } as any);
+    expect(res.status).toBe(200);
+
+    const body = await res.json() as any;
+    const instructions: string = body.result.instructions;
+    expect(instructions).toBeTruthy();
+    // Word-boundary match — the static refresh text mentions "full
+    // projection" which would false-trigger a substring check.
+    expect(instructions).toMatch(/\btask\b/);
+    expect(instructions).not.toMatch(/\bproject\b/);
 
     closeAllStores();
   });
