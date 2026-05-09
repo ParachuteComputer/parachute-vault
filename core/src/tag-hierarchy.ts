@@ -32,7 +32,22 @@ export interface TagHierarchy {
   childrenOf: Map<string, Set<string>>;
   /** Memoization cache: tag → set including the tag itself plus all transitive descendants. */
   descendantsCache: Map<string, Set<string>>;
+  /**
+   * Every known tag name in the vault. Loaded once at hierarchy build so the
+   * `_default` universal-parent magic in `getTagDescendants` can answer
+   * "expand `_default` → every tag" without a second DB scan.
+   */
+  allTags: Set<string>;
 }
+
+/**
+ * Reserved tag name treated as the implicit universal parent of every other
+ * tag (vault#270). When a row named `_default` exists in the `tags` table,
+ * its schema applies to all notes — tagged or not — and tag-hierarchy queries
+ * for `_default` expand to the full tag list. The `tags.parent_names` column
+ * is never auto-mutated; the universal-parent property lives at resolve time.
+ */
+export const DEFAULT_TAG_NAME = "_default";
 
 /**
  * Pre-v14 path prefix that marked a note as a tag-hierarchy declaration.
@@ -59,16 +74,21 @@ function readParentNames(raw: string | null): string[] {
 /**
  * Scan the `tags` table and build the parent→children adjacency map.
  * Each row's `parent_names` JSON array contributes one edge per parent.
+ * Also collects every known tag name in `allTags` so the `_default`
+ * universal-parent leg in `getTagDescendants` can return the full tag list
+ * without a second scan.
  */
 export function loadTagHierarchy(db: Database): TagHierarchy {
   const rows = db.prepare(
-    `SELECT name, parent_names FROM tags WHERE parent_names IS NOT NULL`,
+    `SELECT name, parent_names FROM tags`,
   ).all() as { name: string; parent_names: string | null }[];
 
   const childrenOf = new Map<string, Set<string>>();
+  const allTags = new Set<string>();
 
   for (const row of rows) {
     if (!row.name) continue;
+    allTags.add(row.name);
     const parents = readParentNames(row.parent_names);
     for (const parent of parents) {
       let children = childrenOf.get(parent);
@@ -80,17 +100,31 @@ export function loadTagHierarchy(db: Database): TagHierarchy {
     }
   }
 
-  return { childrenOf, descendantsCache: new Map() };
+  return { childrenOf, descendantsCache: new Map(), allTags };
 }
 
 /**
  * Return the tag plus all transitive descendants. Always includes the tag
  * itself, so callers can use the result as a drop-in replacement for the
  * input tag when expanding queries.
+ *
+ * Special case: `_default` is treated as the implicit parent of every tag
+ * (vault#270). When a row named `_default` exists in the `tags` table, this
+ * function returns the full set of known tag names — symmetric with the
+ * schema-inheritance model where `_default`'s fields apply to every note.
+ * When `_default` is *not* declared as a tag row, the call falls through to
+ * normal descendant traversal (which yields just `{_default}` since nothing
+ * lists it as a parent).
  */
 export function getTagDescendants(h: TagHierarchy, tag: string): Set<string> {
   const cached = h.descendantsCache.get(tag);
   if (cached) return cached;
+
+  if (tag === DEFAULT_TAG_NAME && h.allTags.has(DEFAULT_TAG_NAME)) {
+    const universal = new Set<string>(h.allTags);
+    h.descendantsCache.set(tag, universal);
+    return universal;
+  }
 
   const result = new Set<string>([tag]);
   const stack = [tag];

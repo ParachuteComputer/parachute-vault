@@ -11,6 +11,7 @@ import {
   loadTagHierarchy,
   getTagDescendants,
   TAG_CONFIG_PREFIX,
+  DEFAULT_TAG_NAME,
   type TagHierarchy,
 } from "./tag-hierarchy.js";
 import {
@@ -217,16 +218,45 @@ export class BunSqliteStore implements Store {
    * each input tag is replaced with `{tag} ∪ descendants(tag)`. The SQL
    * builder uses this to widen the tag join from `name = ?` to
    * `name IN (...)`, so a query for `#manual` matches notes tagged with
-   * any descendant declared via `_tags/*` config notes.
+   * any descendant declared via `tags.parent_names`.
    *
-   * No-op when no `_tags/*` notes exist (empty hierarchy → each tag
-   * expands to just itself, identical to the pre-expansion behavior).
+   * `_default` magic (vault#270): when a `_default` tag row exists in the
+   * vault, it's the implicit parent of every note (tagged or not). A query
+   * filter that names `_default` is therefore equivalent to "no tag filter
+   * at all" — but the precise treatment depends on `tagMatch`:
+   *
+   * - `all` (default, AND-semantics): `_default` is universally satisfied,
+   *   so it can be dropped from the tag list. Other tags' AND-semantics
+   *   still apply. If `_default` was the only entry, drop the filter
+   *   entirely so untagged notes match.
+   * - `any` (OR-semantics): `_default` matches every note, so the disjunction
+   *   collapses to "every note." Drop the filter entirely regardless of
+   *   what else was in the list (otherwise we'd narrow to the union of
+   *   the other tags' notes — wrong).
+   *
+   * Other filters (path, metadata, dates) still apply in both cases.
    */
   private expandQueryTags(opts: QueryOpts): QueryOpts {
     if (!opts.tags || opts.tags.length === 0) return opts;
     const hierarchy = this.getTagHierarchy();
+
+    let tags = opts.tags;
+    if (hierarchy.allTags.has(DEFAULT_TAG_NAME) && tags.includes(DEFAULT_TAG_NAME)) {
+      const match = opts.tagMatch ?? "all";
+      if (match === "any") {
+        const { tags: _drop, ..._rest } = opts;
+        return _rest as QueryOpts;
+      }
+      tags = tags.filter((t) => t !== DEFAULT_TAG_NAME);
+      if (tags.length === 0) {
+        const { tags: _drop, ..._rest } = opts;
+        return _rest as QueryOpts;
+      }
+      opts = { ...opts, tags };
+    }
+
     if (hierarchy.childrenOf.size === 0) return opts;
-    const expanded = opts.tags.map((t) => Array.from(getTagDescendants(hierarchy, t)));
+    const expanded = tags.map((t) => Array.from(getTagDescendants(hierarchy, t)));
     return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
@@ -235,9 +265,16 @@ export class BunSqliteStore implements Store {
     // should match notes tagged with any descendant tag. The underlying
     // FTS path already uses `IN (...)` for tags, so we flatten the
     // per-input expansions into a single union (search semantics are
-    // "any tag matches").
+    // "any tag matches"). When `_default` is among the requested tags
+    // (and a `_default` row exists), the OR collapses to "every note" —
+    // drop the tag filter entirely so the search hits the full corpus
+    // and untagged notes are reachable.
     if (opts?.tags && opts.tags.length > 0) {
       const hierarchy = this.getTagHierarchy();
+      if (hierarchy.allTags.has(DEFAULT_TAG_NAME) && opts.tags.includes(DEFAULT_TAG_NAME)) {
+        const { tags: _drop, ..._rest } = opts;
+        return noteOps.searchNotes(this.db, query, _rest);
+      }
       if (hierarchy.childrenOf.size > 0) {
         const expanded = new Set<string>();
         for (const t of opts.tags) {
@@ -417,9 +454,19 @@ export class BunSqliteStore implements Store {
   ) {
     const result = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
     if (patch.parent_names !== undefined) {
+      // parent_names drives both query expansion (tag hierarchy) AND, post
+      // vault#270, schema inheritance — bust both caches.
       this._tagHierarchy = null;
+      this._schemaConfig = null;
     }
     if (patch.fields !== undefined) {
+      this._schemaConfig = null;
+    }
+    // First-time creation of a tag row (e.g. an empty `_default` placeholder)
+    // changes the `_default` universal-parent gate even when no fields or
+    // parent_names are touched. Cheap to bust: caches rebuild on next read.
+    if (tag === "_default") {
+      this._tagHierarchy = null;
       this._schemaConfig = null;
     }
     return result;

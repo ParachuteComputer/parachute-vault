@@ -6,6 +6,70 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.2] — 2026-05-09
+
+### Added
+
+- **Tag schema inheritance via `parent_names` + `_default` universal parent
+  (closes #270).** A tag's `parent_names` column already drove query
+  expansion (a query for `#manual` matched any descendant). It now also
+  drives **schema inheritance**: a child tag's effective `fields` map = its
+  own ∪ all ancestors' (recursive walk, cycle-safe). Multi-inheritance is
+  supported — list multiple parents in `parent_names`.
+
+  A tag named `_default` is treated as the implicit universal parent of
+  every note, tagged or not. Its `fields` declarations apply everywhere.
+  Modeling: magic at resolve time only — `tags.parent_names` is never
+  auto-mutated. Removable by deleting the `_default` tag row. The
+  symmetric query expansion: `query-notes { tag: "_default" }` returns
+  every note in the vault (including untagged).
+
+  Conflict resolution for multi-inheritance is **first-in-walk wins**:
+  the child's own `fields` take precedence over inherited specs; among
+  parents, earlier entries in `parent_names` outrank later ones. When
+  ancestors disagree on a field's spec, the loser surfaces as a
+  `schema_conflict` advisory warning on `validation_status` — no write
+  blocking, consistent with the rest of the schema-validation model.
+  Each `schema_conflict` warning carries `schema` (winner) and
+  `loser_schema` (overridden) as structured fields so agents can resolve
+  the disagreement without parsing `message`.
+
+  Cache hygiene: the schema-config cache invalidates on `parent_names`
+  changes (in addition to the existing `fields` mutations) since
+  inheritance now walks parent chains.
+
+### Notes
+
+- **`schema_conflict` is a new `ValidationWarning.reason` value.** Existing
+  reasons (`type_mismatch`, `enum_mismatch`) are unchanged. Downstream
+  clients with strict-enum deserialization compiled against pre-`0.4.1-rc.2`
+  `@openparachute/vault` types may see an unrecognized value if they hit
+  vault rows where multiple ancestors declare the same field with diverging
+  specs. The warning is advisory — clients can safely ignore unknown
+  `reason` values.
+- **`_default`-scoped auth tokens grant full-vault access.** Tag-scoped
+  tokens (see `patterns/tag-scoped-tokens.md`) compute their effective tag
+  set by expanding each input tag through `getTagDescendants`. Because
+  `_default` is the universal parent of every tag, expanding it returns
+  the full tag list — so a token scoped to `_default` is functionally
+  equivalent to an unscoped token. **Do not mint `_default`-scoped tokens
+  thinking they restrict to a "default-only" tag.** The semantic is
+  intended (it's symmetric with the schema-inheritance model), but the
+  wide blast radius is worth flagging explicitly.
+
+### Fixed (folded from PR #272 review)
+
+- **`tagMatch: "any"` + `_default` now drops the tag filter entirely.**
+  Pre-fold, an `any`-match query like `tag: ["_default", "task"]` would
+  strip `_default` and narrow to `task`-tagged notes only — wrong, since
+  the OR-semantics with `_default` (which matches everything) should
+  collapse to "every note." The `all`-match behavior (drop `_default`
+  from the AND-set, keep the rest) was already correct and is unchanged.
+- **`searchNotes` honors `_default` filter-strip.** The FTS-backed search
+  path now short-circuits the tag filter when `_default` is requested,
+  matching `queryNotes` semantics so untagged notes are reachable from
+  search.
+
 ## [0.4.1-rc.1] — 2026-05-09
 
 Audit-driven cleanup. The vault MCP surface had two subsystems that

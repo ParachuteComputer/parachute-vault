@@ -3224,6 +3224,384 @@ describe("schema validation (tags.fields)", async () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Schema inheritance via parent_names + `_default` universal parent — vault#270
+// ---------------------------------------------------------------------------
+
+describe("schema inheritance via parent_names (vault#270)", async () => {
+  it("single-parent: child inherits parent's fields", async () => {
+    await store.upsertTagRecord("work", {
+      fields: { project: { type: "string" } },
+    });
+    await store.upsertTagRecord("task", {
+      parent_names: ["work"],
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: 7, project: 42 }, // both wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(2);
+    const fields = result.validation_status.warnings.map((w: any) => w.field).sort();
+    expect(fields).toEqual(["priority", "project"]);
+  });
+
+  it("multi-parent: child gets union of parents' fields", async () => {
+    await store.upsertTagRecord("work", {
+      fields: { project: { type: "string" } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { venue: { type: "string" } },
+    });
+    await store.upsertTagRecord("paper", {
+      parent_names: ["work", "publication"],
+      fields: { title: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["paper"],
+      metadata: { title: 1, project: 2, venue: 3 }, // all wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(3);
+    const fields = result.validation_status.warnings.map((w: any) => w.field).sort();
+    expect(fields).toEqual(["project", "title", "venue"]);
+  });
+
+  it("diamond: A→B, A→C, B→D, C→D — D's field appears once", async () => {
+    await store.upsertTagRecord("D", {
+      fields: { d_field: { type: "string" } },
+    });
+    await store.upsertTagRecord("B", { parent_names: ["D"] });
+    await store.upsertTagRecord("C", { parent_names: ["D"] });
+    await store.upsertTagRecord("A", { parent_names: ["B", "C"] });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["A"],
+      metadata: { d_field: 999 }, // wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("d_field");
+    expect(result.validation_status.warnings[0].schema).toBe("D");
+  });
+
+  it("cycle: A→B, B→A — no infinite loop, both fields visible", async () => {
+    await store.upsertTagRecord("A", {
+      parent_names: ["B"],
+      fields: { a_field: { type: "string" } },
+    });
+    await store.upsertTagRecord("B", {
+      parent_names: ["A"],
+      fields: { b_field: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["A"],
+      metadata: { a_field: 1, b_field: 2 }, // both wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(2);
+    const fields = result.validation_status.warnings.map((w: any) => w.field).sort();
+    expect(fields).toEqual(["a_field", "b_field"]);
+  });
+
+  it("override: child's spec wins over parent's for the same field name", async () => {
+    await store.upsertTagRecord("parent_tag", {
+      fields: { status: { type: "string", enum: ["a", "b"] } },
+    });
+    await store.upsertTagRecord("child_tag", {
+      parent_names: ["parent_tag"],
+      fields: { status: { type: "string", enum: ["x", "y"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["child_tag"],
+      metadata: { status: "x" }, // valid under child, invalid under parent
+    }) as any;
+
+    // Child's spec wins → "x" passes the enum check.
+    const enumWarnings = result.validation_status.warnings.filter(
+      (w: any) => w.reason === "enum_mismatch",
+    );
+    expect(enumWarnings.length).toBe(0);
+    // The conflict surfaces as a schema_conflict warning whose `schema` field
+    // names the *winning* tag (child).
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("status");
+    expect(conflict.schema).toBe("child_tag");
+  });
+
+  it("conflict warning: two parents declare same field with different specs, first wins", async () => {
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string", enum: ["todo", "doing", "done"] } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { status: { type: "string", enum: ["draft", "published"] } },
+    });
+    // parent_names order = ["task", "publication"] → task wins.
+    await store.upsertTagRecord("article_task", {
+      parent_names: ["task", "publication"],
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["article_task"],
+      metadata: { status: "todo" }, // valid under task (winner), invalid under publication
+    }) as any;
+
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("status");
+    expect(conflict.schema).toBe("task"); // winner
+    // No enum_mismatch — the value is valid under task's enum.
+    const enumMismatch = result.validation_status.warnings.find(
+      (w: any) => w.reason === "enum_mismatch",
+    );
+    expect(enumMismatch).toBeUndefined();
+  });
+
+  it("`_default` universal parent: untagged note picks up `_default`'s schema", async () => {
+    await store.upsertTagRecord("_default", {
+      fields: { author: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "untagged note",
+      metadata: { author: 42 }, // wrong type
+    }) as any;
+
+    expect(result.validation_status.schemas).toEqual(["_default"]);
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("author");
+  });
+
+  it("`_default` universal parent: tagged note gets `_default` + its tag schema", async () => {
+    await store.upsertTagRecord("_default", {
+      fields: { author: { type: "string" } },
+    });
+    await store.upsertTagRecord("task", {
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { author: 1, priority: 2 }, // both wrong type
+    }) as any;
+
+    expect(result.validation_status.warnings.length).toBe(2);
+    const schemas = new Set(
+      result.validation_status.warnings.map((w: any) => w.schema),
+    );
+    expect(schemas.has("_default")).toBe(true);
+    expect(schemas.has("task")).toBe(true);
+  });
+
+  it("`_default` query expansion: query-notes { tag: '_default' } returns every note", async () => {
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    const b = await store.createNote("beta", { tags: ["project"] });
+    const g = await store.createNote("gamma"); // untagged
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ tag: "_default" }) as any;
+
+    expect(result.length).toBe(3);
+    const ids = (result as { id: string }[]).map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id, g.id].sort());
+  });
+
+  it("missing parent: non-existent name in parent_names is silently skipped", async () => {
+    await store.upsertTagRecord("task", {
+      parent_names: ["nonexistent_tag"],
+      fields: { priority: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: 999 }, // wrong type
+    }) as any;
+
+    // No error. task's own field still validates.
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("priority");
+  });
+
+  it("`_default` deleted mid-session: cache invalidates, default behavior goes away", async () => {
+    await store.upsertTagRecord("_default", {
+      fields: { author: { type: "string" } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      metadata: { author: 42 }, // wrong type
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+
+    await store.deleteTag("_default");
+
+    result = await create.execute({
+      content: "y",
+      metadata: { author: 42 },
+    }) as any;
+    expect(result.validation_status).toBeUndefined();
+  });
+
+  it("`_default` + `tagMatch: 'any'` drops the tag filter entirely (every note matches)", async () => {
+    // Folded from PR #272 review (N1). With OR-semantics, `_default` matches
+    // everything → the disjunction collapses regardless of what else is in
+    // the list. Pre-fold this would have narrowed to `task`-tagged notes.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    const b = await store.createNote("beta", { tags: ["project"] });
+    const g = await store.createNote("gamma"); // untagged
+
+    const results = await store.queryNotes({ tags: ["_default", "task"], tagMatch: "any" });
+    const ids = results.map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id, g.id].sort());
+  });
+
+  it("`_default` + `tagMatch: 'all'` drops only `_default` from the AND-set", async () => {
+    // Symmetric guard for N1: AND-semantics should NOT collapse — `_default`
+    // is universally satisfied so it can be dropped, but other tags still
+    // narrow the result set.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("alpha", { tags: ["task"] });
+    await store.createNote("beta", { tags: ["project"] });
+    await store.createNote("gamma"); // untagged
+
+    const results = await store.queryNotes({ tags: ["_default", "task"], tagMatch: "all" });
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe(a.id);
+  });
+
+  it("`searchNotes` with `_default` returns matches from every note (including untagged)", async () => {
+    // Folded from PR #272 review (N2). FTS-backed search now short-circuits
+    // the tag filter when `_default` is requested, matching `queryNotes`.
+    await store.upsertTagRecord("_default", { description: "universal parent" });
+    const a = await store.createNote("findme alpha", { tags: ["task"] });
+    const b = await store.createNote("findme beta"); // untagged
+
+    const results = await store.searchNotes("findme", { tags: ["_default"] });
+    const ids = results.map((n) => n.id).sort();
+    expect(ids).toEqual([a.id, b.id].sort());
+  });
+
+  it("`schema_conflict` warning carries structured `loser_schema`", async () => {
+    // Folded from PR #272 review (N3). Agents shouldn't have to regex
+    // `message` to find the overridden tag — surface it structurally.
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string", enum: ["todo", "done"] } },
+    });
+    await store.upsertTagRecord("publication", {
+      fields: { status: { type: "string", enum: ["draft", "published"] } },
+    });
+    await store.upsertTagRecord("article_task", {
+      parent_names: ["task", "publication"],
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["article_task"],
+      metadata: { status: "todo" },
+    }) as any;
+
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.schema).toBe("task"); // winner
+    expect(conflict.loser_schema).toBe("publication"); // overridden
+  });
+
+  it("non-conflict warnings (type/enum mismatch) don't carry `loser_schema`", async () => {
+    // Symmetric guard for N3: `loser_schema` is only meaningful for
+    // schema_conflict; absent on type/enum mismatches.
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+    }) as any;
+
+    expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(result.validation_status.warnings[0].loser_schema).toBeUndefined();
+  });
+
+  it("invalidates schema cache when only parent_names changes (no fields touched)", async () => {
+    // Regression guard: pre-vault#270, parent_names changes only invalidated
+    // the hierarchy cache. Now they must also invalidate the schema cache,
+    // since inheritance walks parent chains at validation time.
+    await store.upsertTagRecord("base", {
+      fields: { tier: { type: "string" } },
+    });
+    await store.upsertTagRecord("derived", { description: "starts orphaned" });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    let result = await create.execute({
+      content: "x",
+      tags: ["derived"],
+      metadata: { tier: 1 },
+    }) as any;
+    expect(result.validation_status).toBeUndefined();
+
+    // Wire up inheritance — fields *not* touched, only parent_names.
+    await store.upsertTagRecord("derived", { parent_names: ["base"] });
+
+    result = await create.execute({
+      content: "y",
+      tags: ["derived"],
+      metadata: { tier: 1 }, // wrong type per base.tier
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].field).toBe("tier");
+    expect(result.validation_status.warnings[0].schema).toBe("base");
+  });
+});
+
 describe("expandTagsWithDescendants (tag-scoped tokens — patterns/tag-scoped-tokens.md)", async () => {
   it("returns the union of root + every descendant per tags.parent_names", async () => {
     await store.upsertTagRecord("health/food", { parent_names: ["health"] });
