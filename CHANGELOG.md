@@ -6,6 +6,90 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-10
+
+Six release cuts (`0.4.1-rc.1` through `0.4.1-rc.6`) ship together as
+`0.4.2` on `@latest`. Release-RC detail is preserved in the entries
+below for granular history; this entry is the operator-facing summary.
+
+### Auth
+
+- **Hub revocation enforcement (hub#212 Phase 4, PR #281).** Hub-issued
+  JWTs are checked against the hub's revocation list on every request.
+  Bumps `@openparachute/scope-guard` from `^0.1.0` to `^0.2.0`. Revoked
+  jtis are rejected with a `401`; client-facing messages for
+  revocation-related codes (`revoked`, `revocation_unavailable`) are
+  sanitized — full diagnostic stays in the server-side audit log via
+  `console.warn`. The existing `pvt_*` opaque-token path is untouched.
+
+### Schema & tags
+
+- **Tag schema inheritance + `_default` universal parent (closes #270,
+  rc.2).** A child tag's effective fields = its own ∪ all ancestors'
+  (recursive walk, cycle-safe). Multi-inheritance via `parent_names`;
+  conflict resolution is first-in-walk wins with a new
+  `schema_conflict` advisory warning. A tag named `_default` is the
+  implicit universal parent of every note (tagged or not).
+- **Tag rename cascade (closes #240, #247, rc.4).** `renameTag(old,
+  new)` now rewrites every surface where the old name was referenced
+  — tags, sub-tags, `note_tags`, `parent_names` JSON arrays,
+  `tokens.scoped_tags`, `indexed_fields.declarer_tags`, note body
+  references (`#oldname` / `[[_tags/oldname]]`), and `_tags/<old>`
+  config-note paths — in a single `BEGIN IMMEDIATE` transaction.
+  **Breaking** for callers that relied on the old
+  `tag_in_use_by_tokens` 409 on `POST /api/tags/:name/rename`; the
+  cascade now rewrites token allowlists transparently and returns
+  `200` with per-surface counts.
+- **Migration v17: retire `note_schemas` + `schema_mappings` (closes
+  #267, rc.1).** The parallel validation subsystem had zero rows in
+  real vaults; the tables drop along with 6 MCP tools
+  (`list-note-schemas`, `update-note-schema`, `delete-note-schema`,
+  `list-schema-mappings`, `set-schema-mapping`,
+  `delete-schema-mapping`) and `/api/note-schemas` REST endpoints.
+  `tags.fields` is now the sole schema surface.
+
+### vault-info
+
+- **`vault-info` projection + structured connect-time MCP instruction
+  (closes #271, rc.3).** Returns a comprehensive schema description —
+  schema-bearing tags with effective inheritance, `indexed_fields`
+  catalog, `query_hints` array — that an agent can use to self-orient.
+  The MCP `initialize` response carries a markdown projection rendered
+  from the same state. Filtered by tag-scoped tokens so the JSON tool
+  and the connect-time brief stay in lockstep with the rest of the
+  scope-aware surface. Token budget verified under ~5K at 50
+  schema-bearing tags.
+- **Stats line distinguishes note-usage from schema-bearing tag count
+  (closes #274, rc.5).** Was `100 tags`; now `100 tags total, 5 with
+  schemas`. Closes the ambiguity an agent or operator hit when many
+  ad-hoc tags lived alongside few schema-bearing ones.
+
+### Removed
+
+- **`synthesize-notes` MCP tool retired (closes #268, rc.1).** The
+  retirement is part of the same audit-driven cleanup as `note_schemas`
+  removal — surfaces that weren't earning their keep.
+
+### Migration notes
+
+- Schema v17 runs idempotently on first boot of `0.4.2`. Existing
+  `note_schemas` and `schema_mappings` rows drop; the data lived in
+  parallel to `tags.fields` and was unused in real vaults.
+- API callers that relied on the `tag_in_use_by_tokens` 409 from
+  `POST /api/tags/:name/rename` will need to adapt — the cascade now
+  rewrites token allowlists transparently and returns `200` with
+  cascade stats. Existing callers using `result.renamed` continue to
+  work; field semantics are unchanged.
+- `schema_conflict` is a new `ValidationWarning.reason` value
+  (rc.2). Strict-enum deserialization may see this on cross-ancestor
+  field disagreement; the warning is advisory and safely ignorable by
+  clients that don't recognize it.
+- **`_default`-scoped auth tokens grant full-vault access.** Tag-scoped
+  tokens compute their effective tag set via descendant expansion;
+  because `_default` is the universal parent, expanding it returns the
+  full tag list. Don't mint `_default`-scoped tokens thinking they
+  restrict to a "default-only" tag.
+
 ## [0.4.1-rc.6] — 2026-05-10
 
 ### Changed
