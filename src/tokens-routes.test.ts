@@ -31,7 +31,7 @@ const { route } = await import("./routing.ts");
 const { writeGlobalConfig, writeVaultConfig } = await import("./config.ts");
 const { clearVaultStoreCache, getVaultStore } = await import("./vault-store.ts");
 const { generateToken, createToken, resolveToken } = await import("./token-store.ts");
-const { resetJwksCache } = await import("./hub-jwt.ts");
+const { resetJwksCache, resetRevocationCache } = await import("./hub-jwt.ts");
 
 interface Keypair {
   privateKey: CryptoKey;
@@ -59,10 +59,16 @@ function startJwksFixture(keys: Keypair[]): JwksFixture {
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/.well-known/jwks.json") {
-        return new Response("not found", { status: 404 });
+      if (url.pathname === "/.well-known/jwks.json") {
+        return Response.json({ keys: keys.map((k) => k.publicJwk) });
       }
-      return Response.json({ keys: keys.map((k) => k.publicJwk) });
+      // scope-guard 0.2+ consults the revocation list on every JWT validation
+      // (when the token has a jti). Empty list = "clear" outcome; tokens
+      // signed in this suite all pass the revocation check.
+      if (url.pathname === "/.well-known/parachute-revocation.json") {
+        return Response.json({ generated_at: new Date().toISOString(), jtis: [] });
+      }
+      return new Response("not found", { status: 404 });
     },
   });
   return {
@@ -132,6 +138,7 @@ beforeEach(async () => {
   prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
   process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
   resetJwksCache();
+  resetRevocationCache();
 });
 
 afterEach(() => {

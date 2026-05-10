@@ -6,6 +6,66 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.6] — 2026-05-10
+
+### Changed
+
+- **Hub-issued JWTs are now checked against the hub's revocation list on
+  every request (hub#212 Phase 4).** Bumps `@openparachute/scope-guard`
+  from `^0.1.0` to `^0.2.0`. The new version's `validateHubJwt` consults
+  `<hub-origin>/.well-known/parachute-revocation.json` after sig/iss/aud/
+  expiry pass; revoked jtis surface as `HubJwtError(code: "revoked")` and
+  are rejected at `authenticateVaultRequest` with a 401. Without this,
+  Aaron could revoke a token via the hub's mint API but vault would still
+  honor it — this PR closes that gap from vault's side.
+
+  The existing `pvt_*` opaque-token path is untouched. Phase 6 deprecates
+  `pvt_*` separately.
+
+  Failure semantics (live in scope-guard's revocation cache; vault just
+  consumes the outcome):
+  - 60s TTL matches the hub's `Cache-Control: max-age=60` on the endpoint.
+  - Fail-open with last-good cache during a hub outage — a revoked token
+    may be accepted up to ~60s past revocation when the hub is unreachable,
+    matching the published convergence target.
+  - Fail-closed only on first-fetch-failure (cold start, no last-good).
+    Surfaces as `HubJwtError(code: "revocation_unavailable")` so operators
+    can tell "list couldn't load" from "this token has been retired."
+
+  Client-facing 401s for **all revocation-related codes** are sanitized:
+  - `code: "revoked"` → client gets `"token has been revoked"`; the jti
+    goes to the server-side audit log via `console.warn`.
+  - `code: "revocation_unavailable"` → client gets
+    `"token cannot be validated: revocation list unavailable"`; the
+    implementation-detail phrasing (`"no last-good cache"`) goes to the
+    server-side audit log.
+
+  Sets the inheritable pattern across vault/scribe/agent: revocation
+  diagnostics live in operator audit logs, never in the response body.
+  Other failure modes (signature, audience, expired, etc.) forward the
+  diagnostic message as before — they carry no jti and no implementation
+  internals.
+
+### Internal
+
+- Test fixtures in `auth-hub-jwt.test.ts`, `hub-jwt.test.ts`, and
+  `tokens-routes.test.ts` extended to serve `/.well-known/parachute-revocation.json`
+  alongside the existing `/.well-known/jwks.json` mock. Default response
+  is an empty list; `auth-hub-jwt.test.ts` adds explicit cases for revoked
+  jtis, mixed-list happy path, and cold-start unreachable.
+
+  scope-guard's own unit suite covers the cache mechanics (TTL refresh,
+  fail-open with last-good, single-flight) — vault's tests pin the
+  wire-up, the 401 response shapes, and the audit-log invariant
+  (`console.warn` spy in the revoked-jti and cold-start cases asserts
+  the full diagnostic routes server-side even though the client message
+  is sanitized).
+
+### Versioning note
+
+Continues the `0.4.1-rc.N` chain (rc.5 → rc.6) per the pre-1.0 rule —
+patch number bumps only on Aaron-confirmed releases.
+
 ## [0.4.1-rc.5] — 2026-05-09
 
 ### Fixed
