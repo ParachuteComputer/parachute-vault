@@ -671,7 +671,10 @@ describe("scoped MCP wrapper", async () => {
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
     expect(md).toContain("Working notebook for the daily team.");
-    expect(md).toContain("1 note, 1 tag");
+    // vault#274: stats line distinguishes total tag count (note-usage)
+    // from schema-bearing count. One note tagged `person`, one tag
+    // overall, that one tag has a schema → "1 tag total, 1 with schemas".
+    expect(md).toContain("1 note, 1 tag total, 1 with schemas");
     expect(md).toContain("1 tag with schemas: person");
     expect(md).toContain("Indexed metadata fields");
     expect(md).toContain("email");
@@ -698,7 +701,10 @@ describe("scoped MCP wrapper", async () => {
     const md = await getServerInstruction(vaultName);
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
-    expect(md).toContain("0 notes, 0 tags");  // 0 is plural per English convention
+    // vault#274: empty vault — no schemas, so the suffix is omitted.
+    // 0 is plural per English convention.
+    expect(md).toContain("0 notes, 0 tags total");
+    expect(md).not.toContain("with schemas,");
     expect(md).toContain("No tag schemas declared");
     expect(md).toContain("No indexed metadata fields");
     // Refresh hints surface both pointers so the agent knows where to look.

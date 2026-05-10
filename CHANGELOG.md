@@ -6,6 +6,27 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.5] — 2026-05-09
+
+### Fixed
+
+- **`vault-info` connect-time stats line distinguishes note-usage tag
+  count from schema-bearing count (closes #274).** Pre-fix, the line
+  read `2280 notes, 100 tags` — conflating "tags any note carries"
+  with "tags with schema declarations." An agent reading "100 tags"
+  next to "5 tags with schemas" had to infer the relationship; in
+  practice, vaults with many ad-hoc tags and few schema-bearing tags
+  read the line as if every tag had a schema.
+
+  New shape: `2280 notes, 100 tags total, 5 with schemas`. The
+  schema-bearing count is dropped when zero (so an empty vault still
+  reads cleanly as `0 notes, 0 tags total`). Pluralization preserved
+  per the rc.3 fix.
+
+  No JSON-schema change to `vault-info` — the stats object still
+  carries `tagCount` (driven by `note_tags`) unchanged. The fix is
+  purely in `projectionToMarkdown`.
+
 ## [0.4.1-rc.4] — 2026-05-09
 
 ### Added
