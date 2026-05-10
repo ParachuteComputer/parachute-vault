@@ -275,17 +275,31 @@ async function authenticateHubJwt(
     return { permission, scopes: claims.scopes, legacyDerived: false, scoped_tags: null, vault_name: null };
   } catch (err) {
     if (err instanceof HubJwtError) {
-      // Revoked-token error message carries the jti for operator audit (built
-      // into scope-guard). Log it server-side for the audit trail, but strip
-      // it from the client-facing 401 — the unauthenticated caller doesn't
-      // need to learn which jti was retired. Other HubJwtError codes carry
-      // generic messages and are forwarded as-is (the existing test suite
-      // pins those exact strings).
+      // Revocation-related codes get sanitized client messages: server-side
+      // audit log carries the full diagnostic (jti for `revoked`,
+      // implementation-detail phrasing for `revocation_unavailable`); the
+      // unauthenticated caller gets a code-shaped sentence with no internals.
+      // This is the inheritable pattern across vault/scribe/agent — keep all
+      // revocation-related diagnostics server-side. Other HubJwtError codes
+      // (signature, audience, expired, etc.) carry generic messages and are
+      // forwarded as-is; the existing test suite pins those exact strings.
       if (err.code === "revoked") {
         console.warn(`[auth] hub JWT rejected: ${err.message}`);
         return {
           error: Response.json(
             { error: "Unauthorized", message: "token has been revoked" },
+            { status: 401 },
+          ),
+        };
+      }
+      if (err.code === "revocation_unavailable") {
+        console.warn(`[auth] hub JWT rejected: ${err.message}`);
+        return {
+          error: Response.json(
+            {
+              error: "Unauthorized",
+              message: "token cannot be validated: revocation list unavailable",
+            },
             { status: 401 },
           ),
         };

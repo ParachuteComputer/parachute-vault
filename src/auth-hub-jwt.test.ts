@@ -21,7 +21,7 @@
  * wiring and the response-shape contract.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdirSync, rmSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -258,7 +258,7 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
     }
   });
 
-  test("revoked jti → 401 with sanitized message (jti not leaked to caller)", async () => {
+  test("revoked jti → 401 sanitized; full diagnostic (with jti) routed to console.warn audit log", async () => {
     seedVault("journal");
     const revokedJti = "jti-revoked-by-operator";
     fixture.setRevoked([revokedJti]);
@@ -271,17 +271,31 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
     const config = readVaultConfig("journal")!;
     const store = getVaultStore("journal");
 
-    const result = await authenticateVaultRequest(bearer(token), config, store.db);
-    expect("error" in result).toBe(true);
-    if ("error" in result) {
-      expect(result.error.status).toBe(401);
-      const body = (await result.error.json()) as { error: string; message: string };
-      expect(body.error).toBe("Unauthorized");
-      // Client-facing message must NOT carry the jti — that's a server-side
-      // audit-log concern only. See the `code === "revoked"` branch in
-      // authenticateHubJwt for the sanitization.
-      expect(body.message).toBe("token has been revoked");
-      expect(body.message).not.toContain(revokedJti);
+    // Spy + suppress so the assertion is the audit-trail invariant for
+    // this scenario, not a stderr inspection. Pattern carries to scribe/agent.
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await authenticateVaultRequest(bearer(token), config, store.db);
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error.status).toBe(401);
+        const body = (await result.error.json()) as { error: string; message: string };
+        expect(body.error).toBe("Unauthorized");
+        // Client-facing message must NOT carry the jti — that's a server-side
+        // audit-log concern only. See the `code === "revoked"` branch in
+        // authenticateHubJwt for the sanitization.
+        expect(body.message).toBe("token has been revoked");
+        expect(body.message).not.toContain(revokedJti);
+      }
+      // Audit-log invariant: console.warn fires exactly once with a message
+      // that carries the jti, so an operator chasing a 401 in production logs
+      // can correlate to which token was retired.
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const warnArg = warnSpy.mock.calls[0]![0] as string;
+      expect(warnArg).toContain(revokedJti);
+      expect(warnArg).toContain("revoked");
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 
@@ -305,12 +319,13 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
     }
   });
 
-  test("revocation list unreachable on cold start → fail-closed 401", async () => {
+  test("revocation list unreachable on cold start → fail-closed 401 sanitized; full diagnostic routed to console.warn", async () => {
     seedVault("journal");
     // Hub is reachable for JWKS but the revocation endpoint 503s. Cold cache
     // + first-fetch-fail = "unknown" outcome, surfaced as
-    // HubJwtError(code: "revocation_unavailable"). The auth layer forwards
-    // the message verbatim (no jti to leak; safe to surface the diagnostic).
+    // HubJwtError(code: "revocation_unavailable"). Client gets a code-shaped
+    // sentence; the implementation-detail phrasing ("no last-good cache")
+    // stays in the server-side audit log.
     fixture.setRevocationFails(true);
     const token = await signJwt(kp, {
       iss: fixture.origin,
@@ -320,12 +335,26 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
     const config = readVaultConfig("journal")!;
     const store = getVaultStore("journal");
 
-    const result = await authenticateVaultRequest(bearer(token), config, store.db);
-    expect("error" in result).toBe(true);
-    if ("error" in result) {
-      expect(result.error.status).toBe(401);
-      const body = (await result.error.json()) as { error: string; message: string };
-      expect(body.message).toContain("revocation list unavailable");
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await authenticateVaultRequest(bearer(token), config, store.db);
+      expect("error" in result).toBe(true);
+      if ("error" in result) {
+        expect(result.error.status).toBe(401);
+        const body = (await result.error.json()) as { error: string; message: string };
+        // Client message: code-shaped, no internals.
+        expect(body.message).toBe("token cannot be validated: revocation list unavailable");
+        // The internal phrase "no last-good cache" is a scope-guard
+        // implementation detail and must not leak into the public response.
+        expect(body.message).not.toContain("last-good cache");
+      }
+      // Audit-log invariant: full diagnostic routed to console.warn so
+      // operators can distinguish cold-start from sustained outage.
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const warnArg = warnSpy.mock.calls[0]![0] as string;
+      expect(warnArg).toContain("no last-good cache");
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

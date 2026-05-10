@@ -32,10 +32,19 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
     Surfaces as `HubJwtError(code: "revocation_unavailable")` so operators
     can tell "list couldn't load" from "this token has been retired."
 
-  Client-facing 401 for revoked tokens is sanitized — the jti goes to the
-  server-side audit log via `console.warn`, not into the response body.
-  Other failure modes forward the diagnostic message as before (those
-  carry no jti).
+  Client-facing 401s for **all revocation-related codes** are sanitized:
+  - `code: "revoked"` → client gets `"token has been revoked"`; the jti
+    goes to the server-side audit log via `console.warn`.
+  - `code: "revocation_unavailable"` → client gets
+    `"token cannot be validated: revocation list unavailable"`; the
+    implementation-detail phrasing (`"no last-good cache"`) goes to the
+    server-side audit log.
+
+  Sets the inheritable pattern across vault/scribe/agent: revocation
+  diagnostics live in operator audit logs, never in the response body.
+  Other failure modes (signature, audience, expired, etc.) forward the
+  diagnostic message as before — they carry no jti and no implementation
+  internals.
 
 ### Internal
 
@@ -47,7 +56,10 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
   scope-guard's own unit suite covers the cache mechanics (TTL refresh,
   fail-open with last-good, single-flight) — vault's tests pin the
-  wire-up and the 401 response shapes.
+  wire-up, the 401 response shapes, and the audit-log invariant
+  (`console.warn` spy in the revoked-jti and cold-start cases asserts
+  the full diagnostic routes server-side even though the client message
+  is sanitized).
 
 ### Versioning note
 
