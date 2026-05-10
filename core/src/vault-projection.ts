@@ -258,9 +258,20 @@ export function projectionToMarkdown(args: {
   lines.push("");
 
   if (stats) {
-    lines.push(
-      `- ${stats.totalNotes} ${stats.totalNotes === 1 ? "note" : "notes"}, ${stats.tagCount} ${stats.tagCount === 1 ? "tag" : "tags"}`,
-    );
+    // Two distinct counts surface here so an agent doesn't conflate
+    // them (vault#274): `tagCount` is "tags ANY note uses" — driven by
+    // note_tags rows. `projection.tags.length` is "tags carrying a
+    // schema declaration" — strictly smaller and the relevant denominator
+    // for the schema-bearing list a few lines down. Showing only one
+    // hid the gap (e.g., 100 tags but only 5 with schemas read as
+    // "100 tags with schemas").
+    const noteCount = stats.totalNotes;
+    const tagCount = stats.tagCount;
+    const withSchemas = projection.tags.length;
+    const noteLabel = noteCount === 1 ? "note" : "notes";
+    const tagLabel = tagCount === 1 ? "tag" : "tags";
+    const tagSuffix = withSchemas > 0 ? `, ${withSchemas} with schemas` : "";
+    lines.push(`- ${noteCount} ${noteLabel}, ${tagCount} ${tagLabel} total${tagSuffix}`);
   } else {
     lines.push(`- (call \`vault-info { include_stats: true }\` for note/tag counts)`);
   }
