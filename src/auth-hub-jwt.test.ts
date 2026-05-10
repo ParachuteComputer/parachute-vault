@@ -10,10 +10,15 @@
  *   - broad `vault:<verb>` scope rejected (forced narrowing per #180)
  *   - `aud=vault.<other>` rejected (audience mismatch)
  *   - JWT path rejected at the global (cross-vault) entrypoint
+ *   - revoked jti rejected (revocation list integration; client-facing
+ *     message is sanitized so the jti doesn't leak)
+ *   - revocation list unavailable on cold start → fail-closed 401
  *
- * Each test owns a fresh `PARACHUTE_HOME` and JWKS fixture, like the auth.test
- * peer file. The JWKS fixture mirrors the one in hub-jwt.test.ts; duplicating
- * ~30 lines is cheaper than introducing a shared test-helper module.
+ * Each test owns a fresh `PARACHUTE_HOME` and a fake hub fixture that serves
+ * BOTH `/.well-known/jwks.json` and `/.well-known/parachute-revocation.json`.
+ * scope-guard's own unit suite covers the cache mechanics (TTL refresh,
+ * fail-open with last-good, single-flight); this file pins the vault-side
+ * wiring and the response-shape contract.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -24,7 +29,7 @@ import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { writeVaultConfig, readVaultConfig } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
-import { resetJwksCache } from "./hub-jwt.ts";
+import { resetJwksCache, resetRevocationCache } from "./hub-jwt.ts";
 
 interface Keypair {
   privateKey: CryptoKey;
@@ -42,24 +47,45 @@ async function makeKeypair(kid: string): Promise<Keypair> {
   };
 }
 
-interface JwksFixture {
+interface HubFixture {
   origin: string;
+  /** Drive the revocation list contents; cleared by default. */
+  setRevoked(jtis: string[]): void;
+  /** When true, the revocation endpoint returns 503 — exercises fail-closed. */
+  setRevocationFails(fails: boolean): void;
   stop: () => void;
 }
 
-function startJwksFixture(keys: Keypair[]): JwksFixture {
+function startHubFixture(keys: Keypair[]): HubFixture {
+  let revokedJtis: string[] = [];
+  let revocationFails = false;
   const server = Bun.serve({
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/.well-known/jwks.json") {
-        return new Response("not found", { status: 404 });
+      if (url.pathname === "/.well-known/jwks.json") {
+        return Response.json({ keys: keys.map((k) => k.publicJwk) });
       }
-      return Response.json({ keys: keys.map((k) => k.publicJwk) });
+      if (url.pathname === "/.well-known/parachute-revocation.json") {
+        if (revocationFails) {
+          return new Response("hub down", { status: 503 });
+        }
+        return Response.json({
+          generated_at: new Date().toISOString(),
+          jtis: revokedJtis,
+        });
+      }
+      return new Response("not found", { status: 404 });
     },
   });
   return {
     origin: `http://127.0.0.1:${server.port}`,
+    setRevoked: (jtis) => {
+      revokedJtis = jtis;
+    },
+    setRevocationFails: (fails) => {
+      revocationFails = fails;
+    },
     stop: () => server.stop(true),
   };
 }
@@ -70,6 +96,8 @@ interface SignOpts {
   scope: string;
   sub?: string;
   ttlSeconds?: number;
+  /** Override the random jti — needed when a test wants to revoke this exact token. */
+  jti?: string;
 }
 
 async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
@@ -82,7 +110,7 @@ async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
     .setAudience(opts.aud)
     .setIssuedAt(iat)
     .setExpirationTime(exp)
-    .setJti(`jti-${Math.random().toString(36).slice(2)}`)
+    .setJti(opts.jti ?? `jti-${Math.random().toString(36).slice(2)}`)
     .sign(kp.privateKey);
 }
 
@@ -95,7 +123,7 @@ function bearer(token: string): Request {
 let tmpHome: string;
 let prevHome: string | undefined;
 let prevHubOrigin: string | undefined;
-let fixture: JwksFixture;
+let fixture: HubFixture;
 let kp: Keypair;
 
 beforeEach(async () => {
@@ -109,10 +137,11 @@ beforeEach(async () => {
   clearVaultStoreCache();
 
   kp = await makeKeypair("k1");
-  fixture = startJwksFixture([kp]);
+  fixture = startHubFixture([kp]);
   prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
   process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
   resetJwksCache();
+  resetRevocationCache();
 });
 
 afterEach(() => {
@@ -226,6 +255,77 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
       const body = (await result.error.json()) as { error: string; message: string };
       expect(body.message).toContain("vault-bound");
       expect(body.message).toContain("/vault/<name>");
+    }
+  });
+
+  test("revoked jti → 401 with sanitized message (jti not leaked to caller)", async () => {
+    seedVault("journal");
+    const revokedJti = "jti-revoked-by-operator";
+    fixture.setRevoked([revokedJti]);
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:read",
+      jti: revokedJti,
+    });
+    const config = readVaultConfig("journal")!;
+    const store = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as { error: string; message: string };
+      expect(body.error).toBe("Unauthorized");
+      // Client-facing message must NOT carry the jti — that's a server-side
+      // audit-log concern only. See the `code === "revoked"` branch in
+      // authenticateHubJwt for the sanitization.
+      expect(body.message).toBe("token has been revoked");
+      expect(body.message).not.toContain(revokedJti);
+    }
+  });
+
+  test("non-revoked jti against populated list → still honored (happy path with active revocations)", async () => {
+    seedVault("journal");
+    fixture.setRevoked(["some-other-revoked-jti"]);
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      jti: "jti-still-good",
+    });
+    const config = readVaultConfig("journal")!;
+    const store = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+      expect(result.scopes).toEqual(["vault:journal:write"]);
+    }
+  });
+
+  test("revocation list unreachable on cold start → fail-closed 401", async () => {
+    seedVault("journal");
+    // Hub is reachable for JWKS but the revocation endpoint 503s. Cold cache
+    // + first-fetch-fail = "unknown" outcome, surfaced as
+    // HubJwtError(code: "revocation_unavailable"). The auth layer forwards
+    // the message verbatim (no jti to leak; safe to surface the diagnostic).
+    fixture.setRevocationFails(true);
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:read",
+    });
+    const config = readVaultConfig("journal")!;
+    const store = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as { error: string; message: string };
+      expect(body.message).toContain("revocation list unavailable");
     }
   });
 });

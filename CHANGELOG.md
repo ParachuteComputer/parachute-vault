@@ -6,6 +6,54 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.1-rc.6] — 2026-05-10
+
+### Changed
+
+- **Hub-issued JWTs are now checked against the hub's revocation list on
+  every request (hub#212 Phase 4).** Bumps `@openparachute/scope-guard`
+  from `^0.1.0` to `^0.2.0`. The new version's `validateHubJwt` consults
+  `<hub-origin>/.well-known/parachute-revocation.json` after sig/iss/aud/
+  expiry pass; revoked jtis surface as `HubJwtError(code: "revoked")` and
+  are rejected at `authenticateVaultRequest` with a 401. Without this,
+  Aaron could revoke a token via the hub's mint API but vault would still
+  honor it — this PR closes that gap from vault's side.
+
+  The existing `pvt_*` opaque-token path is untouched. Phase 6 deprecates
+  `pvt_*` separately.
+
+  Failure semantics (live in scope-guard's revocation cache; vault just
+  consumes the outcome):
+  - 60s TTL matches the hub's `Cache-Control: max-age=60` on the endpoint.
+  - Fail-open with last-good cache during a hub outage — a revoked token
+    may be accepted up to ~60s past revocation when the hub is unreachable,
+    matching the published convergence target.
+  - Fail-closed only on first-fetch-failure (cold start, no last-good).
+    Surfaces as `HubJwtError(code: "revocation_unavailable")` so operators
+    can tell "list couldn't load" from "this token has been retired."
+
+  Client-facing 401 for revoked tokens is sanitized — the jti goes to the
+  server-side audit log via `console.warn`, not into the response body.
+  Other failure modes forward the diagnostic message as before (those
+  carry no jti).
+
+### Internal
+
+- Test fixtures in `auth-hub-jwt.test.ts`, `hub-jwt.test.ts`, and
+  `tokens-routes.test.ts` extended to serve `/.well-known/parachute-revocation.json`
+  alongside the existing `/.well-known/jwks.json` mock. Default response
+  is an empty list; `auth-hub-jwt.test.ts` adds explicit cases for revoked
+  jtis, mixed-list happy path, and cold-start unreachable.
+
+  scope-guard's own unit suite covers the cache mechanics (TTL refresh,
+  fail-open with last-good, single-flight) — vault's tests pin the
+  wire-up and the 401 response shapes.
+
+### Versioning note
+
+Continues the `0.4.1-rc.N` chain (rc.5 → rc.6) per the pre-1.0 rule —
+patch number bumps only on Aaron-confirmed releases.
+
 ## [0.4.1-rc.5] — 2026-05-09
 
 ### Fixed

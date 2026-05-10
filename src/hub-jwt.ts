@@ -75,5 +75,14 @@ export function resetJwksCache(): void {
   guard.resetJwksCache();
 }
 
+/**
+ * Reset the cached revocation list. Tests use this to start from a clean
+ * fail-closed state between cases; production callers shouldn't need it
+ * (the cache refreshes itself on TTL expiry).
+ */
+export function resetRevocationCache(): void {
+  guard.resetRevocationCache();
+}
+
 export { HubJwtError, looksLikeJwt };
 export type { HubJwtClaims, ValidateHubJwtOptions };

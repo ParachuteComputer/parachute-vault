@@ -275,6 +275,21 @@ async function authenticateHubJwt(
     return { permission, scopes: claims.scopes, legacyDerived: false, scoped_tags: null, vault_name: null };
   } catch (err) {
     if (err instanceof HubJwtError) {
+      // Revoked-token error message carries the jti for operator audit (built
+      // into scope-guard). Log it server-side for the audit trail, but strip
+      // it from the client-facing 401 — the unauthenticated caller doesn't
+      // need to learn which jti was retired. Other HubJwtError codes carry
+      // generic messages and are forwarded as-is (the existing test suite
+      // pins those exact strings).
+      if (err.code === "revoked") {
+        console.warn(`[auth] hub JWT rejected: ${err.message}`);
+        return {
+          error: Response.json(
+            { error: "Unauthorized", message: "token has been revoked" },
+            { status: 401 },
+          ),
+        };
+      }
       return { error: Response.json({ error: "Unauthorized", message: err.message }, { status: 401 }) };
     }
     // Unknown failure shape — surface the message but stay 401.

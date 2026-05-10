@@ -14,7 +14,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
-import { resetJwksCache, validateHubJwt, looksLikeJwt } from "./hub-jwt.ts";
+import { resetJwksCache, resetRevocationCache, validateHubJwt, looksLikeJwt } from "./hub-jwt.ts";
 
 interface Keypair {
   privateKey: CryptoKey;
@@ -53,11 +53,19 @@ function startJwksFixture(): JwksFixture {
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/.well-known/jwks.json") {
-        return new Response("not found", { status: 404 });
-      }
       if (down) return new Response("upstream down", { status: 503 });
-      return Response.json({ keys: keys.map((k) => k.publicJwk) });
+      if (url.pathname === "/.well-known/jwks.json") {
+        return Response.json({ keys: keys.map((k) => k.publicJwk) });
+      }
+      // scope-guard 0.2+ consults `/.well-known/parachute-revocation.json` on
+      // every JWT validation (when the token has a jti). Serve an empty list
+      // by default so unrelated tests in this file aren't fail-closed by a
+      // 404 on that endpoint. The integration tests (`auth-hub-jwt.test.ts`)
+      // own the revoked-jti / fail-closed cases separately.
+      if (url.pathname === "/.well-known/parachute-revocation.json") {
+        return Response.json({ generated_at: new Date().toISOString(), jtis: [] });
+      }
+      return new Response("not found", { status: 404 });
     },
   });
   return {
@@ -121,6 +129,9 @@ beforeEach(() => {
   fixture.setUnreachable(false);
   fixture.setKeys([kp]);
   resetJwksCache();
+  // Drop the per-process revocation cache so each test starts cold against
+  // the fixture (an empty list by default; tests opt into populated lists).
+  resetRevocationCache();
 });
 
 describe("looksLikeJwt", () => {
