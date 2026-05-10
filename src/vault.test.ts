@@ -702,9 +702,13 @@ describe("scoped MCP wrapper", async () => {
 
     expect(md).toContain(`Parachute Vault "${vaultName}"`);
     // vault#274: empty vault — no schemas, so the suffix is omitted.
-    // 0 is plural per English convention.
+    // 0 is plural per English convention. The not.toContain guard
+    // pins that "with schemas" doesn't leak through anywhere — when
+    // schemas exist it appears in two places (stats suffix + the
+    // tags-with-schemas list line); on an empty vault both branches
+    // are unreachable, so the phrase shouldn't appear at all.
     expect(md).toContain("0 notes, 0 tags total");
-    expect(md).not.toContain("with schemas,");
+    expect(md).not.toContain("with schemas");
     expect(md).toContain("No tag schemas declared");
     expect(md).toContain("No indexed metadata fields");
     // Refresh hints surface both pointers so the agent knows where to look.
