@@ -432,6 +432,139 @@ GET            /vaults/list                                       public: vault 
 GET            /health                                            health check
 ```
 
+## Common queries / cookbook
+
+Patterns that fall out of vault's read and write surfaces. All examples assume your vault is reachable at `http://localhost:1940` and your token is in `$VAULT_TOKEN`. MCP-side examples are how the same operation looks via the tool layer (Claude Code, Claude Desktop, Daily). Each recipe answers a question consumers have asked while building against vault — see [vault#285](https://github.com/ParachuteComputer/parachute-vault/issues/285) for the field-input thread these distilled from.
+
+### Fetch every note under a path subtree
+
+For an SSG or wiki rendering a section of the vault. `path_prefix` matches against the normalized path string — no `.md`, no trailing slash.
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?path_prefix=Boulder%20Civics/City%20Council/&include_content=true"
+```
+
+```jsonc
+// MCP
+{ "name": "query-notes", "arguments": { "path_prefix": "Boulder Civics/City Council/", "include_content": true } }
+```
+
+### Sort by a metadata field
+
+Sort by something other than `created_at`. The field must be declared `indexed: true` in some tag schema first — that's what materializes the backing generated column + B-tree index. The "tag authorizes the index" pattern lives in [`core/src/indexed-fields.ts`](./core/src/indexed-fields.ts).
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?order_by=meeting_date&sort=desc&include_content=true"
+```
+
+Declare the index via `update-tag`:
+
+```jsonc
+{ "name": "update-tag", "arguments": {
+    "tag": "meeting",
+    "fields": { "meeting_date": { "type": "string", "indexed": true } }
+} }
+```
+
+### Return previews instead of full bodies
+
+Listing pages don't need the whole note. By default `GET /notes` returns the lean shape — 120-char whitespace-collapsed `preview`, `byteSize`, and the usual metadata — with no `content`. Single-note `GET /notes/:id` still returns full content by default; pass `include_content=false` to drop it.
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?path_prefix=Posts/"
+# → [{ id, path, byteSize, preview, tags, metadata, ... }, ...]
+```
+
+Caller-tunable preview length is a future enhancement — file an issue if 120 chars isn't enough.
+
+### Incremental rebuilds: "what changed since X"
+
+The SSG / sync pattern. Two equivalent forms — bracket-style is canonical going forward; the flat form is the same shape that ships through the REST/MCP date filter today.
+
+```bash
+# Bracket-style (canonical)
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?meta[updated_at][gte]=2026-04-01T00:00:00Z"
+
+# Flat form (DEPRECATED in 0.4.3; planned removal 0.6.0 per vault#288)
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?date_field=updated_at&date_from=2026-04-01T00:00:00Z"
+```
+
+```jsonc
+// MCP — `date_filter` accepts created_at, updated_at, or any indexed metadata field.
+{ "name": "query-notes", "arguments": { "date_filter": { "field": "updated_at", "from": "2026-04-01T00:00:00Z" } } }
+```
+
+Only `gte` and `lt` are accepted on `created_at` / `updated_at` (other operators reject with `INVALID_QUERY` — these bracket forms route to the real-column `dateFilter`, not the full metadata operator set, so the half-open `[from, to)` shape is the only expressible range). The full operator set in the next recipe applies to *metadata* fields only.
+
+### Filter by metadata values (bracket style)
+
+Equality on any metadata field works with no setup:
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes?meta[meeting-type]=study-session&include_content=true"
+```
+
+Range, `in`, `not_in`, and `exists` operators require the field to be declared `indexed: true` (same gate as `order_by`):
+
+```bash
+# Range — both bounds AND together on one field
+"…/notes?meta[date][gte]=2026-01-01&meta[date][lt]=2026-04-01"
+
+# Membership — `[]` array form OR comma-separated; same result.
+"…/notes?meta[status][in][]=active&meta[status][in][]=exploring"
+"…/notes?meta[status][in]=active,exploring"
+
+# Presence check
+"…/notes?meta[deadline][exists]=true"
+```
+
+Supported operators: `eq` (default when no operator given), `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `exists`. Multiple `meta[…]` filters AND together. Bracket-style and shorthand on the same field in one request reject loudly — pick one form.
+
+### Edit one line in a large note (without re-sending the whole body)
+
+`content_edit` does surgical find-and-replace. Payload is the changed text, not the whole note. `old_text` must occur exactly once; multiple matches or zero matches reject with a "re-read and retry" error.
+
+```jsonc
+// MCP
+{ "name": "update-note", "arguments": {
+    "id": "notes/decisions",
+    "content_edit": {
+      "old_text": "Status: pending",
+      "new_text": "Status: shipped (2026-05-10)"
+    },
+    "if_updated_at": "2026-05-10T12:34:56.789Z"
+} }
+```
+
+```bash
+# REST equivalent
+curl -X PATCH -H "Authorization: Bearer $VAULT_TOKEN" -H "Content-Type: application/json" \
+  -d '{"content_edit":{"old_text":"Status: pending","new_text":"Status: shipped (2026-05-10)"},"if_updated_at":"…"}' \
+  "http://localhost:1940/vault/default/api/notes/notes/decisions"
+```
+
+Set `include_content: false` on the request to cut the response cost too — you get back the lean `NoteIndex` shape instead of the full updated note.
+
+### Append to a note (no concurrency ceremony)
+
+Atomic at the SQL layer: two concurrent appends both land in some order, never clobber. Append-only and prepend-only updates are exempt from the `if_updated_at` precondition that other mutations require — the SQL-atomic concatenation can't lose data on a stale read, so the precondition would be ceremony for no benefit. Underlying mechanic in [`core/src/notes.ts:295-322`](./core/src/notes.ts).
+
+```jsonc
+{ "name": "update-note", "arguments": { "id": "notes/journal/2026-05-10", "append": "\n\nEvening note: …" } }
+```
+
+`prepend` is frontmatter-aware: if the note opens with YAML frontmatter, the prepended text is automatically injected *after* the closing `---` fence so parsers that expect frontmatter at byte 0 still find it. Detection is done in the same SQL UPDATE expression, so atomicity is preserved.
+
+### CI / public access via Tailscale Funnel
+
+The shortest path to a public HTTPS URL for a vault you control — useful for SSG rebuilds running on GitHub Actions, Vercel, or any runner that isn't on your tailnet. See [Remote access via Tailscale Funnel](#remote-access-via-tailscale-funnel) below for the full setup.
+
 ## Data model
 
 ```
