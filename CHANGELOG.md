@@ -6,6 +6,65 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-05-10
+
+Two release cuts (`0.4.3-rc.1` and `0.4.3-rc.2`) ship together as `0.4.3`
+on `@latest`. Release-RC detail is preserved in the entries below; this
+heading is the operator-facing summary.
+
+Theme: closing the high-priority friction points from the [vault#285
+field-input evaluation](https://github.com/ParachuteComputer/parachute-vault/issues/285).
+Two PRs landed under the rc chain:
+
+- **vault#286 (rc.1)** — `updated_at` filter (1.5) + `update-note`
+  response-shape opt-out (2.response). Two small additive enhancements;
+  no behavior change for existing callers.
+- **vault#289 (rc.2)** — bracket-style HTTP metadata filter (1.3) with
+  bridge for `created_at` / `updated_at` and a deprecation path for the
+  flat date params. Closes the largest HTTP-side surface gap.
+
+### Read path
+
+- **`dateFilter` recognizes `updated_at`** (1.5 / vault#286). SSG
+  incremental-rebuild flows ask "what changed since X" via
+  `dateFilter: { field: "updated_at", from: lastBuildISO }`. No
+  indexed-field declaration required — `updated_at` is a real column on
+  `notes` and joins `created_at` as a recognized exemption from the
+  indexed-field gate.
+- **HTTP bracket-style metadata filter** (1.3 / vault#289). Exposes
+  vault's full engine operator set — `eq` / `ne` / `gt` / `gte` / `lt` /
+  `lte` / `in` / `not_in` / `exists` — to HTTP consumers via
+  `?meta[field][op]=value`. Bracket-style is the canonical shape going
+  forward; the flat `date_field=…&date_from=…&date_to=…` form is
+  deprecated (planned removal 0.6.0, tracked at vault#288).
+
+### Write path
+
+- **`update-note` response-shape opt-out** (2.response / vault#286). New
+  `include_content` parameter (default `true`). Set `false` and the
+  response swaps the full `Note` for the lean `NoteIndex` shape (drops
+  `content`, keeps `byteSize` / `preview` / `validation_status`).
+  Order-of-magnitude smaller responses on big notes — the workflow that
+  surfaced the friction.
+
+### Discoverability
+
+- **Cookbook section in `README.md`.** Patterns for path-subtree queries,
+  sort-by-metadata, preview-only listings, incremental rebuilds, the new
+  bracket-meta filter, surgical `content_edit`, atomic `append`, and the
+  Funnel pointer for CI access. Distilled from the field-input thread.
+
+### Out of scope (still deferred)
+
+- **1.6 URL-safe slug** — design pending (stability under rename, derive
+  from id vs path); deferred until a renderer concretely needs it.
+- **Tunable preview length** — the 120-char default has held; revisit
+  when a real consumer hits a wall.
+- **Section / diff / line-range edits on `update-note`** — speculative
+  given that `content_edit` + `append` cover the originating workflow.
+- **OR composition across metadata filters** — engine doesn't expose OR
+  through the `metadata` shape; future engine-level decision.
+
 ## [0.4.3-rc.2] — 2026-05-10
 
 Closes the HTTP-side gap in vault's metadata-filter surface (vault#285
