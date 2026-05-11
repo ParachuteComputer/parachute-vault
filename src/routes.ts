@@ -125,27 +125,48 @@ function parseMetaBrackets(url: URL): {
   // Real columns on `notes` — exempt from the indexed-field gate, routed
   // through `dateFilter` instead of `metadata`.
   const REAL_DATE_COLUMNS = new Set(["created_at", "updated_at"]);
+  // Operators that take an array value. Used for parser-level rejection of
+  // `[]`-array syntax on the wrong operator (e.g. `meta[field][eq][]=value`).
+  const ARRAY_OPS = new Set(["in", "not_in"]);
   // `meta[FIELD]` or `meta[FIELD][OP]` or `meta[FIELD][OP][]`. Field names are
   // bounded by `FIELD_NAME_RE` at the engine layer; the parser is liberal here
   // and lets the engine raise the loud error on bad names.
   const META_RE = /^meta\[([^\]]+)\](?:\[([^\]]+)\](\[\])?)?$/;
 
+  // `metadata[field]` is either a primitive (shorthand `eq` via json_extract)
+  // or a sub-object of operator clauses. The two are *mutually exclusive per
+  // field per request*: mixing them is a silent-data-loss footgun (op set,
+  // then shorthand stomps; or shorthand set, then op stomps) so we reject
+  // loudly. Track each field's chosen form here.
   const metadata: Record<string, unknown> = {};
-  const arrayBuckets = new Map<string, string[]>(); // key: `${field}|${op}` → values
-  const dateBucket: { field?: string; from?: string; to?: string } = {};
+  const shorthandFields = new Set<string>();
+  const opBucketsByField = new Map<string, Map<string, string[]>>(); // field → op → values (array form)
+  const opObjectByField = new Map<string, Record<string, unknown>>(); // field → built op object (single-value ops)
 
-  function metaOpBucket(field: string): Record<string, unknown> {
-    const existing = metadata[field];
-    if (existing && typeof existing === "object" && !Array.isArray(existing)) {
-      return existing as Record<string, unknown>;
+  // dateFilter accumulates `from` (gte) and `to` (lt) bounds on a single
+  // column. Spanning both `created_at` AND `updated_at` in one request is
+  // not expressible (the engine takes one `field`), so we reject early
+  // rather than silently corrupting one bound. See vault#289 review F1.
+  let dateField: "created_at" | "updated_at" | null = null;
+  let dateFrom: string | undefined;
+  let dateTo: string | undefined;
+
+  function rejectMixedForms(field: string): Response {
+    return json(
+      {
+        error: `bracket-meta filter: cannot mix shorthand and operator forms for the same field — \`meta[${field}]=…\` and \`meta[${field}][<op>]=…\` are mutually exclusive in one request. Pick one form.`,
+        code: "INVALID_QUERY",
+      },
+      400,
+    );
+  }
+
+  function getOpObject(field: string): Record<string, unknown> {
+    let bucket = opObjectByField.get(field);
+    if (!bucket) {
+      bucket = {};
+      opObjectByField.set(field, bucket);
     }
-    // Shorthand `meta[field]=v` first, then `meta[field][op]=w` second would
-    // overwrite the shorthand. That's contradictory input — the bracket form
-    // wins (the more specific shape), but we drop the shorthand silently.
-    // We don't reject here; consumers who hit this can see the bracket op
-    // result and adjust.
-    const bucket: Record<string, unknown> = {};
-    metadata[field] = bucket;
     return bucket;
   }
 
@@ -169,13 +190,7 @@ function parseMetaBrackets(url: URL): {
           ),
         };
       }
-      if (op === "gte") {
-        dateBucket.field = field;
-        dateBucket.from = value;
-      } else if (op === "lt") {
-        dateBucket.field = field;
-        dateBucket.to = value;
-      } else {
+      if (op !== "gte" && op !== "lt") {
         return {
           error: json(
             {
@@ -186,6 +201,23 @@ function parseMetaBrackets(url: URL): {
           ),
         };
       }
+      // F1: dateFilter takes a single column. Reject the cross-column
+      // case before assigning — otherwise the second column's
+      // assignment would silently override the first.
+      if (dateField !== null && dateField !== field) {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter cannot span both \`created_at\` and \`updated_at\` in one request — issue two queries or use one column per request.`,
+              code: "INVALID_QUERY",
+            },
+            400,
+          ),
+        };
+      }
+      dateField = field as "created_at" | "updated_at";
+      if (op === "gte") dateFrom = value;
+      else dateTo = value;
       continue;
     }
 
@@ -193,26 +225,63 @@ function parseMetaBrackets(url: URL): {
     if (!op) {
       // Shorthand: `?meta[field]=value` → primitive (engine routes through
       // json_extract; no indexed declaration required).
+      // F2: reject if any operator form already wrote a bucket for this
+      // field — the two shapes don't compose and the silent stomp would
+      // drop one form's intent. Mirror check for the reverse order below.
+      if (opObjectByField.has(field) || opBucketsByField.has(field)) {
+        return { error: rejectMixedForms(field) };
+      }
+      shorthandFields.add(field);
       metadata[field] = value;
       continue;
     }
+    // F2: reject if shorthand already wrote a primitive for this field.
+    if (shorthandFields.has(field)) {
+      return { error: rejectMixedForms(field) };
+    }
+    // F4: `[]`-array syntax only makes sense for `in` / `not_in`. Other ops
+    // (eq, gt, exists, …) take a scalar; `meta[field][eq][]=v` is a
+    // shape error — surface it at the parser layer with a clear message
+    // instead of letting the engine raise a generic INVALID_OPERATOR_VALUE
+    // downstream.
+    if (isArray && !ARRAY_OPS.has(op)) {
+      return {
+        error: json(
+          {
+            error: `bracket-meta filter: array form \`meta[${field}][${op}][]=…\` is only valid for \`in\` and \`not_in\`. \`${op}\` takes a single value — use \`meta[${field}][${op}]=value\` instead.`,
+            code: "INVALID_OPERATOR_VALUE",
+          },
+          400,
+        ),
+      };
+    }
     if (isArray) {
-      // `meta[field][in][]=v1&meta[field][in][]=v2`
-      const bucketKey = `${field}|${op}`;
-      let bucket = arrayBuckets.get(bucketKey);
-      if (!bucket) {
-        bucket = [];
-        arrayBuckets.set(bucketKey, bucket);
+      // `meta[field][in][]=v1&meta[field][in][]=v2`. Nested map keeps
+      // field and op as separate dimensions — no string-concat ambiguity
+      // for field names that contain (or might one day be allowed to
+      // contain) the delimiter character. See vault#289 review F5.
+      let fieldBucket = opBucketsByField.get(field);
+      if (!fieldBucket) {
+        fieldBucket = new Map<string, string[]>();
+        opBucketsByField.set(field, fieldBucket);
       }
-      bucket.push(value);
+      let values = fieldBucket.get(op);
+      if (!values) {
+        values = [];
+        fieldBucket.set(op, values);
+      }
+      values.push(value);
       continue;
     }
     if (op === "in" || op === "not_in") {
-      // Comma form: `meta[field][in]=v1,v2`
+      // Comma form: `meta[field][in]=v1,v2`. Mutually exclusive with the
+      // `[]` array form per field+op — last write wins if both are
+      // supplied; we don't reject because the resulting array is well-
+      // defined regardless of which form a caller picked.
       const arr = value.includes(",")
         ? value.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
         : [value];
-      metaOpBucket(field)[op] = arr;
+      getOpObject(field)[op] = arr;
     } else if (op === "exists") {
       const bool = value === "true" ? true : value === "false" ? false : null;
       if (bool === null) {
@@ -226,23 +295,28 @@ function parseMetaBrackets(url: URL): {
           ),
         };
       }
-      metaOpBucket(field)[op] = bool;
+      getOpObject(field)[op] = bool;
     } else {
       // eq / ne / gt / gte / lt / lte — all primitive, single value. Type
       // coercion is left to SQLite affinity rules: indexed columns are
       // declared TEXT or INTEGER, and SQLite will compare a string-shaped
       // numeric correctly against an INTEGER column. The engine raises
       // UNKNOWN_OPERATOR if `op` isn't in SUPPORTED_OPS.
-      metaOpBucket(field)[op] = value;
+      getOpObject(field)[op] = value;
     }
   }
 
-  // Roll up `[]`-array buckets onto their fields.
-  for (const [bucketKey, values] of arrayBuckets) {
-    const sep = bucketKey.indexOf("|");
-    const field = bucketKey.slice(0, sep);
-    const op = bucketKey.slice(sep + 1);
-    metaOpBucket(field)[op] = values;
+  // Roll up `[]`-array buckets onto their op-objects. Done after the main
+  // loop so `in`/`not_in` array-form and comma-form on the same field
+  // collapse into one merged op-object cleanly.
+  for (const [field, opMap] of opBucketsByField) {
+    for (const [op, values] of opMap) {
+      getOpObject(field)[op] = values;
+    }
+  }
+  // Roll up op-objects onto the metadata payload.
+  for (const [field, opObj] of opObjectByField) {
+    metadata[field] = opObj;
   }
 
   const result: {
@@ -250,10 +324,10 @@ function parseMetaBrackets(url: URL): {
     dateFilter?: { field: string; from?: string; to?: string };
   } = {};
   if (Object.keys(metadata).length > 0) result.metadata = metadata;
-  if (dateBucket.field) {
-    result.dateFilter = { field: dateBucket.field };
-    if (dateBucket.from !== undefined) result.dateFilter.from = dateBucket.from;
-    if (dateBucket.to !== undefined) result.dateFilter.to = dateBucket.to;
+  if (dateField) {
+    result.dateFilter = { field: dateField };
+    if (dateFrom !== undefined) result.dateFilter.from = dateFrom;
+    if (dateTo !== undefined) result.dateFilter.to = dateTo;
   }
   return result;
 }

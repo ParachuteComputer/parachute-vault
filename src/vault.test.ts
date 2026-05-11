@@ -2288,6 +2288,98 @@ describe("HTTP /notes", async () => {
       expect(body.error).toContain("operator");
     });
 
+    // ---- Mutually-exclusive shapes that would silently corrupt input ----
+
+    test("bracket-date filter spanning created_at AND updated_at in one request rejects (vault#289 F1)", async () => {
+      // Before this guard, the parser flattened both columns onto a single
+      // `dateBucket.field`, so the second column silently won and the first
+      // column's bound was applied against the wrong column.
+      const res = await handleNotes(
+        mkReq(
+          "GET",
+          "/notes?meta[created_at][gte]=2026-04-01&meta[updated_at][lt]=2026-06-01",
+        ),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("cannot span");
+      expect(body.error).toContain("created_at");
+      expect(body.error).toContain("updated_at");
+    });
+
+    test("two bracket-date params on the same column compose into a range (regression)", async () => {
+      // The F1 guard must reject *different* columns only — same-column
+      // gte+lt is the canonical range case and must keep working.
+      await store.createNote("in-window", { created_at: "2026-04-15T00:00:00.000Z" });
+      await store.createNote("after-window", { created_at: "2026-05-15T00:00:00.000Z" });
+      await store.createNote("before-window", { created_at: "2026-03-15T00:00:00.000Z" });
+      const res = await handleNotes(
+        mkReq(
+          "GET",
+          "/notes?meta[created_at][gte]=2026-04-01&meta[created_at][lt]=2026-05-01&include_content=true",
+        ),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["in-window"]);
+    });
+
+    test("shorthand-then-operator on the same field rejects (vault#289 F2)", async () => {
+      // `URLSearchParams` iteration is insertion-order. Before this guard,
+      // shorthand wrote `metadata[field] = primitive`, then the operator
+      // handler called `metaOpBucket` which overwrote it with a fresh op
+      // object — the shorthand was silently dropped.
+      await declareIndexed();
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority]=5&meta[priority][gte]=3"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("mix shorthand and operator");
+    });
+
+    test("operator-then-shorthand on the same field rejects (vault#289 F2, reverse order)", async () => {
+      // Reverse insertion order. Before this guard, the operator was set
+      // first, then the shorthand wrote `metadata[field] = primitive` and
+      // clobbered the op bucket — operator silently dropped.
+      await declareIndexed();
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][gte]=3&meta[priority]=5"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("mix shorthand and operator");
+    });
+
+    test("`[]` array form on a non-array operator rejects at the parser layer (vault#289 F4)", async () => {
+      // `meta[field][eq][]=value` is a shape error — `eq` takes a scalar.
+      // The engine would also catch this (the value would be an array
+      // SQLite can't bind), but the parser-level error names the issue
+      // more precisely: "use single-value form for `eq`."
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][eq][]=5"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_OPERATOR_VALUE");
+      expect(body.error).toContain("array form");
+      expect(body.error).toContain("in");
+      expect(body.error).toContain("not_in");
+    });
+
     // ---- Precedence on overlap ----
     test("when both flat and bracket date params overlap, bracket wins", async () => {
       await store.createNote("old", { created_at: "2026-01-15T00:00:00.000Z" });

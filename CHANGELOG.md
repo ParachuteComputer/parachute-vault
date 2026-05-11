@@ -6,7 +6,7 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
-## [0.4.3-rc.2] — 2026-05-11
+## [0.4.3-rc.2] — 2026-05-10
 
 Closes the HTTP-side gap in vault's metadata-filter surface (vault#285
 friction point 1.3). The engine has always supported the full operator set —
@@ -69,14 +69,40 @@ through with a consistent shape.
   in 0.6.0; tracked at vault#288. On overlap (a request that supplies both
   forms), bracket wins.
 
+### Parser hardening (review folds on initial implementation)
+
+The parser holds invariants that the engine doesn't enforce on its side,
+because by the time bad input reaches the engine the parser has already
+flattened things. Three classes of silent-data-loss caught in review:
+
+- **Cross-column date filter rejection.** A request mixing
+  `meta[created_at][gte]=…` and `meta[updated_at][lt]=…` previously
+  flattened both onto a single column (whichever was parsed second won),
+  silently applying one column's bound against the wrong column. Now
+  rejects with INVALID_QUERY.
+- **Shorthand-vs-operator on the same field is mutually exclusive.**
+  `meta[field]=v` and `meta[field][gt]=w` in the same request used to
+  silently stomp each other based on URL parameter order (insertion-order
+  iteration). Both directions now reject with INVALID_QUERY.
+- **`[]` array syntax is gated to `in` / `not_in`.** `meta[field][eq][]=v`
+  is a shape error rather than a "happens to be an array passed to a
+  scalar operator" — now caught at the parser layer with a clear message
+  rather than via a generic engine-side INVALID_OPERATOR_VALUE.
+
+Also: refactored the array-bucket keying from `${field}|${op}` string concat
+to a nested `Map<field, Map<op, values>>` so field-name characters can't
+collide with the delimiter.
+
 ### Test plan
 
-- 18 new HTTP tests in `src/vault.test.ts` covering: every operator, both
+- 23 new HTTP tests in `src/vault.test.ts` covering: every operator, both
   array forms, shorthand equality, compound AND on one field and across
   fields, the `created_at`/`updated_at` bridge, deprecation precedence
-  (bracket wins), and all the rejection paths (unsupported date-column op,
-  non-boolean `exists`, non-indexed field, unknown operator).
-- 1250/1250 tests pass.
+  (bracket wins), every rejection path (unsupported date-column op,
+  non-boolean `exists`, non-indexed field, unknown operator), and the
+  three silent-data-loss guards (cross-column date, shorthand+operator
+  mix in both orderings, `[]` on non-array operator).
+- 1255/1255 tests pass.
 
 ### Out of scope
 
