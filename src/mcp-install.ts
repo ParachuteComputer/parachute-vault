@@ -156,13 +156,15 @@ export interface MintedHubJwt {
 
 /**
  * Discriminated failure modes from `mintHubJwt`. Callers turn each into a
- * different operator-facing message — missing operator.token has a specific
- * remediation (`parachute auth rotate-operator`); hub-unreachable has a
- * different one (check `PARACHUTE_HUB_ORIGIN` / start the hub); API-error
- * propagates the hub's own `error_description`.
+ * different operator-facing message — hub-unreachable has its own remediation
+ * (check `PARACHUTE_HUB_ORIGIN` / start the hub); API-error propagates the
+ * hub's own `error_description`.
+ *
+ * Operator-token absence is *not* a `mintHubJwt` failure mode: the caller is
+ * responsible for `readOperatorToken()` before invoking us — by the time we
+ * see `operatorToken: string`, it's guaranteed present.
  */
 export type MintHubJwtError =
-  | { kind: "no-operator-token"; checkedPath: string }
   | { kind: "network"; cause: string; origin: string }
   | { kind: "api-error"; status: number; error: string; description: string };
 

@@ -1033,7 +1033,7 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     console.error(
       "Note: --legacy-pat mints a vault-DB pvt_* token. The hub-issued JWT path (--mint, default) " +
         "is the canonical install going forward; pvt_* support is preserved for self-hosted-without-hub " +
-        "setups but may be removed in a future release.",
+        "setups, tracked at vault#288, planned removal 0.6.0.",
     );
     const store = getVaultStore(vaultName);
     const { fullToken } = generateToken();
@@ -1086,10 +1086,6 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     });
     if ("kind" in result) {
       switch (result.kind) {
-        case "no-operator-token":
-          // Shouldn't reach — we already checked above. Defensive branch.
-          console.error("Operator token disappeared between read and mint. Re-run.");
-          break;
         case "network":
           console.error(
             `Hub unreachable at ${result.origin} — ${result.cause}.\n` +

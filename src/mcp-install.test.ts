@@ -201,6 +201,36 @@ describe("chooseHubOrigin", () => {
     const res = chooseHubOrigin(1940, {});
     expect(res).toEqual({ url: "http://127.0.0.1:1940", source: "loopback" });
   });
+
+  test("derives the hub origin from an active expose-state FQDN", () => {
+    // Tailnet/public exposure with no hub env: hub origin uses the
+    // exposure's canonical FQDN (no /vault/<name>/mcp suffix — that's
+    // chooseMcpUrl's job, this returns the bare origin for the
+    // mint-token API call).
+    fs.writeFileSync(
+      path.join(tmpHome, "expose-state.json"),
+      JSON.stringify({
+        version: 1,
+        layer: "tailnet",
+        mode: "path",
+        canonicalFqdn: "parachute.taildf9ce2.ts.net",
+        port: 1940,
+        funnel: false,
+        entries: [],
+      }),
+    );
+    const res = chooseHubOrigin(1940, {});
+    expect(res).toEqual({
+      url: "https://parachute.taildf9ce2.ts.net",
+      source: "expose-state",
+    });
+  });
+
+  test("malformed expose-state.json gracefully falls through to loopback", () => {
+    fs.writeFileSync(path.join(tmpHome, "expose-state.json"), "{ not json");
+    const res = chooseHubOrigin(1940, {});
+    expect(res.source).toBe("loopback");
+  });
 });
 
 describe("readOperatorToken", () => {
@@ -501,9 +531,13 @@ describe("mcp-install end-to-end", () => {
     const res = runCli(["mcp-install", "--legacy-pat"], tmp);
     expect(res.exitCode).toBe(0);
     // Deprecation warning lands on stderr (we used `console.error` for the
-    // notice so it's visible without polluting stdout).
+    // notice so it's visible without polluting stdout). The message names
+    // the tracking issue + planned-removal milestone so operators can
+    // see what they're opting into.
     expect(res.stderr).toMatch(/--legacy-pat mints a vault-DB pvt_/);
     expect(res.stderr).toMatch(/canonical install going forward/);
+    expect(res.stderr).toMatch(/vault#288/);
+    expect(res.stderr).toMatch(/planned removal 0\.6\.0/);
     const config = readJson(path.join(tmp, ".claude.json"));
     const bearer = config.mcpServers["parachute-vault"].headers.Authorization;
     expect(bearer).toMatch(/^Bearer pvt_/);
