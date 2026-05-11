@@ -264,6 +264,12 @@ export interface InstallTarget {
  * Pick the MCP client config file path based on `--install-scope`. Project
  * scope writes to `<cwd>/.mcp.json` (Claude Code convention); user scope
  * writes to `~/.claude.json` (legacy + still canonical for user-wide setup).
+ *
+ * `homedir()` from node:os is cached at process start on Bun, so in-process
+ * `process.env.HOME` overrides don't propagate to it. We prefer the
+ * (mutable) env var when set so tests that flip `HOME` see the override
+ * without subprocess-spawning. Falls back to `homedir()` for the
+ * common case where neither tests nor exotic chrooting touches HOME.
  */
 export function resolveInstallTarget(
   scope: InstallScope,
@@ -272,5 +278,174 @@ export function resolveInstallTarget(
   if (scope === "project") {
     return { path: resolve(cwd, ".mcp.json"), scope: "project" };
   }
-  return { path: resolve(homedir(), ".claude.json"), scope: "user" };
+  const home = process.env.HOME ?? homedir();
+  return { path: resolve(home, ".claude.json"), scope: "user" };
+}
+
+// ---------------------------------------------------------------------------
+// Context detection — feeds the interactive walkthrough's smart defaults
+// ---------------------------------------------------------------------------
+
+/**
+ * "Is this a project directory?" heuristic. Looks for any of the common
+ * project-root markers in the supplied directory (defaults to CWD):
+ *
+ *   .git              — git checkout (the strong signal)
+ *   package.json      — Node/Bun project
+ *   pyproject.toml    — Python project (modern)
+ *   Cargo.toml        — Rust project
+ *   go.mod            — Go module
+ *   deno.json         — Deno project
+ *   .parachute        — Parachute config dir present (matches our own convention)
+ *
+ * The detection is intentionally shallow — only the supplied directory,
+ * not its ancestors. Walking up to find a marker would create surprising
+ * defaults from arbitrary subdirectories ("why does installing from
+ * ~/code/myproject/subdir behave like ~/code/myproject?"). The operator
+ * can always opt explicitly with `--install-scope project` from anywhere.
+ */
+export function detectProjectContext(cwd: string = process.cwd()): boolean {
+  const markers = [
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "go.mod",
+    "deno.json",
+    ".parachute",
+  ];
+  for (const marker of markers) {
+    if (existsSync(resolve(cwd, marker))) return true;
+  }
+  return false;
+}
+
+/**
+ * Shape of an existing vault MCP entry the interactive walkthrough cares
+ * about. Used to default the "update where it is" branch in the install-
+ * scope prompt without re-reading the same files multiple times.
+ */
+export interface ExistingMcpEntry {
+  /** Absolute path of the config file the entry lives in. */
+  path: string;
+  /** Display label for prompts (~/.claude.json or ./.mcp.json). */
+  label: string;
+  /** Whether the entry sits in user or project scope. */
+  scope: InstallScope;
+  /** `mcpServers` key the entry occupies. */
+  entryKey: string;
+  /** The URL field of the entry (operator-visible state). */
+  url: string;
+  /** Whether the entry has an Authorization header. */
+  hasAuth: boolean;
+}
+
+/**
+ * Look for an existing parachute-vault entry at the user-level
+ * `~/.claude.json` and the project-level `./.mcp.json`. Returns each
+ * matching entry independently so the walkthrough can present either
+ * (or both, but in practice we pick one).
+ *
+ * `parachute-vault` (singular) wins over `parachute-vault-<name>` at the
+ * same file — the singular slot is the canonical default install; per-
+ * vault keys are the multi-vault add-ons.
+ */
+export function detectExistingEntries(
+  cwd: string = process.cwd(),
+): { user?: ExistingMcpEntry; project?: ExistingMcpEntry } {
+  return {
+    ...maybeEntry(resolveInstallTarget("user"), "~/.claude.json"),
+    ...maybeEntry(resolveInstallTarget("project", cwd), `${cwd}/.mcp.json`),
+  };
+
+  function maybeEntry(
+    target: InstallTarget,
+    label: string,
+  ): { user?: ExistingMcpEntry } | { project?: ExistingMcpEntry } | {} {
+    if (!existsSync(target.path)) return {};
+    let config: any;
+    try {
+      config = JSON.parse(readFileSync(target.path, "utf-8"));
+    } catch {
+      return {};
+    }
+    const servers: Record<string, any> = config?.mcpServers ?? {};
+    let entry = servers["parachute-vault"];
+    let entryKey = "parachute-vault";
+    if (!entry) {
+      for (const key of Object.keys(servers)) {
+        if (key.startsWith("parachute-vault-")) {
+          entry = servers[key];
+          entryKey = key;
+          break;
+        }
+      }
+    }
+    if (!entry || typeof entry.url !== "string") return {};
+    const result: ExistingMcpEntry = {
+      path: target.path,
+      label,
+      scope: target.scope,
+      entryKey,
+      url: entry.url,
+      hasAuth: Boolean(entry.headers?.Authorization),
+    };
+    return target.scope === "user" ? { user: result } : { project: result };
+  }
+}
+
+/**
+ * Snapshot of everything the interactive walkthrough needs to pick smart
+ * defaults. Computed once at the start of the flow so each prompt's
+ * reasoning is consistent (no surprise mid-flow re-reads).
+ */
+export interface InstallContext {
+  /** All vault names declared on this host. */
+  vaults: string[];
+  /** The vault `default_vault` config points at (or first vault, or "default"). */
+  defaultVault: string;
+  /** Whether a hub origin is configured beyond the loopback fallback. */
+  hubReachable: boolean;
+  /** The resolved hub origin (loopback if no hub configured). */
+  hubOrigin: string;
+  /** Whether `~/.parachute/operator.token` exists and is non-empty. */
+  operatorTokenPresent: boolean;
+  /** Heuristic: is CWD a project directory? */
+  inProjectContext: boolean;
+  /** Where the walkthrough was invoked from. */
+  cwd: string;
+  /** Pre-existing entries at user / project scope, if any. */
+  existing: { user?: ExistingMcpEntry; project?: ExistingMcpEntry };
+}
+
+/**
+ * Build an `InstallContext` from the current process + filesystem. Pure-
+ * function-shaped (takes everything it needs as args with sensible
+ * defaults), so tests can synthesize alternate contexts without monkey-
+ * patching globals.
+ */
+export function detectInstallContext(opts: {
+  vaults: string[];
+  defaultVault: string;
+  port: number;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}): InstallContext {
+  const env = opts.env ?? process.env;
+  const cwd = opts.cwd ?? process.cwd();
+  // Narrow to chooseHubOrigin's expected shape — NodeJS.ProcessEnv is a
+  // string-index type that doesn't structurally match the explicit shape
+  // chooseHubOrigin declares; passing a sliced view sidesteps the
+  // structural-incompatibility complaint without losing safety.
+  const hub = chooseHubOrigin(opts.port, { PARACHUTE_HUB_ORIGIN: env.PARACHUTE_HUB_ORIGIN });
+  return {
+    vaults: opts.vaults,
+    defaultVault: opts.defaultVault,
+    hubReachable: hub.source !== "loopback",
+    hubOrigin: hub.url,
+    operatorTokenPresent: readOperatorToken(env) !== null,
+    inProjectContext: detectProjectContext(cwd),
+    cwd,
+    existing: detectExistingEntries(cwd),
+  };
 }
