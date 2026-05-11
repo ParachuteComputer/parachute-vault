@@ -1550,6 +1550,31 @@ describe("HTTP /notes", async () => {
     expect(body.map((n) => n.content)).toEqual(["plain"]);
   });
 
+  // ---- updated_at filter via date_field (vault#285 friction point 1.5) ----
+  //
+  // HTTP plumbing routes `date_field=updated_at&date_from=…` straight to
+  // the core `dateFilter` resolver, which now recognizes `updated_at` as
+  // a real column. Smoke-tests the end-to-end HTTP path; the engine-side
+  // semantics are exercised in core.test.ts.
+  test("GET /notes?date_field=updated_at filters by last-write time", async () => {
+    const a = await store.createNote("untouched", { id: "ua", path: "ua" });
+    const b = await store.createNote("modified", { id: "ub", path: "ub" });
+    // Bump b's updated_at into the test window, leave a's at its createdAt.
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-01-15T00:00:00.000Z", a.id);
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-04-25T00:00:00.000Z", b.id);
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?date_field=updated_at&date_from=2026-04-01&include_content=true"),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["modified"]);
+  });
+
   test("GET /notes?has_links=false returns only orphaned notes", async () => {
     const a = await store.createNote("src", { id: "qa" });
     const b = await store.createNote("tgt", { id: "qb" });
@@ -2352,6 +2377,39 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.path).toBe("beta");
     // Source note unchanged
     expect((await store.getNote("a"))!.path).toBe("alpha");
+  });
+
+  // ---- include_content response-shape opt-out (vault#285 friction point 2.response) ----
+  test("PATCH defaults to returning the full Note (back-compat)", async () => {
+    await store.createNote("body", { id: "x" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { content: "updated", force: true }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.content).toBe("updated");
+    expect(body.byteSize).toBeUndefined();
+    expect(body.preview).toBeUndefined();
+  });
+
+  test("PATCH with include_content: false returns the lean NoteIndex shape", async () => {
+    const longBody = "x".repeat(2_000);
+    await store.createNote(longBody, { id: "big", path: "big" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/big", { append: " edit", include_content: false }),
+      store,
+      "/big",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.content).toBeUndefined();
+    expect(typeof body.byteSize).toBe("number");
+    expect(body.byteSize).toBe(2_000 + 5);
+    expect(typeof body.preview).toBe("string");
+    expect(body.id).toBe("big");
+    expect(body.path).toBe("big");
   });
 });
 

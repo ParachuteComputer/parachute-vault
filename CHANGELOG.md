@@ -6,6 +6,57 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.3-rc.1] — 2026-05-10
+
+Two small additive enhancements distilled from the field-input evaluation in
+vault#285. Neither changes existing behavior; both are opt-in conveniences for
+agents and SSGs already hitting vault's query and write surfaces.
+
+### Read path
+
+- **`dateFilter` recognizes `updated_at` (vault#285 friction point 1.5).**
+  Today `dateFilter.field` accepted only `created_at` or an indexed metadata
+  field. `updated_at` joins them as a recognized real column — no indexed-field
+  declaration required, no schema setup. Unblocks the incremental-rebuild
+  pattern an SSG (or any syncing consumer) reaches for: ask vault "what
+  changed since my last build" via
+  `dateFilter: { field: "updated_at", from: lastBuildISO }`. Same API across
+  MCP (`date_filter.field`) and HTTP (`?date_field=updated_at&date_from=…`).
+  No B-tree index on `updated_at` today; a sequential scan is fine for the
+  current sizes (file an issue if a real workload ever shows it).
+
+### Write path
+
+- **`update-note` response-shape opt-out (vault#285 friction point 2.response).**
+  `update-note` accepts a new `include_content: boolean` parameter. Default
+  is `true` for back-compat — existing callers see no change. Set to `false`
+  and the response swaps the full `Note` for the lean `NoteIndex` shape
+  (`id`, `path`, `createdAt`, `updatedAt`, `tags`, `metadata`, `byteSize`,
+  `preview`); `validation_status` is preserved when present. Cuts the
+  response cost on the agent workflow that motivated this — frequent
+  `append` / `content_edit` edits to large notes — by an order of magnitude
+  for big notes. Exposed via MCP `update-note` and HTTP `PATCH /notes/:id`.
+
+### Notes on what stayed put
+
+The wider vault#285 evaluation surfaced six other friction points. None ship
+here; the framing is "small additive only, defer design choices":
+
+- **1.1 path_prefix** — already shipped end-to-end (MCP + HTTP + storage).
+- **1.2 sort by metadata** — already shipped via `order_by` on indexed fields.
+- **1.3 metadata-value filters on HTTP REST** — engine + MCP have it; the
+  HTTP query-string syntax is a design choice still pending.
+- **1.4 tunable preview length** — `NoteIndex` already returns a 120-char
+  preview; a knob is deferred until concretely needed.
+- **1.6 URL-safe slug** — design pending (stability under rename, derive
+  from id vs path); deferred until a renderer needs it.
+- **1.7 Tailscale Funnel** — already documented in README §"Remote access
+  via Tailscale Funnel."
+- **Section 2 section/diff/line-range edits** — speculative; the
+  `append`/`prepend`/`content_edit` primitives that already shipped in
+  #200 cover the originating workflow; the response-side cost is what
+  this release closes.
+
 ## [0.4.2] — 2026-05-10
 
 Six release cuts (`0.4.1-rc.1` through `0.4.1-rc.6`) ship together as
