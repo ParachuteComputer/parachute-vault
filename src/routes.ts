@@ -81,6 +81,258 @@ function parseInt10(val: string | null): number | undefined {
 }
 
 /**
+ * Parse bracket-style metadata filters (vault#285 friction point 1.3).
+ *
+ * Maps `?meta[field][op]=value` (Stripe / JSON:API / Strapi convention) to
+ * the engine `metadata` filter shape at `core/src/notes.ts:494-509`. Recognised
+ * forms:
+ *
+ *   - `?meta[field]=value`                 — shorthand equality (JSON-scan;
+ *                                            no indexed-field declaration
+ *                                            required)
+ *   - `?meta[field][op]=value`             — operator query (routes through
+ *                                            the indexed generated column;
+ *                                            engine raises FIELD_NOT_INDEXED
+ *                                            if the field isn't declared)
+ *   - `?meta[field][in][]=v1&[in][]=v2`    — array form for in/not_in
+ *   - `?meta[field][in]=v1,v2`             — comma-separated form for in/not_in
+ *
+ * Supported operators mirror the engine: `eq`, `ne`, `gt`, `gte`, `lt`,
+ * `lte`, `in`, `not_in`, `exists`. `exists` requires `"true"` or `"false"`;
+ * other values reject with INVALID_OPERATOR_VALUE.
+ *
+ * Compound filters AND together: multiple `meta[a][gte]=1&meta[a][lt]=5`
+ * on the same field merge into one operator object; filters on different
+ * fields stack as independent AND clauses (engine semantics).
+ *
+ * **Bridge for the real `n.created_at` / `n.updated_at` columns** — these
+ * route through `dateFilter` (the existing engine path that exempts them
+ * from the indexed-field gate), not through the metadata-filter path. Only
+ * `gte` (→ inclusive `from`) and `lt` (→ exclusive `to`) are accepted on
+ * these fields, matching the dateFilter contract exactly. Other operators
+ * reject with INVALID_QUERY so callers don't think `meta[created_at][eq]=…`
+ * works.
+ *
+ * Returns `{ metadata?, dateFilter?, error? }`. When `error` is set the
+ * caller should return it directly (already shaped as a 400 with
+ * `error` + `code`).
+ */
+function parseMetaBrackets(url: URL): {
+  metadata?: Record<string, unknown>;
+  dateFilter?: { field: string; from?: string; to?: string };
+  error?: Response;
+} {
+  // Real columns on `notes` — exempt from the indexed-field gate, routed
+  // through `dateFilter` instead of `metadata`.
+  const REAL_DATE_COLUMNS = new Set(["created_at", "updated_at"]);
+  // Operators that take an array value. Used for parser-level rejection of
+  // `[]`-array syntax on the wrong operator (e.g. `meta[field][eq][]=value`).
+  const ARRAY_OPS = new Set(["in", "not_in"]);
+  // `meta[FIELD]` or `meta[FIELD][OP]` or `meta[FIELD][OP][]`. Field names are
+  // bounded by `FIELD_NAME_RE` at the engine layer; the parser is liberal here
+  // and lets the engine raise the loud error on bad names.
+  const META_RE = /^meta\[([^\]]+)\](?:\[([^\]]+)\](\[\])?)?$/;
+
+  // `metadata[field]` is either a primitive (shorthand `eq` via json_extract)
+  // or a sub-object of operator clauses. The two are *mutually exclusive per
+  // field per request*: mixing them is a silent-data-loss footgun (op set,
+  // then shorthand stomps; or shorthand set, then op stomps) so we reject
+  // loudly. Track each field's chosen form here.
+  const metadata: Record<string, unknown> = {};
+  const shorthandFields = new Set<string>();
+  const opBucketsByField = new Map<string, Map<string, string[]>>(); // field → op → values (array form)
+  const opObjectByField = new Map<string, Record<string, unknown>>(); // field → built op object (single-value ops)
+
+  // dateFilter accumulates `from` (gte) and `to` (lt) bounds on a single
+  // column. Spanning both `created_at` AND `updated_at` in one request is
+  // not expressible (the engine takes one `field`), so we reject early
+  // rather than silently corrupting one bound. See vault#289 review F1.
+  let dateField: "created_at" | "updated_at" | null = null;
+  let dateFrom: string | undefined;
+  let dateTo: string | undefined;
+
+  function rejectMixedForms(field: string): Response {
+    return json(
+      {
+        error: `bracket-meta filter: cannot mix shorthand and operator forms for the same field — \`meta[${field}]=…\` and \`meta[${field}][<op>]=…\` are mutually exclusive in one request. Pick one form.`,
+        code: "INVALID_QUERY",
+      },
+      400,
+    );
+  }
+
+  function getOpObject(field: string): Record<string, unknown> {
+    let bucket = opObjectByField.get(field);
+    if (!bucket) {
+      bucket = {};
+      opObjectByField.set(field, bucket);
+    }
+    return bucket;
+  }
+
+  for (const [key, value] of url.searchParams.entries()) {
+    const m = META_RE.exec(key);
+    if (!m) continue;
+    const field = m[1]!;
+    const op = m[2];
+    const isArray = m[3] === "[]";
+
+    // Bridge: real date columns route to dateFilter, not metadata.
+    if (REAL_DATE_COLUMNS.has(field)) {
+      if (!op) {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter on \`${field}\` requires an operator: meta[${field}][gte]=… (lower bound) or meta[${field}][lt]=… (upper bound, exclusive).`,
+              code: "INVALID_QUERY",
+            },
+            400,
+          ),
+        };
+      }
+      if (op !== "gte" && op !== "lt") {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter on \`${field}\` supports only \`gte\` (inclusive lower bound) and \`lt\` (exclusive upper bound). Got: \`${op}\`. The dateFilter contract uses these two ops because the equivalent flat shape (\`date_field=${field}&date_from=…&date_to=…\`) is half-open by design.`,
+              code: "INVALID_QUERY",
+            },
+            400,
+          ),
+        };
+      }
+      // F1: dateFilter takes a single column. Reject the cross-column
+      // case before assigning — otherwise the second column's
+      // assignment would silently override the first.
+      if (dateField !== null && dateField !== field) {
+        return {
+          error: json(
+            {
+              error: `bracket-date filter cannot span both \`created_at\` and \`updated_at\` in one request — issue two queries or use one column per request.`,
+              code: "INVALID_QUERY",
+            },
+            400,
+          ),
+        };
+      }
+      dateField = field as "created_at" | "updated_at";
+      if (op === "gte") dateFrom = value;
+      else dateTo = value;
+      continue;
+    }
+
+    // Regular metadata field.
+    if (!op) {
+      // Shorthand: `?meta[field]=value` → primitive (engine routes through
+      // json_extract; no indexed declaration required).
+      // F2: reject if any operator form already wrote a bucket for this
+      // field — the two shapes don't compose and the silent stomp would
+      // drop one form's intent. Mirror check for the reverse order below.
+      if (opObjectByField.has(field) || opBucketsByField.has(field)) {
+        return { error: rejectMixedForms(field) };
+      }
+      shorthandFields.add(field);
+      metadata[field] = value;
+      continue;
+    }
+    // F2: reject if shorthand already wrote a primitive for this field.
+    if (shorthandFields.has(field)) {
+      return { error: rejectMixedForms(field) };
+    }
+    // F4: `[]`-array syntax only makes sense for `in` / `not_in`. Other ops
+    // (eq, gt, exists, …) take a scalar; `meta[field][eq][]=v` is a
+    // shape error — surface it at the parser layer with a clear message
+    // instead of letting the engine raise a generic INVALID_OPERATOR_VALUE
+    // downstream.
+    if (isArray && !ARRAY_OPS.has(op)) {
+      return {
+        error: json(
+          {
+            error: `bracket-meta filter: array form \`meta[${field}][${op}][]=…\` is only valid for \`in\` and \`not_in\`. \`${op}\` takes a single value — use \`meta[${field}][${op}]=value\` instead.`,
+            code: "INVALID_OPERATOR_VALUE",
+          },
+          400,
+        ),
+      };
+    }
+    if (isArray) {
+      // `meta[field][in][]=v1&meta[field][in][]=v2`. Nested map keeps
+      // field and op as separate dimensions — no string-concat ambiguity
+      // for field names that contain (or might one day be allowed to
+      // contain) the delimiter character. See vault#289 review F5.
+      let fieldBucket = opBucketsByField.get(field);
+      if (!fieldBucket) {
+        fieldBucket = new Map<string, string[]>();
+        opBucketsByField.set(field, fieldBucket);
+      }
+      let values = fieldBucket.get(op);
+      if (!values) {
+        values = [];
+        fieldBucket.set(op, values);
+      }
+      values.push(value);
+      continue;
+    }
+    if (op === "in" || op === "not_in") {
+      // Comma form: `meta[field][in]=v1,v2`. Mutually exclusive with the
+      // `[]` array form per field+op — last write wins if both are
+      // supplied; we don't reject because the resulting array is well-
+      // defined regardless of which form a caller picked.
+      const arr = value.includes(",")
+        ? value.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+        : [value];
+      getOpObject(field)[op] = arr;
+    } else if (op === "exists") {
+      const bool = value === "true" ? true : value === "false" ? false : null;
+      if (bool === null) {
+        return {
+          error: json(
+            {
+              error: `bracket-meta filter: \`exists\` on \`${field}\` requires "true" or "false", got "${value}"`,
+              code: "INVALID_OPERATOR_VALUE",
+            },
+            400,
+          ),
+        };
+      }
+      getOpObject(field)[op] = bool;
+    } else {
+      // eq / ne / gt / gte / lt / lte — all primitive, single value. Type
+      // coercion is left to SQLite affinity rules: indexed columns are
+      // declared TEXT or INTEGER, and SQLite will compare a string-shaped
+      // numeric correctly against an INTEGER column. The engine raises
+      // UNKNOWN_OPERATOR if `op` isn't in SUPPORTED_OPS.
+      getOpObject(field)[op] = value;
+    }
+  }
+
+  // Roll up `[]`-array buckets onto their op-objects. Done after the main
+  // loop so `in`/`not_in` array-form and comma-form on the same field
+  // collapse into one merged op-object cleanly.
+  for (const [field, opMap] of opBucketsByField) {
+    for (const [op, values] of opMap) {
+      getOpObject(field)[op] = values;
+    }
+  }
+  // Roll up op-objects onto the metadata payload.
+  for (const [field, opObj] of opObjectByField) {
+    metadata[field] = opObj;
+  }
+
+  const result: {
+    metadata?: Record<string, unknown>;
+    dateFilter?: { field: string; from?: string; to?: string };
+  } = {};
+  if (Object.keys(metadata).length > 0) result.metadata = metadata;
+  if (dateField) {
+    result.dateFilter = { field: dateField };
+    if (dateFrom !== undefined) result.dateFilter.from = dateFrom;
+    if (dateTo !== undefined) result.dateFilter.to = dateTo;
+  }
+  return result;
+}
+
+/**
  * Parse include_metadata query param.
  * - absent/null → undefined (all metadata, default)
  * - "true"/"1" → true (all metadata)
@@ -219,13 +471,32 @@ export async function handleNotes(
 
       // Structured query
       //
-      // Surface asymmetry: REST uses three flat query params
-      // (`date_field`, `date_from`, `date_to`) while MCP takes a nested
-      // `date_filter: { field, from, to }` object. Both lower to the same
-      // store-level `dateFilter` shape — the difference is just that query
-      // strings are flat by nature. This mirrors the broader REST/MCP
-      // pattern across the API and is intentional, not a fix-it-up TODO.
+      // Two filter syntaxes coexist on this endpoint:
+      //
+      //   - **Bracket-style** (canonical, vault#285 friction point 1.3):
+      //     `?meta[field][op]=value` / `?meta[created_at][gte]=…`. Exposes
+      //     the full engine `metadata` filter (eq/ne/gt/gte/lt/lte/in/
+      //     not_in/exists) and the dateFilter bridge through one consistent
+      //     shape. See `parseMetaBrackets` for the grammar.
+      //
+      //   - **Flat date params** (DEPRECATED): `?date_field=created_at&
+      //     date_from=…&date_to=…` and the legacy `?date_from=…&date_to=…`.
+      //     Still functional through 0.5.x; planned removal in 0.6.0
+      //     (vault#288). New consumers should use bracket-style.
+      //
+      // Precedence on overlap: bracket-style wins. If a caller passes both
+      // `meta[created_at][gte]=X` and `date_field=created_at&date_from=Y`,
+      // the bracket form is the dateFilter the engine sees; the flat
+      // params are silently dropped. We don't error — the bracket form is
+      // documented as canonical, and rejecting the overlap would block a
+      // realistic migration path where a caller half-converted their code.
+      //
+      // Surface asymmetry: REST flattens to a query string; MCP takes a
+      // nested `date_filter: { field, from, to }` object directly. Both
+      // lower to the same store-level `dateFilter` shape.
       const tags = parseQueryList(url, "tag");
+      const bracket = parseMetaBrackets(url);
+      if (bracket.error) return bracket.error;
       let results: Note[];
       try {
         results = await store.queryNotes({
@@ -236,23 +507,28 @@ export async function handleNotes(
           hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
           path: parseQuery(url, "path") ?? undefined,
           pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
-          metadata: undefined, // metadata filter not practical in query params
-          // `date_field=<name>&date_from=...&date_to=...` activates the
-          // generalized filter (filters on the named indexed field). Without
-          // `date_field`, `date_from`/`date_to` keep their legacy meaning of
-          // filtering on `created_at` (vault ingestion time).
-          ...(parseQuery(url, "date_field")
-            ? {
-                dateFilter: {
-                  field: parseQuery(url, "date_field")!,
-                  from: parseQuery(url, "date_from") ?? undefined,
-                  to: parseQuery(url, "date_to") ?? undefined,
-                },
-              }
-            : {
-                dateFrom: parseQuery(url, "date_from") ?? undefined,
-                dateTo: parseQuery(url, "date_to") ?? undefined,
-              }),
+          metadata: bracket.metadata,
+          // Date-range precedence chain (highest to lowest):
+          //   1. Bracket-style `meta[created_at][gte]=…` (canonical).
+          //   2. Flat `date_field=…&date_from=…&date_to=…` (deprecated).
+          //   3. Legacy `date_from=…&date_to=…` (no date_field, deprecated)
+          //      — filters on `n.created_at` by definition.
+          // The engine rejects combinations of `dateFilter` with the legacy
+          // `dateFrom`/`dateTo`, so we never set both shapes simultaneously.
+          ...(bracket.dateFilter
+            ? { dateFilter: bracket.dateFilter }
+            : parseQuery(url, "date_field")
+              ? {
+                  dateFilter: {
+                    field: parseQuery(url, "date_field")!,
+                    from: parseQuery(url, "date_from") ?? undefined,
+                    to: parseQuery(url, "date_to") ?? undefined,
+                  },
+                }
+              : {
+                  dateFrom: parseQuery(url, "date_from") ?? undefined,
+                  dateTo: parseQuery(url, "date_to") ?? undefined,
+                }),
           sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
           orderBy: parseQuery(url, "order_by") ?? undefined,
           limit: parseInt10(parseQuery(url, "limit")) ?? 50,

@@ -2027,6 +2027,378 @@ describe("HTTP /notes", async () => {
       expect(body).toHaveLength(500);
     });
   });
+
+  // ---- Bracket-style metadata filter (vault#285 friction point 1.3) ----
+  //
+  // Exposes vault's engine-level metadata-value filtering to HTTP REST
+  // callers (today: only MCP). Uses `meta[field][op]=value` (Stripe /
+  // JSON:API / Strapi convention). The HTTP layer translates to the engine's
+  // existing `metadata` filter; engine semantics + gates are unchanged.
+  // Bridges `created_at` / `updated_at` through `dateFilter`.
+  describe("bracket-style metadata filter", () => {
+    async function declareIndexed() {
+      const { declareField } = await import("../core/src/indexed-fields.ts");
+      declareField(db, "priority", "INTEGER", "project");
+      declareField(db, "status", "TEXT", "project");
+    }
+
+    test("shorthand `?meta[field]=value` does exact equality (JSON scan, no indexed gate)", async () => {
+      // Deliberately NOT calling declareIndexed — shorthand should work on
+      // any field via the json_extract fallback at core/src/notes.ts:504-507.
+      await store.createNote("matches", { metadata: { kind: "draft" } });
+      await store.createNote("other", { metadata: { kind: "final" } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[kind]=draft&include_content=true"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["matches"]);
+    });
+
+    test("eq operator on indexed field", async () => {
+      await declareIndexed();
+      await store.createNote("p5", { metadata: { priority: 5 } });
+      await store.createNote("p1", { metadata: { priority: 1 } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][eq]=5&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["p5"]);
+    });
+
+    test("ne operator returns non-matching rows plus rows without the field", async () => {
+      await declareIndexed();
+      await store.createNote("has-1", { metadata: { priority: 1 } });
+      await store.createNote("has-2", { metadata: { priority: 2 } });
+      await store.createNote("missing");
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][ne]=1&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content).sort()).toEqual(["has-2", "missing"]);
+    });
+
+    test("gt / gte / lt / lte compose into a range query on one field", async () => {
+      await declareIndexed();
+      for (const p of [1, 2, 3, 4, 5]) {
+        await store.createNote(`p${p}`, { metadata: { priority: p } });
+      }
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][gte]=2&meta[priority][lt]=5&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content).sort()).toEqual(["p2", "p3", "p4"]);
+    });
+
+    test("in array form: `?meta[field][in][]=v1&meta[field][in][]=v2`", async () => {
+      await declareIndexed();
+      await store.createNote("a", { metadata: { status: "active" } });
+      await store.createNote("b", { metadata: { status: "exploring" } });
+      await store.createNote("c", { metadata: { status: "done" } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[status][in][]=active&meta[status][in][]=exploring&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content).sort()).toEqual(["a", "b"]);
+    });
+
+    test("in comma form: `?meta[field][in]=v1,v2`", async () => {
+      await declareIndexed();
+      await store.createNote("a", { metadata: { status: "active" } });
+      await store.createNote("b", { metadata: { status: "exploring" } });
+      await store.createNote("c", { metadata: { status: "done" } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[status][in]=active,exploring&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content).sort()).toEqual(["a", "b"]);
+    });
+
+    test("not_in via comma form", async () => {
+      await declareIndexed();
+      await store.createNote("a", { metadata: { status: "active" } });
+      await store.createNote("b", { metadata: { status: "done" } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[status][not_in]=done&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["a"]);
+    });
+
+    test("exists: true / false distinguishes present vs absent field", async () => {
+      await declareIndexed();
+      await store.createNote("has", { metadata: { priority: 3 } });
+      await store.createNote("missing");
+
+      const hasRes = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][exists]=true&include_content=true"),
+        store,
+        "",
+      );
+      const hasBody = await hasRes.json() as any[];
+      expect(hasBody.map((n) => n.content)).toEqual(["has"]);
+
+      const missingRes = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][exists]=false&include_content=true"),
+        store,
+        "",
+      );
+      const missingBody = await missingRes.json() as any[];
+      expect(missingBody.map((n) => n.content)).toEqual(["missing"]);
+    });
+
+    test("exists with non-boolean value rejects with INVALID_OPERATOR_VALUE", async () => {
+      await declareIndexed();
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][exists]=yes"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_OPERATOR_VALUE");
+    });
+
+    test("compound filter across two fields ANDs together", async () => {
+      await declareIndexed();
+      await store.createNote("hit", { metadata: { priority: 5, status: "active" } });
+      await store.createNote("priority-only", { metadata: { priority: 5, status: "done" } });
+      await store.createNote("status-only", { metadata: { priority: 1, status: "active" } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][gte]=4&meta[status][eq]=active&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["hit"]);
+    });
+
+    test("operator query on a non-indexed field returns 400 with FIELD_NOT_INDEXED", async () => {
+      // Don't declare the field — the engine's indexed-field gate should fire.
+      await store.createNote("x", { metadata: { mood: "great" } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[mood][eq]=great"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("FIELD_NOT_INDEXED");
+    });
+
+    test("unknown operator returns 400 with UNKNOWN_OPERATOR", async () => {
+      await declareIndexed();
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][bogus]=5"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("UNKNOWN_OPERATOR");
+    });
+
+    // ---- Bridge: created_at / updated_at via brackets route to dateFilter ----
+    test("`meta[created_at][gte]=…` routes to dateFilter (same result as flat date_field)", async () => {
+      await store.createNote("old", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("new", { created_at: "2026-04-15T00:00:00.000Z" });
+
+      const bracketRes = await handleNotes(
+        mkReq("GET", "/notes?meta[created_at][gte]=2026-04-01&include_content=true"),
+        store,
+        "",
+      );
+      const bracketBody = await bracketRes.json() as any[];
+      const flatRes = await handleNotes(
+        mkReq("GET", "/notes?date_field=created_at&date_from=2026-04-01&include_content=true"),
+        store,
+        "",
+      );
+      const flatBody = await flatRes.json() as any[];
+      expect(bracketBody.map((n) => n.content)).toEqual(["new"]);
+      expect(bracketBody.map((n) => n.content)).toEqual(flatBody.map((n) => n.content));
+    });
+
+    test("`meta[updated_at][gte]=…` routes to dateFilter on n.updated_at", async () => {
+      const a = await store.createNote("untouched");
+      const b = await store.createNote("modified");
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+        .run("2026-01-15T00:00:00.000Z", a.id);
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", b.id);
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[updated_at][gte]=2026-04-01&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["modified"]);
+    });
+
+    test("`meta[created_at][lt]=…` maps to dateFilter's exclusive upper bound", async () => {
+      await store.createNote("inside", { created_at: "2026-04-15T00:00:00.000Z" });
+      await store.createNote("on-boundary", { created_at: "2026-05-01T00:00:00.000Z" });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[created_at][lt]=2026-05-01&include_content=true"),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      // "on-boundary" excluded because `< to` is half-open by design.
+      expect(body.map((n) => n.content)).toEqual(["inside"]);
+    });
+
+    test("unsupported date-column operator (e.g. gt) rejects with a guiding error", async () => {
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[created_at][gt]=2026-01-01"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      // Error must call out the supported ops so callers can self-correct.
+      expect(body.error).toContain("gte");
+      expect(body.error).toContain("lt");
+    });
+
+    test("`meta[created_at]=…` (shorthand, no operator) rejects with a guiding error", async () => {
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[created_at]=2026-01-01"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("operator");
+    });
+
+    // ---- Mutually-exclusive shapes that would silently corrupt input ----
+
+    test("bracket-date filter spanning created_at AND updated_at in one request rejects (vault#289 F1)", async () => {
+      // Before this guard, the parser flattened both columns onto a single
+      // `dateBucket.field`, so the second column silently won and the first
+      // column's bound was applied against the wrong column.
+      const res = await handleNotes(
+        mkReq(
+          "GET",
+          "/notes?meta[created_at][gte]=2026-04-01&meta[updated_at][lt]=2026-06-01",
+        ),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("cannot span");
+      expect(body.error).toContain("created_at");
+      expect(body.error).toContain("updated_at");
+    });
+
+    test("two bracket-date params on the same column compose into a range (regression)", async () => {
+      // The F1 guard must reject *different* columns only — same-column
+      // gte+lt is the canonical range case and must keep working.
+      await store.createNote("in-window", { created_at: "2026-04-15T00:00:00.000Z" });
+      await store.createNote("after-window", { created_at: "2026-05-15T00:00:00.000Z" });
+      await store.createNote("before-window", { created_at: "2026-03-15T00:00:00.000Z" });
+      const res = await handleNotes(
+        mkReq(
+          "GET",
+          "/notes?meta[created_at][gte]=2026-04-01&meta[created_at][lt]=2026-05-01&include_content=true",
+        ),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["in-window"]);
+    });
+
+    test("shorthand-then-operator on the same field rejects (vault#289 F2)", async () => {
+      // `URLSearchParams` iteration is insertion-order. Before this guard,
+      // shorthand wrote `metadata[field] = primitive`, then the operator
+      // handler called `metaOpBucket` which overwrote it with a fresh op
+      // object — the shorthand was silently dropped.
+      await declareIndexed();
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority]=5&meta[priority][gte]=3"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("mix shorthand and operator");
+    });
+
+    test("operator-then-shorthand on the same field rejects (vault#289 F2, reverse order)", async () => {
+      // Reverse insertion order. Before this guard, the operator was set
+      // first, then the shorthand wrote `metadata[field] = primitive` and
+      // clobbered the op bucket — operator silently dropped.
+      await declareIndexed();
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][gte]=3&meta[priority]=5"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("mix shorthand and operator");
+    });
+
+    test("`[]` array form on a non-array operator rejects at the parser layer (vault#289 F4)", async () => {
+      // `meta[field][eq][]=value` is a shape error — `eq` takes a scalar.
+      // The engine would also catch this (the value would be an array
+      // SQLite can't bind), but the parser-level error names the issue
+      // more precisely: "use single-value form for `eq`."
+      const res = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][eq][]=5"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_OPERATOR_VALUE");
+      expect(body.error).toContain("array form");
+      expect(body.error).toContain("in");
+      expect(body.error).toContain("not_in");
+    });
+
+    // ---- Precedence on overlap ----
+    test("when both flat and bracket date params overlap, bracket wins", async () => {
+      await store.createNote("old", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("new", { created_at: "2026-04-15T00:00:00.000Z" });
+      // Bracket says "from 2026-04-01"; flat says "from 2020-01-01". If
+      // flat won, both notes would match. The bracket-wins precedence is
+      // verified by getting back only the post-April note.
+      const res = await handleNotes(
+        mkReq(
+          "GET",
+          "/notes?meta[created_at][gte]=2026-04-01&date_field=created_at&date_from=2020-01-01&include_content=true",
+        ),
+        store,
+        "",
+      );
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["new"]);
+    });
+  });
 });
 
 describe("HTTP GET /notes?format=graph", async () => {
