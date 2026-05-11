@@ -55,11 +55,17 @@ import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./lau
 import {
   chooseHubOrigin,
   chooseMcpUrl,
+  detectInstallContext,
   mintHubJwt,
   readOperatorToken,
   resolveInstallTarget,
   type InstallScope,
 } from "./mcp-install.ts";
+import {
+  defaultInteractiveIO,
+  runInteractiveInstall,
+  type InteractiveIO,
+} from "./mcp-install-interactive.ts";
 import { buildInitSummaryLines } from "./init-summary.ts";
 import {
   runBackup,
@@ -932,6 +938,50 @@ function takeArgValue(args: string[], name: string): { value?: string; missingVa
  *   --client <name>       Reserved for Phase C. Only `claude-code` accepted.
  */
 async function cmdMcpInstall(args: string[]): Promise<void> {
+  // Set of install-shaping flags. Any one of these flips the dispatch to
+  // non-interactive — flag-passing semantics are "I know what I want."
+  // `--interactive` is the explicit opt-in for prompts even when other
+  // flags are present (useful for partial specification).
+  //
+  // Declared inside the function (rather than module-top) because this
+  // file's top-level dispatch await runs cmdMcpInstall during module
+  // initialization, and a module-top `const` is still in its temporal
+  // dead zone when the function body first executes from that dispatch.
+  const MCP_INSTALL_FLAG_NAMES = [
+    "--mint",
+    "--legacy-pat",
+    "--token",
+    "--scope",
+    "--install-scope",
+    "--vault",
+    "--client",
+  ];
+
+  const wantInteractive = args.includes("--interactive");
+  const hasFlag = args.some((a) => MCP_INSTALL_FLAG_NAMES.includes(a));
+  const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+  // Interactive dispatch fires when (a) the operator typed --interactive,
+  // OR (b) they passed no install-shaping flags and stdin is a TTY. The
+  // second condition is the bare-`mcp-install` case Aaron's feedback
+  // targets: a contextual walkthrough instead of the silent defaults.
+  //
+  // Refuse `--interactive` when stdin isn't a TTY rather than dispatching
+  // into the walkthrough — readline would hang forever on closed stdin,
+  // and a CI script that accidentally passed --interactive would
+  // deadlock until the runner's wall-clock timer fired. Loud refusal
+  // costs nothing and surfaces the misconfiguration immediately.
+  if (wantInteractive && !isTTY) {
+    console.error(
+      "--interactive requires a TTY for stdin (a real terminal). Got a piped / non-tty stdin. " +
+        "Either drop --interactive (defaults apply) or run from an interactive shell.",
+    );
+    process.exit(1);
+  }
+  if (wantInteractive || (isTTY && !hasFlag)) {
+    return await cmdMcpInstallInteractive();
+  }
+
   // --- Auth-mode parsing (mutually exclusive) ---
   const wantMint = args.includes("--mint");
   const wantLegacy = args.includes("--legacy-pat");
@@ -962,9 +1012,6 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     );
     process.exit(1);
   }
-  // Verb is the last segment of `vault:<verb>` — used to narrow to
-  // `vault:<vault-name>:<verb>` for the hub-mint path.
-  const verb = rawScope.split(":")[1]!;
 
   // --- Install scope: user (default) or project. ---
   const installScopeArg = takeArgValue(args, "--install-scope");
@@ -1006,29 +1053,88 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
   const globalConfig = readGlobalConfig();
   const defaultVault = globalConfig.default_vault || "default";
   const vaultName = vaultArg.value ?? defaultVault;
-  // Was --vault explicitly given? Used to decide entry-key shape — explicit
-  // means "this is one vault among many, key it per-vault"; default means
-  // "the single canonical install, key it as `parachute-vault`."
   const vaultExplicit = vaultArg.value !== undefined;
   if (!readVaultConfig(vaultName)) {
     console.error(`Vault "${vaultName}" not found. Available: ${listVaults().join(", ") || "(none)"}.`);
     process.exit(1);
   }
 
-  // --- Resolve target file + entry key. ---
+  await executeMcpInstall({
+    mode,
+    rawScope,
+    installScope,
+    vaultName,
+    vaultExplicit,
+    pastedToken: mode === "token" ? tokenArg.value : undefined,
+    globalConfig,
+  });
+}
+
+/**
+ * Interactive front-end for `mcp-install`. Builds the install context,
+ * walks the operator through prompts, then hands the resolved decision
+ * to `executeMcpInstall`. Failure modes from the walkthrough (operator
+ * aborted, no vaults yet, etc.) exit cleanly without touching disk.
+ */
+async function cmdMcpInstallInteractive(): Promise<void> {
+  const globalConfig = readGlobalConfig();
+  const defaultVault = globalConfig.default_vault || "default";
+  const port = globalConfig.port || DEFAULT_PORT;
+  const ctx = detectInstallContext({
+    vaults: listVaults(),
+    defaultVault,
+    port,
+  });
+  const io = await defaultInteractiveIO();
+  const decision = await runInteractiveInstall(ctx, io);
+  if (decision === "abort") {
+    process.exit(0);
+  }
+  await executeMcpInstall({
+    mode: decision.mode,
+    rawScope: decision.scope,
+    installScope: decision.installScope,
+    vaultName: decision.vaultName,
+    vaultExplicit: decision.vaultExplicit,
+    pastedToken: decision.pastedToken,
+    globalConfig,
+  });
+}
+
+interface ExecuteMcpInstallOpts {
+  mode: "mint" | "token" | "legacy-pat";
+  /** Full scope string (e.g. "vault:read"). The verb segment narrows downstream. */
+  rawScope: string;
+  installScope: InstallScope;
+  vaultName: string;
+  /** Whether vault target was explicit (controls singular vs per-vault entry key). */
+  vaultExplicit: boolean;
+  /** Bearer the operator pasted in `--token` / interactive paste mode. */
+  pastedToken?: string;
+  /** Reused across the call chain to avoid re-parsing config.yaml. */
+  globalConfig: ReturnType<typeof readGlobalConfig>;
+}
+
+/**
+ * Shared backend for both the flag-driven path and the interactive
+ * walkthrough. Acquires the bearer per mode, writes the entry, prints the
+ * result. The interactive path delays this call until *after* the
+ * preview-and-confirm step so a cancel skips the network mint entirely.
+ */
+async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
+  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig } = opts;
+  const verb = rawScope.split(":")[1]!;
   const target = resolveInstallTarget(installScope);
-  // Multi-vault installs key the entry as `parachute-vault-<name>` so the
-  // singular `parachute-vault` slot remains the default install. An explicit
-  // `--vault <name>` (even pointing at the default) opts into the per-vault
-  // key shape; without `--vault`, the default install keeps clobbering the
-  // singular slot as before.
   const entryKey = vaultExplicit ? `parachute-vault-${vaultName}` : "parachute-vault";
 
-  // --- Acquire the bearer per mode. ---
-  let bearer: string | undefined;
+  let bearer: string;
   if (mode === "token") {
-    bearer = tokenArg.value!;
-    console.log(`Using supplied --token (skipping mint).`);
+    if (!pastedToken) {
+      console.error("Internal error: token mode missing pastedToken.");
+      process.exit(1);
+    }
+    bearer = pastedToken;
+    console.log(`Using supplied token (skipping mint).`);
   } else if (mode === "legacy-pat") {
     console.error(
       "Note: --legacy-pat mints a vault-DB pvt_* token. The hub-issued JWT path (--mint, default) " +
@@ -1075,8 +1181,6 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
       );
       process.exit(1);
     }
-    // Narrow the mint to `vault:<vault-name>:<verb>` so the JWT can't be
-    // reused against other vaults on the same hub.
     const narrowScope = `vault:${vaultName}:${verb}`;
     const result = await mintHubJwt({
       hubOrigin: hub.url,
@@ -1105,7 +1209,6 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     console.log(`Minted hub JWT (jti=${result.jti}, expires ${result.expires_at}, scope ${result.scope}).`);
   }
 
-  // --- Write the entry. ---
   const { url, source } = installMcpConfig({
     targetPath: target.path,
     entryKey,
@@ -2644,14 +2747,21 @@ Vaults:
   parachute-vault create <name> [--json]   Create a new vault (--json: emit { name, token, paths, set_as_default })
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
-  parachute-vault mcp-install [--mint|--token <t>|--legacy-pat]
+  parachute-vault mcp-install [--interactive]
+                              [--mint|--token <t>|--legacy-pat]
                               [--scope vault:read|vault:write|vault:admin]
                               [--install-scope user|project]
                               [--vault <name>] [--client claude-code]
                                             Install vault MCP into a client config.
-                                            Default: --mint (hub-issued JWT via
-                                            ~/.parachute/operator.token) into
-                                            ~/.claude.json with vault:read scope.
+                                            From a terminal with no flags: walks you
+                                            through a contextual conversation (vault,
+                                            location, auth) with smart defaults +
+                                            preview before write. With any flag, runs
+                                            non-interactively. --interactive forces
+                                            the walkthrough even with flags present.
+                                            Default (non-interactive): --mint
+                                            (hub-issued JWT via ~/.parachute/operator.token)
+                                            into ~/.claude.json with vault:read scope.
                                             --token <t>: paste an existing bearer
                                             (any shape) instead of minting.
                                             --legacy-pat: mint a vault-DB pvt_*

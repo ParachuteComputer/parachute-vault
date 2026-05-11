@@ -571,14 +571,15 @@ The shortest path to a public HTTPS URL for a vault you control — useful for S
 
 ### Install vault MCP into a client config
 
-Four common patterns. The standalone `mcp-install` command supports three explicit auth modes plus user-level vs project-level installs.
+Bare `parachute-vault mcp-install` from a terminal **walks you through a short contextual conversation** — picks defaults informed by your environment (how many vaults you have, whether the hub is reachable, whether you're in a project directory, whether vault is already installed somewhere), shows the JSON shape it will write before doing anything, and asks before each non-obvious choice. The four patterns below are the non-interactive shapes — pass any flag (`--mint`, `--token`, `--scope`, `--install-scope`, `--vault`, `--legacy-pat`) and the walkthrough is skipped. Use `--interactive` to force the walkthrough even with some flags pre-specified.
 
 ```bash
-# 1. Default — mint a scope-narrow hub JWT (vault:<vault>:read) via your
-#    operator token, write it into ~/.claude.json. Requires:
+# 1. Default (non-interactive shape) — mint a scope-narrow hub JWT
+#    (vault:<vault>:read) via your operator token, write it into
+#    ~/.claude.json. Requires:
 #      - ~/.parachute/operator.token (run `parachute auth rotate-operator` if missing)
 #      - PARACHUTE_HUB_ORIGIN set OR an active `parachute expose` session
-parachute-vault mcp-install
+parachute-vault mcp-install --mint
 
 # 2. Project-level install — write ./.mcp.json (Claude Code reads project-
 #    local configs) instead of ~/.claude.json. Pair with --scope vault:write

@@ -6,6 +6,105 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.2] — 2026-05-11
+
+Interactive default for `parachute-vault mcp-install`. Bare invocation
+(no flags, TTY stdin) now walks the operator through a short, contextual
+conversation instead of executing silent defaults. Each prompt picks a
+smart default informed by ambient context — number of vaults, hub
+reachability, project-directory detection, existing entries — and shows
+the reason for the default so the operator can override informedly. The
+final preview shows the actual JSON the install will write before any
+network call or filesystem mutation.
+
+### What changes for the operator
+
+- **Bare `mcp-install`** (TTY, no flags) → walkthrough.
+- **Any install-shaping flag** (`--mint` / `--token` / `--legacy-pat` /
+  `--scope` / `--install-scope` / `--vault` / `--client`) → existing
+  non-interactive path. Flag-passing semantics: "I know what I want."
+- **Piped / CI stdin + no flags** → existing non-interactive defaults
+  (`--mint`, `vault:read`, user-scope, default vault). Skips prompts
+  rather than hanging on stdin no one can answer.
+- **New `--interactive` flag** → opts in to the walkthrough even when
+  some flags are passed (useful for partial specification). Refuses with
+  a clear message on non-TTY stdin rather than deadlocking on closed
+  stdin.
+
+### Walkthrough shape
+
+Each step has a smart default; pressing Enter accepts it. The default is
+auto-selected when the choice is obvious:
+
+1. **Vault target.** Skipped when there's exactly one vault, or when an
+   existing entry already pins it. With 2+ vaults, prompts and defaults
+   to `default_vault`.
+2. **Install location.** Defaults to project-scope (`./.mcp.json`) when
+   CWD has project markers (`.git`, `package.json`, `pyproject.toml`,
+   `Cargo.toml`, `go.mod`, `deno.json`, `.parachute`); otherwise to
+   user-scope (`~/.claude.json`). Project-marker detection is shallow —
+   only the supplied directory, not its ancestors. Skipped when updating
+   an existing entry.
+3. **Auth mode + scope.** When hub-mint is available (hub origin
+   configured + operator.token present), prompts with `mint` default and
+   `vault:read` scope (least-privilege); accepts `write` / `admin` to
+   widen, `paste` to use an existing bearer, or `legacy` to fall back to
+   `pvt_*`. When hub-mint isn't available, prompts paste vs legacy
+   directly with a one-line explanation of why mint is off.
+4. **Preview + confirm.** Renders the exact JSON shape that will be
+   written (with a `<hub-jwt>` placeholder for the bearer). The live
+   mint runs *after* the confirm — a cancellation skips the network
+   call entirely.
+
+### Existing-entry detection
+
+When the walkthrough finds a pre-existing parachute-vault entry at
+`~/.claude.json` or `./.mcp.json`, it leads with "I see Parachute Vault
+is already installed at X. Update it (recommended)?" — accepting the
+default pins both install location and entry key from the existing entry,
+skipping later prompts that would re-pick them. Operators can decline to
+get the fresh-pick flow.
+
+### Internals
+
+- New module `src/mcp-install-interactive.ts` with `runInteractiveInstall`
+  + an `InteractiveIO` seam (production wires to `prompt.ts`, tests mock).
+- New helpers in `src/mcp-install.ts`: `detectInstallContext`,
+  `detectProjectContext`, `detectExistingEntries`. Pure functions —
+  test-driveable without monkey-patching globals.
+- `cmdMcpInstall` refactored: dispatch front (TTY / flag-presence /
+  `--interactive` checks) → either flag path or interactive front-end;
+  shared `executeMcpInstall` backend acquires bearer and writes (called
+  by both paths).
+- `resolveInstallTarget` now prefers `process.env.HOME` over cached
+  `os.homedir()` so in-process HOME overrides apply (tests, exotic
+  chrooting). `homedir()` remains the fallback.
+
+### Tests
+
+39 new tests across two files:
+
+- `src/mcp-install-interactive.test.ts` (31 tests) — decision-tree
+  coverage via `InteractiveIO` mock: single/multi-vault, project /
+  non-project context, hub-reachable / not, existing-entry-leads-with-
+  update, scope widening to write/admin, paste/legacy fallthrough, help
+  reprompt, invalid-input retry, final-confirm abort, empty-vault-list
+  bail. Plus context-detection helpers (`detectProjectContext`,
+  `detectExistingEntries`, `detectInstallContext`) with positive +
+  negative cases.
+- `src/mcp-install.test.ts` (3 new tests) — subprocess-level dispatch:
+  non-TTY no-flag falls to defaults, `--interactive` on non-TTY refuses
+  with a clear message (no deadlock), any flag bypasses interactive.
+
+1317/1317 pass. Typecheck clean.
+
+### Out of scope (Phase C — still deferred)
+
+- Cross-client support (Cursor, Claude Desktop, Codex, Zed, Goose, Cline).
+- Client auto-detection.
+- Token-masking on paste (decided against — security theater; most client
+  configs store tokens in plain text anyway).
+
 ## [0.4.4-rc.1] — 2026-05-11
 
 Rework `parachute-vault mcp-install` (Phase A + B of the install-flow audit).
