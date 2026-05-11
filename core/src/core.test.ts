@@ -1089,6 +1089,58 @@ describe("queryNotes", async () => {
       }) as any[];
       expect(results.map((n) => n.content)).toEqual(["recent email"]);
     });
+
+    // ---- updated_at filter (vault#285 friction point 1.5) ----
+    //
+    // Incremental-rebuild flows ask "what changed since X." Like `created_at`,
+    // `updated_at` is a real column on `notes` (no indexed-field gate), but
+    // it tracks the *last write* rather than ingestion time. SSGs paginate
+    // against it; sync clients use it as a high-watermark cursor.
+    it("dateFilter on updated_at routes to the n.updated_at column (vault#285 1.5)", async () => {
+      // Two notes; only one is later modified. The filter should pick up the
+      // modification time, not the original creation time.
+      const a = await store.createNote("untouched", { created_at: "2026-01-15T00:00:00.000Z" });
+      const b = await store.createNote("modified-later", { created_at: "2026-01-20T00:00:00.000Z" });
+      // Mutate b to bump its updated_at into a window that excludes a.
+      await store.updateNote(b.id, { append: " edit" });
+
+      // Pin each note's updated_at deterministically so the assertion isn't
+      // racing real wall-clock writes from the test harness.
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+        .run("2026-01-15T00:00:00.000Z", a.id);
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", b.id);
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "2026-04-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["modified-later edit"]);
+    });
+
+    it("dateFilter on updated_at requires no indexed-field declaration", async () => {
+      // `updated_at` is a recognized real column — must not hit the
+      // requireIndexedField gate that fires for arbitrary metadata fields.
+      await store.createNote("x");
+      // Should not throw.
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "1970-01-01" },
+      });
+      expect(Array.isArray(results)).toBe(true);
+    });
+
+    it("dateFilter on updated_at honors the upper-bound exclusive `to`", async () => {
+      const a = await store.createNote("inside-window");
+      const b = await store.createNote("after-window");
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", a.id);
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+        .run("2026-05-15T00:00:00.000Z", b.id);
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "2026-04-01", to: "2026-05-01" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["inside-window"]);
+    });
   });
 
   it("sorts ascending and descending", async () => {
@@ -1709,6 +1761,96 @@ describe("MCP tools", async () => {
     expect(err.note_id).toBe(note.id);
     expect(err.note_path).toBe("Inbox/x");
     expect((await store.getNote(note.id))!.content).toBe("Test");
+  });
+
+  // ---- include_content response-shape opt-out (vault#285 friction point 2.response) ----
+  //
+  // Default behavior is unchanged: full Note is returned with `content`.
+  // Setting `include_content: false` swaps in the lean NoteIndex shape
+  // (drops content, adds byteSize + preview). Cuts the response cost on
+  // small-edit / large-note workflows.
+  describe("update-note include_content", () => {
+    it("defaults to full Note (back-compat)", async () => {
+      const note = await store.createNote("Original body", { path: "x" });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        id: note.id,
+        content: "Replaced body",
+        force: true,
+      }) as any;
+      expect(result.content).toBe("Replaced body");
+      // Index-only fields must NOT appear on the back-compat shape.
+      expect(result.byteSize).toBeUndefined();
+      expect(result.preview).toBeUndefined();
+    });
+
+    it("include_content: false returns the lean NoteIndex shape", async () => {
+      const longBody = "a".repeat(5_000);
+      const note = await store.createNote(longBody, { path: "big-note" });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        id: note.id,
+        append: " edit",
+        include_content: false,
+      }) as any;
+      // No content payload — that's the whole point of the opt-out.
+      expect(result.content).toBeUndefined();
+      // Index fields present.
+      expect(typeof result.byteSize).toBe("number");
+      expect(result.byteSize).toBe(5_000 + 5); // original + " edit"
+      expect(typeof result.preview).toBe("string");
+      expect(result.preview.length).toBeGreaterThan(0);
+      expect(result.id).toBe(note.id);
+      expect(result.path).toBe("big-note");
+      expect(result.updatedAt).toBeTruthy();
+    });
+
+    it("include_content: false applies uniformly across batch responses", async () => {
+      await store.createNote("A", { id: "a", path: "a" });
+      await store.createNote("B", { id: "b", path: "b" });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        include_content: false,
+        notes: [
+          { id: "a", content: "A v2", force: true },
+          { id: "b", append: " v2" },
+        ],
+      }) as any[];
+      expect(result).toHaveLength(2);
+      for (const item of result) {
+        expect(item.content).toBeUndefined();
+        expect(typeof item.byteSize).toBe("number");
+        expect(typeof item.preview).toBe("string");
+      }
+    });
+
+    it("include_content: false preserves validation_status when present", async () => {
+      // Declare a tag schema with an indexed `priority` field that constrains
+      // values; then write a note whose metadata violates the schema, so
+      // attachValidationStatus has something to surface.
+      await store.upsertTagSchema("task", {
+        description: "tasks",
+        fields: {
+          priority: { type: "string", enum: ["low", "med", "high"], indexed: false },
+        },
+      });
+      await store.createNote("a task", { id: "t1", tags: ["task"] });
+      const tools = generateMcpTools(store);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const result = await updateNote.execute({
+        id: "t1",
+        metadata: { priority: "URGENT" }, // not in enum — generates a warning
+        include_content: false,
+        force: true,
+      }) as any;
+      expect(result.content).toBeUndefined();
+      expect(result.validation_status).toBeTruthy();
+      expect(Array.isArray(result.validation_status.warnings)).toBe(true);
+      expect(result.validation_status.warnings.length).toBeGreaterThan(0);
+    });
   });
 
   it("update-note force:true bypasses precondition and mutates unconditionally", async () => {

@@ -80,12 +80,14 @@ export interface QueryOpts {
   // as the common path; specifying both this and `dateFilter` rejects.
   dateFrom?: string;    // ISO date
   dateTo?: string;      // ISO date
-  // Generalized date range. `field` defaults to `created_at`; any other
-  // field must be declared `indexed: true` in a tag schema (so the SQL
-  // hits a real B-tree index, same contract as `metadata` operator
-  // queries and `orderBy`). Use this to filter on a *content* date — an
-  // email's received date, a meeting's scheduled date — rather than the
-  // ingestion timestamp.
+  // Generalized date range. `field` defaults to `created_at`; `updated_at`
+  // is also a recognized real column (the incremental-rebuild path —
+  // vault#285 1.5). Any other field must be declared `indexed: true` in a
+  // tag schema (so the SQL hits a real B-tree index, same contract as
+  // `metadata` operator queries and `orderBy`). Use this to filter on a
+  // *content* date — an email's received date, a meeting's scheduled
+  // date — rather than the ingestion timestamp, or on `updated_at` to ask
+  // "what changed since X."
   dateFilter?: {
     field?: string;
     from?: string;

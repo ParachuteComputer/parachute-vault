@@ -740,7 +740,14 @@ export async function handleNotes(
         }
       }
 
-      return json(await store.getNote(note.id));
+      // Response shape: full Note (back-compat default) or lean NoteIndex
+      // (vault#285 friction point 2.response — opt-out for callers making
+      // frequent small edits to large notes). Mirror the MCP `update-note`
+      // `include_content` knob exactly.
+      const updatedNote = await store.getNote(note.id);
+      if (updatedNote === null) return json({ error: "Note disappeared" }, 404);
+      const includeContentResp = body.include_content !== false;
+      return json(includeContentResp ? updatedNote : toNoteIndex(updatedNote));
     } catch (e: any) {
       if (e instanceof NotFoundError) return json({ error: e.message }, 404);
       // Duck-type on `code` rather than `instanceof ConflictError`: this

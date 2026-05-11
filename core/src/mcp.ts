@@ -144,11 +144,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           date_filter: {
             type: "object",
             properties: {
-              field: { type: "string", description: "Field to filter on. Defaults to `created_at` (vault ingestion time). Any other field must be declared `indexed: true` in a tag schema — same contract as metadata operator queries and `order_by`." },
+              field: { type: "string", description: "Field to filter on. Defaults to `created_at` (vault ingestion time). `updated_at` is also recognized as a real column — use it for incremental rebuilds (\"what changed since X\"). Any other field must be declared `indexed: true` in a tag schema — same contract as metadata operator queries and `order_by`." },
               from: { type: "string", description: "Inclusive lower bound (ISO date)." },
               to: { type: "string", description: "Exclusive upper bound (ISO date)." },
             },
-            description: "Generalized date-range filter. Use this when the date that matters is the *content* date (e.g. an email's received date, a meeting's scheduled date), not the vault ingestion time — set `field` to the indexed metadata field that holds it. Mutually exclusive with the top-level `date_from` / `date_to` shorthand.",
+            description: "Generalized date-range filter. Use this when the date that matters is the *content* date (e.g. an email's received date, a meeting's scheduled date) rather than the vault ingestion time, or when paging by `updated_at` for incremental rebuilds. Mutually exclusive with the top-level `date_from` / `date_to` shorthand.",
           },
           near: {
             type: "object",
@@ -468,7 +468,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
-- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).`,
+- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).
+- \`include_content\` (default \`true\`) — set \`false\` to receive a lean index shape (\`id\`, \`path\`, \`createdAt\`, \`updatedAt\`, \`tags\`, \`metadata\`, \`byteSize\`, \`preview\`) instead of full content. Useful for agents making frequent small edits to large notes (e.g. via \`append\` or \`content_edit\`) where re-receiving the body is the dominant cost. \`validation_status\` is preserved on the lean shape when present.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -525,6 +526,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               },
             },
             description: "Links to add/remove",
+          },
+          include_content: {
+            type: "boolean",
+            description: "Response shape opt-out. Default `true` (returns the full Note with content). Set `false` to receive the lean index shape (drops `content`, adds `byteSize` and a whitespace-collapsed `preview`). `validation_status` is preserved on the lean shape when present. Applies uniformly to single and batch responses.",
           },
           // Batch
           notes: {
@@ -737,7 +742,19 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           throw e;
         }
 
-        const final = updated.map((n) => attachValidationStatus(store, db, n));
+        // Response shape: full Note (back-compat default) or lean NoteIndex
+        // (#285 friction point 2.response — opt-out for callers making
+        // frequent small edits to large notes). `validation_status` from
+        // `tags.fields` is preserved across either shape.
+        const includeContent = params.include_content !== false;
+        const final = updated.map((n) => {
+          const validated = attachValidationStatus(store, db, n);
+          if (includeContent) return validated;
+          const lean: any = noteOps.toNoteIndex(validated);
+          const vs = (validated as any).validation_status;
+          if (vs !== undefined) lean.validation_status = vs;
+          return lean;
+        });
         return batch ? final : final[0];
       },
     },

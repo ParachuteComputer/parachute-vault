@@ -512,10 +512,18 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   //   - Legacy `dateFrom` / `dateTo` — always filters on `n.created_at`
   //     (vault ingestion time).
   //   - Generalized `dateFilter: { field, from, to }` — filters on the
-  //     named field. `created_at` (default) maps to `n.created_at`; any
-  //     other field must be declared `indexed: true` so the SQL targets
-  //     a real B-tree index. The two shapes are mutually exclusive — the
-  //     combination would silently AND, which would be surprising.
+  //     named field. `created_at` (default) and `updated_at` map to the
+  //     real columns on `notes`; any other field must be declared
+  //     `indexed: true` so the SQL targets a real B-tree index. The two
+  //     shapes are mutually exclusive — the combination would silently
+  //     AND, which would be surprising.
+  //
+  // `updated_at` enables incremental-rebuild flows (vault#285 1.5): an
+  // SSG or syncer asks "what changed since my last build" via
+  // `dateFilter: { field: "updated_at", from: lastBuildISO }`. There's
+  // no B-tree on `updated_at` today; a sequential scan is acceptable up
+  // to ~tens of thousands of notes. Add an index if the scan ever shows
+  // up in a real workload.
   const hasLegacyDate = opts.dateFrom !== undefined || opts.dateTo !== undefined;
   const hasDateFilter = opts.dateFilter !== undefined;
   if (hasLegacyDate && hasDateFilter) {
@@ -530,6 +538,8 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     let column: string;
     if (field === "created_at") {
       column = "n.created_at";
+    } else if (field === "updated_at") {
+      column = "n.updated_at";
     } else {
       // Re-uses the same indexed-field gate as `metadata` operator queries
       // and `orderBy` so the error message and contract are consistent.
