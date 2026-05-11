@@ -499,6 +499,8 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
 { "name": "query-notes", "arguments": { "date_filter": { "field": "updated_at", "from": "2026-04-01T00:00:00Z" } } }
 ```
 
+Only `gte` and `lt` are accepted on `created_at` / `updated_at` (other operators reject with `INVALID_QUERY` — these bracket forms route to the real-column `dateFilter`, not the full metadata operator set, so the half-open `[from, to)` shape is the only expressible range). The full operator set in the next recipe applies to *metadata* fields only.
+
 ### Filter by metadata values (bracket style)
 
 Equality on any metadata field works with no setup:
@@ -551,13 +553,13 @@ Set `include_content: false` on the request to cut the response cost too — you
 
 ### Append to a note (no concurrency ceremony)
 
-Atomic at the SQL layer: two concurrent appends both land in some order, never clobber. Append-only updates are exempt from the `if_updated_at` precondition that other mutations require.
+Atomic at the SQL layer: two concurrent appends both land in some order, never clobber. Append-only and prepend-only updates are exempt from the `if_updated_at` precondition that other mutations require — the SQL-atomic concatenation can't lose data on a stale read, so the precondition would be ceremony for no benefit. Underlying mechanic in [`core/src/notes.ts:295-322`](./core/src/notes.ts).
 
 ```jsonc
 { "name": "update-note", "arguments": { "id": "notes/journal/2026-05-10", "append": "\n\nEvening note: …" } }
 ```
 
-If the note opens with YAML frontmatter, `prepend` is automatically injected after the closing fence so parsers still see frontmatter at byte 0.
+`prepend` is frontmatter-aware: if the note opens with YAML frontmatter, the prepended text is automatically injected *after* the closing `---` fence so parsers that expect frontmatter at byte 0 still find it. Detection is done in the same SQL UPDATE expression, so atomicity is preserved.
 
 ### CI / public access via Tailscale Funnel
 
