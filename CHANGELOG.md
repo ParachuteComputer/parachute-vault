@@ -6,6 +6,87 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.3-rc.2] — 2026-05-11
+
+Closes the HTTP-side gap in vault's metadata-filter surface (vault#285
+friction point 1.3). The engine has always supported the full operator set —
+`eq`/`ne`/`gt`/`gte`/`lt`/`lte`/`in`/`not_in`/`exists` — and MCP exposes it.
+Until this release, the HTTP route declared the surface "not practical in
+query params" and dropped it entirely. Bracket-style filtering plumbs it
+through with a consistent shape.
+
+### Read path
+
+- **Bracket-style metadata filter on `GET /notes` (vault#285 friction point 1.3).**
+  Uses the Stripe / JSON:API / Strapi convention:
+
+  ```
+  ?meta[field][op]=value                 # eq, ne, gt, gte, lt, lte
+  ?meta[field]=value                     # shorthand for eq (JSON-scan fallback;
+                                         # no indexed-field declaration required)
+  ?meta[field][in][]=v1&meta[field][in][]=v2   # array form
+  ?meta[field][in]=v1,v2                 # comma-separated form
+  ?meta[field][exists]=true              # presence check (true|false only)
+  ```
+
+  Multiple `meta[...]` params AND together. Same-field operators (e.g.
+  `meta[score][gte]=5&meta[score][lt]=10`) merge into one operator object.
+  Hand-rolled parser in `src/routes.ts` — vault doesn't ship the `qs`
+  dependency, and the grammar is small enough that one regex + a couple of
+  buckets is cleaner than pulling in a parser library.
+
+- **Bridge for `created_at` / `updated_at` columns.** Bracket-style also
+  accepts the real date columns:
+
+  ```
+  ?meta[created_at][gte]=2026-04-01
+  ?meta[updated_at][gte]=2026-04-01
+  ?meta[created_at][lt]=2026-05-01
+  ```
+
+  These route through `dateFilter` (not through `metadata`) because they're
+  real columns on `notes`, not metadata fields — same exemption as the
+  existing flat-param path. Only `gte` (→ inclusive `from`) and `lt` (→
+  exclusive `to`) are accepted on these fields; other operators reject with
+  a guiding error that names the supported ops. Matches the dateFilter
+  contract exactly — `>= from AND < to` is half-open by design.
+
+- **Tag-authorizes-index gate flows through.** Operator queries on a metadata
+  field still require the field to be declared `indexed: true` in some tag
+  schema (the engine's existing contract at
+  `core/src/indexed-fields.ts:1-17`). Bracket-style errors surface as
+  HTTP 400 with `code: "FIELD_NOT_INDEXED"`. Shorthand `?meta[field]=value`
+  is the exception: it uses the json_extract fallback path and doesn't
+  require an index, mirroring the engine's existing primitive-equality
+  semantics.
+
+### Deprecation
+
+- **Flat date params are deprecated.** `?date_field=`, `?date_from=`,
+  `?date_to=` (and the legacy bare-`date_from`/`date_to` shape) remain
+  functional through the 0.5.x line — no behavior change for existing
+  consumers — but bracket-style is canonical going forward. Planned removal
+  in 0.6.0; tracked at vault#288. On overlap (a request that supplies both
+  forms), bracket wins.
+
+### Test plan
+
+- 18 new HTTP tests in `src/vault.test.ts` covering: every operator, both
+  array forms, shorthand equality, compound AND on one field and across
+  fields, the `created_at`/`updated_at` bridge, deprecation precedence
+  (bracket wins), and all the rejection paths (unsupported date-column op,
+  non-boolean `exists`, non-indexed field, unknown operator).
+- 1250/1250 tests pass.
+
+### Out of scope
+
+- OR composition across `metadata` filters — the engine's `metadata` shape
+  doesn't expose OR; left for a future engine-level decision.
+- CLI bracket-style — CLI uses the MCP shape directly; not affected.
+- Bumping the operator set on date columns past `gte`/`lt` — would require
+  engine-side work and the half-open contract is intentional. Document
+  rather than expand.
+
 ## [0.4.3-rc.1] — 2026-05-10
 
 Two small additive enhancements distilled from the field-input evaluation in
