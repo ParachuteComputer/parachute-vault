@@ -26,10 +26,6 @@ network call or filesystem mutation.
 - **Piped / CI stdin + no flags** → existing non-interactive defaults
   (`--mint`, `vault:read`, user-scope, default vault). Skips prompts
   rather than hanging on stdin no one can answer.
-- **New `--interactive` flag** → opts in to the walkthrough even when
-  some flags are passed (useful for partial specification). Refuses with
-  a clear message on non-TTY stdin rather than deadlocking on closed
-  stdin.
 
 ### Walkthrough shape
 
@@ -72,10 +68,9 @@ get the fresh-pick flow.
 - New helpers in `src/mcp-install.ts`: `detectInstallContext`,
   `detectProjectContext`, `detectExistingEntries`. Pure functions —
   test-driveable without monkey-patching globals.
-- `cmdMcpInstall` refactored: dispatch front (TTY / flag-presence /
-  `--interactive` checks) → either flag path or interactive front-end;
-  shared `executeMcpInstall` backend acquires bearer and writes (called
-  by both paths).
+- `cmdMcpInstall` refactored: dispatch front (TTY + flag-presence checks)
+  → either flag path or interactive front-end; shared `executeMcpInstall`
+  backend acquires bearer and writes (called by both paths).
 - `resolveInstallTarget` now prefers `process.env.HOME` over cached
   `os.homedir()` so in-process HOME overrides apply (tests, exotic
   chrooting). `homedir()` remains the fallback.
@@ -92,11 +87,22 @@ get the fresh-pick flow.
   bail. Plus context-detection helpers (`detectProjectContext`,
   `detectExistingEntries`, `detectInstallContext`) with positive +
   negative cases.
-- `src/mcp-install.test.ts` (3 new tests) — subprocess-level dispatch:
-  non-TTY no-flag falls to defaults, `--interactive` on non-TTY refuses
-  with a clear message (no deadlock), any flag bypasses interactive.
+- `src/mcp-install.test.ts` (2 new tests) — subprocess-level dispatch:
+  non-TTY no-flag falls through to flag-driven defaults (doesn't hang
+  on prompts); any flag bypasses interactive.
 
-1317/1317 pass. Typecheck clean.
+All gates pass. Typecheck clean.
+
+### Deferred from F3 (vault#292 review)
+
+Preview-accuracy cross-check (preview entry-key/URL must match what
+`executeMcpInstall` writes) was attempted in
+`describe.skip("preview accuracy …")`. The initial in-process walkthrough
++ `Bun.spawnSync` shape looped on `askPersistent` when the inline mock's
+coarse default-branch heuristic didn't match a prompt's default. Skipped
+for this PR; the equivalence is worth pinning at a smaller seam (extract
+shared entry-key/URL builder, pin it directly) rather than driving the
+full walkthrough through ad-hoc IO. Tracked as a vault#292 follow-up.
 
 ### Out of scope (Phase C — still deferred)
 

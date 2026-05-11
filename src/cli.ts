@@ -938,10 +938,8 @@ function takeArgValue(args: string[], name: string): { value?: string; missingVa
  *   --client <name>       Reserved for Phase C. Only `claude-code` accepted.
  */
 async function cmdMcpInstall(args: string[]): Promise<void> {
-  // Set of install-shaping flags. Any one of these flips the dispatch to
-  // non-interactive — flag-passing semantics are "I know what I want."
-  // `--interactive` is the explicit opt-in for prompts even when other
-  // flags are present (useful for partial specification).
+  // Set of install-shaping flags. Any one flips dispatch to non-interactive
+  // — flag-passing semantics are "I know what I want."
   //
   // Declared inside the function (rather than module-top) because this
   // file's top-level dispatch await runs cmdMcpInstall during module
@@ -957,28 +955,16 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     "--client",
   ];
 
-  const wantInteractive = args.includes("--interactive");
   const hasFlag = args.some((a) => MCP_INSTALL_FLAG_NAMES.includes(a));
   const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
-  // Interactive dispatch fires when (a) the operator typed --interactive,
-  // OR (b) they passed no install-shaping flags and stdin is a TTY. The
-  // second condition is the bare-`mcp-install` case Aaron's feedback
-  // targets: a contextual walkthrough instead of the silent defaults.
-  //
-  // Refuse `--interactive` when stdin isn't a TTY rather than dispatching
-  // into the walkthrough — readline would hang forever on closed stdin,
-  // and a CI script that accidentally passed --interactive would
-  // deadlock until the runner's wall-clock timer fired. Loud refusal
-  // costs nothing and surfaces the misconfiguration immediately.
-  if (wantInteractive && !isTTY) {
-    console.error(
-      "--interactive requires a TTY for stdin (a real terminal). Got a piped / non-tty stdin. " +
-        "Either drop --interactive (defaults apply) or run from an interactive shell.",
-    );
-    process.exit(1);
-  }
-  if (wantInteractive || (isTTY && !hasFlag)) {
+  // Interactive dispatch fires when the operator passed no install-shaping
+  // flags AND stdin is a TTY. No separate `--interactive` flag — TTY+
+  // no-flags already covers the "walk me through it" case, and forcing
+  // interactive with partial flags is a half-feature that silently
+  // discards co-present flag values (vault#292 review F1). Non-TTY
+  // bare invocation falls through to the flag-driven defaults.
+  if (isTTY && !hasFlag) {
     return await cmdMcpInstallInteractive();
   }
 
@@ -2747,8 +2733,7 @@ Vaults:
   parachute-vault create <name> [--json]   Create a new vault (--json: emit { name, token, paths, set_as_default })
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
-  parachute-vault mcp-install [--interactive]
-                              [--mint|--token <t>|--legacy-pat]
+  parachute-vault mcp-install [--mint|--token <t>|--legacy-pat]
                               [--scope vault:read|vault:write|vault:admin]
                               [--install-scope user|project]
                               [--vault <name>] [--client claude-code]
@@ -2756,9 +2741,8 @@ Vaults:
                                             From a terminal with no flags: walks you
                                             through a contextual conversation (vault,
                                             location, auth) with smart defaults +
-                                            preview before write. With any flag, runs
-                                            non-interactively. --interactive forces
-                                            the walkthrough even with flags present.
+                                            preview before write. Pass any flag and
+                                            the command runs non-interactively.
                                             Default (non-interactive): --mint
                                             (hub-issued JWT via ~/.parachute/operator.token)
                                             into ~/.claude.json with vault:read scope.

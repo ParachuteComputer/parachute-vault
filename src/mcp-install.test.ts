@@ -583,18 +583,7 @@ describe("mcp-install interactive dispatch", () => {
     expect(res.stdout).not.toMatch(/Setting up Parachute Vault/);
   });
 
-  test("--interactive on a non-TTY refuses with a clear message (doesn't deadlock)", () => {
-    // Edge: `--interactive` requested but stdin is piped. readline would
-    // hang forever on closed stdin, so the CLI refuses up-front. Catches
-    // CI scripts that accidentally pass --interactive — better to fail
-    // fast than deadlock until a wall-clock timer fires.
-    setupBareVault(tmp, "default");
-    const res = runCli(["mcp-install", "--interactive"], tmp);
-    expect(res.exitCode).toBe(1);
-    expect(res.stderr).toMatch(/--interactive requires a TTY/);
-  });
-
-  test("any install-shaping flag + no --interactive bypasses the walkthrough", () => {
+  test("any install-shaping flag bypasses the walkthrough", () => {
     // --legacy-pat triggers the flag-driven path even on a TTY. The
     // walkthrough mustn't fire when a flag is present, so its
     // "Setting up…" banner must not appear in output.

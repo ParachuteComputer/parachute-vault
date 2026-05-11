@@ -571,7 +571,7 @@ The shortest path to a public HTTPS URL for a vault you control — useful for S
 
 ### Install vault MCP into a client config
 
-Bare `parachute-vault mcp-install` from a terminal **walks you through a short contextual conversation** — picks defaults informed by your environment (how many vaults you have, whether the hub is reachable, whether you're in a project directory, whether vault is already installed somewhere), shows the JSON shape it will write before doing anything, and asks before each non-obvious choice. The four patterns below are the non-interactive shapes — pass any flag (`--mint`, `--token`, `--scope`, `--install-scope`, `--vault`, `--legacy-pat`) and the walkthrough is skipped. Use `--interactive` to force the walkthrough even with some flags pre-specified.
+Bare `parachute-vault mcp-install` from a terminal **walks you through a short contextual conversation** — picks defaults informed by your environment (how many vaults you have, whether the hub is reachable, whether you're in a project directory, whether vault is already installed somewhere), shows the JSON shape it will write before doing anything, and asks before each non-obvious choice. The four patterns below are the non-interactive shapes — pass any flag (`--mint`, `--token`, `--scope`, `--install-scope`, `--vault`, `--legacy-pat`) and the walkthrough is skipped.
 
 ```bash
 # 1. Default (non-interactive shape) — mint a scope-narrow hub JWT

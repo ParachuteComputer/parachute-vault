@@ -173,8 +173,11 @@ export async function runInteractiveInstall(
       pastedToken = await askToken(io);
     } else if (answer === "legacy") {
       mode = "legacy-pat";
-      // Legacy path keeps the scope choice — narrowing applies to the
-      // pvt_*'s scope set the same way it would to a hub JWT.
+      // Legacy path mints a vault-DB pvt_* with scope narrowing — same
+      // verb choice as the mint path. Prompt for it explicitly so the
+      // operator gets the same control they get when widening a hub
+      // JWT's scope. (vault#292 review F2.)
+      scope = await askScope(io);
     } else {
       mode = "mint";
       if (answer === "write") scope = "vault:write";
@@ -199,6 +202,8 @@ export async function runInteractiveInstall(
       pastedToken = await askToken(io);
     } else {
       mode = "legacy-pat";
+      // Same scope prompt as the canMint legacy branch (F2).
+      scope = await askScope(io);
     }
   }
   io.log("");
@@ -224,6 +229,13 @@ export async function runInteractiveInstall(
     io.log(`  Scope: ${scope} → narrowed to vault:${vaultName}:${scope.split(":")[1]}.`);
   } else if (mode === "legacy-pat") {
     io.log(`  Scope: ${scope}. The pvt_* token is vault-DB-resident (vault#288 deprecation).`);
+  } else {
+    // mode === "token" (paste). The pasted bearer carries its own scope
+    // claim — we don't inspect or override it; whatever scope the issuer
+    // baked in is what the vault will enforce. Surfacing this in the
+    // preview keeps the operator from assuming they're getting
+    // vault:read just because the walkthrough's default reads that way.
+    io.log(`  Scope: determined by the pasted token (not validated here).`);
   }
   const proceed = await io.confirm("Proceed?", true);
   if (!proceed) {
@@ -273,6 +285,29 @@ function mcpUrlFromCtx(ctx: InstallContext, vaultName: string): string {
 function pathTail(p: string): string {
   const parts = p.split("/").filter((s) => s.length > 0);
   return parts.slice(-2).join("/") || p;
+}
+
+/**
+ * Prompt for scope when minting a vault-DB pvt_* (legacy-pat). Mirrors
+ * the mint path's "widen with write/admin" wording so the legacy and
+ * hub-mint branches surface scope as the same kind of choice. Mint's
+ * own scope prompt is inline at the auth-mode step (legacy is the
+ * extra round we couldn't fold there without ambiguity).
+ */
+async function askScope(io: InteractiveIO): Promise<InstallDecision["scope"]> {
+  const answer = await askPersistent(io, "Press Enter for vault:read (least privilege), or type 'write' or 'admin' to widen", "read", {
+    help: [
+      "Scopes for the legacy pvt_* token:",
+      "  read   → vault:read (default — listing + reading only).",
+      "  write  → vault:write (mutations: create, update, delete notes).",
+      "  admin  → vault:admin (full, including schema management).",
+    ].join("\n"),
+    validate: (s) => {
+      const ok = ["read", "write", "admin"];
+      return ok.includes(s) ? null : `expected one of: ${ok.join(", ")}`;
+    },
+  });
+  return `vault:${answer}` as InstallDecision["scope"];
 }
 
 /**
