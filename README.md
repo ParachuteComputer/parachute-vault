@@ -139,7 +139,7 @@ Password and 2FA secrets live in `~/.parachute/vault/config.yaml` at mode 0600 (
 
 Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **First MCP call after `vault init` requires no browser handoff — Claude Code uses the baked-in token and the vault's tools show up in your next session.** This is intentional: for an owner connecting their own machine's vault to their own Claude Code, the token is already there and OAuth would add friction.
 
-To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/vault/config.yaml` and re-run `parachute-vault init` — which re-mints an API token and re-writes the `~/.claude.json` entry end-to-end. To rotate the token only, edit `~/.claude.json` and replace the `Authorization` header value with a fresh token from `parachute-vault tokens create`. (Running `parachute-vault mcp-install` on its own overwrites the MCP entry *without* an `Authorization` header and is intended for the rare case where you want to drop the token and connect via OAuth instead.)
+To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/vault/config.yaml` and re-run `parachute-vault init` — which re-mints an API token and re-writes the `~/.claude.json` entry end-to-end. To rotate the token only, run `parachute-vault mcp-install` (defaults to `--mint`, which mints a fresh scope-narrow hub JWT via `~/.parachute/operator.token` and writes it into `~/.claude.json` with an `Authorization: Bearer …` header). See the [cookbook](#install-vault-mcp-into-a-client-config) section below for the full flag surface — token paste, scope narrowing, project-level install, multi-vault.
 
 ### Claude Desktop (OAuth)
 
@@ -190,7 +190,11 @@ parachute-vault uninstall --yes --wipe     # scripted destructive wipe (prints a
 parachute-vault create work                # create a new vault
 parachute-vault list                       # list all vaults (alias: `ls`)
 parachute-vault remove work --yes          # delete a vault (alias: `rm`)
-parachute-vault mcp-install                # (re)write the ~/.claude.json MCP entry for the default vault
+parachute-vault mcp-install                # (re)write the MCP client entry; defaults to --mint (hub-issued JWT)
+parachute-vault mcp-install --token <t>    # paste an existing bearer instead of minting
+parachute-vault mcp-install --legacy-pat   # mint a vault-DB pvt_* (self-hosted-without-hub)
+parachute-vault mcp-install --install-scope project   # write ./.mcp.json instead of ~/.claude.json
+parachute-vault mcp-install --vault work   # target the "work" vault (keyed as parachute-vault-work)
 
 # OAuth — owner password + 2FA
 parachute-vault set-password               # set/change the owner password (OAuth consent page)
@@ -564,6 +568,37 @@ Atomic at the SQL layer: two concurrent appends both land in some order, never c
 ### CI / public access via Tailscale Funnel
 
 The shortest path to a public HTTPS URL for a vault you control — useful for SSG rebuilds running on GitHub Actions, Vercel, or any runner that isn't on your tailnet. See [Remote access via Tailscale Funnel](#remote-access-via-tailscale-funnel) below for the full setup.
+
+### Install vault MCP into a client config
+
+Four common patterns. The standalone `mcp-install` command supports three explicit auth modes plus user-level vs project-level installs.
+
+```bash
+# 1. Default — mint a scope-narrow hub JWT (vault:<vault>:read) via your
+#    operator token, write it into ~/.claude.json. Requires:
+#      - ~/.parachute/operator.token (run `parachute auth rotate-operator` if missing)
+#      - PARACHUTE_HUB_ORIGIN set OR an active `parachute expose` session
+parachute-vault mcp-install
+
+# 2. Project-level install — write ./.mcp.json (Claude Code reads project-
+#    local configs) instead of ~/.claude.json. Pair with --scope vault:write
+#    when the project actually mutates the vault.
+parachute-vault mcp-install --install-scope project --scope vault:write
+
+# 3. Paste an existing token — useful when you already have a pvt_* in hand
+#    or want to re-use a long-lived bearer from another machine. Skips the
+#    mint step entirely.
+parachute-vault mcp-install --token pvt_abc123...
+
+# 4. Self-hosted-without-hub — mint a vault-DB pvt_* token (the legacy
+#    path; preserved so deployments without a hub keep working). Prints a
+#    deprecation notice.
+parachute-vault mcp-install --legacy-pat
+```
+
+**Multi-vault.** `--vault <name>` targets a specific vault and writes the entry under `parachute-vault-<name>` so multiple vaults coexist. Without `--vault`, the singular `parachute-vault` slot is used and one install clobbers another — that's intentional for the common single-vault case.
+
+**Doctor.** `parachute-vault doctor` checks both `~/.claude.json` and `./.mcp.json` and reports which one holds the entry, plus port-match and reachability of the MCP URL.
 
 ## Data model
 

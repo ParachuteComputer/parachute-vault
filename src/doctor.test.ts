@@ -156,16 +156,16 @@ describe("vault doctor — extended checks", () => {
     // Isolated HOME with no ~/.claude.json at all — the most common
     // pre-`mcp-install` state for new users.
     const res = runCli(["doctor"], dir, { HOME: dir });
-    expect(res.stdout).toMatch(/! MCP entry in ~\/\.claude\.json/);
-    expect(res.stdout).toMatch(/does not exist|no mcpServers/);
+    expect(res.stdout).toMatch(/! MCP entry in MCP client config/);
+    expect(res.stdout).toMatch(/does not exist|no parachute-vault entry/);
     expect(res.stdout).toMatch(/mcp-install/);
   });
 
   test("warns when ~/.claude.json exists but has no parachute-vault entry", () => {
     writeFileSync(join(dir, ".claude.json"), JSON.stringify({ mcpServers: {} }));
     const res = runCli(["doctor"], dir, { HOME: dir });
-    expect(res.stdout).toMatch(/! MCP entry in ~\/\.claude\.json/);
-    expect(res.stdout).toMatch(/no mcpServers\["parachute-vault"\] entry/);
+    expect(res.stdout).toMatch(/! MCP entry in MCP client config/);
+    expect(res.stdout).toMatch(/no parachute-vault entry/);
   });
 
   test("passes MCP entry + port-match checks when URL points at the configured port", () => {
@@ -174,7 +174,8 @@ describe("vault doctor — extended checks", () => {
     writeFileSync(join(dir, "config.yaml"), "port: 4321\n");
     writeClaudeJson(dir, "http://127.0.0.1:4321/vault/default/mcp");
     const res = runCli(["doctor"], dir, { HOME: dir });
-    expect(res.stdout).toMatch(/✓ MCP entry in ~\/\.claude\.json/);
+    // Doctor now names the source file in the check label.
+    expect(res.stdout).toMatch(/✓ MCP entry in ~\/\.claude\.json \(parachute-vault\)/);
     expect(res.stdout).toMatch(/✓ MCP URL port matches vault\s+\(port 4321\)/);
     // Reachability will warn because nothing is bound to 4321 in the test
     // env — this is the "entry present, port matches, daemon unreachable"
@@ -186,7 +187,7 @@ describe("vault doctor — extended checks", () => {
     writeFileSync(join(dir, "config.yaml"), "port: 4321\n");
     writeClaudeJson(dir, "http://127.0.0.1:9999/vault/default/mcp");
     const res = runCli(["doctor"], dir, { HOME: dir });
-    expect(res.stdout).toMatch(/✓ MCP entry in ~\/\.claude\.json/);
+    expect(res.stdout).toMatch(/✓ MCP entry in ~\/\.claude\.json \(parachute-vault\)/);
     expect(res.stdout).toMatch(/! MCP URL port matches vault/);
     expect(res.stdout).toMatch(/MCP URL port 9999 ≠ vault port 4321/);
   });

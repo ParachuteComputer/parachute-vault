@@ -6,6 +6,88 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.1] — 2026-05-11
+
+Rework `parachute-vault mcp-install` (Phase A + B of the install-flow audit).
+Hub-mint becomes the canonical install path; `pvt_*` becomes the explicit
+`--legacy-pat` opt-in. New flag surface gives operators control over auth
+source, scope, install location, and target vault.
+
+### New CLI shape
+
+```
+parachute-vault mcp-install
+  [--mint | --token <bearer> | --legacy-pat]    # auth mode (mutually exclusive)
+  [--scope vault:read|vault:write|vault:admin]  # default: vault:read
+  [--install-scope user|project]                # default: user (~/.claude.json)
+  [--vault <name>]                              # default: default_vault
+  [--client claude-code]                        # only claude-code wired up
+```
+
+### Behavior changes
+
+- **Default is now `--mint`** — install reads `~/.parachute/operator.token`,
+  POSTs to `<hub>/api/auth/mint-token` with the requested scope, and writes
+  the returned scope-narrow JWT into `Authorization: Bearer …`. Aligns with
+  the hub-as-AS direction settled in vault#212. Requires the operator token
+  + a configured hub origin; both failure modes have specific remediation
+  messages.
+- **`--token <bearer>`** — paste an existing bearer (any shape: hub JWT,
+  `pvt_*`, legacy YAML key) instead of minting. Skips all token-mint logic.
+- **`--legacy-pat`** — mints a vault-DB `pvt_*` token. Preserved for
+  self-hosted-without-hub setups. Prints a deprecation notice on stderr;
+  the canonical path going forward is hub-mint.
+- **`--scope vault:read|vault:write|vault:admin`** — narrows the minted
+  token's scope. Default `vault:read` (least-privilege). For `--mint`,
+  expands to `vault:<vault-name>:<verb>` so the JWT can't be re-used
+  against other vaults on the same hub. For `--legacy-pat`, narrows the
+  on-disk token's scope set.
+- **`--install-scope user|project`** — `user` writes `~/.claude.json` (old
+  behavior); `project` writes `./.mcp.json` in CWD (Claude Code's
+  project-local config). Doctor checks both locations now.
+- **`--vault <name>`** — targets a specific vault; the entry is keyed as
+  `parachute-vault-<name>` so multi-vault installs coexist. Without
+  `--vault`, the singular `parachute-vault` slot is used (one install
+  per file, default).
+
+### Internals
+
+- `installMcpConfig(apiKey?)` signature → `installMcpConfig(opts)` with
+  `targetPath` / `entryKey` / `vaultName` / `bearer` fields. Init's
+  bootstrap path continues to mint a `pvt_*` so a fresh standalone install
+  still works without a hub; operators with a hub re-run `mcp-install`
+  (now defaulting to hub-mint) to upgrade.
+- `removeMcpConfig` cleans both `~/.claude.json` and `./.mcp.json` and
+  honors the new `parachute-vault-<name>` per-vault keys (plus the legacy
+  `parachute-vault/<name>` slash-form for backward cleanup).
+- `readMcpEntry` (doctor) checks both target files, prefers user-level,
+  and accepts singular + per-vault entry keys. Reports which file +
+  entry-key the check matched.
+- New helpers in `src/mcp-install.ts`: `chooseHubOrigin` (bare origin for
+  hub API calls), `readOperatorToken` (reads `~/.parachute/operator.token`),
+  `mintHubJwt` (test-seamed fetch wrapper for the mint-token endpoint),
+  `resolveInstallTarget` (user/project file resolver).
+
+### Tests
+
+26 new tests in `src/mcp-install.test.ts` cover: hub-mint happy path with
+mocked fetch, every API/network failure mode, operator-token read paths,
+install-target resolution, every flag-parsing rejection (mutually
+exclusive auth modes, bad `--scope`, bad `--install-scope`, bad
+`--client`), missing operator token, no-hub-configured, end-to-end
+`--token` / `--legacy-pat` / `--install-scope project` / `--vault <name>` /
+overwrite-existing-bearer. Doctor tests updated for the new check-name
+shape that includes the source file + entry key. 1281/1281 pass.
+
+### Out of scope (Phase C — deferred)
+
+- **Cross-client support** (Cursor, Claude Desktop, Codex, Zed, Goose,
+  Cline) — `--client` flag accepts only `claude-code` and rejects others
+  with a "Phase C" message so the surface is documented but not yet
+  pluralized.
+- **Client auto-detection** (probe installed clients, suggest defaults).
+- **Interactive picker** when run from a TTY without explicit flags.
+
 ## [0.4.3] — 2026-05-10
 
 Two release cuts (`0.4.3-rc.1` and `0.4.3-rc.2`) ship together as `0.4.3`

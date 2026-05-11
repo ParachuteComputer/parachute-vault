@@ -7,7 +7,8 @@
  *   parachute-vault init                    — set up everything, one command
  *   parachute-vault create <name>           — create a new vault
  *   parachute-vault list                    — list all vaults
- *   parachute-vault mcp-install <name>      — add vault MCP to ~/.claude.json
+ *   parachute-vault mcp-install [flags]     — install vault MCP into a client config
+ *                                              (defaults: --mint into ~/.claude.json)
  *   parachute-vault remove <name>           — remove a vault
  *   parachute-vault config                  — show all config
  *   parachute-vault config set <key> <val>  — set a config value
@@ -51,7 +52,14 @@ import {
 import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
-import { chooseMcpUrl } from "./mcp-install.ts";
+import {
+  chooseHubOrigin,
+  chooseMcpUrl,
+  mintHubJwt,
+  readOperatorToken,
+  resolveInstallTarget,
+  type InstallScope,
+} from "./mcp-install.ts";
 import { buildInitSummaryLines } from "./init-summary.ts";
 import {
   runBackup,
@@ -152,7 +160,7 @@ switch (command) {
     cmdList();
     break;
   case "mcp-install":
-    cmdMcpInstall(cmdArgs);
+    await cmdMcpInstall(cmdArgs);
     break;
   case "remove":
   case "rm":
@@ -503,7 +511,19 @@ async function cmdInit(args: string[] = []) {
   }
 
   if (addMcp) {
-    installMcpConfig(apiKey);
+    // Init's bootstrap path stays on the pvt_* shape so a fresh-install
+    // without a hub still works out of the box. Operators with a hub can
+    // re-run `parachute-vault mcp-install` (defaults to hub-mint) to
+    // upgrade. The new `installMcpConfig` opts shape is used here with
+    // the same effective behavior as before.
+    const target = resolveInstallTarget("user");
+    const { url, source } = installMcpConfig({
+      targetPath: target.path,
+      entryKey: "parachute-vault",
+      vaultName: defaultVault,
+      bearer: apiKey,
+    });
+    console.log(`MCP URL: ${url} (${source})`);
     console.log(`  MCP server added to ~/.claude.json`);
   } else {
     console.log("  Skipped adding MCP to ~/.claude.json.");
@@ -880,10 +900,220 @@ function cmdList() {
   }
 }
 
-function cmdMcpInstall(_args: string[]) {
-  installMcpConfig();
-  console.log(`Added MCP server "parachute-vault" to ~/.claude.json`);
-  console.log(`All vaults accessible via the 'vault' parameter on each tool.`);
+/**
+ * Parse a `--flag value` pair from an args array. Returns the value (or
+ * undefined when the flag isn't present) and a flag whether the flag's value
+ * was actually present (catches `--flag` without an argument).
+ */
+function takeArgValue(args: string[], name: string): { value?: string; missingValue?: boolean } {
+  const idx = args.indexOf(name);
+  if (idx === -1) return {};
+  const next = args[idx + 1];
+  if (!next || next.startsWith("--")) return { missingValue: true };
+  return { value: next };
+}
+
+/**
+ * `parachute-vault mcp-install` — install the vault MCP server into an
+ * AI client's config. Three auth modes (mutually exclusive):
+ *
+ *   --mint                (default) Mint a hub JWT via `POST <hub>/api/auth/mint-token`
+ *                         using the local operator token.
+ *   --token <bearer>      Use an existing token (hub JWT, pvt_*, anything).
+ *   --legacy-pat          Mint a vault-DB `pvt_*` token (deprecated;
+ *                         self-hosted-without-hub setups).
+ *
+ * Targeting:
+ *   --scope <verb>        vault:read | vault:write | vault:admin (default: vault:read).
+ *                         For --mint, expands to vault:<vault-name>:<verb>.
+ *   --install-scope <s>   user (default; ~/.claude.json) | project (./.mcp.json).
+ *   --vault <name>        Vault to target (default: default_vault). Multi-vault
+ *                         installs key the entry as `parachute-vault-<name>`.
+ *   --client <name>       Reserved for Phase C. Only `claude-code` accepted.
+ */
+async function cmdMcpInstall(args: string[]): Promise<void> {
+  // --- Auth-mode parsing (mutually exclusive) ---
+  const wantMint = args.includes("--mint");
+  const wantLegacy = args.includes("--legacy-pat");
+  const tokenArg = takeArgValue(args, "--token");
+  if (tokenArg.missingValue) {
+    console.error("--token requires a value (the bearer token to embed).");
+    process.exit(1);
+  }
+  const wantToken = tokenArg.value !== undefined;
+  const modesSet = (wantMint ? 1 : 0) + (wantLegacy ? 1 : 0) + (wantToken ? 1 : 0);
+  if (modesSet > 1) {
+    console.error("--mint, --token, and --legacy-pat are mutually exclusive.");
+    process.exit(1);
+  }
+  const mode: "mint" | "token" | "legacy-pat" =
+    wantToken ? "token" : wantLegacy ? "legacy-pat" : "mint";
+
+  // --- Scope parsing. Default vault:read (least-privilege). ---
+  const scopeArg = takeArgValue(args, "--scope");
+  if (scopeArg.missingValue) {
+    console.error("--scope requires a value: vault:read, vault:write, or vault:admin.");
+    process.exit(1);
+  }
+  const rawScope = scopeArg.value ?? "vault:read";
+  if (!(VAULT_SCOPES as readonly string[]).includes(rawScope)) {
+    console.error(
+      `--scope must be one of: ${VAULT_SCOPES.join(", ")}. Got: ${rawScope}.`,
+    );
+    process.exit(1);
+  }
+  // Verb is the last segment of `vault:<verb>` — used to narrow to
+  // `vault:<vault-name>:<verb>` for the hub-mint path.
+  const verb = rawScope.split(":")[1]!;
+
+  // --- Install scope: user (default) or project. ---
+  const installScopeArg = takeArgValue(args, "--install-scope");
+  if (installScopeArg.missingValue) {
+    console.error("--install-scope requires a value: user or project.");
+    process.exit(1);
+  }
+  const installScopeRaw = installScopeArg.value ?? "user";
+  if (installScopeRaw !== "user" && installScopeRaw !== "project") {
+    console.error(`--install-scope must be "user" or "project". Got: ${installScopeRaw}.`);
+    process.exit(1);
+  }
+  const installScope: InstallScope = installScopeRaw;
+
+  // --- Client (Phase C placeholder). Reject anything other than claude-code. ---
+  // Validated before filesystem-dependent vault-existence so a static flag
+  // typo fails on its own terms ("--client cursor not supported") rather
+  // than getting masked by an unrelated "vault not found" error.
+  const clientArg = takeArgValue(args, "--client");
+  if (clientArg.missingValue) {
+    console.error("--client requires a value.");
+    process.exit(1);
+  }
+  const client = clientArg.value ?? "claude-code";
+  if (client !== "claude-code") {
+    console.error(
+      `--client "${client}" is not yet supported. Only "claude-code" is wired up; ` +
+        `Cursor / Claude Desktop / Codex / Zed are Phase C work.`,
+    );
+    process.exit(1);
+  }
+
+  // --- Vault target. Default = default_vault; validate existence. ---
+  const vaultArg = takeArgValue(args, "--vault");
+  if (vaultArg.missingValue) {
+    console.error("--vault requires a value (the vault name).");
+    process.exit(1);
+  }
+  const globalConfig = readGlobalConfig();
+  const defaultVault = globalConfig.default_vault || "default";
+  const vaultName = vaultArg.value ?? defaultVault;
+  // Was --vault explicitly given? Used to decide entry-key shape — explicit
+  // means "this is one vault among many, key it per-vault"; default means
+  // "the single canonical install, key it as `parachute-vault`."
+  const vaultExplicit = vaultArg.value !== undefined;
+  if (!readVaultConfig(vaultName)) {
+    console.error(`Vault "${vaultName}" not found. Available: ${listVaults().join(", ") || "(none)"}.`);
+    process.exit(1);
+  }
+
+  // --- Resolve target file + entry key. ---
+  const target = resolveInstallTarget(installScope);
+  // Multi-vault installs key the entry as `parachute-vault-<name>` so the
+  // singular `parachute-vault` slot remains the default install. An explicit
+  // `--vault <name>` (even pointing at the default) opts into the per-vault
+  // key shape; without `--vault`, the default install keeps clobbering the
+  // singular slot as before.
+  const entryKey = vaultExplicit ? `parachute-vault-${vaultName}` : "parachute-vault";
+
+  // --- Acquire the bearer per mode. ---
+  let bearer: string | undefined;
+  if (mode === "token") {
+    bearer = tokenArg.value!;
+    console.log(`Using supplied --token (skipping mint).`);
+  } else if (mode === "legacy-pat") {
+    console.error(
+      "Note: --legacy-pat mints a vault-DB pvt_* token. The hub-issued JWT path (--mint, default) " +
+        "is the canonical install going forward; pvt_* support is preserved for self-hosted-without-hub " +
+        "setups, tracked at vault#288, planned removal 0.6.0.",
+    );
+    const store = getVaultStore(vaultName);
+    const { fullToken } = generateToken();
+    // Narrow the pvt_* to the requested verb's scope set when not full-admin.
+    // `scopes: undefined` leaves the token at full vault permissions
+    // (admin); narrowing to a single-scope array gates it to that verb.
+    const createTokenOpts: Parameters<typeof createToken>[2] = {
+      label: "mcp-install",
+      permission: verb === "read" ? "read" : "full",
+      vault_name: vaultName,
+    };
+    if (verb !== "admin") {
+      createTokenOpts.scopes = [rawScope];
+    }
+    createToken(store.db, fullToken, createTokenOpts);
+    bearer = fullToken;
+  } else {
+    // mode === "mint"
+    const operatorToken = readOperatorToken();
+    if (!operatorToken) {
+      console.error(
+        "No operator token found at ~/.parachute/operator.token. The default install path " +
+          "(--mint) requires a hub-issued operator token to mint scope-narrow JWTs.\n" +
+          "  Fix: run `parachute auth rotate-operator` to create one, then re-run.\n" +
+          "  Or:  use `--token <bearer>` to paste an existing token, or `--legacy-pat` to " +
+          "mint a vault-DB pvt_* token (self-hosted-without-hub).",
+      );
+      process.exit(1);
+    }
+    const port = globalConfig.port || DEFAULT_PORT;
+    const hub = chooseHubOrigin(port);
+    if (hub.source === "loopback") {
+      console.error(
+        "No hub origin configured (PARACHUTE_HUB_ORIGIN unset, no active expose-state). " +
+          "Hub-mint (--mint) needs a real hub URL to call. Either:\n" +
+          "  - Start the hub and set PARACHUTE_HUB_ORIGIN, OR\n" +
+          "  - Bring up an exposure (`parachute expose tailnet`), OR\n" +
+          "  - Use --legacy-pat to mint a vault-DB pvt_* token instead.",
+      );
+      process.exit(1);
+    }
+    // Narrow the mint to `vault:<vault-name>:<verb>` so the JWT can't be
+    // reused against other vaults on the same hub.
+    const narrowScope = `vault:${vaultName}:${verb}`;
+    const result = await mintHubJwt({
+      hubOrigin: hub.url,
+      operatorToken,
+      scope: narrowScope,
+      subject: "parachute-vault-mcp",
+    });
+    if ("kind" in result) {
+      switch (result.kind) {
+        case "network":
+          console.error(
+            `Hub unreachable at ${result.origin} — ${result.cause}.\n` +
+              `  Fix: verify the hub is running and PARACHUTE_HUB_ORIGIN is set, ` +
+              `or use --legacy-pat to skip hub-mint.`,
+          );
+          break;
+        case "api-error":
+          console.error(
+            `Hub mint-token rejected (HTTP ${result.status}, ${result.error}): ${result.description}`,
+          );
+          break;
+      }
+      process.exit(1);
+    }
+    bearer = result.token;
+    console.log(`Minted hub JWT (jti=${result.jti}, expires ${result.expires_at}, scope ${result.scope}).`);
+  }
+
+  // --- Write the entry. ---
+  const { url, source } = installMcpConfig({
+    targetPath: target.path,
+    entryKey,
+    vaultName,
+    bearer,
+  });
+  console.log(`MCP URL: ${url} (${source})`);
+  console.log(`Added MCP server "${entryKey}" to ${target.path}`);
 }
 
 function cmdRemove(args: string[]) {
@@ -1554,23 +1784,23 @@ async function cmdDoctor() {
     });
   }
 
-  // MCP entry in ~/.claude.json. Split into three separate checks so the
-  // user can see exactly which condition fails: "entry present", "port
-  // matches vault", "daemon reachable over MCP URL". A common failure is
-  // "entry exists but port is stale" after the user changed PORT without
-  // re-running `mcp-install`.
+  // MCP entry in ~/.claude.json or ./.mcp.json. Split into three separate
+  // checks so the user can see exactly which condition fails: "entry
+  // present", "port matches vault", "daemon reachable over MCP URL". A
+  // common failure is "entry exists but port is stale" after the user
+  // changed PORT without re-running `mcp-install`.
   const port = resolveVaultPort();
   const mcpEntry = readMcpEntry();
   if (!mcpEntry.found) {
     checks.push({
-      name: "MCP entry in ~/.claude.json",
+      name: "MCP entry in MCP client config",
       status: "warn",
       detail: mcpEntry.reason,
       fix: "Run `parachute-vault mcp-install` to register the vault with Claude.",
     });
   } else {
     checks.push({
-      name: "MCP entry in ~/.claude.json",
+      name: `MCP entry in ${mcpEntry.locationLabel}`,
       status: "pass",
       detail: mcpEntry.url,
     });
@@ -1734,57 +1964,79 @@ function resolveVaultPort(): number {
 
 type McpEntryLookup =
   | { found: false; reason: string }
-  | { found: true; url: string; port: number | null };
+  | { found: true; url: string; port: number | null; locationLabel: string };
 
 /**
- * Read `~/.claude.json` and return the shape of the `parachute-vault` MCP
- * entry if present. The entry is always an HTTP MCP pointing at the local
- * daemon — `{ type: "http", url: "http://127.0.0.1:<port>/vault/<name>/mcp" }`
- * — so we parse the URL's port for the port-match check.
+ * Read the parachute vault MCP entry from either `~/.claude.json` (user
+ * scope) or `./.mcp.json` (project scope), preferring user-level. Accepts
+ * the singular `parachute-vault` key or any per-vault `parachute-vault-<name>`
+ * key — multi-vault installs key per-vault. The entry is always an HTTP MCP
+ * pointing at the local daemon, so we parse the URL's port for the
+ * port-match check.
  *
- * Invariant: the check is NON-fatal. A missing ~/.claude.json is a warn,
- * not a fail: plenty of users install the vault first and wire it to
- * Claude later. We just make the "is it wired up?" state legible.
+ * Invariant: the check is NON-fatal. A missing entry is a warn, not a fail:
+ * plenty of users install the vault first and wire it to Claude later. We
+ * just make the "is it wired up?" state legible.
  */
 function readMcpEntry(): McpEntryLookup {
-  const claudeJsonPath = resolve(homedir(), ".claude.json");
-  if (!existsSync(claudeJsonPath)) {
-    return { found: false, reason: `${claudeJsonPath} does not exist` };
+  const candidates = [
+    { path: resolve(homedir(), ".claude.json"), label: "~/.claude.json" },
+    { path: resolve(process.cwd(), ".mcp.json"), label: `${process.cwd()}/.mcp.json` },
+  ];
+  const checkedReasons: string[] = [];
+  for (const { path, label } of candidates) {
+    if (!existsSync(path)) {
+      checkedReasons.push(`${label} does not exist`);
+      continue;
+    }
+    let config: any;
+    try {
+      config = JSON.parse(readFileSync(path, "utf-8"));
+    } catch (err: any) {
+      checkedReasons.push(`${label} is not valid JSON: ${String(err?.message ?? err)}`);
+      continue;
+    }
+    const servers = config?.mcpServers ?? {};
+    // Prefer the singular `parachute-vault` slot (canonical default
+    // install); fall back to the first `parachute-vault-<name>` per-vault
+    // entry. Multi-vault installs may have several; the doctor reports on
+    // the one it finds first so the basic "is something wired up?" check
+    // still works without enumerating every vault.
+    let entry = servers["parachute-vault"];
+    let entryKey = "parachute-vault";
+    if (!entry) {
+      for (const key of Object.keys(servers)) {
+        if (key.startsWith("parachute-vault-")) {
+          entry = servers[key];
+          entryKey = key;
+          break;
+        }
+      }
+    }
+    if (!entry) {
+      checkedReasons.push(`no parachute-vault entry in ${label}`);
+      continue;
+    }
+    const url = typeof entry.url === "string" ? entry.url : null;
+    if (!url) {
+      checkedReasons.push(
+        `${label} mcpServers["${entryKey}"] has no \`url\` field (got ${JSON.stringify(entry).slice(0, 80)})`,
+      );
+      continue;
+    }
+    let entryPort: number | null = null;
+    try {
+      const parsed = new URL(url);
+      entryPort = parsed.port ? Number(parsed.port) : null;
+    } catch {
+      entryPort = null;
+    }
+    return { found: true, url, port: entryPort, locationLabel: `${label} (${entryKey})` };
   }
-  let config: any;
-  try {
-    config = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
-  } catch (err: any) {
-    return {
-      found: false,
-      reason: `${claudeJsonPath} is not valid JSON: ${String(err?.message ?? err)}`,
-    };
-  }
-  const entry = config?.mcpServers?.["parachute-vault"];
-  if (!entry) {
-    return {
-      found: false,
-      reason: `no mcpServers["parachute-vault"] entry in ${claudeJsonPath}`,
-    };
-  }
-  // The entry is always a URL-bearing HTTP MCP. Non-URL shapes are
-  // unexpected (Claude Code would ignore them anyway) but we surface the
-  // raw shape so the user can see what's there.
-  const url = typeof entry.url === "string" ? entry.url : null;
-  if (!url) {
-    return {
-      found: false,
-      reason: `mcpServers["parachute-vault"] has no \`url\` field (got ${JSON.stringify(entry).slice(0, 80)})`,
-    };
-  }
-  let entryPort: number | null = null;
-  try {
-    const parsed = new URL(url);
-    entryPort = parsed.port ? Number(parsed.port) : null;
-  } catch {
-    entryPort = null;
-  }
-  return { found: true, url, port: entryPort };
+  return {
+    found: false,
+    reason: checkedReasons.length > 0 ? checkedReasons.join("; ") : "no MCP config files found",
+  };
 }
 
 /**
@@ -2282,12 +2534,24 @@ function createVault(name: string): string {
   return fullToken;
 }
 
-function installMcpConfig(apiKey?: string) {
-  const claudeJsonPath = resolve(homedir(), ".claude.json");
+interface InstallMcpConfigOpts {
+  /** Absolute path to the MCP client config file. Computed by the caller via `resolveInstallTarget`. */
+  targetPath: string;
+  /** `mcpServers.<entryKey>` slot the entry lands at. Default is `parachute-vault`; multi-vault installs key as `parachute-vault-<name>`. */
+  entryKey: string;
+  /** Vault name to embed in the URL (`/vault/<vaultName>/mcp`). */
+  vaultName: string;
+  /** Bearer token to embed in `Authorization: Bearer …`. Omitted means the entry is unauthenticated — only useful for OAuth-capable clients (Claude Code does discovery). */
+  bearer?: string;
+}
+
+function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: string } {
+  const { targetPath, entryKey, vaultName, bearer } = opts;
+
   let config: any = {};
-  if (existsSync(claudeJsonPath)) {
+  if (existsSync(targetPath)) {
     try {
-      config = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
+      config = JSON.parse(readFileSync(targetPath, "utf-8"));
     } catch {}
   }
 
@@ -2296,45 +2560,48 @@ function installMcpConfig(apiKey?: string) {
   const globalConfig = readGlobalConfig();
   const port = globalConfig.port || DEFAULT_PORT;
 
-  // Clean up old per-vault stdio entries
-  for (const key of Object.keys(config.mcpServers)) {
-    if (key.startsWith("parachute-vault/")) {
-      delete config.mcpServers[key];
-    }
-  }
-
-  // Single HTTP MCP entry — use per-vault endpoint so pvt_ tokens work.
   // Pick the URL that matches the OAuth issuer vault will advertise, in this
   // order: explicit hub origin env > active tailnet/public exposure >
   // loopback. Otherwise a strict MCP client (Claude Code) hits a loopback URL
   // whose discovery issuer points at the hub and rejects on origin mismatch
   // (RFC 8414).
-  const defaultVault = globalConfig.default_vault || "default";
-  const { url: mcpUrl, source } = chooseMcpUrl(defaultVault, port);
-  console.log(`MCP URL: ${mcpUrl} (${source})`);
+  const { url: mcpUrl, source } = chooseMcpUrl(vaultName, port);
   const mcpEntry: Record<string, unknown> = { type: "http", url: mcpUrl };
-  if (apiKey) {
-    mcpEntry.headers = { Authorization: `Bearer ${apiKey}` };
+  if (bearer) {
+    mcpEntry.headers = { Authorization: `Bearer ${bearer}` };
   }
-  config.mcpServers["parachute-vault"] = mcpEntry;
+  config.mcpServers[entryKey] = mcpEntry;
 
-  writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
+  writeFileSync(targetPath, JSON.stringify(config, null, 2) + "\n");
+  return { url: mcpUrl, source };
 }
 
 function removeMcpConfig() {
+  // Remove vault entries from both user-level and project-level config
+  // files. Project-level uses CWD — only relevant when uninstall is run
+  // from inside a project that had `mcp-install --install-scope project`
+  // applied; otherwise the project path doesn't exist and we no-op.
   const claudeJsonPath = resolve(homedir(), ".claude.json");
-  if (!existsSync(claudeJsonPath)) return;
-  try {
-    const config = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
-    delete config.mcpServers?.["parachute-vault"];
-    // Also clean up any old per-vault entries
-    for (const key of Object.keys(config.mcpServers ?? {})) {
-      if (key.startsWith("parachute-vault/")) {
-        delete config.mcpServers[key];
+  const projectMcpJsonPath = resolve(process.cwd(), ".mcp.json");
+  for (const path of [claudeJsonPath, projectMcpJsonPath]) {
+    if (!existsSync(path)) continue;
+    try {
+      const config = JSON.parse(readFileSync(path, "utf-8"));
+      // Drop the singular key and every per-vault `parachute-vault-<name>`
+      // entry. Legacy `parachute-vault/<name>` (slash-form) sub-keys from a
+      // pre-multi-vault pattern still get cleaned up here.
+      for (const key of Object.keys(config.mcpServers ?? {})) {
+        if (
+          key === "parachute-vault" ||
+          key.startsWith("parachute-vault-") ||
+          key.startsWith("parachute-vault/")
+        ) {
+          delete config.mcpServers[key];
+        }
       }
-    }
-    writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
-  } catch {}
+      writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+    } catch {}
+  }
 }
 
 function usage() {
@@ -2377,7 +2644,25 @@ Vaults:
   parachute-vault create <name> [--json]   Create a new vault (--json: emit { name, token, paths, set_as_default })
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
-  parachute-vault mcp-install              Add vault MCP to Claude
+  parachute-vault mcp-install [--mint|--token <t>|--legacy-pat]
+                              [--scope vault:read|vault:write|vault:admin]
+                              [--install-scope user|project]
+                              [--vault <name>] [--client claude-code]
+                                            Install vault MCP into a client config.
+                                            Default: --mint (hub-issued JWT via
+                                            ~/.parachute/operator.token) into
+                                            ~/.claude.json with vault:read scope.
+                                            --token <t>: paste an existing bearer
+                                            (any shape) instead of minting.
+                                            --legacy-pat: mint a vault-DB pvt_*
+                                            token (deprecated; for self-hosted-
+                                            without-hub setups).
+                                            --install-scope project writes
+                                            ./.mcp.json in CWD instead of
+                                            ~/.claude.json.
+                                            --vault <name> targets a specific
+                                            vault and keys the entry as
+                                            parachute-vault-<name>.
 
 Tokens:
   parachute-vault tokens                          List tokens (every vault)
