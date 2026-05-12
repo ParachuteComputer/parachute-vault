@@ -55,7 +55,6 @@ import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./lau
 import {
   buildMcpEntryPlan,
   chooseHubOrigin,
-  chooseMcpUrl,
   detectInstallContext,
   mintHubJwt,
   readOperatorToken,
@@ -522,13 +521,19 @@ async function cmdInit(args: string[] = []) {
     // Init's bootstrap path stays on the pvt_* shape so a fresh-install
     // without a hub still works out of the box. Operators with a hub can
     // re-run `parachute-vault mcp-install` (defaults to hub-mint) to
-    // upgrade. The new `installMcpConfig` opts shape is used here with
-    // the same effective behavior as before.
+    // upgrade. Goes through `buildMcpEntryPlan` for entryKey + url so this
+    // path shares the writer-side invariant with `executeMcpInstall` — a
+    // future URL-shape change can't drift between init and mcp-install.
     const target = resolveInstallTarget("user");
-    const { url, source } = installMcpConfig({
-      targetPath: target.path,
-      entryKey: "parachute-vault",
+    const { entryKey, url, source } = buildMcpEntryPlan({
       vaultName: defaultVault,
+      vaultExplicit: false,
+      port: globalConfig.port || DEFAULT_PORT,
+    });
+    installMcpConfig({
+      targetPath: target.path,
+      entryKey,
+      url,
       bearer: apiKey,
     });
     console.log(`MCP URL: ${url} (${source})`);
@@ -1139,9 +1144,10 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
   const verb = rawScope.split(":")[1]!;
   const target = resolveInstallTarget(installScope);
   // Single source of truth shared with the interactive walkthrough's
-  // preview — preview-shows-this-shape ⇒ this-shape-lands-on-disk. See
-  // vault#293.
-  const { entryKey } = buildMcpEntryPlan({
+  // preview — preview-shows-this-shape ⇒ this-shape-lands-on-disk. The
+  // helper closes both halves of the invariant (entryKey + url) — see
+  // vault#293 for the seam, vault#302 for closing the writer-side URL.
+  const { entryKey, url, source } = buildMcpEntryPlan({
     vaultName,
     vaultExplicit,
     port: globalConfig.port || DEFAULT_PORT,
@@ -1230,10 +1236,10 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     console.log(`Minted hub JWT (jti=${result.jti}, expires ${result.expires_at}, scope ${result.scope}).`);
   }
 
-  const { url, source } = installMcpConfig({
+  installMcpConfig({
     targetPath: target.path,
     entryKey,
-    vaultName,
+    url,
     bearer,
     ...(target.localProjectKey ? { localProjectKey: target.localProjectKey } : {}),
   });
@@ -2695,8 +2701,15 @@ interface InstallMcpConfigOpts {
   targetPath: string;
   /** `mcpServers.<entryKey>` slot the entry lands at. Default is `parachute-vault`; multi-vault installs key as `parachute-vault-<name>`. */
   entryKey: string;
-  /** Vault name to embed in the URL (`/vault/<vaultName>/mcp`). */
-  vaultName: string;
+  /**
+   * URL embedded in the entry's `url` field. The caller is the sole source of
+   * truth — `buildMcpEntryPlan` produces both `entryKey` and `url` together,
+   * and passing them through closes the preview ⇄ writer invariant (the
+   * shape the preview promised is the shape that lands on disk). See
+   * vault#302; #301 introduced the seam for `entryKey`, this closes it for
+   * `url` too.
+   */
+  url: string;
   /** Bearer token to embed in `Authorization: Bearer …`. Omitted means the entry is unauthenticated — only useful for OAuth-capable clients (Claude Code does discovery). */
   bearer?: string;
   /**
@@ -2709,8 +2722,13 @@ interface InstallMcpConfigOpts {
   localProjectKey?: string;
 }
 
-function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: string } {
-  const { targetPath, entryKey, vaultName, bearer, localProjectKey } = opts;
+/**
+ * Write the MCP entry into the target config file. Pure file-writer — the
+ * caller has already decided `entryKey` and `url` (via `buildMcpEntryPlan`).
+ * Returns `void`; the caller already has `url` and `source` for logging.
+ */
+function installMcpConfig(opts: InstallMcpConfigOpts): void {
+  const { targetPath, entryKey, url, bearer, localProjectKey } = opts;
 
   let config: any = {};
   if (existsSync(targetPath)) {
@@ -2719,16 +2737,7 @@ function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: st
     } catch {}
   }
 
-  const globalConfig = readGlobalConfig();
-  const port = globalConfig.port || DEFAULT_PORT;
-
-  // Pick the URL that matches the OAuth issuer vault will advertise, in this
-  // order: explicit hub origin env > active tailnet/public exposure >
-  // loopback. Otherwise a strict MCP client (Claude Code) hits a loopback URL
-  // whose discovery issuer points at the hub and rejects on origin mismatch
-  // (RFC 8414).
-  const { url: mcpUrl, source } = chooseMcpUrl(vaultName, port);
-  const mcpEntry: Record<string, unknown> = { type: "http", url: mcpUrl };
+  const mcpEntry: Record<string, unknown> = { type: "http", url };
   if (bearer) {
     mcpEntry.headers = { Authorization: `Bearer ${bearer}` };
   }
@@ -2749,7 +2758,6 @@ function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: st
   }
 
   writeFileSync(targetPath, JSON.stringify(config, null, 2) + "\n");
-  return { url: mcpUrl, source };
 }
 
 function usage() {

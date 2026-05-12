@@ -6,6 +6,56 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.7] — 2026-05-12
+
+`buildMcpEntryPlan` ⇄ `installMcpConfig` — close the URL invariant on the
+writer side (vault#302, follow-up to vault#301).
+
+vault#301 introduced `buildMcpEntryPlan` as the shared seam for the
+preview ⇄ writer entry-key + URL invariant. But `entryKey` was the only
+half closed: `installMcpConfig` still called `chooseMcpUrl(vaultName,
+port)` directly inside the writer, reading `process.env` rather than the
+`env` threaded through `InstallContext`. In production both branches
+read `process.env`, so they agreed by accident — a future change that
+introduced a non-process-env source (tests with in-memory env, alternate
+config paths, anything using `InstallContext.env` differently) would
+silently diverge between preview and writer.
+
+### Internal
+
+- `InstallMcpConfigOpts` now requires `url` from the caller. The
+  writer is a pure file-writer; the URL decision lives in
+  `buildMcpEntryPlan` alone.
+- `installMcpConfig` returns `void` (was `{ url, source }`). Both
+  call-sites already have `url` and `source` from
+  `buildMcpEntryPlan`'s output — no need to round-trip.
+- `executeMcpInstall` destructures `{ entryKey, url, source }` from
+  `buildMcpEntryPlan` and passes `url` to `installMcpConfig`.
+- The `init --add-mcp` bootstrap path (cli.ts:521) goes through
+  `buildMcpEntryPlan` too, so init and `mcp-install` share the same
+  URL-computation seam — a future URL-shape change can't drift
+  between the two.
+- `chooseMcpUrl` is no longer imported by `cli.ts` (only used inside
+  `buildMcpEntryPlan` now).
+
+### Tests
+
+- `src/mcp-install.test.ts`: new end-to-end test pins that the URL on
+  disk matches `buildMcpEntryPlan({ env: { PARACHUTE_HUB_ORIGIN: ... } })`
+  for a non-default hub origin. A regression that reintroduces the
+  direct `chooseMcpUrl` call inside `installMcpConfig` would drop the
+  caller's env and read `process.env` — this test goes red on that
+  shape.
+
+### Gates
+
+- `bun test` (root) → 1342 pass / 3 skip / 0 fail
+- `bun test ./src/` → 913 pass / 0 fail (was 912)
+- `bun test ./core/src/` → 429 pass / 0 fail
+- `bunx tsc --noEmit` clean
+
+No operator-visible behavior change.
+
 ## [0.4.4-rc.6] — 2026-05-12
 
 `bun test` from the repo root now returns green (vault#294).

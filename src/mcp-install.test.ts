@@ -605,6 +605,48 @@ describe("mcp-install end-to-end", () => {
     }
   });
 
+  test("writer URL on disk matches buildMcpEntryPlan(env) — non-default PARACHUTE_HUB_ORIGIN (vault#302)", () => {
+    // The preview ⇄ writer invariant introduced in vault#301 closed
+    // `entryKey` but left `url` only-coincidentally-coherent: production
+    // both branches read `process.env`, so they agreed by accident.
+    // vault#302 closes the URL half too — `installMcpConfig` now receives
+    // the URL from the caller's `buildMcpEntryPlan({ env, ... })` rather
+    // than re-computing via a direct `chooseMcpUrl(vaultName, port)`. This
+    // test exercises a non-default env so a regression that reintroduces
+    // the direct `chooseMcpUrl` call (which would re-read `process.env`,
+    // possibly without the test's intended override) goes red.
+    setupBareVault(tmp, "default");
+    const hubOrigin = "https://hub-302.example";
+    const res = runCli(
+      ["mcp-install", "--install-scope", "user", "--token", "pasted-302"],
+      tmp,
+      { PARACHUTE_HUB_ORIGIN: hubOrigin },
+    );
+    expect(res.exitCode).toBe(0);
+
+    // Compute what `buildMcpEntryPlan` says the URL should be for the same
+    // env the writer ran under. The writer must land exactly this URL.
+    const plan = buildMcpEntryPlan({
+      vaultName: "default",
+      vaultExplicit: false,
+      port: 1940,
+      env: { PARACHUTE_HUB_ORIGIN: hubOrigin },
+    });
+    expect(plan.url).toBe(`${hubOrigin}/vault/default/mcp`);
+    expect(plan.source).toBe("hub-origin");
+
+    const config = readJson(path.join(tmp, ".claude.json"));
+    const entry = config.mcpServers[plan.entryKey];
+    expect(entry).toBeDefined();
+    expect(entry.url).toBe(plan.url);
+    expect(entry.headers.Authorization).toBe("Bearer pasted-302");
+
+    // Stdout's `MCP URL:` line surfaces the same URL so an operator
+    // reading the log sees what landed (was the same `url` variable
+    // pre-#302 by coincidence; this pins it explicitly).
+    expect(res.stdout).toContain(`MCP URL: ${plan.url}`);
+  });
+
   test("--install-scope local writes ~/.claude.json under projects[<cwd>].mcpServers", () => {
     setupBareVault(tmp, "default");
     const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-local-"));
