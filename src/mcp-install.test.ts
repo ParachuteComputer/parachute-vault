@@ -930,3 +930,106 @@ function setupBareVault(parachuteHome: string, name: string): void {
 function readJson(p: string): any {
   return JSON.parse(fs.readFileSync(p, "utf-8"));
 }
+
+// ---------------------------------------------------------------------------
+// Uninstall flow — end-to-end with --skip-daemon (vault#296)
+// ---------------------------------------------------------------------------
+//
+// `parachute-vault uninstall` calls `uninstallAgent()` which targets the
+// hardcoded launchd label `computer.parachute.vault`. That label ignores
+// `PARACHUTE_HOME`, so a naive subprocess test would `launchctl bootout`
+// the real daemon on the developer's machine. `--skip-daemon` bypasses the
+// launchd / systemd / backup-agent uninstall calls so tests can exercise
+// the rest of the flow (wrapper removal, MCP cleanup, exit codes, ordering)
+// without touching real operator state.
+
+describe("cmdUninstall --skip-daemon (isolation flag for tests)", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vault-uninstall-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("removes wrapper + server-path pointer + MCP entry, never touches real launchd", () => {
+    // Stage the post-init artifacts uninstall is responsible for clearing:
+    //   - start.sh wrapper (would otherwise need `bun:sqlite` + a real init)
+    //   - server-path pointer
+    //   - a vault MCP entry in the sandbox ~/.claude.json
+    const vaultHome = path.join(tmp, "vault");
+    fs.mkdirSync(vaultHome, { recursive: true });
+    fs.writeFileSync(path.join(vaultHome, "start.sh"), "#!/bin/bash\necho stub\n", { mode: 0o755 });
+    fs.writeFileSync(path.join(vaultHome, "server-path"), "/imaginary/server.ts\n");
+    const claudePath = path.join(tmp, ".claude.json");
+    fs.writeFileSync(
+      claudePath,
+      JSON.stringify({
+        mcpServers: { "parachute-vault": { type: "http", url: "stub" } },
+      }) + "\n",
+    );
+
+    const res = runCli(["uninstall", "--yes", "--skip-daemon"], tmp);
+
+    expect(res.exitCode).toBe(0);
+
+    // The flag must surface in stdout so a future maintainer reading a CI
+    // log can tell the daemon step was skipped intentionally (vs. silently
+    // by a future regression).
+    expect(res.stdout).toContain("Skipping daemon removal (--skip-daemon).");
+
+    // Wrapper + pointer gone — that's the "shared across platforms" step
+    // immediately after daemon removal, so this pins the ordering invariant
+    // that --skip-daemon doesn't short-circuit the rest of the flow.
+    expect(fs.existsSync(path.join(vaultHome, "start.sh"))).toBe(false);
+    expect(fs.existsSync(path.join(vaultHome, "server-path"))).toBe(false);
+
+    // MCP cleanup ran — the vault entry is gone from ~/.claude.json.
+    const after = readJson(claudePath);
+    expect(after.mcpServers).toBeDefined();
+    expect(after.mcpServers["parachute-vault"]).toBeUndefined();
+
+    // "Done. To reinstall: `parachute-vault init`." is the closing
+    // confirmation. Its presence means the function ran to completion;
+    // its absence on a future regression would catch an early-return bug.
+    expect(res.stdout).toContain("Done. To reinstall:");
+  });
+
+  test("--skip-daemon leaves user data alone without --wipe", () => {
+    // The wipe-confirm branch is independent of the daemon branch; this
+    // pins that --skip-daemon doesn't accidentally promote to a destructive
+    // wipe. Seed a vaults dir, run uninstall without --wipe, assert it
+    // still exists afterward.
+    const vaultHome = path.join(tmp, "vault");
+    const dataDir = path.join(vaultHome, "data", "default");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, "vault.db"), "stub\n");
+
+    const res = runCli(["uninstall", "--yes", "--skip-daemon"], tmp);
+
+    expect(res.exitCode).toBe(0);
+    expect(fs.existsSync(path.join(dataDir, "vault.db"))).toBe(true);
+    // No wipe banner should appear.
+    expect(res.stdout).not.toMatch(/User data removed/);
+    expect(res.stdout).toContain("User data (~/.parachute/vault/) is left alone");
+  });
+
+  test("--skip-daemon + --wipe removes vault data (composes with destructive path)", () => {
+    // Pin that --skip-daemon is purely the daemon-call escape hatch — it
+    // does not gate or alter the --wipe semantics. A scripted destructive
+    // test (CI cleanup, fresh-machine setup) must still see --wipe work.
+    const vaultHome = path.join(tmp, "vault");
+    const dataDir = path.join(vaultHome, "data", "default");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, "vault.db"), "stub\n");
+    fs.writeFileSync(path.join(vaultHome, ".env"), "PORT=1940\n");
+
+    const res = runCli(["uninstall", "--yes", "--wipe", "--skip-daemon"], tmp);
+
+    expect(res.exitCode).toBe(0);
+    expect(fs.existsSync(path.join(vaultHome, "data"))).toBe(false);
+    expect(fs.existsSync(path.join(vaultHome, ".env"))).toBe(false);
+    expect(res.stdout).toMatch(/scripted destructive wipe/);
+    expect(res.stdout).toContain("User data removed");
+  });
+});

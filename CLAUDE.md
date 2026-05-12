@@ -109,6 +109,10 @@ bun test ./core/src/               # run core tests
 
 `parachute-vault stop` writes a sentinel file at `~/.parachute/vault/stop.signal`. The running server polls for it every 500ms and, when it finds one, deletes it and runs the same drain-and-exit shutdown path used for SIGINT/SIGTERM. Stale sentinels are removed at server startup, so a `stop` written while no server was listening can't pre-empt the next boot. This exists for environments where signals are awkward (Docker exec, foreground runs without a managed PID) — when you have a PID, `kill -TERM` still works and is the more direct path.
 
+### `uninstall --skip-daemon` (test-only)
+
+`parachute-vault uninstall` calls `uninstallAgent()` which targets the hardcoded launchd label `computer.parachute.vault`. That label ignores `PARACHUTE_HOME`, so a naive test that spawns `parachute-vault uninstall --yes` on a developer's machine would `launchctl bootout` the real registered daemon. The undocumented `--skip-daemon` flag bypasses the launchd / systemd / backup-agent uninstall calls — tests use it to exercise the rest of the flow (wrapper removal, MCP cleanup, exit codes, ordering) without touching real operator state. Humans should never need it; it's intentionally absent from `usage()` so it doesn't invite "I'll just skip the daemon step" misuse that orphans a daemon firing on a missing wrapper. See vault#296.
+
 ## Deployment
 
 Self-hosted:

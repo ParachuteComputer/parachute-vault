@@ -1725,6 +1725,16 @@ function printErrLogTail(n: number) {
 async function cmdUninstall(argsList: string[]) {
   const wipe = argsList.includes("--wipe");
   const skipPrompts = argsList.includes("--yes") || argsList.includes("-y");
+  // Test-isolation escape hatch (vault#296): skip the launchd / systemd /
+  // backup-agent uninstall calls. Those target hardcoded labels
+  // (`computer.parachute.vault*`) that ignore `PARACHUTE_HOME`, so a test
+  // run on a developer's machine would `launchctl bootout` their real
+  // daemon. With this flag tests can exercise the rest of the uninstall
+  // flow (wrapper removal, MCP cleanup, ordering, exit codes) safely.
+  // Intentionally not documented in `usage()` — humans should never need
+  // it; surfacing it would invite "I'll just skip the daemon step" misuse
+  // that leaves an orphaned daemon firing on a missing wrapper.
+  const skipDaemon = argsList.includes("--skip-daemon");
 
   console.log("Parachute Vault uninstall\n");
   console.log("This removes the daemon registration and wrapper script.");
@@ -1754,7 +1764,9 @@ async function cmdUninstall(argsList: string[]) {
   }
 
   // 1. Stop and remove the daemon registration.
-  if (process.platform === "darwin") {
+  if (skipDaemon) {
+    console.log("Skipping daemon removal (--skip-daemon).");
+  } else if (process.platform === "darwin") {
     console.log("Removing launchd agent...");
     await uninstallAgent();
     // Scheduled backup agent lives in a separate plist — uninstall it too,
