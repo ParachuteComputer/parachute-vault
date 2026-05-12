@@ -21,6 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  buildMcpEntryPlan,
   detectExistingEntries,
   detectInstallContext,
   detectProjectContext,
@@ -86,6 +87,8 @@ function baseCtx(overrides: Partial<InstallContext> = {}): InstallContext {
     defaultVault: "default",
     hubReachable: true,
     hubOrigin: "https://hub.example",
+    port: 1940,
+    env: { PARACHUTE_HUB_ORIGIN: "https://hub.example" },
     operatorTokenPresent: true,
     inProjectContext: false,
     cwd: "/tmp/cwd",
@@ -754,83 +757,52 @@ describe("detectInstallContext", () => {
 // Preview-accuracy: what the walkthrough renders === what the install writes.
 // ---------------------------------------------------------------------------
 //
-// Reviewer F3 asked for a regression pin cross-checking preview entry-key +
-// URL against what executeMcpInstall writes. The initial attempt drives the
-// full walkthrough via an inline mock IO + Bun.spawnSync on the CLI; in
-// practice the mock's coarse "return PASTED-BEARER unless def === 'mint'"
-// loops askPersistent on prompts whose default doesn't fit either branch.
-// Skipped pending a follow-up that either (a) shares mockIO from the
-// decision-tree suite or (b) tests the equivalence at a smaller seam
-// (e.g. extract an entry-key/url builder used by both render paths and
-// pin it directly). Tracked as a vault#292 follow-up.
+// vault#293. The walkthrough's preview shows the operator a JSON shape; the
+// writer then constructs the actual entry. If the two compute the entry-key
+// or URL by different recipes, the operator confirms a shape that doesn't
+// land on disk. The seam is `buildMcpEntryPlan` — both call sites must use
+// it. These tests pin the seam directly + assert the preview's logged
+// entry-key matches what `buildMcpEntryPlan` produces for the equivalent
+// decision shape.
 
-describe.skip("preview accuracy (vault#292 review F3)", () => {
-  let parachuteHome: string;
-  let projectDir: string;
+// Direct unit tests for `buildMcpEntryPlan` live in `mcp-install.test.ts`
+// alongside the rest of the `mcp-install.ts` module tests. The cross-check
+// below asserts the consumer side (preview render) matches the helper's
+// output for the equivalent decision shape.
 
-  beforeEach(() => {
-    parachuteHome = fs.mkdtempSync(path.join(os.tmpdir(), "vault-preview-home-"));
-    projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-preview-proj-"));
-    // .git marker so the walkthrough's detectProjectContext fires the
-    // project-scope default branch — that's the path with the most
-    // moving parts (different file destination, different prompt
-    // sequence) and therefore the highest drift risk.
-    fs.mkdirSync(path.join(projectDir, ".git"));
-    // Vault config so executeMcpInstall's vault-existence check passes.
-    const vaultsDir = path.join(parachuteHome, "vault", "data", "default");
-    fs.mkdirSync(vaultsDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(vaultsDir, "vault.yaml"),
-      "name: default\napi_keys: []\n",
-    );
-    fs.writeFileSync(
-      path.join(parachuteHome, "vault", "config.yaml"),
-      "default_vault: default\nport: 1940\n",
-    );
-  });
-  afterEach(() => {
-    fs.rmSync(parachuteHome, { recursive: true, force: true });
-    fs.rmSync(projectDir, { recursive: true, force: true });
-  });
+describe("preview accuracy — what the walkthrough logs === buildMcpEntryPlan(decision)", () => {
+  // The walkthrough's preview render and the writer's entry-construction
+  // share `buildMcpEntryPlan` post-vault#293. These tests run the
+  // walkthrough end-to-end with a mock IO, capture the preview's logged
+  // entry-key + URL lines, and assert they match what `buildMcpEntryPlan`
+  // would produce for the decision shape the walkthrough returned. If
+  // either path drifts, this test goes red — without needing to spawn the
+  // CLI or touch the filesystem.
 
-  test("preview JSON entry-key + URL match what the CLI subprocess writes", async () => {
-    // Build the same context the CLI would build, then run the
-    // walkthrough in-process with paste mode (no live mint required).
-    const ctx = detectInstallContext({
-      vaults: ["default"],
-      defaultVault: "default",
+  test("default-vault paste flow at user scope: preview matches buildMcpEntryPlan", async () => {
+    const { io } = mockIO([
+      null, // accept install-scope default ("user" — no project ctx, no existing)
+      "paste", // auth mode → paste
+      "PASTED-BEARER", // token prompt
+      true, // proceed at final confirm
+    ]);
+    const ctx = baseCtx({
+      inProjectContext: false,
       port: 1940,
-      env: {
-        PARACHUTE_HUB_ORIGIN: "https://hub.example",
-        PARACHUTE_HOME: parachuteHome,
-        HOME: parachuteHome,
-      },
-      cwd: projectDir,
+      env: { PARACHUTE_HUB_ORIGIN: "https://hub.example" },
+      hubOrigin: "https://hub.example",
     });
 
     const logs: string[] = [];
-    const io: InteractiveIO = {
-      log: (line) => logs.push(line),
-      ask: async (_q, def) => {
-        // Drive paste-mode end-to-end:
-        //   step 2 project confirm — handled by io.confirm below
-        //   step 3 auth-mode prompt → "paste"
-        //   step 3b token prompt → "PASTED-BEARER"
-        // The branching here mirrors mockIO's behavior but inline so
-        // we can keep the test single-file. `def` is the prompt's
-        // default; the question text drives the answer choice.
-        return def === "mint" ? "paste" : "PASTED-BEARER";
-      },
-      confirm: async (q, def) => {
-        // step 2 project confirm → accept default (project)
-        // step 5 final confirm   → accept default (Y)
-        // Both default to true in this flow.
-        void q;
-        return def;
+    const captured: InteractiveIO = {
+      ...io,
+      log: (line) => {
+        logs.push(line);
+        io.log(line);
       },
     };
 
-    const decision = await runInteractiveInstall(ctx, io);
+    const decision = await runInteractiveInstall(ctx, captured);
     expect(decision).not.toBe("abort");
     if (decision === "abort") return;
 
@@ -842,34 +814,70 @@ describe.skip("preview accuracy (vault#292 review F3)", () => {
     const previewEntryKey = /"(parachute-vault[^"]*)"/.exec(entryKeyLine!)![1]!;
     const previewUrl = /"url":\s*"([^"]+)"/.exec(urlLine!)![1]!;
 
-    // Translate the decision into equivalent flags + run the CLI.
-    const flags = ["mcp-install", "--token", "PASTED-BEARER"];
-    if (decision.installScope === "project") flags.push("--install-scope", "project");
-    if (decision.vaultExplicit) flags.push("--vault", decision.vaultName);
-    const proc = Bun.spawnSync({
-      cmd: ["bun", CLI, ...flags],
-      cwd: projectDir,
-      env: {
-        ...process.env,
-        PARACHUTE_HOME: parachuteHome,
-        HOME: parachuteHome,
-        PARACHUTE_HUB_ORIGIN: "https://hub.example",
-      },
-      stdout: "pipe",
-      stderr: "pipe",
+    // What the seam says the writer will produce for the same decision:
+    const plan = buildMcpEntryPlan({
+      vaultName: decision.vaultName,
+      vaultExplicit: decision.vaultExplicit,
+      port: ctx.port,
+      env: ctx.env,
+      ...(decision.existingEntryKey ? { existingEntryKey: decision.existingEntryKey } : {}),
     });
-    expect(proc.exitCode).toBe(0);
 
-    // Inspect the written file at the location the decision dictated.
-    const targetPath =
-      decision.installScope === "project"
-        ? path.join(projectDir, ".mcp.json")
-        : path.join(parachuteHome, ".claude.json");
-    expect(fs.existsSync(targetPath)).toBe(true);
-    const written = JSON.parse(fs.readFileSync(targetPath, "utf-8"));
+    expect(previewEntryKey).toBe(plan.entryKey);
+    expect(previewUrl).toBe(plan.url);
+  });
 
-    // The preview promised THIS key with THIS URL. The write must agree.
-    expect(written.mcpServers[previewEntryKey]).toBeDefined();
-    expect(written.mcpServers[previewEntryKey].url).toBe(previewUrl);
+  test("update-existing flow reuses the existing entry-key in both preview and plan", async () => {
+    // Existing entry sits at `parachute-vault-legacy-name`. The
+    // walkthrough's "update where it is" branch should keep that key in
+    // the preview AND propagate it on the decision so the writer agrees.
+    const existing: ExistingMcpEntry = {
+      path: "/tmp/.claude.json",
+      label: "~/.claude.json",
+      scope: "user",
+      entryKey: "parachute-vault-legacy-name",
+      url: "https://hub.example/vault/default/mcp",
+      hasAuth: true,
+    };
+    const ctx = baseCtx({
+      existing: { user: existing },
+      port: 1940,
+      env: { PARACHUTE_HUB_ORIGIN: "https://hub.example" },
+      hubOrigin: "https://hub.example",
+    });
+
+    const { io } = mockIO([
+      null, // accept "update where it is" (default true)
+      "paste",
+      "PASTED-BEARER",
+      true, // proceed
+    ]);
+    const logs: string[] = [];
+    const captured: InteractiveIO = {
+      ...io,
+      log: (line) => {
+        logs.push(line);
+        io.log(line);
+      },
+    };
+    const decision = await runInteractiveInstall(ctx, captured);
+    expect(decision).not.toBe("abort");
+    if (decision === "abort") return;
+
+    expect(decision.existingEntryKey).toBe("parachute-vault-legacy-name");
+
+    const previewEntryKeyLine = logs.find((l) => /^\s+"parachute-vault[^"]*":/.test(l));
+    expect(previewEntryKeyLine).toBeDefined();
+    const previewEntryKey = /"(parachute-vault[^"]*)"/.exec(previewEntryKeyLine!)![1]!;
+    expect(previewEntryKey).toBe("parachute-vault-legacy-name");
+
+    const plan = buildMcpEntryPlan({
+      vaultName: decision.vaultName,
+      vaultExplicit: decision.vaultExplicit,
+      port: ctx.port,
+      env: ctx.env,
+      existingEntryKey: decision.existingEntryKey!,
+    });
+    expect(plan.entryKey).toBe("parachute-vault-legacy-name");
   });
 });
