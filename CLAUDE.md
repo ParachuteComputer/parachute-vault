@@ -101,9 +101,13 @@ bun src/cli.ts vault config        # view/edit config
 bun src/cli.ts vault stop          # graceful shutdown via filesystem sentinel
 bun src/cli.ts vault import <path> # import Obsidian vault
 bun src/cli.ts vault export <path> # export as Obsidian markdown
-bun test ./src/                    # run server tests (anchored — excludes web/ui)
+bun test ./src/                    # run server tests (anchored — also excluded from bare `bun test`)
 bun test ./core/src/               # run core tests
+bun test                           # run server + core (web/ui excluded via bunfig.toml pathIgnorePatterns)
+cd web/ui && bunx vitest run       # run the React SPA's tests (different runner — vi.mock + jsdom)
 ```
+
+The repo holds two test suites with different runners. Server + core run under `bun:test` (Bun-native, `bun:sqlite`-aware). The React admin SPA at `web/ui/` runs under **vitest 4.x** because its tests use `vi.mock("path")` single-arg auto-stubbing, jsdom, and `@testing-library/react` — none of which `bun:test` supports today. `bunfig.toml` excludes `web/ui/**` from `bun test` discovery so the bare `bun test` stays green; the SPA's canonical test command is `vitest run` (its `npm test` script). See vault#294.
 
 ### Graceful shutdown
 
