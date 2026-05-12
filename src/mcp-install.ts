@@ -24,9 +24,61 @@
  *      `--install-scope` flag.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+
+/**
+ * Strip every vault MCP entry from ~/.claude.json (user-scope + every
+ * local-scope `projects[*].mcpServers`) and ./.mcp.json (project-scope at
+ * cwd). Cleanup walks every `projects[*]` slot so an operator who installed
+ * locally in one directory can uninstall from anywhere without remembering
+ * where. Silent no-op on missing files / malformed JSON.
+ *
+ * Lives in mcp-install.ts (not cli.ts) so tests can call it directly
+ * without triggering cli.ts's top-level dispatch on import.
+ */
+export function removeMcpConfig(): void {
+  // Prefer `process.env.HOME` over cached `homedir()` — Bun caches the OS
+  // userinfo at process start so in-process HOME overrides (tests, exotic
+  // chrooting) don't apply via homedir(). Matches resolveInstallTarget's
+  // home-resolution pattern.
+  const home = process.env.HOME ?? homedir();
+  const claudeJsonPath = resolve(home, ".claude.json");
+  const projectMcpJsonPath = resolve(process.cwd(), ".mcp.json");
+  for (const path of [claudeJsonPath, projectMcpJsonPath]) {
+    if (!existsSync(path)) continue;
+    try {
+      const config = JSON.parse(readFileSync(path, "utf-8"));
+      // Drop the singular key and every per-vault `parachute-vault-<name>`
+      // entry. Legacy `parachute-vault/<name>` (slash-form) sub-keys from a
+      // pre-multi-vault pattern still get cleaned up here.
+      const stripVaultKeys = (servers: Record<string, unknown> | undefined) => {
+        if (!servers) return;
+        for (const key of Object.keys(servers)) {
+          if (
+            key === "parachute-vault" ||
+            key.startsWith("parachute-vault-") ||
+            key.startsWith("parachute-vault/")
+          ) {
+            delete servers[key];
+          }
+        }
+      };
+      stripVaultKeys(config.mcpServers);
+      // Local-scope cleanup: walk every project entry and strip vault keys.
+      if (config.projects && typeof config.projects === "object") {
+        for (const projectKey of Object.keys(config.projects)) {
+          const projectEntry = config.projects[projectKey];
+          if (projectEntry && typeof projectEntry === "object") {
+            stripVaultKeys(projectEntry.mcpServers);
+          }
+        }
+      }
+      writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+    } catch {}
+  }
+}
 
 // ---------------------------------------------------------------------------
 // URL picking
@@ -251,19 +303,29 @@ export async function mintHubJwt(opts: MintHubJwtOpts): Promise<MintedHubJwt | M
 // Install target resolver
 // ---------------------------------------------------------------------------
 
-export type InstallScope = "user" | "project";
+export type InstallScope = "user" | "project" | "local";
 
 export interface InstallTarget {
   /** Absolute path the install will write to. */
   path: string;
   /** Which scope the path corresponds to (for log lines + doctor). */
   scope: InstallScope;
+  /**
+   * For `local` scope: the absolute CWD the entry is keyed under inside
+   * `~/.claude.json`'s `projects` map. Undefined for `user` and `project`.
+   */
+  localProjectKey?: string;
 }
 
 /**
- * Pick the MCP client config file path based on `--install-scope`. Project
- * scope writes to `<cwd>/.mcp.json` (Claude Code convention); user scope
- * writes to `~/.claude.json` (legacy + still canonical for user-wide setup).
+ * Pick the MCP client config file path based on `--install-scope`. Three
+ * shapes:
+ *
+ *   user    → `~/.claude.json` top-level `mcpServers` (global, every project).
+ *   project → `<cwd>/.mcp.json` (Claude Code convention; check into the repo).
+ *   local   → `~/.claude.json` under `projects[<absolute-cwd>].mcpServers`
+ *             (private to this machine, scoped to this directory). Matches
+ *             Claude's own `claude mcp add` default.
  *
  * `homedir()` from node:os is cached at process start on Bun, so in-process
  * `process.env.HOME` overrides don't propagate to it. We prefer the
@@ -279,7 +341,15 @@ export function resolveInstallTarget(
     return { path: resolve(cwd, ".mcp.json"), scope: "project" };
   }
   const home = process.env.HOME ?? homedir();
-  return { path: resolve(home, ".claude.json"), scope: "user" };
+  const claudeJson = resolve(home, ".claude.json");
+  if (scope === "local") {
+    return {
+      path: claudeJson,
+      scope: "local",
+      localProjectKey: resolve(cwd),
+    };
+  }
+  return { path: claudeJson, scope: "user" };
 }
 
 // ---------------------------------------------------------------------------
@@ -341,10 +411,13 @@ export interface ExistingMcpEntry {
 }
 
 /**
- * Look for an existing parachute-vault entry at the user-level
- * `~/.claude.json` and the project-level `./.mcp.json`. Returns each
- * matching entry independently so the walkthrough can present either
- * (or both, but in practice we pick one).
+ * Look for an existing parachute-vault entry across the three scopes:
+ *   user    — `~/.claude.json` top-level `mcpServers`.
+ *   local   — `~/.claude.json` under `projects[<cwd>].mcpServers`.
+ *   project — `<cwd>/.mcp.json`.
+ *
+ * Returns each matching entry independently so the walkthrough can present
+ * the most relevant one to the operator.
  *
  * `parachute-vault` (singular) wins over `parachute-vault-<name>` at the
  * same file — the singular slot is the canonical default install; per-
@@ -352,24 +425,27 @@ export interface ExistingMcpEntry {
  */
 export function detectExistingEntries(
   cwd: string = process.cwd(),
-): { user?: ExistingMcpEntry; project?: ExistingMcpEntry } {
+): { user?: ExistingMcpEntry; local?: ExistingMcpEntry; project?: ExistingMcpEntry } {
+  const userTarget = resolveInstallTarget("user");
+  const localTarget = resolveInstallTarget("local", cwd);
+  const projectTarget = resolveInstallTarget("project", cwd);
+  const userConfig = readJsonOrNull(userTarget.path);
   return {
-    ...maybeEntry(resolveInstallTarget("user"), "~/.claude.json"),
-    ...maybeEntry(resolveInstallTarget("project", cwd), `${cwd}/.mcp.json`),
+    ...maybeUserEntry(userConfig, userTarget.path),
+    ...maybeLocalEntry(userConfig, localTarget.path, localTarget.localProjectKey!),
+    ...maybeProjectEntry(projectTarget.path, `${cwd}/.mcp.json`),
   };
 
-  function maybeEntry(
-    target: InstallTarget,
-    label: string,
-  ): { user?: ExistingMcpEntry } | { project?: ExistingMcpEntry } | {} {
-    if (!existsSync(target.path)) return {};
-    let config: any;
+  function readJsonOrNull(p: string): any {
+    if (!existsSync(p)) return null;
     try {
-      config = JSON.parse(readFileSync(target.path, "utf-8"));
+      return JSON.parse(readFileSync(p, "utf-8"));
     } catch {
-      return {};
+      return null;
     }
-    const servers: Record<string, any> = config?.mcpServers ?? {};
+  }
+
+  function pickEntry(servers: Record<string, any>): { entry: any; entryKey: string } | null {
     let entry = servers["parachute-vault"];
     let entryKey = "parachute-vault";
     if (!entry) {
@@ -381,16 +457,64 @@ export function detectExistingEntries(
         }
       }
     }
-    if (!entry || typeof entry.url !== "string") return {};
-    const result: ExistingMcpEntry = {
-      path: target.path,
-      label,
-      scope: target.scope,
-      entryKey,
-      url: entry.url,
-      hasAuth: Boolean(entry.headers?.Authorization),
+    if (!entry || typeof entry.url !== "string") return null;
+    return { entry, entryKey };
+  }
+
+  function maybeUserEntry(config: any, p: string): { user?: ExistingMcpEntry } | {} {
+    if (!config) return {};
+    const servers: Record<string, any> = config?.mcpServers ?? {};
+    const picked = pickEntry(servers);
+    if (!picked) return {};
+    return {
+      user: {
+        path: p,
+        label: "~/.claude.json",
+        scope: "user",
+        entryKey: picked.entryKey,
+        url: picked.entry.url,
+        hasAuth: Boolean(picked.entry.headers?.Authorization),
+      },
     };
-    return target.scope === "user" ? { user: result } : { project: result };
+  }
+
+  function maybeLocalEntry(
+    config: any,
+    p: string,
+    projectKey: string,
+  ): { local?: ExistingMcpEntry } | {} {
+    if (!config) return {};
+    const servers: Record<string, any> = config?.projects?.[projectKey]?.mcpServers ?? {};
+    const picked = pickEntry(servers);
+    if (!picked) return {};
+    return {
+      local: {
+        path: p,
+        label: `~/.claude.json (projects["${projectKey}"])`,
+        scope: "local",
+        entryKey: picked.entryKey,
+        url: picked.entry.url,
+        hasAuth: Boolean(picked.entry.headers?.Authorization),
+      },
+    };
+  }
+
+  function maybeProjectEntry(p: string, label: string): { project?: ExistingMcpEntry } | {} {
+    const config = readJsonOrNull(p);
+    if (!config) return {};
+    const servers: Record<string, any> = config?.mcpServers ?? {};
+    const picked = pickEntry(servers);
+    if (!picked) return {};
+    return {
+      project: {
+        path: p,
+        label,
+        scope: "project",
+        entryKey: picked.entryKey,
+        url: picked.entry.url,
+        hasAuth: Boolean(picked.entry.headers?.Authorization),
+      },
+    };
   }
 }
 
@@ -414,8 +538,8 @@ export interface InstallContext {
   inProjectContext: boolean;
   /** Where the walkthrough was invoked from. */
   cwd: string;
-  /** Pre-existing entries at user / project scope, if any. */
-  existing: { user?: ExistingMcpEntry; project?: ExistingMcpEntry };
+  /** Pre-existing entries at user / local / project scope, if any. */
+  existing: { user?: ExistingMcpEntry; local?: ExistingMcpEntry; project?: ExistingMcpEntry };
 }
 
 /**

@@ -190,10 +190,12 @@ parachute-vault uninstall --yes --wipe     # scripted destructive wipe (prints a
 parachute-vault create work                # create a new vault
 parachute-vault list                       # list all vaults (alias: `ls`)
 parachute-vault remove work --yes          # delete a vault (alias: `rm`)
-parachute-vault mcp-install                # (re)write the MCP client entry; defaults to --mint (hub-issued JWT)
+parachute-vault mcp-install                # (re)write the MCP client entry; defaults to --mint (hub-issued JWT) at local scope
 parachute-vault mcp-install --token <t>    # paste an existing bearer instead of minting
 parachute-vault mcp-install --legacy-pat   # mint a vault-DB pvt_* (self-hosted-without-hub)
-parachute-vault mcp-install --install-scope project   # write ./.mcp.json instead of ~/.claude.json
+parachute-vault mcp-install --install-scope user      # write ~/.claude.json top-level (every project)
+parachute-vault mcp-install --install-scope local     # write ~/.claude.json projects[<cwd>] (this directory only — default)
+parachute-vault mcp-install --install-scope project   # write ./.mcp.json (checked into the repo)
 parachute-vault mcp-install --vault work   # target the "work" vault (keyed as parachute-vault-work)
 
 # OAuth — owner password + 2FA
@@ -571,27 +573,45 @@ The shortest path to a public HTTPS URL for a vault you control — useful for S
 
 ### Install vault MCP into a client config
 
-Bare `parachute-vault mcp-install` from a terminal **walks you through a short contextual conversation** — picks defaults informed by your environment (how many vaults you have, whether the hub is reachable, whether you're in a project directory, whether vault is already installed somewhere), shows the JSON shape it will write before doing anything, and asks before each non-obvious choice. The four patterns below are the non-interactive shapes — pass any flag (`--mint`, `--token`, `--scope`, `--install-scope`, `--vault`, `--legacy-pat`) and the walkthrough is skipped.
+Bare `parachute-vault mcp-install` from a terminal **walks you through a short contextual conversation** — picks defaults informed by your environment (how many vaults you have, whether the hub is reachable, whether you're in a project directory, whether vault is already installed somewhere), shows the JSON shape it will write before doing anything, and asks before each non-obvious choice. The patterns below are the non-interactive shapes — pass any flag (`--mint`, `--token`, `--scope`, `--install-scope`, `--vault`, `--legacy-pat`) and the walkthrough is skipped.
+
+#### Install scopes
+
+`--install-scope` accepts three values, matching Claude Code's own `claude mcp add --scope`:
+
+| Scope | Where the entry lives | Visibility |
+|---|---|---|
+| `local` *(default)* | `~/.claude.json` under `projects[<absolute-cwd>].mcpServers` | private to your machine, scoped to this directory |
+| `user` | `~/.claude.json` top-level `mcpServers` | every project, every directory on this machine |
+| `project` | `<cwd>/.mcp.json` | checked into the repo, shared with anyone who clones it |
+
+The default is **`local`** — Claude Code only loads the entry when launched from the directory you ran the install from. Pick `user` for a global install (every project sees the vault); pick `project` to commit the entry to the repo so collaborators get it on `git pull`.
+
+#### Cookbook
 
 ```bash
-# 1. Default (non-interactive shape) — mint a scope-narrow hub JWT
-#    (vault:<vault>:read) via your operator token, write it into
-#    ~/.claude.json. Requires:
+# 1. Default — mint a scope-narrow hub JWT (vault:<vault>:read) via your
+#    operator token; write it into ~/.claude.json under projects[<cwd>]
+#    (local scope, this directory only). Requires:
 #      - ~/.parachute/operator.token (run `parachute auth rotate-operator` if missing)
 #      - PARACHUTE_HUB_ORIGIN set OR an active `parachute expose` session
 parachute-vault mcp-install --mint
 
-# 2. Project-level install — write ./.mcp.json (Claude Code reads project-
-#    local configs) instead of ~/.claude.json. Pair with --scope vault:write
-#    when the project actually mutates the vault.
+# 2. Global install — write the entry at top-level ~/.claude.json so
+#    Claude Code loads it from every project, every directory.
+parachute-vault mcp-install --install-scope user
+
+# 3. Project-level install — write ./.mcp.json (committed to the repo,
+#    shared with the team). Pair with --scope vault:write when the
+#    project actually mutates the vault.
 parachute-vault mcp-install --install-scope project --scope vault:write
 
-# 3. Paste an existing token — useful when you already have a pvt_* in hand
+# 4. Paste an existing token — useful when you already have a pvt_* in hand
 #    or want to re-use a long-lived bearer from another machine. Skips the
 #    mint step entirely.
 parachute-vault mcp-install --token pvt_abc123...
 
-# 4. Self-hosted-without-hub — mint a vault-DB pvt_* token (the legacy
+# 5. Self-hosted-without-hub — mint a vault-DB pvt_* token (the legacy
 #    path; preserved so deployments without a hub keep working). Prints a
 #    deprecation notice.
 parachute-vault mcp-install --legacy-pat
@@ -599,7 +619,7 @@ parachute-vault mcp-install --legacy-pat
 
 **Multi-vault.** `--vault <name>` targets a specific vault and writes the entry under `parachute-vault-<name>` so multiple vaults coexist. Without `--vault`, the singular `parachute-vault` slot is used and one install clobbers another — that's intentional for the common single-vault case.
 
-**Doctor.** `parachute-vault doctor` checks both `~/.claude.json` and `./.mcp.json` and reports which one holds the entry, plus port-match and reachability of the MCP URL.
+**Doctor.** `parachute-vault doctor` checks `~/.claude.json` (both top-level and `projects[<cwd>]`) and `./.mcp.json`, and reports which one holds the entry, plus port-match and reachability of the MCP URL.
 
 ## Data model
 
