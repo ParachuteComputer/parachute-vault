@@ -6,6 +6,45 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.6] — 2026-05-12
+
+`bun test` from the repo root now returns green (vault#294).
+
+The 27 failures in `web/ui/` tests on `main` were misdiagnosed as a
+`vi.mock` version incompatibility. Root cause: `bun test` walks the
+entire repo for `*.test.*` files, including `web/ui/`'s React SPA
+tests. Those tests import `vitest` and use `vi.mock("path")` in the
+single-arg auto-stub form, which `bun:test` rejects with
+`TypeError: mock(module, fn) requires a function`. The SPA tests are
+written for vitest 4.x (its declared `npm test` runner) and pass
+cleanly there — they were never broken; `bun test` was just trying to
+run them with the wrong runner.
+
+### Fix
+
+- `bunfig.toml` adds `pathIgnorePatterns = ["web/ui/**"]` under
+  `[test]`. `bun test` from the repo root now stops at the
+  server + core boundary; the React SPA's tests stay green under
+  their canonical `vitest run` command.
+
+### Docs
+
+- `CLAUDE.md` "Running" section documents the two-runner split
+  explicitly: `bun test` for server + core, `bunx vitest run` (from
+  `web/ui/`) for the SPA. Future contributors won't trip over the
+  same mis-diagnosis.
+
+### Gates
+
+- `bun test` from repo root → 1341 pass / 3 skip / 0 fail (was
+  1362 pass / 3 skip / 27 fail / 2 errors).
+- `bun test ./src/` → 912 pass / 0 fail (unchanged).
+- `bun test ./core/src/` → 429 pass / 0 fail (unchanged).
+- `cd web/ui && bunx vitest run` → 61 pass / 0 fail (unchanged —
+  always green under vitest).
+
+No code change. Configuration + docs only.
+
 ## [0.4.4-rc.5] — 2026-05-12
 
 `parachute-vault uninstall --skip-daemon` test-isolation flag (vault#296).

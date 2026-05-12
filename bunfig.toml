@@ -1,2 +1,11 @@
 [test]
 preload = ["./core/src/test-preload.ts"]
+# Exclude the React SPA's tests from `bun test` discovery (vault#294). The
+# SPA's *.test.tsx files import `vitest`, mock modules via `vi.mock("path")`
+# (single-arg auto-stub form), and exercise React DOM via @testing-library —
+# all of which vitest 4.x handles but `bun:test` doesn't. The SPA's
+# canonical runner is `vitest run` (see web/ui/package.json `scripts.test`);
+# without this exclusion, `bun test` from the repo root walks into web/ui/
+# and produces 27 spurious failures on a green tree. Anchored test commands
+# (`bun test ./src/`, `bun test ./core/src/`) were already clean.
+pathIgnorePatterns = ["web/ui/**"]
