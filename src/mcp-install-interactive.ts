@@ -119,27 +119,51 @@ export async function runInteractiveInstall(
   }
 
   // 3. Install location. If we're updating, use that location. Otherwise
-  //    suggest project when in a project context, user otherwise.
+  //    always prompt with the three scopes available (local / project /
+  //    user) — Claude Code reads ./.mcp.json regardless of git/package
+  //    markers, so the prior "no markers → autopilot global" branch was
+  //    wrong (silently overrode the operator's intent when they happened
+  //    to be in a plain dir). Default tilts on the same marker signal:
+  //    project markers → suggest `project`, else suggest `local`. The
+  //    suggestion shapes the default; it does NOT decide.
   let installScope: InstallScope;
   if (updateLocation) {
     installScope = updateLocation.scope;
   } else {
-    const suggested: InstallScope = ctx.inProjectContext ? "project" : "user";
-    if (suggested === "project") {
-      io.log(`Looks like you're in a project directory (${pathTail(ctx.cwd)}).`);
-      const useProject = await io.confirm(
-        "Install for this project only (./.mcp.json)?",
-        true,
-      );
-      installScope = useProject ? "project" : "user";
-      io.log(
-        installScope === "project"
-          ? `  → Writing to ${ctx.cwd}/.mcp.json (project-scoped).`
-          : "  → Writing to ~/.claude.json (user-scoped).",
-      );
+    const suggested: InstallScope = ctx.inProjectContext ? "project" : "local";
+    io.log(`Where to install? (CWD: ${pathTail(ctx.cwd)})`);
+    io.log("  local    — ~/.claude.json under projects[<cwd>] (private, this dir only)");
+    io.log("  project  — ./.mcp.json (checked into the repo, shared with team)");
+    io.log("  user     — ~/.claude.json top-level (every project, every dir)");
+    const answer = await askPersistent(
+      io,
+      `Press Enter for "${suggested}", or type local / project / user`,
+      suggested,
+      {
+        help: [
+          "Install scopes (mirrors Claude Code's `claude mcp add --scope`):",
+          "  local    → ~/.claude.json under projects[<cwd>].mcpServers.",
+          "             Private to your machine, scoped to this directory.",
+          "             Claude Code only loads it when launched from here.",
+          "  project  → <cwd>/.mcp.json. Checked into the repo; shared with",
+          "             anyone who clones it. Pick this when the vault",
+          "             integration belongs to the team / project.",
+          "  user     → ~/.claude.json top-level mcpServers. Loaded for",
+          "             every Claude Code session regardless of cwd.",
+        ].join("\n"),
+        validate: (s) => {
+          const ok = ["local", "project", "user"];
+          return ok.includes(s) ? null : `expected one of: ${ok.join(", ")}`;
+        },
+      },
+    );
+    installScope = answer as InstallScope;
+    if (installScope === "local") {
+      io.log(`  → Writing to ~/.claude.json under projects["${ctx.cwd}"].mcpServers (local — this directory only).`);
+    } else if (installScope === "project") {
+      io.log(`  → Writing to ${ctx.cwd}/.mcp.json (project-scoped — shared with the repo).`);
     } else {
-      io.log("Installing globally to ~/.claude.json (no project markers in this directory).");
-      installScope = "user";
+      io.log("  → Writing to ~/.claude.json top-level (user-scoped — every project).");
     }
     io.log("");
   }
@@ -209,7 +233,12 @@ export async function runInteractiveInstall(
   io.log("");
 
   // 5. Preview + final confirm.
-  const targetLabel = installScope === "project" ? `${ctx.cwd}/.mcp.json` : "~/.claude.json";
+  const targetLabel =
+    installScope === "project"
+      ? `${ctx.cwd}/.mcp.json`
+      : installScope === "local"
+        ? `~/.claude.json (projects["${ctx.cwd}"])`
+        : "~/.claude.json";
   const entryKey =
     updateLocation?.entryKey ??
     (vaultExplicit ? `parachute-vault-${vaultName}` : "parachute-vault");
@@ -251,13 +280,15 @@ export async function runInteractiveInstall(
 // ---------------------------------------------------------------------------
 
 /**
- * Pick which existing entry the prompt should lead with. Prefer user-level
- * (the canonical "installed for me everywhere" location) over project-level
- * (which is more often a per-project override that may not represent the
- * operator's primary install).
+ * Pick which existing entry the prompt should lead with. Preference order:
+ *   1. local at this exact CWD — strongest signal the operator was just
+ *      here and updated this very directory before.
+ *   2. user — the global install location, applies to every project.
+ *   3. project — the repo-shared install; lowest priority since it can
+ *      drift independently of the operator's primary install.
  */
 function pickExistingForPrompt(ctx: InstallContext): ExistingMcpEntry | null {
-  return ctx.existing.user ?? ctx.existing.project ?? null;
+  return ctx.existing.local ?? ctx.existing.user ?? ctx.existing.project ?? null;
 }
 
 /**

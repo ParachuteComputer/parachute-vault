@@ -6,6 +6,89 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.3] — 2026-05-11
+
+Two `parachute-vault mcp-install` fixes from real dogfood feedback —
+operator ran the walkthrough from a plain directory (no `.git`, no
+`package.json`) intending a directory-private install, and the
+walkthrough decided unilaterally for them. Both fixes restore "always
+let the operator pick the scope."
+
+### Fix 1 — Add the `local` install scope
+
+Claude Code has three MCP scopes; vault previously only supported two.
+All three are now first-class:
+
+| Scope | Where the entry lives | Visibility |
+|---|---|---|
+| `user` | `~/.claude.json` top-level `mcpServers` | every project, every directory |
+| `local` | `~/.claude.json` under `projects[<absolute-cwd>].mcpServers` | private to this machine, scoped to this directory |
+| `project` | `<cwd>/.mcp.json` | checked into the repo, shared with the team |
+
+`local` matches Claude Code's own `claude mcp add --scope local` default
+and is the right shape when the operator wants vault available in this
+working directory only, without committing the entry to the repo or
+exposing it from every other project.
+
+Surfaces:
+
+- New `--install-scope local` flag.
+- Walkthrough's install-location prompt now offers all three scopes
+  (see Fix 2).
+- `parachute-vault doctor` reads local entries from `~/.claude.json`
+  under `projects[<cwd>].mcpServers`.
+- `parachute-vault uninstall` cleans local entries from every project
+  slot it finds (not just the current `cwd`'s), so a single uninstall
+  removes the vault server regardless of which directory the operator
+  ran the install from.
+
+### Fix 2 — Drop the marker gate; always prompt for install scope
+
+The interactive walkthrough's install-location step used to silently
+auto-pick **user** scope when no project markers (`.git`, `package.json`,
+…) were detected — the operator never saw the prompt. The premise was
+wrong: Claude Code reads `./.mcp.json` (project scope) and
+`projects[<cwd>]` (local scope) regardless of git/package markers.
+Skipping the prompt buried the operator's actual intent.
+
+The walkthrough now always prompts with the three scopes laid out. The
+default *tilts* on the marker signal — present → `project`, absent →
+`local` — but the operator always sees and can override the choice.
+
+### Breaking — non-interactive default changed from `user` to `local`
+
+`parachute-vault mcp-install` with no `--install-scope` flag previously
+wrote to `~/.claude.json` top-level (user scope). It now writes to
+`~/.claude.json` under `projects[<absolute-cwd>].mcpServers` (local
+scope). This mirrors Claude Code's own `claude mcp add` default. Two
+things to know:
+
+- **Scripted installs**: pass `--install-scope user` explicitly to keep
+  the prior global-install behavior. (We recommend doing this in any
+  automation that runs `mcp-install` non-interactively — the operator-
+  intent prompt isn't there to surface the change.)
+- **Non-interactive `local` install** prints a one-line consequence
+  callout on stdout — "Installed locally for this directory only. To
+  install globally, re-run with `--install-scope user`." — so a
+  first-time operator who hits the new default doesn't wonder why
+  vault works only from one directory.
+
+### Tests
+
+10 new tests across `src/mcp-install.test.ts` and
+`src/mcp-install-interactive.test.ts`:
+
+- `local` scope writer round-trip (writes to `~/.claude.json` under
+  `projects[<cwd>]`, preserves pre-existing top-level entries and
+  pre-existing sibling MCP servers).
+- `--install-scope local` CLI flag accepted; default-when-no-flag
+  changed to `local`; new default writes to the projects-keyed slot.
+- Walkthrough always prompts for scope (no marker-gate skip);
+  default-tilt logic (markers → `project`, no markers → `local`);
+  operator can override either default.
+- `detectExistingEntries` recognises local entries (and ignores
+  local entries at *other* cwds).
+
 ## [0.4.4-rc.2] — 2026-05-11
 
 Interactive default for `parachute-vault mcp-install`. Bare invocation

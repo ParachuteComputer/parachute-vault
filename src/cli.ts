@@ -932,7 +932,12 @@ function takeArgValue(args: string[], name: string): { value?: string; missingVa
  * Targeting:
  *   --scope <verb>        vault:read | vault:write | vault:admin (default: vault:read).
  *                         For --mint, expands to vault:<vault-name>:<verb>.
- *   --install-scope <s>   user (default; ~/.claude.json) | project (./.mcp.json).
+ *   --install-scope <s>   local (default) | user | project. local writes to
+ *                         ~/.claude.json under projects[<cwd>].mcpServers
+ *                         (private, this directory only — matches Claude
+ *                         Code's own default). user writes to top-level
+ *                         mcpServers (every project). project writes to
+ *                         ./.mcp.json (check into the repo).
  *   --vault <name>        Vault to target (default: default_vault). Multi-vault
  *                         installs key the entry as `parachute-vault-<name>`.
  *   --client <name>       Reserved for Phase C. Only `claude-code` accepted.
@@ -999,15 +1004,25 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // --- Install scope: user (default) or project. ---
+  // --- Install scope: local (default), user, or project. ---
+  // `local` matches Claude Code's own `claude mcp add` default — entry sits
+  // under `projects[<cwd>].mcpServers` in ~/.claude.json, private to this
+  // machine + this directory. Operators wanting a global install pass
+  // `--install-scope user`; team-shared installs pass `--install-scope project`.
   const installScopeArg = takeArgValue(args, "--install-scope");
   if (installScopeArg.missingValue) {
-    console.error("--install-scope requires a value: user or project.");
+    console.error("--install-scope requires a value: local, user, or project.");
     process.exit(1);
   }
-  const installScopeRaw = installScopeArg.value ?? "user";
-  if (installScopeRaw !== "user" && installScopeRaw !== "project") {
-    console.error(`--install-scope must be "user" or "project". Got: ${installScopeRaw}.`);
+  const installScopeRaw = installScopeArg.value ?? "local";
+  if (
+    installScopeRaw !== "user" &&
+    installScopeRaw !== "project" &&
+    installScopeRaw !== "local"
+  ) {
+    console.error(
+      `--install-scope must be "local", "user", or "project". Got: ${installScopeRaw}.`,
+    );
     process.exit(1);
   }
   const installScope: InstallScope = installScopeRaw;
@@ -1200,9 +1215,16 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     entryKey,
     vaultName,
     bearer,
+    ...(target.localProjectKey ? { localProjectKey: target.localProjectKey } : {}),
   });
   console.log(`MCP URL: ${url} (${source})`);
-  console.log(`Added MCP server "${entryKey}" to ${target.path}`);
+  if (target.scope === "local") {
+    console.log(`Added MCP server "${entryKey}" to ${target.path} under projects["${target.localProjectKey}"] (local scope).`);
+    console.log(`  Installed locally for this directory only — runs only when Claude Code launches from ${target.localProjectKey}.`);
+    console.log(`  To install globally instead, re-run with --install-scope user.`);
+  } else {
+    console.log(`Added MCP server "${entryKey}" to ${target.path}`);
+  }
 }
 
 function cmdRemove(args: string[]) {
@@ -2068,12 +2090,14 @@ type McpEntryLookup =
  * just make the "is it wired up?" state legible.
  */
 function readMcpEntry(): McpEntryLookup {
-  const candidates = [
+  const cwd = resolve(process.cwd());
+  const candidates: Array<{ path: string; label: string; localProjectKey?: string }> = [
     { path: resolve(homedir(), ".claude.json"), label: "~/.claude.json" },
-    { path: resolve(process.cwd(), ".mcp.json"), label: `${process.cwd()}/.mcp.json` },
+    { path: resolve(homedir(), ".claude.json"), label: `~/.claude.json (projects["${cwd}"])`, localProjectKey: cwd },
+    { path: resolve(cwd, ".mcp.json"), label: `${cwd}/.mcp.json` },
   ];
   const checkedReasons: string[] = [];
-  for (const { path, label } of candidates) {
+  for (const { path, label, localProjectKey } of candidates) {
     if (!existsSync(path)) {
       checkedReasons.push(`${label} does not exist`);
       continue;
@@ -2085,7 +2109,9 @@ function readMcpEntry(): McpEntryLookup {
       checkedReasons.push(`${label} is not valid JSON: ${String(err?.message ?? err)}`);
       continue;
     }
-    const servers = config?.mcpServers ?? {};
+    const servers = localProjectKey
+      ? (config?.projects?.[localProjectKey]?.mcpServers ?? {})
+      : (config?.mcpServers ?? {});
     // Prefer the singular `parachute-vault` slot (canonical default
     // install); fall back to the first `parachute-vault-<name>` per-vault
     // entry. Multi-vault installs may have several; the doctor reports on
@@ -2632,10 +2658,18 @@ interface InstallMcpConfigOpts {
   vaultName: string;
   /** Bearer token to embed in `Authorization: Bearer …`. Omitted means the entry is unauthenticated — only useful for OAuth-capable clients (Claude Code does discovery). */
   bearer?: string;
+  /**
+   * When set, the entry is keyed under `projects[<localProjectKey>].mcpServers`
+   * inside `~/.claude.json` (Claude Code's `local` scope: private to this
+   * machine, scoped to this directory). When unset, keyed at top-level
+   * `mcpServers` (user scope) or written directly to `./.mcp.json`
+   * (project scope — caller passes the project file path).
+   */
+  localProjectKey?: string;
 }
 
 function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: string } {
-  const { targetPath, entryKey, vaultName, bearer } = opts;
+  const { targetPath, entryKey, vaultName, bearer, localProjectKey } = opts;
 
   let config: any = {};
   if (existsSync(targetPath)) {
@@ -2643,8 +2677,6 @@ function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: st
       config = JSON.parse(readFileSync(targetPath, "utf-8"));
     } catch {}
   }
-
-  if (!config.mcpServers) config.mcpServers = {};
 
   const globalConfig = readGlobalConfig();
   const port = globalConfig.port || DEFAULT_PORT;
@@ -2659,7 +2691,21 @@ function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: st
   if (bearer) {
     mcpEntry.headers = { Authorization: `Bearer ${bearer}` };
   }
-  config.mcpServers[entryKey] = mcpEntry;
+
+  if (localProjectKey) {
+    if (!config.projects || typeof config.projects !== "object") config.projects = {};
+    if (!config.projects[localProjectKey] || typeof config.projects[localProjectKey] !== "object") {
+      config.projects[localProjectKey] = {};
+    }
+    const projectEntry = config.projects[localProjectKey];
+    if (!projectEntry.mcpServers || typeof projectEntry.mcpServers !== "object") {
+      projectEntry.mcpServers = {};
+    }
+    projectEntry.mcpServers[entryKey] = mcpEntry;
+  } else {
+    if (!config.mcpServers) config.mcpServers = {};
+    config.mcpServers[entryKey] = mcpEntry;
+  }
 
   writeFileSync(targetPath, JSON.stringify(config, null, 2) + "\n");
   return { url: mcpUrl, source };
@@ -2670,6 +2716,10 @@ function removeMcpConfig() {
   // files. Project-level uses CWD — only relevant when uninstall is run
   // from inside a project that had `mcp-install --install-scope project`
   // applied; otherwise the project path doesn't exist and we no-op.
+  // Local-scope entries (under `projects[<cwd>].mcpServers` in
+  // ~/.claude.json) are cleaned up for every `projects[*]` slot so a
+  // user can uninstall without remembering which directory they ran the
+  // local install from.
   const claudeJsonPath = resolve(homedir(), ".claude.json");
   const projectMcpJsonPath = resolve(process.cwd(), ".mcp.json");
   for (const path of [claudeJsonPath, projectMcpJsonPath]) {
@@ -2679,13 +2729,26 @@ function removeMcpConfig() {
       // Drop the singular key and every per-vault `parachute-vault-<name>`
       // entry. Legacy `parachute-vault/<name>` (slash-form) sub-keys from a
       // pre-multi-vault pattern still get cleaned up here.
-      for (const key of Object.keys(config.mcpServers ?? {})) {
-        if (
-          key === "parachute-vault" ||
-          key.startsWith("parachute-vault-") ||
-          key.startsWith("parachute-vault/")
-        ) {
-          delete config.mcpServers[key];
+      const stripVaultKeys = (servers: Record<string, unknown> | undefined) => {
+        if (!servers) return;
+        for (const key of Object.keys(servers)) {
+          if (
+            key === "parachute-vault" ||
+            key.startsWith("parachute-vault-") ||
+            key.startsWith("parachute-vault/")
+          ) {
+            delete servers[key];
+          }
+        }
+      };
+      stripVaultKeys(config.mcpServers);
+      // Local-scope cleanup: walk every project entry and strip vault keys.
+      if (config.projects && typeof config.projects === "object") {
+        for (const projectKey of Object.keys(config.projects)) {
+          const projectEntry = config.projects[projectKey];
+          if (projectEntry && typeof projectEntry === "object") {
+            stripVaultKeys(projectEntry.mcpServers);
+          }
         }
       }
       writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
@@ -2735,7 +2798,7 @@ Vaults:
   parachute-vault remove <name> [--yes]    Remove a vault
   parachute-vault mcp-install [--mint|--token <t>|--legacy-pat]
                               [--scope vault:read|vault:write|vault:admin]
-                              [--install-scope user|project]
+                              [--install-scope local|user|project]
                               [--vault <name>] [--client claude-code]
                                             Install vault MCP into a client config.
                                             From a terminal with no flags: walks you
@@ -2745,15 +2808,21 @@ Vaults:
                                             the command runs non-interactively.
                                             Default (non-interactive): --mint
                                             (hub-issued JWT via ~/.parachute/operator.token)
-                                            into ~/.claude.json with vault:read scope.
+                                            into ~/.claude.json under
+                                            projects[<cwd>].mcpServers (local scope,
+                                            matches Claude Code's claude-mcp-add
+                                            default) with vault:read scope.
                                             --token <t>: paste an existing bearer
                                             (any shape) instead of minting.
                                             --legacy-pat: mint a vault-DB pvt_*
                                             token (deprecated; for self-hosted-
                                             without-hub setups).
-                                            --install-scope project writes
-                                            ./.mcp.json in CWD instead of
-                                            ~/.claude.json.
+                                            --install-scope local (default) writes
+                                            ~/.claude.json under
+                                            projects[<cwd>].mcpServers (this
+                                            directory only). user writes top-level
+                                            mcpServers (every project). project
+                                            writes ./.mcp.json (check into the repo).
                                             --vault <name> targets a specific
                                             vault and keys the entry as
                                             parachute-vault-<name>.

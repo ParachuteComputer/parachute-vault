@@ -99,8 +99,9 @@ function baseCtx(overrides: Partial<InstallContext> = {}): InstallContext {
 // ---------------------------------------------------------------------------
 
 describe("runInteractiveInstall — decision tree", () => {
-  test("single vault + no project context + can mint: walkthrough auto-picks vault and installs user-scope mint at vault:read", async () => {
+  test("single vault + no project context + can mint: prompts for install scope (defaults local), then mint at vault:read", async () => {
     const { io, state } = mockIO([
+      null, // accept install-scope default ("local")
       null, // accept "mint" with vault:read scope
       true, // proceed
     ]);
@@ -109,18 +110,20 @@ describe("runInteractiveInstall — decision tree", () => {
     if (result === "abort") return;
     expect(result.mode).toBe("mint");
     expect(result.scope).toBe("vault:read");
-    expect(result.installScope).toBe("user");
+    // No project markers → suggested default is `local` (matches Claude
+    // Code's `claude mcp add` default). The walkthrough always prompts.
+    expect(result.installScope).toBe("local");
     expect(result.vaultName).toBe("default");
     expect(result.vaultExplicit).toBe(false);
-    // Vault prompt is skipped (single vault), install-scope prompt is
-    // skipped (no project markers → user is automatic), and we hit the
-    // auth prompt + final confirm.
-    expect(state.prompts.map((p) => p.kind)).toEqual(["ask", "confirm"]);
+    // Vault prompt skipped (single vault). Install-scope is now an ask
+    // (not a confirm) — always fires. Then auth ask + final confirm.
+    expect(state.prompts.map((p) => p.kind)).toEqual(["ask", "ask", "confirm"]);
   });
 
   test("multi-vault: walkthrough asks which vault and respects the choice", async () => {
     const { io, state } = mockIO([
       "boulder", // pick vault "boulder"
+      null,       // accept install-scope default
       null,       // accept mint with vault:read
       true,       // proceed
     ]);
@@ -138,7 +141,7 @@ describe("runInteractiveInstall — decision tree", () => {
   });
 
   test("multi-vault: pressing Enter accepts the default_vault and is not marked explicit", async () => {
-    const { io } = mockIO([null, null, true]); // accept default vault, accept mint, proceed
+    const { io } = mockIO([null, null, null, true]); // vault, install-scope, mint, proceed
     const result = await runInteractiveInstall(
       baseCtx({ vaults: ["default", "boulder"] }),
       io,
@@ -149,9 +152,9 @@ describe("runInteractiveInstall — decision tree", () => {
     expect(result.vaultExplicit).toBe(false);
   });
 
-  test("project context: walkthrough suggests project-scope install (default Y)", async () => {
+  test("project context: walkthrough suggests project-scope install as the default", async () => {
     const { io, state } = mockIO([
-      null, // accept project-scope default
+      null, // accept install-scope default (project, because markers detected)
       null, // accept mint with vault:read
       true, // proceed
     ]);
@@ -162,16 +165,17 @@ describe("runInteractiveInstall — decision tree", () => {
     expect(result).not.toBe("abort");
     if (result === "abort") return;
     expect(result.installScope).toBe("project");
-    expect(state.prompts[0]!.kind).toBe("confirm");
-    expect(state.prompts[0]!.question).toMatch(/this project/i);
-    expect(state.prompts[0]!.default).toBe(true);
+    // First prompt is the install-scope ask; default tilts to "project"
+    // when project markers are present in cwd.
+    expect(state.prompts[0]!.kind).toBe("ask");
+    expect(state.prompts[0]!.default).toBe("project");
   });
 
-  test("project context but operator declines: install scope falls to user", async () => {
+  test("project context but operator picks user: install scope falls to user", async () => {
     const { io } = mockIO([
-      false, // decline project scope
-      null,  // accept mint
-      true,  // proceed
+      "user", // override the project-scope default → user
+      null,   // accept mint
+      true,   // proceed
     ]);
     const result = await runInteractiveInstall(
       baseCtx({ inProjectContext: true }),
@@ -182,8 +186,57 @@ describe("runInteractiveInstall — decision tree", () => {
     expect(result.installScope).toBe("user");
   });
 
+  test("no project markers: install-scope prompt still fires and defaults to local", async () => {
+    const { io, state } = mockIO([
+      null, // accept install-scope default (local)
+      null, // accept mint
+      true, // proceed
+    ]);
+    const result = await runInteractiveInstall(
+      baseCtx({ inProjectContext: false, cwd: "/Gitcoin" }),
+      io,
+    );
+    expect(result).not.toBe("abort");
+    if (result === "abort") return;
+    // This is the dogfood-feedback case: operator is in a plain
+    // directory (no .git, no package.json). The walkthrough must NOT
+    // silently autopilot to user scope — always prompt.
+    expect(result.installScope).toBe("local");
+    expect(state.prompts.find((p) => p.kind === "ask" && p.default === "local")).toBeDefined();
+  });
+
+  test("no project markers: operator can choose user explicitly", async () => {
+    const { io } = mockIO([
+      "user", // override default
+      null,   // accept mint
+      true,   // proceed
+    ]);
+    const result = await runInteractiveInstall(
+      baseCtx({ inProjectContext: false }),
+      io,
+    );
+    expect(result).not.toBe("abort");
+    if (result === "abort") return;
+    expect(result.installScope).toBe("user");
+  });
+
+  test("install-scope prompt: invalid value re-prompts with help affordance", async () => {
+    const { io, state } = mockIO([
+      "everywhere", // invalid
+      "local",       // valid
+      null,          // accept mint
+      true,          // proceed
+    ]);
+    const result = await runInteractiveInstall(baseCtx(), io);
+    expect(result).not.toBe("abort");
+    if (result === "abort") return;
+    expect(result.installScope).toBe("local");
+    expect(state.logs.some((l) => /expected one of/.test(l))).toBe(true);
+  });
+
   test("hub not reachable: walkthrough offers paste vs legacy (no mint option)", async () => {
     const { io, state } = mockIO([
+      null,     // accept install-scope default
       "legacy", // pick legacy-pat
       null,     // accept default scope (read) on the F2 scope prompt
       true,     // proceed
@@ -202,6 +255,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("hub reachable but no operator.token: also offers paste vs legacy", async () => {
     const { io, state } = mockIO([
+      null,         // accept install-scope default
       "paste",      // pick paste
       "pasted-jwt", // the bearer
       true,         // proceed
@@ -219,6 +273,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("scope widening: typing 'write' produces vault:write mint", async () => {
     const { io } = mockIO([
+      null,    // accept install-scope default
       "write", // widen scope
       true,    // proceed
     ]);
@@ -231,6 +286,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("scope widening: typing 'admin' produces vault:admin mint", async () => {
     const { io } = mockIO([
+      null,    // accept install-scope default
       "admin",
       true,
     ]);
@@ -242,6 +298,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("typing 'paste' at the auth prompt switches to token mode + asks for token", async () => {
     const { io } = mockIO([
+      null,              // accept install-scope default
       "paste",           // switch to paste
       "my-existing-jwt", // the bearer
       true,              // proceed
@@ -255,6 +312,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("typing 'legacy' at the auth prompt switches to legacy-pat with default scope", async () => {
     const { io } = mockIO([
+      null,    // accept install-scope default
       "legacy",
       null,    // accept default scope (read) on the F2 scope prompt
       true,
@@ -268,6 +326,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("legacy-pat path: typing 'write' on the scope prompt widens to vault:write (F2)", async () => {
     const { io, state } = mockIO([
+      null,       // accept install-scope default
       "legacy",   // pick legacy-pat
       "write",    // widen scope
       true,       // proceed
@@ -283,6 +342,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("legacy-pat path (no-hub branch): scope prompt also fires (F2)", async () => {
     const { io } = mockIO([
+      null,      // accept install-scope default
       "legacy",  // pick legacy (no-hub branch)
       "admin",   // widen scope
       true,      // proceed
@@ -296,6 +356,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("paste path: preview clarifies scope is determined by the pasted token (F2)", async () => {
     const { io, state } = mockIO([
+      null,             // accept install-scope default
       "paste",          // pick paste
       "my-existing-jwt", // bearer
       true,              // proceed
@@ -349,6 +410,7 @@ describe("runInteractiveInstall — decision tree", () => {
     };
     const { io } = mockIO([
       false, // decline update
+      null,  // accept install-scope default (local)
       null,  // accept mint
       true,  // proceed
     ]);
@@ -358,12 +420,13 @@ describe("runInteractiveInstall — decision tree", () => {
     );
     expect(result).not.toBe("abort");
     if (result === "abort") return;
-    // Default flow resumed — user scope (no project context), default vault.
-    expect(result.installScope).toBe("user");
+    // Default flow resumed — local scope (no project markers), default vault.
+    expect(result.installScope).toBe("local");
   });
 
   test("aborts cleanly when the operator declines the final confirm", async () => {
     const { io, state } = mockIO([
+      null,  // accept install-scope default
       null,  // accept mint
       false, // decline final confirm
     ]);
@@ -382,6 +445,7 @@ describe("runInteractiveInstall — decision tree", () => {
 
   test("'help' input on the auth prompt re-prompts after showing explanation", async () => {
     const { io, state } = mockIO([
+      null,   // accept install-scope default
       "help", // ask for help
       null,   // then accept mint
       true,   // proceed
@@ -400,6 +464,7 @@ describe("runInteractiveInstall — decision tree", () => {
     const { io, state } = mockIO([
       "ghost",   // unknown vault
       "boulder", // pick a real one
+      null,      // accept install-scope default
       null,      // accept mint
       true,      // proceed
     ]);
@@ -545,6 +610,88 @@ describe("detectExistingEntries", () => {
   test("malformed JSON does not throw — silently skipped", () => {
     fs.writeFileSync(path.join(tmpHome, ".claude.json"), "{ not json");
     expect(detectExistingEntries(tmpCwd)).toEqual({});
+  });
+
+  test("detects local-scope entry under projects[<cwd>].mcpServers", () => {
+    const projectKey = path.resolve(tmpCwd);
+    fs.writeFileSync(
+      path.join(tmpHome, ".claude.json"),
+      JSON.stringify({
+        projects: {
+          [projectKey]: {
+            mcpServers: {
+              "parachute-vault": {
+                type: "http",
+                url: "https://hub.example/vault/default/mcp",
+                headers: { Authorization: "Bearer x" },
+              },
+            },
+          },
+        },
+      }),
+    );
+    const found = detectExistingEntries(tmpCwd);
+    expect(found.local).toBeDefined();
+    expect(found.local!.scope).toBe("local");
+    expect(found.local!.entryKey).toBe("parachute-vault");
+    expect(found.local!.label).toContain(projectKey);
+  });
+
+  test("local-scope entry at a different cwd is not surfaced", () => {
+    // Operator did `mcp-install --install-scope local` from /Other/Project
+    // some time ago. The walkthrough running from tmpCwd today shouldn't
+    // misread that as an "existing here" entry — local scope is per-cwd.
+    fs.writeFileSync(
+      path.join(tmpHome, ".claude.json"),
+      JSON.stringify({
+        projects: {
+          "/Other/Project": {
+            mcpServers: {
+              "parachute-vault": {
+                type: "http",
+                url: "https://hub.example/vault/default/mcp",
+              },
+            },
+          },
+        },
+      }),
+    );
+    const found = detectExistingEntries(tmpCwd);
+    expect(found.local).toBeUndefined();
+  });
+
+  test("user + local + project entries coexist in one detect call", () => {
+    const projectKey = path.resolve(tmpCwd);
+    fs.writeFileSync(
+      path.join(tmpHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          "parachute-vault": { type: "http", url: "https://hub.example/vault/u/mcp" },
+        },
+        projects: {
+          [projectKey]: {
+            mcpServers: {
+              "parachute-vault": { type: "http", url: "https://hub.example/vault/l/mcp" },
+            },
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpCwd, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          "parachute-vault": { type: "http", url: "https://hub.example/vault/p/mcp" },
+        },
+      }),
+    );
+    const found = detectExistingEntries(tmpCwd);
+    expect(found.user).toBeDefined();
+    expect(found.local).toBeDefined();
+    expect(found.project).toBeDefined();
+    expect(found.user!.url).toContain("/vault/u/");
+    expect(found.local!.url).toContain("/vault/l/");
+    expect(found.project!.url).toContain("/vault/p/");
   });
 });
 

@@ -264,6 +264,7 @@ describe("resolveInstallTarget", () => {
     const res = resolveInstallTarget("user");
     expect(res.path).toBe(path.resolve(os.homedir(), ".claude.json"));
     expect(res.scope).toBe("user");
+    expect(res.localProjectKey).toBeUndefined();
   });
 
   test("project scope → <cwd>/.mcp.json", () => {
@@ -272,6 +273,22 @@ describe("resolveInstallTarget", () => {
       const res = resolveInstallTarget("project", tmp);
       expect(res.path).toBe(path.resolve(tmp, ".mcp.json"));
       expect(res.scope).toBe("project");
+      expect(res.localProjectKey).toBeUndefined();
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("local scope → ~/.claude.json with absolute-cwd project key", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vault-target-local-"));
+    try {
+      const res = resolveInstallTarget("local", tmp);
+      // Same file as user scope — what differs is where inside the JSON
+      // the entry lands (top-level vs projects[<cwd>].mcpServers).
+      expect(res.path).toBe(path.resolve(os.homedir(), ".claude.json"));
+      expect(res.scope).toBe("local");
+      // Absolute path → matches Claude Code's own convention.
+      expect(res.localProjectKey).toBe(path.resolve(tmp));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -401,7 +418,16 @@ describe("mcp-install flag parsing", () => {
       tmp,
     );
     expect(res.exitCode).toBe(1);
-    expect(res.stderr).toMatch(/--install-scope must be "user" or "project"/);
+    expect(res.stderr).toMatch(/--install-scope must be "local", "user", or "project"/);
+  });
+
+  test("accepts --install-scope local", () => {
+    setupBareVault(tmp, "default");
+    const res = runCli(
+      ["mcp-install", "--install-scope", "local", "--token", "t"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
   });
 
   test("rejects a --client other than claude-code (Phase C is future work)", () => {
@@ -457,10 +483,10 @@ describe("mcp-install end-to-end", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test("--token writes the supplied bearer into ~/.claude.json", () => {
+  test("--install-scope user writes top-level mcpServers in ~/.claude.json", () => {
     setupBareVault(tmp, "default");
     const res = runCli(
-      ["mcp-install", "--token", "pasted-bearer"],
+      ["mcp-install", "--install-scope", "user", "--token", "pasted-bearer"],
       tmp,
     );
     expect(res.exitCode).toBe(0);
@@ -469,6 +495,36 @@ describe("mcp-install end-to-end", () => {
     expect(entry.type).toBe("http");
     expect(entry.headers.Authorization).toBe("Bearer pasted-bearer");
     expect(entry.url).toContain("/vault/default/mcp");
+    // No projects[*] entry written.
+    expect(config.projects).toBeUndefined();
+  });
+
+  test("default (no --install-scope) writes ~/.claude.json under projects[<cwd>].mcpServers (local)", () => {
+    setupBareVault(tmp, "default");
+    // CLI runs with cwd=tmp (the parachute-home temp dir). Local-scope
+    // default keys the entry under projects[<cwd>] in the same file
+    // user-scope uses (~/.claude.json). On macOS /tmp is a symlink to
+    // /private/tmp, so the spawned process's cwd resolves through —
+    // use fs.realpathSync to compute the same key the CLI will write.
+    const res = runCli(
+      ["mcp-install", "--token", "local-bearer"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
+    const config = readJson(path.join(tmp, ".claude.json"));
+    // The new default is `local` — top-level mcpServers should be empty
+    // or absent; the entry lives under projects[<absolute-cwd>].
+    const flatEntry = config.mcpServers?.["parachute-vault"];
+    expect(flatEntry).toBeUndefined();
+    const projectKey = fs.realpathSync(tmp);
+    const localServers = config.projects?.[projectKey]?.mcpServers ?? {};
+    expect(localServers["parachute-vault"]).toBeDefined();
+    expect(localServers["parachute-vault"].headers.Authorization).toBe("Bearer local-bearer");
+    expect(localServers["parachute-vault"].url).toContain("/vault/default/mcp");
+    // Stdout surfaces the consequence so operators know the install is
+    // scoped to this directory (and how to widen if they wanted global).
+    expect(res.stdout).toMatch(/this directory only/);
+    expect(res.stdout).toMatch(/--install-scope user/);
   });
 
   test("--install-scope project writes <cwd>/.mcp.json instead of ~/.claude.json", () => {
@@ -494,13 +550,112 @@ describe("mcp-install end-to-end", () => {
     }
   });
 
-  test("--vault <name> keys the entry as parachute-vault-<name>", () => {
+  test("--install-scope local writes ~/.claude.json under projects[<cwd>].mcpServers", () => {
+    setupBareVault(tmp, "default");
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-local-"));
+    try {
+      const res = runCli(
+        ["mcp-install", "--install-scope", "local", "--token", "local-bearer"],
+        tmp,
+        {},
+        projectDir,
+      );
+      expect(res.exitCode).toBe(0);
+      // Local writes to ~/.claude.json under projects[<absolute-cwd>].
+      // Not <cwd>/.mcp.json (that's project scope).
+      expect(fs.existsSync(path.join(projectDir, ".mcp.json"))).toBe(false);
+      expect(fs.existsSync(path.join(tmp, ".claude.json"))).toBe(true);
+      const config = readJson(path.join(tmp, ".claude.json"));
+      const projectKey = fs.realpathSync(projectDir);
+      const entry = config.projects[projectKey].mcpServers["parachute-vault"];
+      expect(entry.type).toBe("http");
+      expect(entry.headers.Authorization).toBe("Bearer local-bearer");
+      expect(entry.url).toContain("/vault/default/mcp");
+      // No top-level entry written for local scope.
+      expect(config.mcpServers?.["parachute-vault"]).toBeUndefined();
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test("--install-scope local preserves an existing top-level entry untouched", () => {
+    setupBareVault(tmp, "default");
+    // Pre-seed ~/.claude.json with a top-level user-scope entry from some
+    // other client. The local install must not clobber it.
+    fs.writeFileSync(
+      path.join(tmp, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          "some-other-server": { type: "http", url: "https://other.example/mcp" },
+        },
+      }),
+    );
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-local-pre-"));
+    try {
+      const res = runCli(
+        ["mcp-install", "--install-scope", "local", "--token", "t"],
+        tmp,
+        {},
+        projectDir,
+      );
+      expect(res.exitCode).toBe(0);
+      const config = readJson(path.join(tmp, ".claude.json"));
+      // Pre-existing top-level entry preserved.
+      expect(config.mcpServers["some-other-server"]).toBeDefined();
+      // New local entry under projects[<cwd>].
+      const projectKey = fs.realpathSync(projectDir);
+      expect(config.projects[projectKey].mcpServers["parachute-vault"]).toBeDefined();
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test("--install-scope local preserves a pre-existing project's other mcp servers", () => {
+    setupBareVault(tmp, "default");
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-local-coexist-"));
+    const projectKey = fs.realpathSync(projectDir);
+    // Pre-seed a projects[cwd] entry with an unrelated MCP server +
+    // additional fields. The install must not blow them away.
+    fs.writeFileSync(
+      path.join(tmp, ".claude.json"),
+      JSON.stringify({
+        projects: {
+          [projectKey]: {
+            allowedTools: ["Bash(ls:*)"],
+            mcpServers: {
+              "glif": { type: "http", url: "https://glif.example/mcp" },
+            },
+          },
+        },
+      }),
+    );
+    try {
+      const res = runCli(
+        ["mcp-install", "--install-scope", "local", "--token", "t"],
+        tmp,
+        {},
+        projectDir,
+      );
+      expect(res.exitCode).toBe(0);
+      const config = readJson(path.join(tmp, ".claude.json"));
+      // Pre-existing sibling preserved.
+      expect(config.projects[projectKey].mcpServers["glif"]).toBeDefined();
+      // Pre-existing non-mcpServers field preserved.
+      expect(config.projects[projectKey].allowedTools).toEqual(["Bash(ls:*)"]);
+      // New entry added.
+      expect(config.projects[projectKey].mcpServers["parachute-vault"]).toBeDefined();
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test("--vault <name> keys the entry as parachute-vault-<name> (user scope)", () => {
     setupBareVault(tmp, "default");
     setupBareVault(tmp, "work");
-    // Install for the second vault — singular slot stays free for the
-    // default. Multi-vault is the motivation.
+    // Install for the second vault under user scope — singular slot
+    // stays free for the default. Multi-vault is the motivation.
     const res = runCli(
-      ["mcp-install", "--vault", "work", "--token", "work-bearer"],
+      ["mcp-install", "--install-scope", "user", "--vault", "work", "--token", "work-bearer"],
       tmp,
     );
     expect(res.exitCode).toBe(0);
@@ -515,9 +670,12 @@ describe("mcp-install end-to-end", () => {
     expect(config.mcpServers["parachute-vault"]).toBeUndefined();
   });
 
-  test("--vault without an explicit name uses the default and keys the singular slot", () => {
+  test("--vault without an explicit name uses the default and keys the singular slot (user scope)", () => {
     setupBareVault(tmp, "default");
-    const res = runCli(["mcp-install", "--token", "default-bearer"], tmp);
+    const res = runCli(
+      ["mcp-install", "--install-scope", "user", "--token", "default-bearer"],
+      tmp,
+    );
     expect(res.exitCode).toBe(0);
     const config = readJson(path.join(tmp, ".claude.json"));
     expect(config.mcpServers["parachute-vault"]).toBeDefined();
@@ -528,7 +686,7 @@ describe("mcp-install end-to-end", () => {
 
   test("--legacy-pat mints a vault-DB pvt_* token and prints deprecation warning", () => {
     setupBareVault(tmp, "default");
-    const res = runCli(["mcp-install", "--legacy-pat"], tmp);
+    const res = runCli(["mcp-install", "--install-scope", "user", "--legacy-pat"], tmp);
     expect(res.exitCode).toBe(0);
     // Deprecation warning lands on stderr (we used `console.error` for the
     // notice so it's visible without polluting stdout). The message names
@@ -543,13 +701,28 @@ describe("mcp-install end-to-end", () => {
     expect(bearer).toMatch(/^Bearer pvt_/);
   });
 
-  test("subsequent --token install on top of an existing entry overwrites the bearer", () => {
+  test("subsequent --token install on top of an existing entry overwrites the bearer (user scope)", () => {
     setupBareVault(tmp, "default");
-    runCli(["mcp-install", "--token", "first"], tmp);
-    const res = runCli(["mcp-install", "--token", "second"], tmp);
+    runCli(["mcp-install", "--install-scope", "user", "--token", "first"], tmp);
+    const res = runCli(["mcp-install", "--install-scope", "user", "--token", "second"], tmp);
     expect(res.exitCode).toBe(0);
     const config = readJson(path.join(tmp, ".claude.json"));
     expect(config.mcpServers["parachute-vault"].headers.Authorization).toBe("Bearer second");
+  });
+
+  test("subsequent --token install in local scope overwrites the bearer at projects[<cwd>]", () => {
+    setupBareVault(tmp, "default");
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-local-update-"));
+    try {
+      runCli(["mcp-install", "--install-scope", "local", "--token", "first"], tmp, {}, projectDir);
+      const res = runCli(["mcp-install", "--install-scope", "local", "--token", "second"], tmp, {}, projectDir);
+      expect(res.exitCode).toBe(0);
+      const config = readJson(path.join(tmp, ".claude.json"));
+      const projectKey = fs.realpathSync(projectDir);
+      expect(config.projects[projectKey].mcpServers["parachute-vault"].headers.Authorization).toBe("Bearer second");
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
   });
 });
 
