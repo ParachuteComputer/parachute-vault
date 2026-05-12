@@ -157,6 +157,41 @@ function readExposedFqdn(): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Entry-key + URL builder (shared by preview render + write path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Single source of truth for the MCP entry's slot key and URL. Both the
+ * interactive walkthrough's preview render and the writer (`executeMcpInstall`
+ * → `installMcpConfig`) call this so the JSON shape the operator confirms is
+ * the JSON shape that lands on disk. Drift between the two would silently
+ * mislead — they used to compute these independently (preview from
+ * `${ctx.hubOrigin}/vault/<name>/mcp` directly; writer through `chooseMcpUrl`).
+ * They agree today but a future change to one path could diverge from the
+ * other. vault#293.
+ *
+ * `existingEntryKey` wins when an update of a pre-existing entry is in
+ * progress — the walkthrough already pins this earlier in the flow; passing
+ * it here just keeps the preview honest about the slot the writer will
+ * actually use.
+ */
+export function buildMcpEntryPlan(opts: {
+  vaultName: string;
+  vaultExplicit: boolean;
+  port: number;
+  env?: { PARACHUTE_HUB_ORIGIN?: string | undefined };
+  /** When updating an existing entry, the slot key the operator picked previously. */
+  existingEntryKey?: string;
+}): { entryKey: string; url: string; source: McpUrlSource } {
+  const { vaultName, vaultExplicit, port, env, existingEntryKey } = opts;
+  const entryKey =
+    existingEntryKey ??
+    (vaultExplicit ? `parachute-vault-${vaultName}` : "parachute-vault");
+  const { url, source } = chooseMcpUrl(vaultName, port, env ?? (process.env as { PARACHUTE_HUB_ORIGIN?: string }));
+  return { entryKey, url, source };
+}
+
+// ---------------------------------------------------------------------------
 // Operator-token reader
 // ---------------------------------------------------------------------------
 
@@ -532,6 +567,20 @@ export interface InstallContext {
   hubReachable: boolean;
   /** The resolved hub origin (loopback if no hub configured). */
   hubOrigin: string;
+  /**
+   * Vault listen port. Carried on the context so the preview's
+   * `buildMcpEntryPlan` call resolves the MCP URL through the same
+   * `chooseMcpUrl` path the writer uses. Without this, preview was building
+   * the URL from `${hubOrigin}/vault/<name>/mcp` directly — coincidentally
+   * identical today but liable to drift.
+   */
+  port: number;
+  /**
+   * Environment snapshot used for hub-origin resolution. Held on the
+   * context so the preview's URL build sees the same `PARACHUTE_HUB_ORIGIN`
+   * the writer will see (tests can override deterministically).
+   */
+  env: { PARACHUTE_HUB_ORIGIN?: string | undefined };
   /** Whether `~/.parachute/operator.token` exists and is non-empty. */
   operatorTokenPresent: boolean;
   /** Heuristic: is CWD a project directory? */
@@ -561,12 +610,15 @@ export function detectInstallContext(opts: {
   // string-index type that doesn't structurally match the explicit shape
   // chooseHubOrigin declares; passing a sliced view sidesteps the
   // structural-incompatibility complaint without losing safety.
-  const hub = chooseHubOrigin(opts.port, { PARACHUTE_HUB_ORIGIN: env.PARACHUTE_HUB_ORIGIN });
+  const hubEnv = { PARACHUTE_HUB_ORIGIN: env.PARACHUTE_HUB_ORIGIN };
+  const hub = chooseHubOrigin(opts.port, hubEnv);
   return {
     vaults: opts.vaults,
     defaultVault: opts.defaultVault,
     hubReachable: hub.source !== "loopback",
     hubOrigin: hub.url,
+    port: opts.port,
+    env: hubEnv,
     operatorTokenPresent: readOperatorToken(env) !== null,
     inProjectContext: detectProjectContext(cwd),
     cwd,

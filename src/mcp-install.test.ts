@@ -20,6 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  buildMcpEntryPlan,
   chooseHubOrigin,
   chooseMcpUrl,
   mintHubJwt,
@@ -231,6 +232,59 @@ describe("chooseHubOrigin", () => {
     fs.writeFileSync(path.join(tmpHome, "expose-state.json"), "{ not json");
     const res = chooseHubOrigin(1940, {});
     expect(res.source).toBe("loopback");
+  });
+});
+
+// vault#293 — pin that the preview-render and the writer go through the same
+// helper. If either side stops calling `buildMcpEntryPlan` (or the helper's
+// shape changes), the preview can disagree with what lands on disk; these
+// tests catch the helper-shape drift directly. The walkthrough/preview test
+// in mcp-install-interactive.test.ts asserts the consumer-side cross-check
+// (preview's logged entry-key/url match `buildMcpEntryPlan`'s output).
+describe("buildMcpEntryPlan", () => {
+  test("singular key + per-vault key + URL match what the writer would land", () => {
+    const env = { PARACHUTE_HUB_ORIGIN: "https://hub.example" };
+
+    const singular = buildMcpEntryPlan({ vaultName: "default", vaultExplicit: false, port: 1940, env });
+    expect(singular.entryKey).toBe("parachute-vault");
+    expect(singular.url).toBe("https://hub.example/vault/default/mcp");
+
+    const perVault = buildMcpEntryPlan({ vaultName: "work", vaultExplicit: true, port: 1940, env });
+    expect(perVault.entryKey).toBe("parachute-vault-work");
+    expect(perVault.url).toBe("https://hub.example/vault/work/mcp");
+  });
+
+  test("existingEntryKey wins over the synthesized key (preserves an in-place update)", () => {
+    // The walkthrough's update-existing branch pins the slot the entry
+    // already occupies — even if `vaultExplicit` would otherwise produce a
+    // different synthesized key, the plan must honor the existing slot or
+    // the writer lands at a different key than the preview promised.
+    const env = { PARACHUTE_HUB_ORIGIN: "https://hub.example" };
+    const res = buildMcpEntryPlan({
+      vaultName: "default",
+      vaultExplicit: false,
+      port: 1940,
+      env,
+      existingEntryKey: "parachute-vault-legacy-name",
+    });
+    expect(res.entryKey).toBe("parachute-vault-legacy-name");
+  });
+
+  test("URL shape tracks chooseMcpUrl's source order (loopback when nothing configured)", () => {
+    // Mirror chooseMcpUrl's contract: empty env + no expose-state ⇒ loopback.
+    // Using a separate PARACHUTE_HOME so the real one's expose-state doesn't leak in.
+    const origHome = process.env.PARACHUTE_HOME;
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "vault-build-plan-"));
+    process.env.PARACHUTE_HOME = tmpHome;
+    try {
+      const res = buildMcpEntryPlan({ vaultName: "default", vaultExplicit: false, port: 1940, env: {} });
+      expect(res.source).toBe("loopback");
+      expect(res.url).toBe("http://127.0.0.1:1940/vault/default/mcp");
+    } finally {
+      if (origHome === undefined) delete process.env.PARACHUTE_HOME;
+      else process.env.PARACHUTE_HOME = origHome;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
   });
 });
 

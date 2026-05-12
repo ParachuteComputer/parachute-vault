@@ -53,6 +53,7 @@ import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import {
+  buildMcpEntryPlan,
   chooseHubOrigin,
   chooseMcpUrl,
   detectInstallContext,
@@ -1099,6 +1100,7 @@ async function cmdMcpInstallInteractive(): Promise<void> {
     vaultName: decision.vaultName,
     vaultExplicit: decision.vaultExplicit,
     pastedToken: decision.pastedToken,
+    existingEntryKey: decision.existingEntryKey,
     globalConfig,
   });
 }
@@ -1113,6 +1115,15 @@ interface ExecuteMcpInstallOpts {
   vaultExplicit: boolean;
   /** Bearer the operator pasted in `--token` / interactive paste mode. */
   pastedToken?: string;
+  /**
+   * When the interactive walkthrough is updating an existing entry, the
+   * walkthrough's preview pinned a specific key (e.g. `parachute-vault-work`
+   * because that's what was already there). Passing it through ensures the
+   * write lands at the same key the operator just confirmed. Absent for
+   * fresh installs and for the flag-driven path (which always synthesizes).
+   * See vault#293.
+   */
+  existingEntryKey?: string;
   /** Reused across the call chain to avoid re-parsing config.yaml. */
   globalConfig: ReturnType<typeof readGlobalConfig>;
 }
@@ -1124,10 +1135,18 @@ interface ExecuteMcpInstallOpts {
  * preview-and-confirm step so a cancel skips the network mint entirely.
  */
 async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
-  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig } = opts;
+  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig, existingEntryKey } = opts;
   const verb = rawScope.split(":")[1]!;
   const target = resolveInstallTarget(installScope);
-  const entryKey = vaultExplicit ? `parachute-vault-${vaultName}` : "parachute-vault";
+  // Single source of truth shared with the interactive walkthrough's
+  // preview — preview-shows-this-shape ⇒ this-shape-lands-on-disk. See
+  // vault#293.
+  const { entryKey } = buildMcpEntryPlan({
+    vaultName,
+    vaultExplicit,
+    port: globalConfig.port || DEFAULT_PORT,
+    ...(existingEntryKey ? { existingEntryKey } : {}),
+  });
 
   let bearer: string;
   if (mode === "token") {

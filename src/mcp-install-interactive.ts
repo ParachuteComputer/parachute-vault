@@ -19,6 +19,7 @@
  * the IO to `prompt.ts` + console.log.
  */
 
+import { buildMcpEntryPlan } from "./mcp-install.ts";
 import type { InstallContext, ExistingMcpEntry, InstallScope } from "./mcp-install.ts";
 
 /**
@@ -57,6 +58,12 @@ export interface InstallDecision {
   vaultExplicit: boolean;
   /** Pasted bearer when `mode === "token"`. */
   pastedToken?: string;
+  /**
+   * When the walkthrough decided to update an existing entry, the key of
+   * that entry — so the writer keys the new state at the same slot the
+   * preview promised. Absent on fresh installs. See vault#293.
+   */
+  existingEntryKey?: string;
 }
 
 /**
@@ -239,10 +246,15 @@ export async function runInteractiveInstall(
       : installScope === "local"
         ? `~/.claude.json (projects["${ctx.cwd}"])`
         : "~/.claude.json";
-  const entryKey =
-    updateLocation?.entryKey ??
-    (vaultExplicit ? `parachute-vault-${vaultName}` : "parachute-vault");
-  const url = mcpUrlFromCtx(ctx, vaultName);
+  // Single source of truth for entry-key + URL — same function the writer
+  // will call when it actually lands the entry. See vault#293.
+  const { entryKey, url } = buildMcpEntryPlan({
+    vaultName,
+    vaultExplicit,
+    port: ctx.port,
+    env: ctx.env,
+    ...(updateLocation?.entryKey ? { existingEntryKey: updateLocation.entryKey } : {}),
+  });
   const bearerPreview =
     mode === "token" ? "<your token>" : mode === "mint" ? "<hub-jwt>" : "<pvt_*>";
 
@@ -272,7 +284,15 @@ export async function runInteractiveInstall(
     return "abort";
   }
 
-  return { mode, scope, installScope, vaultName, vaultExplicit, ...(pastedToken ? { pastedToken } : {}) };
+  return {
+    mode,
+    scope,
+    installScope,
+    vaultName,
+    vaultExplicit,
+    ...(pastedToken ? { pastedToken } : {}),
+    ...(updateLocation?.entryKey ? { existingEntryKey: updateLocation.entryKey } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,15 +318,6 @@ function pickExistingForPrompt(ctx: InstallContext): ExistingMcpEntry | null {
 function extractVaultFromUrl(url: string): string | null {
   const match = /\/vault\/([^/]+)\/mcp\b/.exec(url);
   return match ? match[1]! : null;
-}
-
-/**
- * Build the URL the walkthrough will preview. Same shape `chooseMcpUrl`
- * would produce — we re-derive here to keep the preview honest without
- * piping `chooseMcpUrl`'s extra metadata through.
- */
-function mcpUrlFromCtx(ctx: InstallContext, vaultName: string): string {
-  return `${ctx.hubOrigin}/vault/${vaultName}/mcp`;
 }
 
 /**

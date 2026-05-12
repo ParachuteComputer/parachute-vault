@@ -6,6 +6,39 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.4] — 2026-05-12
+
+`mcp-install` preview-accuracy regression pin (vault#293 follow-up to vault#292).
+
+The interactive walkthrough's preview render and the writer
+(`executeMcpInstall` → `installMcpConfig`) used to compute the entry
+key and URL independently — identical by coincidence of template
+strings. A future change to either path could silently mislead: the
+operator confirms one JSON shape, a different shape lands on disk.
+
+### Internal
+
+- Extract `buildMcpEntryPlan` in `src/mcp-install.ts` as the single
+  source of truth for `(entryKey, url)`. Both the preview render and
+  the writer call it.
+- Thread `port` + `env` through `InstallContext` so the preview
+  resolves the URL through `chooseMcpUrl` (the same path the writer
+  uses) rather than rebuilding the string from `${ctx.hubOrigin}/…`.
+- Thread `existingEntryKey` from `InstallDecision` into
+  `executeMcpInstall` so the writer keys the new entry at the same
+  slot the preview promised when the walkthrough is updating an
+  existing entry (instead of synthesizing a fresh key).
+- Un-skip the F3 preview-accuracy test from vault#292 and replace it
+  with a smaller-seam test: direct unit tests on `buildMcpEntryPlan`
+  in `mcp-install.test.ts` (entry-key formula: singular vs per-vault
+  vs update-existing; URL source: hub-origin vs loopback fallback),
+  plus two walkthrough tests in `mcp-install-interactive.test.ts`
+  that capture the preview's logged JSON and assert it matches
+  `buildMcpEntryPlan(decision)`. Faster + sturdier than the previous
+  walkthrough+spawn shape; no subprocess, no temp filesystem.
+
+No operator-visible behavior change.
+
 ## [0.4.4-rc.3] — 2026-05-11
 
 Two `parachute-vault mcp-install` fixes from real dogfood feedback —
