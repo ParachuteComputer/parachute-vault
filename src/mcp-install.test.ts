@@ -724,6 +724,62 @@ describe("mcp-install end-to-end", () => {
       fs.rmSync(projectDir, { recursive: true, force: true });
     }
   });
+
+  test("uninstall from a different cwd still strips a local-scope entry installed elsewhere", () => {
+    // Pins the cwd-agnostic property of removeMcpConfig's local-scope
+    // walk: an operator who runs `mcp-install --install-scope local`
+    // from one directory and `parachute-vault uninstall` from another
+    // should still see the entry cleaned up. The implementation iterates
+    // every projects[*] slot rather than just the current cwd's; this
+    // test fails fast if a future "optimization" narrows that walk to
+    // only the running-from cwd.
+    setupBareVault(tmp, "default");
+    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-uninstall-install-from-"));
+    const uninstallDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-uninstall-from-"));
+    try {
+      // 1. Install at installDir with --install-scope local.
+      const installRes = runCli(
+        ["mcp-install", "--install-scope", "local", "--token", "doomed-bearer"],
+        tmp,
+        {},
+        installDir,
+      );
+      expect(installRes.exitCode).toBe(0);
+      const installKey = fs.realpathSync(installDir);
+      let config = readJson(path.join(tmp, ".claude.json"));
+      expect(config.projects[installKey].mcpServers["parachute-vault"]).toBeDefined();
+
+      // 2. Pre-create some unrelated state at the same projects[installDir]
+      //    slot to make sure uninstall's cleanup is surgical — it should
+      //    strip the vault keys but leave siblings + non-mcpServers fields.
+      config.projects[installKey].allowedTools = ["Bash(ls:*)"];
+      config.projects[installKey].mcpServers["some-other-server"] = {
+        type: "http",
+        url: "https://other.example/mcp",
+      };
+      fs.writeFileSync(path.join(tmp, ".claude.json"), JSON.stringify(config, null, 2) + "\n");
+
+      // 3. Run uninstall from a DIFFERENT cwd (uninstallDir). The current
+      //    cwd's projects[*] slot doesn't exist; the install's does.
+      //    `--yes` skips both interactive confirms; we don't pass `--wipe`
+      //    so user data is left alone — only the MCP-entry walk runs.
+      const uninstallRes = runCli(["uninstall", "--yes"], tmp, {}, uninstallDir);
+      expect(uninstallRes.exitCode).toBe(0);
+
+      // 4. The vault entry at installDir should be gone — even though
+      //    that's not where we ran uninstall from.
+      config = readJson(path.join(tmp, ".claude.json"));
+      const installServers = config.projects?.[installKey]?.mcpServers ?? {};
+      expect(installServers["parachute-vault"]).toBeUndefined();
+      // 5. Sibling MCP server preserved.
+      expect(installServers["some-other-server"]).toBeDefined();
+      // 6. Non-mcpServers field at the same slot preserved.
+      expect(config.projects[installKey].allowedTools).toEqual(["Bash(ls:*)"]);
+    } finally {
+      fs.rmSync(installDir, { recursive: true, force: true });
+      fs.rmSync(uninstallDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

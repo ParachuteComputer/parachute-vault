@@ -2090,7 +2090,16 @@ type McpEntryLookup =
  * just make the "is it wired up?" state legible.
  */
 function readMcpEntry(): McpEntryLookup {
+  // Bun's process.cwd() already follows symlinks on macOS, so resolve()
+  // matches the key the install writer used; tests assert with
+  // fs.realpathSync to match the same shape.
   const cwd = resolve(process.cwd());
+  // Two entries point at the same ~/.claude.json file but search different
+  // key namespaces — top-level `mcpServers` (user scope) vs
+  // `projects[<cwd>].mcpServers` (local scope). Intentional duplication: a
+  // single read can't satisfy both without restructuring the search loop,
+  // and the cost of reading the file twice is trivial against the doctor
+  // run's other work.
   const candidates: Array<{ path: string; label: string; localProjectKey?: string }> = [
     { path: resolve(homedir(), ".claude.json"), label: "~/.claude.json" },
     { path: resolve(homedir(), ".claude.json"), label: `~/.claude.json (projects["${cwd}"])`, localProjectKey: cwd },
@@ -2711,7 +2720,7 @@ function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: st
   return { url: mcpUrl, source };
 }
 
-function removeMcpConfig() {
+export function removeMcpConfig() {
   // Remove vault entries from both user-level and project-level config
   // files. Project-level uses CWD — only relevant when uninstall is run
   // from inside a project that had `mcp-install --install-scope project`
