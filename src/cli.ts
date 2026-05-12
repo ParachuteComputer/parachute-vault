@@ -58,6 +58,7 @@ import {
   detectInstallContext,
   mintHubJwt,
   readOperatorToken,
+  removeMcpConfig,
   resolveInstallTarget,
   type InstallScope,
 } from "./mcp-install.ts";
@@ -2718,51 +2719,6 @@ function installMcpConfig(opts: InstallMcpConfigOpts): { url: string; source: st
 
   writeFileSync(targetPath, JSON.stringify(config, null, 2) + "\n");
   return { url: mcpUrl, source };
-}
-
-export function removeMcpConfig() {
-  // Remove vault entries from both user-level and project-level config
-  // files. Project-level uses CWD — only relevant when uninstall is run
-  // from inside a project that had `mcp-install --install-scope project`
-  // applied; otherwise the project path doesn't exist and we no-op.
-  // Local-scope entries (under `projects[<cwd>].mcpServers` in
-  // ~/.claude.json) are cleaned up for every `projects[*]` slot so a
-  // user can uninstall without remembering which directory they ran the
-  // local install from.
-  const claudeJsonPath = resolve(homedir(), ".claude.json");
-  const projectMcpJsonPath = resolve(process.cwd(), ".mcp.json");
-  for (const path of [claudeJsonPath, projectMcpJsonPath]) {
-    if (!existsSync(path)) continue;
-    try {
-      const config = JSON.parse(readFileSync(path, "utf-8"));
-      // Drop the singular key and every per-vault `parachute-vault-<name>`
-      // entry. Legacy `parachute-vault/<name>` (slash-form) sub-keys from a
-      // pre-multi-vault pattern still get cleaned up here.
-      const stripVaultKeys = (servers: Record<string, unknown> | undefined) => {
-        if (!servers) return;
-        for (const key of Object.keys(servers)) {
-          if (
-            key === "parachute-vault" ||
-            key.startsWith("parachute-vault-") ||
-            key.startsWith("parachute-vault/")
-          ) {
-            delete servers[key];
-          }
-        }
-      };
-      stripVaultKeys(config.mcpServers);
-      // Local-scope cleanup: walk every project entry and strip vault keys.
-      if (config.projects && typeof config.projects === "object") {
-        for (const projectKey of Object.keys(config.projects)) {
-          const projectEntry = config.projects[projectKey];
-          if (projectEntry && typeof projectEntry === "object") {
-            stripVaultKeys(projectEntry.mcpServers);
-          }
-        }
-      }
-      writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
-    } catch {}
-  }
 }
 
 function usage() {

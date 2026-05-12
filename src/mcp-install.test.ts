@@ -24,6 +24,7 @@ import {
   chooseMcpUrl,
   mintHubJwt,
   readOperatorToken,
+  removeMcpConfig,
   resolveInstallTarget,
 } from "./mcp-install.ts";
 
@@ -725,60 +726,75 @@ describe("mcp-install end-to-end", () => {
     }
   });
 
-  test("uninstall from a different cwd still strips a local-scope entry installed elsewhere", () => {
-    // Pins the cwd-agnostic property of removeMcpConfig's local-scope
-    // walk: an operator who runs `mcp-install --install-scope local`
-    // from one directory and `parachute-vault uninstall` from another
-    // should still see the entry cleaned up. The implementation iterates
-    // every projects[*] slot rather than just the current cwd's; this
-    // test fails fast if a future "optimization" narrows that walk to
-    // only the running-from cwd.
-    setupBareVault(tmp, "default");
-    const installDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-uninstall-install-from-"));
-    const uninstallDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-uninstall-from-"));
+  test("removeMcpConfig walks every projects[*] slot regardless of cwd", () => {
+    // Pins the cwd-agnostic property of removeMcpConfig's local-scope walk.
+    // Called directly rather than via subprocess `uninstall --yes` because
+    // the CLI uninstall also runs `uninstallAgent()` against the real
+    // launchd label `computer.parachute.vault` — not isolated by
+    // PARACHUTE_HOME, so a subprocess test would nuke a real registered
+    // daemon. Direct call keeps the test focused on the cleanup walk,
+    // which is the property the reviewer flagged as untested.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "vault-rmcfg-home-"));
+    const cwdA = "/Users/imaginary/projectA";
+    const cwdB = "/Users/imaginary/projectB";
+    const claudePath = path.join(fakeHome, ".claude.json");
+    fs.writeFileSync(
+      claudePath,
+      JSON.stringify({
+        mcpServers: { "parachute-vault": { type: "http", url: "user-scope" } },
+        projects: {
+          [cwdA]: {
+            allowedTools: ["Bash(ls:*)"],
+            mcpServers: {
+              "parachute-vault": { type: "http", url: "a" },
+              "some-other-server": { type: "http", url: "kept-a" },
+            },
+          },
+          [cwdB]: {
+            mcpServers: {
+              "parachute-vault-extra": { type: "http", url: "b1" },
+              "parachute-vault/legacy": { type: "http", url: "b2-legacy" },
+              "kept-server": { type: "http", url: "kept-b" },
+            },
+          },
+        },
+      }) + "\n",
+    );
+
+    // Bun's `os.homedir()` reads `process.env.HOME` first — swapping it for
+    // the duration of the call routes the cleanup at fakeHome's .claude.json,
+    // not the real user's. Restored in `finally`.
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "vault-rmcfg-cwd-"));
+    const origHome = process.env.HOME;
+    const origCwd = process.cwd();
     try {
-      // 1. Install at installDir with --install-scope local.
-      const installRes = runCli(
-        ["mcp-install", "--install-scope", "local", "--token", "doomed-bearer"],
-        tmp,
-        {},
-        installDir,
-      );
-      expect(installRes.exitCode).toBe(0);
-      const installKey = fs.realpathSync(installDir);
-      let config = readJson(path.join(tmp, ".claude.json"));
-      expect(config.projects[installKey].mcpServers["parachute-vault"]).toBeDefined();
-
-      // 2. Pre-create some unrelated state at the same projects[installDir]
-      //    slot to make sure uninstall's cleanup is surgical — it should
-      //    strip the vault keys but leave siblings + non-mcpServers fields.
-      config.projects[installKey].allowedTools = ["Bash(ls:*)"];
-      config.projects[installKey].mcpServers["some-other-server"] = {
-        type: "http",
-        url: "https://other.example/mcp",
-      };
-      fs.writeFileSync(path.join(tmp, ".claude.json"), JSON.stringify(config, null, 2) + "\n");
-
-      // 3. Run uninstall from a DIFFERENT cwd (uninstallDir). The current
-      //    cwd's projects[*] slot doesn't exist; the install's does.
-      //    `--yes` skips both interactive confirms; we don't pass `--wipe`
-      //    so user data is left alone — only the MCP-entry walk runs.
-      const uninstallRes = runCli(["uninstall", "--yes"], tmp, {}, uninstallDir);
-      expect(uninstallRes.exitCode).toBe(0);
-
-      // 4. The vault entry at installDir should be gone — even though
-      //    that's not where we ran uninstall from.
-      config = readJson(path.join(tmp, ".claude.json"));
-      const installServers = config.projects?.[installKey]?.mcpServers ?? {};
-      expect(installServers["parachute-vault"]).toBeUndefined();
-      // 5. Sibling MCP server preserved.
-      expect(installServers["some-other-server"]).toBeDefined();
-      // 6. Non-mcpServers field at the same slot preserved.
-      expect(config.projects[installKey].allowedTools).toEqual(["Bash(ls:*)"]);
+      process.env.HOME = fakeHome;
+      process.chdir(elsewhere);
+      removeMcpConfig();
     } finally {
-      fs.rmSync(installDir, { recursive: true, force: true });
-      fs.rmSync(uninstallDir, { recursive: true, force: true });
+      process.chdir(origCwd);
+      if (origHome !== undefined) process.env.HOME = origHome;
+      else delete process.env.HOME;
+      fs.rmSync(elsewhere, { recursive: true, force: true });
     }
+
+    const after = JSON.parse(fs.readFileSync(claudePath, "utf-8"));
+
+    // User-scope: stripped.
+    expect(after.mcpServers["parachute-vault"]).toBeUndefined();
+
+    // projectA: vault entry gone, sibling MCP + allowedTools preserved.
+    expect(after.projects[cwdA].mcpServers["parachute-vault"]).toBeUndefined();
+    expect(after.projects[cwdA].mcpServers["some-other-server"]).toBeDefined();
+    expect(after.projects[cwdA].allowedTools).toEqual(["Bash(ls:*)"]);
+
+    // projectB: per-vault `parachute-vault-*` + legacy slash-form gone,
+    // unrelated sibling preserved.
+    expect(after.projects[cwdB].mcpServers["parachute-vault-extra"]).toBeUndefined();
+    expect(after.projects[cwdB].mcpServers["parachute-vault/legacy"]).toBeUndefined();
+    expect(after.projects[cwdB].mcpServers["kept-server"]).toBeDefined();
+
+    fs.rmSync(fakeHome, { recursive: true, force: true });
   });
 });
 

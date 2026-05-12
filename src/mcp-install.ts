@@ -24,9 +24,61 @@
  *      `--install-scope` flag.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+
+/**
+ * Strip every vault MCP entry from ~/.claude.json (user-scope + every
+ * local-scope `projects[*].mcpServers`) and ./.mcp.json (project-scope at
+ * cwd). Cleanup walks every `projects[*]` slot so an operator who installed
+ * locally in one directory can uninstall from anywhere without remembering
+ * where. Silent no-op on missing files / malformed JSON.
+ *
+ * Lives in mcp-install.ts (not cli.ts) so tests can call it directly
+ * without triggering cli.ts's top-level dispatch on import.
+ */
+export function removeMcpConfig(): void {
+  // Prefer `process.env.HOME` over cached `homedir()` — Bun caches the OS
+  // userinfo at process start so in-process HOME overrides (tests, exotic
+  // chrooting) don't apply via homedir(). Matches resolveInstallTarget's
+  // home-resolution pattern.
+  const home = process.env.HOME ?? homedir();
+  const claudeJsonPath = resolve(home, ".claude.json");
+  const projectMcpJsonPath = resolve(process.cwd(), ".mcp.json");
+  for (const path of [claudeJsonPath, projectMcpJsonPath]) {
+    if (!existsSync(path)) continue;
+    try {
+      const config = JSON.parse(readFileSync(path, "utf-8"));
+      // Drop the singular key and every per-vault `parachute-vault-<name>`
+      // entry. Legacy `parachute-vault/<name>` (slash-form) sub-keys from a
+      // pre-multi-vault pattern still get cleaned up here.
+      const stripVaultKeys = (servers: Record<string, unknown> | undefined) => {
+        if (!servers) return;
+        for (const key of Object.keys(servers)) {
+          if (
+            key === "parachute-vault" ||
+            key.startsWith("parachute-vault-") ||
+            key.startsWith("parachute-vault/")
+          ) {
+            delete servers[key];
+          }
+        }
+      };
+      stripVaultKeys(config.mcpServers);
+      // Local-scope cleanup: walk every project entry and strip vault keys.
+      if (config.projects && typeof config.projects === "object") {
+        for (const projectKey of Object.keys(config.projects)) {
+          const projectEntry = config.projects[projectKey];
+          if (projectEntry && typeof projectEntry === "object") {
+            stripVaultKeys(projectEntry.mcpServers);
+          }
+        }
+      }
+      writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+    } catch {}
+  }
+}
 
 // ---------------------------------------------------------------------------
 // URL picking
