@@ -6,6 +6,44 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.5] — 2026-05-12
+
+`parachute-vault uninstall --skip-daemon` test-isolation flag (vault#296).
+
+The CLI's `uninstall` command calls `uninstallAgent()`, which targets the
+hardcoded launchd label `computer.parachute.vault`. That label ignores
+`PARACHUTE_HOME`, so a naive subprocess test of `uninstall --yes` on a
+developer's machine would `launchctl bootout` the real registered
+daemon. We previously dodged this by avoiding subprocess tests entirely
+for the uninstall flow — but that left the full path (wrapper removal,
+MCP cleanup, ordering, exit codes) untested.
+
+### Added
+
+- Undocumented `--skip-daemon` flag on `parachute-vault uninstall`.
+  Bypasses the launchd / systemd / backup-agent uninstall calls;
+  everything else (wrapper removal, MCP cleanup, optional wipe) runs
+  as normal. Tests use this to exercise the full flow against a
+  sandbox `PARACHUTE_HOME` without touching real operator state.
+  Intentionally absent from `usage()` — humans should never need it,
+  and surfacing it would invite "I'll just skip the daemon step"
+  misuse that leaves an orphaned daemon firing on a missing wrapper.
+
+### Tests
+
+- End-to-end uninstall coverage in `src/mcp-install.test.ts`:
+  - wrapper + server-path pointer + MCP entry removed; daemon skip
+    surfaces in stdout for CI log audit.
+  - `--skip-daemon` alone leaves user data alone (no accidental wipe).
+  - `--skip-daemon --wipe --yes` composes correctly — destructive
+    path still removes vault data + .env.
+
+### Docs
+
+- Convention documented in `CLAUDE.md` under "Running".
+
+No operator-visible behavior change in the default uninstall path.
+
 ## [0.4.4-rc.4] — 2026-05-12
 
 `mcp-install` preview-accuracy regression pin (vault#293 follow-up to vault#292).
