@@ -6,6 +6,63 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.13] — 2026-05-13
+
+`if_missing` tighten-up — vault#321 follow-ups from the vault#320 review.
+Three commits, all under the "if_missing tighten-up" theme. Closes
+vault#321 (F2 + F3 + F4 sub-issues).
+
+### fix(api): REST PATCH if_missing=create applies links.add (vault#321 F2)
+
+Cross-surface inconsistency: MCP's create-on-missing branch processed
+`links.add` (let drift sync declare typed links at upsert time); REST
+PATCH `/notes/:id`'s create-on-missing branch didn't process `links`
+at all. Gitcoin would have tripped on this migrating MCP → REST.
+
+REST now mirrors MCP exactly:
+- `links.add` applied — drift sync materializes typed links alongside
+  the create.
+- `links.remove` ignored (nothing to remove on a fresh note).
+- Missing target notes skip silently.
+- Resolves target via `resolveNote(store, link.target)` — same
+  id-or-path lookup as the update path.
+
+Two new REST integration tests (vault.test.ts):
+- `links.add` creates typed-link rows (id-target + path-target both
+  resolve; metadata round-trips).
+- Missing target → silent skip.
+
+### test(api): schema-conflict warning surfaces on if_missing=create branch (vault#321 F3)
+
+The `attachValidationStatus` path handles schema conflicts (two tags
+declaring the same field with conflicting types) but the create branch
+of `if_missing="create"` reused that path without exercising the case
+in a test. Now pinned on BOTH surfaces for symmetry:
+
+- MCP test in core.test.ts.
+- REST test in vault.test.ts.
+
+Both confirm a `schema_conflict` warning surfaces in
+`validation_status.warnings` when two directly-applied tags declare
+the same field with conflicting specs. First-tag-wins precedence
+(`schema` = winner, `loser_schema` = the dropped declaration).
+
+### test(mcp): links.add applied on if_missing=create branch (vault#321 F4)
+
+`core/src/mcp.ts:644-650` applies `links.add` on the create branch.
+Code was there pre-fold but untested — a future regression breaking
+Gitcoin's upsert-with-typed-links workflow would have slipped through.
+Now pinned: MCP `update-note` + `if_missing: "create"` + `links.add`
+payload → assert link rows materialize with the right targets +
+relationships + metadata.
+
+### Gates
+
+- `bun test` (root) → 1416 pass / 3 skip / 0 fail (was 1411; +5 tests)
+- `bun test ./src/` → 926 pass / 0 fail (was 923; +3 REST tests: 2 F2 + 1 F3)
+- `bun test ./core/src/` → 490 pass / 0 fail (was 488; +2 MCP tests: 1 F3 + 1 F4)
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.12] — 2026-05-13
 
 Gitcoin sync ergonomics — bundled two-commit PR. Both close real
