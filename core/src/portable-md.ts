@@ -73,7 +73,7 @@
  */
 
 import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync } from "fs";
-import { join, relative, extname, dirname } from "path";
+import { join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 
@@ -163,8 +163,17 @@ export interface ExportStats {
  * Quote a string when it contains YAML-meaningful characters. Mirrors the
  * subset of YAML 1.2 plain-scalar rules that matter for our payloads:
  * leading whitespace / `-` / `?` / `:` / `#` / `&` / `*` / `!` / `|` / `>`,
- * leading/trailing whitespace, embedded `:` followed by whitespace, or
- * values that would parse as boolean/null/numeric.
+ * leading/trailing whitespace, embedded `:` followed by whitespace,
+ * embedded newlines / control characters, or values that would parse as
+ * boolean/null/numeric.
+ *
+ * Newline detection is critical (vault#317 F1): vault `metadata` is
+ * `Record<string, unknown>` and notes legitimately carry multi-line
+ * strings (transcripts, descriptions, body-as-metadata). Without a
+ * newline check, single-quoting splits the value across physical lines
+ * and the parser silently truncates or corrupts. Multi-line values fall
+ * through to `quoteString` which switches to the double-quoted form
+ * with `\n` escapes so the whole value stays on one line.
  */
 function needsQuote(s: string): boolean {
   if (s === "") return true;
@@ -177,12 +186,37 @@ function needsQuote(s: string): boolean {
   // Embedded `: ` (key/value separator) or `#` (comment) makes a plain
   // scalar ambiguous.
   if (s.includes(": ") || s.includes(" #")) return true;
+  // Embedded newlines / control characters require the double-quoted
+  // escape form. vault#317 F1.
+  // eslint-disable-next-line no-control-regex
+  if (/[\n\r\t\v\f\x00-\x08\x0e-\x1f]/.test(s)) return true;
   return false;
 }
 
+/**
+ * Quote a string for YAML emission. Strings containing newlines or other
+ * control characters use the **double-quoted** form with escape sequences
+ * (so the value stays on one physical YAML line — single-quoted multi-
+ * line splits the parser, vault#317 F1). All other quoted strings use the
+ * single-quoted form (cleaner output; YAML 1.2 escapes `'` by doubling).
+ */
 function quoteString(s: string): string {
-  // Single-quote — easier than double for embedded backslashes; YAML 1.2
-  // escapes single quotes by doubling them.
+  // eslint-disable-next-line no-control-regex
+  if (/[\n\r\t\v\f\x00-\x08\x0e-\x1f]/.test(s)) {
+    // Double-quoted with escape sequences. Escape backslash first so we
+    // don't double-escape the escapes themselves.
+    const escaped = s
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, "\\\"")
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")
+      .replace(/\t/g, "\\t")
+      .replace(/\v/g, "\\v")
+      .replace(/\f/g, "\\f")
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\x00-\x08\x0e-\x1f]/g, (ch) => `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`);
+    return `"${escaped}"`;
+  }
   return `'${s.replace(/'/g, "''")}'`;
 }
 
@@ -358,7 +392,7 @@ export function portableExportFilePath(note: PortableNote): string {
  * tags alpha-sorted; links sorted by `(relationship, target)`; attachments
  * sorted by `id`.
  */
-export async function notetoPortable(
+export async function noteToPortable(
   note: Note,
   store: Store,
 ): Promise<PortableNote> {
@@ -469,17 +503,47 @@ export async function exportVaultToDir(
 
   // 3. Per-note files. Iterate the full vault; if `since` is set, filter
   // by updated_at >= since (incremental export).
+  //
+  // Note: in-memory bulk load. The 1M cap is a defensive ceiling — for
+  // very large vaults (>>100k notes) we should swap to a cursor /
+  // streaming query so the whole result set doesn't have to materialize
+  // at once. PR 2 follow-up if a real workload surfaces (vault#317 F5).
   const allNotes = await store.queryNotes({ limit: 1_000_000, sort: "asc" });
   const since = opts.since;
+  const outDirResolved = resolvePath(outDir);
   let notesWritten = 0;
+  const skipped: { path: string | undefined; reason: string }[] = [];
   for (const note of allNotes) {
     if (since && !shouldIncludeForSince(note, since)) continue;
-    const portable = await notetoPortable(note, store);
+    const portable = await noteToPortable(note, store);
     const relPath = portableExportFilePath(portable);
     const fullPath = join(outDir, relPath);
+    // vault#317 F3 — path-traversal guard. A note with
+    // `path: "../../.ssh/authorized_keys"` would otherwise write outside
+    // outDir. Refuse the write and surface the offending note's path so
+    // the operator can fix the note (self-inflicted at vault level —
+    // user owns the data — but programmatic callers might not control
+    // the note path source, e.g. ingest from external systems).
+    const fullPathResolved = resolvePath(fullPath);
+    if (!isWithinDir(fullPathResolved, outDirResolved)) {
+      skipped.push({
+        path: portable.path,
+        reason: `path-traversal: resolved write target "${fullPathResolved}" escapes export root "${outDirResolved}"`,
+      });
+      continue;
+    }
     mkdirSync(dirname(fullPath), { recursive: true });
     writeFileSync(fullPath, toPortableMarkdown(portable));
     notesWritten++;
+  }
+  if (skipped.length > 0) {
+    // Surface to the caller without aborting — partial export is more
+    // useful than no export. CLI prints the list; programmatic callers
+    // can inspect via the return value.
+    for (const s of skipped) {
+      // eslint-disable-next-line no-console
+      console.warn(`[export] skipped note (path="${s.path ?? "<unpathed>"}"): ${s.reason}`);
+    }
   }
 
   return {
@@ -505,6 +569,18 @@ function hasSchemaContent(tag: TagRecord): boolean {
  */
 function sanitizeTagFilename(tag: string): string {
   return tag.replace(/[/\\]/g, "__");
+}
+
+/**
+ * Path-traversal guard (vault#317 F3). Returns true iff `candidate` is
+ * exactly `root` or sits beneath it. Both inputs must be **already
+ * resolved** (no `..` segments). Uses a trailing-separator check rather
+ * than a bare `startsWith` so `outDir/foo` doesn't satisfy a containment
+ * check for outDir `outDi` (substring-match false-positive).
+ */
+function isWithinDir(candidate: string, root: string): boolean {
+  if (candidate === root) return true;
+  return candidate.startsWith(root + pathSep);
 }
 
 function shouldIncludeForSince(note: Note, since: string): boolean {
@@ -759,7 +835,52 @@ function unquote(s: string): unknown {
     return s.slice(1, -1).replace(/''/g, "'");
   }
   if (s.startsWith('"') && s.endsWith('"')) {
-    return s.slice(1, -1);
+    // Double-quoted form with escape sequences — the shape the emitter
+    // produces for strings containing newlines / control characters
+    // (vault#317 F1). Decode the escapes the emitter emits:
+    // `\\` `\"` `\n` `\r` `\t` `\v` `\f` `\xNN`. TODO: YAML 1.2 defines
+    // additional escapes (`\0` `\a` `\e` `\N` `\_` `\L` `\P` `\u<4hex>`
+    // `\U<8hex>`) — the emitter never produces them, but legacy
+    // vault.yaml / schema files might. Add when a real case lands.
+    const body = s.slice(1, -1);
+    let out = "";
+    let i = 0;
+    while (i < body.length) {
+      const ch = body[i]!;
+      if (ch === "\\" && i + 1 < body.length) {
+        const next = body[i + 1]!;
+        switch (next) {
+          case "\\": out += "\\"; i += 2; continue;
+          case "\"": out += "\""; i += 2; continue;
+          case "n":  out += "\n"; i += 2; continue;
+          case "r":  out += "\r"; i += 2; continue;
+          case "t":  out += "\t"; i += 2; continue;
+          case "v":  out += "\v"; i += 2; continue;
+          case "f":  out += "\f"; i += 2; continue;
+          case "x": {
+            const hex = body.slice(i + 2, i + 4);
+            if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+              out += String.fromCharCode(parseInt(hex, 16));
+              i += 4;
+              continue;
+            }
+            // Malformed escape — fall through, treat as literal.
+            out += ch;
+            i += 1;
+            continue;
+          }
+          default:
+            // Unknown escape — preserve literally; future-proof against
+            // additional YAML escapes we don't yet decode.
+            out += ch + next;
+            i += 2;
+            continue;
+        }
+      }
+      out += ch;
+      i += 1;
+    }
+    return out;
   }
   if (s === "true") return true;
   if (s === "false") return false;

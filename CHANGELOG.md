@@ -6,6 +6,65 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.10] — 2026-05-13
+
+vault#317 reviewer fold — three critical bugs in the rc.9 portable-md
+export. All caught before merge.
+
+### Fixed
+
+- **F1 (silent corruption)** — Multi-line strings in `metadata`
+  silently truncated. The pre-fold `needsQuote` didn't detect embedded
+  newlines, so a `metadata` value like `"line1\nline2"` got
+  single-quoted and emitted across two physical YAML lines; the
+  line-oriented parser then read line 0 as `'line1` (unclosed quote)
+  and the second line as garbage. Vault metadata legitimately carries
+  multi-line strings (transcripts, descriptions, body-as-metadata).
+  Fix: `needsQuote` now detects `\n\r\t\v\f` and `\x00-\x08\x0e-\x1f`;
+  `quoteString` switches to the **double-quoted** form with escape
+  sequences (`\\n`, `\\xNN`) so the whole value stays on one physical
+  line. `unquote` decodes the same escapes on parse. Pinned by two
+  round-trip tests in `portable-md.test.ts`.
+- **F2 (tautology test)** — The rc.9 "byte-identical re-emit"
+  idempotency test called `toPortableMarkdown` twice on the same
+  in-memory object and compared. That proves nothing about
+  round-tripping through the on-disk bytes. The CHANGELOG claim was
+  load-bearing for the format's whole pitch ("clean git diffs") and
+  the test didn't prove it. Fix: parse the emitted markdown back
+  through `parseFrontmatter`, reconstruct a `PortableNote`, re-emit,
+  compare bytes. That's the real invariant.
+- **F3 (path traversal)** — `exportVaultToDir` did
+  `join(outDir, relPath)` without verifying the resolved path stayed
+  under `outDir`. A note with `path: "../../escape"` would write
+  outside the export directory. Self-inflicted at the vault level
+  (operator owns the data) but a real surprise for programmatic
+  callers (e.g. ingest from external systems). Fix: resolve both
+  paths absolute, assert `candidate === root || candidate.startsWith(root + sep)`.
+  Refuses the write with a `console.warn` rather than aborting the
+  whole export — partial export is more useful than no export.
+  Pinned by two tests (escape attempt skipped; nested path inside
+  outDir permitted).
+
+### Polished
+
+- **F4** — `notetoPortable` renamed to `noteToPortable` (camelCase
+  typo).
+- **F5** — Added a code comment on the 1M-note bulk-load ceiling in
+  `exportVaultToDir`. Cursor / streaming for very-large vaults is a
+  PR 2 follow-up.
+- **F6** — `unquote` now decodes the double-quoted YAML escapes the
+  emitter produces (`\\\\`, `\\"`, `\\n`, `\\r`, `\\t`, `\\v`, `\\f`,
+  `\\xNN`). TODO comment notes that YAML 1.2 defines additional
+  escapes (`\\0`, `\\u<4hex>`, etc.) that the emitter never produces
+  but legacy `.yaml` files might — to add when a real case lands.
+
+### Gates
+
+- `bun test` (root) → 1384 pass / 3 skip / 0 fail (was 1380; +4 fold tests)
+- `bun test ./src/` → 919 pass / 0 fail (unchanged)
+- `bun test ./core/src/` → 465 pass / 0 fail (was 461; +4 fold tests)
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.9] — 2026-05-13
 
 Portable markdown knowledge-base export — PR 1 of 2 (closes part of

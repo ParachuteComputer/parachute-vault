@@ -27,7 +27,7 @@ import { SqliteStore } from "./store.js";
 import {
   emitYamlDoc,
   exportVaultToDir,
-  notetoPortable,
+  noteToPortable,
   parseFrontmatter,
   portableExportFilePath,
   SIDECAR_DIR,
@@ -187,12 +187,17 @@ describe("toPortableMarkdown — note frontmatter shape", () => {
     expect(md).toContain("See [[OtherNote]] for context.");
   });
 
-  it("re-emit is byte-identical (idempotency pin)", () => {
+  it("re-emit is byte-identical: emit → parseFrontmatter → reconstruct → re-emit (idempotency pin, vault#317 F2)", () => {
+    // The pre-fold version of this test called `toPortableMarkdown` twice
+    // on the same in-memory object — that proves nothing about
+    // round-tripping through the bytes. Real invariant: emit, parse the
+    // bytes back, reconstruct a PortableNote, re-emit. Output must be
+    // byte-identical.
     const note: PortableNote = {
       id: "abc",
       path: "Inbox/x",
       content: "body\n",
-      tags: ["meeting", "donor"],
+      tags: ["donor", "meeting"], // pre-sorted (emitter sorts; reconstruct must match)
       metadata: { priority: "high", status: "active" },
       links: [
         { target: "def", relationship: "derived-from", metadata: { source: "git://x" } },
@@ -201,13 +206,76 @@ describe("toPortableMarkdown — note frontmatter shape", () => {
       updated_at: "2026-05-12T11:00:00.000Z",
     };
     const first = toPortableMarkdown(note);
-    // Parse + reconstruct + re-emit. Since the parser strips frontmatter
-    // and we have a PortableNote shape we control, just re-emit the same
-    // shape.
-    const second = toPortableMarkdown(note);
+    const reconstructed = reconstructFromMarkdown(first);
+    const second = toPortableMarkdown(reconstructed);
     expect(second).toBe(first);
   });
+
+  // vault#317 F1 — pre-fold, multi-line strings in metadata silently
+  // corrupted: the single-quoted emit split across physical YAML lines
+  // and the line-oriented parser truncated at the first newline. Now the
+  // emitter detects newlines + control characters and switches to
+  // double-quoted with escape sequences, keeping the value on one line.
+  it("multi-line string in metadata round-trips byte-equivalent (vault#317 F1)", () => {
+    const note: PortableNote = {
+      id: "abc",
+      content: "body\n",
+      metadata: { transcript: "line1\nline2\nline3" },
+      created_at: "2026-05-12T10:00:00.000Z",
+    };
+    const first = toPortableMarkdown(note);
+
+    // The emit must keep the value on a single physical YAML line —
+    // critical for the parser's line-oriented scan.
+    const fmEnd = first.indexOf("\n---\n", 4);
+    const fm = first.slice(4, fmEnd);
+    const transcriptLines = fm.split("\n").filter((l) => l.includes("transcript"));
+    expect(transcriptLines).toHaveLength(1);
+    expect(transcriptLines[0]).toContain("\\n"); // escape sequence, not raw newline
+
+    // And round-trip preserves the value exactly.
+    const reconstructed = reconstructFromMarkdown(first);
+    expect(reconstructed.metadata!.transcript).toBe("line1\nline2\nline3");
+
+    // And re-emit is byte-identical.
+    const second = toPortableMarkdown(reconstructed);
+    expect(second).toBe(first);
+  });
+
+  it("control characters in metadata round-trip via \\xNN escapes (vault#317 F1)", () => {
+    const note: PortableNote = {
+      id: "abc",
+      content: "",
+      metadata: { control: "before\tafterend" },
+      created_at: "2026-05-12T10:00:00.000Z",
+    };
+    const first = toPortableMarkdown(note);
+    const reconstructed = reconstructFromMarkdown(first);
+    expect(reconstructed.metadata!.control).toBe("before\tafterend");
+  });
 });
+
+/**
+ * Helper for idempotency tests — round-trip a portable-md document
+ * through `parseFrontmatter` and reconstruct a `PortableNote`. Mirrors
+ * the shape the importer will use in PR 2; keeping it test-local here so
+ * the production import path can land cleanly later without churning
+ * this test's assertions.
+ */
+function reconstructFromMarkdown(md: string): PortableNote {
+  const { frontmatter, content } = parseFrontmatter(md);
+  return {
+    id: frontmatter.id as string,
+    ...(frontmatter.path ? { path: frontmatter.path as string } : {}),
+    content,
+    ...(frontmatter.tags ? { tags: frontmatter.tags as string[] } : {}),
+    ...(frontmatter.metadata ? { metadata: frontmatter.metadata as Record<string, unknown> } : {}),
+    ...(frontmatter.links ? { links: frontmatter.links as PortableNote["links"] } : {}),
+    ...(frontmatter.attachments ? { attachments: frontmatter.attachments as PortableNote["attachments"] } : {}),
+    created_at: frontmatter.created_at as string,
+    ...(frontmatter.updated_at ? { updated_at: frontmatter.updated_at as string } : {}),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // portableExportFilePath
@@ -461,13 +529,49 @@ describe("exportVaultToDir", async () => {
     // recoverable from the content's [[brackets]]).
     expect(md).not.toContain("relationship: wikilink");
   });
+
+  // vault#317 F3 — path-traversal guard. A note with `path:
+  // "../../escape"` (legitimate at vault level — user owns the data)
+  // must NOT be allowed to write outside the export root. Refuses with
+  // a console warning rather than aborting the export, so a partial
+  // export is still useful.
+  it("refuses to write a note whose path escapes the export root (vault#317 F3)", async () => {
+    await store.createNote("safe", { id: "ok", path: "ok" });
+    await store.createNote("escape", { id: "bad", path: "../../escape-attempt" });
+
+    const outDir = join(tmpBase, "out");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      exportedAt: "2026-05-12T00:00:00.000Z",
+    });
+
+    // Safe note written; escape-attempt skipped.
+    expect(stats.notes).toBe(1);
+    expect(existsSync(join(outDir, "ok.md"))).toBe(true);
+    // The escape target — under tmpBase but above outDir — must NOT exist.
+    expect(existsSync(join(tmpBase, "escape-attempt.md"))).toBe(false);
+  });
+
+  // Also pin the boundary case where the resolved write target is
+  // exactly the outDir (path is a single segment, no traversal). This
+  // should NOT trigger the guard.
+  it("permits notes whose resolved path stays inside the export root", async () => {
+    await store.createNote("nested-ok", { id: "n", path: "sub/dir/note" });
+    const outDir = join(tmpBase, "out");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      exportedAt: "2026-05-12T00:00:00.000Z",
+    });
+    expect(stats.notes).toBe(1);
+    expect(existsSync(join(outDir, "sub/dir/note.md"))).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
-// notetoPortable — shape conversion
+// noteToPortable — shape conversion
 // ---------------------------------------------------------------------------
 
-describe("notetoPortable", async () => {
+describe("noteToPortable", async () => {
   let store: SqliteStore;
   beforeEach(() => {
     store = new SqliteStore(new Database(":memory:"));
@@ -480,7 +584,7 @@ describe("notetoPortable", async () => {
     await store.createNote("t", { id: "t", path: "t" });
     await store.createLink("n1", "t", "derived-from");
 
-    const portable = await notetoPortable(note, store);
+    const portable = await noteToPortable(note, store);
     expect(portable.id).toBe("n1");
     expect(portable.path).toBe("x");
     expect(portable.tags).toEqual(["a", "z"]); // sorted
@@ -491,7 +595,7 @@ describe("notetoPortable", async () => {
 
   it("omits empty collections from the result", async () => {
     const note = await store.createNote("body", { id: "n1", path: "x" });
-    const portable = await notetoPortable(note, store);
+    const portable = await noteToPortable(note, store);
     expect(portable.tags).toBeUndefined();
     expect(portable.metadata).toBeUndefined();
     expect(portable.links).toBeUndefined();
