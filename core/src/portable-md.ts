@@ -892,8 +892,31 @@ export async function importPortableVault(
     // Upsert by id. createNote will throw on duplicate id; check first.
     const existing = await store.getNote(id);
     if (existing) {
-      // Update content + path + metadata + tags. Replace tags wholesale
-      // (the export is the source of truth for current state).
+      // **Upsert merge policy** (vault#319 F2 — pinned here so future
+      // edits don't drift):
+      //
+      //   - `content`:   ALWAYS replaced from the import. (Required —
+      //                  the import always has content, even if empty
+      //                  string, and that's the unambiguous source of
+      //                  truth on a non-blow-away upsert.)
+      //   - `tags`:      REPLACED WHOLESALE — existing tags removed,
+      //                  imported set applied. The export is the source
+      //                  of truth for the current tag set.
+      //   - `path`:      REPLACED if the frontmatter declares one;
+      //                  otherwise the existing vault path is preserved.
+      //                  This is upsert-by-field, NOT replace-by-id: a
+      //                  note that lost its path before export keeps the
+      //                  vault's existing path on a non-blow-away
+      //                  import.
+      //   - `metadata`:  REPLACED if the frontmatter declares one;
+      //                  otherwise existing metadata is preserved. Same
+      //                  upsert-by-field asymmetry as `path`.
+      //
+      // For a strict replace-by-id ("the vault should look exactly like
+      // the export, no surviving fields"), use `--blow-away`. The
+      // wipe-first-replay-from-export path drops every row and rebuilds,
+      // so absent fields can't survive.
+      //
       // Store-level updateNote has no `if_updated_at` set → always
       // succeeds (precondition gate lives at the HTTP/MCP layer; the
       // Store accepts unconditional writes from importer/internal

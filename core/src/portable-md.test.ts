@@ -856,3 +856,146 @@ describe("portable-md round-trip — byte-equivalent re-export after blow-away i
     compareTree(outA, outB);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Attachment round-trip — bytes survive export → import (vault#319 F3)
+// ---------------------------------------------------------------------------
+//
+// PR 2 added attachment binary copy on both export and import sides but
+// shipped without an integration test for the byte-level round-trip.
+// Folding here per reviewer F3. Two tests:
+//   1. Happy path — source vault with a real binary file → export →
+//      fresh-vault import → assert bytes match at the new assetsDir.
+//   2. Adversarial path — attachment whose `path` escapes assetsDir on
+//      import side. (Export-side guard is already covered; this is the
+//      *import*-side guard we want pinned.)
+
+describe("portable-md attachments round-trip (vault#319 F3)", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-att");
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(tmpBase, { recursive: true });
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("attachment bytes survive vault → export → fresh-vault import", async () => {
+    // Source vault: write a binary file at <srcAssets>/<rel>, then
+    // register it via addAttachment (DB row only — the bytes already
+    // exist on disk).
+    const srcAssets = join(tmpBase, "src-assets");
+    mkdirSync(srcAssets, { recursive: true });
+    const relPath = "2026-05-13/sample.bin";
+    mkdirSync(join(srcAssets, "2026-05-13"), { recursive: true });
+    // Distinctive bytes — non-utf8 so we know the buffer round-tripped.
+    const originalBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+    writeFileSync(join(srcAssets, relPath), originalBytes);
+
+    const note = await store.createNote("note with attachment", { id: "n-att", path: "n" });
+    await store.addAttachment(note.id, relPath, "image/png");
+
+    // Export with assetsDir wired so the binary lands in the sidecar.
+    const outDir = join(tmpBase, "out");
+    const exportStats = await exportVaultToDir(store, {
+      outDir,
+      assetsDir: srcAssets,
+      exportedAt: "2026-05-13T00:00:00.000Z",
+    });
+    expect(exportStats.attachments).toBe(1);
+    expect(exportStats.skipped_attachments).toEqual([]);
+
+    // The binary lives at .parachute/attachments/<att-id>/sample.bin.
+    const attachments = await store.getAttachments(note.id);
+    expect(attachments).toHaveLength(1);
+    const exportedAttId = attachments[0]!.id;
+    const sidecarFile = join(outDir, SIDECAR_DIR, "attachments", exportedAttId, "sample.bin");
+    expect(existsSync(sidecarFile)).toBe(true);
+    expect(readFileSync(sidecarFile)).toEqual(originalBytes);
+
+    // Import into a fresh vault + different assetsDir. Binary must
+    // land at <destAssets>/<original relPath> (the frontmatter
+    // preserves the original vault-internal path).
+    const destAssets = join(tmpBase, "dest-assets");
+    mkdirSync(destAssets, { recursive: true });
+    const target = new SqliteStore(new Database(":memory:"));
+    const importStats = await importPortableVault(target, {
+      inDir: outDir,
+      assetsDir: destAssets,
+    });
+    expect(importStats.attachments_restored).toBe(1);
+    expect(importStats.skipped_attachments).toEqual([]);
+
+    // Bytes match — the load-bearing assertion. Read through the
+    // serialized form (filesystem), not the original buffer, to round-trip
+    // honestly per the F2 memory.
+    const restoredBytes = readFileSync(join(destAssets, relPath));
+    expect(restoredBytes).toEqual(originalBytes);
+
+    // DB row restored too — note has an attachment with the right path
+    // + mime_type (id re-mints per the known limitation in CHANGELOG).
+    const restoredAtts = await target.getAttachments("n-att");
+    expect(restoredAtts).toHaveLength(1);
+    expect(restoredAtts[0]!.path).toBe(relPath);
+    expect(restoredAtts[0]!.mimeType).toBe("image/png");
+  });
+
+  it("import skips attachments whose frontmatter path escapes destination assetsDir", async () => {
+    // Hand-craft an adversarial export: a .md file with an
+    // `attachments[].path` that resolves outside the dest assetsDir.
+    // Plus a dummy binary in the sidecar so the file-existence check
+    // doesn't trip first (we want to exercise the path-traversal guard
+    // specifically).
+    const outDir = join(tmpBase, "adversarial");
+    const sidecar = join(outDir, SIDECAR_DIR);
+    mkdirSync(sidecar, { recursive: true });
+    writeFileSync(
+      join(sidecar, "vault.yaml"),
+      "export_format_version: 1\nexported_at: 2026-05-13T00:00:00.000Z\n",
+    );
+
+    // Sidecar binary at attachments/<id>/escape.bin so the
+    // file-existence check passes; the traversal guard fires on the
+    // *dest* path resolve.
+    const advAttId = "att_adversarial";
+    mkdirSync(join(sidecar, "attachments", advAttId), { recursive: true });
+    writeFileSync(join(sidecar, "attachments", advAttId, "escape.bin"), "harmless\n");
+
+    // Note frontmatter with an escape path.
+    writeFileSync(
+      join(outDir, "n.md"),
+      `---
+id: n
+attachments:
+  - id: ${advAttId}
+    path: ../../../escape.bin
+    mime_type: application/octet-stream
+created_at: 2026-05-13T00:00:00.000Z
+---
+note body
+`,
+    );
+
+    // Import. assetsDir is destAssets; the adversarial path resolves
+    // outside it, so the guard fires.
+    const destAssets = join(tmpBase, "dest-assets");
+    mkdirSync(destAssets, { recursive: true });
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, {
+      inDir: outDir,
+      assetsDir: destAssets,
+    });
+
+    // The DB row still creates (path-traversal only blocks the file
+    // copy — the DB row stores whatever path the frontmatter declared;
+    // the guard's job is preventing arbitrary-file-write, not
+    // poisoning the DB which is operator-owned). What we pin: the
+    // adversarial file did NOT land in destAssets parent.
+    expect(stats.skipped_attachments).toHaveLength(1);
+    expect(stats.skipped_attachments[0]!.reason).toMatch(/path-traversal/);
+    // The escape target — under tmpBase/<parent-of-destAssets>/escape.bin
+    // — must NOT exist. Most importantly NOT at a path higher than destAssets.
+    const wouldBeEscape = join(tmpBase, "escape.bin");
+    expect(existsSync(wouldBeEscape)).toBe(false);
+  });
+});

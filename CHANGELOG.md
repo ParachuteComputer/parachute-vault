@@ -94,12 +94,30 @@ round-trip invariant.
   test exercises this. Filed as a future enhancement; landing it
   requires the parallel surface to `restoreNoteTimestamps`.
 
+### Reviewer fold (vault#319 F1 + F2 + F3)
+
+- **F1 (safety)** — `--blow-away` confirm now defaults NO (was YES).
+  Every other destructive confirm in the CLI defaults NO; a
+  distracted Enter-press no longer wipes a vault. One-char fix.
+- **F2 (doc)** — Pinned upsert merge policy in a comment block at
+  `importPortableVault`'s update branch. Non-blow-away imports
+  **always replace** content + tags, but **upsert-by-field** for
+  metadata + path (absent fields preserve the vault's existing
+  values). To force a clean replace-by-id, use `--blow-away`.
+- **F3 (coverage)** — Folded the missing attachment-import tests:
+  - Bytes survive vault → export → fresh-vault import (different
+    `assetsDir`). Non-utf8 distinctive bytes verify the buffer
+    round-trips honestly through the filesystem.
+  - Adversarial frontmatter `attachments[].path` that resolves
+    outside the destination `assetsDir` is skipped + recorded in
+    `ImportStats.skipped_attachments` with a `path-traversal`
+    reason; the would-be escape file never lands.
+
 ### Gates
 
-- `bun test` (root) → 1392 pass / 3 skip / 0 fail (was 1384)
+- `bun test` (root) → 1394 pass / 3 skip / 0 fail (was 1392; +2 F3 tests)
 - `bun test ./src/` → 919 pass / 0 fail (unchanged)
-- `bun test ./core/src/` → 473 pass / 0 fail (was 465; +8 import tests
-  + 1 integration round-trip)
+- `bun test ./core/src/` → 475 pass / 0 fail (was 473; +2 F3 tests)
 - `bunx tsc --noEmit` clean
 
 ## [0.4.4-rc.10] — 2026-05-13

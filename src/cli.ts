@@ -2568,10 +2568,13 @@ async function cmdImport(args: string[]) {
     const { assetsDir } = await import("./routes.ts");
 
     if (blowAway && !assumeYes && !dryRun) {
-      // Confirm-prompt the destructive action. The reader is the same
-      // utility init/uninstall use.
+      // Confirm-prompt the destructive action. Default NO — every other
+      // destructive confirm in this CLI (uninstall's wipe, 2FA
+      // re-enrollment) defaults NO, so a distracted Enter-press can't
+      // wipe a vault. vault#319 fold F1.
       const proceed = await confirm(
         `\nDESTRUCTIVE: --blow-away will DELETE every note in vault "${vaultName}" before replaying from "${fullPath}". Proceed?`,
+        false,
       );
       if (!proceed) {
         console.log("Cancelled.");
