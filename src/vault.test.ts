@@ -3063,6 +3063,40 @@ describe("HTTP PATCH /notes/:idOrPath if_missing=create (vault#309)", async () =
     const links = await store.getLinks(body.id, { direction: "outbound" });
     expect(links.filter((l) => l.relationship === "derived-from")).toHaveLength(0);
   });
+
+  // vault#321 F3 — schema-conflict warning on REST create branch
+  // (mirror of the MCP test in core.test.ts). Same conflict-detection
+  // path runs on both surfaces via attachValidationStatus, but we pin
+  // both ends explicitly so a regression on either side surfaces
+  // immediately.
+  test("schema-conflict warning surfaces on REST create branch (vault#321 F3)", async () => {
+    await store.upsertTagSchema("kpi-rest-321", {
+      fields: { count: { type: "integer" } },
+    });
+    await store.upsertTagSchema("metric-rest-321", {
+      fields: { count: { type: "string" } }, // conflicting
+    });
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${encodeURIComponent("Inbox/conflict-321")}`, {
+        content: "x",
+        if_missing: "create",
+        tags: ["kpi-rest-321", "metric-rest-321"],
+        metadata: { count: 5 },
+      }),
+      store,
+      `/${encodeURIComponent("Inbox/conflict-321")}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+    const conflict = body.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("count");
+    expect(conflict.schema).toBe("kpi-rest-321");
+    expect(conflict.loser_schema).toBe("metric-rest-321");
+  });
 });
 
 describe("HTTP /tags", async () => {
