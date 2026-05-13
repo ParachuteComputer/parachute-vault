@@ -99,8 +99,9 @@ bun src/cli.ts vault init          # setup everything
 bun src/cli.ts vault status        # check status
 bun src/cli.ts vault config        # view/edit config
 bun src/cli.ts vault stop          # graceful shutdown via filesystem sentinel
-bun src/cli.ts vault import <path> # import Obsidian vault
-bun src/cli.ts vault export <path> # export as Obsidian markdown
+bun src/cli.ts vault import <path> # import Obsidian vault (legacy lossy)
+bun src/cli.ts vault export <dir>  # export as portable markdown (vault#308 — lossless across IDs, typed links, schemas)
+bun src/cli.ts vault export <dir> --since <iso>  # incremental — only notes updated_at >= iso
 bun test ./src/                    # run server tests (anchored — also excluded from bare `bun test`)
 bun test ./core/src/               # run core tests
 bun test                           # run server + core (web/ui excluded via bunfig.toml pathIgnorePatterns)
@@ -116,6 +117,22 @@ The repo holds two test suites with different runners. Server + core run under `
 ### `uninstall --skip-daemon` (test-only)
 
 `parachute-vault uninstall` calls `uninstallAgent()` which targets the hardcoded launchd label `computer.parachute.vault`. That label ignores `PARACHUTE_HOME`, so a naive test that spawns `parachute-vault uninstall --yes` on a developer's machine would `launchctl bootout` the real registered daemon. The undocumented `--skip-daemon` flag bypasses the launchd / systemd / backup-agent uninstall calls — tests use it to exercise the rest of the flow (wrapper removal, MCP cleanup, exit codes, ordering) without touching real operator state. Humans should never need it; it's intentionally absent from `usage()` so it doesn't invite "I'll just skip the daemon step" misuse that orphans a daemon firing on a missing wrapper. See vault#296.
+
+### Portable markdown export
+
+`core/src/portable-md.ts` is the canonical home for the markdown knowledge-base format. Vault's `parachute-vault export <dir>` writes:
+
+```
+<dir>/
+  .parachute/
+    vault.yaml              # vault meta + export_format_version
+    schemas/<tag>.yaml      # per-tag: description, fields, relationships, parent_names
+  <note.path>.md            # one file per note
+```
+
+Per-note frontmatter uses a fixed top-level key order (`id` → `path` → `tags` → `metadata` → `links` → `attachments` → `created_at` → `updated_at`) with alpha-sorted keys in nested objects, so re-exporting an unchanged vault produces byte-identical output (clean git diffs).
+
+`core/src/obsidian.ts` is a deprecated back-compat shim — re-exports the parser helpers and keeps the legacy lossy `toObsidianMarkdown` / `exportFilePath` for callers that intentionally want the flat-frontmatter shape. New code imports from `portable-md.ts` directly. PR 2 of #308 will add attachment file-copy + `--blow-away` import for full round-trip disaster recovery. See vault#308.
 
 ## Deployment
 

@@ -1,15 +1,41 @@
 /**
- * Obsidian vault parser — reads .md files and extracts notes, tags, links.
+ * Obsidian-compatible markdown export/import — back-compat shim.
  *
- * Handles:
- *   - YAML frontmatter → note.metadata
- *   - Inline #tags and frontmatter tags → tags table
- *   - [[wikilinks]] → handled by wikilinks.ts on note creation
- *   - File path → note.path
+ * @deprecated The canonical home for the markdown knowledge-base format
+ * is `portable-md.ts`. The format isn't Obsidian-specific (it's consumed
+ * unchanged by Logseq, Foam, Quartz, Dendron, and most markdown-shaped
+ * static-site generators) — anchoring the function name to the format
+ * keeps the door open as other consumers adopt the same shape. See
+ * vault#308.
+ *
+ * What lives here:
+ *   - `toObsidianMarkdown` — the **legacy** lossy emitter (flat
+ *     frontmatter, no IDs, no typed links, no attachments). Kept for
+ *     existing callers; for round-trippable exports use
+ *     `toPortableMarkdown` in `portable-md.ts`.
+ *   - `parseObsidianVault` / `parseObsidianFile` — directory + file
+ *     parsers. These delegate to `portable-md.ts`'s parser, which
+ *     handles both the new lossless shape and the legacy flat
+ *     frontmatter shape.
+ *   - Re-exports of `parseFrontmatter`, `extractInlineTags`,
+ *     `walkMarkdownFiles` from `portable-md.ts` so existing imports
+ *     keep working without code-level churn.
+ *
+ * New code should import from `portable-md.ts` directly.
  */
 
-import { readdirSync, readFileSync, statSync } from "fs";
-import { join, relative, extname, basename } from "path";
+import { readFileSync } from "fs";
+import { relative } from "path";
+
+// Re-export the canonical parser helpers so existing callers (and tests)
+// keep working against the legacy import path.
+export {
+  parseFrontmatter,
+  extractInlineTags,
+  walkMarkdownFiles,
+} from "./portable-md.js";
+
+import { parseFrontmatter, walkMarkdownFiles, extractInlineTags } from "./portable-md.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,156 +60,13 @@ export interface ImportStats {
   errors: { path: string; error: string }[];
 }
 
-// ---------------------------------------------------------------------------
-// Frontmatter parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Parse YAML frontmatter from markdown content.
- * Returns { frontmatter, content } where content has frontmatter stripped.
- *
- * Uses a simple parser — no dependency on a YAML library.
- * Handles common frontmatter patterns: strings, arrays, numbers, booleans.
- */
-export function parseFrontmatter(raw: string): {
-  frontmatter: Record<string, unknown>;
-  content: string;
-} {
-  if (!raw.startsWith("---")) {
-    return { frontmatter: {}, content: raw };
-  }
-
-  const endIdx = raw.indexOf("\n---", 3);
-  if (endIdx === -1) {
-    return { frontmatter: {}, content: raw };
-  }
-
-  const yamlBlock = raw.slice(4, endIdx); // skip opening "---\n"
-  const content = raw.slice(endIdx + 4).replace(/^\n/, ""); // skip closing "---\n"
-
-  const frontmatter: Record<string, unknown> = {};
-  let currentKey = "";
-  let currentArray: string[] | null = null;
-
-  for (const line of yamlBlock.split("\n")) {
-    // Array item (continuation of previous key)
-    if (currentArray !== null && /^\s+-\s+/.test(line)) {
-      const val = line.replace(/^\s+-\s+/, "").trim();
-      currentArray.push(unquote(val));
-      continue;
-    }
-
-    // If we were building an array, save it (or save empty string if no items found)
-    if (currentArray !== null) {
-      frontmatter[currentKey] = currentArray.length > 0 ? currentArray : "";
-      currentArray = null;
-    }
-
-    // Key: value pair — keys must be YAML-valid (word chars and hyphens, no spaces)
-    const kvMatch = line.match(/^([\w][\w-]*):\s*(.*)/);
-    if (kvMatch) {
-      const key = kvMatch[1]!;
-      const value = kvMatch[2]!.trim();
-
-      if (value === "[]") {
-        frontmatter[key] = [];
-      } else if (value === "") {
-        // Empty value: could be start of array (next lines are "- item")
-        // or genuinely empty string. We start array accumulation and
-        // handle the empty case when a non-array line follows.
-        currentKey = key;
-        currentArray = [];
-      } else if (value.startsWith("[") && value.endsWith("]")) {
-        // Inline array: [item1, item2]
-        const items = value.slice(1, -1).split(",").map((s) => unquote(s.trim())).filter(Boolean);
-        frontmatter[key] = items;
-      } else {
-        frontmatter[key] = parseValue(value);
-      }
-    }
-  }
-
-  // Save any trailing array (or empty string if no items)
-  if (currentArray !== null) {
-    frontmatter[currentKey] = currentArray.length > 0 ? currentArray : "";
-  }
-
-  return { frontmatter, content };
-}
-
-function unquote(s: string): string {
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    return s.slice(1, -1);
-  }
-  return s;
-}
-
-function parseValue(s: string): unknown {
-  s = unquote(s);
-  if (s === "true") return true;
-  if (s === "false") return false;
-  if (s === "null") return null;
-  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
-  if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
-  return s;
-}
-
-// ---------------------------------------------------------------------------
-// Tag extraction
-// ---------------------------------------------------------------------------
-
-/** Extract inline #tags from markdown content. Excludes tags in code blocks. */
-export function extractInlineTags(content: string): string[] {
-  // Strip code blocks and inline code
-  let stripped = content.replace(/```[\s\S]*?```/g, "");
-  stripped = stripped.replace(/`[^`\n]+`/g, "");
-
-  const tags = new Set<string>();
-  // Match #tag and #nested/tag — must be preceded by whitespace or start of line
-  const regex = /(?:^|\s)#([\w][\w/-]*[\w]|[\w])/gm;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(stripped)) !== null) {
-    tags.add(match[1]!.toLowerCase());
-  }
-  return [...tags];
-}
-
-/** Extract tags from frontmatter (handles both array and string formats). */
+/** Tags from frontmatter (handles both array and string formats). */
 function extractFrontmatterTags(frontmatter: Record<string, unknown>): string[] {
   const raw = frontmatter.tags;
   if (!raw) return [];
   if (Array.isArray(raw)) return raw.map((t) => String(t).toLowerCase().trim()).filter(Boolean);
   if (typeof raw === "string") return raw.split(",").map((t) => t.toLowerCase().trim()).filter(Boolean);
   return [];
-}
-
-// ---------------------------------------------------------------------------
-// Directory walking
-// ---------------------------------------------------------------------------
-
-/** Recursively list all .md files in a directory, excluding .obsidian/ and hidden dirs. */
-export function walkMarkdownFiles(dir: string): string[] {
-  const results: string[] = [];
-
-  function walk(current: string) {
-    for (const entry of readdirSync(current)) {
-      // Skip hidden directories and .obsidian config
-      if (entry.startsWith(".")) continue;
-      if (entry === "node_modules") continue;
-
-      const full = join(current, entry);
-      const stat = statSync(full);
-
-      if (stat.isDirectory()) {
-        walk(full);
-      } else if (stat.isFile() && extname(entry).toLowerCase() === ".md") {
-        results.push(full);
-      }
-    }
-  }
-
-  walk(dir);
-  return results.sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -207,12 +90,7 @@ export function parseObsidianFile(filePath: string, vaultRoot: string): Obsidian
   const metadata = { ...frontmatter };
   delete metadata.tags;
 
-  return {
-    path,
-    content,
-    frontmatter: metadata,
-    tags: allTags,
-  };
+  return { path, content, frontmatter: metadata, tags: allTags };
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +132,13 @@ export function parseObsidianVault(vaultPath: string): {
 }
 
 // ---------------------------------------------------------------------------
-// Export to Obsidian format
+// Legacy export — kept for back-compat. New code: use `toPortableMarkdown`.
 // ---------------------------------------------------------------------------
 
+/**
+ * Note shape the legacy export accepts. Distinct from `PortableNote` —
+ * older + lossy by design (no IDs, no typed links, no attachments).
+ */
 export interface ExportableNote {
   path?: string;
   id: string;
@@ -267,34 +149,33 @@ export interface ExportableNote {
 }
 
 /**
- * Convert a vault note to Obsidian-compatible markdown with YAML frontmatter.
+ * Convert a vault note to Obsidian-compatible markdown with YAML
+ * frontmatter — legacy flat-frontmatter shape (metadata keys at the
+ * top level, no IDs, no typed links, no attachments).
+ *
+ * @deprecated Prefer `toPortableMarkdown` in `portable-md.ts` for new
+ * code. This function is preserved for callers that intentionally want
+ * the legacy lossy shape — typically one-shot "give me an Obsidian
+ * copy" exports without round-trip concerns. See vault#308.
  */
 export function toObsidianMarkdown(note: ExportableNote): string {
   const fm: Record<string, unknown> = {};
 
-  // Add tags to frontmatter
-  if (note.tags && note.tags.length > 0) {
-    fm.tags = note.tags;
-  }
-
-  // Add metadata fields (excluding internal ones)
+  if (note.tags && note.tags.length > 0) fm.tags = note.tags;
   if (note.metadata) {
     for (const [key, value] of Object.entries(note.metadata)) {
-      if (key === "tags") continue; // already handled
+      if (key === "tags") continue;
       fm[key] = value;
     }
   }
 
-  // Build frontmatter string
   let result = "";
   if (Object.keys(fm).length > 0) {
     result += "---\n";
     for (const [key, value] of Object.entries(fm)) {
       if (Array.isArray(value)) {
         result += `${key}:\n`;
-        for (const item of value) {
-          result += `  - ${item}\n`;
-        }
+        for (const item of value) result += `  - ${item}\n`;
       } else if (typeof value === "object" && value !== null) {
         result += `${key}: ${JSON.stringify(value)}\n`;
       } else {
@@ -309,14 +190,11 @@ export function toObsidianMarkdown(note: ExportableNote): string {
 }
 
 /**
- * Determine the file path for an exported note.
- * Notes with paths use the path; pathless notes use date/id.
+ * Determine the file path for an exported note (legacy form).
+ * @deprecated Use `portableExportFilePath` from `portable-md.ts`.
  */
 export function exportFilePath(note: ExportableNote): string {
-  if (note.path) {
-    return note.path + ".md";
-  }
-  // Fallback: use date prefix + truncated id
+  if (note.path) return note.path + ".md";
   const date = note.createdAt.split("T")[0];
   return `${date}/${note.id}.md`;
 }

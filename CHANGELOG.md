@@ -6,6 +6,154 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.10] — 2026-05-13
+
+vault#317 reviewer fold — three critical bugs in the rc.9 portable-md
+export. All caught before merge.
+
+### Fixed
+
+- **F1 (silent corruption)** — Multi-line strings in `metadata`
+  silently truncated. The pre-fold `needsQuote` didn't detect embedded
+  newlines, so a `metadata` value like `"line1\nline2"` got
+  single-quoted and emitted across two physical YAML lines; the
+  line-oriented parser then read line 0 as `'line1` (unclosed quote)
+  and the second line as garbage. Vault metadata legitimately carries
+  multi-line strings (transcripts, descriptions, body-as-metadata).
+  Fix: `needsQuote` now detects `\n\r\t\v\f` and `\x00-\x08\x0e-\x1f`;
+  `quoteString` switches to the **double-quoted** form with escape
+  sequences (`\\n`, `\\xNN`) so the whole value stays on one physical
+  line. `unquote` decodes the same escapes on parse. Pinned by two
+  round-trip tests in `portable-md.test.ts`.
+- **F2 (tautology test)** — The rc.9 "byte-identical re-emit"
+  idempotency test called `toPortableMarkdown` twice on the same
+  in-memory object and compared. That proves nothing about
+  round-tripping through the on-disk bytes. The CHANGELOG claim was
+  load-bearing for the format's whole pitch ("clean git diffs") and
+  the test didn't prove it. Fix: parse the emitted markdown back
+  through `parseFrontmatter`, reconstruct a `PortableNote`, re-emit,
+  compare bytes. That's the real invariant.
+- **F3 (path traversal)** — `exportVaultToDir` did
+  `join(outDir, relPath)` without verifying the resolved path stayed
+  under `outDir`. A note with `path: "../../escape"` would write
+  outside the export directory. Self-inflicted at the vault level
+  (operator owns the data) but a real surprise for programmatic
+  callers (e.g. ingest from external systems). Fix: resolve both
+  paths absolute, assert `candidate === root || candidate.startsWith(root + sep)`.
+  Refuses the write with a `console.warn` rather than aborting the
+  whole export — partial export is more useful than no export.
+  Pinned by two tests (escape attempt skipped; nested path inside
+  outDir permitted).
+
+### Polished
+
+- **F4** — `notetoPortable` renamed to `noteToPortable` (camelCase
+  typo).
+- **F5** — Added a code comment on the 1M-note bulk-load ceiling in
+  `exportVaultToDir`. Cursor / streaming for very-large vaults is a
+  PR 2 follow-up.
+- **F6** — `unquote` now decodes the double-quoted YAML escapes the
+  emitter produces (`\\\\`, `\\"`, `\\n`, `\\r`, `\\t`, `\\v`, `\\f`,
+  `\\xNN`). TODO comment notes that YAML 1.2 defines additional
+  escapes (`\\0`, `\\u<4hex>`, etc.) that the emitter never produces
+  but legacy `.yaml` files might — to add when a real case lands.
+
+### Gates
+
+- `bun test` (root) → 1384 pass / 3 skip / 0 fail (was 1380; +4 fold tests)
+- `bun test ./src/` → 919 pass / 0 fail (unchanged)
+- `bun test ./core/src/` → 465 pass / 0 fail (was 461; +4 fold tests)
+- `bunx tsc --noEmit` clean
+
+## [0.4.4-rc.9] — 2026-05-13
+
+Portable markdown knowledge-base export — PR 1 of 2 (closes part of
+vault#308; PR 2 follows with attachments + `--blow-away` import for
+full round-trip disaster recovery).
+
+The current export at `core/src/obsidian.ts` produces Obsidian-
+compatible markdown — but the format isn't Obsidian-specific. Markdown
++ frontmatter + folder hierarchy is the de-facto knowledge-base
+interchange format, consumed by Obsidian, Logseq, Foam, Quartz,
+Dendron, and most markdown-shaped static-site generators. Anchoring
+the function name to the format (rather than to one consumer) opens
+the door as other consumers adopt it. The legacy export is also
+lossy: no IDs, no typed-link relationships, no tag schemas, no
+attachments, no idempotency guarantee. Gitcoin Brain's vault-as-
+primary + git-as-projection architecture (and any operator using
+vault-as-primary) needs lossless round-trip.
+
+### Added
+
+- `core/src/portable-md.ts` — canonical home for the format.
+  - `toPortableMarkdown(note)` — emits a fixed top-level frontmatter
+    key order (`id` → `path` → `tags` → `metadata` → `links` →
+    `attachments` → `created_at` → `updated_at`) with alpha-sorted
+    keys in nested objects. Re-exporting an unchanged vault produces
+    byte-identical files.
+  - `exportVaultToDir(store, opts)` — writes
+    `<dir>/.parachute/vault.yaml`, `.parachute/schemas/<tag>.yaml`
+    per schema-carrying tag, and `<note.path>.md` per note.
+  - Typed-link relationships (non-wikilink) serialized in the
+    `links:` frontmatter block. Wikilinks stay in the content (their
+    `[[brackets]]` are the source of truth).
+  - Note IDs preserved in frontmatter (`id:` is the first key,
+    durable across renames).
+  - Hand-rolled YAML emitter — no new dep; strict string quoting
+    for values that would round-trip as different types
+    (`'true'`, `'42'`, `'null'`).
+- CLI: `parachute-vault export <dir> [--since <iso>]`. The
+  `--since` flag filters notes to those with `updated_at >= iso`,
+  for incremental git-projection cadences.
+
+### Changed
+
+- `core/src/obsidian.ts` — now a back-compat shim. Re-exports the
+  parser helpers (`parseFrontmatter`, `extractInlineTags`,
+  `walkMarkdownFiles`) from `portable-md.ts`. The legacy lossy
+  `toObsidianMarkdown` / `exportFilePath` are retained (marked
+  `@deprecated`) for callers that intentionally want the flat
+  frontmatter shape. All existing tests against `obsidian.ts` pass
+  unchanged.
+
+### Tests
+
+- `core/src/portable-md.test.ts` — 32 tests covering:
+  - YAML emitter (alpha-sort, scalar quoting, idempotency).
+  - Frontmatter key order (fixed top-level, alpha-sorted nested).
+  - `exportVaultToDir` (vault.yaml + schemas/<tag>.yaml + per-note
+    .md files, with `--since` filter).
+  - Byte-identical re-export of unchanged vault (idempotency pin).
+  - Wikilinks excluded from `links:` block.
+
+### Format change (callers that store the legacy `toObsidianMarkdown` output)
+
+The new portable-md frontmatter shape **nests metadata** under a
+`metadata:` block, where the legacy obsidian export flattened
+metadata keys at the top level. Operators using the legacy
+`parachute-vault export` for one-shot Obsidian copies will see a
+shape change after upgrading to `parachute-vault export` (now the
+new portable-md emitter). The legacy `toObsidianMarkdown` function
+is still callable for callers that import it directly; the CLI
+moves to the new format. Export output is *projection*, not
+authoritative state — regeneratable, so the migration cost is
+re-running the export.
+
+### Coming in PR 2
+
+- Attachments export/import (file copy under `.parachute/attachments/`).
+- `parachute-vault import <dir> --blow-away` for disaster recovery.
+- Full round-trip byte-equivalence test (vault → export → blow-away
+  → import → vault state byte-equivalent).
+- Cookbook entry for webhook-driven nightly git projection.
+
+### Gates
+
+- `bun test` (root) → 1380 pass / 3 skip / 0 fail
+- `bun test ./src/` → 919 pass / 0 fail (unchanged)
+- `bun test ./core/src/` → 461 pass / 0 fail (was 429; +32)
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.8] — 2026-05-12
 
 HTTP create/update now attach `validation_status` — symmetry with MCP
