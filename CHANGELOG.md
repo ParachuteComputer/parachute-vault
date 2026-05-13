@@ -6,6 +6,95 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.9] — 2026-05-13
+
+Portable markdown knowledge-base export — PR 1 of 2 (closes part of
+vault#308; PR 2 follows with attachments + `--blow-away` import for
+full round-trip disaster recovery).
+
+The current export at `core/src/obsidian.ts` produces Obsidian-
+compatible markdown — but the format isn't Obsidian-specific. Markdown
++ frontmatter + folder hierarchy is the de-facto knowledge-base
+interchange format, consumed by Obsidian, Logseq, Foam, Quartz,
+Dendron, and most markdown-shaped static-site generators. Anchoring
+the function name to the format (rather than to one consumer) opens
+the door as other consumers adopt it. The legacy export is also
+lossy: no IDs, no typed-link relationships, no tag schemas, no
+attachments, no idempotency guarantee. Gitcoin Brain's vault-as-
+primary + git-as-projection architecture (and any operator using
+vault-as-primary) needs lossless round-trip.
+
+### Added
+
+- `core/src/portable-md.ts` — canonical home for the format.
+  - `toPortableMarkdown(note)` — emits a fixed top-level frontmatter
+    key order (`id` → `path` → `tags` → `metadata` → `links` →
+    `attachments` → `created_at` → `updated_at`) with alpha-sorted
+    keys in nested objects. Re-exporting an unchanged vault produces
+    byte-identical files.
+  - `exportVaultToDir(store, opts)` — writes
+    `<dir>/.parachute/vault.yaml`, `.parachute/schemas/<tag>.yaml`
+    per schema-carrying tag, and `<note.path>.md` per note.
+  - Typed-link relationships (non-wikilink) serialized in the
+    `links:` frontmatter block. Wikilinks stay in the content (their
+    `[[brackets]]` are the source of truth).
+  - Note IDs preserved in frontmatter (`id:` is the first key,
+    durable across renames).
+  - Hand-rolled YAML emitter — no new dep; strict string quoting
+    for values that would round-trip as different types
+    (`'true'`, `'42'`, `'null'`).
+- CLI: `parachute-vault export <dir> [--since <iso>]`. The
+  `--since` flag filters notes to those with `updated_at >= iso`,
+  for incremental git-projection cadences.
+
+### Changed
+
+- `core/src/obsidian.ts` — now a back-compat shim. Re-exports the
+  parser helpers (`parseFrontmatter`, `extractInlineTags`,
+  `walkMarkdownFiles`) from `portable-md.ts`. The legacy lossy
+  `toObsidianMarkdown` / `exportFilePath` are retained (marked
+  `@deprecated`) for callers that intentionally want the flat
+  frontmatter shape. All existing tests against `obsidian.ts` pass
+  unchanged.
+
+### Tests
+
+- `core/src/portable-md.test.ts` — 32 tests covering:
+  - YAML emitter (alpha-sort, scalar quoting, idempotency).
+  - Frontmatter key order (fixed top-level, alpha-sorted nested).
+  - `exportVaultToDir` (vault.yaml + schemas/<tag>.yaml + per-note
+    .md files, with `--since` filter).
+  - Byte-identical re-export of unchanged vault (idempotency pin).
+  - Wikilinks excluded from `links:` block.
+
+### Format change (callers that store the legacy `toObsidianMarkdown` output)
+
+The new portable-md frontmatter shape **nests metadata** under a
+`metadata:` block, where the legacy obsidian export flattened
+metadata keys at the top level. Operators using the legacy
+`parachute-vault export` for one-shot Obsidian copies will see a
+shape change after upgrading to `parachute-vault export` (now the
+new portable-md emitter). The legacy `toObsidianMarkdown` function
+is still callable for callers that import it directly; the CLI
+moves to the new format. Export output is *projection*, not
+authoritative state — regeneratable, so the migration cost is
+re-running the export.
+
+### Coming in PR 2
+
+- Attachments export/import (file copy under `.parachute/attachments/`).
+- `parachute-vault import <dir> --blow-away` for disaster recovery.
+- Full round-trip byte-equivalence test (vault → export → blow-away
+  → import → vault state byte-equivalent).
+- Cookbook entry for webhook-driven nightly git projection.
+
+### Gates
+
+- `bun test` (root) → 1380 pass / 3 skip / 0 fail
+- `bun test ./src/` → 919 pass / 0 fail (unchanged)
+- `bun test ./core/src/` → 461 pass / 0 fail (was 429; +32)
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.8] — 2026-05-12
 
 HTTP create/update now attach `validation_status` — symmetry with MCP

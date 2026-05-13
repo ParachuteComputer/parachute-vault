@@ -2619,6 +2619,7 @@ async function cmdImport(args: string[]) {
 async function cmdExport(args: string[]) {
   let vaultName = "default";
   let outputPath = "";
+  let since: string | undefined;
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -2630,6 +2631,21 @@ async function cmdExport(args: string[]) {
         process.exit(1);
       }
       vaultName = v;
+    } else if (arg === "--since") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--since requires an ISO-8601 timestamp value.");
+        process.exit(1);
+      }
+      // Defensive: parse to verify it's a real ISO timestamp before we
+      // hand it to the store. Avoids silent "no matches" when the
+      // operator typo's the date and gets an empty export.
+      const parsed = Date.parse(v);
+      if (Number.isNaN(parsed)) {
+        console.error(`--since: invalid ISO-8601 timestamp '${v}'`);
+        process.exit(1);
+      }
+      since = v;
     } else {
       positional.push(arg);
     }
@@ -2637,14 +2653,17 @@ async function cmdExport(args: string[]) {
   outputPath = positional[0] ?? "";
 
   if (!outputPath) {
-    console.error("Usage: parachute-vault export <output-path> [--vault <name>]");
-    console.error("\nExports a Parachute Vault as Obsidian-compatible markdown files.");
+    console.error("Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>]");
+    console.error("\nExports a Parachute Vault as portable markdown — round-trippable across");
+    console.error("Obsidian / Logseq / Foam / Quartz / Dendron and most markdown SSGs.");
+    console.error("\nOptions:");
+    console.error("  --vault <name>       Source vault (default: 'default')");
+    console.error("  --since <iso>        Only export notes whose updated_at >= ISO timestamp");
+    console.error("                       (incremental — useful for git-projection cadences)");
     process.exit(1);
   }
 
   const { resolve: resolvePath } = await import("path");
-  const { mkdirSync: mkdir, writeFileSync: writeFile } = await import("fs");
-  const { join, dirname } = await import("path");
   const fullPath = resolvePath(outputPath);
 
   const config = readVaultConfig(vaultName);
@@ -2653,28 +2672,23 @@ async function cmdExport(args: string[]) {
     process.exit(1);
   }
 
-  const { toObsidianMarkdown, exportFilePath } = await import("../core/src/obsidian.ts");
+  const { exportVaultToDir } = await import("../core/src/portable-md.ts");
   const { getVaultStore } = await import("./vault-store.ts");
 
   const store = getVaultStore(vaultName);
-  const notes = await store.queryNotes({ limit: 100000, sort: "asc" });
+  console.log(`Exporting vault "${vaultName}" to ${fullPath}${since ? ` (since ${since})` : ""}`);
+  const stats = await exportVaultToDir(store, {
+    outDir: fullPath,
+    vaultName,
+    ...(config.description ? { vaultDescription: config.description } : {}),
+    ...(since ? { since } : {}),
+  });
 
-  console.log(`Exporting ${notes.length} notes from vault "${vaultName}" to ${fullPath}`);
-  mkdir(fullPath, { recursive: true });
-
-  let exported = 0;
-  for (const note of notes) {
-    const filePath = exportFilePath(note);
-    const fullFilePath = join(fullPath, filePath);
-    const dir = dirname(fullFilePath);
-    mkdir(dir, { recursive: true });
-
-    const markdown = toObsidianMarkdown(note);
-    writeFile(fullFilePath, markdown);
-    exported++;
+  console.log(`Exported ${stats.notes} note(s) and ${stats.schemas} tag schema(s).`);
+  console.log(`Sidecar: ${fullPath}/.parachute/`);
+  if (stats.filtered_by_since) {
+    console.log(`Incremental: filtered by --since ${since}.`);
   }
-
-  console.log(`Exported ${exported} notes as markdown files.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2867,9 +2881,11 @@ Backup:
   parachute-vault backup status                 Show schedule, last run, destinations, next run
 
 Import/Export:
-  parachute-vault import <path>            Import an Obsidian vault
-  parachute-vault import <path> --dry-run  Preview import without writing
-  parachute-vault export <path>            Export vault as Obsidian markdown
+  parachute-vault import <path>                       Import an Obsidian vault (legacy)
+  parachute-vault import <path> --dry-run             Preview import without writing
+  parachute-vault export <dir>                        Export vault as portable markdown
+                                                       (Obsidian/Logseq/Foam/Quartz-compatible)
+  parachute-vault export <dir> --since <iso>          Incremental: only notes updated_at >= ISO
 
 ── Advanced / standalone ──────────────────────────────────────────────
 
