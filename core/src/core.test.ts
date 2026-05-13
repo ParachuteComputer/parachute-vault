@@ -3678,6 +3678,122 @@ describe("schema validation (tags.fields)", async () => {
     const result = await create.execute({ content: "x", tags: ["task"] }) as any;
     expect(result.validation_status).toBeUndefined();
   });
+
+  // vault#310 — integer type validation. JSON has no separate integer
+  // type, so a JSON number with zero fractional part (`5`, `5.0`) must
+  // pass an `integer`-typed field. Pre-fix, the validator had no
+  // `"integer"` case at all — falling through the switch returned
+  // undefined and every integer-typed field warned `type_mismatch` on
+  // legitimate values. Gitcoin Brain's drift detector emits JSON for
+  // diffs; every `kpi: 3` triggered the false-positive and buried the
+  // real warnings.
+
+  it("integer-typed field: JSON integer (5) passes (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5 },
+    }) as any;
+    expect(result.validation_status?.warnings ?? []).toEqual([]);
+  });
+
+  it("integer-typed field: JSON `5.0` (zero-fractional) passes (vault#310)", async () => {
+    // 5.0 is the canonical Gitcoin shape — JSON.parse decodes the
+    // emitted JSON number as a JS Number; the JS Number for `5.0` is
+    // identical to `5` so Number.isInteger reports true. This is the
+    // load-bearing assertion for the Gitcoin drift-detector use case.
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.0 },
+    }) as any;
+    expect(result.validation_status?.warnings ?? []).toEqual([]);
+  });
+
+  it("integer-typed field: JSON `5.5` (non-zero fractional) warns type_mismatch (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.5 },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("count");
+  });
+
+  it("integer-typed field: string `\"5\"` warns type_mismatch (no string→number coercion) (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: "5" },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  it("integer-typed field: edge `5.0000000000001` warns type_mismatch (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.0000000000001 },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  it("integer-typed field: boolean warns type_mismatch (vault#310)", async () => {
+    // Pin that boolean is rejected (Number.isInteger(true) returns
+    // false, but extra coverage in case anyone "improves" the check
+    // with a looser predicate later).
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: true },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  // Note on NaN/Infinity: those values pass through
+  // JSON.stringify as `null`, then the validator's null short-circuit
+  // (schema-defaults.ts:327 — "value === null → skip") filters them out
+  // before reaching the type check. We can't observe them in
+  // validation_status from this layer; a dedicated unit test against
+  // `valueMatchesType` would catch the case at the inner boundary.
+  // Pinned at the next layer down:
+
+  it("valueMatchesType('integer', ...) rejects NaN / Infinity (vault#310)", async () => {
+    // Reach the unexported helper indirectly via validateNote on a
+    // hand-built resolved-schemas + metadata where the value is the
+    // actual NaN/Infinity (no JSON round-trip).
+    const { validateNote, loadSchemaConfig } = await import("./schema-defaults.js");
+    // Seed via the public surface, then load the resolved schemas
+    // snapshot.
+    await store.upsertTagSchema("k", { fields: { c: { type: "integer" } } });
+    const resolved = loadSchemaConfig((store as any).db);
+    expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.NaN } })?.warnings[0]?.reason)
+      .toBe("type_mismatch");
+    expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.POSITIVE_INFINITY } })?.warnings[0]?.reason)
+      .toBe("type_mismatch");
+  });
 });
 
 // ---------------------------------------------------------------------------
