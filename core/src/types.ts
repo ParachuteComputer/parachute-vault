@@ -143,6 +143,21 @@ export interface Store {
   getNoteByPath(path: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
   updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; if_updated_at?: string }): Promise<Note>;
+  /**
+   * Set a note's `created_at` and `updated_at` explicitly. Import-only:
+   * used by the portable-md round-trip path to restore timestamps from
+   * the export bytes. The regular `updateNote` either bumps `updated_at`
+   * to wall-clock-now or (with `skipUpdatedAt: true`) leaves it
+   * untouched — neither shape lets the importer write a specific
+   * historical timestamp. Bypasses hooks. See vault#308 PR 2.
+   */
+  restoreNoteTimestamps(id: string, createdAt: string, updatedAt: string): Promise<void>;
+  /**
+   * Sync wikilinks for every note in the vault. Cheap O(n) walk; used
+   * after bulk-imports to rebuild link rows from `[[brackets]]` in
+   * content. Returns counts for caller logging.
+   */
+  syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
   deleteNote(id: string): Promise<void>;
   queryNotes(opts: QueryOpts): Promise<Note[]>;
   searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]>;

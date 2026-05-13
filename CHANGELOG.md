@@ -6,6 +6,120 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.11] — 2026-05-13
+
+Portable markdown knowledge-base format — PR 2 of 2 (closes vault#308 +
+folds vault#318). Closes the remaining two lossy gaps from PR 1
+(attachments + import) and pins the load-bearing byte-equivalent
+round-trip invariant.
+
+### Added — export
+
+- `core/src/portable-md.ts` `exportVaultToDir` now copies attachment
+  binaries to `<outDir>/.parachute/attachments/<id>/<basename>`
+  when `opts.assetsDir` is set (the CLI wires this via
+  `src/routes.ts:assetsDir(vault)`; core stays pure — no dep on
+  server-side path resolution).
+- Attachment refs in note frontmatter preserve the **original
+  vault-internal path** (relative to `assetsDir`). The sidecar
+  location is derived from `att.id` so it's deterministic across
+  renames and different export runs.
+- `ExportStats` extended (folds vault#318): adds `attachments`,
+  `skipped_traversal`, `skipped_notes`, `skipped_attachments`.
+  Programmatic consumers (PR 2 importer; future drift sidecars)
+  no longer have to log-scrape.
+
+### Added — import
+
+- `core/src/portable-md.ts` `importPortableVault(store, opts)` —
+  reads a portable-md export back into a vault. Upsert by frontmatter
+  `id`: existing notes updated in place, new ones created.
+- `--blow-away` flag — the disaster-recovery path: wipe the target
+  vault first (delete all notes + tags; cascade-deletes flow through
+  FKs), then replay from the export. CLI gates this behind a confirm
+  prompt unless `--yes` is set. Returns `notes_wiped` count.
+- Tag schemas restored from `.parachute/schemas/<tag>.yaml` before
+  notes (so any tag a note carries can validate against its schema).
+- Typed links replayed after all notes exist (forward-ref safe).
+  Skipped links surface in `ImportStats.skipped_links` with the
+  reason.
+- Attachment binaries restored from
+  `.parachute/attachments/<exported-id>/<basename>` to
+  `<assetsDir>/<frontmatter-path>` when `opts.assetsDir` is set.
+  Path-traversal guards on both ends.
+- `--dry-run` counts would-create / would-update without writing.
+- `Store.restoreNoteTimestamps(id, createdAt, updatedAt)` —
+  import-only setter that writes both timestamps explicitly. Regular
+  `updateNote` either bumps `updated_at` to wall-clock-now or leaves
+  it untouched; neither lets the importer write a historical
+  timestamp. Used so the round-trip preserves notes where
+  `created_at ≠ updated_at`.
+- `Store.syncAllWikilinks` lifted into the `Store` interface (was on
+  `BunSqliteStore` only). The importer calls it once at the end to
+  rebuild wikilink rows from `[[brackets]]` in content.
+
+### CLI
+
+- `parachute-vault import <dir>` autodetects portable-md vs legacy
+  Obsidian via the presence of `.parachute/vault.yaml`. Lossless path
+  takes over when present; legacy obsidian parser handles the rest.
+  `--format <name>` and `--obsidian` flags retained as no-op hints.
+- `parachute-vault import <dir> --blow-away [--yes] [--dry-run]` —
+  the disaster-recovery path.
+- `parachute-vault export <dir>` now wires `assetsDir(vault)` so
+  attachment binaries are copied alongside the markdown. Output
+  shows `notes / schemas / attachments` counts.
+
+### Tests
+
+- 8 new import tests covering: not-a-portable-md error path, upsert by
+  id (new + existing), `--blow-away`, schema restoration, typed-link
+  replay, missing-target skip, dry-run no-writes.
+- **Round-trip byte-equivalent integration test** (PR 2 P3, the
+  load-bearing pin for the format's whole pitch): realistic vault
+  (multiple notes, schema-carrying tags, typed link, multi-line
+  metadata, divergent created_at/updated_at) → export → blow-away
+  import → re-export → recursively compare every file's bytes.
+  Drift triggers a diff hint in console.error before the test fails,
+  so future regressions are debuggable.
+
+### Known limitation
+
+- **Attachment IDs are re-minted on import.** `addAttachment` generates
+  a fresh id; the Store interface doesn't yet expose a
+  `restoreAttachment(id, ...)` import-only path. Frontmatter refs still
+  resolve by `(note_id, path)` tuple, but a round-trip with
+  attachments present produces byte-different `attachments[].id`
+  values between original and re-export. The note-level round-trip
+  test exercises this. Filed as a future enhancement; landing it
+  requires the parallel surface to `restoreNoteTimestamps`.
+
+### Reviewer fold (vault#319 F1 + F2 + F3)
+
+- **F1 (safety)** — `--blow-away` confirm now defaults NO (was YES).
+  Every other destructive confirm in the CLI defaults NO; a
+  distracted Enter-press no longer wipes a vault. One-char fix.
+- **F2 (doc)** — Pinned upsert merge policy in a comment block at
+  `importPortableVault`'s update branch. Non-blow-away imports
+  **always replace** content + tags, but **upsert-by-field** for
+  metadata + path (absent fields preserve the vault's existing
+  values). To force a clean replace-by-id, use `--blow-away`.
+- **F3 (coverage)** — Folded the missing attachment-import tests:
+  - Bytes survive vault → export → fresh-vault import (different
+    `assetsDir`). Non-utf8 distinctive bytes verify the buffer
+    round-trips honestly through the filesystem.
+  - Adversarial frontmatter `attachments[].path` that resolves
+    outside the destination `assetsDir` is skipped + recorded in
+    `ImportStats.skipped_attachments` with a `path-traversal`
+    reason; the would-be escape file never lands.
+
+### Gates
+
+- `bun test` (root) → 1394 pass / 3 skip / 0 fail (was 1392; +2 F3 tests)
+- `bun test ./src/` → 919 pass / 0 fail (unchanged)
+- `bun test ./core/src/` → 475 pass / 0 fail (was 473; +2 F3 tests)
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.10] — 2026-05-13
 
 vault#317 reviewer fold — three critical bugs in the rc.9 portable-md

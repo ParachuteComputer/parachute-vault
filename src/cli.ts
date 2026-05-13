@@ -2492,21 +2492,21 @@ function describeNextRun(schedule: BackupSchedule): string {
 
 async function cmdImport(args: string[]) {
   // Parse flags
-  let format = "obsidian";
   let vaultName = "default";
   let sourcePath = "";
   let dryRun = false;
+  let blowAway = false;
+  let assumeYes = false;
+  // `--format <name>` / `--obsidian` retained as no-op hints — autodetect
+  // now drives the format choice (presence of `.parachute/vault.yaml`).
+  // Surfaced in help text below; ignored at runtime to avoid surprising
+  // operators with stale flags.
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--format") {
-      const v = args[++i];
-      if (!v) {
-        console.error("--format requires a value.");
-        process.exit(1);
-      }
-      format = v;
+      i++; // consume the value; ignored.
     } else if (arg === "--vault") {
       const v = args[++i];
       if (!v) {
@@ -2517,7 +2517,11 @@ async function cmdImport(args: string[]) {
     } else if (arg === "--dry-run") {
       dryRun = true;
     } else if (arg === "--obsidian") {
-      format = "obsidian";
+      // no-op; autodetect.
+    } else if (arg === "--blow-away") {
+      blowAway = true;
+    } else if (arg === "--yes" || arg === "-y") {
+      assumeYes = true;
     } else {
       positional.push(arg);
     }
@@ -2525,15 +2529,21 @@ async function cmdImport(args: string[]) {
   sourcePath = positional[0] ?? "";
 
   if (!sourcePath) {
-    console.error("Usage: parachute-vault import <path> [--vault <name>] [--dry-run]");
-    console.error("\nImports an Obsidian vault into Parachute Vault.");
+    console.error("Usage: parachute-vault import <path> [--vault <name>] [--blow-away] [--yes] [--dry-run]");
+    console.error("\nImports a portable-md export OR a legacy Obsidian vault. Format is");
+    console.error("autodetected by the presence of `.parachute/vault.yaml` in the input dir.");
     console.error("\nOptions:");
     console.error("  --vault <name>   Target vault (default: 'default')");
-    console.error("  --dry-run        Show what would be imported without importing");
+    console.error("  --blow-away      DESTRUCTIVE: wipe the target vault first, then replay");
+    console.error("                   the import. Disaster-recovery path. Confirms unless");
+    console.error("                   `--yes` is set.");
+    console.error("  --yes, -y        Skip the destructive-action confirm prompt.");
+    console.error("  --dry-run        Show what would be imported without writing.");
     process.exit(1);
   }
 
   const { resolve: resolvePath } = await import("path");
+  const { join } = await import("path");
   const fullPath = resolvePath(sourcePath);
 
   if (!existsSync(fullPath)) {
@@ -2545,6 +2555,73 @@ async function cmdImport(args: string[]) {
   const config = readVaultConfig(vaultName);
   if (!config) {
     console.error(`Vault "${vaultName}" not found. Run: parachute-vault create ${vaultName}`);
+    process.exit(1);
+  }
+
+  // Autodetect: portable-md export → `.parachute/vault.yaml` present.
+  const isPortableMd = existsSync(join(fullPath, ".parachute", "vault.yaml"));
+
+  if (isPortableMd) {
+    // New lossless path. Supports --blow-away for disaster recovery.
+    const { importPortableVault } = await import("../core/src/portable-md.ts");
+    const { getVaultStore } = await import("./vault-store.ts");
+    const { assetsDir } = await import("./routes.ts");
+
+    if (blowAway && !assumeYes && !dryRun) {
+      // Confirm-prompt the destructive action. Default NO — every other
+      // destructive confirm in this CLI (uninstall's wipe, 2FA
+      // re-enrollment) defaults NO, so a distracted Enter-press can't
+      // wipe a vault. vault#319 fold F1.
+      const proceed = await confirm(
+        `\nDESTRUCTIVE: --blow-away will DELETE every note in vault "${vaultName}" before replaying from "${fullPath}". Proceed?`,
+        false,
+      );
+      if (!proceed) {
+        console.log("Cancelled.");
+        return;
+      }
+    }
+
+    const store = getVaultStore(vaultName);
+    console.log(
+      `Importing portable-md export from ${fullPath} into vault "${vaultName}"` +
+      `${blowAway ? " (BLOW-AWAY)" : ""}${dryRun ? " (dry-run)" : ""}`,
+    );
+    const stats = await importPortableVault(store, {
+      inDir: fullPath,
+      blowAway,
+      assetsDir: assetsDir(vaultName),
+      dryRun,
+    });
+
+    console.log(
+      `\n${dryRun ? "Would " : ""}created ${stats.notes_created} note(s), ` +
+      `updated ${stats.notes_updated}, ` +
+      `restored ${stats.schemas_restored} schema(s), ` +
+      `${stats.links_restored} link(s), ` +
+      `${stats.attachments_restored} attachment(s).`,
+    );
+    if (stats.notes_wiped > 0) {
+      console.log(`Blow-away: wiped ${stats.notes_wiped} pre-existing note(s).`);
+    }
+    if (stats.skipped_links.length > 0) {
+      console.log(`Skipped ${stats.skipped_links.length} link(s) — target notes not in import set.`);
+    }
+    if (stats.skipped_attachments.length > 0) {
+      console.log(`Skipped ${stats.skipped_attachments.length} attachment(s) — see warnings above.`);
+    }
+    return;
+  }
+
+  // Legacy obsidian-format path. No-op when --blow-away passed (this
+  // path is for "ingest an external Obsidian vault" not disaster
+  // recovery); explicit error so the operator doesn't get a surprising
+  // partial wipe.
+  if (blowAway) {
+    console.error(
+      "--blow-away requires a portable-md export (`.parachute/vault.yaml` present in the input dir). " +
+      "Legacy Obsidian imports don't support --blow-away — they always upsert by path.",
+    );
     process.exit(1);
   }
 
@@ -2674,20 +2751,29 @@ async function cmdExport(args: string[]) {
 
   const { exportVaultToDir } = await import("../core/src/portable-md.ts");
   const { getVaultStore } = await import("./vault-store.ts");
+  const { assetsDir } = await import("./routes.ts");
 
   const store = getVaultStore(vaultName);
+  const assetsDirPath = assetsDir(vaultName);
   console.log(`Exporting vault "${vaultName}" to ${fullPath}${since ? ` (since ${since})` : ""}`);
   const stats = await exportVaultToDir(store, {
     outDir: fullPath,
     vaultName,
+    assetsDir: assetsDirPath,
     ...(config.description ? { vaultDescription: config.description } : {}),
     ...(since ? { since } : {}),
   });
 
-  console.log(`Exported ${stats.notes} note(s) and ${stats.schemas} tag schema(s).`);
+  console.log(`Exported ${stats.notes} note(s), ${stats.schemas} tag schema(s), ${stats.attachments} attachment(s).`);
   console.log(`Sidecar: ${fullPath}/.parachute/`);
   if (stats.filtered_by_since) {
     console.log(`Incremental: filtered by --since ${since}.`);
+  }
+  if (stats.skipped_traversal > 0) {
+    console.log(`Note: ${stats.skipped_traversal} note(s) skipped (path-traversal). See [export] warnings above.`);
+  }
+  if (stats.skipped_attachments.length > 0) {
+    console.log(`Note: ${stats.skipped_attachments.length} attachment(s) skipped. See [export] warnings above.`);
   }
 }
 
@@ -2881,7 +2967,11 @@ Backup:
   parachute-vault backup status                 Show schedule, last run, destinations, next run
 
 Import/Export:
-  parachute-vault import <path>                       Import an Obsidian vault (legacy)
+  parachute-vault import <path>                       Import portable-md export OR legacy
+                                                       Obsidian vault (autodetected by
+                                                       presence of .parachute/vault.yaml)
+  parachute-vault import <path> --blow-away           DESTRUCTIVE: wipe target vault, replay
+                                                       (disaster recovery; confirms)
   parachute-vault import <path> --dry-run             Preview import without writing
   parachute-vault export <dir>                        Export vault as portable markdown
                                                        (Obsidian/Logseq/Foam/Quartz-compatible)

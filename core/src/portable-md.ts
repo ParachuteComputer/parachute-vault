@@ -72,8 +72,8 @@
  * See vault#308.
  */
 
-import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync } from "fs";
-import { join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
+import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync } from "fs";
+import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 
@@ -151,8 +151,29 @@ export interface PortableVaultMeta {
 export interface ExportStats {
   notes: number;
   schemas: number;
+  attachments: number;
   /** Set when caller passed `since`; counts notes whose `updated_at >= since`. */
   filtered_by_since: boolean;
+  /**
+   * Number of notes skipped because their resolved write target escaped
+   * the export root. Operators / programmatic callers (e.g. PR 2's
+   * importer) inspect this to decide whether to treat the export as
+   * complete. The corresponding entries are detailed in `skipped_notes`.
+   * vault#318.
+   */
+  skipped_traversal: number;
+  /**
+   * Per-skipped-note detail. Each entry pairs the offending note's path
+   * with the human-readable reason it was skipped. Empty when nothing
+   * was skipped.
+   */
+  skipped_notes: Array<{ path: string | undefined; reason: string }>;
+  /**
+   * Per-skipped-attachment detail. Skipped reasons: source file missing,
+   * source path escapes assetsDir, dest path escapes outDir. Importer
+   * uses this to distinguish expected-missing from data corruption.
+   */
+  skipped_attachments: Array<{ note_id: string; attachment_id: string; path: string; reason: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +469,17 @@ export interface ExportOptions {
   since?: string;
   /** Override `exported_at` timestamp (test seam — keeps re-export byte-equiv). */
   exportedAt?: string;
+  /**
+   * Absolute path to the vault's assets directory (where attachment
+   * bytes live, one file per `attachments.path` row). When set, attachment
+   * binaries are copied into `<outDir>/.parachute/attachments/<id>/<basename>`
+   * alongside the frontmatter reference. When unset, attachment refs are
+   * still emitted but the binaries stay where they are — useful for
+   * partial exports / git-projection where only the markdown is checked
+   * in. The CLI computes this via `src/routes.ts:assetsDir(vault)`; core
+   * stays pure (no dep on server-side path resolution).
+   */
+  assetsDir?: string;
 }
 
 /**
@@ -456,9 +488,15 @@ export interface ExportOptions {
  *   - `<outDir>/.parachute/schemas/<tag>.yaml` for each tag that declares
  *     description/fields/relationships/parent_names.
  *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
+ *   - `<outDir>/.parachute/attachments/<id>/<basename>` for each attachment
+ *     (only when `opts.assetsDir` is set; the path-traversal guard rejects
+ *     attachments whose source path escapes assetsDir and whose dest path
+ *     would escape outDir).
  *
- * Attachment file-copying is PR 2 (#308). The PortableNote shape includes
- * attachment refs already; the binaries land in PR 2.
+ * The frontmatter `attachments[].path` value preserves the original
+ * vault-internal path (relative to `assetsDir`). Import restores the
+ * binary to that path. The sidecar location is derived from `id` so it
+ * stays stable across renames + different export runs.
  */
 export async function exportVaultToDir(
   store: Store,
@@ -469,6 +507,10 @@ export async function exportVaultToDir(
   const sidecar = join(outDir, SIDECAR_DIR);
   mkdirSync(sidecar, { recursive: true });
   mkdirSync(join(sidecar, "schemas"), { recursive: true });
+  // attachments dir only when assetsDir is wired (caller opted in).
+  if (opts.assetsDir) {
+    mkdirSync(join(sidecar, "attachments"), { recursive: true });
+  }
 
   // 1. vault.yaml — vault meta + export format version. Trailing
   // export-time timestamp is the one place where re-exports legitimately
@@ -511,8 +553,13 @@ export async function exportVaultToDir(
   const allNotes = await store.queryNotes({ limit: 1_000_000, sort: "asc" });
   const since = opts.since;
   const outDirResolved = resolvePath(outDir);
+  const assetsDirResolved = opts.assetsDir ? resolvePath(opts.assetsDir) : undefined;
+  const attachmentsRoot = join(sidecar, "attachments");
+  const attachmentsRootResolved = resolvePath(attachmentsRoot);
   let notesWritten = 0;
+  let attachmentsWritten = 0;
   const skipped: { path: string | undefined; reason: string }[] = [];
+  const skippedAttachments: { note_id: string; attachment_id: string; path: string; reason: string }[] = [];
   for (const note of allNotes) {
     if (since && !shouldIncludeForSince(note, since)) continue;
     const portable = await noteToPortable(note, store);
@@ -535,6 +582,55 @@ export async function exportVaultToDir(
     mkdirSync(dirname(fullPath), { recursive: true });
     writeFileSync(fullPath, toPortableMarkdown(portable));
     notesWritten++;
+
+    // Copy attachment binaries when assetsDir is wired. Each attachment
+    // is path-traversal-guarded on both ends: source under assetsDir,
+    // dest under outDir's sidecar attachments root. Missing source files
+    // are skipped (warn) rather than aborting — assetsDir state may
+    // legitimately lag the DB (e.g. file evicted while row persists).
+    if (assetsDirResolved && portable.attachments && portable.attachments.length > 0) {
+      for (const att of portable.attachments) {
+        const srcPath = join(assetsDirResolved, att.path);
+        const srcResolved = resolvePath(srcPath);
+        if (!isWithinDir(srcResolved, assetsDirResolved)) {
+          skippedAttachments.push({
+            note_id: portable.id,
+            attachment_id: att.id,
+            path: att.path,
+            reason: `path-traversal: source "${srcResolved}" escapes assetsDir "${assetsDirResolved}"`,
+          });
+          continue;
+        }
+        if (!existsSync(srcResolved)) {
+          skippedAttachments.push({
+            note_id: portable.id,
+            attachment_id: att.id,
+            path: att.path,
+            reason: `source file missing at "${srcResolved}"`,
+          });
+          continue;
+        }
+        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>.
+        // Using att.id as the directory name keeps multiple attachments
+        // with the same basename from colliding; basename keeps the
+        // filename human-readable.
+        const destDir = join(attachmentsRoot, att.id);
+        const destFile = join(destDir, basename(att.path));
+        const destResolved = resolvePath(destFile);
+        if (!isWithinDir(destResolved, attachmentsRootResolved)) {
+          skippedAttachments.push({
+            note_id: portable.id,
+            attachment_id: att.id,
+            path: att.path,
+            reason: `path-traversal: dest "${destResolved}" escapes attachments root "${attachmentsRootResolved}"`,
+          });
+          continue;
+        }
+        mkdirSync(destDir, { recursive: true });
+        copyFileSync(srcResolved, destResolved);
+        attachmentsWritten++;
+      }
+    }
   }
   if (skipped.length > 0) {
     // Surface to the caller without aborting — partial export is more
@@ -545,11 +641,21 @@ export async function exportVaultToDir(
       console.warn(`[export] skipped note (path="${s.path ?? "<unpathed>"}"): ${s.reason}`);
     }
   }
+  if (skippedAttachments.length > 0) {
+    for (const s of skippedAttachments) {
+      // eslint-disable-next-line no-console
+      console.warn(`[export] skipped attachment (note=${s.note_id}, path="${s.path}"): ${s.reason}`);
+    }
+  }
 
   return {
     notes: notesWritten,
     schemas: schemasWritten,
+    attachments: attachmentsWritten,
     filtered_by_since: since !== undefined,
+    skipped_traversal: skipped.length,
+    skipped_notes: skipped,
+    skipped_attachments: skippedAttachments,
   };
 }
 
@@ -586,6 +692,383 @@ function isWithinDir(candidate: string, root: string): boolean {
 function shouldIncludeForSince(note: Note, since: string): boolean {
   const stamp = note.updatedAt ?? note.createdAt;
   return stamp >= since;
+}
+
+// ---------------------------------------------------------------------------
+// Vault-level import — read a portable-md directory back into a vault
+// ---------------------------------------------------------------------------
+
+export interface ImportOptions {
+  /** Source directory (an `exportVaultToDir` output). */
+  inDir: string;
+  /**
+   * Wipe the vault first (DELETE FROM notes; DELETE FROM tags;
+   * cascade-deletes flow through note_tags/links/attachments). The
+   * disaster-recovery path; the CLI gates this behind an
+   * explicit confirm prompt. Default `false` — upsert-by-id semantics
+   * (existing notes updated, new ones created).
+   */
+  blowAway?: boolean;
+  /**
+   * When set, attachment binaries are restored from
+   * `<inDir>/.parachute/attachments/<id>/<basename>` to
+   * `<assetsDir>/<frontmatter-path>`. When unset, the DB rows are
+   * created but the binaries are left untouched (handy when assetsDir
+   * isn't relevant or attachments weren't exported).
+   */
+  assetsDir?: string;
+  /**
+   * Dry run — parse the export, surface what would happen, but don't
+   * write anything to the store or filesystem. The returned stats still
+   * count "would-create" / "would-update" so the operator can audit.
+   */
+  dryRun?: boolean;
+}
+
+export interface ImportStats {
+  notes_created: number;
+  notes_updated: number;
+  schemas_restored: number;
+  links_restored: number;
+  attachments_restored: number;
+  /** Per-skipped-link detail: target note ID missing post-import.
+   *  Common when a forward-ref points at a note that wasn't exported. */
+  skipped_links: Array<{ source_id: string; target_id: string; relationship: string; reason: string }>;
+  /** Per-skipped-attachment detail. */
+  skipped_attachments: Array<{ note_id: string; attachment_id: string; reason: string }>;
+  /** Set when the caller passed `blowAway: true`; counts notes removed. */
+  notes_wiped: number;
+}
+
+/**
+ * Read a portable-md export directory back into a vault. Lossless
+ * counterpart to `exportVaultToDir`. With `blowAway: true`, replaces
+ * vault state byte-equivalent to the export (the disaster-recovery
+ * path). Without it, upserts by frontmatter `id` — existing notes
+ * updated in place, new notes created.
+ *
+ * Restoration order (matters for forward refs):
+ *   1. Tag schemas (so notes with schema-bearing tags validate cleanly).
+ *   2. Notes — content/path/metadata/tags. Use `restoreNoteTimestamps`
+ *      after create so created_at AND updated_at land at their exported
+ *      values (regular createNote sets updated_at = created_at).
+ *   3. Typed links — only now that all target notes exist (forward-ref
+ *      pattern). Wikilinks rebuild themselves from `[[brackets]]` in
+ *      content via the existing `syncAllWikilinks` pass.
+ *   4. Attachments — DB row first, then file copy from sidecar to
+ *      `<assetsDir>/<path>` when `assetsDir` is wired.
+ *
+ * See vault#308 PR 2.
+ */
+export async function importPortableVault(
+  store: Store,
+  opts: ImportOptions,
+): Promise<ImportStats> {
+  const inDir = opts.inDir;
+  const inDirResolved = resolvePath(inDir);
+  const sidecar = join(inDir, SIDECAR_DIR);
+  if (!existsSync(join(sidecar, "vault.yaml"))) {
+    throw new Error(
+      `not a portable-md export: missing ${join(SIDECAR_DIR, "vault.yaml")} in "${inDir}". ` +
+      `If this is a legacy Obsidian-shape directory, use the obsidian.ts \`parseObsidianVault\` ` +
+      `path instead — vault#308 importer only handles the portable-md format.`,
+    );
+  }
+
+  const stats: ImportStats = {
+    notes_created: 0,
+    notes_updated: 0,
+    schemas_restored: 0,
+    links_restored: 0,
+    attachments_restored: 0,
+    skipped_links: [],
+    skipped_attachments: [],
+    notes_wiped: 0,
+  };
+
+  // 1. Optional wipe. Notes are deleted via the public Store API so
+  // hooks fire (callers depend on `attachment.deleted` hooks for
+  // assets-dir cleanup; we don't bypass that on blow-away).
+  if (opts.blowAway && !opts.dryRun) {
+    const existing = await store.queryNotes({ limit: 1_000_000 });
+    for (const note of existing) {
+      await store.deleteNote(note.id);
+    }
+    stats.notes_wiped = existing.length;
+    // Clear tag rows too — `deleteNote` clears note_tags via FK cascade
+    // but leaves the `tags` table rows in place (orphaned schemas).
+    const tagRecords = await store.listTagRecords();
+    for (const tag of tagRecords) {
+      await store.deleteTag(tag.tag);
+    }
+  }
+
+  // 2. Tag schemas — restore before notes so any tag a note carries can
+  // validate against its schema on insert.
+  const schemasDir = join(sidecar, "schemas");
+  if (existsSync(schemasDir)) {
+    for (const entry of readdirSync(schemasDir)) {
+      if (!entry.endsWith(".yaml")) continue;
+      const fullPath = join(schemasDir, entry);
+      // Path-traversal guard on the read side: refuse to follow a
+      // symlink out of the sidecar (the readdirSync already only
+      // surfaces names; this is belt-and-suspenders).
+      const resolved = resolvePath(fullPath);
+      if (!isWithinDir(resolved, resolvePath(schemasDir))) continue;
+      const text = readFileSync(fullPath, "utf-8");
+      // Reuse the frontmatter parser by wrapping the doc in `---`s.
+      // The schema file is a YAML doc (no `---` markers); pad with them
+      // so `parseFrontmatter` can chew on it via the same code path.
+      const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+      const { frontmatter } = parseFrontmatter(wrapped);
+      const tagName = typeof frontmatter.name === "string" ? frontmatter.name : null;
+      if (!tagName) continue;
+      if (opts.dryRun) {
+        stats.schemas_restored++;
+        continue;
+      }
+      await store.upsertTagRecord(tagName, {
+        description: (frontmatter.description as string | null | undefined) ?? null,
+        fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
+        relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
+        parent_names: (frontmatter.parent_names as string[] | null | undefined) ?? null,
+      });
+      stats.schemas_restored++;
+    }
+  }
+
+  // 3. Notes. Walk every .md file under inDir (dot-dirs already
+  // excluded), parse, upsert.
+  // Track per-import (id → portable) so we can replay typed links
+  // after all notes exist.
+  const seenNotes = new Map<string, PortableNote>();
+  for (const filePath of walkMarkdownFiles(inDir)) {
+    // Containment check — readdirSync should already be safe, but
+    // verify the resolved path is inside inDir (symlinks).
+    const resolved = resolvePath(filePath);
+    if (!isWithinDir(resolved, inDirResolved)) continue;
+
+    const raw = readFileSync(filePath, "utf-8");
+    const { frontmatter, content } = parseFrontmatter(raw);
+
+    const id = typeof frontmatter.id === "string" ? frontmatter.id : null;
+    if (!id) {
+      // No `id` → legacy obsidian-style note. Skip with a warning; the
+      // importer is for the portable-md format, the legacy path stays
+      // on the obsidian.ts parseObsidianVault flow.
+      // eslint-disable-next-line no-console
+      console.warn(`[import] skipped "${filePath}": no \`id\` in frontmatter (legacy obsidian format — use parseObsidianVault)`);
+      continue;
+    }
+    const created_at = typeof frontmatter.created_at === "string" ? frontmatter.created_at : new Date().toISOString();
+    const updated_at = typeof frontmatter.updated_at === "string" ? frontmatter.updated_at : created_at;
+    const path = typeof frontmatter.path === "string" ? frontmatter.path : undefined;
+    const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags.filter((t): t is string => typeof t === "string") : undefined;
+    const metadata = (frontmatter.metadata && typeof frontmatter.metadata === "object" && !Array.isArray(frontmatter.metadata))
+      ? frontmatter.metadata as Record<string, unknown>
+      : undefined;
+    const links = Array.isArray(frontmatter.links) ? frontmatter.links : undefined;
+    const attachments = Array.isArray(frontmatter.attachments) ? frontmatter.attachments : undefined;
+
+    const portable: PortableNote = {
+      id,
+      content,
+      created_at,
+      updated_at,
+      ...(path ? { path } : {}),
+      ...(tags && tags.length > 0 ? { tags } : {}),
+      ...(metadata ? { metadata } : {}),
+      ...(links ? { links: links as PortableLink[] } : {}),
+      ...(attachments ? { attachments: attachments as PortableAttachmentRef[] } : {}),
+    };
+    seenNotes.set(id, portable);
+
+    if (opts.dryRun) {
+      const existing = await store.getNote(id);
+      if (existing) stats.notes_updated++; else stats.notes_created++;
+      continue;
+    }
+
+    // Upsert by id. createNote will throw on duplicate id; check first.
+    const existing = await store.getNote(id);
+    if (existing) {
+      // **Upsert merge policy** (vault#319 F2 — pinned here so future
+      // edits don't drift):
+      //
+      //   - `content`:   ALWAYS replaced from the import. (Required —
+      //                  the import always has content, even if empty
+      //                  string, and that's the unambiguous source of
+      //                  truth on a non-blow-away upsert.)
+      //   - `tags`:      REPLACED WHOLESALE — existing tags removed,
+      //                  imported set applied. The export is the source
+      //                  of truth for the current tag set.
+      //   - `path`:      REPLACED if the frontmatter declares one;
+      //                  otherwise the existing vault path is preserved.
+      //                  This is upsert-by-field, NOT replace-by-id: a
+      //                  note that lost its path before export keeps the
+      //                  vault's existing path on a non-blow-away
+      //                  import.
+      //   - `metadata`:  REPLACED if the frontmatter declares one;
+      //                  otherwise existing metadata is preserved. Same
+      //                  upsert-by-field asymmetry as `path`.
+      //
+      // For a strict replace-by-id ("the vault should look exactly like
+      // the export, no surviving fields"), use `--blow-away`. The
+      // wipe-first-replay-from-export path drops every row and rebuilds,
+      // so absent fields can't survive.
+      //
+      // Store-level updateNote has no `if_updated_at` set → always
+      // succeeds (precondition gate lives at the HTTP/MCP layer; the
+      // Store accepts unconditional writes from importer/internal
+      // callers).
+      await store.updateNote(id, {
+        content,
+        ...(path !== undefined ? { path } : {}),
+        ...(metadata ? { metadata } : {}),
+      });
+      // Tags: delete existing, re-tag with imported set.
+      if (existing.tags && existing.tags.length > 0) {
+        await store.untagNote(id, existing.tags);
+      }
+      if (tags && tags.length > 0) {
+        await store.tagNote(id, tags);
+      }
+      stats.notes_updated++;
+    } else {
+      await store.createNote(content, {
+        id,
+        ...(path ? { path } : {}),
+        ...(tags && tags.length > 0 ? { tags } : {}),
+        ...(metadata ? { metadata } : {}),
+        created_at,
+      });
+      stats.notes_created++;
+    }
+    // Restore both timestamps explicitly. Two reasons:
+    //   1. createNote sets updated_at = created_at; we want the
+    //      exported updated_at (may differ if the note was edited).
+    //   2. update path bumped updated_at to now(); we want to peg it
+    //      back to the exported value.
+    await store.restoreNoteTimestamps(id, created_at, updated_at);
+  }
+
+  // 4. Typed links — replay only now that all notes exist. Wikilinks
+  // (which the exporter excludes from `links:`) rebuild from
+  // content brackets via syncAllWikilinks (a callable Store method).
+  for (const [sourceId, portable] of seenNotes) {
+    if (!portable.links) continue;
+    for (const link of portable.links) {
+      // Confirm target exists. Forward refs to notes the export
+      // didn't include (subset export) are skipped with a warning
+      // rather than aborting.
+      const target = await store.getNote(link.target);
+      if (!target) {
+        stats.skipped_links.push({
+          source_id: sourceId,
+          target_id: link.target,
+          relationship: link.relationship,
+          reason: `target note ${link.target} not present in vault after import`,
+        });
+        continue;
+      }
+      if (opts.dryRun) {
+        stats.links_restored++;
+        continue;
+      }
+      await store.createLink(sourceId, link.target, link.relationship, link.metadata);
+      stats.links_restored++;
+    }
+  }
+
+  // 5. Attachments — DB row then file copy (when assetsDir wired).
+  // Skip the file-copy phase when assetsDir isn't set; the DB row still
+  // restores so callers operating without an assetsDir keep parity.
+  const assetsDirResolved = opts.assetsDir ? resolvePath(opts.assetsDir) : undefined;
+  const attachmentsRootResolved = resolvePath(join(sidecar, "attachments"));
+  for (const [noteId, portable] of seenNotes) {
+    if (!portable.attachments) continue;
+    for (const att of portable.attachments) {
+      if (opts.dryRun) {
+        stats.attachments_restored++;
+        continue;
+      }
+      // DB row first so the path column matches the export. The store's
+      // generateId() would mint a fresh id; we need to preserve the
+      // exported att.id so downstream refs (note frontmatter, other
+      // tools) stay stable. Use a direct route — see comment.
+      //
+      // The public addAttachment generates a fresh id. To preserve the
+      // exported id we need a low-level path; there isn't one in the
+      // Store interface today. Workaround: addAttachment, then update
+      // the row's id via the DB if the Store is a SqliteStore.
+      // TODO: surface a `restoreAttachment(id, noteId, path, mimeType, metadata, createdAt)`
+      // import-only method on the Store interface (parallel to
+      // restoreNoteTimestamps). For now, attachment ids are
+      // re-minted on import — this is a known PR-2-scope limitation
+      // documented in CHANGELOG. Frontmatter refs still resolve by
+      // (note_id, path) tuple on a round-trip; only the att.id values
+      // change. Mark in skipped_attachments? No — the data is there.
+      //
+      // The exporter writes `attachments` keyed by exported att.id;
+      // a round-trip where ids change will produce a byte-different
+      // export (different att.id values). PR 2 round-trip test
+      // therefore can't claim byte-equivalent attachment ids in the
+      // first version — call this out in CHANGELOG.
+      const attachment = await store.addAttachment(
+        noteId,
+        att.path,
+        att.mime_type,
+        att.metadata,
+      );
+
+      // File copy: from sidecar to assetsDir.
+      if (assetsDirResolved) {
+        // Source: .parachute/attachments/<exported-att-id>/<basename>.
+        // Use the EXPORTED id from the frontmatter — that's what the
+        // exporter wrote, even though our newly-created DB row has a
+        // fresh `attachment.id`.
+        const srcFile = join(sidecar, "attachments", att.id, basename(att.path));
+        const srcResolved = resolvePath(srcFile);
+        if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
+          stats.skipped_attachments.push({
+            note_id: noteId,
+            attachment_id: attachment.id,
+            reason: `path-traversal on source: "${srcResolved}" escapes attachments root`,
+          });
+          continue;
+        }
+        if (!existsSync(srcResolved)) {
+          stats.skipped_attachments.push({
+            note_id: noteId,
+            attachment_id: attachment.id,
+            reason: `source attachment file missing at "${srcResolved}"`,
+          });
+          continue;
+        }
+        const destFile = join(assetsDirResolved, att.path);
+        const destResolved = resolvePath(destFile);
+        if (!isWithinDir(destResolved, assetsDirResolved)) {
+          stats.skipped_attachments.push({
+            note_id: noteId,
+            attachment_id: attachment.id,
+            reason: `path-traversal on dest: "${destResolved}" escapes assetsDir`,
+          });
+          continue;
+        }
+        mkdirSync(dirname(destResolved), { recursive: true });
+        copyFileSync(srcResolved, destResolved);
+      }
+      stats.attachments_restored++;
+    }
+  }
+
+  // 6. Sync wikilinks across the imported set so `[[brackets]]` in
+  // content rebuild link rows for the imported notes.
+  if (!opts.dryRun) {
+    await store.syncAllWikilinks();
+  }
+
+  return stats;
 }
 
 // ---------------------------------------------------------------------------
