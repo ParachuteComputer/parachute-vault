@@ -2998,6 +2998,71 @@ describe("HTTP PATCH /notes/:idOrPath if_missing=create (vault#309)", async () =
     const body = await res.json() as any;
     expect(body.created).toBe(false);
   });
+
+  // vault#321 F2 — REST create-on-missing branch applies links.add.
+  // MCP's create branch already did; REST was missing the
+  // link-creation pass entirely. Cross-surface inconsistency Gitcoin
+  // would trip on if they migrated from MCP to REST. The new pass
+  // mirrors MCP exactly (links.add applied, links.remove ignored,
+  // missing targets skip silently).
+  test("if_missing=create + links.add creates typed-link rows (vault#321 F2)", async () => {
+    // Two pre-existing target notes (different ids + paths) so the
+    // source can fan out to both.
+    await store.createNote("target A", { id: "t-a-321", path: "Targets/A" });
+    await store.createNote("target B", { id: "t-b-321", path: "Targets/B" });
+
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${encodeURIComponent("Inbox/source-321")}`, {
+        content: "source body",
+        if_missing: "create",
+        links: {
+          add: [
+            { target: "t-a-321", relationship: "derived-from" },
+            { target: "Targets/B", relationship: "responds-to", metadata: { weight: 5 } },
+          ],
+        },
+      }),
+      store,
+      `/${encodeURIComponent("Inbox/source-321")}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+
+    // Link rows exist + resolved targets correctly. We look up by the
+    // source's note id (the body returned by the create branch).
+    const sourceId = body.id as string;
+    const outboundLinks = await store.getLinks(sourceId, { direction: "outbound" });
+    const derivedFrom = outboundLinks.find((l) => l.relationship === "derived-from");
+    expect(derivedFrom).toBeDefined();
+    expect(derivedFrom!.targetId).toBe("t-a-321");
+
+    const respondsTo = outboundLinks.find((l) => l.relationship === "responds-to");
+    expect(respondsTo).toBeDefined();
+    expect(respondsTo!.targetId).toBe("t-b-321");
+    expect(respondsTo!.metadata).toEqual({ weight: 5 });
+  });
+
+  test("if_missing=create + links.add silently skips when target does not exist (vault#321 F2)", async () => {
+    // Mirrors MCP: missing target → silent skip, no error. Sync loops
+    // that declare links to not-yet-imported notes shouldn't abort
+    // the whole upsert.
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${encodeURIComponent("Inbox/source-missing-321")}`, {
+        content: "x",
+        if_missing: "create",
+        links: { add: [{ target: "does-not-exist", relationship: "derived-from" }] },
+      }),
+      store,
+      `/${encodeURIComponent("Inbox/source-missing-321")}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+    // The note is created. No links resolved.
+    const links = await store.getLinks(body.id, { direction: "outbound" });
+    expect(links.filter((l) => l.relationship === "derived-from")).toHaveLength(0);
+  });
 });
 
 describe("HTTP /tags", async () => {

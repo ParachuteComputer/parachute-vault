@@ -893,6 +893,26 @@ export async function handleNotes(
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
           }
+          // vault#321 F2 — apply `links.add` on the create branch.
+          // MCP's create-on-missing branch already did this
+          // (`core/src/mcp.ts` if_missing=create block); the REST side
+          // was missing it, producing a cross-surface inconsistency
+          // operators (Gitcoin's drift sync) would trip on. Mirror the
+          // MCP recipe exactly:
+          //   - `links.add` IS applied — drift sync can declare typed
+          //     links at upsert time and have them materialize.
+          //   - `links.remove` is ignored (nothing to remove on a
+          //     fresh note).
+          //   - Missing target notes skip silently (mirrors MCP).
+          const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+          if (linksAdd) {
+            for (const link of linksAdd) {
+              const target = await resolveNote(store, link.target);
+              if (target) {
+                await store.createLink(created.id, target.id, link.relationship, link.metadata);
+              }
+            }
+          }
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared" }, 500);
           const validated = attachValidationStatus(store, db, final);
