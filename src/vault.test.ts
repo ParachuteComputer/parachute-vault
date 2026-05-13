@@ -2926,6 +2926,80 @@ describe("HTTP POST /notes — validation_status attachment (vault#287)", async 
   });
 });
 
+// vault#309 — HTTP PATCH /notes/:id with if_missing: "create" mirrors
+// the MCP update-note path. Sync loops (Gitcoin Brain et al) use this
+// for idempotent upsert without a separate query-first round trip.
+
+describe("HTTP PATCH /notes/:idOrPath if_missing=create (vault#309)", async () => {
+  test("missing note + if_missing=create creates and returns created: true", async () => {
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${encodeURIComponent("Inbox/m309a")}`, {
+        content: "agenda body",
+        tags: ["meeting309"],
+        metadata: { priority: "high" },
+        if_missing: "create",
+      }),
+      store,
+      `/${encodeURIComponent("Inbox/m309a")}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+    expect(body.path).toBe("Inbox/m309a");
+    expect(body.content).toBe("agenda body");
+    expect(body.tags).toContain("meeting309");
+    expect(body.metadata.priority).toBe("high");
+    // And the row landed.
+    expect(await store.getNoteByPath("Inbox/m309a")).not.toBeNull();
+  });
+
+  test("existing note + if_missing=create updates and returns created: false", async () => {
+    await store.createNote("original", { path: "m309b", metadata: { v: 1 } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/m309b", {
+        content: "updated body",
+        metadata: { v: 2 },
+        if_missing: "create",
+        force: true,
+      }),
+      store,
+      "/m309b",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(false);
+    expect(body.content).toBe("updated body");
+    expect(body.metadata.v).toBe(2);
+  });
+
+  test("missing note without if_missing returns 404 (back-compat)", async () => {
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/m309c-nope", {
+        content: "x",
+        force: true,
+      }),
+      store,
+      "/m309c-nope",
+    );
+    expect(res.status).toBe(404);
+  });
+
+  test("regular update path now also carries created: false (response shape extended)", async () => {
+    await store.createNote("body", { path: "m309d" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/m309d", {
+        content: "new body",
+        force: true,
+      }),
+      store,
+      "/m309d",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(false);
+  });
+});
+
 describe("HTTP /tags", async () => {
   test("GET /tags lists all tags", async () => {
     await store.createNote("A", { tags: ["daily"] });

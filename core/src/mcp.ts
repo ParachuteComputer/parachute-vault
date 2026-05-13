@@ -469,6 +469,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
 - **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).
+- **Idempotent upsert via \`if_missing: "create"\`** — when the note doesn't exist, create it from this same payload (content/path/tags/metadata become the create fields; OC precondition skipped — nothing to conflict with). Response carries \`created: true\`. Useful for nightly sync loops that don't know ahead of time whether the note exists. Default \`"fail"\` (current behavior — missing note errors). See vault#309.
 - \`include_content\` (default \`true\`) — set \`false\` to receive a lean index shape (\`id\`, \`path\`, \`createdAt\`, \`updatedAt\`, \`tags\`, \`metadata\`, \`byteSize\`, \`preview\`) instead of full content. Useful for agents making frequent small edits to large notes (e.g. via \`append\` or \`content_edit\`) where re-receiving the body is the dominant cost. \`validation_status\` is preserved on the lean shape when present.`,
       inputSchema: {
         type: "object",
@@ -491,6 +492,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           created_at: { type: "string", description: "New created_at timestamp" },
           if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
           force: { type: "boolean", description: "Override the required `if_updated_at` check and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe." },
+          if_missing: { type: "string", enum: ["fail", "create"], description: "What to do when the note (by `id`/path) doesn't exist. `\"fail\"` (default) — error, current behavior. `\"create\"` — create the note from this same payload (content/path/tags/metadata become the create fields; the response carries `created: true`). Skips the `if_updated_at` precondition on the create branch (nothing to conflict with). Idempotent for sync loops that don't know ahead of time whether the note exists. See vault#309." },
           tags: {
             type: "object",
             properties: {
@@ -554,6 +556,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                 created_at: { type: "string" },
                 if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item or the item is `append`/`prepend`-only." },
                 force: { type: "boolean", description: "Override the required `if_updated_at` check for this item." },
+                if_missing: { type: "string", enum: ["fail", "create"], description: "Per-item: see top-level `if_missing` docs. Each batch item carries its own setting." },
                 tags: { type: "object" },
                 links: { type: "object" },
               },
@@ -572,6 +575,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         }
 
         const updated: Note[] = [];
+        // Track which note IDs were freshly created via `if_missing: "create"`
+        // so the response can carry `created: true|false` per-note. The
+        // sync-loop caller (Gitcoin Brain et al) reads this to know which
+        // path fired without doing a separate query. vault#309.
+        const createdIds = new Set<string>();
         // Wrap multi-item batches in a SQLite transaction so any mid-batch
         // failure (precondition error, content_edit miss, ConflictError, …)
         // rolls back every prior mutation in the batch — see #236.
@@ -581,7 +589,77 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         if (batched) db.exec("BEGIN");
         try {
         for (const item of items) {
-          const note = requireNote(db, item.id as string);
+          // Try ID-then-path resolve. If not found AND
+          // `if_missing: "create"` is set, fall through to the create
+          // branch using this same item's payload. Otherwise mirror the
+          // existing `requireNote` behavior (throw "Note not found").
+          // vault#309.
+          const resolved = resolveNote(db, item.id as string);
+          if (!resolved) {
+            if (item.if_missing === "create") {
+              // Treat the update payload as a create payload. Minimum:
+              // content OR a path/id (something the createNote-empty-row
+              // invariant accepts). createNote enforces its own
+              // not-both-empty check — we leave that to the Store and
+              // surface any error to the caller verbatim.
+              //
+              // Field mapping (mirrors the create-note tool surface):
+              //   - `item.id` → both the note's `id` AND a fallback
+              //     `path` when `item.path` isn't set. Treating `id` as
+              //     the path-or-id lookup key matches Gitcoin's nightly
+              //     sync shape where the canonical key is a path string
+              //     like "Inbox/2026-05-13-meeting". If the caller
+              //     supplied an opaque ULID as `id` and no `path`, we
+              //     still create with that as `id` (path stays null).
+              //   - `item.content` / `item.path` / `item.tags` /
+              //     `item.metadata` / `item.created_at` → forwarded.
+              //   - `if_updated_at` / `force` / `content_edit` /
+              //     `append` / `prepend` / `links` are
+              //     update-only — silently ignored on the create branch.
+              //     (Content-edit on a non-existent note is a nonsense
+              //     combination; the caller's intent on missing-note is
+              //     "create the row", not "patch in this section".)
+              const idOrPath = item.id as string;
+              // Heuristic: if `path` isn't set AND the `id` looks like a
+              // path (contains "/" or doesn't match a typical opaque-id
+              // shape), use it as the path too. Otherwise treat it as a
+              // pure id. The shared `id` field for update is ID-or-path
+              // already (see `resolveNote`), so this preserves the
+              // caller's intent.
+              const idLooksLikePath = idOrPath.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPath);
+              const explicitPath = typeof item.path === "string" ? item.path as string : undefined;
+              const createOpts: Parameters<Store["createNote"]>[1] = {
+                ...(idLooksLikePath ? { path: explicitPath ?? idOrPath } : { id: idOrPath, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
+                ...(item.tags && Array.isArray((item.tags as any).add)
+                  ? { tags: (item.tags as any).add as string[] }
+                  : Array.isArray(item.tags)
+                    ? { tags: item.tags as string[] }
+                    : {}),
+                ...(item.metadata !== undefined ? { metadata: item.metadata as Record<string, unknown> } : {}),
+                ...(item.created_at !== undefined ? { created_at: item.created_at as string } : {}),
+              };
+              const content = (item.content as string | undefined) ?? "";
+              const created = await store.createNote(content, createOpts);
+              await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
+              // Apply links.add if the caller declared any.
+              const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+              if (linksAdd) {
+                for (const link of linksAdd) {
+                  const target = resolveNote(db, link.target);
+                  if (target) await store.createLink(created.id, target.id, link.relationship, link.metadata);
+                }
+              }
+              const fresh = noteOps.getNote(db, created.id) ?? created;
+              updated.push(fresh);
+              createdIds.add(fresh.id);
+              continue;
+            }
+            // Fallthrough: not-found + no if_missing → existing error
+            // contract. Match `requireNote`'s message shape so existing
+            // callers see no behavior change.
+            throw new Error(`Note not found: "${item.id}"`);
+          }
+          const note = resolved;
 
           // --- Validate mutual exclusion of content modes ---
           const hasContent = item.content !== undefined;
@@ -745,14 +823,21 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // Response shape: full Note (back-compat default) or lean NoteIndex
         // (#285 friction point 2.response — opt-out for callers making
         // frequent small edits to large notes). `validation_status` from
-        // `tags.fields` is preserved across either shape.
+        // `tags.fields` is preserved across either shape. `created: true|false`
+        // (vault#309) is attached to every response so callers using
+        // `if_missing: "create"` can tell which branch fired without a
+        // separate query. `false` for the (overwhelmingly common) update
+        // path; `true` only when this call took the create-on-missing
+        // branch.
         const includeContent = params.include_content !== false;
         const final = updated.map((n) => {
           const validated = attachValidationStatus(store, db, n);
-          if (includeContent) return validated;
+          const created = createdIds.has(n.id);
+          if (includeContent) return { ...validated, created } as Note & { created: boolean };
           const lean: any = noteOps.toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
+          lean.created = created;
           return lean;
         });
         return batch ? final : final[0];

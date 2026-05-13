@@ -3681,6 +3681,122 @@ describe("schema validation (tags.fields)", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// update-note `if_missing: "create"` — idempotent upsert (vault#309)
+// ---------------------------------------------------------------------------
+
+describe("update-note if_missing=create (vault#309)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("creates the note when missing + carries created: true", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/2026-05-13-meeting",
+      content: "agenda body",
+      tags: ["meeting"],
+      metadata: { priority: "high" },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.path).toBe("Inbox/2026-05-13-meeting");
+    expect(result.content).toBe("agenda body");
+    expect(result.tags).toContain("meeting");
+    expect(result.metadata?.priority).toBe("high");
+
+    // And the row landed.
+    const fetched = await store.getNoteByPath("Inbox/2026-05-13-meeting");
+    expect(fetched).not.toBeNull();
+  });
+
+  it("updates the note when present + carries created: false", async () => {
+    await store.createNote("original", { path: "p", metadata: { v: 1 } });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "p",
+      content: "updated body",
+      metadata: { v: 2 },
+      if_missing: "create",
+      force: true, // bypass OC since this is an unconditional update
+    }) as any;
+    expect(result.created).toBe(false);
+    expect(result.content).toBe("updated body");
+    expect(result.metadata?.v).toBe(2);
+  });
+
+  it("without if_missing, missing note errors (current behavior — back-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    await expect(update.execute({
+      id: "nope",
+      content: "x",
+      force: true,
+    })).rejects.toThrow(/Note not found/);
+  });
+
+  it("create branch applies tag-schema defaults when the new tag declares fields", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/new-task",
+      content: "do the thing",
+      tags: ["task"],
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    // Schema defaults populated metadata.priority on insert.
+    expect(result.metadata?.priority).toBeDefined();
+  });
+
+  it("create branch surfaces validation warnings just like create-note", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/bad-task",
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  it("idempotent: second call with same id + same content updates without error", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const first = await update.execute({
+      id: "Inbox/sync-target",
+      content: "v1",
+      if_missing: "create",
+    }) as any;
+    expect(first.created).toBe(true);
+
+    const second = await update.execute({
+      id: "Inbox/sync-target",
+      content: "v2",
+      if_missing: "create",
+      force: true,
+    }) as any;
+    expect(second.created).toBe(false);
+    expect(second.content).toBe("v2");
+
+    // Only one row exists.
+    const all = await store.queryNotes({ limit: 100 });
+    expect(all.filter((n) => n.path === "Inbox/sync-target")).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Schema inheritance via parent_names + `_default` universal parent — vault#270
 // ---------------------------------------------------------------------------
 
