@@ -14,6 +14,7 @@
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE } from "../core/src/notes.ts";
+import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import {
@@ -733,7 +734,13 @@ export async function handleNotes(
         }
       }
 
-      return json(body.notes ? created : created[0], 201);
+      // Attach `validation_status` so HTTP create-note matches the MCP
+      // surface (vault#287). Mirrors the MCP create-note attach site at
+      // `core/src/mcp.ts:451`. `attachValidationStatus` returns the note
+      // unchanged when no tag declares fields, so vaults without any tag
+      // schemas see no behavior change.
+      const final = created.map((n) => attachValidationStatus(store, db, n));
+      return json(body.notes ? final : final[0], 201);
     }
 
     return json({ error: "Method not allowed" }, 405);
@@ -1019,11 +1026,20 @@ export async function handleNotes(
       // Response shape: full Note (back-compat default) or lean NoteIndex
       // (vault#285 friction point 2.response — opt-out for callers making
       // frequent small edits to large notes). Mirror the MCP `update-note`
-      // `include_content` knob exactly.
+      // `include_content` knob exactly, *and* `validation_status` attachment
+      // (vault#287) so HTTP and MCP consumers see the same schema-validation
+      // signal. Recipe matches `core/src/mcp.ts:751` — attach to the full
+      // Note first, then carry the field across the lean conversion (since
+      // `toNoteIndex` drops unknown fields).
       const updatedNote = await store.getNote(note.id);
       if (updatedNote === null) return json({ error: "Note disappeared" }, 404);
+      const validated = attachValidationStatus(store, db, updatedNote);
       const includeContentResp = body.include_content !== false;
-      return json(includeContentResp ? updatedNote : toNoteIndex(updatedNote));
+      if (includeContentResp) return json(validated);
+      const lean: any = toNoteIndex(validated);
+      const vs = (validated as any).validation_status;
+      if (vs !== undefined) lean.validation_status = vs;
+      return json(lean);
     } catch (e: any) {
       if (e instanceof NotFoundError) return json({ error: e.message }, 404);
       // Duck-type on `code` rather than `instanceof ConflictError`: this
