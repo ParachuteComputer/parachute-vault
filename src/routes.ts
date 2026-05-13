@@ -854,15 +854,64 @@ export async function handleNotes(
   // PATCH /notes/:idOrPath — update (content, path, metadata, tags, links)
   if (method === "PATCH") {
     try {
+      // Body is parsed up front so the `if_missing: "create"` branch
+      // (vault#309) can fire when the note doesn't exist. Pre-#309
+      // shape parsed the body only after the not-found check.
+      const body = await req.json() as any;
       const note = await resolveNote(store, idOrPath);
-      if (!note) throw new NotFoundError(`Note not found: "${idOrPath}"`);
+      if (!note) {
+        // vault#309 — `if_missing: "create"` turns this PATCH into a
+        // create using the same payload. POST /notes is the canonical
+        // create surface, but supporting it inline on PATCH lets sync
+        // loops use one endpoint for both branches. Returns the
+        // created note with `created: true` and HTTP 200 (not 201 —
+        // the response shape is "the note as it now exists," same
+        // contract as the update path; `created: true` carries the
+        // signal).
+        if (body.if_missing === "create") {
+          const idOrPathStr = idOrPath;
+          // Tag-scope check on the create branch: the prospective
+          // tag set must still satisfy scope. Compute from body.tags
+          // (create-shape: an array, not the {add,remove} dict).
+          const tagsArr = Array.isArray(body.tags)
+            ? body.tags as string[]
+            : Array.isArray(body.tags?.add) ? body.tags.add as string[] : [];
+          if (tagScope.allowed && !tagsWithinScope(tagsArr, tagScope.allowed, tagScope.raw)) {
+            return tagScopeForbidden(tagScope.raw ?? []);
+          }
+          const idLooksLikePath = idOrPathStr.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPathStr);
+          const explicitPath = typeof body.path === "string" ? body.path as string : undefined;
+          const createOpts: Parameters<Store["createNote"]>[1] = {
+            ...(idLooksLikePath ? { path: explicitPath ?? idOrPathStr } : { id: idOrPathStr, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
+            ...(tagsArr.length > 0 ? { tags: tagsArr } : {}),
+            ...(body.metadata !== undefined ? { metadata: body.metadata as Record<string, unknown> } : {}),
+            ...(body.created_at !== undefined ? { created_at: body.created_at as string } : {}),
+            ...(body.createdAt !== undefined ? { created_at: body.createdAt as string } : {}),
+          };
+          const content = (body.content as string | undefined) ?? "";
+          const created = await store.createNote(content, createOpts);
+          if (tagsArr.length > 0) {
+            await applySchemaDefaults(store, db, [created.id], tagsArr);
+          }
+          const final = await store.getNote(created.id);
+          if (!final) return json({ error: "Note disappeared" }, 500);
+          const validated = attachValidationStatus(store, db, final);
+          const includeContentResp = body.include_content !== false;
+          if (includeContentResp) return json({ ...validated, created: true });
+          const lean: any = toNoteIndex(validated);
+          const vs = (validated as any).validation_status;
+          if (vs !== undefined) lean.validation_status = vs;
+          lean.created = true;
+          return json(lean);
+        }
+        throw new NotFoundError(`Note not found: "${idOrPath}"`);
+      }
       // Tag-scope: existing note must be in scope. Mirror the read-side
       // 404-not-403 stance — a token can't see (and therefore can't
       // discover-then-modify) notes outside its allowlist.
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         throw new NotFoundError(`Note not found: "${idOrPath}"`);
       }
-      const body = await req.json() as any;
       // Tag-scope: post-update tag set must still satisfy scope. Compute
       // the prospective tag set (existing − removed + added) and reject
       // before any write if it would drift outside the allowlist. This
@@ -1035,10 +1084,15 @@ export async function handleNotes(
       if (updatedNote === null) return json({ error: "Note disappeared" }, 404);
       const validated = attachValidationStatus(store, db, updatedNote);
       const includeContentResp = body.include_content !== false;
-      if (includeContentResp) return json(validated);
+      // `created: false` is appended to every update-path response so
+      // sync-loop callers using `if_missing: "create"` can distinguish
+      // the two branches without a separate query (vault#309). The
+      // create-branch response above carries `created: true`.
+      if (includeContentResp) return json({ ...validated, created: false });
       const lean: any = toNoteIndex(validated);
       const vs = (validated as any).validation_status;
       if (vs !== undefined) lean.validation_status = vs;
+      lean.created = false;
       return json(lean);
     } catch (e: any) {
       if (e instanceof NotFoundError) return json({ error: e.message }, 404);

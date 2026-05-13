@@ -47,7 +47,17 @@ import { Database } from "bun:sqlite";
 // ---------------------------------------------------------------------------
 
 export interface SchemaField {
-  type?: "string" | "number" | "boolean" | "array" | "object";
+  /**
+   * Declared type for the field's metadata value. `"integer"` is distinct
+   * from `"number"` only at validation time — JSON has no separate integer
+   * type, so a JSON number with zero fractional part (`5`, `5.0`,
+   * `Number.isInteger(n) === true`) is accepted as integer and a non-zero
+   * fractional value (`5.5`) is rejected. This matches the indexed-fields
+   * `"integer"` storage type (TYPE_MAP) and removes the false-positive
+   * `type_mismatch` warning that previously fired on every integer-shaped
+   * field because the validator had no `"integer"` case. See vault#310.
+   */
+  type?: "string" | "number" | "integer" | "boolean" | "array" | "object";
   enum?: string[];
   description?: string;
 }
@@ -270,6 +280,14 @@ function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
       return typeof value === "string";
     case "number":
       return typeof value === "number" && Number.isFinite(value);
+    case "integer":
+      // JSON has no separate integer type — `5.0` and `5` decode to the
+      // same JS Number. Accept any finite Number whose fractional part is
+      // zero; reject `5.5`, `NaN`, `Infinity`, and non-Number types.
+      // vault#310 (Gitcoin Brain drift detector emits JSON for diffs;
+      // without this case, every integer-typed field warned
+      // `type_mismatch` and buried the real warnings).
+      return typeof value === "number" && Number.isInteger(value);
     case "boolean":
       return typeof value === "boolean";
     case "array":

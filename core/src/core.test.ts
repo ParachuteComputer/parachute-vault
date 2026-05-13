@@ -3678,6 +3678,238 @@ describe("schema validation (tags.fields)", async () => {
     const result = await create.execute({ content: "x", tags: ["task"] }) as any;
     expect(result.validation_status).toBeUndefined();
   });
+
+  // vault#310 — integer type validation. JSON has no separate integer
+  // type, so a JSON number with zero fractional part (`5`, `5.0`) must
+  // pass an `integer`-typed field. Pre-fix, the validator had no
+  // `"integer"` case at all — falling through the switch returned
+  // undefined and every integer-typed field warned `type_mismatch` on
+  // legitimate values. Gitcoin Brain's drift detector emits JSON for
+  // diffs; every `kpi: 3` triggered the false-positive and buried the
+  // real warnings.
+
+  it("integer-typed field: JSON integer (5) passes (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5 },
+    }) as any;
+    expect(result.validation_status?.warnings ?? []).toEqual([]);
+  });
+
+  it("integer-typed field: JSON `5.0` (zero-fractional) passes (vault#310)", async () => {
+    // 5.0 is the canonical Gitcoin shape — JSON.parse decodes the
+    // emitted JSON number as a JS Number; the JS Number for `5.0` is
+    // identical to `5` so Number.isInteger reports true. This is the
+    // load-bearing assertion for the Gitcoin drift-detector use case.
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.0 },
+    }) as any;
+    expect(result.validation_status?.warnings ?? []).toEqual([]);
+  });
+
+  it("integer-typed field: JSON `5.5` (non-zero fractional) warns type_mismatch (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.5 },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("count");
+  });
+
+  it("integer-typed field: string `\"5\"` warns type_mismatch (no string→number coercion) (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: "5" },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  it("integer-typed field: edge `5.0000000000001` warns type_mismatch (vault#310)", async () => {
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: 5.0000000000001 },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  it("integer-typed field: boolean warns type_mismatch (vault#310)", async () => {
+    // Pin that boolean is rejected (Number.isInteger(true) returns
+    // false, but extra coverage in case anyone "improves" the check
+    // with a looser predicate later).
+    await store.upsertTagSchema("kpi", { fields: { count: { type: "integer" } } });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "x",
+      tags: ["kpi"],
+      metadata: { count: true },
+    }) as any;
+    expect(result.validation_status.warnings.length).toBe(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+  });
+
+  // Note on NaN/Infinity: those values pass through
+  // JSON.stringify as `null`, then the validator's null short-circuit
+  // (schema-defaults.ts:327 — "value === null → skip") filters them out
+  // before reaching the type check. We can't observe them in
+  // validation_status from this layer; a dedicated unit test against
+  // `valueMatchesType` would catch the case at the inner boundary.
+  // Pinned at the next layer down:
+
+  it("valueMatchesType('integer', ...) rejects NaN / Infinity (vault#310)", async () => {
+    // Reach the unexported helper indirectly via validateNote on a
+    // hand-built resolved-schemas + metadata where the value is the
+    // actual NaN/Infinity (no JSON round-trip).
+    const { validateNote, loadSchemaConfig } = await import("./schema-defaults.js");
+    // Seed via the public surface, then load the resolved schemas
+    // snapshot.
+    await store.upsertTagSchema("k", { fields: { c: { type: "integer" } } });
+    const resolved = loadSchemaConfig((store as any).db);
+    expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.NaN } })?.warnings[0]?.reason)
+      .toBe("type_mismatch");
+    expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.POSITIVE_INFINITY } })?.warnings[0]?.reason)
+      .toBe("type_mismatch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// update-note `if_missing: "create"` — idempotent upsert (vault#309)
+// ---------------------------------------------------------------------------
+
+describe("update-note if_missing=create (vault#309)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("creates the note when missing + carries created: true", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/2026-05-13-meeting",
+      content: "agenda body",
+      tags: ["meeting"],
+      metadata: { priority: "high" },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.path).toBe("Inbox/2026-05-13-meeting");
+    expect(result.content).toBe("agenda body");
+    expect(result.tags).toContain("meeting");
+    expect(result.metadata?.priority).toBe("high");
+
+    // And the row landed.
+    const fetched = await store.getNoteByPath("Inbox/2026-05-13-meeting");
+    expect(fetched).not.toBeNull();
+  });
+
+  it("updates the note when present + carries created: false", async () => {
+    await store.createNote("original", { path: "p", metadata: { v: 1 } });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "p",
+      content: "updated body",
+      metadata: { v: 2 },
+      if_missing: "create",
+      force: true, // bypass OC since this is an unconditional update
+    }) as any;
+    expect(result.created).toBe(false);
+    expect(result.content).toBe("updated body");
+    expect(result.metadata?.v).toBe(2);
+  });
+
+  it("without if_missing, missing note errors (current behavior — back-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    await expect(update.execute({
+      id: "nope",
+      content: "x",
+      force: true,
+    })).rejects.toThrow(/Note not found/);
+  });
+
+  it("create branch applies tag-schema defaults when the new tag declares fields", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/new-task",
+      content: "do the thing",
+      tags: ["task"],
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    // Schema defaults populated metadata.priority on insert.
+    expect(result.metadata?.priority).toBeDefined();
+  });
+
+  it("create branch surfaces validation warnings just like create-note", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/bad-task",
+      content: "x",
+      tags: ["task"],
+      metadata: { priority: "ULTRA" },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  it("idempotent: second call with same id + same content updates without error", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const first = await update.execute({
+      id: "Inbox/sync-target",
+      content: "v1",
+      if_missing: "create",
+    }) as any;
+    expect(first.created).toBe(true);
+
+    const second = await update.execute({
+      id: "Inbox/sync-target",
+      content: "v2",
+      if_missing: "create",
+      force: true,
+    }) as any;
+    expect(second.created).toBe(false);
+    expect(second.content).toBe("v2");
+
+    // Only one row exists.
+    const all = await store.queryNotes({ limit: 100 });
+    expect(all.filter((n) => n.path === "Inbox/sync-target")).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------

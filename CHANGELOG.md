@@ -6,6 +6,82 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.12] — 2026-05-13
+
+Gitcoin sync ergonomics — bundled two-commit PR. Both close real
+friction points from `from_parachute_round_2.md`, queued as the
+priorities after vault#308.
+
+### feat(api): `if_missing: "create"` on update-note (closes vault#309)
+
+Pre-fix, Gitcoin's nightly drift-detector loop had to either
+query-first-then-create on 404 (1 extra round trip per item, ~500/night)
+or accept that "update" semantics weren't safe when the note might not
+exist. Now `update-note` accepts an optional `if_missing` field:
+
+- **MCP `update-note`** — new `if_missing: "fail" | "create"` param
+  (default `"fail"`, current behavior). On `"create"`: if the note
+  doesn't exist (`resolveNote` returns null), treat the update payload
+  as a create payload (content/path/tags/metadata become the create
+  fields; `if_updated_at` precondition skipped since there's nothing
+  to conflict with).
+- **REST `PATCH /api/notes/:idOrPath`** — same `if_missing` field in
+  the JSON body. Mirrors MCP semantics.
+- **Response carries `created: true | false`** on every update-note
+  response (both branches). Sync loops read this to know which path
+  fired without a separate query.
+- **Idempotent**: repeated calls with the same id + payload produce
+  the same vault state (first call creates with `created: true`,
+  subsequent calls update with `created: false`).
+- **Tag-schema defaults + validation_status** fire on the create
+  branch identically to `create-note` (the create-path reuses the
+  same `applySchemaDefaults` + `attachValidationStatus` recipe).
+
+ID-vs-path heuristic on the create branch: if the `id` field looks
+path-shaped (contains `/` or doesn't match `^[A-Za-z0-9_-]+$`) and
+`path` isn't explicitly set, use `id` as the path. Otherwise treat as
+opaque id. Matches Gitcoin's sync shape where canonical keys are
+`Inbox/2026-05-13-meeting`-style paths.
+
+Tests:
+- `core/src/core.test.ts`: 6 new MCP tests (create-when-missing,
+  update-when-present, no-if_missing-errors, schema-defaults apply,
+  validation_status surfaces, idempotency).
+- `src/vault.test.ts`: 4 new REST tests (mirror of MCP cases +
+  response-shape pin for the additive `created: false` field).
+
+### fix(schema): coerce JSON number → integer when fractional is zero (closes vault#310)
+
+Pre-fix, every integer-typed metadata field warned `type_mismatch` on
+legitimate values because the validator had no `"integer"` case at
+all — falling through the switch returned `undefined` and the
+`if (spec.type && !valueMatchesType(...))` gate fired. Gitcoin's drift
+detector emits JSON for diffs (and JSON has no separate integer type),
+so every `kpi: 3` triggered a false-positive and buried the real
+warnings in the noise floor.
+
+- `SchemaField.type` union extended with `"integer"`.
+- `valueMatchesType` adds an `"integer"` case using
+  `Number.isInteger(value)`: accepts `5` and `5.0` (zero fractional);
+  rejects `5.5`, `"5"` (string — no string→number coercion),
+  `5.0000000000001` (edge non-zero fractional), `NaN`, `Infinity`.
+- The Gitcoin shape (JSON-decoded integer arriving as JS Number with
+  zero fractional part) now passes validation cleanly.
+
+Tests in `core/src/core.test.ts`:
+- Happy path: `5`, `5.0`, boolean rejection.
+- Strict path: `5.5`, `"5"`, `5.0000000000001`.
+- Inner-boundary: `valueMatchesType` rejects `NaN`/`Infinity` directly
+  (the outer null-short-circuit at the validator level filters them
+  before they reach the type check after JSON.stringify normalization).
+
+### Gates
+
+- `bun test` (root) → 1411 pass / 3 skip / 0 fail (was 1394; +17 tests)
+- `bun test ./src/` → 923 pass / 0 fail (was 919; +4 REST tests)
+- `bun test ./core/src/` → 488 pass / 0 fail (was 475; +6 MCP if_missing + 7 int coercion)
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.11] — 2026-05-13
 
 Portable markdown knowledge-base format — PR 2 of 2 (closes vault#308 +
