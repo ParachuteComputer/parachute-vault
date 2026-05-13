@@ -118,21 +118,26 @@ The repo holds two test suites with different runners. Server + core run under `
 
 `parachute-vault uninstall` calls `uninstallAgent()` which targets the hardcoded launchd label `computer.parachute.vault`. That label ignores `PARACHUTE_HOME`, so a naive test that spawns `parachute-vault uninstall --yes` on a developer's machine would `launchctl bootout` the real registered daemon. The undocumented `--skip-daemon` flag bypasses the launchd / systemd / backup-agent uninstall calls — tests use it to exercise the rest of the flow (wrapper removal, MCP cleanup, exit codes, ordering) without touching real operator state. Humans should never need it; it's intentionally absent from `usage()` so it doesn't invite "I'll just skip the daemon step" misuse that orphans a daemon firing on a missing wrapper. See vault#296.
 
-### Portable markdown export
+### Portable markdown export + import (vault#308)
 
 `core/src/portable-md.ts` is the canonical home for the markdown knowledge-base format. Vault's `parachute-vault export <dir>` writes:
 
 ```
 <dir>/
   .parachute/
-    vault.yaml              # vault meta + export_format_version
-    schemas/<tag>.yaml      # per-tag: description, fields, relationships, parent_names
-  <note.path>.md            # one file per note
+    vault.yaml                # vault meta + export_format_version
+    schemas/<tag>.yaml        # per-tag: description, fields, relationships, parent_names
+    attachments/<id>/<file>   # attachment binaries (when assetsDir is wired — CLI does)
+  <note.path>.md              # one file per note
 ```
 
-Per-note frontmatter uses a fixed top-level key order (`id` → `path` → `tags` → `metadata` → `links` → `attachments` → `created_at` → `updated_at`) with alpha-sorted keys in nested objects, so re-exporting an unchanged vault produces byte-identical output (clean git diffs).
+Per-note frontmatter uses a fixed top-level key order (`id` → `path` → `tags` → `metadata` → `links` → `attachments` → `created_at` → `updated_at`) with alpha-sorted keys in nested objects, so re-exporting an unchanged vault produces byte-identical output (clean git diffs). The frontmatter `attachments[].path` value is the **original vault-internal path** (relative to `assetsDir`); the sidecar location is derived from `id` so it stays stable across renames + different export runs.
 
-`core/src/obsidian.ts` is a deprecated back-compat shim — re-exports the parser helpers and keeps the legacy lossy `toObsidianMarkdown` / `exportFilePath` for callers that intentionally want the flat-frontmatter shape. New code imports from `portable-md.ts` directly. PR 2 of #308 will add attachment file-copy + `--blow-away` import for full round-trip disaster recovery. See vault#308.
+`parachute-vault import <dir>` is the lossless round-trip path. Autodetects the format via `.parachute/vault.yaml`'s presence: if there, runs `importPortableVault` (upsert-by-id; preserves IDs, restores tag schemas, replays typed links, restores attachment binaries when `assetsDir` is wired); if absent, falls back to the legacy obsidian parser. `--blow-away` is the disaster-recovery path — wipes the target vault before replaying, confirms unless `--yes` is set.
+
+Round-trip invariant pinned by `portable-md.test.ts`: realistic vault → export → blow-away import → re-export → byte-equivalent. Path-traversal guards on every file write (source under assetsDir, dest under outDir's sidecar root); skips with `console.warn` rather than aborting.
+
+`core/src/obsidian.ts` is a deprecated back-compat shim — re-exports the parser helpers and keeps the legacy lossy `toObsidianMarkdown` / `exportFilePath` for callers that intentionally want the flat-frontmatter shape. New code imports from `portable-md.ts` directly. See vault#308 (PR 1 = export + schemas + idempotency; PR 2 = attachments + import + round-trip).
 
 ## Deployment
 

@@ -19,7 +19,7 @@
 
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from "fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync, statSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -27,6 +27,7 @@ import { SqliteStore } from "./store.js";
 import {
   emitYamlDoc,
   exportVaultToDir,
+  importPortableVault,
   noteToPortable,
   parseFrontmatter,
   portableExportFilePath,
@@ -600,5 +601,258 @@ describe("noteToPortable", async () => {
     expect(portable.metadata).toBeUndefined();
     expect(portable.links).toBeUndefined();
     expect(portable.attachments).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// importPortableVault — replay from a portable-md export back to a vault
+// ---------------------------------------------------------------------------
+
+describe("importPortableVault", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-import");
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(tmpBase, { recursive: true });
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("throws when input dir lacks .parachute/vault.yaml (not a portable-md export)", async () => {
+    const inDir = join(tmpBase, "not-an-export");
+    mkdirSync(inDir, { recursive: true });
+    writeFileSync(join(inDir, "stray.md"), "hello");
+    await expect(importPortableVault(store, { inDir })).rejects.toThrow(/not a portable-md export/);
+  });
+
+  it("upserts by id — new notes created, existing notes updated, ids preserved", async () => {
+    // Build a 2-note vault and export it.
+    const n1 = await store.createNote("alpha body", { id: "n1", path: "a", tags: ["t1"] });
+    await store.createNote("beta body", { id: "n2", path: "b" });
+
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    // Now import into a fresh store. Notes should appear with the same
+    // ids (n1, n2) and contents.
+    const freshStore = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(freshStore, { inDir: outDir });
+    expect(stats.notes_created).toBe(2);
+    expect(stats.notes_updated).toBe(0);
+
+    const restoredA = await freshStore.getNote("n1");
+    expect(restoredA).toBeTruthy();
+    // Content survives the round-trip modulo a normalizing trailing
+    // newline — `toPortableMarkdown` always emits one (so the parser's
+    // line-oriented scan ends cleanly), and `parseFrontmatter` preserves
+    // the body verbatim. The store happily round-trips either form.
+    expect(restoredA!.content.trimEnd()).toBe("alpha body");
+    expect(restoredA!.path).toBe("a");
+    expect(restoredA!.tags).toContain("t1");
+
+    const restoredB = await freshStore.getNote("n2");
+    expect(restoredB).toBeTruthy();
+    expect(restoredB!.content.trimEnd()).toBe("beta body");
+
+    // Re-import into a store that ALREADY has n1 — should update,
+    // not error, not duplicate.
+    const partialStore = new SqliteStore(new Database(":memory:"));
+    await partialStore.createNote("old alpha", { id: "n1", path: "a" });
+    const stats2 = await importPortableVault(partialStore, { inDir: outDir });
+    expect(stats2.notes_created).toBe(1); // n2 only
+    expect(stats2.notes_updated).toBe(1); // n1 overwritten
+    const updated = await partialStore.getNote("n1");
+    expect(updated!.content.trimEnd()).toBe("alpha body"); // import won
+  });
+
+  it("--blow-away wipes the existing vault before replaying", async () => {
+    // Build a vault, export, then in a fresh store seed unrelated
+    // notes + blow-away-import. Those unrelated notes should vanish.
+    const outDir = join(tmpBase, "out");
+    await store.createNote("kept", { id: "k1" });
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const targetStore = new SqliteStore(new Database(":memory:"));
+    await targetStore.createNote("will-be-wiped", { id: "old1" });
+    await targetStore.createNote("also-wiped", { id: "old2" });
+
+    const stats = await importPortableVault(targetStore, { inDir: outDir, blowAway: true });
+    expect(stats.notes_wiped).toBe(2);
+    expect(stats.notes_created).toBe(1);
+    expect(await targetStore.getNote("old1")).toBeNull();
+    expect(await targetStore.getNote("k1")).toBeTruthy();
+  });
+
+  it("restores tag schemas (description + fields)", async () => {
+    await store.upsertTagSchema("task", {
+      description: "A unit of work",
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    await store.createNote("x", { id: "x", tags: ["task"] });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir: outDir });
+    expect(stats.schemas_restored).toBe(1);
+    const schema = await target.getTagSchema("task");
+    expect(schema).toBeTruthy();
+    expect(schema!.description).toBe("A unit of work");
+  });
+
+  it("restores typed links (non-wikilink relationships)", async () => {
+    await store.createNote("src body", { id: "src", path: "src" });
+    await store.createNote("tgt body", { id: "tgt", path: "tgt" });
+    await store.createLink("src", "tgt", "derived-from", { source: "git://x" });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir: outDir });
+    expect(stats.links_restored).toBe(1);
+    const links = await target.getLinks("src", { direction: "outbound" });
+    const typed = links.find((l) => l.relationship === "derived-from");
+    expect(typed).toBeTruthy();
+    expect(typed!.targetId).toBe("tgt");
+    expect(typed!.metadata).toEqual({ source: "git://x" });
+  });
+
+  it("skips typed links whose target is missing from the import set", async () => {
+    // Source note has a typed link to a target we don't include in
+    // the export (synthetic — write the .md file by hand).
+    const outDir = join(tmpBase, "out");
+    const sidecar = join(outDir, SIDECAR_DIR);
+    mkdirSync(sidecar, { recursive: true });
+    writeFileSync(join(sidecar, "vault.yaml"), "export_format_version: 1\nexported_at: 2026-05-13T00:00:00.000Z\n");
+    writeFileSync(join(outDir, "src.md"), `---
+id: src
+path: src
+links:
+  - relationship: derived-from
+    target: ghost
+created_at: 2026-05-13T00:00:00.000Z
+---
+body
+`);
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir: outDir });
+    expect(stats.skipped_links).toHaveLength(1);
+    expect(stats.skipped_links[0]).toMatchObject({ source_id: "src", target_id: "ghost" });
+  });
+
+  it("dry-run counts would-be operations without writing", async () => {
+    await store.createNote("x", { id: "x" });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir: outDir, dryRun: true });
+    expect(stats.notes_created).toBe(1);
+    // …but nothing actually landed.
+    expect(await target.getNote("x")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Full round-trip: vault → export → blow-away import → re-export →
+// byte-equivalent to first export. This is the load-bearing test for
+// the format's whole pitch (vault#308 P3).
+// ---------------------------------------------------------------------------
+
+describe("portable-md round-trip — byte-equivalent re-export after blow-away import", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-roundtrip");
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(tmpBase, { recursive: true });
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("realistic vault → export → blow-away import → re-export → byte-equivalent", async () => {
+    // Build a vault that exercises every field of the format:
+    //   - Multiple notes (some pathed, one un-pathed).
+    //   - Tags with declared schemas (description + fields).
+    //   - Typed links (non-wikilink).
+    //   - Multi-line metadata (vault#317 F1 path).
+    //   - One note edited (created_at ≠ updated_at).
+    await store.upsertTagSchema("project", {
+      description: "A long-running effort",
+      fields: { status: { type: "string", enum: ["active", "done"] } },
+    });
+    const n1 = await store.createNote("alpha body", {
+      id: "01HX001",
+      path: "Inbox/alpha",
+      tags: ["project", "z-other"],
+      metadata: {
+        priority: "high",
+        // Multi-line — exercises the F1 double-quoted-escape path.
+        notes: "line1\nline2\nline3",
+      },
+    });
+    await store.createNote("beta body", {
+      id: "01HX002",
+      path: "Inbox/beta",
+      tags: ["project"],
+    });
+    await store.createNote("unpathed jot", { id: "01HX003" });
+    await store.createLink("01HX001", "01HX002", "derived-from", { source: "git://example" });
+
+    // Force a divergence between created_at and updated_at on n1 so
+    // the round-trip exercises restoreNoteTimestamps.
+    const newerStamp = new Date(new Date(n1.createdAt).getTime() + 60_000).toISOString();
+    await store.restoreNoteTimestamps("01HX001", n1.createdAt, newerStamp);
+
+    // First export.
+    const outA = join(tmpBase, "outA");
+    await exportVaultToDir(store, {
+      outDir: outA,
+      vaultName: "test",
+      exportedAt: "2026-05-13T00:00:00.000Z",
+    });
+
+    // Blow-away import into a fresh store.
+    const restored = new SqliteStore(new Database(":memory:"));
+    const importStats = await importPortableVault(restored, { inDir: outA, blowAway: true });
+    expect(importStats.notes_created).toBe(3);
+    expect(importStats.schemas_restored).toBe(1);
+    expect(importStats.links_restored).toBe(1);
+
+    // Second export from the restored store.
+    const outB = join(tmpBase, "outB");
+    await exportVaultToDir(restored, {
+      outDir: outB,
+      vaultName: "test",
+      exportedAt: "2026-05-13T00:00:00.000Z",
+    });
+
+    // Byte-equivalence: every file in outA must match outB exactly.
+    const compareTree = (a: string, b: string, prefix = "") => {
+      const aEntries = readdirSync(a).sort();
+      const bEntries = readdirSync(b).sort();
+      expect(bEntries).toEqual(aEntries);
+      for (const entry of aEntries) {
+        const aPath = join(a, entry);
+        const bPath = join(b, entry);
+        const aStat = statSync(aPath);
+        const bStat = statSync(bPath);
+        expect(bStat.isDirectory()).toBe(aStat.isDirectory());
+        if (aStat.isDirectory()) {
+          compareTree(aPath, bPath, prefix + entry + "/");
+        } else {
+          const aBuf = readFileSync(aPath, "utf-8");
+          const bBuf = readFileSync(bPath, "utf-8");
+          if (aBuf !== bBuf) {
+            // Surface the offending file path + a diff hint so a real
+            // drift bug is debuggable.
+            // eslint-disable-next-line no-console
+            console.error(`drift at ${prefix}${entry}:\n--- outA ---\n${aBuf}\n--- outB ---\n${bBuf}`);
+          }
+          expect(bBuf).toBe(aBuf);
+        }
+      }
+    };
+    compareTree(outA, outB);
   });
 });

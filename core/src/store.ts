@@ -202,6 +202,19 @@ export class BunSqliteStore implements Store {
     }
   }
 
+  async restoreNoteTimestamps(id: string, createdAt: string, updatedAt: string): Promise<void> {
+    // Import-only: direct UPDATE so the importer can restore a note's
+    // historical `created_at`/`updated_at` from the portable-md export
+    // bytes. `updateNote` either bumps `updated_at` to wall-clock-now or
+    // (with `skipUpdatedAt: true`) leaves it untouched — neither lets
+    // the importer write a specific historical timestamp. Skips hooks
+    // by design: this isn't a user-edit, it's a state restoration.
+    // See vault#308 PR 2.
+    this.db
+      .prepare("UPDATE notes SET created_at = ?, updated_at = ? WHERE id = ?")
+      .run(createdAt, updatedAt, id);
+  }
+
   async deleteNote(id: string): Promise<void> {
     // Read before delete so we can invalidate config caches on the way out.
     const existing = noteOps.getNote(this.db, id);
