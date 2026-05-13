@@ -614,11 +614,21 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               //   - `item.content` / `item.path` / `item.tags` /
               //     `item.metadata` / `item.created_at` → forwarded.
               //   - `if_updated_at` / `force` / `content_edit` /
-              //     `append` / `prepend` / `links` are
-              //     update-only — silently ignored on the create branch.
-              //     (Content-edit on a non-existent note is a nonsense
-              //     combination; the caller's intent on missing-note is
-              //     "create the row", not "patch in this section".)
+              //     `append` / `prepend` are update-only — silently
+              //     ignored on the create branch. (Content-edit on a
+              //     non-existent note is a nonsense combination; the
+              //     caller's intent on missing-note is "create the
+              //     row", not "patch in this section".)
+              //   - `links.remove` is also ignored on create (nothing
+              //     to remove on a fresh note).
+              //   - `links.add` IS applied below — the drift sync can
+              //     declare typed links at upsert time and have them
+              //     materialize alongside the create. See vault#320
+              //     reviewer F1 — the prior comment claimed all
+              //     `links` were ignored, but `links.add` was already
+              //     processed and used by Gitcoin's sync; the
+              //     misleading wording is fixed here so a future
+              //     reader doesn't trust it and break the workflow.
               const idOrPath = item.id as string;
               // Heuristic: if `path` isn't set AND the `id` looks like a
               // path (contains "/" or doesn't match a typical opaque-id
