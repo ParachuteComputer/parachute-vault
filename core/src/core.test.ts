@@ -3910,6 +3910,77 @@ describe("update-note if_missing=create (vault#309)", async () => {
     const all = await store.queryNotes({ limit: 100 });
     expect(all.filter((n) => n.path === "Inbox/sync-target")).toHaveLength(1);
   });
+
+  // vault#321 F3 — schema-conflict warning surfaces on the create
+  // branch. The branch reuses `attachValidationStatus` so the
+  // conflict-detection logic should fire, but pre-fold it wasn't
+  // pinned. Two tags directly applied to the new note, each
+  // declaring the same field with conflicting specs → schema_conflict
+  // warning (the existing `resolveNoteSchemas` walk produces this for
+  // both inheritance chains AND multi-tag direct application).
+  it("schema-conflict warning surfaces on create branch (vault#321 F3)", async () => {
+    await store.upsertTagSchema("kpi", {
+      fields: { count: { type: "integer" } },
+    });
+    await store.upsertTagSchema("metric", {
+      fields: { count: { type: "string" } }, // conflicting spec
+    });
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/conflicting-tags",
+      content: "x",
+      tags: ["kpi", "metric"],
+      metadata: { count: 5 },
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    const conflict = result.validation_status.warnings.find(
+      (w: any) => w.reason === "schema_conflict",
+    );
+    expect(conflict).toBeDefined();
+    expect(conflict.field).toBe("count");
+    // First-tag-wins precedence (kpi → integer). The loser_schema
+    // field names metric.
+    expect(conflict.schema).toBe("kpi");
+    expect(conflict.loser_schema).toBe("metric");
+  });
+
+  // vault#321 F4 — links.add on the create branch is applied. The
+  // implementation at mcp.ts:644-650 was present pre-fold; this
+  // test pins it so a future regression breaking Gitcoin's
+  // upsert-with-typed-links workflow goes red.
+  it("links.add applied on create branch (vault#321 F4)", async () => {
+    // Two pre-existing target notes the new source links to.
+    await store.createNote("A", { id: "t-mcp-a-321", path: "Targets/A-mcp" });
+    await store.createNote("B", { id: "t-mcp-b-321", path: "Targets/B-mcp" });
+
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const result = await update.execute({
+      id: "Inbox/mcp-source-321",
+      content: "source body",
+      if_missing: "create",
+      links: {
+        add: [
+          { target: "t-mcp-a-321", relationship: "derived-from" },
+          { target: "Targets/B-mcp", relationship: "responds-to", metadata: { weight: 5 } },
+        ],
+      },
+    }) as any;
+    expect(result.created).toBe(true);
+
+    const sourceId = result.id as string;
+    const outboundLinks = await store.getLinks(sourceId, { direction: "outbound" });
+    const derivedFrom = outboundLinks.find((l) => l.relationship === "derived-from");
+    expect(derivedFrom).toBeDefined();
+    expect(derivedFrom!.targetId).toBe("t-mcp-a-321");
+
+    const respondsTo = outboundLinks.find((l) => l.relationship === "responds-to");
+    expect(respondsTo).toBeDefined();
+    expect(respondsTo!.targetId).toBe("t-mcp-b-321");
+    expect(respondsTo!.metadata).toEqual({ weight: 5 });
+  });
 });
 
 // ---------------------------------------------------------------------------
