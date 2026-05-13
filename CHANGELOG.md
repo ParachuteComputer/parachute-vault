@@ -6,6 +6,67 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.8] — 2026-05-12
+
+HTTP create/update now attach `validation_status` — symmetry with MCP
+(closes vault#287).
+
+The MCP `create-note` and `update-note` tools wrap their responses in
+`attachValidationStatus`: when a tag on the note declares `fields` (a
+type / enum schema) on its `tags` row, the response carries a
+`validation_status` block with the resolved schemas and any warnings
+(type mismatch, enum mismatch). HTTP `POST /api/notes` and `PATCH
+/api/notes/:id` did not — HTTP consumers of schema-validated vaults
+had no signal that their write triggered a warning. They had to
+re-read the note, cross-reference its tags, and replay validation
+client-side. Defeats one of the load-bearing reasons validation runs
+at write time.
+
+### Changed
+
+- `attachValidationStatus` is now exported from `core/src/mcp.ts` so
+  both transports use the same recipe (single source of truth).
+- HTTP `PATCH /api/notes/:idOrPath` attaches `validation_status` to
+  the response, on both the default full-Note shape and the lean
+  (`include_content: false`) shape. The lean-shape preservation
+  mirrors the MCP recipe at `core/src/mcp.ts:751` — `toNoteIndex`
+  drops unknown fields, so the field is re-attached after the
+  conversion.
+- HTTP `POST /api/notes` (single + batch) attaches
+  `validation_status` to each created note. Mirrors the MCP
+  `create-note` attach site at `core/src/mcp.ts:451`.
+
+### Behavior
+
+- No change for vaults without tag schemas: `attachValidationStatus`
+  returns the note unchanged when no tag on it declares fields.
+- No change for MCP — the validation-status surface was already
+  there.
+- HTTP consumers using tag schemas now see `validation_status` on
+  every write response, matching the MCP contract.
+
+### Tests
+
+- 6 new tests in `src/vault.test.ts`:
+  - PATCH attaches `enum_mismatch` warning on a schema-violating
+    metadata update.
+  - PATCH preserves `validation_status` on `include_content: false`
+    (lean shape).
+  - PATCH omits `validation_status` when no tag declares fields
+    (back-compat).
+  - POST attaches `type_mismatch` warning on schema-violating
+    create.
+  - POST batch attaches per-note `validation_status` (mixed
+    valid/invalid entries each carry their own status).
+  - POST omits `validation_status` when no tag declares fields.
+
+### Gates
+
+- `bun test` (root) → 1348 pass / 3 skip / 0 fail
+- `bun test ./src/` → 919 pass / 0 fail (was 913)
+- `bun test ./core/src/` → 429 pass / 0 fail
+- `bunx tsc --noEmit` clean
+
 ## [0.4.4-rc.7] — 2026-05-12
 
 `buildMcpEntryPlan` ⇄ `installMcpConfig` — close the URL invariant on the

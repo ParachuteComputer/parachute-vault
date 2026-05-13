@@ -1127,8 +1127,13 @@ function defaultForField(field: { type: string; enum?: string[] }): unknown {
  *
  * Returns the note unchanged when no tag declares fields, so callers
  * without any tag schemas see no behavior change.
+ *
+ * Exported so both transports (MCP `update-note` here, HTTP `PATCH
+ * /api/notes/:id` in `src/routes.ts`) attach the same status field by
+ * the same recipe — see vault#287 for the asymmetry that motivated
+ * exposing it.
  */
-function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
+export function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
   // Short-circuit cheaply: when no tag declares fields, the resolver
   // returns null without us paying a re-read of the note.
   const status = store.validateNoteAgainstSchemas({

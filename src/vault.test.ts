@@ -2783,6 +2783,147 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.id).toBe("big");
     expect(body.path).toBe("big");
   });
+
+  // vault#287 — HTTP must match MCP on validation_status attachment.
+  // Pre-#287 fix: MCP `update-note` attached validation_status; HTTP
+  // PATCH didn't. HTTP consumers using schema-validated vaults had no
+  // way to see schema warnings without re-reading + replaying validation
+  // client-side. These tests pin the symmetry on both response shapes
+  // (`include_content: true` and `false`) and confirm the no-schema
+  // case still returns no validation_status (advisory only — never
+  // forced onto vaults that don't declare fields).
+
+  test("PATCH attaches validation_status with enum_mismatch warning when tag schema is violated", async () => {
+    await store.upsertTagSchema("task287patch", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const note = await store.createNote("body", {
+      id: "p287a",
+      tags: ["task287patch"],
+      metadata: { priority: "high" },
+    });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/p287a", {
+        metadata: { priority: "ULTRA" },
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/p287a",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    // The write still lands — validation is advisory.
+    expect(body.metadata.priority).toBe("ULTRA");
+    // …but the response carries the warning so the HTTP caller knows.
+    expect(body.validation_status).toBeTruthy();
+    expect(body.validation_status.schemas).toContain("task287patch");
+    expect(body.validation_status.warnings.length).toBeGreaterThan(0);
+    expect(body.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(body.validation_status.warnings[0].field).toBe("priority");
+  });
+
+  test("PATCH preserves validation_status on the lean (include_content: false) response", async () => {
+    await store.upsertTagSchema("task287lean", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const note = await store.createNote("body", {
+      id: "p287b",
+      tags: ["task287lean"],
+      metadata: { priority: "high" },
+    });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/p287b", {
+        metadata: { priority: "ULTRA" },
+        include_content: false,
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/p287b",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    // Lean shape: no `content`, has `byteSize` + `preview`.
+    expect(body.content).toBeUndefined();
+    expect(typeof body.byteSize).toBe("number");
+    // …and validation_status survives the lean conversion.
+    expect(body.validation_status).toBeTruthy();
+    expect(body.validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  test("PATCH omits validation_status when no tag on the note declares fields", async () => {
+    // No tag schemas configured for this note — the response should look
+    // exactly like the pre-#287 shape (no validation_status). The behavior-
+    // unchanged guarantee for callers that don't use tag schemas.
+    await store.createNote("body", { id: "p287c", tags: ["plain"] });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/p287c", { content: "updated", force: true }),
+      store,
+      "/p287c",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.content).toBe("updated");
+    expect(body.validation_status).toBeUndefined();
+  });
+});
+
+describe("HTTP POST /notes — validation_status attachment (vault#287)", async () => {
+  // Mirror of the PATCH cases for create. The MCP create-note path
+  // attaches validation_status; HTTP POST must match (vault#287).
+
+  test("POST attaches validation_status with type_mismatch warning", async () => {
+    await store.upsertTagSchema("task287post", {
+      fields: { done: { type: "boolean" } },
+    });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "x",
+        tags: ["task287post"],
+        metadata: { done: "yes" }, // wrong type
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.id).toBeTruthy();
+    expect(body.validation_status).toBeTruthy();
+    expect(body.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(body.validation_status.warnings[0].field).toBe("done");
+  });
+
+  test("POST batch attaches validation_status per-note", async () => {
+    await store.upsertTagSchema("task287batch", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        notes: [
+          { content: "good", tags: ["task287batch"], metadata: { priority: "high" } },
+          { content: "bad", tags: ["task287batch"], metadata: { priority: "ULTRA" } },
+        ],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    expect(body[0].validation_status.warnings).toEqual([]);
+    expect(body[1].validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  test("POST omits validation_status when no tag declares fields (back-compat)", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "no schema here", tags: ["plain287"] }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.id).toBeTruthy();
+    expect(body.validation_status).toBeUndefined();
+  });
 });
 
 describe("HTTP /tags", async () => {
