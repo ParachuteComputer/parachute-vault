@@ -434,6 +434,34 @@ function buildFrontmatter(note: PortableNote): Record<string, unknown> {
 }
 
 /**
+ * Emit a frontmatter-shape object using `FRONTMATTER_KEY_ORDER`: each
+ * present key gets one or more lines (inline form for scalars + empty
+ * collections, block form otherwise). Every line ends in `\n`. The
+ * output does NOT include the `---` wrapper — that's the caller's
+ * concern (only `toPortableMarkdown` wraps; `toSidecarYaml` doesn't).
+ *
+ * Single source of truth for the per-key emit loop shared by
+ * `toPortableMarkdown` and `toSidecarYaml` (vault#330 F3 — pure
+ * refactor, behavior unchanged).
+ */
+function emitFrontmatterKeys(fm: Record<string, unknown>): string {
+  let out = "";
+  for (const key of FRONTMATTER_KEY_ORDER) {
+    if (!(key in fm)) continue;
+    const value = fm[key];
+    const inline = emitValueInline(value, 1);
+    if (inline !== null) {
+      out += `${key}: ${inline}\n`;
+    } else {
+      out += `${key}:\n`;
+      const block = emitValueBlock(value, 1);
+      if (block !== null) out += `${block}\n`;
+    }
+  }
+  return out;
+}
+
+/**
  * Render a note's content-file bytes. Behavior depends on the note's
  * `extension`:
  *
@@ -459,18 +487,7 @@ export function toPortableMarkdown(note: PortableNote): string {
   }
   const fm = buildFrontmatter(note);
   let out = "---\n";
-  for (const key of FRONTMATTER_KEY_ORDER) {
-    if (!(key in fm)) continue;
-    const value = fm[key];
-    const inline = emitValueInline(value, 1);
-    if (inline !== null) {
-      out += `${key}: ${inline}\n`;
-    } else {
-      out += `${key}:\n`;
-      const block = emitValueBlock(value, 1);
-      if (block !== null) out += `${block}\n`;
-    }
-  }
+  out += emitFrontmatterKeys(fm);
   out += "---\n";
   // Preserve content as-is; ensure exactly one trailing newline if missing.
   out += note.content;
@@ -505,20 +522,7 @@ export function toSidecarYaml(note: PortableNote): string {
   fm.created_at = note.created_at;
   if (note.updated_at) fm.updated_at = note.updated_at;
 
-  let out = "";
-  for (const key of FRONTMATTER_KEY_ORDER) {
-    if (!(key in fm)) continue;
-    const value = fm[key];
-    const inline = emitValueInline(value, 1);
-    if (inline !== null) {
-      out += `${key}: ${inline}\n`;
-    } else {
-      out += `${key}:\n`;
-      const block = emitValueBlock(value, 1);
-      if (block !== null) out += `${block}\n`;
-    }
-  }
-  return out;
+  return emitFrontmatterKeys(fm);
 }
 
 /**
