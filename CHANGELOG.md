@@ -6,6 +6,70 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.4-rc.14] — 2026-05-15
+
+Round-trip import unblocker — vault#323. Aaron's real default vault
+(2290 notes / 12 schemas / 298 attachments) tripped two distinct bugs
+on the round-trip import smoke that gates the @latest stable
+promotion of `0.4.4`. Three commits, all under vault#323.
+
+### fix(notes): drop EMPTY_NOTE guard — empty content is a valid state (vault#323)
+
+The earlier #213 guard rejected `content + path both absent` from
+createNote and updateNote, plus pre-validators in MCP and REST that
+short-circuited the same shape with 400 EmptyNoteError. Real vaults
+have empty-content notes (skeletons, drafts, organizing notes,
+capture-then-fill flows); export emits them fine but the import then
+rejected every one — blocking the round-trip.
+
+Design call (Aaron, 2026-05-13): empty notes are a valid state.
+
+Dropped:
+- `EmptyNoteError` class + Store-level throw in createNote/updateNote
+  (core/src/notes.ts).
+- MCP create-note pre-walk that rejected empty entries with item_index
+  (core/src/mcp.ts), plus the `EmptyNoteError` re-export.
+- REST POST /notes pre-walk + the 400-on-EMPTY_NOTE error mappers in
+  POST and PATCH handlers (src/routes.ts).
+
+Tests flipped (core/src/core.test.ts + src/vault.test.ts): empty-
+content creates and clears now succeed end-to-end across Store, MCP,
+and REST. Batch atomicity (#236) and MAX_BATCH_SIZE (separate
+runaway-client protection) are untouched.
+
+### fix(cli): detect running daemon on import, refuse with clear error (vault#323)
+
+`parachute-vault import` opens its own bun:sqlite connection. When a
+daemon was already running on the configured port, the first
+createNote contended for the writer lock and hit SQLITE_BUSY —
+leaving the target vault partially replayed. The error trace
+surfaced nothing actionable.
+
+cmdImport now probes `checkHealth(port)` after verifying the vault
+and before touching the database. `healthy` or `unhealthy` (port
+bound, any HTTP response) prints a clear error pointing at the
+workaround and exits 1:
+
+  error: vault daemon is running on port <port>; stop it first with:
+    parachute stop vault
+  the import requires exclusive write access to the SQLite database.
+
+A proper WAL / concurrent-writer story is a separate follow-up.
+
+Integration test in src/import-daemon-busy.test.ts asserts both
+branches.
+
+### test(import): empty-content round-trip in integration suite (vault#323)
+
+Added an empty-content note (`01HX004`, `path: "Inbox/skeleton"`,
+tagged `project`) to the round-trip fixture in
+`core/src/portable-md.test.ts`. The test now exports → blow-away
+import → re-export → byte-equivalent over a fixture that includes
+the shape vault#323 was hitting. Pre-fix, importPortableVault threw
+on the empty-content create; post-fix, the skeleton survives the
+round-trip with content/path/tags intact. Pins the regression so a
+future paternalistic guard re-introduction breaks CI before it ships.
+
 ## [0.4.4-rc.13] — 2026-05-13
 
 `if_missing` tighten-up — vault#321 follow-ups from the vault#320 review.

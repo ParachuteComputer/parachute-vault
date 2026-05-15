@@ -777,6 +777,10 @@ describe("portable-md round-trip — byte-equivalent re-export after blow-away i
     //   - Typed links (non-wikilink).
     //   - Multi-line metadata (vault#317 F1 path).
     //   - One note edited (created_at ≠ updated_at).
+    //   - Empty-content note (vault#323) — skeleton/draft shape that real
+    //     vaults legitimately carry. Pins the round-trip regression that
+    //     blocked stable promotion when the EMPTY_NOTE guard was still
+    //     rejecting these on import.
     await store.upsertTagSchema("project", {
       description: "A long-running effort",
       fields: { status: { type: "string", enum: ["active", "done"] } },
@@ -797,6 +801,14 @@ describe("portable-md round-trip — byte-equivalent re-export after blow-away i
       tags: ["project"],
     });
     await store.createNote("unpathed jot", { id: "01HX003" });
+    // Empty-content note with a path — the skeleton/organizing-only
+    // shape from vault#323. Export emits it as frontmatter + empty body;
+    // import must accept it.
+    await store.createNote("", {
+      id: "01HX004",
+      path: "Inbox/skeleton",
+      tags: ["project"],
+    });
     await store.createLink("01HX001", "01HX002", "derived-from", { source: "git://example" });
 
     // Force a divergence between created_at and updated_at on n1 so
@@ -815,9 +827,19 @@ describe("portable-md round-trip — byte-equivalent re-export after blow-away i
     // Blow-away import into a fresh store.
     const restored = new SqliteStore(new Database(":memory:"));
     const importStats = await importPortableVault(restored, { inDir: outA, blowAway: true });
-    expect(importStats.notes_created).toBe(3);
+    expect(importStats.notes_created).toBe(4);
     expect(importStats.schemas_restored).toBe(1);
     expect(importStats.links_restored).toBe(1);
+
+    // Empty-content note survives the round-trip — content is empty,
+    // path + tags persist. This is the load-bearing assertion for
+    // vault#323: prior to the EMPTY_NOTE drop, importPortableVault
+    // threw on the createNote("") call here.
+    const skeleton = await restored.getNote("01HX004");
+    expect(skeleton).not.toBeNull();
+    expect(skeleton!.content).toBe("");
+    expect(skeleton!.path).toBe("Inbox/skeleton");
+    expect(skeleton!.tags).toContain("project");
 
     // Second export from the restored store.
     const outB = join(tmpBase, "outB");
