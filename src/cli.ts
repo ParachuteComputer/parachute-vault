@@ -2558,6 +2558,23 @@ async function cmdImport(args: string[]) {
     process.exit(1);
   }
 
+  // Daemon-busy guard (vault#323): the import opens its own bun:sqlite
+  // connection, but a running daemon already holds the writer lock. The
+  // first createNote then trips SQLITE_BUSY mid-stream and leaves a
+  // partially-replayed vault. Refuse with a clear error rather than
+  // attempt-and-fail. WAL/concurrent-writer is a separate follow-up.
+  const globalConfig = readGlobalConfig();
+  const port = globalConfig.port || DEFAULT_PORT;
+  const health = await checkHealth(port);
+  if (health.status === "healthy" || health.status === "unhealthy") {
+    console.error(
+      `error: vault daemon is running on port ${port}; stop it first with:\n` +
+        `  parachute stop vault\n` +
+        `the import requires exclusive write access to the SQLite database.`,
+    );
+    process.exit(1);
+  }
+
   // Autodetect: portable-md export → `.parachute/vault.yaml` present.
   const isPortableMd = existsSync(join(fullPath, ".parachute", "vault.yaml"));
 
