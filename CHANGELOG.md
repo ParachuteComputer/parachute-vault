@@ -6,6 +6,113 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.5-rc.1] — 2026-05-15
+
+File-extension support — vault#328. Substrate-side feature enabling
+notes whose content is NOT markdown (CSV, YAML, JSON, MDX, plaintext,
+etc.) as first-class. Markdown stays the default; every existing row
+keeps its meaning. Three commits under the vault#328 theme.
+
+### feat(db): add extension column to notes, default 'md' (vault#328)
+
+Schema v17 → v18: `ALTER TABLE notes ADD COLUMN extension TEXT NOT
+NULL DEFAULT 'md'`, and widen the path-uniqueness index from `(path)`
+to `(path, extension)` so two notes can share a path differing only by
+extension (e.g. `Recipes/pasta.md` + `Recipes/pasta.csv`).
+
+Backward-compat by construction — every existing row defaults to "md",
+so the new composite-index uniqueness collapses to the v5 "(path WHERE
+NOT NULL) is unique" behavior on existing data.
+
+Threaded `extension` through `Note`/`NoteSummary`/`NoteIndex`, the
+`Store` interface (`createNote` / `updateNote` / `createNoteRaw`),
+`BulkNoteInput`, and `QueryOpts.extension` (single string or array,
+case-insensitive `LOWER(n.extension) IN (...)` SQL).
+
+Tests: 7 new in `core/src/core.test.ts` covering default 'md',
+explicit persist, v18 migration backfills legacy NULL → 'md',
+`updateNote` changes extension, query filter (single + array shapes),
+case-insensitive match.
+
+### feat(api): extension field on create-note + update-note + query-notes (vault#328)
+
+MCP and REST surfaces gain a symmetric `extension` field:
+
+- **MCP `create-note`**: optional `extension` on single + batch shapes.
+- **MCP `update-note`**: optional `extension`; same validation on both
+  the update branch AND the `if_missing: "create"` branch.
+- **MCP `query-notes`**: `extension` filter accepts a single string or
+  an array.
+- **REST `POST /notes`** + **`PATCH /notes/:id`** (incl.
+  `if_missing=create` branch): symmetric `extension` field, validation,
+  400 `invalid_extension` on bad input with structured
+  `error_type`/`extension`/`reason`.
+- **REST `GET /notes`**: `?extension=csv` (single) or
+  `?extension=csv&extension=yaml` / `?extension=csv,yaml` (array).
+
+Validation: `/^[a-z0-9]{1,16}$/` + reserved `parachute` prefix guard.
+Single source of truth at
+`core/src/notes.ts:validateExtension`, imported by both transports so
+the contract can't drift.
+
+Tests: 7 MCP + 9 REST integration tests — default, persist, validation
+rejections (uppercase, dot, slash, reserved prefix, too long, empty),
+update branch, `if_missing=create` branch, GET filter (single + array).
+
+### feat(export): non-markdown content with sidecar metadata + .mdx as frontmatter-compatible (vault#328)
+
+`core/src/portable-md.ts:supportsInlineFrontmatter(ext)` predicate
+splits extensions into two buckets:
+
+- **Frontmatter-compatible** (`md`, `mdx`): metadata as inline YAML
+  frontmatter at top of content file. Today's behavior, extended to
+  `.mdx` (YAML frontmatter works in MDX identically — and Aaron's
+  planning to use MDX in some notes).
+- **Sidecar-required** (`csv`, `yaml`, `json`, anything else): metadata
+  in `.parachute/notes-meta/<note-id>.yaml`. Content file holds the
+  raw bytes — no frontmatter prepend.
+
+Export emits one sidecar per non-frontmatter-compat note; new
+`ExportStats.sidecars` counter pins the count. Sidecar path-traversal
+guard symmetric with the attachments path: the sidecar lives under
+`.parachute/notes-meta/`, period.
+
+Import builds a `(path, extension) → sidecar` index from the
+`.parachute/notes-meta/` directory at the top of the import pass.
+Walks every content file (not just `.md` — new `walkContentFiles`
+helper) and, for each, parses inline frontmatter (frontmatter-compat
+extensions) or looks up the sidecar (non-frontmatter-compat). Orphaned
+content files (no matching sidecar) are skipped with a warning rather
+than crashing.
+
+`toPortableMarkdown` now returns raw content for sidecar-required
+extensions (no synthetic `---` frontmatter prepend). New
+`toSidecarYaml` emits the metadata-only bytes for the sidecar.
+`portableExportFilePath` honors the note's `extension` (was hardcoded
+`.md`).
+
+**Wikilink ambiguity policy** (vault#328 edge case 3): when two notes
+share a path differing only by extension (`Foo.md` + `Foo.csv`),
+`[[Foo]]` is refused (returns null from `resolveWikilink`) and
+recorded as unresolved. `[[Foo.md]]` / `[[Foo.csv]]` resolve
+unambiguously to their respective notes via the new explicit-extension
+form. The extension-recognition pattern in the wikilink parser mirrors
+`EXTENSION_PATTERN` in `core/src/notes.ts` so the two share the same
+notion of "this looks like an extension."
+
+Frontmatter `extension` field is OMITTED for `md` (the default) so
+pre-vault#328 markdown-only exports produce byte-identical bytes
+before and after the upgrade. The sidecar always includes `extension`
+(the field is the sidecar's reason for existing).
+
+Tests: 10 new in `core/src/portable-md.test.ts` —
+`supportsInlineFrontmatter` true/false matrix, `toPortableMarkdown`
+extension awareness (md, mdx, csv), `toSidecarYaml` shape, full
+round-trip integration over csv/yaml/json/mdx/empty-content/.md
+(export → blow-away import → byte-equiv re-export), orphan-content-
+file rejection, wikilink ambiguity refuse + explicit-extension
+resolve.
+
 ## [0.4.4-rc.14] — 2026-05-15
 
 Round-trip import unblocker — vault#323. Aaron's real default vault

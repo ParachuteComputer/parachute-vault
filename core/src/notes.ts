@@ -29,12 +29,16 @@ export function generateId(): string {
 export function createNote(
   db: Database,
   content: string,
-  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string },
+  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string },
 ): Note {
   const id = opts?.id ?? generateId();
   const createdAt = opts?.created_at ?? new Date().toISOString();
   const metadata = opts?.metadata ? JSON.stringify(opts.metadata) : "{}";
   const path = normalizePath(opts?.path);
+  // `extension` defaults to "md" so existing callers see no change.
+  // Validation happens at the API surface (MCP/REST) — the Store accepts
+  // whatever the caller passed; importer paths trust the export's shape.
+  const extension = opts?.extension ?? "md";
 
   // Empty content is a valid state (vault#323): skeleton notes, drafts
   // saved before content, organizing-only notes, capture-then-fill flows.
@@ -50,8 +54,8 @@ export function createNote(
   // "user-touched since creation."
   try {
     db.prepare(
-      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(id, content, path, metadata, createdAt, createdAt);
+      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at, extension) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, content, path, metadata, createdAt, createdAt, extension);
   } catch (err) {
     if (path !== null && isPathUniqueError(err)) {
       throw new PathConflictError(path);
@@ -153,10 +157,72 @@ export class PathConflictError extends Error {
 export const MAX_BATCH_SIZE = 500;
 
 /**
- * Match bun:sqlite's UNIQUE-constraint error on the notes.path index. The
- * error class is `SQLiteError` but matching on the message is sufficient
- * here — the index name and column are stable parts of the schema, and
- * bun:sqlite has carried this exact message text since 1.0.
+ * Validate a caller-supplied file extension (vault#328). Rules:
+ *   1. Non-empty, lowercase alphanumeric only.
+ *   2. Length 1–16 — long enough for "markdown" etc., short enough to
+ *      bound on-disk filename length.
+ *   3. No dot/slash/uppercase — those would create path-encoding
+ *      ambiguity or collide with filesystem separators.
+ *   4. Reserved: anything matching /^parachute/i is refused because the
+ *      `.parachute/` sidecar dir convention owns that namespace; a note
+ *      with extension `parachute` would write to `<path>.parachute`
+ *      which is ambiguous with a directory entry.
+ *
+ * Throws `ExtensionValidationError` on failure. Both MCP and REST
+ * surfaces import this so the contract can never drift between them.
+ */
+export const EXTENSION_PATTERN = /^[a-z0-9]{1,16}$/;
+
+export class ExtensionValidationError extends Error {
+  code = "INVALID_EXTENSION" as const;
+  extension: string;
+  reason: string;
+
+  constructor(extension: string, reason: string) {
+    super(`invalid extension "${extension}": ${reason}`);
+    this.name = "ExtensionValidationError";
+    this.extension = extension;
+    this.reason = reason;
+  }
+}
+
+export function validateExtension(extension: unknown): string {
+  if (typeof extension !== "string") {
+    throw new ExtensionValidationError(
+      String(extension),
+      `must be a string (got ${typeof extension})`,
+    );
+  }
+  if (extension.length === 0) {
+    throw new ExtensionValidationError(
+      extension,
+      "must be non-empty; omit the field entirely to default to 'md'",
+    );
+  }
+  if (!EXTENSION_PATTERN.test(extension)) {
+    throw new ExtensionValidationError(
+      extension,
+      `must match ${EXTENSION_PATTERN.source} (lowercase alphanumeric, 1–16 chars; no '.', '/', or uppercase)`,
+    );
+  }
+  // Reserved namespace: anything that starts with "parachute" collides
+  // with the .parachute/ sidecar directory convention. The pattern check
+  // above already enforces lowercase, so a literal prefix match is exact.
+  if (extension.startsWith("parachute")) {
+    throw new ExtensionValidationError(
+      extension,
+      "the 'parachute' prefix is reserved for the .parachute/ sidecar dir",
+    );
+  }
+  return extension;
+}
+
+/**
+ * Match bun:sqlite's UNIQUE-constraint error on the notes path index.
+ * Post-vault#328 the unique index is composite `(path, extension)`, so
+ * the message text is "UNIQUE constraint failed: notes.path,
+ * notes.extension". Pre-v18 (legacy `(path)` index) emitted just
+ * "notes.path". Match on the common prefix to cover both.
  */
 function isPathUniqueError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -182,6 +248,7 @@ export function updateNote(
      */
     prepend?: string;
     path?: string;
+    extension?: string;
     metadata?: Record<string, unknown>;
     created_at?: string;
     skipUpdatedAt?: boolean;
@@ -260,6 +327,14 @@ export function updateNote(
     sets.push("path = ?");
     values.push(normalizePath(updates.path));
   }
+  if (updates.extension !== undefined) {
+    // Allowed but documented as caller-owned (vault#328 edge case 1):
+    // the Store accepts whatever the API surface validated, including
+    // changing extension on a non-empty note. The caller is responsible
+    // for content validity post-change.
+    sets.push("extension = ?");
+    values.push(updates.extension);
+  }
   if (updates.metadata !== undefined) {
     sets.push("metadata = ?");
     values.push(JSON.stringify(updates.metadata));
@@ -305,8 +380,14 @@ export function updateNote(
       db.prepare(sql).run(...values);
     }
   } catch (err) {
-    if (updates.path !== undefined && isPathUniqueError(err)) {
-      throw new PathConflictError(normalizePath(updates.path) ?? updates.path);
+    // Post-vault#328 the unique index is composite (path, extension), so
+    // an extension-only update can also trip UNIQUE — widen the catch to
+    // surface those as structured PATH_CONFLICT instead of a raw 500.
+    if (isPathUniqueError(err)) {
+      const conflictPath = updates.path !== undefined
+        ? (normalizePath(updates.path) ?? updates.path)
+        : ((db.prepare("SELECT path FROM notes WHERE id = ?").get(id) as { path: string | null } | undefined)?.path ?? "<unknown>");
+      throw new PathConflictError(conflictPath);
     }
     throw err;
   }
@@ -422,6 +503,26 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   if (opts.pathPrefix) {
     conditions.push("n.path LIKE ?");
     params.push(opts.pathPrefix + "%");
+  }
+
+  // Extension filter (vault#328). Single string → exact match; array → IN
+  // clause. Compared lower-case so a caller passing "CSV" still hits rows
+  // stored as "csv". An empty array is a no-op (no filter applied) rather
+  // than a "no rows match" short-circuit — matches the spirit of the
+  // existing `tags: []` behavior.
+  if (opts.extension !== undefined) {
+    const exts = Array.isArray(opts.extension) ? opts.extension : [opts.extension];
+    const cleaned = exts
+      .filter((e): e is string => typeof e === "string" && e.length > 0)
+      .map((e) => e.toLowerCase());
+    if (cleaned.length === 1) {
+      conditions.push("LOWER(n.extension) = ?");
+      params.push(cleaned[0]!);
+    } else if (cleaned.length > 1) {
+      const placeholders = cleaned.map(() => "?").join(", ");
+      conditions.push(`LOWER(n.extension) IN (${placeholders})`);
+      params.push(...cleaned);
+    }
   }
 
   // Metadata filters — operator objects route through the indexed generated
@@ -1122,6 +1223,7 @@ export function toNoteIndex(note: Note): NoteIndex {
   return {
     id: note.id,
     path: note.path,
+    extension: note.extension,
     createdAt: note.createdAt,
     updatedAt: note.updatedAt,
     tags: note.tags,
@@ -1229,6 +1331,7 @@ export interface BulkNoteInput {
   tags?: string[];
   metadata?: Record<string, unknown>;
   created_at?: string;
+  extension?: string;
 }
 
 export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
@@ -1244,6 +1347,7 @@ export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
           tags: input.tags,
           metadata: input.metadata,
           created_at: input.created_at,
+          extension: input.extension,
         }),
       );
     }
@@ -1311,6 +1415,7 @@ interface NoteRow {
   metadata: string | null;
   created_at: string;
   updated_at: string | null;
+  extension: string | null;
 }
 
 function rowToNote(row: NoteRow): Note {
@@ -1322,6 +1427,10 @@ function rowToNote(row: NoteRow): Note {
     id: row.id,
     content: row.content,
     path: row.path ?? undefined,
+    // `extension` is NOT NULL DEFAULT 'md' in v18+, but rows under a v17
+    // migration window might briefly read as NULL. Fall back to "md" so
+    // callers never see a missing extension.
+    extension: row.extension ?? "md",
     metadata,
     createdAt: row.created_at,
     // Legacy notes (pre-#70) may have NULL updated_at. Fall back to created_at

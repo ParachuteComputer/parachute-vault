@@ -92,7 +92,7 @@ export class BunSqliteStore implements Store {
 
   // ---- Notes ----
 
-  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
+  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note> {
     const note = noteOps.createNote(this.db, content, opts);
 
     if (content) {
@@ -128,6 +128,7 @@ export class BunSqliteStore implements Store {
       append?: string;
       prepend?: string;
       path?: string;
+      extension?: string;
       metadata?: Record<string, unknown>;
       created_at?: string;
       skipUpdatedAt?: boolean;
@@ -498,7 +499,7 @@ export class BunSqliteStore implements Store {
    * `syncAllWikilinks`, so adding the cache rebuild there is the natural
    * place.)
    */
-  async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note> {
+  async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note> {
     return noteOps.createNote(this.db, content, opts);
   }
 

@@ -32,7 +32,10 @@ import {
   parseFrontmatter,
   portableExportFilePath,
   SIDECAR_DIR,
+  NOTES_META_DIR,
+  supportsInlineFrontmatter,
   toPortableMarkdown,
+  toSidecarYaml,
   type PortableNote,
 } from "./portable-md.js";
 
@@ -293,6 +296,25 @@ describe("portableExportFilePath", () => {
     expect(portableExportFilePath({
       id: "01HABC", content: "", created_at: "2026-05-12T00:00:00.000Z",
     })).toBe("_unpathed/01HABC.md");
+  });
+
+  it("honors the note's extension for pathless notes (vault#329 F4)", () => {
+    expect(portableExportFilePath({
+      id: "01HXCSV",
+      content: "a,b\n1,2",
+      created_at: "2026-05-12T00:00:00.000Z",
+      extension: "csv",
+    })).toBe("_unpathed/01HXCSV.csv");
+  });
+
+  it("honors the note's extension for pathed notes (vault#329 F4)", () => {
+    expect(portableExportFilePath({
+      id: "x",
+      content: "",
+      created_at: "2026-05-12T00:00:00.000Z",
+      path: "Inbox/y",
+      extension: "mdx",
+    })).toBe("Inbox/y.mdx");
   });
 });
 
@@ -1019,5 +1041,299 @@ note body
     // — must NOT exist. Most importantly NOT at a path higher than destAssets.
     const wouldBeEscape = join(tmpBase, "escape.bin");
     expect(existsSync(wouldBeEscape)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// File-extension support — non-markdown notes (vault#328)
+// ---------------------------------------------------------------------------
+//
+// Two pinned behaviors per the design issue:
+//   1. supportsInlineFrontmatter: md + mdx return true; everything else
+//      returns false.
+//   2. Round-trip integration: vault containing csv/yaml/json/mdx/empty
+//      notes survives export → blow-away import → re-export byte-equiv.
+
+describe("supportsInlineFrontmatter (vault#328)", () => {
+  it("returns true for md and mdx", () => {
+    expect(supportsInlineFrontmatter("md")).toBe(true);
+    expect(supportsInlineFrontmatter("mdx")).toBe(true);
+    // Case-insensitive — guard against caller-supplied 'MD'.
+    expect(supportsInlineFrontmatter("MD")).toBe(true);
+  });
+
+  it("returns false for sidecar-required formats", () => {
+    expect(supportsInlineFrontmatter("csv")).toBe(false);
+    expect(supportsInlineFrontmatter("yaml")).toBe(false);
+    expect(supportsInlineFrontmatter("json")).toBe(false);
+    expect(supportsInlineFrontmatter("txt")).toBe(false);
+    expect(supportsInlineFrontmatter("org")).toBe(false); // not yet in the set
+  });
+});
+
+describe("toPortableMarkdown — extension awareness (vault#328)", () => {
+  it(".md note still gets inline frontmatter", () => {
+    const out = toPortableMarkdown({
+      id: "1",
+      path: "Inbox/a",
+      extension: "md",
+      content: "hello\n",
+      created_at: "2026-05-15T00:00:00.000Z",
+    });
+    expect(out.startsWith("---\n")).toBe(true);
+    expect(out).toContain("id: '1'");
+    expect(out).toContain("hello");
+  });
+
+  it(".mdx note also gets inline frontmatter", () => {
+    const out = toPortableMarkdown({
+      id: "1",
+      path: "Components/Card",
+      extension: "mdx",
+      content: "import X from './x';\n\n<X/>\n",
+      created_at: "2026-05-15T00:00:00.000Z",
+    });
+    expect(out.startsWith("---\n")).toBe(true);
+    expect(out).toContain("extension: mdx");
+  });
+
+  it(".csv note returns raw content — no frontmatter prepend", () => {
+    const out = toPortableMarkdown({
+      id: "1",
+      path: "Tabular/budget",
+      extension: "csv",
+      content: "month,total\n2026-01,9000\n",
+      created_at: "2026-05-15T00:00:00.000Z",
+    });
+    expect(out.startsWith("---\n")).toBe(false);
+    expect(out).toBe("month,total\n2026-01,9000\n");
+  });
+
+  it("toSidecarYaml emits the same key set as inline frontmatter, always includes extension", () => {
+    const sidecar = toSidecarYaml({
+      id: "abc",
+      path: "Tabular/budget",
+      extension: "csv",
+      tags: ["budget"],
+      content: "irrelevant — sidecar carries metadata only",
+      metadata: { fiscal_year: 2026 },
+      created_at: "2026-05-15T00:00:00.000Z",
+      updated_at: "2026-05-15T00:00:00.000Z",
+    });
+    expect(sidecar).toContain("id: abc");
+    expect(sidecar).toContain("path: Tabular/budget");
+    expect(sidecar).toContain("extension: csv");
+    expect(sidecar).toContain("tags:");
+    expect(sidecar).toContain("budget");
+    expect(sidecar).toContain("fiscal_year");
+  });
+});
+
+describe("portable-md non-markdown round-trip (vault#328)", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-ext");
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(tmpBase, { recursive: true });
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("csv/yaml/json/mdx/empty notes survive export → blow-away import → byte-equivalent re-export", async () => {
+    // Seed a vault that hits every extension axis the brief calls out:
+    //   - .csv (sidecar-required, non-empty)
+    //   - .yaml (sidecar-required, non-empty)
+    //   - .json (sidecar-required, non-empty)
+    //   - .mdx (frontmatter-compatible, non-empty)
+    //   - .csv empty-content (the vault#323 edge case, vault#328 sidecar path)
+    //   - .md (back-compat baseline — same shape as pre-vault#328)
+    await store.createNote("month,total\n2026-01,9000\n", {
+      id: "csv-1",
+      path: "Tabular/budget",
+      extension: "csv",
+      tags: ["budget"],
+      metadata: { fiscal_year: 2026, currency: "USD" },
+    });
+    await store.createNote("- one\n- two\n", {
+      id: "yaml-1",
+      path: "Config/options",
+      extension: "yaml",
+    });
+    await store.createNote(`{"k":1}\n`, {
+      id: "json-1",
+      path: "Data/sample",
+      extension: "json",
+    });
+    await store.createNote("import X from './x';\n\n<X/>\n", {
+      id: "mdx-1",
+      path: "Components/Card",
+      extension: "mdx",
+      tags: ["component"],
+    });
+    await store.createNote("", {
+      id: "csv-empty",
+      path: "Tabular/skeleton",
+      extension: "csv",
+    });
+    await store.createNote("plain markdown body\n", {
+      id: "md-1",
+      path: "Inbox/note",
+      tags: ["inbox"],
+    });
+
+    // Export A.
+    const outA = join(tmpBase, "outA");
+    const statsA = await exportVaultToDir(store, {
+      outDir: outA,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+    });
+    expect(statsA.notes).toBe(6);
+    // Four sidecar-required notes (csv ×2, yaml, json) → four sidecars.
+    // md + mdx carry frontmatter inline so they don't get sidecars.
+    expect(statsA.sidecars).toBe(4);
+
+    // Sidecar files exist with the right basenames (note ids).
+    const sidecarDir = join(outA, SIDECAR_DIR, NOTES_META_DIR);
+    expect(readdirSync(sidecarDir).sort()).toEqual([
+      "csv-1.yaml",
+      "csv-empty.yaml",
+      "json-1.yaml",
+      "yaml-1.yaml",
+    ]);
+
+    // Content files at the user-visible paths with the right suffixes.
+    expect(existsSync(join(outA, "Tabular/budget.csv"))).toBe(true);
+    expect(existsSync(join(outA, "Config/options.yaml"))).toBe(true);
+    expect(existsSync(join(outA, "Data/sample.json"))).toBe(true);
+    expect(existsSync(join(outA, "Components/Card.mdx"))).toBe(true);
+    expect(existsSync(join(outA, "Tabular/skeleton.csv"))).toBe(true);
+    expect(existsSync(join(outA, "Inbox/note.md"))).toBe(true);
+
+    // .csv content is RAW — no `---` frontmatter prepend.
+    const csvFile = readFileSync(join(outA, "Tabular/budget.csv"), "utf-8");
+    expect(csvFile.startsWith("---")).toBe(false);
+    expect(csvFile).toBe("month,total\n2026-01,9000\n");
+
+    // .mdx content has inline frontmatter (same as .md).
+    const mdxFile = readFileSync(join(outA, "Components/Card.mdx"), "utf-8");
+    expect(mdxFile.startsWith("---\n")).toBe(true);
+    expect(mdxFile).toContain("extension: mdx");
+
+    // Blow-away import into a fresh store.
+    const restored = new SqliteStore(new Database(":memory:"));
+    const importStats = await importPortableVault(restored, { inDir: outA, blowAway: true });
+    expect(importStats.notes_created).toBe(6);
+
+    // Verify each note round-tripped its content + extension.
+    const csvRestored = await restored.getNote("csv-1");
+    expect(csvRestored).not.toBeNull();
+    expect(csvRestored!.content).toBe("month,total\n2026-01,9000\n");
+    expect(csvRestored!.extension).toBe("csv");
+    expect(csvRestored!.metadata).toEqual({ fiscal_year: 2026, currency: "USD" });
+    expect(csvRestored!.tags).toContain("budget");
+
+    const emptyCsv = await restored.getNote("csv-empty");
+    expect(emptyCsv!.content).toBe("");
+    expect(emptyCsv!.extension).toBe("csv");
+    expect(emptyCsv!.path).toBe("Tabular/skeleton");
+
+    const mdxRestored = await restored.getNote("mdx-1");
+    expect(mdxRestored!.extension).toBe("mdx");
+    expect(mdxRestored!.content).toBe("import X from './x';\n\n<X/>\n");
+
+    const mdRestored = await restored.getNote("md-1");
+    expect(mdRestored!.extension).toBe("md");
+    expect(mdRestored!.tags).toContain("inbox");
+
+    // Re-export B from the restored store.
+    const outB = join(tmpBase, "outB");
+    await exportVaultToDir(restored, {
+      outDir: outB,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+    });
+
+    // Byte-equivalence — every file in outA matches outB.
+    const compareTree = (a: string, b: string, prefix = "") => {
+      const aEntries = readdirSync(a).sort();
+      const bEntries = readdirSync(b).sort();
+      expect(bEntries).toEqual(aEntries);
+      for (const entry of aEntries) {
+        const aPath = join(a, entry);
+        const bPath = join(b, entry);
+        const aStat = statSync(aPath);
+        const bStat = statSync(bPath);
+        expect(bStat.isDirectory()).toBe(aStat.isDirectory());
+        if (aStat.isDirectory()) {
+          compareTree(aPath, bPath, prefix + entry + "/");
+        } else {
+          const aBuf = readFileSync(aPath, "utf-8");
+          const bBuf = readFileSync(bPath, "utf-8");
+          if (aBuf !== bBuf) {
+            // eslint-disable-next-line no-console
+            console.error(`drift at ${prefix}${entry}:\n--- outA ---\n${aBuf}\n--- outB ---\n${bBuf}`);
+          }
+          expect(bBuf).toBe(aBuf);
+        }
+      }
+    };
+    compareTree(outA, outB);
+  });
+
+  it("import refuses content files lacking a sidecar (orphaned non-md file)", async () => {
+    // Build a minimal portable-md directory by hand: a valid vault.yaml
+    // + a .csv content file with NO matching sidecar. The importer
+    // should skip the orphaned file rather than crashing or creating
+    // a sidecar-less note.
+    const outDir = join(tmpBase, "orphan");
+    mkdirSync(join(outDir, SIDECAR_DIR), { recursive: true });
+    writeFileSync(
+      join(outDir, SIDECAR_DIR, "vault.yaml"),
+      "export_format_version: 1\nexported_at: '2026-05-15T00:00:00.000Z'\n",
+    );
+    mkdirSync(join(outDir, "Tabular"), { recursive: true });
+    writeFileSync(join(outDir, "Tabular/orphan.csv"), "a,b\n1,2\n");
+
+    const restored = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(restored, { inDir: outDir });
+    // No sidecar → no DB row.
+    expect(stats.notes_created).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wikilink ambiguity policy (vault#328)
+// ---------------------------------------------------------------------------
+//
+// When two notes share a path differing only by extension (e.g. `Foo.md`
+// and `Foo.csv`), `[[Foo]]` is ambiguous. The resolver must:
+//   - refuse to resolve the bare form and record it as unresolved
+//   - resolve `[[Foo.md]]` and `[[Foo.csv]]` to their respective notes
+
+describe("wikilink ambiguity across extensions (vault#328)", async () => {
+  it("refuses ambiguous bare-form wikilinks when path collides on extension", async () => {
+    const store = new SqliteStore(new Database(":memory:"));
+    const md = await store.createNote("# MD note", { path: "Foo", id: "foo-md" });
+    const csv = await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    // Sanity — both rows landed under the composite uniqueness key.
+    expect(md.path).toBe("Foo");
+    expect(csv.path).toBe("Foo");
+
+    // A third note linking to bare `[[Foo]]` should be UNRESOLVED.
+    await store.createNote("see [[Foo]]", { id: "linker", path: "Linker" });
+    const outboundLinks = await store.getLinks("linker", { direction: "outbound" });
+    expect(outboundLinks).toHaveLength(0);
+  });
+
+  it("resolves explicit-extension wikilinks unambiguously", async () => {
+    const store = new SqliteStore(new Database(":memory:"));
+    await store.createNote("# MD note", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+
+    await store.createNote("see [[Foo.csv]]", { id: "linker", path: "Linker" });
+    const outbound = await store.getLinks("linker", { direction: "outbound" });
+    expect(outbound).toHaveLength(1);
+    expect(outbound[0]!.targetId).toBe("foo-csv");
   });
 });

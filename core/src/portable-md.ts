@@ -90,11 +90,42 @@ export const EXPORT_FORMAT_VERSION = 1;
  *  as notes; consumers like Logseq/Foam/Quartz don't see the sidecar. */
 export const SIDECAR_DIR = ".parachute";
 
+/**
+ * Subdirectory under the sidecar where per-note metadata sidecars live
+ * for non-frontmatter-compatible extensions (vault#328). One YAML file
+ * per note, keyed by note id: `.parachute/notes-meta/<note-id>.yaml`.
+ * Mirrors the inline-frontmatter shape so the parser can chew either.
+ */
+export const NOTES_META_DIR = "notes-meta";
+
+/**
+ * Extensions whose serialized form carries metadata as inline YAML
+ * frontmatter at the top of the content file. `.md` is the canonical
+ * case; `.mdx` joins it because MDX's parser accepts the same `---`
+ * delimited preamble (and Aaron's planning to use MDX in notes).
+ * Anything else is sidecar-required — see `core/src/portable-md.ts`
+ * write/read paths.
+ *
+ * Easy to extend later — e.g. `.org` if/when a real workflow demands
+ * it. Today's set is conservative: only formats whose parser semantics
+ * we've explicitly validated.
+ */
+const FRONTMATTER_COMPAT_EXTENSIONS = new Set(["md", "mdx"]);
+
+export function supportsInlineFrontmatter(extension: string): boolean {
+  return FRONTMATTER_COMPAT_EXTENSIONS.has(extension.toLowerCase());
+}
+
 /** Order in which top-level frontmatter keys are emitted. Fixed — required
- *  for byte-identical re-exports of unchanged vault state. */
+ *  for byte-identical re-exports of unchanged vault state. `extension` is
+ *  emitted right after `path` so the suffix story sits with the
+ *  filesystem-location story; emitted only when non-default ("md"
+ *  doesn't get a frontmatter line so the existing `.md`-only corpus
+ *  diffs cleanly against pre-vault#328 exports). */
 const FRONTMATTER_KEY_ORDER = [
   "id",
   "path",
+  "extension",
   "tags",
   "metadata",
   "links",
@@ -107,11 +138,20 @@ const FRONTMATTER_KEY_ORDER = [
 // Types
 // ---------------------------------------------------------------------------
 
-/** Per-note shape written into one .md file (frontmatter + content). */
+/** Per-note shape written into one file (frontmatter + content for
+ *  `.md`/`.mdx`; raw content + sidecar metadata for everything else). */
 export interface PortableNote {
   id: string;
   path?: string;
   content: string;
+  /**
+   * File extension (vault#328). Defaults to "md" when omitted —
+   * back-compat with PR1/PR2 exports that predate the extension axis.
+   * Controls both the file suffix on disk AND whether metadata goes
+   * inline as frontmatter (`md`, `mdx`) or in a sidecar
+   * (`csv`/`yaml`/`json`/etc).
+   */
+  extension?: string;
   metadata?: Record<string, unknown>;
   tags?: string[];
   links?: PortableLink[];
@@ -152,6 +192,13 @@ export interface ExportStats {
   notes: number;
   schemas: number;
   attachments: number;
+  /**
+   * Per-note metadata sidecars written for non-frontmatter-compatible
+   * extensions (vault#328). For `.md`/`.mdx` notes this stays 0 —
+   * metadata is inline. For `.csv`/`.yaml`/`.json` notes, one sidecar
+   * per note.
+   */
+  sidecars: number;
   /** Set when caller passed `since`; counts notes whose `updated_at >= since`. */
   filtered_by_since: boolean;
   /**
@@ -356,6 +403,9 @@ function buildFrontmatter(note: PortableNote): Record<string, unknown> {
   const fm: Record<string, unknown> = {};
   fm.id = note.id;
   if (note.path) fm.path = note.path;
+  // Emit only when non-default ("md") so legacy markdown-only exports
+  // produce byte-identical bytes pre- and post-vault#328.
+  if (note.extension && note.extension !== "md") fm.extension = note.extension;
   if (note.tags && note.tags.length > 0) fm.tags = [...note.tags].sort();
   if (note.metadata && Object.keys(note.metadata).length > 0) fm.metadata = note.metadata;
   if (note.links && note.links.length > 0) fm.links = note.links;
@@ -366,11 +416,29 @@ function buildFrontmatter(note: PortableNote): Record<string, unknown> {
 }
 
 /**
- * Render a note as portable markdown: `--- <frontmatter> --- <content>`.
- * Frontmatter keys in `FRONTMATTER_KEY_ORDER`; nested objects alpha-sorted.
- * Trailing newline preserved from `content` (or one is added if absent).
+ * Render a note's content-file bytes. Behavior depends on the note's
+ * `extension`:
+ *
+ *   - Frontmatter-compatible (`.md`, `.mdx`): emits `--- <frontmatter>
+ *     --- <content>`. Today's behavior, generalized to also handle MDX.
+ *   - Sidecar-required (`.csv`, `.yaml`, `.json`, etc.): emits the
+ *     raw content as-is (no frontmatter prepend). The metadata lives in
+ *     `.parachute/notes-meta/<id>.yaml`; see `toSidecarYaml`.
+ *
+ * Trailing-newline: frontmatter form always ends with `\n`. Raw content
+ * form is returned verbatim — if the note's content has no trailing
+ * newline, the file ends without one. Callers wanting strict
+ * trailing-newline normalization (re-emit invariant) should add it
+ * outside this function.
  */
 export function toPortableMarkdown(note: PortableNote): string {
+  const ext = note.extension ?? "md";
+  if (!supportsInlineFrontmatter(ext)) {
+    // Sidecar-required: content goes out as-is. No frontmatter, no
+    // synthetic trailing newline — the file is whatever the caller
+    // stored as `content`.
+    return note.content;
+  }
   const fm = buildFrontmatter(note);
   let out = "---\n";
   for (const key of FRONTMATTER_KEY_ORDER) {
@@ -393,13 +461,59 @@ export function toPortableMarkdown(note: PortableNote): string {
 }
 
 /**
+ * Render a note's sidecar metadata bytes (vault#328). Same key set as
+ * the inline frontmatter — just lifted out of the content file. Used
+ * for sidecar-required extensions (`.csv`/`.yaml`/`.json`/etc.) where
+ * the content file can't host YAML. Order of keys is fixed
+ * (`FRONTMATTER_KEY_ORDER`) so the sidecar bytes are byte-identical
+ * across re-exports of unchanged vault state.
+ *
+ * Always includes the `extension` field (unlike `buildFrontmatter`,
+ * which omits it for `md` to keep legacy diffs clean) — the sidecar is
+ * a new artifact, the omit-default optimization buys nothing.
+ */
+export function toSidecarYaml(note: PortableNote): string {
+  // Build a "full" frontmatter — same as buildFrontmatter, but always
+  // emit the extension. The sidecar's purpose is exactly to record
+  // the extension that's not in the filename.
+  const fm: Record<string, unknown> = {};
+  fm.id = note.id;
+  if (note.path) fm.path = note.path;
+  fm.extension = note.extension ?? "md";
+  if (note.tags && note.tags.length > 0) fm.tags = [...note.tags].sort();
+  if (note.metadata && Object.keys(note.metadata).length > 0) fm.metadata = note.metadata;
+  if (note.links && note.links.length > 0) fm.links = note.links;
+  if (note.attachments && note.attachments.length > 0) fm.attachments = note.attachments;
+  fm.created_at = note.created_at;
+  if (note.updated_at) fm.updated_at = note.updated_at;
+
+  let out = "";
+  for (const key of FRONTMATTER_KEY_ORDER) {
+    if (!(key in fm)) continue;
+    const value = fm[key];
+    const inline = emitValueInline(value, 1);
+    if (inline !== null) {
+      out += `${key}: ${inline}\n`;
+    } else {
+      out += `${key}:\n`;
+      const block = emitValueBlock(value, 1);
+      if (block !== null) out += `${block}\n`;
+    }
+  }
+  return out;
+}
+
+/**
  * Determine the file path for an exported portable-md note. Notes with a
- * `path` use it; pathless notes use `_unpathed/<id>.md` (no date-prefix
- * coincidence with user content).
+ * `path` use it + their `extension`; pathless notes use
+ * `_unpathed/<id>.<extension>` (no date-prefix coincidence with user
+ * content). Default extension is "md" so pre-vault#328 exports produce
+ * the same filenames.
  */
 export function portableExportFilePath(note: PortableNote): string {
-  if (note.path) return note.path + ".md";
-  return `_unpathed/${note.id}.md`;
+  const ext = note.extension ?? "md";
+  if (note.path) return `${note.path}.${ext}`;
+  return `_unpathed/${note.id}.${ext}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,10 +554,16 @@ export async function noteToPortable(
     }))
     .sort((a, b) => a.id.localeCompare(b.id));
 
+  // Default to "md" so old PR1/PR2 callers (or callers that didn't get
+  // the v18 column from a fresh-DB read) keep producing identical
+  // frontmatter shape.
+  const extension = note.extension ?? "md";
+
   const result: PortableNote = {
     id: note.id,
     ...(note.path ? { path: note.path } : {}),
     content: note.content,
+    ...(extension ? { extension } : {}),
     ...(note.metadata && Object.keys(note.metadata).length > 0 ? { metadata: note.metadata } : {}),
     ...(note.tags && note.tags.length > 0 ? { tags: [...note.tags].sort() } : {}),
     ...(typedLinks.length > 0 ? { links: typedLinks } : {}),
@@ -556,8 +676,11 @@ export async function exportVaultToDir(
   const assetsDirResolved = opts.assetsDir ? resolvePath(opts.assetsDir) : undefined;
   const attachmentsRoot = join(sidecar, "attachments");
   const attachmentsRootResolved = resolvePath(attachmentsRoot);
+  const notesMetaRoot = join(sidecar, NOTES_META_DIR);
+  const notesMetaRootResolved = resolvePath(notesMetaRoot);
   let notesWritten = 0;
   let attachmentsWritten = 0;
+  let sidecarsWritten = 0;
   const skipped: { path: string | undefined; reason: string }[] = [];
   const skippedAttachments: { note_id: string; attachment_id: string; path: string; reason: string }[] = [];
   for (const note of allNotes) {
@@ -582,6 +705,28 @@ export async function exportVaultToDir(
     mkdirSync(dirname(fullPath), { recursive: true });
     writeFileSync(fullPath, toPortableMarkdown(portable));
     notesWritten++;
+
+    // Sidecar metadata write for non-frontmatter-compat extensions
+    // (vault#328). The content file holds raw bytes (no YAML); the
+    // sidecar at .parachute/notes-meta/<id>.yaml carries id/path/tags/
+    // metadata/links/attachments/timestamps.
+    const portableExt = portable.extension ?? "md";
+    if (!supportsInlineFrontmatter(portableExt)) {
+      const sidecarFile = join(notesMetaRoot, `${portable.id}.yaml`);
+      const sidecarResolved = resolvePath(sidecarFile);
+      // Path-traversal guard symmetric with the attachments path: the
+      // sidecar lives under the .parachute/notes-meta/ subtree, period.
+      if (!isWithinDir(sidecarResolved, notesMetaRootResolved)) {
+        skipped.push({
+          path: portable.path,
+          reason: `path-traversal: sidecar write target "${sidecarResolved}" escapes notes-meta root "${notesMetaRootResolved}"`,
+        });
+      } else {
+        mkdirSync(notesMetaRoot, { recursive: true });
+        writeFileSync(sidecarResolved, toSidecarYaml(portable));
+        sidecarsWritten++;
+      }
+    }
 
     // Copy attachment binaries when assetsDir is wired. Each attachment
     // is path-traversal-guarded on both ends: source under assetsDir,
@@ -652,6 +797,7 @@ export async function exportVaultToDir(
     notes: notesWritten,
     schemas: schemasWritten,
     attachments: attachmentsWritten,
+    sidecars: sidecarsWritten,
     filtered_by_since: since !== undefined,
     skipped_traversal: skipped.length,
     skipped_notes: skipped,
@@ -837,19 +983,93 @@ export async function importPortableVault(
     }
   }
 
-  // 3. Notes. Walk every .md file under inDir (dot-dirs already
-  // excluded), parse, upsert.
+  // 3. Notes. Walk every content file under inDir (dot-dirs already
+  // excluded). For frontmatter-compatible extensions (md, mdx) parse
+  // inline metadata. For sidecar-required extensions (csv, yaml, json,
+  // etc.) look up metadata in `.parachute/notes-meta/<id>.yaml`.
+  //
+  // The sidecar's `path` + `extension` are the source of truth for the
+  // user-visible filename — but we walk filenames first and INDEX
+  // sidecars by `(path, extension)` for O(1) lookup per content file.
+  // Sidecars with no matching content file are warned about (and
+  // skipped) rather than triggering a write — preserves the
+  // export-bytes-are-truth invariant.
+  const notesMetaDir = join(sidecar, NOTES_META_DIR);
+  const sidecarByKey = new Map<string, Record<string, unknown>>();
+  const sidecarByIdLeftover = new Map<string, Record<string, unknown>>();
+  if (existsSync(notesMetaDir)) {
+    const notesMetaRootResolved = resolvePath(notesMetaDir);
+    for (const entry of readdirSync(notesMetaDir)) {
+      if (!entry.endsWith(".yaml")) continue;
+      if (entry.startsWith(".")) continue;
+      const fullPath = join(notesMetaDir, entry);
+      const resolved = resolvePath(fullPath);
+      if (!isWithinDir(resolved, notesMetaRootResolved)) continue;
+      const text = readFileSync(fullPath, "utf-8");
+      // The sidecar is a bare YAML doc (no `---`); wrap to reuse the
+      // shared frontmatter parser.
+      const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+      const { frontmatter } = parseFrontmatter(wrapped);
+      const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
+      const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
+      const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
+      if (!sidecarId) continue;
+      // Index by both (path, ext) tuple (for pathed notes) and by id
+      // (for unpathed notes whose filename is `_unpathed/<id>.<ext>`).
+      if (sidecarPath && sidecarExt) {
+        sidecarByKey.set(`${sidecarPath.toLowerCase()}|${sidecarExt.toLowerCase()}`, frontmatter);
+      }
+      sidecarByIdLeftover.set(sidecarId, frontmatter);
+    }
+  }
+
   // Track per-import (id → portable) so we can replay typed links
   // after all notes exist.
   const seenNotes = new Map<string, PortableNote>();
-  for (const filePath of walkMarkdownFiles(inDir)) {
+  for (const filePath of walkContentFiles(inDir)) {
     // Containment check — readdirSync should already be safe, but
     // verify the resolved path is inside inDir (symlinks).
     const resolved = resolvePath(filePath);
     if (!isWithinDir(resolved, inDirResolved)) continue;
 
-    const raw = readFileSync(filePath, "utf-8");
-    const { frontmatter, content } = parseFrontmatter(raw);
+    // Derive the file's extension (lowercased, no leading dot) and the
+    // user-visible note path (everything between inDir and the
+    // extension).
+    const extWithDot = extname(filePath); // e.g. ".csv"
+    const fileExt = extWithDot.slice(1).toLowerCase();
+    if (fileExt.length === 0) continue;
+    const relWithExt = relative(inDir, filePath);
+    const relNoExt = relWithExt.slice(0, relWithExt.length - extWithDot.length);
+    // Normalize path separators for cross-platform exports.
+    const userPath = relNoExt.split(pathSep).join("/");
+
+    let frontmatter: Record<string, unknown>;
+    let content: string;
+    if (supportsInlineFrontmatter(fileExt)) {
+      const raw = readFileSync(filePath, "utf-8");
+      const parsed = parseFrontmatter(raw);
+      frontmatter = parsed.frontmatter;
+      content = parsed.content;
+    } else {
+      // Look up sidecar by (path, ext). Lowercase path-key match.
+      const key = `${userPath.toLowerCase()}|${fileExt}`;
+      const found = sidecarByKey.get(key);
+      if (!found) {
+        // No sidecar — log and skip. Importing the raw bytes with no
+        // metadata would orphan the row (no id, no path, no
+        // timestamps). Better to surface the gap than silently lose
+        // shape.
+        // eslint-disable-next-line no-console
+        console.warn(`[import] skipped "${filePath}": no matching sidecar at ${NOTES_META_DIR}/<id>.yaml (path="${userPath}", extension="${fileExt}")`);
+        continue;
+      }
+      frontmatter = found;
+      content = readFileSync(filePath, "utf-8");
+      // Mark this sidecar as consumed so the "stale sidecar" pass
+      // below doesn't double-count.
+      const sidecarId = typeof found.id === "string" ? found.id : null;
+      if (sidecarId) sidecarByIdLeftover.delete(sidecarId);
+    }
 
     const id = typeof frontmatter.id === "string" ? frontmatter.id : null;
     if (!id) {
@@ -863,6 +1083,12 @@ export async function importPortableVault(
     const created_at = typeof frontmatter.created_at === "string" ? frontmatter.created_at : new Date().toISOString();
     const updated_at = typeof frontmatter.updated_at === "string" ? frontmatter.updated_at : created_at;
     const path = typeof frontmatter.path === "string" ? frontmatter.path : undefined;
+    // Trust the frontmatter/sidecar extension first; fall back to the
+    // filename extension. Notes without an explicit extension default
+    // to "md" (back-compat with pre-vault#328 exports).
+    const extension = typeof frontmatter.extension === "string"
+      ? frontmatter.extension
+      : fileExt || "md";
     const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags.filter((t): t is string => typeof t === "string") : undefined;
     const metadata = (frontmatter.metadata && typeof frontmatter.metadata === "object" && !Array.isArray(frontmatter.metadata))
       ? frontmatter.metadata as Record<string, unknown>
@@ -875,6 +1101,7 @@ export async function importPortableVault(
       content,
       created_at,
       updated_at,
+      extension,
       ...(path ? { path } : {}),
       ...(tags && tags.length > 0 ? { tags } : {}),
       ...(metadata ? { metadata } : {}),
@@ -925,6 +1152,7 @@ export async function importPortableVault(
         content,
         ...(path !== undefined ? { path } : {}),
         ...(metadata ? { metadata } : {}),
+        extension,
       });
       // Tags: delete existing, re-tag with imported set.
       if (existing.tags && existing.tags.length > 0) {
@@ -941,6 +1169,7 @@ export async function importPortableVault(
         ...(tags && tags.length > 0 ? { tags } : {}),
         ...(metadata ? { metadata } : {}),
         created_at,
+        extension,
       });
       stats.notes_created++;
     }
@@ -1389,6 +1618,29 @@ export function walkMarkdownFiles(dir: string): string[] {
       const stat = statSync(full);
       if (stat.isDirectory()) walk(full);
       else if (stat.isFile() && extname(entry).toLowerCase() === ".md") results.push(full);
+    }
+  }
+  walk(dir);
+  return results.sort();
+}
+
+/**
+ * Recursively list all content files in a portable-md export (vault#328).
+ * Same dot-dir exclusion as `walkMarkdownFiles` — sidecar metadata under
+ * `.parachute/` is reached separately by the importer. Files with no
+ * extension are skipped (no way to tell what they are; vault doesn't
+ * write extensionless notes by design).
+ */
+export function walkContentFiles(dir: string): string[] {
+  const results: string[] = [];
+  function walk(current: string) {
+    for (const entry of readdirSync(current)) {
+      if (entry.startsWith(".")) continue;
+      if (entry === "node_modules") continue;
+      const full = join(current, entry);
+      const stat = statSync(full);
+      if (stat.isDirectory()) walk(full);
+      else if (stat.isFile() && extname(entry).length > 0) results.push(full);
     }
   }
   walk(dir);

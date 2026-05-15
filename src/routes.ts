@@ -13,7 +13,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE } from "../core/src/notes.ts";
+import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
@@ -73,6 +73,25 @@ function parseQuery(url: URL, key: string): string | null {
 function parseQueryList(url: URL, key: string): string[] | undefined {
   const val = url.searchParams.get(key);
   return val ? val.split(",") : undefined;
+}
+
+/**
+ * Parse the extension query parameter (vault#328). Two accepted shapes:
+ *   - `?extension=csv` (single value → string)
+ *   - `?extension=csv&extension=yaml` OR `?extension=csv,yaml`
+ *     (repeated or comma-list → array)
+ * Returns undefined when absent so the queryNotes filter is skipped.
+ * Validation lives at the engine layer — bad strings result in zero
+ * matches rather than 400, mirroring how `path` works.
+ */
+function parseExtensionFilter(url: URL): string | string[] | undefined {
+  const all = url.searchParams.getAll("extension");
+  if (all.length === 0) return undefined;
+  // Flatten comma-lists inside each param.
+  const flat = all.flatMap((v) => v.split(",")).map((s) => s.trim()).filter((s) => s.length > 0);
+  if (flat.length === 0) return undefined;
+  if (flat.length === 1) return flat[0]!;
+  return flat;
 }
 
 function parseInt10(val: string | null): number | undefined {
@@ -508,6 +527,12 @@ export async function handleNotes(
           hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
           path: parseQuery(url, "path") ?? undefined,
           pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+          // Extension filter (vault#328). Accepts repeated `extension=`
+          // params for the array form: `?extension=csv&extension=yaml`.
+          // `parseQueryList` already returns undefined when no params
+          // are present, so the filter is silently skipped on a plain
+          // GET without the extension query.
+          extension: parseExtensionFilter(url),
           metadata: bracket.metadata,
           // Date-range precedence chain (highest to lowest):
           //   1. Bracket-style `meta[created_at][gte]=…` (canonical).
@@ -660,12 +685,19 @@ export async function handleNotes(
       if (batched) db.exec("BEGIN");
       try {
         for (const item of items) {
+          // Validate extension before reaching the Store (vault#328).
+          // Thrown inside the BEGIN block — outer catch rolls the batch
+          // back, same shape as the path-conflict path.
+          const extension = item.extension !== undefined
+            ? validateExtension(item.extension)
+            : undefined;
           const note = await store.createNote(item.content ?? "", {
             id: item.id,
             path: item.path,
             tags: item.tags,
             metadata: item.metadata,
             created_at: item.createdAt ?? item.created_at,
+            ...(extension !== undefined ? { extension } : {}),
           });
 
           // Create explicit links
@@ -686,6 +718,12 @@ export async function handleNotes(
           return json(
             { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
             409,
+          );
+        }
+        if (e && e.code === "INVALID_EXTENSION") {
+          return json(
+            { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+            400,
           );
         }
         throw e;
@@ -845,12 +883,17 @@ export async function handleNotes(
           }
           const idLooksLikePath = idOrPathStr.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPathStr);
           const explicitPath = typeof body.path === "string" ? body.path as string : undefined;
+          // Validate extension before reaching the Store (vault#328).
+          const createExt = body.extension !== undefined
+            ? validateExtension(body.extension)
+            : undefined;
           const createOpts: Parameters<Store["createNote"]>[1] = {
             ...(idLooksLikePath ? { path: explicitPath ?? idOrPathStr } : { id: idOrPathStr, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
             ...(tagsArr.length > 0 ? { tags: tagsArr } : {}),
             ...(body.metadata !== undefined ? { metadata: body.metadata as Record<string, unknown> } : {}),
             ...(body.created_at !== undefined ? { created_at: body.created_at as string } : {}),
             ...(body.createdAt !== undefined ? { created_at: body.createdAt as string } : {}),
+            ...(createExt !== undefined ? { extension: createExt } : {}),
           };
           const content = (body.content as string | undefined) ?? "";
           const created = await store.createNote(content, createOpts);
@@ -1019,6 +1062,11 @@ export async function handleNotes(
         if (body.prepend !== undefined) updates.prepend = body.prepend;
       }
       if (body.path !== undefined) updates.path = body.path;
+      if (body.extension !== undefined) {
+        // Validate up front (vault#328). Throws ExtensionValidationError
+        // which the outer catch converts to a 400.
+        updates.extension = validateExtension(body.extension);
+      }
       if (body.metadata !== undefined) {
         const existing = (note.metadata as Record<string, unknown>) ?? {};
         updates.metadata = { ...existing, ...body.metadata };
@@ -1106,6 +1154,12 @@ export async function handleNotes(
         return json(
           { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
           409,
+        );
+      }
+      if (e && e.code === "INVALID_EXTENSION") {
+        return json(
+          { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+          400,
         );
       }
       throw e;

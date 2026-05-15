@@ -322,6 +322,113 @@ describe("updated_at backfill on init", async () => {
   });
 });
 
+// ---- Extension (vault#328 Phase 1: DB + Store) ----
+//
+// Three pinned behaviors:
+//   1. Migrations and inserts default to "md" — every existing row keeps
+//      its meaning after the v17 → v18 ALTER TABLE.
+//   2. Explicit extension on createNote persists end-to-end.
+//   3. queryNotes filters by extension (single string + array shapes).
+
+describe("notes.extension (vault#328)", async () => {
+  it("defaults to 'md' when not specified on createNote", async () => {
+    const note = await store.createNote("hello world");
+    expect(note.extension).toBe("md");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("md");
+  });
+
+  it("persists explicit extension on createNote", async () => {
+    const note = await store.createNote("month,income\n2026-01,12000", {
+      path: "Tabular/budget",
+      extension: "csv",
+    });
+    expect(note.extension).toBe("csv");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("csv");
+  });
+
+  it("backfills 'md' on existing rows after v17 → v18 migration", () => {
+    // Build a v17-shape vault by hand: create the notes table WITHOUT the
+    // `extension` column, insert a row, then run initSchema and assert
+    // the migration backfills "md".
+    const raw = new Database(":memory:");
+    raw.exec(`
+      CREATE TABLE notes (
+        id TEXT PRIMARY KEY,
+        content TEXT DEFAULT '',
+        path TEXT,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+      )
+    `);
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("legacy", "old content", "2024-01-01T00:00:00.000Z", "2024-01-01T00:00:00.000Z");
+
+    initSchema(raw); // applies v18 ALTER TABLE
+
+    const row = raw.prepare("SELECT extension FROM notes WHERE id = ?").get("legacy") as {
+      extension: string;
+    };
+    expect(row.extension).toBe("md");
+  });
+
+  it("updateNote changes extension on existing note", async () => {
+    const note = await store.createNote("hello", { path: "Foo" });
+    expect(note.extension).toBe("md");
+    const updated = await store.updateNote(note.id, { extension: "mdx" });
+    expect(updated.extension).toBe("mdx");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("mdx");
+  });
+
+  it("queryNotes filters by extension (single string)", async () => {
+    await store.createNote("md note A", { path: "a", extension: "md" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("md note B", { path: "c" }); // default md
+    const csv = await store.queryNotes({ extension: "csv" });
+    expect(csv).toHaveLength(1);
+    expect(csv[0]!.path).toBe("b");
+    const md = await store.queryNotes({ extension: "md" });
+    expect(md).toHaveLength(2);
+    expect(md.map((n) => n.path).sort()).toEqual(["a", "c"]);
+  });
+
+  it("queryNotes filters by extension (array — IN clause)", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    await store.createNote("json note", { path: "d", extension: "json" });
+    const results = await store.queryNotes({ extension: ["csv", "yaml", "json"] });
+    expect(results).toHaveLength(3);
+    const paths = results.map((n) => n.path).sort();
+    expect(paths).toEqual(["b", "c", "d"]);
+  });
+
+  it("queryNotes extension filter is case-insensitive", async () => {
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    // Caller-supplied case shouldn't matter — stored as "csv", looked up as "CSV".
+    const results = await store.queryNotes({ extension: "CSV" });
+    expect(results).toHaveLength(1);
+  });
+
+  it("updateNote extension-only collision throws PathConflictError (vault#329 F1)", async () => {
+    // Two notes share `Foo` differing only by extension — legal under
+    // v18's composite (path, extension) uniqueness. Flip the md note's
+    // extension to "csv": that would collide with the existing csv
+    // row. The catch in updateNote must surface PATH_CONFLICT (not a
+    // raw SQLiteError) since the composite index fires UNIQUE on
+    // extension-only updates just like it does on path-only updates.
+    const md = await store.createNote("# md note", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    expect(
+      store.updateNote(md.id, { extension: "csv" }),
+    ).rejects.toMatchObject({ code: "PATH_CONFLICT", path: "Foo" });
+  });
+});
+
 // ---- Tags ----
 
 describe("tags", async () => {
@@ -1587,6 +1694,91 @@ describe("MCP tools", async () => {
     expect(result).toHaveLength(2);
     expect(result[0].tags).toContain("daily");
     expect(result[1].tags).toContain("doc");
+  });
+
+  it("create-note accepts extension field (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      content: "month,income\n2026-01,12000",
+      path: "Tabular/budget",
+      extension: "csv",
+    }) as any;
+    expect(result.extension).toBe("csv");
+  });
+
+  it("create-note defaults extension to 'md' when omitted (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "plain markdown" }) as any;
+    expect(result.extension).toBe("md");
+  });
+
+  it("create-note rejects invalid extension (uppercase, dot, reserved) (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    // Uppercase
+    expect(createNote.execute({ content: "x", extension: "CSV" })).rejects.toThrow(/invalid extension/);
+    // Dot
+    expect(createNote.execute({ content: "x", extension: "csv.bak" })).rejects.toThrow(/invalid extension/);
+    // Slash
+    expect(createNote.execute({ content: "x", extension: "foo/bar" })).rejects.toThrow(/invalid extension/);
+    // Reserved "parachute" prefix (lowercase — the pattern check passes,
+    // so the reserved-prefix guard is what fires).
+    expect(createNote.execute({ content: "x", extension: "parachute" })).rejects.toThrow(/reserved/);
+    expect(createNote.execute({ content: "x", extension: "parachutex" })).rejects.toThrow(/reserved/);
+    // Too long (>16)
+    expect(createNote.execute({ content: "x", extension: "a".repeat(17) })).rejects.toThrow(/invalid extension/);
+    // Empty
+    expect(createNote.execute({ content: "x", extension: "" })).rejects.toThrow(/non-empty/);
+  });
+
+  it("update-note changes extension (vault#328)", async () => {
+    const note = await store.createNote("hi", { path: "Foo" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: note.id, extension: "mdx", force: true }) as any;
+    expect(result.extension).toBe("mdx");
+  });
+
+  it("update-note validates extension on update branch (vault#328)", async () => {
+    const note = await store.createNote("hi", { path: "Foo" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    expect(
+      updateNote.execute({ id: note.id, extension: "BAD", force: true }),
+    ).rejects.toThrow(/invalid extension/);
+  });
+
+  it("update-note if_missing=create honors extension (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "Tabular/new-budget",
+      content: "month,total\n2026-02,9000",
+      extension: "csv",
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.extension).toBe("csv");
+  });
+
+  it("query-notes filters by extension (vault#328)", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+
+    // Single extension
+    const csv = await queryNotes.execute({ extension: "csv", include_content: true }) as any[];
+    expect(csv).toHaveLength(1);
+    expect(csv[0].path).toBe("b");
+
+    // Array shape
+    const both = await queryNotes.execute({ extension: ["csv", "yaml"], include_content: true }) as any[];
+    expect(both).toHaveLength(2);
+    expect(both.map((n) => n.path).sort()).toEqual(["b", "c"]);
   });
 
   it("create-note with links resolves targets by path", async () => {

@@ -2,17 +2,25 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 export const SCHEMA_SQL = `
--- Notes: the universal record
+-- Notes: the universal record.
+--
+-- extension (v18, vault#328) carries the file suffix the note should
+-- exhibit when serialized to disk — "md" by default, "csv"/"yaml"/"json"/
+-- "mdx"/etc. for non-markdown notes. Stored extension-less in the path
+-- column; on-disk uniqueness key is (path, extension). See
+-- core/src/portable-md.ts:supportsInlineFrontmatter for the
+-- frontmatter-vs-sidecar split.
 CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
   content TEXT DEFAULT '',
   path TEXT,
   metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL,
-  updated_at TEXT
+  updated_at TEXT,
+  extension TEXT NOT NULL DEFAULT 'md'
 );
 
 -- Tags: first-class identity carrying schema, hierarchy, and typed-link
@@ -265,6 +273,11 @@ export function initSchema(db: Database): void {
   // naming the dropped schemas/mappings so the operator can recreate them
   // as `tags.fields` if needed. See vault#267.
   migrateToV17(db);
+
+  // Migrate v17 → v18: add `notes.extension TEXT NOT NULL DEFAULT 'md'`.
+  // Backward-compat by construction — every existing row defaults to "md"
+  // (markdown), unchanged in meaning. See vault#328.
+  migrateToV18(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -790,6 +803,51 @@ function migrateToV17(db: Database): void {
       );
     }
     console.log(lines.join("\n"));
+  }
+}
+
+/**
+ * Migrate v17 → v18: add `notes.extension TEXT NOT NULL DEFAULT 'md'`
+ * (vault#328) AND widen the path-uniqueness index from `(path)` to
+ * `(path, extension)` so two notes can share a path differing only by
+ * extension (`Recipes/pasta` with both .md and .csv variants).
+ *
+ * Backward-compat by construction — every existing row defaults to "md",
+ * so the new composite-index uniqueness collapses to the v5
+ * "(path WHERE NOT NULL) is unique" behavior on existing data. Wrapped
+ * in BEGIN IMMEDIATE / COMMIT / ROLLBACK per the v14+ pattern.
+ */
+function migrateToV18(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+
+  // Two responsibilities (column add + index swap) — both idempotent
+  // individually. Wrap in one transaction so an upgrading v17 vault
+  // ends up at exactly v17 or v18, never partial.
+  const needsColumn = !hasColumn(db, "notes", "extension");
+  const indexes = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_notes_path_unique', 'idx_notes_path_ext_unique')",
+  ).all() as { name: string }[];
+  const hasOldUnique = indexes.some((r) => r.name === "idx_notes_path_unique");
+  const hasNewUnique = indexes.some((r) => r.name === "idx_notes_path_ext_unique");
+  if (!needsColumn && hasNewUnique && !hasOldUnique) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (needsColumn) {
+      db.exec("ALTER TABLE notes ADD COLUMN extension TEXT NOT NULL DEFAULT 'md'");
+    }
+    if (hasOldUnique) {
+      db.exec("DROP INDEX idx_notes_path_unique");
+    }
+    if (!hasNewUnique) {
+      db.exec(
+        "CREATE UNIQUE INDEX idx_notes_path_ext_unique ON notes(path, extension) WHERE path IS NOT NULL",
+      );
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
   }
 }
 
