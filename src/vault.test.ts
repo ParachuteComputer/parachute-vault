@@ -1702,6 +1702,134 @@ describe("HTTP /notes", async () => {
     expect(body.createdAt).toBe("2025-01-01T00:00:00.000Z");
   });
 
+  // ---- Extension field (vault#328) ----
+
+  test("POST /notes accepts extension and persists it", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "month,total\n2026-01,9000",
+        path: "Tabular/budget",
+        extension: "csv",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.extension).toBe("csv");
+    const fetched = await store.getNote(body.id);
+    expect(fetched!.extension).toBe("csv");
+  });
+
+  test("POST /notes defaults extension to 'md' when omitted", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "plain", path: "p" }),
+      store,
+      "",
+    );
+    const body = await res.json() as any;
+    expect(body.extension).toBe("md");
+  });
+
+  test("POST /notes rejects invalid extension with 400 invalid_extension", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", extension: "CSV" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_extension");
+    expect(body.extension).toBe("CSV");
+  });
+
+  test("POST /notes rejects reserved 'parachute' prefix with 400", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", extension: "parachute" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_extension");
+    expect(body.reason).toMatch(/reserved/);
+  });
+
+  test("PATCH /notes/:id changes extension", async () => {
+    const note = await store.createNote("hi", { id: "ext-patch", path: "p" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/ext-patch", {
+        extension: "mdx",
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/ext-patch",
+    );
+    expect(res.status).toBe(200);
+    const fetched = await store.getNote("ext-patch");
+    expect(fetched!.extension).toBe("mdx");
+  });
+
+  test("PATCH /notes/:id rejects invalid extension with 400", async () => {
+    const note = await store.createNote("hi", { id: "ext-bad", path: "p" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/ext-bad", {
+        extension: "foo.bar",
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/ext-bad",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_extension");
+  });
+
+  test("GET /notes?extension=csv filters by extension", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?extension=csv&include_content=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].path).toBe("b");
+  });
+
+  test("GET /notes?extension=csv&extension=yaml filters by array of extensions", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?extension=csv&extension=yaml&include_content=true"),
+      store,
+      "",
+    );
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(2);
+    expect(body.map((n) => n.path).sort()).toEqual(["b", "c"]);
+  });
+
+  test("PATCH /notes/:id if_missing=create honors extension", async () => {
+    const idOrPath = encodeURIComponent("Tabular/new-budget");
+    const res = await handleNotes(
+      mkReq("PATCH", `/notes/${idOrPath}`, {
+        content: "month,total\n2026-02,1000",
+        extension: "csv",
+        if_missing: "create",
+      }),
+      store,
+      `/${idOrPath}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+    expect(body.extension).toBe("csv");
+  });
+
   test("POST /notes/:id/attachments accepts mimeType (camelCase) in body", async () => {
     const n = await store.createNote("x", { id: "x" });
     const res = await handleNotes(

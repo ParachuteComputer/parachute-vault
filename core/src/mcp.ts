@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
-import { filterMetadata, MAX_BATCH_SIZE } from "./notes.js";
+import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -133,6 +133,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           has_links: { type: "boolean", description: "Presence filter: true = only notes with at least one inbound or outbound link; false = only orphaned notes (no links in either direction)." },
           path: { type: "string", description: "Exact path match (case-insensitive)" },
           path_prefix: { type: "string", description: "Path prefix match (e.g., 'Projects/')" },
+          extension: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description: "Filter by file extension (vault#328). Pass a single extension (e.g. \"csv\") or an array (e.g. [\"csv\", \"yaml\", \"json\"]). Notes default to \"md\"; case-insensitive match.",
+          },
           search: { type: "string", description: "Full-text search query" },
           metadata: {
             type: "object",
@@ -264,6 +271,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             hasLinks: params.has_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
+            extension: params.extension as string | string[] | undefined,
             // Push the near-scope into the SQL WHERE so that LIMIT and ORDER
             // BY apply to the neighborhood. Without this, queryNotes would
             // fetch the first `limit` notes by created_at and then post-
@@ -339,6 +347,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           // Single note fields
           content: { type: "string", description: "Note content (markdown). Wikilinks like [[Target]] auto-resolve." },
           path: { type: "string", description: "Note path (e.g., 'Projects/README')" },
+          extension: { type: "string", description: "File extension (vault#328). Default \"md\". Use \"csv\"/\"yaml\"/\"json\"/\"mdx\"/etc. for non-markdown notes. Lowercase alphanumeric, 1–16 chars; no '.' or '/'. The \"parachute\" prefix is reserved." },
           metadata: { type: "object", description: "Metadata fields" },
           tags: { type: "array", items: { type: "string" }, description: "Tags to apply" },
           links: {
@@ -362,6 +371,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               properties: {
                 content: { type: "string" },
                 path: { type: "string" },
+                extension: { type: "string", description: "File extension (vault#328). See top-level docs." },
                 metadata: { type: "object" },
                 tags: { type: "array", items: { type: "string" } },
                 links: { type: "array" },
@@ -392,11 +402,19 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         if (batched) db.exec("BEGIN");
         try {
           for (const item of items) {
+            // Validate extension up front (vault#328). Throwing here while
+            // we're inside the BEGIN block on a batch rolls back the
+            // transaction in the outer catch — the same behavior as a
+            // path conflict mid-batch.
+            const extension = item.extension !== undefined
+              ? validateExtension(item.extension)
+              : undefined;
             const note = await store.createNote(item.content as string ?? "", {
               path: item.path as string | undefined,
               tags: item.tags as string[] | undefined,
               metadata: item.metadata as Record<string, unknown> | undefined,
               created_at: item.created_at as string | undefined,
+              ...(extension !== undefined ? { extension } : {}),
             });
 
             // Create explicit links (not wikilinks — those are automatic)
@@ -467,6 +485,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             description: "Find-and-replace one occurrence. Errors if `old_text` is not found or matches multiple locations. Mutually exclusive with `content` and `append`/`prepend`.",
           },
           path: { type: "string", description: "New path" },
+          extension: { type: "string", description: "Change the note's file extension (vault#328). Allowed but caller-owned — you're responsible for content validity if you switch a non-empty note's extension. Lowercase alphanumeric, 1–16 chars; \"parachute\" prefix reserved." },
           metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
           created_at: { type: "string", description: "New created_at timestamp" },
           if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
@@ -531,6 +550,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                   required: ["old_text", "new_text"],
                 },
                 path: { type: "string" },
+                extension: { type: "string", description: "Change the note's file extension (vault#328). See top-level docs." },
                 metadata: { type: "object" },
                 created_at: { type: "string" },
                 if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item or the item is `append`/`prepend`-only." },
@@ -617,6 +637,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               // caller's intent.
               const idLooksLikePath = idOrPath.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPath);
               const explicitPath = typeof item.path === "string" ? item.path as string : undefined;
+              // Validate extension before reaching the Store — same
+              // contract as the create-note tool.
+              const createExt = item.extension !== undefined
+                ? validateExtension(item.extension)
+                : undefined;
               const createOpts: Parameters<Store["createNote"]>[1] = {
                 ...(idLooksLikePath ? { path: explicitPath ?? idOrPath } : { id: idOrPath, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
                 ...(item.tags && Array.isArray((item.tags as any).add)
@@ -626,6 +651,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                     : {}),
                 ...(item.metadata !== undefined ? { metadata: item.metadata as Record<string, unknown> } : {}),
                 ...(item.created_at !== undefined ? { created_at: item.created_at as string } : {}),
+                ...(createExt !== undefined ? { extension: createExt } : {}),
               };
               const content = (item.content as string | undefined) ?? "";
               const created = await store.createNote(content, createOpts);
@@ -755,6 +781,9 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             if (item.prepend !== undefined) updates.prepend = item.prepend;
           }
           if (item.path !== undefined) updates.path = item.path;
+          if (item.extension !== undefined) {
+            updates.extension = validateExtension(item.extension);
+          }
           if (item.metadata !== undefined) {
             // Merge metadata (don't replace wholesale)
             const existing = (note.metadata as Record<string, unknown>) ?? {};

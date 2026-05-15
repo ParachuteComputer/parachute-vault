@@ -157,6 +157,67 @@ export class PathConflictError extends Error {
 export const MAX_BATCH_SIZE = 500;
 
 /**
+ * Validate a caller-supplied file extension (vault#328). Rules:
+ *   1. Non-empty, lowercase alphanumeric only.
+ *   2. Length 1–16 — long enough for "markdown" etc., short enough to
+ *      bound on-disk filename length.
+ *   3. No dot/slash/uppercase — those would create path-encoding
+ *      ambiguity or collide with filesystem separators.
+ *   4. Reserved: anything matching /^parachute/i is refused because the
+ *      `.parachute/` sidecar dir convention owns that namespace; a note
+ *      with extension `parachute` would write to `<path>.parachute`
+ *      which is ambiguous with a directory entry.
+ *
+ * Throws `ExtensionValidationError` on failure. Both MCP and REST
+ * surfaces import this so the contract can never drift between them.
+ */
+export const EXTENSION_PATTERN = /^[a-z0-9]{1,16}$/;
+
+export class ExtensionValidationError extends Error {
+  code = "INVALID_EXTENSION" as const;
+  extension: string;
+  reason: string;
+
+  constructor(extension: string, reason: string) {
+    super(`invalid extension "${extension}": ${reason}`);
+    this.name = "ExtensionValidationError";
+    this.extension = extension;
+    this.reason = reason;
+  }
+}
+
+export function validateExtension(extension: unknown): string {
+  if (typeof extension !== "string") {
+    throw new ExtensionValidationError(
+      String(extension),
+      `must be a string (got ${typeof extension})`,
+    );
+  }
+  if (extension.length === 0) {
+    throw new ExtensionValidationError(
+      extension,
+      "must be non-empty; omit the field entirely to default to 'md'",
+    );
+  }
+  if (!EXTENSION_PATTERN.test(extension)) {
+    throw new ExtensionValidationError(
+      extension,
+      `must match ${EXTENSION_PATTERN.source} (lowercase alphanumeric, 1–16 chars; no '.', '/', or uppercase)`,
+    );
+  }
+  // Reserved namespace: anything that starts with "parachute" collides
+  // with the .parachute/ sidecar directory convention. The pattern check
+  // above already enforces lowercase, so a literal prefix match is exact.
+  if (extension.startsWith("parachute")) {
+    throw new ExtensionValidationError(
+      extension,
+      "the 'parachute' prefix is reserved for the .parachute/ sidecar dir",
+    );
+  }
+  return extension;
+}
+
+/**
  * Match bun:sqlite's UNIQUE-constraint error on the notes.path index. The
  * error class is `SQLiteError` but matching on the message is sufficient
  * here — the index name and column are stable parts of the schema, and

@@ -1682,6 +1682,91 @@ describe("MCP tools", async () => {
     expect(result[1].tags).toContain("doc");
   });
 
+  it("create-note accepts extension field (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      content: "month,income\n2026-01,12000",
+      path: "Tabular/budget",
+      extension: "csv",
+    }) as any;
+    expect(result.extension).toBe("csv");
+  });
+
+  it("create-note defaults extension to 'md' when omitted (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({ content: "plain markdown" }) as any;
+    expect(result.extension).toBe("md");
+  });
+
+  it("create-note rejects invalid extension (uppercase, dot, reserved) (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    // Uppercase
+    expect(createNote.execute({ content: "x", extension: "CSV" })).rejects.toThrow(/invalid extension/);
+    // Dot
+    expect(createNote.execute({ content: "x", extension: "csv.bak" })).rejects.toThrow(/invalid extension/);
+    // Slash
+    expect(createNote.execute({ content: "x", extension: "foo/bar" })).rejects.toThrow(/invalid extension/);
+    // Reserved "parachute" prefix (lowercase — the pattern check passes,
+    // so the reserved-prefix guard is what fires).
+    expect(createNote.execute({ content: "x", extension: "parachute" })).rejects.toThrow(/reserved/);
+    expect(createNote.execute({ content: "x", extension: "parachutex" })).rejects.toThrow(/reserved/);
+    // Too long (>16)
+    expect(createNote.execute({ content: "x", extension: "a".repeat(17) })).rejects.toThrow(/invalid extension/);
+    // Empty
+    expect(createNote.execute({ content: "x", extension: "" })).rejects.toThrow(/non-empty/);
+  });
+
+  it("update-note changes extension (vault#328)", async () => {
+    const note = await store.createNote("hi", { path: "Foo" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: note.id, extension: "mdx", force: true }) as any;
+    expect(result.extension).toBe("mdx");
+  });
+
+  it("update-note validates extension on update branch (vault#328)", async () => {
+    const note = await store.createNote("hi", { path: "Foo" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    expect(
+      updateNote.execute({ id: note.id, extension: "BAD", force: true }),
+    ).rejects.toThrow(/invalid extension/);
+  });
+
+  it("update-note if_missing=create honors extension (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "Tabular/new-budget",
+      content: "month,total\n2026-02,9000",
+      extension: "csv",
+      if_missing: "create",
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.extension).toBe("csv");
+  });
+
+  it("query-notes filters by extension (vault#328)", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    const tools = generateMcpTools(store);
+    const queryNotes = tools.find((t) => t.name === "query-notes")!;
+
+    // Single extension
+    const csv = await queryNotes.execute({ extension: "csv", include_content: true }) as any[];
+    expect(csv).toHaveLength(1);
+    expect(csv[0].path).toBe("b");
+
+    // Array shape
+    const both = await queryNotes.execute({ extension: ["csv", "yaml"], include_content: true }) as any[];
+    expect(both).toHaveLength(2);
+    expect(both.map((n) => n.path).sort()).toEqual(["b", "c"]);
+  });
+
   it("create-note with links resolves targets by path", async () => {
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
