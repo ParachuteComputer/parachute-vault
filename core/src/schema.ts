@@ -2,17 +2,25 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 export const SCHEMA_SQL = `
--- Notes: the universal record
+-- Notes: the universal record.
+--
+-- extension (v18, vault#328) carries the file suffix the note should
+-- exhibit when serialized to disk — "md" by default, "csv"/"yaml"/"json"/
+-- "mdx"/etc. for non-markdown notes. Stored extension-less in the path
+-- column; on-disk uniqueness key is (path, extension). See
+-- core/src/portable-md.ts:supportsInlineFrontmatter for the
+-- frontmatter-vs-sidecar split.
 CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
   content TEXT DEFAULT '',
   path TEXT,
   metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL,
-  updated_at TEXT
+  updated_at TEXT,
+  extension TEXT NOT NULL DEFAULT 'md'
 );
 
 -- Tags: first-class identity carrying schema, hierarchy, and typed-link
@@ -265,6 +273,11 @@ export function initSchema(db: Database): void {
   // naming the dropped schemas/mappings so the operator can recreate them
   // as `tags.fields` if needed. See vault#267.
   migrateToV17(db);
+
+  // Migrate v17 → v18: add `notes.extension TEXT NOT NULL DEFAULT 'md'`.
+  // Backward-compat by construction — every existing row defaults to "md"
+  // (markdown), unchanged in meaning. See vault#328.
+  migrateToV18(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -790,6 +803,28 @@ function migrateToV17(db: Database): void {
       );
     }
     console.log(lines.join("\n"));
+  }
+}
+
+/**
+ * Migrate v17 → v18: add `notes.extension TEXT NOT NULL DEFAULT 'md'`
+ * (vault#328). Backward-compat by construction — every existing row keeps
+ * its meaning (markdown). `extension` is the file-suffix story; MIME-type
+ * is a separate axis if we ever need it. Wrapped in BEGIN IMMEDIATE /
+ * COMMIT / ROLLBACK per the v14+ pattern; the column add is idempotent
+ * via `hasColumn`, the transaction wrap is belt-and-suspenders.
+ */
+function migrateToV18(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  if (hasColumn(db, "notes", "extension")) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec("ALTER TABLE notes ADD COLUMN extension TEXT NOT NULL DEFAULT 'md'");
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
   }
 }
 

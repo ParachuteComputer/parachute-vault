@@ -10,6 +10,14 @@ export interface Note {
   id: string;
   content: string;
   path?: string;
+  /**
+   * File extension (sans dot). Defaults to `"md"`. Controls the
+   * serialized file suffix on export — `.md`/`.mdx` carry frontmatter
+   * inline; `.csv`/`.yaml`/`.json`/etc. carry their metadata in a
+   * sidecar at `.parachute/notes-meta/<id>.yaml`. See vault#328 +
+   * `core/src/portable-md.ts:supportsInlineFrontmatter`.
+   */
+  extension?: string;
   metadata?: Record<string, unknown>;
   createdAt: string; // ISO-8601
   updatedAt?: string;
@@ -64,6 +72,13 @@ export interface QueryOpts {
   hasLinks?: boolean;
   path?: string;        // exact path match (case-insensitive)
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
+  /**
+   * Filter by file extension. Pass a single extension (e.g. `"csv"`) or
+   * an array (e.g. `["csv", "yaml", "json"]`). Extension is compared
+   * lower-case. Notes default to `"md"` so `extension: "md"` matches
+   * the existing markdown corpus. See vault#328.
+   */
+  extension?: string | string[];
   // Restrict results to a specific set of note IDs. The MCP `near` query uses
   // this to push graph-neighborhood scoping into the SQL WHERE clause so that
   // LIMIT and ORDER BY apply to the filtered set, not the whole notes table.
@@ -107,6 +122,7 @@ export interface QueryOpts {
 export interface NoteSummary {
   id: string;
   path?: string;
+  extension?: string;
   metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt?: string;
@@ -120,6 +136,7 @@ export interface NoteSummary {
 export interface NoteIndex {
   id: string;
   path?: string;
+  extension?: string;
   createdAt: string;
   updatedAt?: string;
   tags?: string[];
@@ -138,11 +155,11 @@ export interface HydratedLink extends Link {
 
 export interface Store {
   // Notes
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string }): Promise<Note>;
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
   getNoteByPath(path: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
-  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; if_updated_at?: string }): Promise<Note>;
+  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; if_updated_at?: string }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from

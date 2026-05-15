@@ -322,6 +322,99 @@ describe("updated_at backfill on init", async () => {
   });
 });
 
+// ---- Extension (vault#328 Phase 1: DB + Store) ----
+//
+// Three pinned behaviors:
+//   1. Migrations and inserts default to "md" — every existing row keeps
+//      its meaning after the v17 → v18 ALTER TABLE.
+//   2. Explicit extension on createNote persists end-to-end.
+//   3. queryNotes filters by extension (single string + array shapes).
+
+describe("notes.extension (vault#328)", async () => {
+  it("defaults to 'md' when not specified on createNote", async () => {
+    const note = await store.createNote("hello world");
+    expect(note.extension).toBe("md");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("md");
+  });
+
+  it("persists explicit extension on createNote", async () => {
+    const note = await store.createNote("month,income\n2026-01,12000", {
+      path: "Tabular/budget",
+      extension: "csv",
+    });
+    expect(note.extension).toBe("csv");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("csv");
+  });
+
+  it("backfills 'md' on existing rows after v17 → v18 migration", () => {
+    // Build a v17-shape vault by hand: create the notes table WITHOUT the
+    // `extension` column, insert a row, then run initSchema and assert
+    // the migration backfills "md".
+    const raw = new Database(":memory:");
+    raw.exec(`
+      CREATE TABLE notes (
+        id TEXT PRIMARY KEY,
+        content TEXT DEFAULT '',
+        path TEXT,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+      )
+    `);
+    raw.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("legacy", "old content", "2024-01-01T00:00:00.000Z", "2024-01-01T00:00:00.000Z");
+
+    initSchema(raw); // applies v18 ALTER TABLE
+
+    const row = raw.prepare("SELECT extension FROM notes WHERE id = ?").get("legacy") as {
+      extension: string;
+    };
+    expect(row.extension).toBe("md");
+  });
+
+  it("updateNote changes extension on existing note", async () => {
+    const note = await store.createNote("hello", { path: "Foo" });
+    expect(note.extension).toBe("md");
+    const updated = await store.updateNote(note.id, { extension: "mdx" });
+    expect(updated.extension).toBe("mdx");
+    const fetched = await store.getNote(note.id);
+    expect(fetched!.extension).toBe("mdx");
+  });
+
+  it("queryNotes filters by extension (single string)", async () => {
+    await store.createNote("md note A", { path: "a", extension: "md" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("md note B", { path: "c" }); // default md
+    const csv = await store.queryNotes({ extension: "csv" });
+    expect(csv).toHaveLength(1);
+    expect(csv[0]!.path).toBe("b");
+    const md = await store.queryNotes({ extension: "md" });
+    expect(md).toHaveLength(2);
+    expect(md.map((n) => n.path).sort()).toEqual(["a", "c"]);
+  });
+
+  it("queryNotes filters by extension (array — IN clause)", async () => {
+    await store.createNote("md note", { path: "a" });
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    await store.createNote("yaml note", { path: "c", extension: "yaml" });
+    await store.createNote("json note", { path: "d", extension: "json" });
+    const results = await store.queryNotes({ extension: ["csv", "yaml", "json"] });
+    expect(results).toHaveLength(3);
+    const paths = results.map((n) => n.path).sort();
+    expect(paths).toEqual(["b", "c", "d"]);
+  });
+
+  it("queryNotes extension filter is case-insensitive", async () => {
+    await store.createNote("csv note", { path: "b", extension: "csv" });
+    // Caller-supplied case shouldn't matter — stored as "csv", looked up as "CSV".
+    const results = await store.queryNotes({ extension: "CSV" });
+    expect(results).toHaveLength(1);
+  });
+});
+
 // ---- Tags ----
 
 describe("tags", async () => {
