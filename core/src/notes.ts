@@ -218,10 +218,11 @@ export function validateExtension(extension: unknown): string {
 }
 
 /**
- * Match bun:sqlite's UNIQUE-constraint error on the notes.path index. The
- * error class is `SQLiteError` but matching on the message is sufficient
- * here — the index name and column are stable parts of the schema, and
- * bun:sqlite has carried this exact message text since 1.0.
+ * Match bun:sqlite's UNIQUE-constraint error on the notes path index.
+ * Post-vault#328 the unique index is composite `(path, extension)`, so
+ * the message text is "UNIQUE constraint failed: notes.path,
+ * notes.extension". Pre-v18 (legacy `(path)` index) emitted just
+ * "notes.path". Match on the common prefix to cover both.
  */
 function isPathUniqueError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;

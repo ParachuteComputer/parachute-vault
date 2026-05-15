@@ -110,19 +110,57 @@ function stripCode(content: string): string {
  * Resolve a wikilink target to a note ID.
  *
  * Resolution order:
- * 1. Exact path match (case-insensitive)
- * 2. Basename match — target matches the last segment of a path
- *    (e.g., "README" matches "Projects/Parachute/README")
- *    Only if there's exactly one match (ambiguous = unresolved)
+ * 1. **Explicit-extension target**: `[[Foo.csv]]` matches the note with
+ *    `path: "Foo"` AND `extension: "csv"` (vault#328). Lets a reader
+ *    disambiguate when multiple notes share a path differing only by
+ *    extension. The trailing `.<ext>` must match a known
+ *    alphanumeric pattern (1–16 chars) — otherwise the dot is treated
+ *    as part of the path string and falls through to the existing
+ *    rules.
+ * 2. Exact path match (case-insensitive) — multiple matches resolve to
+ *    a single note when only ONE extension is in play; if `Foo.md` and
+ *    `Foo.csv` both exist, the link refuses to resolve and the caller
+ *    sees an unresolved-wikilink entry (vault#328 ambiguity policy).
+ * 3. Basename match — target matches the last segment of a path
+ *    (e.g., "README" matches "Projects/Parachute/README"). Same
+ *    cross-extension ambiguity policy as #2.
  */
 export function resolveWikilink(db: Database, target: string): string | null {
-  // 1. Exact match (case-insensitive)
+  // 1. Explicit extension form: `[[path.ext]]` where `.ext` is a
+  // pattern-matching tail (lowercase alphanumeric, 1–16 chars).
+  // Mirrors EXTENSION_PATTERN in core/src/notes.ts so the wikilink
+  // parser and the API surface share the same notion of "this looks
+  // like an extension."
+  const extMatch = target.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    const pathPart = extMatch[1]!;
+    const extPart = extMatch[2]!.toLowerCase();
+    const explicit = db.prepare(
+      "SELECT id FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ?",
+    ).get(pathPart, extPart) as { id: string } | undefined;
+    if (explicit) return explicit.id;
+    // No match for explicit (path, ext) — fall through to the looser
+    // rules so a literal note named `Recipe.v2` (where `v2` isn't an
+    // extension on a real note) can still resolve under exact-path
+    // match.
+  }
+
+  // 2. Exact match (case-insensitive). When multiple notes share a path
+  // (post-vault#328 this happens when `Foo.md` and `Foo.csv` both
+  // exist, since path is stored extension-less), refuse to resolve.
   const exact = db.prepare(
     "SELECT id FROM notes WHERE path = ? COLLATE NOCASE",
-  ).get(target) as { id: string } | undefined;
-  if (exact) return exact.id;
+  ).all(target) as { id: string }[];
+  if (exact.length === 1) return exact[0]!.id;
+  if (exact.length > 1) {
+    // Ambiguous — refuse-and-require-explicit-extension policy
+    // (vault#328). Returning null routes through the existing
+    // unresolved-wikilinks workflow, so the reader (or the indexer)
+    // sees the conflict.
+    return null;
+  }
 
-  // 2. Basename match — last path segment equals target
+  // 3. Basename match — last path segment equals target.
   // e.g., target "README" matches path "Projects/Parachute/README"
   const basename = db.prepare(`
     SELECT id FROM notes
@@ -150,17 +188,39 @@ export interface WikilinkResolution {
 
 /**
  * Resolve a wikilink target with full detail — single match, ambiguous, or unresolved.
+ * Mirrors `resolveWikilink`'s resolution order, including the explicit-
+ * extension form `[[Foo.csv]]` introduced by vault#328.
  */
 export function resolveWikilinkDetailed(db: Database, target: string): WikilinkResolution {
-  // 1. Exact match (case-insensitive)
-  const exact = db.prepare(
-    "SELECT id, path FROM notes WHERE path = ? COLLATE NOCASE",
-  ).get(target) as { id: string; path: string } | undefined;
-  if (exact) {
-    return { resolved: true, note_id: exact.id, path: exact.path, candidates: [] };
+  // 1. Explicit-extension form: `[[path.ext]]`.
+  const extMatch = target.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    const pathPart = extMatch[1]!;
+    const extPart = extMatch[2]!.toLowerCase();
+    const explicit = db.prepare(
+      "SELECT id, path FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ?",
+    ).get(pathPart, extPart) as { id: string; path: string } | undefined;
+    if (explicit) {
+      return { resolved: true, note_id: explicit.id, path: explicit.path, candidates: [] };
+    }
   }
 
-  // 2. Basename match
+  // 2. Exact path match (case-insensitive). Multiple matches → ambiguous.
+  const exact = db.prepare(
+    "SELECT id, path, extension FROM notes WHERE path = ? COLLATE NOCASE",
+  ).all(target) as { id: string; path: string; extension: string }[];
+  if (exact.length === 1) {
+    return { resolved: true, note_id: exact[0]!.id, path: exact[0]!.path, candidates: [] };
+  }
+  if (exact.length > 1) {
+    return {
+      resolved: false,
+      ambiguous: true,
+      candidates: exact.map((r) => ({ note_id: r.id, path: r.path })),
+    };
+  }
+
+  // 3. Basename match
   const basename = db.prepare(`
     SELECT id, path FROM notes
     WHERE path IS NOT NULL

@@ -808,19 +808,42 @@ function migrateToV17(db: Database): void {
 
 /**
  * Migrate v17 → v18: add `notes.extension TEXT NOT NULL DEFAULT 'md'`
- * (vault#328). Backward-compat by construction — every existing row keeps
- * its meaning (markdown). `extension` is the file-suffix story; MIME-type
- * is a separate axis if we ever need it. Wrapped in BEGIN IMMEDIATE /
- * COMMIT / ROLLBACK per the v14+ pattern; the column add is idempotent
- * via `hasColumn`, the transaction wrap is belt-and-suspenders.
+ * (vault#328) AND widen the path-uniqueness index from `(path)` to
+ * `(path, extension)` so two notes can share a path differing only by
+ * extension (`Recipes/pasta` with both .md and .csv variants).
+ *
+ * Backward-compat by construction — every existing row defaults to "md",
+ * so the new composite-index uniqueness collapses to the v5
+ * "(path WHERE NOT NULL) is unique" behavior on existing data. Wrapped
+ * in BEGIN IMMEDIATE / COMMIT / ROLLBACK per the v14+ pattern.
  */
 function migrateToV18(db: Database): void {
   if (!hasTable(db, "notes")) return;
-  if (hasColumn(db, "notes", "extension")) return;
+
+  // Two responsibilities (column add + index swap) — both idempotent
+  // individually. Wrap in one transaction so an upgrading v17 vault
+  // ends up at exactly v17 or v18, never partial.
+  const needsColumn = !hasColumn(db, "notes", "extension");
+  const indexes = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_notes_path_unique', 'idx_notes_path_ext_unique')",
+  ).all() as { name: string }[];
+  const hasOldUnique = indexes.some((r) => r.name === "idx_notes_path_unique");
+  const hasNewUnique = indexes.some((r) => r.name === "idx_notes_path_ext_unique");
+  if (!needsColumn && hasNewUnique && !hasOldUnique) return;
 
   db.exec("BEGIN IMMEDIATE");
   try {
-    db.exec("ALTER TABLE notes ADD COLUMN extension TEXT NOT NULL DEFAULT 'md'");
+    if (needsColumn) {
+      db.exec("ALTER TABLE notes ADD COLUMN extension TEXT NOT NULL DEFAULT 'md'");
+    }
+    if (hasOldUnique) {
+      db.exec("DROP INDEX idx_notes_path_unique");
+    }
+    if (!hasNewUnique) {
+      db.exec(
+        "CREATE UNIQUE INDEX idx_notes_path_ext_unique ON notes(path, extension) WHERE path IS NOT NULL",
+      );
+    }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
