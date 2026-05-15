@@ -113,8 +113,8 @@ export class BunSqliteStore implements Store {
     return noteOps.getNote(this.db, id);
   }
 
-  async getNoteByPath(path: string): Promise<Note | null> {
-    return noteOps.getNoteByPath(this.db, path);
+  async getNoteByPath(path: string, extension?: string): Promise<Note | null> {
+    return noteOps.getNoteByPath(this.db, path, extension);
   }
 
   async getNotes(ids: string[]): Promise<Note[]> {

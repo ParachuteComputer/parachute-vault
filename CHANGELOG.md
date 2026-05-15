@@ -6,6 +6,77 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.5-rc.2] — 2026-05-15
+
+0.4.5 cleanup — closes known limitations from rc.1 ship. Four commits
+under "0.4.5 cleanup": one substantive (vault#327), three follow-ups
+from the vault#328 reviewer (vault#330 S1/S2/F3). 0.4.5 stable
+promotes from rc.2.
+
+### fix(export): case-collision detection + auto-disambiguation (vault#327)
+
+Aaron's real default vault on macOS APFS had two notes whose paths
+differed only by case silently collapsing into one file on export.
+The fix:
+
+- Probe filesystem case-sensitivity at export time
+  (`probeCaseSensitive`: write a hidden tempfile with a lowercase
+  name, test whether the uppercase variant is reachable). Cleans up
+  its tempfile; defaults to conservative true (case-sensitive,
+  matches today's behavior) on probe failure.
+- On case-insensitive FS, build a lowercased `(path, ext)` index
+  during the export walk. Collisions auto-disambiguate to
+  `<path>__<id-prefix>.<ext>` — deterministic across runs (note IDs
+  are stable, timestamp-prefixed).
+- Note's stored `path` (in inline frontmatter + sidecar) stays
+  canonical. Only on-disk filename is munged. Import recovers
+  truth from frontmatter/sidecar.
+- `ExportStats.case_insensitive_fs` + `disambiguated_paths` audit
+  trail.
+- Import handles both shapes: exact-case canonical match → first
+  remaining bucket entry → id-prefix fallback for disambiguated
+  filenames. `sidecarByKey` is now multi-value Map<key, sidecar[]>
+  so case-collided sidecars coexist.
+- `caseSensitiveOverride: boolean` test seam.
+
+### fix(notes): getNoteByPath ambiguity-aware (vault#330 S1)
+
+`getNoteByPath` was non-deterministic under v18 — two same-path-
+different-extension notes would resolve to one in SQLite's undefined
+row order. Aligns the path-as-key contract with the wikilink
+ambiguity policy: `(path, extension)` is the uniqueness tuple
+everywhere.
+
+- `getNoteByPath(path, extension?)` signature. >1 row with no
+  extension hint → throws new `AmbiguousPathError`
+  (`code=AMBIGUOUS_PATH` + `candidates: [{id, extension}, ...]`).
+- MCP `resolveNote` + REST `resolveNote` both parse trailing
+  `.<ext>` as `(path, extension)` — same explicit-extension form
+  as wikilinks. Falls through to the ambiguity-throwing lookup
+  when no hint is supplied.
+- REST handlers convert `AmbiguousPathError` to structured 409 with
+  `error_type=ambiguous_path` + candidates array.
+
+### fix(import): drain orphaned sidecars into ImportStats.skipped_sidecars (vault#330 S2)
+
+The PR2 import flow built `sidecarByIdLeftover` but never iterated
+it — the comment promising stale-sidecar warnings was a lie. This
+makes the comment honest:
+
+- After the content-file walk, iterate leftover sidecars and record
+  each in `ImportStats.skipped_sidecars` (sidecar_id, expected_path,
+  expected_extension, reason).
+- `console.warn` per entry so CLI / log scrapers can surface the gap.
+- Common cause: operator removed a content file by hand without
+  deleting the matching sidecar.
+
+### refactor(portable-md): unify the frontmatter/sidecar key-emit loop (vault#330 F3)
+
+`toPortableMarkdown` and `toSidecarYaml` had identical per-key emit
+loops with subtly different trailing-newline behaviors. Extracted
+`emitFrontmatterKeys(fm)` so both call paths share one source of
+truth. Pure refactor — round-trip test still pins byte-equivalence.
+
 ## [0.4.5-rc.1] — 2026-05-15
 
 File-extension support — vault#328. Substrate-side feature enabling

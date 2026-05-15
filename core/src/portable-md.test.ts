@@ -31,6 +31,7 @@ import {
   noteToPortable,
   parseFrontmatter,
   portableExportFilePath,
+  probeCaseSensitive,
   SIDECAR_DIR,
   NOTES_META_DIR,
   supportsInlineFrontmatter,
@@ -1281,6 +1282,52 @@ describe("portable-md non-markdown round-trip (vault#328)", async () => {
     compareTree(outA, outB);
   });
 
+  it("records orphan sidecars in ImportStats.skipped_sidecars (vault#330 S2)", async () => {
+    // Build a portable-md export by hand with an orphan sidecar: a
+    // sidecar YAML at .parachute/notes-meta/<id>.yaml whose
+    // (path, extension) doesn't point to any real content file on
+    // disk. Import should record it in skipped_sidecars without
+    // crashing.
+    const outDir = join(tmpBase, "orphan-sidecar");
+    mkdirSync(join(outDir, SIDECAR_DIR, NOTES_META_DIR), { recursive: true });
+    writeFileSync(
+      join(outDir, SIDECAR_DIR, "vault.yaml"),
+      "export_format_version: 1\nexported_at: '2026-05-15T00:00:00.000Z'\n",
+    );
+    writeFileSync(
+      join(outDir, SIDECAR_DIR, NOTES_META_DIR, "orphan-1.yaml"),
+      "id: orphan-1\npath: Tabular/missing\nextension: csv\ncreated_at: '2026-05-15T00:00:00.000Z'\nupdated_at: '2026-05-15T00:00:00.000Z'\n",
+    );
+
+    const restored = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(restored, { inDir: outDir });
+    expect(stats.notes_created).toBe(0);
+    expect(stats.skipped_sidecars).toHaveLength(1);
+    expect(stats.skipped_sidecars[0]!.sidecar_id).toBe("orphan-1");
+    expect(stats.skipped_sidecars[0]!.expected_path).toBe("Tabular/missing");
+    expect(stats.skipped_sidecars[0]!.expected_extension).toBe("csv");
+    expect(stats.skipped_sidecars[0]!.reason).toMatch(/no content file/);
+  });
+
+  it("skipped_sidecars stays empty on a clean export-then-import", async () => {
+    // Sanity pin: when every sidecar pairs with a content file, the
+    // leftover-drain produces no entries.
+    await store.createNote("month,total\n2026-01,9000", {
+      id: "csv-1",
+      path: "Tabular/budget",
+      extension: "csv",
+    });
+    const outDir = join(tmpBase, "clean-sidecars");
+    await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+    });
+    const restored = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(restored, { inDir: outDir, blowAway: true });
+    expect(stats.skipped_sidecars).toEqual([]);
+  });
+
   it("import refuses content files lacking a sidecar (orphaned non-md file)", async () => {
     // Build a minimal portable-md directory by hand: a valid vault.yaml
     // + a .csv content file with NO matching sidecar. The importer
@@ -1335,5 +1382,173 @@ describe("wikilink ambiguity across extensions (vault#328)", async () => {
     const outbound = await store.getLinks("linker", { direction: "outbound" });
     expect(outbound).toHaveLength(1);
     expect(outbound[0]!.targetId).toBe("foo-csv");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Case-collision detection + auto-disambiguation (vault#327)
+// ---------------------------------------------------------------------------
+//
+// macOS APFS-default + Windows NTFS-default + FAT/exFAT are case-
+// insensitive — two notes whose paths differ only by case collapse
+// into one file on naive export. The fix probes the filesystem then
+// either ships as-is (case-sensitive) or disambiguates with an
+// `__<id-short>` filename suffix (case-insensitive). The note's
+// stored `path` stays canonical; only the on-disk filename is suffixed.
+
+describe("case-collision detection (vault#327)", async () => {
+  const tmpBase = join(tmpdir(), "parachute-portable-case");
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    try { rmSync(tmpBase, { recursive: true }); } catch {}
+    mkdirSync(tmpBase, { recursive: true });
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("probeCaseSensitive runs cleanly and returns a boolean", () => {
+    // Documenting behavior rather than asserting a specific value:
+    // macOS dev environments + most Linux CI runners produce different
+    // results. We just pin that the probe is well-formed (doesn't throw,
+    // returns boolean, cleans up its tempfile).
+    const result = probeCaseSensitive(tmpBase);
+    expect(typeof result).toBe("boolean");
+    // After the probe runs the dir should contain no leftover probe files.
+    const leftovers = readdirSync(tmpBase).filter((e) => e.includes("_parachute_cs_probe_"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("ships as-is when FS is case-sensitive (override=true)", async () => {
+    // Two notes with case-only-differing paths. With the case-sensitive
+    // override, both files land at their canonical paths — no
+    // disambiguation, no collisions in stats.
+    await store.createNote("# in Balance", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/2025-05-26 Technology in Balance",
+    });
+    await store.createNote("# in balance", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/2025-05-26 Technology in balance",
+    });
+
+    const outDir = join(tmpBase, "cs-on");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: true,
+    });
+    expect(stats.notes).toBe(2);
+    expect(stats.case_insensitive_fs).toBe(false);
+    expect(stats.disambiguated_paths).toHaveLength(0);
+  });
+
+  it("disambiguates colliding paths on case-insensitive FS (override=false)", async () => {
+    // Same fixture as above; force the case-insensitive code path. The
+    // second note (deterministic order: queryNotes sorts ASC on
+    // created_at — the IDs sort lexicographically so 'aaaaaa' lands
+    // first, 'bbbbbb' second) gets its filename suffixed.
+    await store.createNote("# in Balance", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/2025-05-26 Technology in Balance",
+    });
+    await store.createNote("# in balance", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/2025-05-26 Technology in balance",
+    });
+
+    const outDir = join(tmpBase, "ci-on");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: false,
+    });
+    expect(stats.notes).toBe(2);
+    expect(stats.case_insensitive_fs).toBe(true);
+    expect(stats.disambiguated_paths).toHaveLength(1);
+    expect(stats.disambiguated_paths[0]!.note_id).toBe("2025-05-26-09-15-42-bbbbbb");
+    expect(stats.disambiguated_paths[0]!.disambiguated_filename).toMatch(/__2025-05-/);
+
+    // Both files exist on disk under their respective filenames.
+    expect(existsSync(join(outDir, "Journal/2025-05-26 Technology in Balance.md"))).toBe(true);
+    expect(existsSync(join(outDir, stats.disambiguated_paths[0]!.disambiguated_filename))).toBe(true);
+
+    // The disambiguated file's inline frontmatter still carries the
+    // canonical (original) path, NOT the disambiguated filename — that
+    // way an import on a case-sensitive filesystem (or a future re-
+    // export on a case-sensitive FS) recovers the truth.
+    const disambigFile = readFileSync(
+      join(outDir, stats.disambiguated_paths[0]!.disambiguated_filename),
+      "utf-8",
+    );
+    expect(disambigFile).toContain("path: Journal/2025-05-26 Technology in balance");
+  });
+
+  it("disambiguated content round-trips through import (md inline frontmatter path)", async () => {
+    await store.createNote("# upper", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/Same-Case Different",
+    });
+    await store.createNote("# lower", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/same-case different",
+    });
+
+    const outDir = join(tmpBase, "rt-md");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: false,
+    });
+    expect(stats.disambiguated_paths).toHaveLength(1);
+
+    const restored = new SqliteStore(new Database(":memory:"));
+    const importStats = await importPortableVault(restored, { inDir: outDir, blowAway: true });
+    expect(importStats.notes_created).toBe(2);
+
+    // Both notes recovered their canonical paths from the frontmatter.
+    const upper = await restored.getNote("2025-05-26-09-15-42-aaaaaa");
+    const lower = await restored.getNote("2025-05-26-09-15-42-bbbbbb");
+    expect(upper!.path).toBe("Journal/Same-Case Different");
+    expect(lower!.path).toBe("Journal/same-case different");
+  });
+
+  it("disambiguated sidecar-required content round-trips (csv with sidecar lookup fallback)", async () => {
+    // The disambig fallback in the import loop kicks in: the sidecar
+    // is keyed by canonical (path, ext) so the walker's
+    // `<base>__<id8>.csv` filename doesn't match the index — but the
+    // id-prefix lookup recovers the sidecar.
+    await store.createNote("month,total\n2026-01,9000", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Tabular/Budget-2026",
+      extension: "csv",
+    });
+    await store.createNote("month,total\n2026-01,1", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Tabular/budget-2026",
+      extension: "csv",
+    });
+
+    const outDir = join(tmpBase, "rt-csv");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: false,
+    });
+    expect(stats.disambiguated_paths).toHaveLength(1);
+
+    const restored = new SqliteStore(new Database(":memory:"));
+    const importStats = await importPortableVault(restored, { inDir: outDir, blowAway: true });
+    expect(importStats.notes_created).toBe(2);
+
+    const upper = await restored.getNote("2025-05-26-09-15-42-aaaaaa");
+    const lower = await restored.getNote("2025-05-26-09-15-42-bbbbbb");
+    expect(upper!.path).toBe("Tabular/Budget-2026");
+    expect(upper!.content).toBe("month,total\n2026-01,9000");
+    expect(lower!.path).toBe("Tabular/budget-2026");
+    expect(lower!.content).toBe("month,total\n2026-01,1");
   });
 });

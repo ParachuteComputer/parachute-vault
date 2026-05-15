@@ -427,6 +427,35 @@ describe("notes.extension (vault#328)", async () => {
       store.updateNote(md.id, { extension: "csv" }),
     ).rejects.toMatchObject({ code: "PATH_CONFLICT", path: "Foo" });
   });
+
+  it("getNoteByPath throws AmbiguousPathError when path matches multiple extensions (vault#330 S1)", async () => {
+    await store.createNote("# md", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    expect(store.getNoteByPath("Foo")).rejects.toMatchObject({
+      code: "AMBIGUOUS_PATH",
+      path: "Foo",
+    });
+  });
+
+  it("getNoteByPath returns the right note when extension is passed (vault#330 S1)", async () => {
+    await store.createNote("# md", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    const md = await store.getNoteByPath("Foo", "md");
+    const csv = await store.getNoteByPath("Foo", "csv");
+    expect(md!.id).toBe("foo-md");
+    expect(csv!.id).toBe("foo-csv");
+  });
+
+  it("getNoteByPath returns single match unchanged when no ambiguity (vault#330 S1 back-compat)", async () => {
+    await store.createNote("# only", { path: "Foo", id: "only" });
+    const note = await store.getNoteByPath("Foo");
+    expect(note!.id).toBe("only");
+  });
+
+  it("getNoteByPath returns null for unknown path (vault#330 S1 back-compat)", async () => {
+    const note = await store.getNoteByPath("DoesNotExist");
+    expect(note).toBeNull();
+  });
 });
 
 // ---- Tags ----

@@ -392,11 +392,21 @@ function parseExpandParams(
 
 
 /**
- * Resolve a note by ID or path. Tries ID first, then case-insensitive path.
+ * Resolve a note by ID or path. Tries ID first, then case-insensitive
+ * path. A trailing `.<ext>` matching the extension pattern is parsed
+ * as `(path, extension)` to disambiguate notes sharing a path
+ * differing only by extension (vault#330 S1). When the path is
+ * ambiguous and no extension hint is supplied, `getNoteByPath` throws
+ * `AmbiguousPathError` — REST handlers catch it and return 409.
  */
 async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
   const byId = await store.getNote(idOrPath);
   if (byId) return byId;
+  const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    const explicit = await store.getNoteByPath(extMatch[1]!, extMatch[2]!);
+    if (explicit) return explicit;
+  }
   return await store.getNoteByPath(idOrPath);
 }
 
@@ -417,7 +427,44 @@ class NotFoundError extends Error {
 // Notes — GET/POST/PATCH/DELETE /api/notes[/:idOrPath]
 // ---------------------------------------------------------------------------
 
+/**
+ * Convert a thrown `AmbiguousPathError` (vault#330 S1) into a structured
+ * 409 JSON response. Shared by every handler that calls `resolveNote`
+ * with a user-supplied path — handleNotes, handleFindPath,
+ * handleViewNote. Returns null when the error isn't an
+ * AmbiguousPathError so the caller can re-throw / fall through.
+ */
+function ambiguousPathResponse(e: any): Response | null {
+  if (!e || e.code !== "AMBIGUOUS_PATH") return null;
+  return json(
+    {
+      error_type: "ambiguous_path",
+      error: "ambiguous_path",
+      path: e.path,
+      candidates: e.candidates,
+      message: e.message,
+    },
+    409,
+  );
+}
+
 export async function handleNotes(
+  req: Request,
+  store: Store,
+  subpath: string,
+  vault?: string,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
+  try {
+    return await handleNotesInner(req, store, subpath, vault, tagScope);
+  } catch (e: any) {
+    const ambig = ambiguousPathResponse(e);
+    if (ambig) return ambig;
+    throw e;
+  }
+}
+
+async function handleNotesInner(
   req: Request,
   store: Store,
   subpath: string,
@@ -1502,6 +1549,11 @@ export async function handleFindPath(
     return json(result);
   } catch (e: any) {
     if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+    // vault#331 N1 — surface AmbiguousPathError from resolveNote as 409
+    // mirroring the handleNotes path. Without this, an ambiguous source/
+    // target path on /api/find-path bubbled to a server-level 500.
+    const ambig = ambiguousPathResponse(e);
+    if (ambig) return ambig;
     throw e;
   }
 }
@@ -1694,7 +1746,19 @@ export async function handleViewNote(
   options: { authenticated?: boolean; publishedTag?: string } = {},
 ): Promise<Response> {
   const { authenticated = false, publishedTag = "publish" } = options;
-  const note = await resolveNote(store, idOrPath);
+  let note: Note | null;
+  try {
+    note = await resolveNote(store, idOrPath);
+  } catch (e: any) {
+    // vault#331 N1 — surface AmbiguousPathError as 409. The HTML view
+    // route doesn't otherwise return JSON, but the structured body is
+    // the right shape for the API contract; a human reader hitting
+    // this URL gets the JSON inline (rare — the bare path form is
+    // mostly an API consumer's mistake).
+    const ambig = ambiguousPathResponse(e);
+    if (ambig) return ambig;
+    throw e;
+  }
   if (!note) {
     return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
   }

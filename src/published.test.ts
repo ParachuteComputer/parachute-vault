@@ -1,5 +1,7 @@
 import { describe, it, expect } from "bun:test";
+import { Database } from "bun:sqlite";
 import { handleViewNote } from "./routes.ts";
+import { SqliteStore } from "../core/src/store.ts";
 
 // Redirect URL builder — mirrors the logic in server.ts
 function buildRedirectUrl(reqUrl: string, noteId: string, prefix = ""): string {
@@ -210,5 +212,20 @@ describe("handleViewNote", async () => {
     });
     const resp = await handleViewNote(store, "n1", { publishedTag: "public" });
     expect(resp.status).toBe(404);
+  });
+
+  it("returns 409 ambiguous_path when bare path resolves to multiple notes (vault#331 N1)", async () => {
+    // Real SqliteStore so the v18 composite (path, extension) uniqueness
+    // index lets two notes coexist at the same path with different
+    // extensions — the scenario AmbiguousPathError is built for.
+    const store = new SqliteStore(new Database(":memory:"));
+    await store.createNote("# md", { id: "vn-md", path: "Foo", tags: ["publish"] });
+    await store.createNote("a,b\n1,2", { id: "vn-csv", path: "Foo", extension: "csv", tags: ["publish"] });
+    const resp = await handleViewNote(store, "Foo", { authenticated: true });
+    expect(resp.status).toBe(409);
+    const body = await resp.json() as any;
+    expect(body.error_type).toBe("ambiguous_path");
+    expect(body.path).toBe("Foo");
+    expect(body.candidates).toHaveLength(2);
   });
 });

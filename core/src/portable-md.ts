@@ -72,7 +72,7 @@
  * See vault#308.
  */
 
-import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync } from "fs";
+import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from "fs";
 import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
@@ -199,6 +199,24 @@ export interface ExportStats {
    * per note.
    */
   sidecars: number;
+  /**
+   * True when the export ran on a case-insensitive filesystem (macOS
+   * APFS default, Windows NTFS, FAT/exFAT) — whether or not any
+   * collision actually occurred. The probe runs once per export
+   * regardless of the note set; this field reflects the probe's
+   * outcome. To detect actual collisions, check
+   * `disambiguated_paths.length > 0`. See vault#327.
+   */
+  case_insensitive_fs: boolean;
+  /**
+   * Per-note disambiguation detail when the export's case-insensitive
+   * filesystem would otherwise silently collapse notes whose paths
+   * differ only by case (vault#327). Each entry records the original
+   * path + the suffixed on-disk filename so the operator can audit.
+   * Empty on case-sensitive filesystems and on case-insensitive
+   * filesystems with no collisions.
+   */
+  disambiguated_paths: Array<{ note_id: string; original_path: string; disambiguated_filename: string }>;
   /** Set when caller passed `since`; counts notes whose `updated_at >= since`. */
   filtered_by_since: boolean;
   /**
@@ -416,6 +434,34 @@ function buildFrontmatter(note: PortableNote): Record<string, unknown> {
 }
 
 /**
+ * Emit a frontmatter-shape object using `FRONTMATTER_KEY_ORDER`: each
+ * present key gets one or more lines (inline form for scalars + empty
+ * collections, block form otherwise). Every line ends in `\n`. The
+ * output does NOT include the `---` wrapper — that's the caller's
+ * concern (only `toPortableMarkdown` wraps; `toSidecarYaml` doesn't).
+ *
+ * Single source of truth for the per-key emit loop shared by
+ * `toPortableMarkdown` and `toSidecarYaml` (vault#330 F3 — pure
+ * refactor, behavior unchanged).
+ */
+function emitFrontmatterKeys(fm: Record<string, unknown>): string {
+  let out = "";
+  for (const key of FRONTMATTER_KEY_ORDER) {
+    if (!(key in fm)) continue;
+    const value = fm[key];
+    const inline = emitValueInline(value, 1);
+    if (inline !== null) {
+      out += `${key}: ${inline}\n`;
+    } else {
+      out += `${key}:\n`;
+      const block = emitValueBlock(value, 1);
+      if (block !== null) out += `${block}\n`;
+    }
+  }
+  return out;
+}
+
+/**
  * Render a note's content-file bytes. Behavior depends on the note's
  * `extension`:
  *
@@ -441,18 +487,7 @@ export function toPortableMarkdown(note: PortableNote): string {
   }
   const fm = buildFrontmatter(note);
   let out = "---\n";
-  for (const key of FRONTMATTER_KEY_ORDER) {
-    if (!(key in fm)) continue;
-    const value = fm[key];
-    const inline = emitValueInline(value, 1);
-    if (inline !== null) {
-      out += `${key}: ${inline}\n`;
-    } else {
-      out += `${key}:\n`;
-      const block = emitValueBlock(value, 1);
-      if (block !== null) out += `${block}\n`;
-    }
-  }
+  out += emitFrontmatterKeys(fm);
   out += "---\n";
   // Preserve content as-is; ensure exactly one trailing newline if missing.
   out += note.content;
@@ -487,20 +522,7 @@ export function toSidecarYaml(note: PortableNote): string {
   fm.created_at = note.created_at;
   if (note.updated_at) fm.updated_at = note.updated_at;
 
-  let out = "";
-  for (const key of FRONTMATTER_KEY_ORDER) {
-    if (!(key in fm)) continue;
-    const value = fm[key];
-    const inline = emitValueInline(value, 1);
-    if (inline !== null) {
-      out += `${key}: ${inline}\n`;
-    } else {
-      out += `${key}:\n`;
-      const block = emitValueBlock(value, 1);
-      if (block !== null) out += `${block}\n`;
-    }
-  }
-  return out;
+  return emitFrontmatterKeys(fm);
 }
 
 /**
@@ -600,6 +622,15 @@ export interface ExportOptions {
    * stays pure (no dep on server-side path resolution).
    */
   assetsDir?: string;
+  /**
+   * Override the filesystem case-sensitivity probe (vault#327). Pass
+   * `false` to force the case-insensitive code path (with auto-
+   * disambiguation) regardless of the real filesystem; pass `true` to
+   * force the case-sensitive code path. Test seam — lets the round-trip
+   * suite exercise both branches on whatever FS the test happens to
+   * run on. When unset (the production default), the probe runs.
+   */
+  caseSensitiveOverride?: boolean;
 }
 
 /**
@@ -683,10 +714,56 @@ export async function exportVaultToDir(
   let sidecarsWritten = 0;
   const skipped: { path: string | undefined; reason: string }[] = [];
   const skippedAttachments: { note_id: string; attachment_id: string; path: string; reason: string }[] = [];
+  const disambiguatedPaths: ExportStats["disambiguated_paths"] = [];
+
+  // Case-collision detection (vault#327). On case-insensitive
+  // filesystems (macOS APFS-default, Windows NTFS-default, FAT/exFAT),
+  // two notes whose paths differ only by case collapse into one file
+  // on write — silent data loss. We probe the export dir's filesystem
+  // once, then either ship as-is (case-sensitive) or build a lowercase
+  // `(path, extension)` index during the walk and disambiguate
+  // colliding notes with an `__<id-short>` filename suffix.
+  //
+  // The note's stored `path` (in frontmatter + sidecar) stays canonical;
+  // only the on-disk filename is suffixed. Import recovers the
+  // canonical path from frontmatter/sidecar, not from the filename.
+  const caseSensitive = opts.caseSensitiveOverride ?? probeCaseSensitive(outDir);
+  // Lowercased `<path>|<ext>` → first-write note-id. Subsequent matches
+  // on the same key trigger disambiguation. Only populated on
+  // case-insensitive filesystems.
+  const seenLowerKeys = new Map<string, string>();
+
   for (const note of allNotes) {
     if (since && !shouldIncludeForSince(note, since)) continue;
     const portable = await noteToPortable(note, store);
-    const relPath = portableExportFilePath(portable);
+    let relPath = portableExportFilePath(portable);
+
+    // Decide whether this note's filename needs disambiguation
+    // (vault#327). Only meaningful when the FS is case-insensitive AND
+    // a prior note's (path, ext) tuple already claimed the same
+    // lowercased filename slot. Pathless notes (`_unpathed/<id>.<ext>`)
+    // are immune by construction — their filename embeds the id, which
+    // is case-stable already.
+    if (!caseSensitive && portable.path) {
+      const ext = portable.extension ?? "md";
+      const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
+      const prior = seenLowerKeys.get(key);
+      if (prior !== undefined && prior !== portable.id) {
+        // Collision: emit the disambiguated form. The frontmatter /
+        // sidecar `path:` still holds the canonical (original) path so
+        // import recovers the truth.
+        const disambig = disambiguateFilename(portable.path, ext, portable.id);
+        relPath = disambig;
+        disambiguatedPaths.push({
+          note_id: portable.id,
+          original_path: portable.path,
+          disambiguated_filename: disambig,
+        });
+      } else if (prior === undefined) {
+        seenLowerKeys.set(key, portable.id);
+      }
+    }
+
     const fullPath = join(outDir, relPath);
     // vault#317 F3 — path-traversal guard. A note with
     // `path: "../../.ssh/authorized_keys"` would otherwise write outside
@@ -798,6 +875,8 @@ export async function exportVaultToDir(
     schemas: schemasWritten,
     attachments: attachmentsWritten,
     sidecars: sidecarsWritten,
+    case_insensitive_fs: !caseSensitive,
+    disambiguated_paths: disambiguatedPaths,
     filtered_by_since: since !== undefined,
     skipped_traversal: skipped.length,
     skipped_notes: skipped,
@@ -833,6 +912,85 @@ function sanitizeTagFilename(tag: string): string {
 function isWithinDir(candidate: string, root: string): boolean {
   if (candidate === root) return true;
   return candidate.startsWith(root + pathSep);
+}
+
+/**
+ * Probe whether `dir` lives on a case-sensitive filesystem (vault#327).
+ *
+ * The check writes a hidden tempfile, then tests whether the same file
+ * is reachable via its uppercased name. macOS APFS-default and Windows
+ * NTFS-default are case-insensitive (the file IS reachable); Linux
+ * ext4 and macOS APFS-CS are case-sensitive (the file is NOT). Other
+ * platforms (FAT32, exFAT, network shares to either) collapse to the
+ * same probe result.
+ *
+ * Returns true when the filesystem distinguishes case, false otherwise.
+ * Defaults to true (case-sensitive — current export behavior) if the
+ * probe fails for any reason — we'd rather ship without disambiguation
+ * than fail-closed on an unexpected I/O error mid-export.
+ *
+ * The probe cleans up after itself: tempfile is removed before return.
+ * Tempfile name uses a UUID-ish suffix so concurrent probes don't
+ * collide in shared directories.
+ */
+export function probeCaseSensitive(dir: string): boolean {
+  const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const lowerName = `._parachute_cs_probe_${suffix}`;
+  const upperName = `._PARACHUTE_CS_PROBE_${suffix.toUpperCase()}`;
+  const lowerPath = join(dir, lowerName);
+  const upperPath = join(dir, upperName);
+  try {
+    writeFileSync(lowerPath, "");
+    // On a case-insensitive FS, `existsSync(upperPath)` returns true
+    // because upperPath references the same inode. On a case-sensitive
+    // FS, the file at upperPath doesn't exist.
+    const caseInsensitive = existsSync(upperPath);
+    return !caseInsensitive;
+  } catch {
+    // Probe failed — assume case-sensitive (the conservative default
+    // that matches today's export behavior).
+    return true;
+  } finally {
+    try { rmSync(lowerPath, { force: true }); } catch {}
+    // Defensive: if some FS variant created a distinct file at
+    // upperPath, clean that too. No-op when it was the same inode.
+    try { rmSync(upperPath, { force: true }); } catch {}
+  }
+}
+
+/**
+ * Compute the disambiguated filename for a colliding note (vault#327).
+ * Appends `__<id-short>` to the path's basename, before the extension.
+ * The id-short is the first 8 chars of the note ID — short enough to
+ * stay readable, unique enough to avoid secondary collisions in
+ * practice (vault IDs are timestamp-prefixed YYYY-MM-DD-HH-MM-SS-ffffff,
+ * so the first 8 chars include the year + month + day).
+ *
+ * Example: `Journal/2025-05-26 Technology in Balance` (path) with
+ * extension `md` + id `2025-05-26-09-15-42-123456` becomes
+ * `Journal/2025-05-26 Technology in Balance__2025-05-.md`.
+ *
+ * The original path is preserved in the note's frontmatter/sidecar
+ * `path:` field — import recovers the canonical path from there, not
+ * from the disambiguated filename.
+ *
+ * **Assumption** (vault#331 N4): two notes created in the same month
+ * share the first 8 chars of the id-prefix (`YYYY-MM-`). For import,
+ * this is harmless because the resolver runs three tiers in order
+ * (exact-case canonical path → leftover-bucket pick → id-prefix
+ * scan), and sidecars are removed from the leftover map as they're
+ * consumed. By the time the id-prefix scan runs for a disambiguated
+ * filename, the only sidecars that could match are still-orphaned,
+ * so there's at most one candidate per scan. If two notes in the
+ * same month BOTH had disambiguated filenames AND the resolver had
+ * to fall through to the prefix scan for both, the first match wins
+ * deterministically (sorted dir walk). Bumping the slice to 12 or 14
+ * chars would tighten this further but adds noise to filenames —
+ * skip it until a real workload demands the change.
+ */
+function disambiguateFilename(path: string, extension: string, noteId: string): string {
+  const idShort = noteId.slice(0, 8);
+  return `${path}__${idShort}.${extension}`;
 }
 
 function shouldIncludeForSince(note: Note, since: string): boolean {
@@ -882,6 +1040,14 @@ export interface ImportStats {
   skipped_links: Array<{ source_id: string; target_id: string; relationship: string; reason: string }>;
   /** Per-skipped-attachment detail. */
   skipped_attachments: Array<{ note_id: string; attachment_id: string; reason: string }>;
+  /**
+   * Sidecars under `.parachute/notes-meta/` with no matching content
+   * file on disk (vault#330 S2). Each entry records the sidecar's id +
+   * the expected `(path, extension)` it claimed so the operator can
+   * see what's orphaned. Empty when every sidecar paired with a
+   * content file during the walk.
+   */
+  skipped_sidecars: Array<{ sidecar_id: string; expected_path: string | null; expected_extension: string | null; reason: string }>;
   /** Set when the caller passed `blowAway: true`; counts notes removed. */
   notes_wiped: number;
 }
@@ -929,6 +1095,7 @@ export async function importPortableVault(
     attachments_restored: 0,
     skipped_links: [],
     skipped_attachments: [],
+    skipped_sidecars: [],
     notes_wiped: 0,
   };
 
@@ -994,8 +1161,14 @@ export async function importPortableVault(
   // Sidecars with no matching content file are warned about (and
   // skipped) rather than triggering a write — preserves the
   // export-bytes-are-truth invariant.
+  // Sidecar index: keyed by lowercased `<path>|<ext>` so the walker's
+  // filename-derived key (also lowered) matches. The bucket holds the
+  // full sidecar(s) — multiple entries occur when two notes share a
+  // case-insensitive path (vault#327 collisions). The lookup logic
+  // picks the right sidecar from the bucket using the walker's
+  // case-preserved filename + the disambiguated-id-suffix heuristic.
   const notesMetaDir = join(sidecar, NOTES_META_DIR);
-  const sidecarByKey = new Map<string, Record<string, unknown>>();
+  const sidecarByKey = new Map<string, Record<string, unknown>[]>();
   const sidecarByIdLeftover = new Map<string, Record<string, unknown>>();
   if (existsSync(notesMetaDir)) {
     const notesMetaRootResolved = resolvePath(notesMetaDir);
@@ -1014,10 +1187,14 @@ export async function importPortableVault(
       const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
       const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
       if (!sidecarId) continue;
-      // Index by both (path, ext) tuple (for pathed notes) and by id
-      // (for unpathed notes whose filename is `_unpathed/<id>.<ext>`).
+      // Index by (path, ext) tuple lowered so case-insensitive walks
+      // match. Multi-value bucket lets two case-collided sidecars coexist
+      // until the per-file lookup picks the right one.
       if (sidecarPath && sidecarExt) {
-        sidecarByKey.set(`${sidecarPath.toLowerCase()}|${sidecarExt.toLowerCase()}`, frontmatter);
+        const key = `${sidecarPath.toLowerCase()}|${sidecarExt.toLowerCase()}`;
+        const bucket = sidecarByKey.get(key);
+        if (bucket) bucket.push(frontmatter);
+        else sidecarByKey.set(key, [frontmatter]);
       }
       sidecarByIdLeftover.set(sidecarId, frontmatter);
     }
@@ -1051,9 +1228,48 @@ export async function importPortableVault(
       frontmatter = parsed.frontmatter;
       content = parsed.content;
     } else {
-      // Look up sidecar by (path, ext). Lowercase path-key match.
+      // Resolve which sidecar this content file belongs to. Two
+      // sources of ambiguity to handle:
+      //   1. vault#327 case-collisions on a case-insensitive FS —
+      //      multiple sidecars share the same lowered (path, ext) key.
+      //   2. Disambiguated filenames — `<base>__<id-prefix>.<ext>` —
+      //      where the walker's path doesn't match any sidecar's
+      //      canonical path.
+      // Resolution order: exact-case match within the bucket → id-prefix
+      // match against the disambiguation suffix → first remaining
+      // sidecar in the bucket → fall through to id-prefix scan of all
+      // leftovers.
+      let found: Record<string, unknown> | undefined;
       const key = `${userPath.toLowerCase()}|${fileExt}`;
-      const found = sidecarByKey.get(key);
+      const bucket = sidecarByKey.get(key);
+      if (bucket && bucket.length > 0) {
+        // Try exact-case match on canonical path first — distinguishes
+        // case-collided notes when the FS preserves filename case but
+        // not equality.
+        found = bucket.find((s) => typeof s.path === "string" && s.path === userPath);
+        if (!found) {
+          // No exact-case match. Pick a sidecar from the bucket whose
+          // id is still in `leftover` (i.e. not yet consumed by a prior
+          // file in the walk). This keeps two case-collided notes on a
+          // case-sensitive replay from claiming the same sidecar twice.
+          found = bucket.find((s) => typeof s.id === "string" && sidecarByIdLeftover.has(s.id));
+        }
+      }
+      if (!found) {
+        // Disambiguated filename fallback: `<base>__<id-prefix>.<ext>`.
+        // Strip the suffix, then find a leftover sidecar whose id
+        // starts with that prefix.
+        const disambigMatch = userPath.match(/^(.*)__([A-Za-z0-9-]{6,})$/);
+        if (disambigMatch) {
+          const idPrefix = disambigMatch[2]!;
+          for (const [sidecarId, sidecar] of sidecarByIdLeftover) {
+            if (sidecarId.startsWith(idPrefix)) {
+              found = sidecar;
+              break;
+            }
+          }
+        }
+      }
       if (!found) {
         // No sidecar — log and skip. Importing the raw bytes with no
         // metadata would orphan the row (no id, no path, no
@@ -1065,8 +1281,8 @@ export async function importPortableVault(
       }
       frontmatter = found;
       content = readFileSync(filePath, "utf-8");
-      // Mark this sidecar as consumed so the "stale sidecar" pass
-      // below doesn't double-count.
+      // Mark this sidecar as consumed so subsequent files (and the
+      // stale-sidecar pass) don't double-count.
       const sidecarId = typeof found.id === "string" ? found.id : null;
       if (sidecarId) sidecarByIdLeftover.delete(sidecarId);
     }
@@ -1179,6 +1395,27 @@ export async function importPortableVault(
     //   2. update path bumped updated_at to now(); we want to peg it
     //      back to the exported value.
     await store.restoreNoteTimestamps(id, created_at, updated_at);
+  }
+
+  // 3b. Drain remaining sidecars (vault#330 S2). Any entry still in
+  // `sidecarByIdLeftover` after the content-file walk is orphaned —
+  // its expected content file wasn't on disk. Record the gap in
+  // `skipped_sidecars` so programmatic callers can surface or repair.
+  // Common cause: an operator removed a content file by hand without
+  // deleting the matching sidecar.
+  for (const [sidecarId, sidecar] of sidecarByIdLeftover) {
+    const expectedPath = typeof sidecar.path === "string" ? sidecar.path : null;
+    const expectedExt = typeof sidecar.extension === "string" ? sidecar.extension : null;
+    stats.skipped_sidecars.push({
+      sidecar_id: sidecarId,
+      expected_path: expectedPath,
+      expected_extension: expectedExt,
+      reason: expectedPath
+        ? `no content file at "${expectedPath}.${expectedExt ?? "md"}"`
+        : "sidecar has no `path:` field; orphaned by construction",
+    });
+    // eslint-disable-next-line no-console
+    console.warn(`[import] orphaned sidecar "${sidecarId}.yaml": ${stats.skipped_sidecars[stats.skipped_sidecars.length - 1]!.reason}`);
   }
 
   // 4. Typed links — replay only now that all notes exist. Wikilinks
