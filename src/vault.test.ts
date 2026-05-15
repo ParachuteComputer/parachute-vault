@@ -3435,6 +3435,25 @@ describe("HTTP /find-path", async () => {
     const res = await handleFindPath(mkReq("GET", "/find-path?source=a"), store);
     expect(res.status).toBe(400);
   });
+
+  test("returns 409 ambiguous_path when source path is ambiguous (vault#331 N1)", async () => {
+    // Two notes share path "Foo" differing by extension. handleFindPath's
+    // resolveNote(source) would otherwise non-deterministically pick
+    // one; post-#331 it throws AmbiguousPathError and the handler's
+    // catch surfaces a structured 409 (same shape as handleNotes).
+    await store.createNote("# md", { id: "foo-md", path: "Foo" });
+    await store.createNote("a,b\n1,2", { id: "foo-csv", path: "Foo", extension: "csv" });
+    await store.createNote("target", { id: "target" });
+    const res = await handleFindPath(
+      mkReq("GET", "/find-path?source=Foo&target=target"),
+      store,
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("ambiguous_path");
+    expect(body.path).toBe("Foo");
+    expect(body.candidates).toHaveLength(2);
+  });
 });
 
 describe("stateless MCP transport", async () => {

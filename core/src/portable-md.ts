@@ -201,11 +201,11 @@ export interface ExportStats {
   sidecars: number;
   /**
    * True when the export ran on a case-insensitive filesystem (macOS
-   * APFS default, Windows NTFS, FAT/exFAT) and detected at least one
-   * lower-cased `(path, extension)` collision in the note set — i.e.
-   * `disambiguated_paths.length > 0` (vault#327). Programmatic callers
-   * (`parachute-vault import` etc.) inspect this to decide whether to
-   * surface the disambiguation in CLI output.
+   * APFS default, Windows NTFS, FAT/exFAT) — whether or not any
+   * collision actually occurred. The probe runs once per export
+   * regardless of the note set; this field reflects the probe's
+   * outcome. To detect actual collisions, check
+   * `disambiguated_paths.length > 0`. See vault#327.
    */
   case_insensitive_fs: boolean;
   /**
@@ -973,6 +973,20 @@ export function probeCaseSensitive(dir: string): boolean {
  * The original path is preserved in the note's frontmatter/sidecar
  * `path:` field — import recovers the canonical path from there, not
  * from the disambiguated filename.
+ *
+ * **Assumption** (vault#331 N4): two notes created in the same month
+ * share the first 8 chars of the id-prefix (`YYYY-MM-`). For import,
+ * this is harmless because the resolver runs three tiers in order
+ * (exact-case canonical path → leftover-bucket pick → id-prefix
+ * scan), and sidecars are removed from the leftover map as they're
+ * consumed. By the time the id-prefix scan runs for a disambiguated
+ * filename, the only sidecars that could match are still-orphaned,
+ * so there's at most one candidate per scan. If two notes in the
+ * same month BOTH had disambiguated filenames AND the resolver had
+ * to fall through to the prefix scan for both, the first match wins
+ * deterministically (sorted dir walk). Bumping the slice to 12 or 14
+ * chars would tighten this further but adds noise to filenames —
+ * skip it until a real workload demands the change.
  */
 function disambiguateFilename(path: string, extension: string, noteId: string): string {
   const idShort = noteId.slice(0, 8);

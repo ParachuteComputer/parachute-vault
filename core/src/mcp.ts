@@ -1281,8 +1281,10 @@ function normalizeTags(tag: unknown): string[] | undefined {
 }
 
 // Re-exported for backward compat; defined in notes.ts alongside the
-// conditional-UPDATE implementation that raises it.
-export { ConflictError, PathConflictError, MAX_BATCH_SIZE } from "./notes.js";
+// conditional-UPDATE implementation that raises it. AmbiguousPathError
+// joins the set (vault#331 N2) so external callers can `instanceof`
+// it without crossing module boundaries.
+export { ConflictError, PathConflictError, AmbiguousPathError, MAX_BATCH_SIZE } from "./notes.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a
