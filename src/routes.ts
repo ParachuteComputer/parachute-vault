@@ -392,11 +392,21 @@ function parseExpandParams(
 
 
 /**
- * Resolve a note by ID or path. Tries ID first, then case-insensitive path.
+ * Resolve a note by ID or path. Tries ID first, then case-insensitive
+ * path. A trailing `.<ext>` matching the extension pattern is parsed
+ * as `(path, extension)` to disambiguate notes sharing a path
+ * differing only by extension (vault#330 S1). When the path is
+ * ambiguous and no extension hint is supplied, `getNoteByPath` throws
+ * `AmbiguousPathError` — REST handlers catch it and return 409.
  */
 async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
   const byId = await store.getNote(idOrPath);
   if (byId) return byId;
+  const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    const explicit = await store.getNoteByPath(extMatch[1]!, extMatch[2]!);
+    if (explicit) return explicit;
+  }
   return await store.getNoteByPath(idOrPath);
 }
 
@@ -418,6 +428,35 @@ class NotFoundError extends Error {
 // ---------------------------------------------------------------------------
 
 export async function handleNotes(
+  req: Request,
+  store: Store,
+  subpath: string,
+  vault?: string,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
+  try {
+    return await handleNotesInner(req, store, subpath, vault, tagScope);
+  } catch (e: any) {
+    // AmbiguousPathError (vault#330 S1) — convert to a structured 409
+    // anywhere it surfaces in the notes routes. Carries the candidate
+    // extensions so the caller knows what to disambiguate with.
+    if (e && e.code === "AMBIGUOUS_PATH") {
+      return json(
+        {
+          error_type: "ambiguous_path",
+          error: "ambiguous_path",
+          path: e.path,
+          candidates: e.candidates,
+          message: e.message,
+        },
+        409,
+      );
+    }
+    throw e;
+  }
+}
+
+async function handleNotesInner(
   req: Request,
   store: Store,
   subpath: string,

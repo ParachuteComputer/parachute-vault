@@ -157,7 +157,14 @@ export interface Store {
   // Notes
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
-  getNoteByPath(path: string): Promise<Note | null>;
+  /**
+   * Look up a note by path. Pass `extension` to disambiguate when
+   * multiple notes share a path differing only by extension (post-
+   * vault#328). When omitted and >1 row matches, throws
+   * `AmbiguousPathError` instead of silently picking one. See
+   * vault#330 S1.
+   */
+  getNoteByPath(path: string, extension?: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
   updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; if_updated_at?: string }): Promise<Note>;
   /**

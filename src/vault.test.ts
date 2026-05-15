@@ -1830,6 +1830,34 @@ describe("HTTP /notes", async () => {
     expect(body.extension).toBe("csv");
   });
 
+  test("GET /notes?id=<path> returns 409 ambiguous_path when path matches multiple extensions (vault#330 S1)", async () => {
+    await store.createNote("# md", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?id=Foo"),
+      store,
+      "",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("ambiguous_path");
+    expect(body.path).toBe("Foo");
+    expect(body.candidates).toHaveLength(2);
+  });
+
+  test("GET /notes?id=Foo.csv resolves the explicit-extension form (vault#330 S1)", async () => {
+    await store.createNote("# md", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    const res = await handleNotes(
+      mkReq("GET", "/notes?id=Foo.csv"),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.id).toBe("foo-csv");
+  });
+
   test("POST /notes/:id/attachments accepts mimeType (camelCase) in body", async () => {
     const n = await store.createNote("x", { id: "x" });
     const res = await handleNotes(

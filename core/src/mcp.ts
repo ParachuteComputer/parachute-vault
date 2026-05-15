@@ -26,14 +26,33 @@ export interface McpToolDef {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a note identifier — tries ID first, then case-insensitive path match.
- * Works everywhere a note reference is accepted.
+ * Resolve a note identifier — tries ID first, then case-insensitive
+ * path match. Works everywhere a note reference is accepted.
+ *
+ * Path-with-extension form (vault#330 S1): a trailing `.<ext>` matching
+ * the extension pattern (`/^[a-z0-9]{1,16}$/i`) is parsed as
+ * `(path, extension)` to disambiguate notes that share a path
+ * differing only by extension. Mirrors the wikilink ambiguity policy
+ * from vault#328.
+ *
+ * On ambiguous path with no extension hint, `getNoteByPath` throws
+ * `AmbiguousPathError` — `resolveNote` propagates it so MCP / REST
+ * handlers can surface a clear 4xx rather than picking arbitrarily.
  */
 function resolveNote(db: Database, idOrPath: string): Note | null {
   // Try ID match first (fast, indexed)
   const byId = noteOps.getNote(db, idOrPath);
   if (byId) return byId;
-  // Fallback to path match
+  // Path-with-extension form: `Tabular/budget.csv` → (path="Tabular/
+  // budget", extension="csv"). Only kicks in when the suffix looks
+  // like an extension AND a `(path, ext)` row exists. Fall through to
+  // the no-extension lookup if not (so `Recipe.v2` where `v2` isn't a
+  // real extension still finds Recipe.v2 by exact-path).
+  const extMatch = idOrPath.match(/^(.*)\.([a-z0-9]{1,16})$/i);
+  if (extMatch) {
+    const explicit = noteOps.getNoteByPath(db, extMatch[1]!, extMatch[2]!);
+    if (explicit) return explicit;
+  }
   return noteOps.getNoteByPath(db, idOrPath);
 }
 

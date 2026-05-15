@@ -79,13 +79,49 @@ export function getNote(db: Database, id: string): Note | null {
   return note;
 }
 
-export function getNoteByPath(db: Database, path: string): Note | null {
-  const row = db.prepare("SELECT * FROM notes WHERE path = ?").get(path) as NoteRow | undefined;
-  if (!row) return null;
+/**
+ * Look up a note by `path`. When `extension` is provided, the lookup
+ * matches the `(path, extension)` tuple — exactly one row, since v18's
+ * composite uniqueness index makes that combo unique. When `extension`
+ * is omitted:
+ *
+ *   - 0 matches → return null (back-compat).
+ *   - 1 match → return it (back-compat).
+ *   - >1 match → throw `AmbiguousPathError` (vault#330 S1). Caller
+ *     must pass `extension` explicitly to disambiguate. Mirrors the
+ *     wikilink ambiguity policy from vault#328 edge case 3 —
+ *     path-as-key lookup is "(path, extension) tuple" everywhere.
+ *
+ * Path match is case-insensitive (`COLLATE NOCASE`) — matches the v5
+ * uniqueness contract and how wikilinks resolve.
+ */
+export function getNoteByPath(db: Database, path: string, extension?: string): Note | null {
+  if (extension !== undefined) {
+    const row = db.prepare(
+      "SELECT * FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ?",
+    ).get(path, extension.toLowerCase()) as NoteRow | undefined;
+    if (!row) return null;
+    const note = rowToNote(row);
+    note.tags = getNoteTags(db, note.id);
+    return note;
+  }
 
-  const note = rowToNote(row);
-  note.tags = getNoteTags(db, note.id);
-  return note;
+  // No extension given. The composite-unique index lets two rows share
+  // a path differing only by extension, so we have to look at all matches
+  // before returning.
+  const rows = db.prepare(
+    "SELECT * FROM notes WHERE path = ? COLLATE NOCASE",
+  ).all(path) as NoteRow[];
+  if (rows.length === 0) return null;
+  if (rows.length === 1) {
+    const note = rowToNote(rows[0]!);
+    note.tags = getNoteTags(db, note.id);
+    return note;
+  }
+  throw new AmbiguousPathError(
+    path,
+    rows.map((r) => ({ id: r.id, extension: r.extension ?? "md" })),
+  );
 }
 
 export function getNotes(db: Database, ids: string[]): Note[] {
@@ -144,6 +180,31 @@ export class PathConflictError extends Error {
     super(`path_conflict: another note already uses path "${path}"`);
     this.name = "PathConflictError";
     this.path = path;
+  }
+}
+
+/**
+ * Thrown by `getNoteByPath` when the caller looked up a path that has
+ * multiple notes (post-vault#328: same path, different extensions),
+ * without specifying which extension to disambiguate. Aligns the
+ * path-as-key lookup contract with the wikilink ambiguity policy
+ * (vault#328 edge case 3): refuse-and-require-explicit-extension.
+ *
+ * Surfaces structured fields so callers (MCP `resolveNote`, REST
+ * path-as-id handlers) can convert to a clear 409 / 4xx with the list
+ * of candidate extensions. See vault#330 S1.
+ */
+export class AmbiguousPathError extends Error {
+  code = "AMBIGUOUS_PATH" as const;
+  path: string;
+  candidates: { id: string; extension: string }[];
+
+  constructor(path: string, candidates: { id: string; extension: string }[]) {
+    const list = candidates.map((c) => c.extension).join(", ");
+    super(`ambiguous_path: "${path}" matches ${candidates.length} notes (extensions: ${list}); pass \`extension\` to disambiguate`);
+    this.name = "AmbiguousPathError";
+    this.path = path;
+    this.candidates = candidates;
   }
 }
 
