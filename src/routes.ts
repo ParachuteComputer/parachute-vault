@@ -636,35 +636,10 @@ export async function handleNotes(
         );
       }
 
-      // Empty-note pre-validation (#213): walk the batch first and reject the
-      // whole request if any item would be content+path empty. This makes
-      // mixed batches atomic for the empty-note case — no caller gets a
-      // half-applied batch where the prefix landed and the empty entry
-      // surfaced the 400. Mirrors the Store-level invariant exactly.
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        const content = (item?.content ?? "").toString();
-        const rawPath = item?.path;
-        const pathEmpty = rawPath === undefined || rawPath === null
-          || (typeof rawPath === "string" && rawPath.trim() === "");
-        if (!content.trim() && pathEmpty) {
-          return json(
-            {
-              error_type: "empty_note",
-              error: "EmptyNoteError",
-              message: `empty_note: a note must have either content or a path (item index ${i})`,
-              item_index: i,
-            },
-            400,
-          );
-        }
-      }
-
       // Tag-scope pre-validation: every new note in the batch must carry at
-      // least one tag inside the token's allowlist. Same atomic-batch
-      // discipline as the empty-note check — reject the whole request before
-      // any DB write so a tag-scoped token can't accidentally land a partial
-      // batch with an in-scope prefix.
+      // least one tag inside the token's allowlist. Reject the whole request
+      // before any DB write so a tag-scoped token can't accidentally land a
+      // partial batch with an in-scope prefix.
       if (tagScope.allowed) {
         for (let i = 0; i < items.length; i++) {
           if (!tagsWithinScope(items[i]?.tags, tagScope.allowed, tagScope.raw)) {
@@ -711,17 +686,6 @@ export async function handleNotes(
           return json(
             { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
             409,
-          );
-        }
-        if (e && e.code === "EMPTY_NOTE") {
-          return json(
-            {
-              error_type: "empty_note",
-              error: "EmptyNoteError",
-              message: e.message,
-              item_index: e.item_index ?? null,
-            },
-            400,
           );
         }
         throw e;
@@ -1142,20 +1106,6 @@ export async function handleNotes(
         return json(
           { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
           409,
-        );
-      }
-      // Empty-note guard from the Store boundary (#213) — the proposed update
-      // would clear both content AND path. Surface as 400 so callers can fix
-      // the request without retrying.
-      if (e && e.code === "EMPTY_NOTE") {
-        return json(
-          {
-            error_type: "empty_note",
-            error: "EmptyNoteError",
-            message: e.message,
-            note_id: e.note_id ?? null,
-          },
-          400,
         );
       }
       throw e;

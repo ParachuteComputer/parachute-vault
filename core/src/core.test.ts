@@ -189,15 +189,31 @@ describe("notes", async () => {
   });
 
   // -------------------------------------------------------------------------
-  // Empty-note invariant at the Store boundary (#213)
+  // Empty content is a valid state (vault#323)
   // -------------------------------------------------------------------------
+  // Skeleton notes, drafts saved before content, organizing-only notes,
+  // capture-then-fill flows. The earlier #213 guard rejected `content +
+  // path both absent` — we no longer enforce it because real vaults
+  // legitimately carry such rows and the round-trip import has to accept
+  // them.
 
-  it("createNote rejects content+path both absent → EmptyNoteError", async () => {
-    await expect(store.createNote("")).rejects.toMatchObject({ code: "EMPTY_NOTE" });
-    await expect(store.createNote("   ")).rejects.toMatchObject({ code: "EMPTY_NOTE" });
-    await expect(store.createNote("", { metadata: { x: 1 } })).rejects.toMatchObject({
-      code: "EMPTY_NOTE",
-    });
+  it("createNote accepts empty content with no path", async () => {
+    const n = await store.createNote("");
+    expect(n.content).toBe("");
+    expect(n.path).toBeUndefined();
+  });
+
+  it("createNote accepts whitespace-only content with no path", async () => {
+    const n = await store.createNote("   ");
+    expect(n.content).toBe("   ");
+  });
+
+  it("createNote empty-content note is queryable + survives round-trip", async () => {
+    const created = await store.createNote("", { metadata: { kind: "skeleton" } });
+    const fetched = await store.getNote(created.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.content).toBe("");
+    expect(fetched!.metadata).toMatchObject({ kind: "skeleton" });
   });
 
   it("createNote accepts content-only (un-pathed jot)", async () => {
@@ -212,18 +228,24 @@ describe("notes", async () => {
     expect(n.path).toBe("wiki/placeholder");
   });
 
-  it("updateNote rejects clearing both content and path → EmptyNoteError", async () => {
+  it("updateNote allows clearing both content and path", async () => {
     const n = await store.createNote("body", { path: "p" });
-    await expect(
-      store.updateNote(n.id, { content: "", path: "", if_updated_at: n.createdAt }),
-    ).rejects.toMatchObject({ code: "EMPTY_NOTE", note_id: n.id });
+    const updated = await store.updateNote(n.id, {
+      content: "",
+      path: "",
+      if_updated_at: n.createdAt,
+    });
+    expect(updated.content).toBe("");
+    expect(updated.path).toBeUndefined();
   });
 
-  it("updateNote rejects clearing content when path is already null", async () => {
+  it("updateNote allows clearing content when path is already null", async () => {
     const n = await store.createNote("body");
-    await expect(
-      store.updateNote(n.id, { content: "", if_updated_at: n.createdAt }),
-    ).rejects.toMatchObject({ code: "EMPTY_NOTE" });
+    const updated = await store.updateNote(n.id, {
+      content: "",
+      if_updated_at: n.createdAt,
+    });
+    expect(updated.content).toBe("");
   });
 
   it("updateNote allows clearing content when path is set (or being set)", async () => {
@@ -2811,58 +2833,32 @@ describe("MCP tools", async () => {
     expect(r2.map((n) => n.content).sort()).toEqual(["a"]);
   });
 
-  // ---- empty-note + batch-cap MCP regressions (#213) ----
+  // ---- empty-note acceptance (vault#323) + batch-cap MCP ----
 
-  it("create-note rejects bare empty content with no path (EMPTY_NOTE)", async () => {
+  it("create-note accepts bare empty content with no path", async () => {
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
-    let err: any;
-    try {
-      await createNote.execute({ content: "" });
-    } catch (e) {
-      err = e;
-    }
-    expect(err?.code).toBe("EMPTY_NOTE");
+    const result = await createNote.execute({ content: "" }) as any;
+    expect(result).toBeTruthy();
+    const note = Array.isArray(result) ? result[0] : result;
+    expect(note.content).toBe("");
+    const fetched = await store.getNote(note.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.content).toBe("");
   });
 
-  it("create-note batch rejects when any entry is empty content + no path (atomic, with item_index)", async () => {
+  it("create-note batch with mixed empty + content entries succeeds end-to-end", async () => {
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
-    const beforeCount = (await store.queryNotes({ search: "atomic-marker" })).length;
-    let err: any;
-    try {
-      await createNote.execute({
-        notes: [
-          { content: "atomic-marker first" },
-          { content: "" },
-        ],
-      });
-    } catch (e) {
-      err = e;
-    }
-    expect(err?.code).toBe("EMPTY_NOTE");
-    // The first item must NOT have been created — pre-validation rolls
-    // the whole batch back atomically. Partial-create would leak prefixes
-    // on every runaway-client burst (#213).
-    const afterCount = (await store.queryNotes({ search: "atomic-marker" })).length;
-    expect(afterCount).toBe(beforeCount);
-    // Parity with HTTP route: MCP callers with multi-item batches need to
-    // know which entry triggered the rejection. The bad entry is at index 1.
-    expect(err.item_index).toBe(1);
-  });
-
-  it("create-note single empty has null item_index (not a batch position)", async () => {
-    const tools = generateMcpTools(store);
-    const createNote = tools.find((t) => t.name === "create-note")!;
-    let err: any;
-    try {
-      await createNote.execute({ content: "" });
-    } catch (e) {
-      err = e;
-    }
-    expect(err?.code).toBe("EMPTY_NOTE");
-    // Single-call (no `notes` array) — there's no batch position to report.
-    expect(err.item_index).toBeNull();
+    const result = await createNote.execute({
+      notes: [
+        { content: "first" },
+        { content: "" },
+        { content: "third" },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(3);
+    expect(result.map((n) => n.content)).toEqual(["first", "", "third"]);
   });
 
   it("create-note batch over MAX_BATCH_SIZE rejects with BATCH_TOO_LARGE", async () => {

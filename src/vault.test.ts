@@ -1883,36 +1883,30 @@ describe("HTTP /notes", async () => {
   });
 
   // -------------------------------------------------------------------------
-  // Empty-note guard + batch cap (#213) — runaway-client protection
+  // Empty content is a valid state (vault#323)
   // -------------------------------------------------------------------------
+  // Skeleton notes, drafts, organizing-only notes, and capture-then-fill
+  // flows all legitimately produce empty-content rows. The earlier #213
+  // guard rejected `content + path both absent` — we no longer enforce
+  // it because real vaults carry such rows and the round-trip import
+  // has to accept them.
 
-  describe("empty-note guard (#213)", async () => {
-    test("POST bare {} body → 400 EmptyNoteError", async () => {
+  describe("empty content is valid (vault#323)", async () => {
+    test("POST bare {} body → 201", async () => {
       const res = await handleNotes(mkReq("POST", "/notes", {}), store, "");
-      expect(res.status).toBe(400);
-      const body = await res.json() as any;
-      expect(body.error_type).toBe("empty_note");
-      expect(body.error).toBe("EmptyNoteError");
+      expect(res.status).toBe(201);
     });
 
-    test("POST batch with one empty entry → 400 EmptyNoteError, NOTHING created (atomic)", async () => {
-      // Pre-validate the batch before any DB writes so a mixed batch with one
-      // bad entry rolls back the whole call. The runaway-client signature
-      // (#213) is "thousands of empties" — partial-create semantics would
-      // still leak the prefix on every burst. Atomic is the only safe shape.
+    test("POST batch with mixed empty + content entries → 201, all created", async () => {
       const beforeCount = (await store.queryNotes({ path: "ok-1" })).length;
       const res = await handleNotes(
-        mkReq("POST", "/notes", { notes: [{ path: "ok-1" }, {}] }),
+        mkReq("POST", "/notes", { notes: [{ path: "ok-1" }, {}, { content: "third" }] }),
         store,
         "",
       );
-      expect(res.status).toBe(400);
-      const body = await res.json() as any;
-      expect(body.error_type).toBe("empty_note");
-      expect(body.item_index).toBe(1);
-      // ok-1 must NOT have been created — atomic rollback.
+      expect(res.status).toBe(201);
       const afterCount = (await store.queryNotes({ path: "ok-1" })).length;
-      expect(afterCount).toBe(beforeCount);
+      expect(afterCount).toBe(beforeCount + 1);
     });
 
     test("POST single content-only (path absent) → 201", async () => {
@@ -1924,9 +1918,7 @@ describe("HTTP /notes", async () => {
       expect(res.status).toBe(201);
     });
 
-    test("POST single path-only (content absent) → 201, no warning log", async () => {
-      // Path-only is a wikilink placeholder / `_schemas/*` shape — must
-      // remain accepted (per #223 design Q3).
+    test("POST single path-only (content absent) → 201", async () => {
       const res = await handleNotes(
         mkReq("POST", "/notes", { path: "wiki/placeholder" }),
         store,
@@ -1935,8 +1927,8 @@ describe("HTTP /notes", async () => {
       expect(res.status).toBe(201);
     });
 
-    test("PATCH that would clear both content and path → 400 EmptyNoteError", async () => {
-      const note = await store.createNote("starts with content", { id: "ep1" });
+    test("PATCH that clears both content and path → 200", async () => {
+      await store.createNote("starts with content", { id: "ep1" });
       const updated = await store.getNote("ep1");
       const res = await handleNotes(
         mkReq("PATCH", "/notes/ep1", {
@@ -1947,14 +1939,11 @@ describe("HTTP /notes", async () => {
         store,
         "/ep1",
       );
-      expect(res.status).toBe(400);
-      const body = await res.json() as any;
-      expect(body.error_type).toBe("empty_note");
-      expect(body.note_id).toBe("ep1");
+      expect(res.status).toBe(200);
     });
 
     test("PATCH that clears content but preserves path → 200", async () => {
-      const note = await store.createNote("body", { id: "ep2", path: "p2" });
+      await store.createNote("body", { id: "ep2", path: "p2" });
       const updated = await store.getNote("ep2");
       const res = await handleNotes(
         mkReq("PATCH", "/notes/ep2", {
@@ -1970,8 +1959,7 @@ describe("HTTP /notes", async () => {
 
   describe("batch atomicity (#236)", async () => {
     test("POST batch where mid-item triggers PATH_CONFLICT → 409, NOTHING created", async () => {
-      // The empty-note pre-walk catches `{}` before any DB write (#213); a
-      // path-conflict only surfaces on the actual INSERT, mid-loop. Without
+      // A path-conflict only surfaces on the actual INSERT, mid-loop. Without
       // the BEGIN/COMMIT wrap the prefix would have already landed by then.
       await store.createNote("existing", { path: "taken" });
       const beforeIds = (await store.queryNotes({})).map((n) => n.id).sort();

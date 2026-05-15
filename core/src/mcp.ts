@@ -381,34 +381,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           throw new BatchTooLargeError(items.length);
         }
 
-        // Empty-note pre-validation (#213): make mixed batches atomic for
-        // the empty-note case. The Store will throw EmptyNoteError on the
-        // empty entry, but in a sequential batch loop the prefix would have
-        // already committed before we hit it. Pre-walk so the whole call
-        // either creates everything or nothing. The error carries
-        // `item_index` so MCP callers with multi-item batches can pinpoint
-        // the bad entry — parity with the HTTP route's response shape.
-        // TODO: tighten batch input type — `items[i] as any` mirrors the
-        // top-of-call cast at `params.notes as any[]`. A typed McpCreateNoteInput
-        // would let us drop both casts.
-        for (let i = 0; i < items.length; i++) {
-          const item = items[i] as any;
-          const content = ((item?.content as string | undefined) ?? "").toString();
-          const rawPath = item?.path;
-          const pathEmpty = rawPath === undefined || rawPath === null
-            || (typeof rawPath === "string" && rawPath.trim() === "");
-          if (!content.trim() && pathEmpty) {
-            throw new noteOps.EmptyNoteError(null, batch ? i : null);
-          }
-        }
-
         const created: Note[] = [];
         // Wrap multi-item batches in a SQLite transaction so a mid-batch
-        // failure rolls back every prior insert — see #236. The pre-walk
-        // above catches empty-note cases; this guards anything thrown from
-        // store.createNote / createLink (path conflict, etc.). Single-item
-        // calls skip the wrap to avoid colliding with concurrent callers
-        // on the shared bun:sqlite connection.
+        // failure rolls back every prior insert — see #236. This guards
+        // anything thrown from store.createNote / createLink (path
+        // conflict, etc.). Single-item calls skip the wrap to avoid
+        // colliding with concurrent callers on the shared bun:sqlite
+        // connection.
         const batched = items.length > 1;
         if (batched) db.exec("BEGIN");
         try {
@@ -1255,7 +1234,7 @@ function normalizeTags(tag: unknown): string[] | undefined {
 
 // Re-exported for backward compat; defined in notes.ts alongside the
 // conditional-UPDATE implementation that raises it.
-export { ConflictError, PathConflictError, EmptyNoteError, MAX_BATCH_SIZE } from "./notes.js";
+export { ConflictError, PathConflictError, MAX_BATCH_SIZE } from "./notes.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a
