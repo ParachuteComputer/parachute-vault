@@ -1282,6 +1282,52 @@ describe("portable-md non-markdown round-trip (vault#328)", async () => {
     compareTree(outA, outB);
   });
 
+  it("records orphan sidecars in ImportStats.skipped_sidecars (vault#330 S2)", async () => {
+    // Build a portable-md export by hand with an orphan sidecar: a
+    // sidecar YAML at .parachute/notes-meta/<id>.yaml whose
+    // (path, extension) doesn't point to any real content file on
+    // disk. Import should record it in skipped_sidecars without
+    // crashing.
+    const outDir = join(tmpBase, "orphan-sidecar");
+    mkdirSync(join(outDir, SIDECAR_DIR, NOTES_META_DIR), { recursive: true });
+    writeFileSync(
+      join(outDir, SIDECAR_DIR, "vault.yaml"),
+      "export_format_version: 1\nexported_at: '2026-05-15T00:00:00.000Z'\n",
+    );
+    writeFileSync(
+      join(outDir, SIDECAR_DIR, NOTES_META_DIR, "orphan-1.yaml"),
+      "id: orphan-1\npath: Tabular/missing\nextension: csv\ncreated_at: '2026-05-15T00:00:00.000Z'\nupdated_at: '2026-05-15T00:00:00.000Z'\n",
+    );
+
+    const restored = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(restored, { inDir: outDir });
+    expect(stats.notes_created).toBe(0);
+    expect(stats.skipped_sidecars).toHaveLength(1);
+    expect(stats.skipped_sidecars[0]!.sidecar_id).toBe("orphan-1");
+    expect(stats.skipped_sidecars[0]!.expected_path).toBe("Tabular/missing");
+    expect(stats.skipped_sidecars[0]!.expected_extension).toBe("csv");
+    expect(stats.skipped_sidecars[0]!.reason).toMatch(/no content file/);
+  });
+
+  it("skipped_sidecars stays empty on a clean export-then-import", async () => {
+    // Sanity pin: when every sidecar pairs with a content file, the
+    // leftover-drain produces no entries.
+    await store.createNote("month,total\n2026-01,9000", {
+      id: "csv-1",
+      path: "Tabular/budget",
+      extension: "csv",
+    });
+    const outDir = join(tmpBase, "clean-sidecars");
+    await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+    });
+    const restored = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(restored, { inDir: outDir, blowAway: true });
+    expect(stats.skipped_sidecars).toEqual([]);
+  });
+
   it("import refuses content files lacking a sidecar (orphaned non-md file)", async () => {
     // Build a minimal portable-md directory by hand: a valid vault.yaml
     // + a .csv content file with NO matching sidecar. The importer

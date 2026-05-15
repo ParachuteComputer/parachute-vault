@@ -1022,6 +1022,14 @@ export interface ImportStats {
   skipped_links: Array<{ source_id: string; target_id: string; relationship: string; reason: string }>;
   /** Per-skipped-attachment detail. */
   skipped_attachments: Array<{ note_id: string; attachment_id: string; reason: string }>;
+  /**
+   * Sidecars under `.parachute/notes-meta/` with no matching content
+   * file on disk (vault#330 S2). Each entry records the sidecar's id +
+   * the expected `(path, extension)` it claimed so the operator can
+   * see what's orphaned. Empty when every sidecar paired with a
+   * content file during the walk.
+   */
+  skipped_sidecars: Array<{ sidecar_id: string; expected_path: string | null; expected_extension: string | null; reason: string }>;
   /** Set when the caller passed `blowAway: true`; counts notes removed. */
   notes_wiped: number;
 }
@@ -1069,6 +1077,7 @@ export async function importPortableVault(
     attachments_restored: 0,
     skipped_links: [],
     skipped_attachments: [],
+    skipped_sidecars: [],
     notes_wiped: 0,
   };
 
@@ -1368,6 +1377,27 @@ export async function importPortableVault(
     //   2. update path bumped updated_at to now(); we want to peg it
     //      back to the exported value.
     await store.restoreNoteTimestamps(id, created_at, updated_at);
+  }
+
+  // 3b. Drain remaining sidecars (vault#330 S2). Any entry still in
+  // `sidecarByIdLeftover` after the content-file walk is orphaned —
+  // its expected content file wasn't on disk. Record the gap in
+  // `skipped_sidecars` so programmatic callers can surface or repair.
+  // Common cause: an operator removed a content file by hand without
+  // deleting the matching sidecar.
+  for (const [sidecarId, sidecar] of sidecarByIdLeftover) {
+    const expectedPath = typeof sidecar.path === "string" ? sidecar.path : null;
+    const expectedExt = typeof sidecar.extension === "string" ? sidecar.extension : null;
+    stats.skipped_sidecars.push({
+      sidecar_id: sidecarId,
+      expected_path: expectedPath,
+      expected_extension: expectedExt,
+      reason: expectedPath
+        ? `no content file at "${expectedPath}.${expectedExt ?? "md"}"`
+        : "sidecar has no `path:` field; orphaned by construction",
+    });
+    // eslint-disable-next-line no-console
+    console.warn(`[import] orphaned sidecar "${sidecarId}.yaml": ${stats.skipped_sidecars[stats.skipped_sidecars.length - 1]!.reason}`);
   }
 
   // 4. Typed links — replay only now that all notes exist. Wikilinks
