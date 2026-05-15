@@ -413,6 +413,20 @@ describe("notes.extension (vault#328)", async () => {
     const results = await store.queryNotes({ extension: "CSV" });
     expect(results).toHaveLength(1);
   });
+
+  it("updateNote extension-only collision throws PathConflictError (vault#329 F1)", async () => {
+    // Two notes share `Foo` differing only by extension — legal under
+    // v18's composite (path, extension) uniqueness. Flip the md note's
+    // extension to "csv": that would collide with the existing csv
+    // row. The catch in updateNote must surface PATH_CONFLICT (not a
+    // raw SQLiteError) since the composite index fires UNIQUE on
+    // extension-only updates just like it does on path-only updates.
+    const md = await store.createNote("# md note", { path: "Foo", id: "foo-md" });
+    await store.createNote("a,b\n1,2", { path: "Foo", extension: "csv", id: "foo-csv" });
+    expect(
+      store.updateNote(md.id, { extension: "csv" }),
+    ).rejects.toMatchObject({ code: "PATH_CONFLICT", path: "Foo" });
+  });
 });
 
 // ---- Tags ----

@@ -380,8 +380,14 @@ export function updateNote(
       db.prepare(sql).run(...values);
     }
   } catch (err) {
-    if (updates.path !== undefined && isPathUniqueError(err)) {
-      throw new PathConflictError(normalizePath(updates.path) ?? updates.path);
+    // Post-vault#328 the unique index is composite (path, extension), so
+    // an extension-only update can also trip UNIQUE — widen the catch to
+    // surface those as structured PATH_CONFLICT instead of a raw 500.
+    if (isPathUniqueError(err)) {
+      const conflictPath = updates.path !== undefined
+        ? (normalizePath(updates.path) ?? updates.path)
+        : ((db.prepare("SELECT path FROM notes WHERE id = ?").get(id) as { path: string | null } | undefined)?.path ?? "<unknown>");
+      throw new PathConflictError(conflictPath);
     }
     throw err;
   }

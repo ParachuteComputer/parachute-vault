@@ -1088,7 +1088,7 @@ export async function importPortableVault(
     // to "md" (back-compat with pre-vault#328 exports).
     const extension = typeof frontmatter.extension === "string"
       ? frontmatter.extension
-      : (supportsInlineFrontmatter(fileExt) ? fileExt : fileExt) || "md";
+      : fileExt || "md";
     const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags.filter((t): t is string => typeof t === "string") : undefined;
     const metadata = (frontmatter.metadata && typeof frontmatter.metadata === "object" && !Array.isArray(frontmatter.metadata))
       ? frontmatter.metadata as Record<string, unknown>

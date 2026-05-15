@@ -297,6 +297,25 @@ describe("portableExportFilePath", () => {
       id: "01HABC", content: "", created_at: "2026-05-12T00:00:00.000Z",
     })).toBe("_unpathed/01HABC.md");
   });
+
+  it("honors the note's extension for pathless notes (vault#329 F4)", () => {
+    expect(portableExportFilePath({
+      id: "01HXCSV",
+      content: "a,b\n1,2",
+      created_at: "2026-05-12T00:00:00.000Z",
+      extension: "csv",
+    })).toBe("_unpathed/01HXCSV.csv");
+  });
+
+  it("honors the note's extension for pathed notes (vault#329 F4)", () => {
+    expect(portableExportFilePath({
+      id: "x",
+      content: "",
+      created_at: "2026-05-12T00:00:00.000Z",
+      path: "Inbox/y",
+      extension: "mdx",
+    })).toBe("Inbox/y.mdx");
+  });
 });
 
 // ---------------------------------------------------------------------------
