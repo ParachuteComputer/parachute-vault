@@ -8,36 +8,60 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [0.4.5] — 2026-05-15
 
-Stable release. Promotes from `0.4.5-rc.2` after real-vault smoke validation
-on a 2296-note default vault (zero silent loss, byte-equivalent round-trip
-across markdown + CSV + sidecar). Same code as rc.2; only the version suffix
-drops. Headline arc since 0.4.4:
+0.4.5 closes the substrate cycle that started with the launch & ecosystem-fit
+phase in late April 2026 — the load-bearing phase where vault stopped being
+a self-contained server and became a pure OAuth resource server inside the
+Parachute Computer ecosystem (URL migration, CLI rename, filesystem
+restructure, hub-issued JWT validation, scope enforcement, indexed metadata
+fields, atomic tag rename/merge, server-side transcription). Across roughly
+four weeks, vault moved from a working single-host prototype into a
+substrate-grade module that round-trips losslessly to git, handles
+non-markdown content as first-class, and lives behind a hub that issues,
+scopes, and revokes its tokens. Stable promotes from `0.4.5-rc.2` after
+real-vault smoke validation on a 2296-note default vault (zero silent loss,
+byte-equivalent round-trip across markdown + CSV + sidecar). Same code as
+rc.2; only the version suffix drops.
 
-- **File-extension support** (vault#328) — non-markdown notes as first-class
-  citizens. CSV / YAML / JSON / MDX / .txt / etc. carry `extension` field;
-  metadata lives in inline frontmatter for frontmatter-compatible formats
-  (.md, .mdx), in `.parachute/notes-meta/<id>.yaml` sidecars for everything
-  else. Wikilink ambiguity policy: explicit-extension required when
-  `Foo.md` and `Foo.csv` both exist. Path uniqueness is now `(path, extension)`.
-- **Gitcoin sync ergonomics** (vault#309, vault#310, vault#321) —
-  `update-note if_missing: "create"` saves a query-then-create round trip
-  per missing note on nightly sync. JSON int coercion accepts `5.0` for
-  integer-typed fields. REST + MCP create-branch link handling is now
-  symmetric.
+**Coming from 0.2.4?** See [UPGRADING.md](./UPGRADING.md) for the operator
+migration guide — the three active-change moments in the launch &
+ecosystem-fit phase (URL surface, CLI rename, filesystem layout) plus the
+ranked-by-impact list of new capabilities to adopt.
+
+> **Note on CHANGELOG completeness.** Prior CHANGELOG entries are incomplete
+> for `0.3.6-rc.2` through `0.3.6-rc.29` (28 RCs across eight days in late
+> April 2026 during which ~13 substantive PRs landed without their own
+> version entries). The primary-sourced audit at
+> [`parachute.computer/preview/vault-0.4.5-arc/`](https://parachute.computer/preview/vault-0.4.5-arc/)
+> reconstructs the gap from git log + merged PRs. UPGRADING.md captures
+> the operator-actionable distillation.
+
+Headline arc since 0.4.4:
+
+- **File-extension support** (vault#328) — non-markdown notes as
+  first-class citizens. CSV / YAML / JSON / MDX / .txt / etc. carry an
+  `extension` field; metadata is inline for frontmatter-compatible
+  formats (.md, .mdx) or in `.parachute/notes-meta/<id>.yaml` sidecars
+  otherwise. Wikilinks to ambiguous bare paths (`[[Foo]]` when both
+  `Foo.md` and `Foo.csv` exist) are refused; use the explicit form.
+  Path uniqueness is now `(path, extension)`.
+- **Sync ergonomics** (vault#309, vault#310, vault#321) — `update-note
+  if_missing: "create"` saves the query-then-create round trip on every
+  missing-note sync. JSON int coercion accepts `5.0` for integer-typed
+  fields. REST + MCP create-branch link handling is now symmetric.
 - **Case-collision auto-disambiguation** (vault#327) — exports probe
   filesystem case-sensitivity; on case-insensitive disks (macOS APFS,
   Windows NTFS), colliding notes get on-disk filename suffixes while
-  canonical paths in frontmatter stay unchanged. Cross-FS replay recovers
-  via three-tier sidecar resolution.
+  canonical paths in frontmatter stay unchanged. Cross-FS replay
+  recovers via three-tier sidecar resolution.
 - **AmbiguousPathError** — distinct from `PathConflictError`. Carries
-  `candidates` field listing matching `(path, extension)` pairs.
-  REST 409 with `error_type: "ambiguous_path"`. Three surfaces
+  a `candidates` array listing matching `(path, extension)` pairs.
+  REST returns 409 with `error_type: "ambiguous_path"`. Three handlers
   (`handleNotes`, `handleFindPath`, `handleViewNote`) share an
   `ambiguousPathResponse` helper.
 - **Sidecar leftover tracking** — orphan sidecars (sidecar present,
   content file missing on import) land in `ImportStats.skipped_sidecars`.
 - **Empty notes are a valid state** (vault#323) — dropped the
-  `EMPTY_NOTE` guard. Skeleton notes, drafts saved-before-content,
+  `EMPTY_NOTE` guard. Skeleton notes, drafts saved-before-content, and
   organizing-only notes all create + round-trip cleanly.
 
 ## [0.4.5-rc.2] — 2026-05-15
