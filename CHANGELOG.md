@@ -6,6 +6,40 @@ This project loosely follows [Keep a Changelog](https://keepachangelog.com) and 
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-05-15
+
+Stable release. Promotes from `0.4.5-rc.2` after real-vault smoke validation
+on a 2296-note default vault (zero silent loss, byte-equivalent round-trip
+across markdown + CSV + sidecar). Same code as rc.2; only the version suffix
+drops. Headline arc since 0.4.4:
+
+- **File-extension support** (vault#328) — non-markdown notes as first-class
+  citizens. CSV / YAML / JSON / MDX / .txt / etc. carry `extension` field;
+  metadata lives in inline frontmatter for frontmatter-compatible formats
+  (.md, .mdx), in `.parachute/notes-meta/<id>.yaml` sidecars for everything
+  else. Wikilink ambiguity policy: explicit-extension required when
+  `Foo.md` and `Foo.csv` both exist. Path uniqueness is now `(path, extension)`.
+- **Gitcoin sync ergonomics** (vault#309, vault#310, vault#321) —
+  `update-note if_missing: "create"` saves a query-then-create round trip
+  per missing note on nightly sync. JSON int coercion accepts `5.0` for
+  integer-typed fields. REST + MCP create-branch link handling is now
+  symmetric.
+- **Case-collision auto-disambiguation** (vault#327) — exports probe
+  filesystem case-sensitivity; on case-insensitive disks (macOS APFS,
+  Windows NTFS), colliding notes get on-disk filename suffixes while
+  canonical paths in frontmatter stay unchanged. Cross-FS replay recovers
+  via three-tier sidecar resolution.
+- **AmbiguousPathError** — distinct from `PathConflictError`. Carries
+  `candidates` field listing matching `(path, extension)` pairs.
+  REST 409 with `error_type: "ambiguous_path"`. Three surfaces
+  (`handleNotes`, `handleFindPath`, `handleViewNote`) share an
+  `ambiguousPathResponse` helper.
+- **Sidecar leftover tracking** — orphan sidecars (sidecar present,
+  content file missing on import) land in `ImportStats.skipped_sidecars`.
+- **Empty notes are a valid state** (vault#323) — dropped the
+  `EMPTY_NOTE` guard. Skeleton notes, drafts saved-before-content,
+  organizing-only notes all create + round-trip cleanly.
+
 ## [0.4.5-rc.2] — 2026-05-15
 
 0.4.5 cleanup — closes known limitations from rc.1 ship. Four commits
