@@ -55,6 +55,20 @@ to *actively* change.
    per-vault audience `aud: vault.<name>` and narrowed scopes
    `vault:<name>:<verb>`.
 
+### Two readers, one doc
+
+*This doc serves two readers:*
+
+*__The human upgrading__: read the TL;DR and the seven numbered
+active changes above. ~5min.*
+
+*__An agent helping the human (or building on parachute)__: read
+everything. The detailed sections cite specific issues
+(`vault#N`), PRs (`#NNN`), commits (`SHA`), and code paths
+(`file.ts:line`). An AI fed this whole doc will understand what
+shipped, what changed shape, what's still in flight, and where to
+look in the codebase for ground truth.*
+
 ### Step-by-step
 
 1. **Stop the daemon** before upgrading:
@@ -222,34 +236,15 @@ Two defaults changed:
 
 ### What if I happen to be on an intermediate version?
 
-The CHANGELOG narrates development RCs that were never published to
-npm. What actually shipped on npm between 0.2.4 and 0.4.5 was:
-`0.3.0-rc.1`, `0.3.0`, `0.3.1`, `0.3.3`, `0.4.0`, `0.4.3`,
-`0.4.4-rc.11`, `0.4.4-rc.12`, `0.4.4-rc.14`, `0.4.5`. See the
-[CHANGELOG meta-note](./CHANGELOG.md) for the full table.
-
-- **On `0.3.0` / `0.3.1` / `0.3.3`**: you're past CLI rename, URL
-  migration, and filesystem restructure. Schema migrations
-  `v12 → v18` run automatically. The active-change list above
-  shrinks to: token audience binding (only if you script JWT
-  minting), the `mcp-install` default flips (if you script
-  installs), the priv-esc audit, and the smaller items in §7.
-- **On `0.4.0`**: schema `v12` or higher. Token audience, JWT scope
-  narrowing, and per-vault token binding all landed here. From 0.4.0
-  the remaining 0.4.5 changes are mostly additive (file extensions,
-  case-collision handling, sync ergonomics, lossless export). The
-  priv-esc fix landed during the 0.4.0 chain — audit
-  `config.yaml` as documented above.
-- **On `0.4.3`**: most ground covered. Remaining: extension column
-  (`vault#328`), case-collision auto-disambig (`vault#327`), upsert
-  on `update-note if_missing: "create"` (`vault#309`), portable
-  export PR-2 polish (attachments, blow-away).
-- **On `0.4.4-rc.11/rc.12/rc.14`**: you're a brave soul; you're at
-  schema `v17` or `v18`. The only meaningful delta to 0.4.5 stable
-  is case-collision auto-disambig (`vault#327`),
-  `AmbiguousPathError` distinct from `PathConflictError`
-  (`vault#330 S1`), and the sidecar leftover tracking
-  (`vault#330 S2`).
+*__If you're not on 0.2.4__ (you installed at some point in the 0.3
+or 0.4 window): the schema and filesystem migrations still apply on
+first boot from any prior version — they're idempotent and only
+execute what's needed. The active changes that affect you depend on
+when you installed. The CHANGELOG meta-note at the top of the
+[CHANGELOG.md](./CHANGELOG.md) maps installed-version-to-schema-version.
+If your upgrade surfaces anything confusing or breaking,
+[reach out on GitHub](https://github.com/ParachuteComputer/parachute-vault/issues)
+— happy to help in real time.*
 
 ### One paragraph on shipped-then-changed-mid-arc
 
