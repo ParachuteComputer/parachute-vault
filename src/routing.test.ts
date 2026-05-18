@@ -17,7 +17,7 @@
  * never touch ~/.parachute.
  */
 
-import { describe, test, expect, beforeEach, afterAll } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { rmSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -1639,5 +1639,89 @@ describe("scope enforcement on /api/*", () => {
       writePath,
     );
     expect(writeRes.status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /health — smoke tests for the unauthenticated liveness probe (vault#339).
+//
+// /health must ALWAYS return 200 regardless of VAULT_AUTH_TOKEN config so
+// Render's health probe + Docker HEALTHCHECK can poll the container even
+// before the operator has configured a bearer. The response shape changes
+// (vault names are leaked only to authed callers) but the status code is
+// invariant.
+// ---------------------------------------------------------------------------
+
+describe("/health — always 200 (Render/Docker healthcheck contract)", () => {
+  let prevToken: string | undefined;
+
+  beforeEach(() => {
+    prevToken = process.env.VAULT_AUTH_TOKEN;
+  });
+
+  afterEach(() => {
+    if (prevToken === undefined) delete process.env.VAULT_AUTH_TOKEN;
+    else process.env.VAULT_AUTH_TOKEN = prevToken;
+  });
+
+  test("env unset + no bearer → 200 (anonymous probe)", async () => {
+    delete process.env.VAULT_AUTH_TOKEN;
+    createVault("journal");
+
+    const res = await route(new Request("http://localhost:1940/health"), "/health");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    // No bearer → no vault names leaked.
+    expect(body.vaults).toBeUndefined();
+  });
+
+  test("env set + no bearer → 200 (Render's health probe doesn't have the secret)", async () => {
+    process.env.VAULT_AUTH_TOKEN = "operator-token-xyz";
+    createVault("journal");
+
+    const res = await route(new Request("http://localhost:1940/health"), "/health");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    expect(body.vaults).toBeUndefined();
+  });
+
+  test("env set + matching bearer → 200 + vault names leaked", async () => {
+    process.env.VAULT_AUTH_TOKEN = "operator-token-xyz";
+    createVault("journal");
+    createVault("work");
+
+    const res = await route(
+      new Request("http://localhost:1940/health", {
+        headers: { Authorization: "Bearer operator-token-xyz" },
+      }),
+      "/health",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    expect(Array.isArray(body.vaults)).toBe(true);
+    expect(body.vaults).toContain("journal");
+    expect(body.vaults).toContain("work");
+  });
+
+  test("env set + wrong bearer → 200 (still healthy, just no vault detail)", async () => {
+    // /health doesn't 401 on a wrong bearer — it just falls back to the
+    // anonymous response. The operator's probe stays green even if the
+    // bearer is mid-rotation.
+    process.env.VAULT_AUTH_TOKEN = "operator-token-xyz";
+    createVault("journal");
+
+    const res = await route(
+      new Request("http://localhost:1940/health", {
+        headers: { Authorization: "Bearer wrong-token" },
+      }),
+      "/health",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    expect(body.vaults).toBeUndefined();
   });
 });

@@ -36,6 +36,56 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6-rc.1] — 2026-05-18
+
+Phase 1 of the v0.6 Render self-host arc (closes vault#339). Lands the
+container-shape primitives vault needs to run as a sibling Render
+service alongside hub:
+
+- **Dockerfile + .dockerignore** — two-stage build mirroring
+  parachute-hub's shape: `oven/bun:1.3-alpine` base, runtime stage with
+  `tini` for SIGTERM forwarding, runs as non-root `bun` (uid 1000) with
+  pre-chowned `/parachute` mount point. Build context pruned to
+  runtime essentials; tests, docs, and the web/ui SPA tree are
+  excluded.
+- **render.yaml Blueprint** — one `web` service on the `starter` plan
+  (persistent disks aren't available on Render's free tier), persistent
+  disk mounted at `/parachute` so vault state survives container
+  restarts. Health probe at `/health`. Env vars wired: `PARACHUTE_HOME`,
+  `PORT`, `VAULT_BIND=0.0.0.0`, `VAULT_AUTH_TOKEN` (sync: false),
+  `TRUST_PROXY=1`, optional `SCRIBE_URL`.
+- **`VAULT_AUTH_TOKEN` server-wide operator bearer** — when the env
+  var is set, a request with `Authorization: Bearer <value>` matching
+  the env var (constant-time compare) authenticates as full/admin
+  against any vault on the server. The minimum cross-container auth
+  shape: hub (sibling Render container) uses this stable bearer to
+  call vault's HTTP surface. When the env var is unset, vault's
+  existing token surface (per-vault DB tokens, hub-issued JWTs, legacy
+  YAML keys) is unchanged — full backwards compat for local
+  self-hosters and `bun link` dev. The end-state hub-issued-JWT-only
+  shape stays on the roadmap at vault#282.
+- **`/health` invariant pinned** — always returns 200 regardless of
+  `VAULT_AUTH_TOKEN` config so Render's health probe + Docker
+  `HEALTHCHECK` stay green even before the operator has wired a
+  bearer. The response shape (vault names leaked only to authed
+  callers) is unchanged.
+
+Deliberately deferred to follow-up PRs / issues:
+
+- Multi-token operator model (one shared bearer fits the v0.6
+  closed-beta; per-user operator tokens land alongside hub#258).
+- Full hub-issued JWT integration on every endpoint — already shipped
+  for the per-vault routes, but the operator-channel use case
+  intentionally keeps a simpler shared-bearer path until the JWT-only
+  endgame at vault#282.
+- Building the admin SPA (`web/ui/dist`) into the container image. The
+  503 fallback in `src/admin-spa.ts` covers the missing-bundle case
+  and the operator-facing UI lives on hub for v0.6.
+
+Gates on this PR:
+- `bun test ./src`: 957 pass, 0 fail (was 941 pre-change).
+- `bun run typecheck`: clean.
+
 ## [0.4.5] — 2026-05-15
 
 0.4.5 closes the substrate cycle that started with the launch &

@@ -398,3 +398,238 @@ describe("auth — legacy global YAML keys honor declared scope", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// VAULT_AUTH_TOKEN — server-wide operator bearer (vault#339)
+//
+// The container-shape auth gate. When the env var is set, a request whose
+// `Authorization: Bearer <value>` matches authenticates as full/admin
+// against any vault on the server — the operator-channel path for sibling
+// services on Render where vault and hub run as separate containers and
+// hub needs a stable shared bearer to call vault.
+//
+// Semantic confirmed for the loopback/non-loopback split (auth gate is
+// orthogonal to socket-level loopback): when VAULT_AUTH_TOKEN is unset,
+// vault's existing token surface (per-vault DB tokens + hub JWTs + legacy
+// YAML keys) is the ONLY auth surface. The bind socket defaults to
+// 127.0.0.1 (`VAULT_BIND` in bind.ts), but no implicit loopback trust
+// exists at the auth layer — a request from 127.0.0.1 still has to
+// present a valid bearer. This matches docs/auth-model.md §1.
+// ---------------------------------------------------------------------------
+
+describe("auth — VAULT_AUTH_TOKEN server-wide operator bearer", () => {
+  const TOKEN = "test-operator-token-deadbeef0123456789abcdef";
+  let prevToken: string | undefined;
+
+  beforeEach(() => {
+    prevToken = process.env.VAULT_AUTH_TOKEN;
+  });
+
+  afterEach(() => {
+    if (prevToken === undefined) delete process.env.VAULT_AUTH_TOKEN;
+    else process.env.VAULT_AUTH_TOKEN = prevToken;
+  });
+
+  test("env set + matching bearer → 200 on vault auth, full permission, admin scopes", async () => {
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(
+      bearer(TOKEN),
+      journalConfig,
+      journalStore.db,
+    );
+
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+      expect(result.scopes).toContain("vault:admin");
+      expect(result.legacyDerived).toBe(false);
+      expect(result.scoped_tags).toBeNull();
+    }
+  });
+
+  test("env set + matching bearer authenticates against ANY vault on the server", async () => {
+    // Server-wide → not tied to any one vault's DB. Same bearer works
+    // for journal and work without minting a per-vault token in either.
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+    seedVault("work");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+    const workConfig = readVaultConfig("work")!;
+    const workStore = getVaultStore("work");
+
+    const j = await authenticateVaultRequest(bearer(TOKEN), journalConfig, journalStore.db);
+    const w = await authenticateVaultRequest(bearer(TOKEN), workConfig, workStore.db);
+
+    expect("error" in j).toBe(false);
+    expect("error" in w).toBe(false);
+  });
+
+  test("env set + missing bearer → 401 (no implicit auth)", async () => {
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    // No Authorization header at all.
+    const noBearer = new Request("https://vault.test/x");
+    const result = await authenticateVaultRequest(noBearer, journalConfig, journalStore.db);
+
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+    }
+  });
+
+  test("env set + wrong bearer → 401", async () => {
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(
+      bearer("wrong-token-doesnotmatch"),
+      journalConfig,
+      journalStore.db,
+    );
+
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+    }
+  });
+
+  test("env set + bearer that matches a vault token still resolves (server-wide first, but per-vault unchanged)", async () => {
+    // Per-vault tokens keep working even when the server-wide bearer is
+    // set. The server-wide check is a fast-path lookup before token DB
+    // resolution — a per-vault token doesn't match the env var so it
+    // falls through to the existing path.
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+    const perVaultToken = mintTokenInVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(
+      bearer(perVaultToken),
+      journalConfig,
+      journalStore.db,
+    );
+
+    expect("error" in result).toBe(false);
+  });
+
+  test("env unset + valid per-vault bearer → 200 (existing behavior preserved)", async () => {
+    delete process.env.VAULT_AUTH_TOKEN;
+    seedVault("journal");
+    const token = mintTokenInVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const result = await authenticateVaultRequest(bearer(token), journalConfig, journalStore.db);
+    expect("error" in result).toBe(false);
+  });
+
+  test("env unset + missing bearer → 401 (existing behavior preserved)", async () => {
+    delete process.env.VAULT_AUTH_TOKEN;
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const noBearer = new Request("https://vault.test/x");
+    const result = await authenticateVaultRequest(noBearer, journalConfig, journalStore.db);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+    }
+  });
+
+  test("env unset + non-loopback simulated via X-Forwarded-For → still 401 without bearer", async () => {
+    // Doc note: vault has NO implicit loopback trust at the auth layer.
+    // The X-Forwarded-For shape (set by hub / Cloudflare Tunnel / etc.)
+    // doesn't affect the auth gate; tokens are required regardless of
+    // socket origin. The `bind.ts` 127.0.0.1 default is a socket-level
+    // listen-restriction, not a trust-asymmetric auth bypass.
+    delete process.env.VAULT_AUTH_TOKEN;
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const remote = new Request("https://vault.test/x", {
+      headers: { "X-Forwarded-For": "203.0.113.7" },
+    });
+    const result = await authenticateVaultRequest(remote, journalConfig, journalStore.db);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+    }
+  });
+
+  test("env set with whitespace-only value → treated as unset", async () => {
+    process.env.VAULT_AUTH_TOKEN = "   ";
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    // An empty/whitespace VAULT_AUTH_TOKEN must NOT allow any bearer to
+    // pass — the operator either commits to bearer auth or doesn't.
+    const result = await authenticateVaultRequest(
+      bearer(""),
+      journalConfig,
+      journalStore.db,
+    );
+    expect("error" in result).toBe(true);
+  });
+
+  test("env set + matching bearer also works on the global auth surface", async () => {
+    // /vaults metadata listing + /health vault names go through
+    // authenticateGlobalRequest. The server-wide bearer must work there
+    // too — otherwise hub couldn't enumerate vaults using the operator
+    // channel.
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+
+    const result = await authenticateGlobalRequest(bearer(TOKEN));
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+    }
+  });
+
+  test("env set + wrong bearer on global auth surface → 401", async () => {
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+
+    const result = await authenticateGlobalRequest(bearer("wrong-token"));
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+    }
+  });
+
+  test("near-miss bearer (one-char difference, same length) → 401 (constant-time compare)", async () => {
+    // Defensive: the server-wide compare uses crypto.timingSafeEqual so
+    // a one-char-off bearer that matches length-wise still rejects.
+    // We can't measure timing in a unit test, but we can pin the
+    // correctness side: a same-length near-miss must still reject.
+    process.env.VAULT_AUTH_TOKEN = TOKEN;
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+    const journalStore = getVaultStore("journal");
+
+    const nearMiss = TOKEN.slice(0, -1) + "x";
+    expect(nearMiss).not.toBe(TOKEN);
+    expect(nearMiss.length).toBe(TOKEN.length);
+
+    const result = await authenticateVaultRequest(
+      bearer(nearMiss),
+      journalConfig,
+      journalStore.db,
+    );
+    expect("error" in result).toBe(true);
+  });
+});

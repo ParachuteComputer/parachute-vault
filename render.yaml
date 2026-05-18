@@ -1,0 +1,102 @@
+# Render Blueprint for self-hosting @openparachute/vault.
+#
+# Layout: one `web` service (the vault HTTP server) backed by a persistent
+# disk at /parachute. Vault state lands at /parachute/vault/ (per-vault
+# SQLite DBs, config.yaml, .env, attachments). The hub Blueprint
+# (parachute-hub/render.yaml) is a sibling — deploy both for a full
+# Parachute self-host on Render.
+#
+# To use: fork this repo, connect Render to the fork, click
+# "New Blueprint" → point at this file. Render provisions the service +
+# disk and runs the build. Set VAULT_AUTH_TOKEN in the Render dashboard
+# (marked `sync: false`) before exposing the service publicly — once
+# hub is on a different container, hub's outbound calls to vault need a
+# shared bearer to authenticate.
+#
+# Cross-service auth shape (issue #339):
+#   - Hub container → vault container: VAULT_AUTH_TOKEN bearer. Set the
+#     SAME value on both services (hub reads it from the matching env
+#     var name it expects; see parachute-hub/render.yaml).
+#   - The full hub-issued JWT integration with audience/scope claims
+#     stays the canonical path for end-user OAuth tokens; the shared
+#     bearer is the minimum-viable operator-channel auth for v0.6
+#     closed-beta. See vault#282 for the JWT-only endgame.
+
+services:
+  - type: web
+    name: parachute-vault
+    runtime: docker
+    # Starter plan ($7/mo) required: persistent disks are NOT available
+    # on Render's free tier, and vault state must survive container
+    # restarts (it's the system of record for notes, tags, links).
+    # Render resizes plans online if capacity needs to grow.
+    plan: starter
+    # /health is unauthenticated and always returns 200 — safe to use
+    # as Render's health probe even before VAULT_AUTH_TOKEN is set.
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: parachute-home
+      mountPath: /parachute
+      # 1 GiB covers a single-operator install with a few vaults +
+      # routine attachment volume. Bump in the Render dashboard for
+      # heavier use; Render resizes online (no redeploy).
+      sizeGB: 1
+    envVars:
+      # The persistent disk mount. Vault honors this for `~/.parachute/`,
+      # so per-vault SQLite DBs + config + attachments all land on the
+      # persistent volume rather than the ephemeral container filesystem.
+      - key: PARACHUTE_HOME
+        value: /parachute
+
+      # Container listens on whatever port Render injects via $PORT.
+      # Render's HTTP forwarder maps the public 443 → this port.
+      - key: PORT
+        value: 1940
+
+      # Bind to all interfaces inside the container so Render's HTTP
+      # forwarder can reach us — vault's on-box default of 127.0.0.1
+      # only works behind a same-host reverse proxy.
+      - key: VAULT_BIND
+        value: 0.0.0.0
+
+      # Server-wide operator bearer token. When set, any request with
+      # `Authorization: Bearer <this-value>` authenticates as full/admin
+      # against any vault. This is how the hub container (sibling
+      # service) authenticates its outbound calls to vault.
+      #
+      # `sync: false` because the value is a secret — each operator's
+      # Render deploy mints its own. Generate with:
+      #   openssl rand -hex 32
+      # …and set the SAME value on hub's render.yaml under the matching
+      # env var.
+      #
+      # Leave unset for a vault that only talks to local-loopback
+      # clients (the on-box CLI / hub-link case); the existing per-vault
+      # token surface (`parachute-vault tokens create`) still works.
+      - key: VAULT_AUTH_TOKEN
+        sync: false
+
+      # Trust proxy headers — Render terminates TLS upstream and passes
+      # the client IP via X-Forwarded-For. Without this, vault's
+      # per-IP OAuth-consent rate limiter sees Render's load balancer
+      # IP for every request.
+      - key: TRUST_PROXY
+        value: "1"
+
+      # Optional: scribe-service URL for the transcription worker. If
+      # set, vault polls scribe for attachments tagged
+      # `transcribe_status=pending`. Leave unset on a vault-only deploy.
+      #
+      # On Render, sibling services reach each other at the
+      # `<service-name>.onrender.com` public hostname OR via Render's
+      # internal mesh hostname (`<service-name>:<port>`) if both
+      # services live in the same region. Pin whichever shape your
+      # deploy uses; `sync: false` so the value doesn't land in source.
+      - key: SCRIBE_URL
+        sync: false
+
+      # Run with a sensible Node-style production hint. Bun honors this
+      # for any libraries that branch on NODE_ENV.
+      - key: NODE_ENV
+        value: production

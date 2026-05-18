@@ -20,6 +20,7 @@ import type { VaultConfig, StoredKey } from "./config.ts";
 import { resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
 import type { Database } from "bun:sqlite";
+import crypto from "node:crypto";
 import { getVaultStore } from "./vault-store.ts";
 import {
   findBroadVaultScopes,
@@ -31,6 +32,66 @@ import {
   SCOPE_WRITE,
 } from "./scopes.ts";
 import { HubJwtError, looksLikeJwt, validateHubJwt } from "./hub-jwt.ts";
+
+/**
+ * Server-wide operator bearer token, sourced from the `VAULT_AUTH_TOKEN`
+ * environment variable.
+ *
+ * Read dynamically per request (not cached at import time) so test seams
+ * that mutate `process.env.VAULT_AUTH_TOKEN` work without re-importing.
+ * In production the env var is set at container start and doesn't change.
+ *
+ * Empty / whitespace-only values are treated as unset — the operator
+ * either commits to bearer auth or doesn't, no degraded "empty token
+ * always matches" failure mode.
+ */
+function getServerWideAuthToken(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env.VAULT_AUTH_TOKEN;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * Constant-time string equality. Returns false when lengths differ
+ * (timingSafeEqual throws on length mismatch; we want a quiet false).
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+/**
+ * If `VAULT_AUTH_TOKEN` is set and the provided bearer matches it
+ * (constant-time), return a full-admin AuthResult that's accepted by
+ * every vault on the server.
+ *
+ * The operator-channel auth shape for non-loopback deploys (Render,
+ * sibling-container setups, vault#339). Hub uses this to call vault
+ * across a container boundary; end-user OAuth tokens still take the
+ * per-vault hub-JWT / pvt_* paths below. See `docs/auth-model.md` §2.
+ *
+ * Scope set is broad (`vault:admin`) — the env-var bearer is an
+ * operator credential, not a user credential. Tag-scoping doesn't
+ * apply; we represent it as unscoped (`scoped_tags: null`).
+ */
+function tryServerWideAuth(
+  providedKey: string,
+  env: NodeJS.ProcessEnv = process.env,
+): AuthResult | null {
+  const configured = getServerWideAuthToken(env);
+  if (configured === null) return null;
+  if (!constantTimeEquals(providedKey, configured)) return null;
+  return {
+    permission: "full",
+    scopes: [SCOPE_ADMIN, SCOPE_WRITE, SCOPE_READ],
+    legacyDerived: false,
+    scoped_tags: null,
+    vault_name: null,
+  };
+}
 
 /** Result of a successful auth check. */
 export interface AuthResult {
@@ -167,6 +228,15 @@ export async function authenticateVaultRequest(
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
+
+  // Server-wide operator token (vault#339). When VAULT_AUTH_TOKEN is set,
+  // a matching bearer authenticates as full/admin against any vault. This
+  // is the cross-container path for Render / sibling-service deployments
+  // where hub talks to vault over HTTP. Checked first so it short-circuits
+  // both JWT validation and per-vault DB lookups — the operator token is
+  // a credential the operator opts into, not one we'd ever fall through.
+  const serverWide = tryServerWideAuth(key);
+  if (serverWide !== null) return serverWide;
 
   // JWT path: hub-issued tokens. Trust pinned to the hub origin via `iss`
   // verification inside validateHubJwt; signature checked against hub's JWKS.
@@ -325,6 +395,14 @@ export async function authenticateGlobalRequest(
   if (!key) {
     return { error: Response.json({ error: "Unauthorized", message: "API key required" }, { status: 401 }) };
   }
+
+  // Server-wide operator token (vault#339). When VAULT_AUTH_TOKEN is set,
+  // a matching bearer authenticates as full/admin on cross-vault routes
+  // (/vaults metadata listing, /health detail). Checked first so a
+  // container-host operator-channel call doesn't depend on any per-vault
+  // DB lookup.
+  const serverWide = tryServerWideAuth(key);
+  if (serverWide !== null) return serverWide;
 
   // Hub-issued JWTs are always vault-bound (aud=vault.<name>). The unified
   // /vaults / /health surface spans every vault and has no single audience to
