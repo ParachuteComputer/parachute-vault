@@ -1,8 +1,68 @@
-node_modules
+# Keep the build context small — Docker uploads everything not listed here
+# to the daemon on every build.
+
+# VCS + editor noise
 .git
-*.test.ts
-*.test.js
-.env
+.gitignore
+.github
+.vscode
+.idea
+*.swp
+*.swo
+
+# Install artifacts (re-installed inside the builder stage)
+node_modules
+**/node_modules
+.bun
+
+# Build artifacts
+**/dist
+**/*.tsbuildinfo
+coverage
+
+# Local runtime state — never want this baked into an image
+.parachute
+parachute-home
+*.db
+*.db-journal
 *.log
 *.err
+
+# Docs / launch artifacts — not needed at runtime
+docs
+scratch
+UPGRADING.md
+CHANGELOG.md
+README.md
+LICENSE
+LAUNCH_SMOKE.md
+RELEASE-NOTES-*.md
+WAKE-UP-*.md
+BETA-EMAIL-*.md
+
+# Tests + fixtures — not needed in the runtime image
+**/*.test.ts
+**/*.test.js
+**/__tests__
+**/__snapshots__
+**/*.test.ts.snap
+
+# The web/ui React SPA is not served by vault's core HTTP loop (admin SPA
+# bundle is built into core/), so skip the source tree.
+web
+
+# Other deploy targets (we don't bake docker-compose or systemd unit files
+# into the image; they're host-side artifacts).
+deploy
+docker-compose.yml
+fly.toml
+railway.json
+Caddyfile
+
+# OS junk
 .DS_Store
+Thumbs.db
+
+# Don't ship the Dockerfile itself into the image
+Dockerfile
+.dockerignore
