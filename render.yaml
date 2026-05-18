@@ -51,6 +51,8 @@ services:
 
       # Container listens on whatever port Render injects via $PORT.
       # Render's HTTP forwarder maps the public 443 → this port.
+      # Render injects $PORT at runtime to its platform-assigned value;
+      # this hardcoded value is the fallback for local `docker run` invocations.
       - key: PORT
         value: 1940
 

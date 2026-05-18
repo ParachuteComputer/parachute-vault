@@ -98,6 +98,10 @@ if (process.env.SCRIBE_URL) {
   console.log("[transcribe] worker disabled (set SCRIBE_URL to enable)");
 }
 
+if (process.env.VAULT_AUTH_TOKEN?.trim()) {
+  console.log("[auth] VAULT_AUTH_TOKEN set — server-wide operator bearer active");
+}
+
 // Auto-init: create a default vault if none exist (first run in Docker)
 if (listVaults().length === 0) {
   const globalConfig = readGlobalConfig();

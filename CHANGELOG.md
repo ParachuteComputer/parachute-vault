@@ -36,6 +36,18 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6-rc.2] — 2026-05-18
+
+Fold reviewer nits on PR #340:
+
+- **server.ts** — log `VAULT_AUTH_TOKEN` active state at startup
+  (`[auth] VAULT_AUTH_TOKEN set — server-wide operator bearer active`),
+  parallel to the existing `[transcribe]` boot signal. Operator gets a
+  bare-minimum visible confirmation the gate is armed.
+- **render.yaml** — comment that Render injects `$PORT` at runtime; the
+  hardcoded `1940` value is the fallback for local `docker run`
+  invocations.
+
 ## [0.4.6-rc.1] — 2026-05-18
 
 Phase 1 of the v0.6 Render self-host arc (closes vault#339). Lands the
