@@ -171,7 +171,7 @@ switch (command) {
     await cmdMcpInstall(cmdArgs);
     break;
   case "mcp-config":
-    cmdMcpConfig(cmdArgs);
+    await cmdMcpConfig(cmdArgs);
     break;
   case "remove":
   case "rm":
@@ -1058,6 +1058,12 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
   }
 
   // --- Vault target. Default = default_vault; validate existence. ---
+  // Read --dry-run *before* the vault-existence guard so a probe like
+  // `mcp-install --vault future-vault --dry-run` can describe the
+  // intended write even when the vault hasn't been created yet. The
+  // dry-run contract ("no side effects, including failures on state
+  // the caller is asking us about") is broken otherwise.
+  const dryRun = args.includes("--dry-run");
   const vaultArg = takeArgValue(args, "--vault");
   if (vaultArg.missingValue) {
     console.error("--vault requires a value (the vault name).");
@@ -1067,12 +1073,10 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
   const defaultVault = globalConfig.default_vault || "default";
   const vaultName = vaultArg.value ?? defaultVault;
   const vaultExplicit = vaultArg.value !== undefined;
-  if (!readVaultConfig(vaultName)) {
+  if (!dryRun && !readVaultConfig(vaultName)) {
     console.error(`Vault "${vaultName}" not found. Available: ${listVaults().join(", ") || "(none)"}.`);
     process.exit(1);
   }
-
-  const dryRun = args.includes("--dry-run");
 
   await executeMcpInstall({
     mode,
@@ -1145,7 +1149,7 @@ async function cmdMcpInstallInteractive(): Promise<void> {
  *                      inlined values. Safe to commit; the shell expands at
  *                      runtime.
  */
-function cmdMcpConfig(args: string[]): void {
+async function cmdMcpConfig(args: string[]): Promise<void> {
   const vaultName = args[0];
   if (!vaultName || vaultName.startsWith("--")) {
     console.error("Usage: parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>] [--env-vars]");
@@ -1277,8 +1281,11 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
   // the filesystem or minting any token. Print to stdout (scripts may
   // parse this); exit 0. Skip the auth-acquisition entirely — the point
   // of --dry-run is to inspect without side effects, including the
-  // network round-trip for hub-mint.
+  // network round-trip for hub-mint *and* the vault-existence guard
+  // (probing the install for a not-yet-created vault is a legitimate
+  // pre-create check, not an error).
   if (dryRun) {
+    const vaultExists = readVaultConfig(vaultName) !== null;
     console.log(`[dry-run] No changes written.`);
     console.log(`  Target file:    ${target.path}`);
     console.log(`  Install scope:  ${target.scope}`);
@@ -1288,7 +1295,7 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     console.log(`  Entry key:      ${entryKey}`);
     console.log(`  MCP URL:        ${url} (${source})`);
     console.log(`  Auth mode:      ${mode}${mode === "mint" ? ` (scope vault:${vaultName}:${verb})` : ""}`);
-    console.log(`  Vault:          ${vaultName}`);
+    console.log(`  Vault:          ${vaultName}${vaultExists ? "" : " (does not exist yet — create with `parachute-vault create " + vaultName + "`)"}`);
     console.log(`  Re-run without --dry-run to apply.`);
     return;
   }

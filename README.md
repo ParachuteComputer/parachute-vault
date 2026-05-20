@@ -640,9 +640,16 @@ claude -p --mcp-config "$(parachute-vault mcp-config gitcoin)" \
           --strict-mcp-config \
           "Summarize the latest notes under projects/gitcoin"
 
-# Or commit a template — placeholders expand at runtime:
+# Or commit a template and expand at use-time:
 parachute-vault mcp-config gitcoin --env-vars > .claude/mcp-gitcoin.json
+# ...then later, when invoking claude:
+export PARACHUTE_HUB_URL=http://127.0.0.1:1940
+export PARACHUTE_VAULT_TOKEN=pvt_...
+claude -p --mcp-config "$(envsubst < .claude/mcp-gitcoin.json)" \
+          --strict-mcp-config ...
 ```
+
+**Note on `--env-vars` expansion.** The file-save pattern requires the caller to expand `${...}` placeholders at use-time (e.g. via `envsubst`, available on most Linux distros and via `brew install gettext` on macOS). Bare `$(cat .claude/mcp-gitcoin.json)` feeds literal `${PARACHUTE_HUB_URL}` strings into `claude -p` — the shell only expands placeholders inside the command-substitution *source*, not inside the *captured output*. `claude -p` itself doesn't expand `${...}` either, so the substitution has to happen between the file and the command.
 
 Flags: `--token <bearer>` (alternative to `PARACHUTE_VAULT_TOKEN`); `--base-url <url>` (override the auto-detected origin, useful for tailnet-exposed hubs: `--base-url https://hub.tail.ts.net`); `--env-vars` (emit the template form with `${PARACHUTE_HUB_URL}` and `${PARACHUTE_VAULT_TOKEN}` placeholders, safe to commit). With no token and no `--env-vars`, the command exits 1 with a clear error — runners get a fail-fast.
 

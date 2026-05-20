@@ -823,6 +823,28 @@ describe("mcp-install end-to-end", () => {
     expect(res.stdout).toMatch(/Re-run without --dry-run to apply\./);
   });
 
+  test("--dry-run works for a vault that doesn't exist yet (probe shape)", () => {
+    // The dry-run contract is "no side effects, including failures on
+    // state the caller is asking about." A future-vault probe — would
+    // installing for this not-yet-created vault land where I expect? —
+    // is a legitimate pre-create check, not an error. The
+    // vault-existence guard runs only on the real-install path.
+    setupBareVault(tmp, "default");
+    const res = runCli(
+      ["mcp-install", "--vault", "future-vault", "--token", "t", "--dry-run"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toMatch(/\[dry-run\]/);
+    // Output names the absent vault explicitly so the operator can tell
+    // the dry-run worked against the right target.
+    expect(res.stdout).toMatch(/Vault:\s+future-vault/);
+    expect(res.stdout).toMatch(/does not exist yet/);
+    expect(res.stdout).toMatch(/Entry key:\s+parachute-vault-future-vault/);
+    // No claude.json written — dry-run still didn't touch disk.
+    expect(fs.existsSync(path.join(tmp, ".claude.json"))).toBe(false);
+  });
+
   test("--dry-run with --mint skips the hub round-trip and operator-token check", () => {
     // The whole point of --dry-run is "no side effects" — that includes
     // the hub-mint network call. A naive implementation might still try
