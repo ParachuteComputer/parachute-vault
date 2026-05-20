@@ -362,6 +362,24 @@ async function authenticateHubJwt(
     // call site), the check is skipped — the audience strict-check
     // inside validateHubJwt is the primary pin in that case.
     if (opts.vaultName !== undefined && !enforceVaultScope(claims, opts.vaultName)) {
+      // Invariant: by the contract of `enforceVaultScope`, the false
+      // branch requires `claims.vaultScope.length > 0` — an empty
+      // `vaultScope` always returns true. The defensive assertion
+      // pins that so a future refactor can't slip an empty-scope
+      // request into this branch (which would render an empty
+      // parenthesised list in the message and break the diagnostic).
+      // Body shape: client gets `required_vault` + a message naming
+      // the conflict. The token's pinned vault is intentionally NOT
+      // echoed back — the attacker holds the token (and can decode
+      // claims locally), so the message would only leak the pin to a
+      // legitimate operator looking at a 403 log line. They already
+      // know which user they assigned where; the required_vault is
+      // the actionable piece.
+      if (claims.vaultScope.length === 0) {
+        throw new Error(
+          "unreachable: enforceVaultScope returned false on an empty vaultScope",
+        );
+      }
       return {
         error: Response.json(
           {
@@ -369,7 +387,6 @@ async function authenticateHubJwt(
             error_type: "vault_scope_mismatch",
             message: `token's vault_scope (${claims.vaultScope.join(", ")}) does not include the requested vault '${opts.vaultName}'`,
             required_vault: opts.vaultName,
-            granted_vault_scope: claims.vaultScope,
           },
           { status: 403 },
         ),

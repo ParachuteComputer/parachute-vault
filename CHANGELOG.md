@@ -36,6 +36,46 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6-rc.4] — 2026-05-20
+
+Hub multi-user Phase 1 PR 5 — consumer-side adoption of the new
+`vault_scope` claim hub mints on every JWT (per
+[`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)).
+
+### Added
+
+- **`authenticateHubJwt` consumes the `vault_scope` claim** via
+  scope-guard's new `enforceVaultScope` helper and refuses cross-vault
+  access at the consumer with a **403 + `error_type:
+  "vault_scope_mismatch"`** response. A token whose `vault_scope`
+  claim names a different vault than the URL targets is rejected
+  before any vault data is read. Defense-in-depth: hub's mint path
+  (PR 4 / parachute-hub#283) already narrows scopes to the user's
+  `assigned_vault`, and the existing audience strict-check + broad-
+  scope rejection are the primary gates. The new claim adds a second
+  pin against the case where a token-mint bug, manual edit, or
+  third-party RS not enforcing the scope-string vocabulary correctly
+  produces scope strings naming the wrong vault. Five new tests in
+  `auth-hub-jwt.test.ts` cover the matching-pin happy path, the cross-
+  vault attempt (403), admin tokens (`vault_scope: []`), pre-PR-4
+  tokens (claim absent → unrestricted back-compat), and the ordering
+  invariant that broad-scope rejection takes precedence over
+  vault_scope_mismatch.
+
+### Changed
+
+- **`@openparachute/scope-guard` dep bumped from `^0.2.0` to
+  `^0.3.0-rc.1`.** The 0.3.0 minor adds `HubJwtClaims.vaultScope:
+  string[]` (parsed from the JWT's `vault_scope` claim; surfaces as
+  `[]` when absent / malformed / explicitly empty) and the
+  `enforceVaultScope(claims, requestVaultName)` helper. See
+  [parachute-hub#285](https://github.com/ParachuteComputer/parachute-hub/pull/285)
+  for the library release.
+
+  **Install order**: scope-guard `0.3.0-rc.1` must publish to npm
+  before `bun install` here will succeed. The lockfile auto-updates on
+  first post-publish install; CI install fails until then.
+
 ## [0.4.6-rc.3] — 2026-05-20
 
 Two small items bundled as one cohesive PR:

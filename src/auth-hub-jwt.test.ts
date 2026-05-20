@@ -383,14 +383,23 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
         error_type: string;
         message: string;
         required_vault: string;
-        granted_vault_scope: string[];
+        granted_vault_scope?: unknown;
       };
       expect(body.error).toBe("Forbidden");
       expect(body.error_type).toBe("vault_scope_mismatch");
+      // Message names both the pinned vault (aaron) and the requested
+      // vault (bob) so operators reading 403 logs can correlate to
+      // user assignment without needing to decode the token.
       expect(body.message).toContain("aaron");
       expect(body.message).toContain("bob");
       expect(body.required_vault).toBe("bob");
-      expect(body.granted_vault_scope).toEqual(["aaron"]);
+      // Surface hygiene: the pinned vault is intentionally NOT echoed
+      // back in a dedicated body field. The message carries enough
+      // diagnostic for an operator reading logs; a dedicated field
+      // would only leak the pin to a passive observer (the attacker
+      // already has it via local decode, but pattern hygiene says
+      // don't volunteer it).
+      expect(body.granted_vault_scope).toBeUndefined();
     }
   });
 
