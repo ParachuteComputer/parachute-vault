@@ -135,9 +135,19 @@ export async function gitPush(
   return { ok: exitCode === 0, stderr: stderr.trim() };
 }
 
-/** Unstage everything in `repoDir` (no-op if nothing staged). */
+/**
+ * Unstage everything in `repoDir` (no-op if nothing staged).
+ *
+ * Uses bare `git reset` (no `HEAD`, no path args) so the call works on a
+ * fresh repo with no commits yet — an operator who runs `--git-commit`
+ * against a `git init`'d empty repo and lands in the `.parachute/`-only
+ * skip path on the first cycle would otherwise leave staging dirty.
+ * Both `git reset HEAD -- .` and `git restore --staged .` require a
+ * resolvable HEAD; bare `git reset` falls back cleanly when none exists.
+ * See vault#346 reviewer note.
+ */
 export async function gitUnstageAll(repoDir: string): Promise<void> {
-  const proc = Bun.spawn(["git", "reset", "HEAD", "--", "."], {
+  const proc = Bun.spawn(["git", "reset"], {
     cwd: repoDir,
     stdout: "pipe",
     stderr: "pipe",
@@ -160,6 +170,12 @@ export async function gitUnstageAll(repoDir: string): Promise<void> {
  *     would otherwise produce a commit per watch interval forever.
  *
  * Otherwise → commit.
+ *
+ * Note: a vault rename (vault.yaml `name` field changes) also follows the
+ * skip path. Metadata-only changes don't commit by design — the operator
+ * who renames a vault and wants that in the git mirror history can either
+ * touch a note or run a one-shot `git commit --allow-empty -m "rename vault"`
+ * by hand.
  */
 export function shouldCommit(stagedFiles: string[], notesChanged: number): {
   commit: boolean;

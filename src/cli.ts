@@ -3072,9 +3072,14 @@ async function cmdExport(args: string[]) {
 
   let stopping = false;
   let inFlight = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
   const onStop = () => {
     if (stopping) return;
     stopping = true;
+    // Clear the interval immediately so the timer can't fire one more
+    // time during the in-flight settle window — `stopping` already guards
+    // re-entry, but symmetry beats relying on that guard.
+    if (timer) clearInterval(timer);
     console.log("\n[watch] stopping watch");
     // Give an in-flight cycle a brief moment to settle, then exit. Don't
     // hang forever — operator hit Ctrl-C, they want out.
@@ -3083,7 +3088,7 @@ async function cmdExport(args: string[]) {
   process.on("SIGINT", onStop);
   process.on("SIGTERM", onStop);
 
-  const timer = setInterval(async () => {
+  timer = setInterval(async () => {
     if (stopping || inFlight) return;
     inFlight = true;
     try {
@@ -3126,6 +3131,12 @@ async function ensureGitRepo(dir: string): Promise<void> {
  * `{{first_note_title}}` template variable for single-note commit messages.
  * Best-effort: returns empty string when nothing matches, or when the cursor
  * is unset (initial export, where "first changed note" is ambiguous).
+ *
+ * Filters at the DB layer via `dateFilter: { field: "updated_at", from:
+ * cursor }` — earlier versions used `sort: "asc"` + `limit: 1` + a
+ * client-side `stamp >= cursor` post-filter, which fetched the vault's
+ * oldest note and almost always failed the filter, rendering the template
+ * variable as empty in production. See vault#346 reviewer note.
  */
 async function firstChangedNoteTitle(
   store: ReturnType<typeof import("./vault-store.ts")["getVaultStore"]>,
@@ -3133,17 +3144,16 @@ async function firstChangedNoteTitle(
 ): Promise<string> {
   if (!cursor) return "";
   try {
-    const notes = await store.queryNotes({ limit: 1, sort: "asc" });
-    for (const n of notes) {
-      const stamp = n.updatedAt ?? n.createdAt;
-      if (stamp >= cursor) {
-        return n.path ?? n.id;
-      }
-    }
+    const notes = await store.queryNotes({
+      limit: 1,
+      sort: "asc",
+      dateFilter: { field: "updated_at", from: cursor },
+    });
+    return notes[0]?.path ?? notes[0]?.id ?? "";
   } catch {
     // Best-effort; template var defaults to empty.
+    return "";
   }
-  return "";
 }
 
 // ---------------------------------------------------------------------------

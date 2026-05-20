@@ -27,6 +27,7 @@ import {
   DEFAULT_COMMIT_TEMPLATE,
   gitAddAll,
   gitCommit,
+  gitUnstageAll,
   isGitRepo,
   listStagedFiles,
   renderCommitMessage,
@@ -280,6 +281,19 @@ describe("git-shell helpers", () => {
     expect(gitLastCommitMessage(dir)).toBe("test: first commit");
     expect(gitLogOneline(dir)).toHaveLength(1);
   });
+
+  test("gitUnstageAll works on a fresh repo with no commits (no HEAD yet)", async () => {
+    // Regression for vault#346 reviewer note: prior version used `git reset
+    // HEAD -- .` which fails on a fresh repo before any commit. The
+    // .parachute/-only skip path on the first cycle would leave staging
+    // dirty. Verify `git restore --staged .` clears staging cleanly.
+    initGitRepo(dir);
+    fs.writeFileSync(path.join(dir, "a.md"), "# a\n");
+    await gitAddAll(dir);
+    expect(await listStagedFiles(dir)).toEqual(["a.md"]);
+    await gitUnstageAll(dir);
+    expect(await listStagedFiles(dir)).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -506,6 +520,67 @@ describe("export CLI: single-shot", () => {
     const res = runCli(["export", exportDir, "--git-push"], tmp);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain("--git-push / --git-message-template only apply with --git-commit");
+  });
+
+  test("{{first_note_title}} resolves to the actual updated note (end-to-end)", async () => {
+    // Regression test for vault#346 reviewer note: previously
+    // firstChangedNoteTitle used `sort: "asc"` + `limit: 1` + a client-side
+    // `stamp >= cursor` post-filter, which fetched the vault's *oldest*
+    // note and almost always failed the post-filter — rendering
+    // {{first_note_title}} as "" in production. The fix moves the filter
+    // to the DB via dateFilter; this test exercises the full CLI to catch
+    // a regression that the helper-unit tests (which inject the title)
+    // can't see.
+    initGitRepo(exportDir);
+    fs.writeFileSync(path.join(exportDir, ".gitkeep"), "");
+    Bun.spawnSync(["git", "add", "-A"], { cwd: exportDir });
+    Bun.spawnSync(["git", "commit", "-q", "-m", "initial"], { cwd: exportDir });
+
+    // Capture a cursor strictly after the seed notes were created, then
+    // add a fresh note whose `updated_at` is after the cursor.
+    await new Promise((r) => setTimeout(r, 10));
+    const cursor = new Date().toISOString();
+    await new Promise((r) => setTimeout(r, 10));
+    await seedVaultWithNotes(tmp, "default", [
+      {
+        id: "01HZN111111111111111111111",
+        path: "Inbox/DonorMeeting",
+        content: "# fresh\n",
+      },
+    ]);
+    const { clearVaultStoreCache } = await import("./vault-store.ts");
+    clearVaultStoreCache();
+
+    const res = runCli(
+      [
+        "export",
+        exportDir,
+        "--since",
+        cursor,
+        "--git-commit",
+        "--git-message-template",
+        "note: {{first_note_title}}",
+      ],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
+    const last = gitLastCommitMessage(exportDir);
+    // The fix renders "Inbox/DonorMeeting"; the bug rendered "note: ".
+    expect(last).toBe("note: Inbox/DonorMeeting");
+  });
+
+  test("--git-message-template without --git-commit is a usage error", () => {
+    // Same guard as --git-push but covers the template-only misuse path —
+    // an operator who set just the template (e.g. via shell history) and
+    // forgot --git-commit would otherwise silently do a plain export.
+    const res = runCli(
+      ["export", exportDir, "--git-message-template", "hi"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).toContain(
+      "--git-push / --git-message-template only apply with --git-commit",
+    );
   });
 });
 
