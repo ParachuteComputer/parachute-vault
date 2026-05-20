@@ -36,6 +36,28 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6-rc.3] — 2026-05-20
+
+Two small items bundled as one cohesive PR:
+
+- **`PARACHUTE_VAULT_NAME` first-boot env var** — companion fix for the
+  hub first-boot wizard (hub#267). When the server starts with zero
+  vaults on disk and `PARACHUTE_VAULT_NAME` is set to a valid name, the
+  auto-created vault uses that name instead of `"default"`. Validation
+  reuses `validateVaultName` so the env var, the `--vault-name` flag,
+  and hub's wizard all share one rule (lowercase alphanumeric +
+  hyphens/underscores, `list` reserved). Invalid values trigger a
+  warning and fall back to `"default"` rather than aborting first boot.
+  First-boot log lines call out which path was taken:
+  `[vault first-boot] using PARACHUTE_VAULT_NAME=<name>` or
+  `[vault first-boot] using default name (no PARACHUTE_VAULT_NAME set)`.
+- **Standalone `render.yaml` deprecated as primary path** (closes
+  vault#341, Option A). The file stays in tree for the operators who
+  specifically want vault as its own Render service, but the
+  `render.yaml` header and the README's Deployment → Cloud platforms
+  section now point the typical v0.6 user at the hub-managed Render
+  deploy (`https://parachute.computer/deploy/render/`).
+
 ## [0.4.6-rc.2] — 2026-05-18
 
 Fold reviewer nits on PR #340:
