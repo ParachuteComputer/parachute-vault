@@ -31,6 +31,7 @@ import {
   SCOPE_READ,
   SCOPE_WRITE,
 } from "./scopes.ts";
+import { enforceVaultScope } from "@openparachute/scope-guard";
 import { HubJwtError, looksLikeJwt, validateHubJwt } from "./hub-jwt.ts";
 
 /**
@@ -241,9 +242,15 @@ export async function authenticateVaultRequest(
   // JWT path: hub-issued tokens. Trust pinned to the hub origin via `iss`
   // verification inside validateHubJwt; signature checked against hub's JWKS.
   // Audience strict-checked against `vault.<name>` so a token stamped for
-  // one vault can't reach another.
+  // one vault can't reach another. `vault_scope` claim additionally checked
+  // against `vaultConfig.name` so a per-user vault pin refuses cross-vault
+  // access even if a scope-string somehow named the wrong vault (multi-user
+  // Phase 1 defense-in-depth — see hub#283 + scope-guard 0.3.0).
   if (looksLikeJwt(key)) {
-    return await authenticateHubJwt(key, { expectedAudience: `vault.${vaultConfig.name}` });
+    return await authenticateHubJwt(key, {
+      expectedAudience: `vault.${vaultConfig.name}`,
+      vaultName: vaultConfig.name,
+    });
   }
 
   // Try vault's token DB first
@@ -319,10 +326,20 @@ export async function authenticateVaultRequest(
  * here — Phase B2 settled that hub tokens always name the resource. Per-
  * vault audience enforcement happens inside `validateHubJwt` via
  * `opts.expectedAudience`.
+ *
+ * Per-user vault-pin enforcement (multi-user Phase 1 PR 5): when
+ * `opts.vaultName` is set, the token's `vault_scope` claim is checked
+ * against it via scope-guard's `enforceVaultScope`. Non-admin tokens
+ * (`vault_scope: [<assigned_vault>]`) refuse cross-vault access with a
+ * 403 + `vault_scope_mismatch` error code. Admin tokens (`vault_scope:
+ * []`) and pre-PR-4 tokens (claim absent → surfaced as `[]`) pass
+ * unchanged. The 403 (not 401) signals "your credential is valid but
+ * doesn't grant access to this vault" — distinct from authentication
+ * failures upstream. See hub#283 + scope-guard 0.3.0 for the mint side.
  */
 async function authenticateHubJwt(
   token: string,
-  opts: { expectedAudience: string | null },
+  opts: { expectedAudience: string | null; vaultName?: string },
 ): Promise<{ error: Response } | AuthResult> {
   try {
     const claims = await validateHubJwt(token, { expectedAudience: opts.expectedAudience });
@@ -335,6 +352,26 @@ async function authenticateHubJwt(
             message: `hub JWT carries broad vault scope(s): ${broad.join(" ")}. Hub-issued tokens must use resource-narrowed scopes (vault:<name>:<verb>).`,
           },
           { status: 401 },
+        ),
+      };
+    }
+    // Defense-in-depth vault-pin check (multi-user Phase 1 PR 5). Runs
+    // AFTER the broad-scope check — a malformed token gets the more-
+    // descriptive scope-shape error rather than a generic pin-mismatch.
+    // When `vaultName` is unset (no per-vault binding known at this
+    // call site), the check is skipped — the audience strict-check
+    // inside validateHubJwt is the primary pin in that case.
+    if (opts.vaultName !== undefined && !enforceVaultScope(claims, opts.vaultName)) {
+      return {
+        error: Response.json(
+          {
+            error: "Forbidden",
+            error_type: "vault_scope_mismatch",
+            message: `token's vault_scope (${claims.vaultScope.join(", ")}) does not include the requested vault '${opts.vaultName}'`,
+            required_vault: opts.vaultName,
+            granted_vault_scope: claims.vaultScope,
+          },
+          { status: 403 },
         ),
       };
     }

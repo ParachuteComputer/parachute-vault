@@ -98,12 +98,24 @@ interface SignOpts {
   ttlSeconds?: number;
   /** Override the random jti — needed when a test wants to revoke this exact token. */
   jti?: string;
+  /**
+   * `vault_scope` claim (multi-user Phase 1 PR 4 / scope-guard 0.3+).
+   * Undefined → omit the claim entirely (pre-PR-4 token shape; surfaces
+   * at scope-guard as `[]` = unrestricted). Provide `[]` explicitly for
+   * a hub-minted admin token; provide `["<name>"]` for a non-admin user.
+   */
+  vaultScope?: string[];
 }
 
 async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
   const iat = Math.floor(Date.now() / 1000);
   const exp = iat + (opts.ttlSeconds ?? 60);
-  return await new SignJWT({ scope: opts.scope, client_id: "test-client" })
+  const payload: Record<string, unknown> = {
+    scope: opts.scope,
+    client_id: "test-client",
+  };
+  if (opts.vaultScope !== undefined) payload.vault_scope = opts.vaultScope;
+  return await new SignJWT(payload)
     .setProtectedHeader({ alg: "RS256", kid: kp.kid })
     .setIssuer(opts.iss)
     .setSubject(opts.sub ?? "user-1")
@@ -316,6 +328,145 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
     if (!("error" in result)) {
       expect(result.permission).toBe("full");
       expect(result.scopes).toEqual(["vault:journal:write"]);
+    }
+  });
+
+  test("vault_scope=[aaron] reaching /vault/aaron → success (matching pin)", async () => {
+    // Non-admin user assigned to vault "aaron" presenting their token
+    // at their own vault. The vault_scope claim names "aaron"; the
+    // request targets "aaron"; the defense-in-depth check passes.
+    seedVault("aaron");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.aaron",
+      scope: "vault:aaron:write",
+      vaultScope: ["aaron"],
+    });
+    const config = readVaultConfig("aaron")!;
+    const store = getVaultStore("aaron");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+      expect(result.scopes).toEqual(["vault:aaron:write"]);
+    }
+  });
+
+  test("vault_scope=[aaron] reaching /vault/bob (cross-vault) → 403 vault_scope_mismatch", async () => {
+    // The exact threat model multi-user Phase 1 PR 5 protects against.
+    // A non-admin user pinned to "aaron" somehow gets a token naming
+    // "bob" in its scope string (mint bug, edited token, third-party RS
+    // bug, replay attack). The audience strict-check inside
+    // validateHubJwt would catch the obvious shape (aud=vault.bob
+    // reaching journal endpoint), but the case below pre-fabricates a
+    // token whose aud + scope DO name bob — only the vault_scope claim
+    // pins the user to aaron. Without the new enforcement, the request
+    // would coast through.
+    seedVault("aaron");
+    seedVault("bob");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.bob", // audience matches bob (so the aud check passes)
+      scope: "vault:bob:write", // scope strings name bob too
+      vaultScope: ["aaron"], // but the user is pinned to aaron
+    });
+    const bobConfig = readVaultConfig("bob")!;
+    const bobStore = getVaultStore("bob");
+
+    const result = await authenticateVaultRequest(bearer(token), bobConfig, bobStore.db);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(403);
+      const body = (await result.error.json()) as {
+        error: string;
+        error_type: string;
+        message: string;
+        required_vault: string;
+        granted_vault_scope: string[];
+      };
+      expect(body.error).toBe("Forbidden");
+      expect(body.error_type).toBe("vault_scope_mismatch");
+      expect(body.message).toContain("aaron");
+      expect(body.message).toContain("bob");
+      expect(body.required_vault).toBe("bob");
+      expect(body.granted_vault_scope).toEqual(["aaron"]);
+    }
+  });
+
+  test("vault_scope=[] (admin token) passes any-vault check", async () => {
+    // Admin tokens carry vault_scope: [] — the explicit "no per-user pin"
+    // sentinel. The defense-in-depth check skips, and the request is
+    // gated purely by audience + scope strings. Both name "work" here,
+    // so the request succeeds.
+    seedVault("work");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.work",
+      scope: "vault:work:admin",
+      vaultScope: [],
+    });
+    const config = readVaultConfig("work")!;
+    const store = getVaultStore("work");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+      expect(result.scopes).toEqual(["vault:work:admin"]);
+    }
+  });
+
+  test("pre-PR-4 token (vault_scope claim absent) → treated as admin (back-compat)", async () => {
+    // Every operator token + CLI-mint that existed before hub PR 4
+    // merged lacks the vault_scope claim entirely. scope-guard surfaces
+    // the absent claim as `[]`, which the helper treats as
+    // "unrestricted" — so the request goes through as long as audience
+    // + scope strings are correct. Without this back-compat, the entire
+    // pre-PR-4 fleet would 403 the moment this code shipped, which is
+    // the wrong tradeoff for a defense-in-depth check.
+    seedVault("legacy");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.legacy",
+      scope: "vault:legacy:write",
+      // vaultScope intentionally omitted — pre-PR-4 token shape
+    });
+    const config = readVaultConfig("legacy")!;
+    const store = getVaultStore("legacy");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.permission).toBe("full");
+      expect(result.scopes).toEqual(["vault:legacy:write"]);
+    }
+  });
+
+  test("vault_scope check runs AFTER broad-scope check — broad scope still wins the failure mode", async () => {
+    // A token with a broad vault scope AND a vault_scope pin gets
+    // rejected for the broad scope (more diagnostic). Pinning the
+    // ordering matters because the 401 message tells the operator
+    // "your token shape is wrong" whereas 403 vault_scope_mismatch
+    // tells them "your user can't reach this vault" — those have
+    // different remediation paths.
+    seedVault("aaron");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.aaron",
+      scope: "vault:write", // broad — should trigger 401 first
+      vaultScope: ["other-vault"], // would also fail vault_scope check
+    });
+    const config = readVaultConfig("aaron")!;
+    const store = getVaultStore("aaron");
+
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      // 401, not 403 — broad-scope rejection takes precedence.
+      expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as { error: string; message: string };
+      expect(body.message).toContain("broad vault scope");
     }
   });
 
