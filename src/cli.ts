@@ -53,6 +53,7 @@ import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import {
+  buildMcpConfigJson,
   buildMcpEntryPlan,
   chooseHubOrigin,
   detectInstallContext,
@@ -168,6 +169,9 @@ switch (command) {
     break;
   case "mcp-install":
     await cmdMcpInstall(cmdArgs);
+    break;
+  case "mcp-config":
+    cmdMcpConfig(cmdArgs);
     break;
   case "remove":
   case "rm":
@@ -1108,6 +1112,107 @@ async function cmdMcpInstallInteractive(): Promise<void> {
     existingEntryKey: decision.existingEntryKey,
     globalConfig,
   });
+}
+
+/**
+ * `parachute-vault mcp-config <vault-name>` — emit the JSON shape
+ * `claude -p --mcp-config '<json>'` consumes, scoped to a named vault.
+ * Pattern from Aaron's Gitcoin Brain runner:
+ *
+ *   claude -p --mcp-config "$(parachute-vault mcp-config gitcoin)" \
+ *             --strict-mcp-config ...
+ *
+ * Synthesizing this JSON by hand was per-script boilerplate every runner
+ * that spawned `claude -p` against a vault had to write. This command is
+ * the canonical synthesizer — the JSON shape is owned here once.
+ *
+ * No state is mutated; this only emits to stdout. The bearer is read from
+ * `--token <pvt_...>` or `PARACHUTE_VAULT_TOKEN` env (deliberate — we don't
+ * mint here, since this is a stdout-piped subprocess where prompting would
+ * deadlock the parent script). If neither is present, we exit 1 with a
+ * clear stderr message; runners get a fail-fast.
+ *
+ * Flags:
+ *   --token <bearer>   Bearer to embed verbatim (alternative: PARACHUTE_VAULT_TOKEN).
+ *   --base-url <url>   Override the auto-detected hub origin (default: chooseHubOrigin).
+ *                      Useful for tailnet-exposed hubs (`--base-url https://hub.tail.ts.net`).
+ *   --env-vars         Emit the template form with `${PARACHUTE_HUB_URL}` and
+ *                      `${PARACHUTE_VAULT_TOKEN}` placeholders rather than
+ *                      inlined values. Safe to commit; the shell expands at
+ *                      runtime.
+ */
+function cmdMcpConfig(args: string[]): void {
+  const vaultName = args[0];
+  if (!vaultName || vaultName.startsWith("--")) {
+    console.error("Usage: parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>] [--env-vars]");
+    console.error("");
+    console.error("Emits the JSON config consumed by `claude -p --mcp-config '<json>'`.");
+    console.error("Pattern: claude -p --mcp-config \"$(parachute-vault mcp-config <name>)\" --strict-mcp-config ...");
+    process.exit(1);
+  }
+
+  const tokenArg = takeArgValue(args, "--token");
+  if (tokenArg.missingValue) {
+    console.error("--token requires a value (the bearer to embed).");
+    process.exit(1);
+  }
+  const baseUrlArg = takeArgValue(args, "--base-url");
+  if (baseUrlArg.missingValue) {
+    console.error("--base-url requires a value (e.g. https://hub.example.ts.net).");
+    process.exit(1);
+  }
+  const useEnvVars = args.includes("--env-vars");
+
+  // --env-vars mode is shape-only — no need to resolve the vault, mint a
+  // token, or even verify the vault exists. Operators committing the
+  // template don't necessarily have the target vault on the machine
+  // generating the config.
+  if (useEnvVars) {
+    const json = buildMcpConfigJson({
+      vaultName,
+      baseUrl: "",
+      bearer: "",
+      useEnvVars: true,
+    });
+    process.stdout.write(json + "\n");
+    return;
+  }
+
+  // Literal mode: verify the vault exists locally, resolve the URL, and
+  // require a bearer (either --token or PARACHUTE_VAULT_TOKEN env).
+  if (!readVaultConfig(vaultName)) {
+    const available = listVaults();
+    console.error(`Vault "${vaultName}" not found. Available: ${available.join(", ") || "(none — run `parachute-vault create <name>`)"}.`);
+    process.exit(1);
+  }
+
+  const bearer = tokenArg.value ?? process.env.PARACHUTE_VAULT_TOKEN;
+  if (!bearer) {
+    console.error("No bearer token provided. Pass --token <bearer> or set PARACHUTE_VAULT_TOKEN.");
+    console.error("  Mint a token with: parachute-vault tokens create --vault " + vaultName);
+    console.error("  Or use --env-vars to emit the template form (safe to commit; expands at runtime).");
+    process.exit(1);
+  }
+
+  const globalConfig = readGlobalConfig();
+  const port = globalConfig.port || DEFAULT_PORT;
+  let baseUrl: string;
+  if (baseUrlArg.value) {
+    baseUrl = baseUrlArg.value;
+  } else {
+    // chooseHubOrigin walks PARACHUTE_HUB_ORIGIN → expose-state → loopback;
+    // for a script invoking `claude -p` against a local vault, loopback is
+    // the right default.
+    baseUrl = chooseHubOrigin(port).url;
+  }
+
+  const json = buildMcpConfigJson({
+    vaultName,
+    baseUrl,
+    bearer,
+    useEnvVars: false,
+  });
+  process.stdout.write(json + "\n");
 }
 
 interface ExecuteMcpInstallOpts {
@@ -2947,6 +3052,24 @@ Vaults:
                                             --vault <name> targets a specific
                                             vault and keys the entry as
                                             parachute-vault-<name>.
+
+  parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>]
+                                          [--env-vars]
+                                            Emit the JSON config consumed by
+                                            \`claude -p --mcp-config '<json>'\`.
+                                            Pattern:
+                                              claude -p --mcp-config \\
+                                                "$(parachute-vault mcp-config <name>)" \\
+                                                --strict-mcp-config ...
+                                            --token or PARACHUTE_VAULT_TOKEN env
+                                            supplies the bearer; both absent
+                                            exits 1 with a clear error.
+                                            --base-url overrides the auto-detected
+                                            origin (e.g. tailnet-exposed hubs).
+                                            --env-vars emits the template form
+                                            with \${PARACHUTE_HUB_URL} and
+                                            \${PARACHUTE_VAULT_TOKEN} placeholders
+                                            (safe to commit; expanded at runtime).
 
 Tokens:
   parachute-vault tokens                          List tokens (every vault)

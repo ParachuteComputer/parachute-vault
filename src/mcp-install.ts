@@ -335,6 +335,67 @@ export async function mintHubJwt(opts: MintHubJwtOpts): Promise<MintedHubJwt | M
 }
 
 // ---------------------------------------------------------------------------
+// `mcp-config` — emit the JSON shape `claude -p --mcp-config '<json>'` expects
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the JSON config shape consumed by `claude -p --mcp-config '<json>'`.
+ *
+ * Two emission modes:
+ *
+ *   - **literal** (`useEnvVars: false`): the URL and bearer are inlined. The
+ *     emitted JSON is ready to splice into a runner via shell substitution
+ *     (`--mcp-config "$(parachute-vault mcp-config <name>)"`). Treat the
+ *     output as secret — it carries a usable bearer.
+ *
+ *   - **env-var template** (`useEnvVars: true`): the URL becomes
+ *     `${PARACHUTE_HUB_URL}/vault/<name>/mcp` and the Authorization value
+ *     becomes `Bearer ${PARACHUTE_VAULT_TOKEN}`. Shape-only; safe to commit.
+ *     Consumers must expand the placeholders at runtime (most shells do this
+ *     under double-quoted interpolation; `claude -p` itself does not).
+ *
+ * The `entryKey` rule mirrors `buildMcpEntryPlan`: vault-explicit installs
+ * key as `parachute-vault-<name>` so multi-vault runners can mount more than
+ * one vault under distinct slots. (The default install — singular
+ * `parachute-vault` — is reserved for the local-scope MCP entry; `mcp-config`
+ * always pins the per-vault key, since this is the script-spawning shape
+ * where you usually do name the vault.)
+ *
+ * Always emits stable JSON with two-space indent so the output is diff-able
+ * across runs.
+ */
+export interface BuildMcpConfigJsonOpts {
+  vaultName: string;
+  /** Base URL (without `/vault/<name>/mcp`). Ignored when `useEnvVars` is true. */
+  baseUrl: string;
+  /** Bearer to embed verbatim. Ignored when `useEnvVars` is true. */
+  bearer: string;
+  /** Emit `${PARACHUTE_HUB_URL}` / `${PARACHUTE_VAULT_TOKEN}` placeholders instead of inlined values. */
+  useEnvVars?: boolean;
+}
+
+export function buildMcpConfigJson(opts: BuildMcpConfigJsonOpts): string {
+  const { vaultName, baseUrl, bearer, useEnvVars } = opts;
+  const entryKey = `parachute-vault-${vaultName}`;
+  const url = useEnvVars
+    ? `\${PARACHUTE_HUB_URL}/vault/${vaultName}/mcp`
+    : `${baseUrl.replace(/\/$/, "")}/vault/${vaultName}/mcp`;
+  const authValue = useEnvVars
+    ? "Bearer ${PARACHUTE_VAULT_TOKEN}"
+    : `Bearer ${bearer}`;
+  const config = {
+    mcpServers: {
+      [entryKey]: {
+        type: "http",
+        url,
+        headers: { Authorization: authValue },
+      },
+    },
+  };
+  return JSON.stringify(config, null, 2);
+}
+
+// ---------------------------------------------------------------------------
 // Install target resolver
 // ---------------------------------------------------------------------------
 
