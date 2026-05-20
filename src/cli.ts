@@ -1387,6 +1387,12 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     console.log(`Added MCP server "${entryKey}" to ${target.path} under projects["${target.localProjectKey}"] (local scope).`);
     console.log(`  Installed locally for this directory only — runs only when Claude Code launches from ${target.localProjectKey}.`);
     console.log(`  To install globally instead, re-run with --install-scope user.`);
+    // Headless-flow heads-up: local-scope MCP entries do NOT propagate
+    // to subprocesses spawned by `claude -p` (script / cron / runner
+    // shapes), even with --setting-sources covering local. Operators
+    // wiring up a runner usually want `--install-scope user` so the
+    // entry reaches every `claude` invocation on this machine.
+    console.log(`  Headless flows (claude -p in scripts, cron, runners): prefer --install-scope user — local-scope entries don't propagate to claude -p subprocesses.`);
   } else {
     console.log(`Added MCP server "${entryKey}" to ${target.path}`);
   }
@@ -3084,6 +3090,13 @@ Vaults:
                                             directory only). user writes top-level
                                             mcpServers (every project). project
                                             writes ./.mcp.json (check into the repo).
+                                            For headless flows (\`claude -p\` in
+                                            scripts, cron jobs, runners), prefer
+                                            --install-scope user — local-scope
+                                            entries don't propagate to claude -p
+                                            subprocesses; interactive sessions
+                                            from the install directory still see
+                                            local just fine.
                                             --vault <name> targets a specific
                                             vault and keys the entry as
                                             parachute-vault-<name>.

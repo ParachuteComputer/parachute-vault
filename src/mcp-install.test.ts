@@ -580,6 +580,10 @@ describe("mcp-install end-to-end", () => {
     // scoped to this directory (and how to widen if they wanted global).
     expect(res.stdout).toMatch(/this directory only/);
     expect(res.stdout).toMatch(/--install-scope user/);
+    // Headless-flow heads-up: local-scope entries don't propagate to
+    // claude -p subprocesses; operators wiring up runners need to know.
+    expect(res.stdout).toMatch(/Headless flows/);
+    expect(res.stdout).toMatch(/claude -p/);
   });
 
   test("--install-scope project writes <cwd>/.mcp.json instead of ~/.claude.json", () => {

@@ -197,6 +197,9 @@ parachute-vault mcp-install --install-scope user      # write ~/.claude.json top
 parachute-vault mcp-install --install-scope local     # write ~/.claude.json projects[<cwd>] (this directory only — default)
 parachute-vault mcp-install --install-scope project   # write ./.mcp.json (checked into the repo)
 parachute-vault mcp-install --vault work   # target the "work" vault (keyed as parachute-vault-work)
+parachute-vault mcp-install --dry-run      # describe the write without touching disk or the hub
+parachute-vault mcp-config gitcoin         # emit JSON for `claude -p --mcp-config "$(...)"`
+parachute-vault mcp-config gitcoin --env-vars   # template form with ${PARACHUTE_HUB_URL}/${PARACHUTE_VAULT_TOKEN}
 
 # OAuth — owner password + 2FA
 parachute-vault set-password               # set/change the owner password (OAuth consent page)
@@ -619,7 +622,29 @@ parachute-vault mcp-install --legacy-pat
 
 **Multi-vault.** `--vault <name>` targets a specific vault and writes the entry under `parachute-vault-<name>` so multiple vaults coexist. Without `--vault`, the singular `parachute-vault` slot is used and one install clobbers another — that's intentional for the common single-vault case.
 
+**Dry-run.** `parachute-vault mcp-install --dry-run` prints the write that would happen — target file, install scope, entry key, URL, auth mode — without touching disk or hitting the hub. Useful for probing the command's effect; in particular, `--help` no longer creates an empty `projects[<cwd>]` entry as a side effect, but `--dry-run` is the deliberate "tell me what you'd do" path.
+
 **Doctor.** `parachute-vault doctor` checks `~/.claude.json` (both top-level and `projects[<cwd>]`) and `./.mcp.json`, and reports which one holds the entry, plus port-match and reachability of the MCP URL.
+
+#### Headless flows — `claude -p` runners (`mcp-config`)
+
+`mcp-install` writes a persistent entry into a Claude Code config file. That's the right shape for interactive sessions, but it has two sharp edges for headless runners that spawn `claude -p` against a vault:
+
+1. **Local-scope MCP entries don't propagate to `claude -p` subprocesses.** A project-scoped install under `projects[<cwd>].mcpServers` is visible to an *interactive* `claude` launched from that directory, but a `claude -p` invocation spawned by a Python script — even from the same directory, even with `--setting-sources user,project,local` — doesn't pick it up. Use `--install-scope user` for scripts, cron jobs, and runners; the local default is fine for interactive sessions.
+2. **`--mcp-config` JSON is per-runner boilerplate.** Some runners prefer to inline the MCP config rather than mutate the user's Claude Code state. `parachute-vault mcp-config <vault-name>` emits exactly the JSON shape `--mcp-config` consumes:
+
+```bash
+# Mint or fetch a vault-scoped token first, then:
+export PARACHUTE_VAULT_TOKEN=pvt_...
+claude -p --mcp-config "$(parachute-vault mcp-config gitcoin)" \
+          --strict-mcp-config \
+          "Summarize the latest notes under projects/gitcoin"
+
+# Or commit a template — placeholders expand at runtime:
+parachute-vault mcp-config gitcoin --env-vars > .claude/mcp-gitcoin.json
+```
+
+Flags: `--token <bearer>` (alternative to `PARACHUTE_VAULT_TOKEN`); `--base-url <url>` (override the auto-detected origin, useful for tailnet-exposed hubs: `--base-url https://hub.tail.ts.net`); `--env-vars` (emit the template form with `${PARACHUTE_HUB_URL}` and `${PARACHUTE_VAULT_TOKEN}` placeholders, safe to commit). With no token and no `--env-vars`, the command exits 1 with a clear error — runners get a fail-fast.
 
 ## Data model
 
@@ -729,6 +754,15 @@ The checks, in the order they're emitted:
 - **Claude Code shows no vault tools.** Check in order: (1) is the daemon up (`parachute-vault status`)? (2) does `~/.claude.json` have a `parachute-vault` entry with both `url` and a valid `Authorization` header? (3) does the URL's vault name match an existing vault? `parachute-vault doctor` catches the first two. A missing or stale `Authorization` header after a bare `vault mcp-install` is the usual culprit for #2 — see the Claude Code section of [Connecting a client](#connecting-a-client) for how to rewrite it.
 - **Claude Desktop / Daily won't connect via OAuth.** If the owner-password prompt was skipped at `vault init`, the consent page falls back to requiring a vault token in place of the password (functional but clunky). Set one now with `parachute-vault set-password`. If 2FA is enrolled, have your authenticator app ready before starting the flow; lost TOTP access recovers via the backup codes printed at enrollment.
 - **Scheduled backups aren't running.** On macOS: `doctor` flags `backup agent: not loaded` when `schedule` isn't `manual` but the launchd agent is missing — rerun `parachute-vault backup --schedule <freq>` to reinstall it. On Linux: systemd-timer support for backup isn't shipped yet, so `--schedule daily` silently skips the scheduler. Run `parachute-vault backup` from cron (or similar) until that lands.
+- **Manual `curl` against `/vault/<name>/mcp` returns `406 Not Acceptable`.** The MCP HTTP transport requires both `application/json` and `text/event-stream` in the `Accept` header (it negotiates between the JSON response and the SSE streaming variant). Claude Code's `--mcp-config` http transport sets this automatically — the symptom only shows up when you probe the endpoint by hand. The fix:
+
+  ```bash
+  curl -H 'Accept: application/json, text/event-stream' \
+       -H "Authorization: Bearer $VAULT_TOKEN" \
+       http://127.0.0.1:1940/vault/default/mcp
+  ```
+
+  Both media types are needed; omitting either is what triggers the 406.
 
 ### Getting help
 
