@@ -117,3 +117,12 @@ services:
       # for any libraries that branch on NODE_ENV.
       - key: NODE_ENV
         value: production
+
+      # Optional: name your first-boot vault (default: "default"). When
+      # vault starts with zero vaults on disk, it auto-creates one named
+      # PARACHUTE_VAULT_NAME (if set + valid) or "default" (otherwise).
+      # Lowercase alphanumeric + hyphens or underscores, 2–32 chars; the
+      # name "list" is reserved. Uncomment and set in the Render dashboard
+      # to pick a name; leave commented to use "default".
+      # - key: PARACHUTE_VAULT_NAME
+      #   sync: false

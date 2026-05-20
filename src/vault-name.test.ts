@@ -1,7 +1,9 @@
 /**
  * Unit tests for `validateVaultName` — the rule enforced by the `init`
- * prompt and the `--vault-name` flag. Covers each rejection branch plus
- * the happy paths the prompt has to accept (default, hyphens, underscores).
+ * prompt, the `--vault-name` flag, and the `PARACHUTE_VAULT_NAME` env var
+ * at server first-boot. Covers each rejection branch (empty, length,
+ * regex, reserved) plus the happy paths the prompt has to accept (default,
+ * hyphens, underscores, length boundaries).
  */
 
 import { describe, test, expect } from "bun:test";
@@ -14,11 +16,12 @@ describe("validateVaultName", () => {
       "aaron",
       "personal",
       "work",
-      "a",
+      "ab", // 2-char boundary (min length)
       "vault-1",
       "my_vault",
       "a-b_c-1",
       "abc123",
+      "a".repeat(32), // 32-char boundary (max length)
     ])("%s", (name) => {
       const result = validateVaultName(name);
       expect(result.ok).toBe(true);
@@ -70,6 +73,24 @@ describe("validateVaultName", () => {
       const result = validateVaultName("list");
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain("reserved");
+    });
+
+    test("single character (below 2-char min)", () => {
+      const result = validateVaultName("a");
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("2");
+    });
+
+    test("33 characters (above 32-char max)", () => {
+      const result = validateVaultName("a".repeat(33));
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("32");
+    });
+
+    test("200 characters (well above max)", () => {
+      const result = validateVaultName("a".repeat(200));
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("32");
     });
   });
 });
@@ -176,5 +197,23 @@ describe("resolveFirstBootVaultName", () => {
     const r = resolveFirstBootVaultName("team/work");
     expect(r.source).toBe("env-invalid");
     expect(r.name).toBe("default");
+  });
+
+  test("env var set to a 200-char name → fallback to default (over max-length)", () => {
+    const r = resolveFirstBootVaultName("a".repeat(200));
+    expect(r.source).toBe("env-invalid");
+    expect(r.name).toBe("default");
+    if (r.source === "env-invalid") {
+      expect(r.reason).toContain("32");
+    }
+  });
+
+  test("env var set to a single character → fallback to default (under min-length)", () => {
+    const r = resolveFirstBootVaultName("a");
+    expect(r.source).toBe("env-invalid");
+    expect(r.name).toBe("default");
+    if (r.source === "env-invalid") {
+      expect(r.reason).toContain("2");
+    }
   });
 });
