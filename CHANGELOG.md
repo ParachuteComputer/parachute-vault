@@ -36,7 +36,7 @@ to `@latest`.
 
 ## [Unreleased]
 
-## [0.4.6] - 2026-05-20
+## [0.4.6] — 2026-05-20
 
 Stable release covering the multi-user companion + Gitcoin Brain enablement. Cumulative changes since `0.4.5`:
 
