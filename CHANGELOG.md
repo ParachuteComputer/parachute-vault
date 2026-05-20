@@ -36,6 +36,20 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-05-20
+
+Stable release covering the multi-user companion + Gitcoin Brain enablement. Cumulative changes since `0.4.5`:
+
+- **`PARACHUTE_VAULT_NAME` env var** (#342): first-boot vault naming via env var. Replaces the hardcoded "default" so hub's wizard can thread the operator's typed vault name through to vault. Length-validated (2-32 chars).
+- **`vault_scope` claim consumer** (#344): vault now enforces the `vault_scope` claim from hub-issued JWTs. A token with `vault_scope: ["aaron"]` reaching `/vault/bob/*` returns 403. Defense-in-depth at the resource server for multi-user Phase 1.
+- **`parachute-vault mcp-config <name>` CLI** (#345): emits the inline MCP config JSON for `claude -p` runners. Eliminates per-script boilerplate.
+- **`mcp-install --dry-run`** (#345): probe `mcp-install` without writing.
+- **Doc fixes** (#345): mcp-install recommends `--install-scope user` for headless flows; README notes the Accept-header requirement for the local MCP endpoint.
+- **`parachute-vault export --watch + --git-commit`** (#346): live mirror of vault to a markdown directory with optional auto-commit + auto-push. Enables Aaron's Gitcoin Brain vault-as-git-projection workflow.
+- **Standalone `render.yaml` deprecated** (#342): per the v0.6 option-A architecture, vault doesn't deploy standalone. The file is retained for advanced users with a clarifying comment.
+
+See individual rc entries below for full detail.
+
 ## [0.4.6-rc.6] — 2026-05-20
 
 Aaron's Gitcoin Brain build wants vault as the system of record and a git
