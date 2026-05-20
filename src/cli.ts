@@ -969,6 +969,7 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     "--install-scope",
     "--vault",
     "--client",
+    "--dry-run",
   ];
 
   const hasFlag = args.some((a) => MCP_INSTALL_FLAG_NAMES.includes(a));
@@ -1071,6 +1072,8 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const dryRun = args.includes("--dry-run");
+
   await executeMcpInstall({
     mode,
     rawScope,
@@ -1079,6 +1082,7 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     vaultExplicit,
     pastedToken: mode === "token" ? tokenArg.value : undefined,
     globalConfig,
+    dryRun,
   });
 }
 
@@ -1236,6 +1240,16 @@ interface ExecuteMcpInstallOpts {
   existingEntryKey?: string;
   /** Reused across the call chain to avoid re-parsing config.yaml. */
   globalConfig: ReturnType<typeof readGlobalConfig>;
+  /**
+   * When true, describe the write that *would* happen (target path,
+   * entry key, URL, install scope) and exit 0 without touching the
+   * filesystem or hitting the network for a hub-mint. Useful for
+   * probing the command from a script that's setting up a runner.
+   * Aaron hit this when accidentally creating an empty
+   * `projects[<cwd>]` entry while just running `--help` — see the
+   * `mcp-config` PR notes.
+   */
+  dryRun?: boolean;
 }
 
 /**
@@ -1245,7 +1259,7 @@ interface ExecuteMcpInstallOpts {
  * preview-and-confirm step so a cancel skips the network mint entirely.
  */
 async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
-  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig, existingEntryKey } = opts;
+  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig, existingEntryKey, dryRun } = opts;
   const verb = rawScope.split(":")[1]!;
   const target = resolveInstallTarget(installScope);
   // Single source of truth shared with the interactive walkthrough's
@@ -1258,6 +1272,26 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     port: globalConfig.port || DEFAULT_PORT,
     ...(existingEntryKey ? { existingEntryKey } : {}),
   });
+
+  // --dry-run: describe the write that *would* happen without touching
+  // the filesystem or minting any token. Print to stdout (scripts may
+  // parse this); exit 0. Skip the auth-acquisition entirely — the point
+  // of --dry-run is to inspect without side effects, including the
+  // network round-trip for hub-mint.
+  if (dryRun) {
+    console.log(`[dry-run] No changes written.`);
+    console.log(`  Target file:    ${target.path}`);
+    console.log(`  Install scope:  ${target.scope}`);
+    if (target.localProjectKey) {
+      console.log(`  Project key:    ${target.localProjectKey}`);
+    }
+    console.log(`  Entry key:      ${entryKey}`);
+    console.log(`  MCP URL:        ${url} (${source})`);
+    console.log(`  Auth mode:      ${mode}${mode === "mint" ? ` (scope vault:${vaultName}:${verb})` : ""}`);
+    console.log(`  Vault:          ${vaultName}`);
+    console.log(`  Re-run without --dry-run to apply.`);
+    return;
+  }
 
   let bearer: string;
   if (mode === "token") {
@@ -3026,6 +3060,7 @@ Vaults:
                               [--scope vault:read|vault:write|vault:admin]
                               [--install-scope local|user|project]
                               [--vault <name>] [--client claude-code]
+                              [--dry-run]
                                             Install vault MCP into a client config.
                                             From a terminal with no flags: walks you
                                             through a contextual conversation (vault,
@@ -3052,6 +3087,10 @@ Vaults:
                                             --vault <name> targets a specific
                                             vault and keys the entry as
                                             parachute-vault-<name>.
+                                            --dry-run prints the write that would
+                                            happen (target file, entry key, URL)
+                                            without touching disk or hitting the
+                                            hub. Useful for probing.
 
   parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>]
                                           [--env-vars]

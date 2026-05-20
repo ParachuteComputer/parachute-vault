@@ -798,6 +798,40 @@ describe("mcp-install end-to-end", () => {
     expect(bearer).toMatch(/^Bearer pvt_/);
   });
 
+  test("--dry-run describes the write without touching disk or hitting the hub", () => {
+    // Aaron hit this when probing `mcp-install --help`: the bare CLI
+    // dispatch was creating an empty `projects[<cwd>]` slot in
+    // ~/.claude.json as a side effect of writing the install. --dry-run
+    // is the deliberate "tell me what you'd do" path.
+    setupBareVault(tmp, "default");
+    const res = runCli(
+      ["mcp-install", "--install-scope", "user", "--token", "should-not-be-used", "--dry-run"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
+    // No claude.json should exist: the install was inhibited.
+    expect(fs.existsSync(path.join(tmp, ".claude.json"))).toBe(false);
+    // The dry-run output names target file, entry key, URL, and how to apply.
+    expect(res.stdout).toMatch(/\[dry-run\]/);
+    expect(res.stdout).toMatch(/Target file:/);
+    expect(res.stdout).toMatch(/Entry key:\s+parachute-vault/);
+    expect(res.stdout).toMatch(/MCP URL:/);
+    expect(res.stdout).toMatch(/Re-run without --dry-run to apply\./);
+  });
+
+  test("--dry-run with --mint skips the hub round-trip and operator-token check", () => {
+    // The whole point of --dry-run is "no side effects" — that includes
+    // the hub-mint network call. A naive implementation might still try
+    // to read operator.token and fail before the dry-run print fires.
+    setupBareVault(tmp, "default");
+    // Deliberately no operator.token file present, no PARACHUTE_HUB_ORIGIN.
+    const res = runCli(["mcp-install", "--dry-run"], tmp, { PARACHUTE_HUB_ORIGIN: "" });
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toMatch(/\[dry-run\]/);
+    expect(res.stderr).not.toMatch(/No operator token found/);
+    expect(res.stderr).not.toMatch(/No hub origin configured/);
+  });
+
   test("subsequent --token install on top of an existing entry overwrites the bearer (user scope)", () => {
     setupBareVault(tmp, "default");
     runCli(["mcp-install", "--install-scope", "user", "--token", "first"], tmp);
