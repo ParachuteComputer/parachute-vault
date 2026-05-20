@@ -18,6 +18,7 @@
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath } from "./config.ts";
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
+import { resolveFirstBootVaultName } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
@@ -102,13 +103,27 @@ if (process.env.VAULT_AUTH_TOKEN?.trim()) {
   console.log("[auth] VAULT_AUTH_TOKEN set — server-wide operator bearer active");
 }
 
-// Auto-init: create a default vault if none exist (first run in Docker)
+// Auto-init: create a default vault if none exist (first run in Docker).
+// The vault name comes from PARACHUTE_VAULT_NAME when set + valid; otherwise
+// falls back to "default". Hub's first-boot wizard (hub#267) passes through
+// an operator-chosen name via this env var.
 if (listVaults().length === 0) {
   const globalConfig = readGlobalConfig();
   if (!globalConfig.default_vault) {
+    const firstBoot = resolveFirstBootVaultName(process.env.PARACHUTE_VAULT_NAME);
+    if (firstBoot.source === "env") {
+      console.log(`[vault first-boot] using PARACHUTE_VAULT_NAME=${firstBoot.name}`);
+    } else if (firstBoot.source === "env-invalid") {
+      console.warn(
+        `[vault first-boot] PARACHUTE_VAULT_NAME=${JSON.stringify(firstBoot.rawValue)} is invalid (${firstBoot.reason}); falling back to "default"`,
+      );
+    } else {
+      console.log("[vault first-boot] using default name (no PARACHUTE_VAULT_NAME set)");
+    }
+    const vaultName = firstBoot.name;
     const { fullKey, keyId } = generateApiKey();
     writeVaultConfig({
-      name: "default",
+      name: vaultName,
       api_keys: [{
         id: keyId,
         label: "default",
@@ -118,7 +133,7 @@ if (listVaults().length === 0) {
       }],
       created_at: new Date().toISOString(),
     });
-    globalConfig.default_vault = "default";
+    globalConfig.default_vault = vaultName;
     if (!globalConfig.api_keys?.length) {
       globalConfig.api_keys = [{
         id: keyId,
@@ -129,7 +144,7 @@ if (listVaults().length === 0) {
       }];
     }
     writeGlobalConfig(globalConfig);
-    console.log(`Auto-created default vault (API key: ${fullKey})`);
+    console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
   }
 }
 

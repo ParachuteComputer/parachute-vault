@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
+import { validateVaultName, decideInitVaultName, resolveFirstBootVaultName } from "./vault-name.ts";
 
 describe("validateVaultName", () => {
   describe("accepts", () => {
@@ -119,5 +119,62 @@ describe("decideInitVaultName", () => {
   test("--vault-name with leading whitespace is trimmed and accepted", () => {
     const d = decideInitVaultName(["--vault-name", "  aaron  "], { isTTY: true });
     expect(d).toEqual({ kind: "name", name: "aaron" });
+  });
+});
+
+describe("resolveFirstBootVaultName", () => {
+  test("env var unset → fallback to default", () => {
+    const r = resolveFirstBootVaultName(undefined);
+    expect(r).toEqual({ source: "default", name: "default" });
+  });
+
+  test("env var empty string → fallback to default", () => {
+    const r = resolveFirstBootVaultName("");
+    expect(r).toEqual({ source: "default", name: "default" });
+  });
+
+  test("env var whitespace-only → fallback to default", () => {
+    const r = resolveFirstBootVaultName("   ");
+    expect(r).toEqual({ source: "default", name: "default" });
+  });
+
+  test("env var set to a valid name → that name (positive path)", () => {
+    const r = resolveFirstBootVaultName("smoke-1939");
+    expect(r).toEqual({ source: "env", name: "smoke-1939" });
+  });
+
+  test("env var set to a valid name with underscores → that name", () => {
+    const r = resolveFirstBootVaultName("my_vault");
+    expect(r).toEqual({ source: "env", name: "my_vault" });
+  });
+
+  test("env var set with surrounding whitespace → trimmed + accepted", () => {
+    const r = resolveFirstBootVaultName("  aaron  ");
+    expect(r).toEqual({ source: "env", name: "aaron" });
+  });
+
+  test("env var set to invalid (uppercase + spaces + special) → fallback to default + record raw + reason", () => {
+    const r = resolveFirstBootVaultName("Bad Name!!");
+    expect(r.source).toBe("env-invalid");
+    expect(r.name).toBe("default");
+    if (r.source === "env-invalid") {
+      expect(r.rawValue).toBe("Bad Name!!");
+      expect(r.reason).toContain("lowercase alphanumeric");
+    }
+  });
+
+  test("env var set to reserved name 'list' → fallback to default", () => {
+    const r = resolveFirstBootVaultName("list");
+    expect(r.source).toBe("env-invalid");
+    expect(r.name).toBe("default");
+    if (r.source === "env-invalid") {
+      expect(r.reason).toContain("reserved");
+    }
+  });
+
+  test("env var set to slash-containing name → fallback to default", () => {
+    const r = resolveFirstBootVaultName("team/work");
+    expect(r.source).toBe("env-invalid");
+    expect(r.name).toBe("default");
   });
 });

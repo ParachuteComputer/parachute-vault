@@ -78,3 +78,43 @@ export function decideInitVaultName(
   }
   return { kind: "prompt" };
 }
+
+/**
+ * Pick the first-boot vault name based on `PARACHUTE_VAULT_NAME`. Used by
+ * `server.ts` when the server starts with zero vaults on disk (Docker
+ * first-boot, hub-driven self-host install).
+ *
+ *   - env var unset / empty / whitespace-only → `{ source: "default", name: "default" }`
+ *   - env var present + valid → `{ source: "env", name: <validated> }`
+ *   - env var present + invalid → `{ source: "env-invalid", name: "default",
+ *     rawValue: <original>, reason: <validator message> }` (caller logs a
+ *     warning and proceeds with the default name; we never abort first-boot
+ *     over a misconfigured env var)
+ *
+ * Validation uses the same `validateVaultName` rule as the `--vault-name`
+ * flag — lowercase alphanumeric + hyphens/underscores, with the `list`
+ * reserved-name carveout — so hub's wizard, the CLI flag, and the env var
+ * all share one truth.
+ */
+export type FirstBootVaultName =
+  | { source: "default"; name: "default" }
+  | { source: "env"; name: string }
+  | { source: "env-invalid"; name: "default"; rawValue: string; reason: string };
+
+export function resolveFirstBootVaultName(
+  rawEnvValue: string | undefined,
+): FirstBootVaultName {
+  if (rawEnvValue === undefined || rawEnvValue.trim() === "") {
+    return { source: "default", name: "default" };
+  }
+  const v = validateVaultName(rawEnvValue);
+  if (v.ok) {
+    return { source: "env", name: v.name };
+  }
+  return {
+    source: "env-invalid",
+    name: "default",
+    rawValue: rawEnvValue,
+    reason: v.error,
+  };
+}
