@@ -580,6 +580,10 @@ describe("mcp-install end-to-end", () => {
     // scoped to this directory (and how to widen if they wanted global).
     expect(res.stdout).toMatch(/this directory only/);
     expect(res.stdout).toMatch(/--install-scope user/);
+    // Headless-flow heads-up: local-scope entries don't propagate to
+    // claude -p subprocesses; operators wiring up runners need to know.
+    expect(res.stdout).toMatch(/Headless flows/);
+    expect(res.stdout).toMatch(/claude -p/);
   });
 
   test("--install-scope project writes <cwd>/.mcp.json instead of ~/.claude.json", () => {
@@ -796,6 +800,62 @@ describe("mcp-install end-to-end", () => {
     const config = readJson(path.join(tmp, ".claude.json"));
     const bearer = config.mcpServers["parachute-vault"].headers.Authorization;
     expect(bearer).toMatch(/^Bearer pvt_/);
+  });
+
+  test("--dry-run describes the write without touching disk or hitting the hub", () => {
+    // Aaron hit this when probing `mcp-install --help`: the bare CLI
+    // dispatch was creating an empty `projects[<cwd>]` slot in
+    // ~/.claude.json as a side effect of writing the install. --dry-run
+    // is the deliberate "tell me what you'd do" path.
+    setupBareVault(tmp, "default");
+    const res = runCli(
+      ["mcp-install", "--install-scope", "user", "--token", "should-not-be-used", "--dry-run"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
+    // No claude.json should exist: the install was inhibited.
+    expect(fs.existsSync(path.join(tmp, ".claude.json"))).toBe(false);
+    // The dry-run output names target file, entry key, URL, and how to apply.
+    expect(res.stdout).toMatch(/\[dry-run\]/);
+    expect(res.stdout).toMatch(/Target file:/);
+    expect(res.stdout).toMatch(/Entry key:\s+parachute-vault/);
+    expect(res.stdout).toMatch(/MCP URL:/);
+    expect(res.stdout).toMatch(/Re-run without --dry-run to apply\./);
+  });
+
+  test("--dry-run works for a vault that doesn't exist yet (probe shape)", () => {
+    // The dry-run contract is "no side effects, including failures on
+    // state the caller is asking about." A future-vault probe — would
+    // installing for this not-yet-created vault land where I expect? —
+    // is a legitimate pre-create check, not an error. The
+    // vault-existence guard runs only on the real-install path.
+    setupBareVault(tmp, "default");
+    const res = runCli(
+      ["mcp-install", "--vault", "future-vault", "--token", "t", "--dry-run"],
+      tmp,
+    );
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toMatch(/\[dry-run\]/);
+    // Output names the absent vault explicitly so the operator can tell
+    // the dry-run worked against the right target.
+    expect(res.stdout).toMatch(/Vault:\s+future-vault/);
+    expect(res.stdout).toMatch(/does not exist yet/);
+    expect(res.stdout).toMatch(/Entry key:\s+parachute-vault-future-vault/);
+    // No claude.json written — dry-run still didn't touch disk.
+    expect(fs.existsSync(path.join(tmp, ".claude.json"))).toBe(false);
+  });
+
+  test("--dry-run with --mint skips the hub round-trip and operator-token check", () => {
+    // The whole point of --dry-run is "no side effects" — that includes
+    // the hub-mint network call. A naive implementation might still try
+    // to read operator.token and fail before the dry-run print fires.
+    setupBareVault(tmp, "default");
+    // Deliberately no operator.token file present, no PARACHUTE_HUB_ORIGIN.
+    const res = runCli(["mcp-install", "--dry-run"], tmp, { PARACHUTE_HUB_ORIGIN: "" });
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toMatch(/\[dry-run\]/);
+    expect(res.stderr).not.toMatch(/No operator token found/);
+    expect(res.stderr).not.toMatch(/No hub origin configured/);
   });
 
   test("subsequent --token install on top of an existing entry overwrites the bearer (user scope)", () => {

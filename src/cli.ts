@@ -53,6 +53,7 @@ import type { VaultConfig } from "./config.ts";
 import { DATA_DIR } from "./config.ts";
 import { installAgent, uninstallAgent, isAgentLoaded, restartAgent } from "./launchd.ts";
 import {
+  buildMcpConfigJson,
   buildMcpEntryPlan,
   chooseHubOrigin,
   detectInstallContext,
@@ -168,6 +169,9 @@ switch (command) {
     break;
   case "mcp-install":
     await cmdMcpInstall(cmdArgs);
+    break;
+  case "mcp-config":
+    await cmdMcpConfig(cmdArgs);
     break;
   case "remove":
   case "rm":
@@ -965,6 +969,7 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     "--install-scope",
     "--vault",
     "--client",
+    "--dry-run",
   ];
 
   const hasFlag = args.some((a) => MCP_INSTALL_FLAG_NAMES.includes(a));
@@ -1053,6 +1058,12 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
   }
 
   // --- Vault target. Default = default_vault; validate existence. ---
+  // Read --dry-run *before* the vault-existence guard so a probe like
+  // `mcp-install --vault future-vault --dry-run` can describe the
+  // intended write even when the vault hasn't been created yet. The
+  // dry-run contract ("no side effects, including failures on state
+  // the caller is asking us about") is broken otherwise.
+  const dryRun = args.includes("--dry-run");
   const vaultArg = takeArgValue(args, "--vault");
   if (vaultArg.missingValue) {
     console.error("--vault requires a value (the vault name).");
@@ -1062,7 +1073,7 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
   const defaultVault = globalConfig.default_vault || "default";
   const vaultName = vaultArg.value ?? defaultVault;
   const vaultExplicit = vaultArg.value !== undefined;
-  if (!readVaultConfig(vaultName)) {
+  if (!dryRun && !readVaultConfig(vaultName)) {
     console.error(`Vault "${vaultName}" not found. Available: ${listVaults().join(", ") || "(none)"}.`);
     process.exit(1);
   }
@@ -1075,6 +1086,7 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     vaultExplicit,
     pastedToken: mode === "token" ? tokenArg.value : undefined,
     globalConfig,
+    dryRun,
   });
 }
 
@@ -1110,6 +1122,107 @@ async function cmdMcpInstallInteractive(): Promise<void> {
   });
 }
 
+/**
+ * `parachute-vault mcp-config <vault-name>` — emit the JSON shape
+ * `claude -p --mcp-config '<json>'` consumes, scoped to a named vault.
+ * Pattern from Aaron's Gitcoin Brain runner:
+ *
+ *   claude -p --mcp-config "$(parachute-vault mcp-config gitcoin)" \
+ *             --strict-mcp-config ...
+ *
+ * Synthesizing this JSON by hand was per-script boilerplate every runner
+ * that spawned `claude -p` against a vault had to write. This command is
+ * the canonical synthesizer — the JSON shape is owned here once.
+ *
+ * No state is mutated; this only emits to stdout. The bearer is read from
+ * `--token <pvt_...>` or `PARACHUTE_VAULT_TOKEN` env (deliberate — we don't
+ * mint here, since this is a stdout-piped subprocess where prompting would
+ * deadlock the parent script). If neither is present, we exit 1 with a
+ * clear stderr message; runners get a fail-fast.
+ *
+ * Flags:
+ *   --token <bearer>   Bearer to embed verbatim (alternative: PARACHUTE_VAULT_TOKEN).
+ *   --base-url <url>   Override the auto-detected hub origin (default: chooseHubOrigin).
+ *                      Useful for tailnet-exposed hubs (`--base-url https://hub.tail.ts.net`).
+ *   --env-vars         Emit the template form with `${PARACHUTE_HUB_URL}` and
+ *                      `${PARACHUTE_VAULT_TOKEN}` placeholders rather than
+ *                      inlined values. Safe to commit; the shell expands at
+ *                      runtime.
+ */
+async function cmdMcpConfig(args: string[]): Promise<void> {
+  const vaultName = args[0];
+  if (!vaultName || vaultName.startsWith("--")) {
+    console.error("Usage: parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>] [--env-vars]");
+    console.error("");
+    console.error("Emits the JSON config consumed by `claude -p --mcp-config '<json>'`.");
+    console.error("Pattern: claude -p --mcp-config \"$(parachute-vault mcp-config <name>)\" --strict-mcp-config ...");
+    process.exit(1);
+  }
+
+  const tokenArg = takeArgValue(args, "--token");
+  if (tokenArg.missingValue) {
+    console.error("--token requires a value (the bearer to embed).");
+    process.exit(1);
+  }
+  const baseUrlArg = takeArgValue(args, "--base-url");
+  if (baseUrlArg.missingValue) {
+    console.error("--base-url requires a value (e.g. https://hub.example.ts.net).");
+    process.exit(1);
+  }
+  const useEnvVars = args.includes("--env-vars");
+
+  // --env-vars mode is shape-only — no need to resolve the vault, mint a
+  // token, or even verify the vault exists. Operators committing the
+  // template don't necessarily have the target vault on the machine
+  // generating the config.
+  if (useEnvVars) {
+    const json = buildMcpConfigJson({
+      vaultName,
+      baseUrl: "",
+      bearer: "",
+      useEnvVars: true,
+    });
+    process.stdout.write(json + "\n");
+    return;
+  }
+
+  // Literal mode: verify the vault exists locally, resolve the URL, and
+  // require a bearer (either --token or PARACHUTE_VAULT_TOKEN env).
+  if (!readVaultConfig(vaultName)) {
+    const available = listVaults();
+    console.error(`Vault "${vaultName}" not found. Available: ${available.join(", ") || "(none — run `parachute-vault create <name>`)"}.`);
+    process.exit(1);
+  }
+
+  const bearer = tokenArg.value ?? process.env.PARACHUTE_VAULT_TOKEN;
+  if (!bearer) {
+    console.error("No bearer token provided. Pass --token <bearer> or set PARACHUTE_VAULT_TOKEN.");
+    console.error("  Mint a token with: parachute-vault tokens create --vault " + vaultName);
+    console.error("  Or use --env-vars to emit the template form (safe to commit; expands at runtime).");
+    process.exit(1);
+  }
+
+  const globalConfig = readGlobalConfig();
+  const port = globalConfig.port || DEFAULT_PORT;
+  let baseUrl: string;
+  if (baseUrlArg.value) {
+    baseUrl = baseUrlArg.value;
+  } else {
+    // chooseHubOrigin walks PARACHUTE_HUB_ORIGIN → expose-state → loopback;
+    // for a script invoking `claude -p` against a local vault, loopback is
+    // the right default.
+    baseUrl = chooseHubOrigin(port).url;
+  }
+
+  const json = buildMcpConfigJson({
+    vaultName,
+    baseUrl,
+    bearer,
+    useEnvVars: false,
+  });
+  process.stdout.write(json + "\n");
+}
+
 interface ExecuteMcpInstallOpts {
   mode: "mint" | "token" | "legacy-pat";
   /** Full scope string (e.g. "vault:read"). The verb segment narrows downstream. */
@@ -1131,6 +1244,16 @@ interface ExecuteMcpInstallOpts {
   existingEntryKey?: string;
   /** Reused across the call chain to avoid re-parsing config.yaml. */
   globalConfig: ReturnType<typeof readGlobalConfig>;
+  /**
+   * When true, describe the write that *would* happen (target path,
+   * entry key, URL, install scope) and exit 0 without touching the
+   * filesystem or hitting the network for a hub-mint. Useful for
+   * probing the command from a script that's setting up a runner.
+   * Aaron hit this when accidentally creating an empty
+   * `projects[<cwd>]` entry while just running `--help` — see the
+   * `mcp-config` PR notes.
+   */
+  dryRun?: boolean;
 }
 
 /**
@@ -1140,7 +1263,7 @@ interface ExecuteMcpInstallOpts {
  * preview-and-confirm step so a cancel skips the network mint entirely.
  */
 async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
-  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig, existingEntryKey } = opts;
+  const { mode, rawScope, installScope, vaultName, vaultExplicit, pastedToken, globalConfig, existingEntryKey, dryRun } = opts;
   const verb = rawScope.split(":")[1]!;
   const target = resolveInstallTarget(installScope);
   // Single source of truth shared with the interactive walkthrough's
@@ -1153,6 +1276,29 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     port: globalConfig.port || DEFAULT_PORT,
     ...(existingEntryKey ? { existingEntryKey } : {}),
   });
+
+  // --dry-run: describe the write that *would* happen without touching
+  // the filesystem or minting any token. Print to stdout (scripts may
+  // parse this); exit 0. Skip the auth-acquisition entirely — the point
+  // of --dry-run is to inspect without side effects, including the
+  // network round-trip for hub-mint *and* the vault-existence guard
+  // (probing the install for a not-yet-created vault is a legitimate
+  // pre-create check, not an error).
+  if (dryRun) {
+    const vaultExists = readVaultConfig(vaultName) !== null;
+    console.log(`[dry-run] No changes written.`);
+    console.log(`  Target file:    ${target.path}`);
+    console.log(`  Install scope:  ${target.scope}`);
+    if (target.localProjectKey) {
+      console.log(`  Project key:    ${target.localProjectKey}`);
+    }
+    console.log(`  Entry key:      ${entryKey}`);
+    console.log(`  MCP URL:        ${url} (${source})`);
+    console.log(`  Auth mode:      ${mode}${mode === "mint" ? ` (scope vault:${vaultName}:${verb})` : ""}`);
+    console.log(`  Vault:          ${vaultName}${vaultExists ? "" : " (does not exist yet — create with `parachute-vault create " + vaultName + "`)"}`);
+    console.log(`  Re-run without --dry-run to apply.`);
+    return;
+  }
 
   let bearer: string;
   if (mode === "token") {
@@ -1248,6 +1394,12 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     console.log(`Added MCP server "${entryKey}" to ${target.path} under projects["${target.localProjectKey}"] (local scope).`);
     console.log(`  Installed locally for this directory only — runs only when Claude Code launches from ${target.localProjectKey}.`);
     console.log(`  To install globally instead, re-run with --install-scope user.`);
+    // Headless-flow heads-up: local-scope MCP entries do NOT propagate
+    // to subprocesses spawned by `claude -p` (script / cron / runner
+    // shapes), even with --setting-sources covering local. Operators
+    // wiring up a runner usually want `--install-scope user` so the
+    // entry reaches every `claude` invocation on this machine.
+    console.log(`  Headless flows (claude -p in scripts, cron, runners): prefer --install-scope user — local-scope entries don't propagate to claude -p subprocesses.`);
   } else {
     console.log(`Added MCP server "${entryKey}" to ${target.path}`);
   }
@@ -2921,6 +3073,7 @@ Vaults:
                               [--scope vault:read|vault:write|vault:admin]
                               [--install-scope local|user|project]
                               [--vault <name>] [--client claude-code]
+                              [--dry-run]
                                             Install vault MCP into a client config.
                                             From a terminal with no flags: walks you
                                             through a contextual conversation (vault,
@@ -2944,9 +3097,38 @@ Vaults:
                                             directory only). user writes top-level
                                             mcpServers (every project). project
                                             writes ./.mcp.json (check into the repo).
+                                            For headless flows (\`claude -p\` in
+                                            scripts, cron jobs, runners), prefer
+                                            --install-scope user — local-scope
+                                            entries don't propagate to claude -p
+                                            subprocesses; interactive sessions
+                                            from the install directory still see
+                                            local just fine.
                                             --vault <name> targets a specific
                                             vault and keys the entry as
                                             parachute-vault-<name>.
+                                            --dry-run prints the write that would
+                                            happen (target file, entry key, URL)
+                                            without touching disk or hitting the
+                                            hub. Useful for probing.
+
+  parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>]
+                                          [--env-vars]
+                                            Emit the JSON config consumed by
+                                            \`claude -p --mcp-config '<json>'\`.
+                                            Pattern:
+                                              claude -p --mcp-config \\
+                                                "$(parachute-vault mcp-config <name>)" \\
+                                                --strict-mcp-config ...
+                                            --token or PARACHUTE_VAULT_TOKEN env
+                                            supplies the bearer; both absent
+                                            exits 1 with a clear error.
+                                            --base-url overrides the auto-detected
+                                            origin (e.g. tailnet-exposed hubs).
+                                            --env-vars emits the template form
+                                            with \${PARACHUTE_HUB_URL} and
+                                            \${PARACHUTE_VAULT_TOKEN} placeholders
+                                            (safe to commit; expanded at runtime).
 
 Tokens:
   parachute-vault tokens                          List tokens (every vault)
