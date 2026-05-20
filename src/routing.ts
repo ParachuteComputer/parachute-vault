@@ -69,6 +69,8 @@ import {
 import { handleConfigSchema, handleConfig } from "./module-config.ts";
 import { buildAuthStatus } from "./auth-status.ts";
 import { getAuthorizeRateLimiter } from "./owner-auth.ts";
+import { handleMirrorGet, handleMirrorPut } from "./mirror-routes.ts";
+import { getMirrorManager } from "./mirror-registry.ts";
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -477,6 +479,50 @@ export async function route(
       );
     }
     return handleTokens(req, store, vaultName, auth.scopes, auth.scoped_tags, tokensMatch[1] ?? "");
+  }
+
+  // /.parachute/mirror — vault-sync Phase A1. Admin-gated read+write of
+  // the persistent mirror config + runtime status. Lives under
+  // `.parachute/` (alongside info/icon/config) rather than `admin/`
+  // because `/vault/<name>/admin/*` is reserved for the admin SPA's
+  // static-file mount; the API surface goes under `.parachute/` by the
+  // module-protocol convention. Per the design doc, the hub admin SPA
+  // (Phase A2 — future PR) is the eventual primary consumer; for Phase
+  // A1 these endpoints unblock direct API callers and the by-hand
+  // config workflow.
+  if (subpath === "/.parachute/mirror") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager();
+    if (!manager) {
+      // The boot path constructs a manager when at least one vault
+      // exists; a missing manager here means either a startup error or
+      // a brand-new deploy that hasn't finished first-boot. Surface a
+      // clear 503 rather than a JSON null so the operator + the hub
+      // SPA know it's a service-state issue, not a misconfig on their
+      // end.
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method === "GET") return handleMirrorGet(manager);
+    if (req.method === "PUT") return handleMirrorPut(req, manager);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);

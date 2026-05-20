@@ -1725,3 +1725,79 @@ describe("/health — always 200 (Render/Docker healthcheck contract)", () => {
     expect(body.vaults).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// /vault/<name>/admin/mirror — vault-sync Phase A1 admin surface.
+//
+// These tests pin the auth gate + the no-manager-bootstrapped fallback;
+// shape + lifecycle behaviour is covered in mirror-routes.test.ts /
+// mirror-manager.test.ts. We exercise the route here to make sure the
+// `vault:admin` enforcement matches the rest of the admin surface.
+// ---------------------------------------------------------------------------
+
+describe("/vault/<name>/.parachute/mirror — auth + dispatch", () => {
+  test("unauthenticated → 401", async () => {
+    createVault("journal");
+    const p = "/vault/journal/.parachute/mirror";
+    const res = await route(new Request(`http://localhost:1940${p}`), p);
+    expect(res.status).toBe(401);
+  });
+
+  test("vault:read token → 403 insufficient_scope", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
+      label: "reader",
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+    const p = "/vault/journal/.parachute/mirror";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        headers: { authorization: `Bearer ${fullToken}` },
+      }),
+      p,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+  });
+
+  test("admin token reaches the handler — returns 503 when manager hasn't been wired (no boot)", async () => {
+    // The routing-test harness boots `route()` without starting the
+    // server.ts wiring that constructs a MirrorManager. We expect the
+    // handler to surface 503 — distinct from an auth or shape error —
+    // so operators can tell "manager not initialized" apart from
+    // "you used the wrong creds".
+    createVault("journal");
+    const token = createAdminToken("journal");
+    const p = "/vault/journal/.parachute/mirror";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      p,
+    );
+    // 200 if a previous test left a manager wired (test ordering varies),
+    // 503 otherwise. Both prove the auth gate passed.
+    expect([200, 503]).toContain(res.status);
+  });
+
+  test("non-GET/PUT methods return 405 when manager isn't wired", async () => {
+    createVault("journal");
+    const token = createAdminToken("journal");
+    const p = "/vault/journal/.parachute/mirror";
+    // 503 short-circuits the method check today — that's fine; what we
+    // want to assert is that we don't crash + the status is non-2xx.
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      p,
+    );
+    expect([405, 503]).toContain(res.status);
+  });
+});

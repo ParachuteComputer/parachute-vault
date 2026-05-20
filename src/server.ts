@@ -27,6 +27,9 @@ import { startTranscriptionWorker, registerTranscriptionHook, type Transcription
 import { assetsDir } from "./routes.ts";
 import { resolveScribeAuthToken } from "./scribe-env.ts";
 import { resolveBindHostname } from "./bind.ts";
+import { MirrorManager } from "./mirror-manager.ts";
+import { setMirrorManager } from "./mirror-registry.ts";
+import { buildMirrorDeps } from "./mirror-deps.ts";
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -192,6 +195,47 @@ const globalConfig = readGlobalConfig();
 const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PORT;
 const hostname = resolveBindHostname();
 
+// ---------------------------------------------------------------------------
+// Mirror lifecycle (vault-sync Phase A1).
+//
+// Boot-time bootstrap of the persistent mirror manager. Only stands up an
+// active mirror when global config carries `mirror.enabled: true`; otherwise
+// the manager construct + status reflects "disabled" but no filesystem work
+// happens. The HTTP `/admin/mirror` routes can still flip it on at runtime
+// without a vault restart — see routing.ts + mirror-routes.ts.
+//
+// Failure here is logged and ignored; vault keeps serving. The operator
+// sees the error via `GET /admin/mirror` + the log line.
+// ---------------------------------------------------------------------------
+let mirrorManager: MirrorManager | null = null;
+{
+  const mirrorVaultName = globalConfig.default_vault ?? listVaults()[0] ?? null;
+  if (mirrorVaultName) {
+    try {
+      mirrorManager = new MirrorManager(buildMirrorDeps(mirrorVaultName));
+      setMirrorManager(mirrorManager);
+      // Don't block server startup on a slow initial export — kick it off
+      // in the background, log the outcome. The HTTP server comes up
+      // immediately so OAuth + REST aren't blocked behind a multi-second
+      // export pass.
+      void mirrorManager
+        .start()
+        .then((status) => {
+          if (!status.enabled && status.last_error) {
+            console.warn(`[mirror] startup error: ${status.last_error}`);
+          }
+        })
+        .catch((err) => {
+          console.warn(`[mirror] startup threw: ${(err as Error).message ?? err}`);
+        });
+    } catch (err) {
+      console.warn(`[mirror] manager construction failed: ${(err as Error).message ?? err}`);
+    }
+  } else {
+    console.log("[mirror] no vaults yet — manager will be initialized on next restart after a vault exists");
+  }
+}
+
 const server = Bun.serve({
   port,
   hostname,
@@ -250,6 +294,10 @@ async function shutdown(signal: string): Promise<void> {
       Promise.all([
         defaultHookRegistry.drain(),
         transcriptionWorker?.stop() ?? Promise.resolve(),
+        // Mirror manager: cancel the watch interval + let any in-flight
+        // export cycle settle. `stop` already has its own brief timeout
+        // (250ms) so this doesn't block the larger shutdown race.
+        mirrorManager?.stop() ?? Promise.resolve(),
       ]),
       new Promise<void>((resolve) => setTimeout(resolve, 5000)),
     ]);
