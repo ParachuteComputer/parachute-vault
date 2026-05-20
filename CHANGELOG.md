@@ -36,6 +36,71 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6-rc.5] — 2026-05-20
+
+Three small wins surfaced while Aaron was wiring the Gitcoin Brain
+runner (vault-as-job-substrate; a Python loop spawning
+`claude -p --mcp-config '<json>'` against a vault). Each was per-script
+boilerplate or a subtle footgun — folded into the CLI here.
+
+### Added
+
+- **`parachute-vault mcp-config <vault-name>`** — emits the JSON shape
+  consumed by `claude -p --mcp-config '<json>'` to stdout. The runner
+  pattern:
+
+  ```bash
+  export PARACHUTE_VAULT_TOKEN=pvt_...
+  claude -p --mcp-config "$(parachute-vault mcp-config gitcoin)" \
+            --strict-mcp-config ...
+  ```
+
+  Flags: `--token <bearer>` (alternative to `PARACHUTE_VAULT_TOKEN`);
+  `--base-url <url>` (override the auto-detected origin, useful for
+  tailnet-exposed hubs); `--env-vars` (emit the template form with
+  `${PARACHUTE_HUB_URL}` and `${PARACHUTE_VAULT_TOKEN}` placeholders —
+  safe to commit; shell-expanded at runtime). With no token and no
+  `--env-vars`, exits 1 with a clear error: runners get a fail-fast,
+  no surprise auto-minting. Literal mode verifies the vault exists
+  locally; `--env-vars` mode is shape-only and works offline.
+
+  The synthesizer lives in `mcp-install.ts:buildMcpConfigJson` so
+  third-party tools that import vault as a library can reuse the
+  shape. Tests in `mcp-config.test.ts` cover both modes + token
+  precedence + base-url override + the no-token / unknown-vault
+  error paths.
+
+- **`mcp-install --dry-run`** — prints the write that would happen
+  (target file, install scope, project key when local, entry key,
+  resolved MCP URL, auth mode) without touching disk or hitting the
+  hub for a mint. Aaron hit the inverse case: probing `mcp-install`
+  was creating an empty `projects[<cwd>]` entry in `~/.claude.json`
+  as a side effect. `--dry-run` is the deliberate "tell me what
+  you'd do" path for scripts wiring up runners. Skips the
+  operator-token check and the hub round-trip entirely — the point
+  is "no side effects, including network."
+
+### Changed
+
+- **`mcp-install` success message + help text recommend
+  `--install-scope user` for headless flows.** Local-scope MCP entries
+  (under `projects[<cwd>].mcpServers` — the default since vault#290)
+  are visible to interactive `claude` from the install directory but
+  do **not** propagate to `claude -p` subprocesses spawned by scripts,
+  even from the same directory and even with
+  `--setting-sources user,project,local`. Operators wiring up runners
+  need user-scope. The success-line heads-up on local installs now
+  says so; the README cookbook has a "headless flows" subsection with
+  the full explanation.
+
+- **README — Troubleshooting: 406 on manual `curl` to
+  `/vault/<name>/mcp`.** The MCP HTTP transport requires both
+  `application/json` and `text/event-stream` in the `Accept` header
+  (it negotiates between JSON response and the SSE streaming variant).
+  Claude Code's `--mcp-config` http transport sets this automatically;
+  the symptom only shows up when probing the endpoint by hand. Added
+  a short troubleshooting entry with the working `curl` invocation.
+
 ## [0.4.6-rc.4] — 2026-05-20
 
 Hub multi-user Phase 1 PR 5 — consumer-side adoption of the new
