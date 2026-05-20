@@ -812,6 +812,29 @@ docker compose up -d
 
 ### Cloud platforms
 
+#### Render — recommended (hub-managed, v0.6)
+
+Most users deploy vault via parachute-hub's `/admin/modules` after the
+hub itself is on Render. See <https://parachute.computer/deploy/render/>
+for the primary v0.6 self-host story: one Render Blueprint provisions
+hub on a persistent disk, then you install vault (and the other
+Parachute modules) from the hub's admin UI. The hub container
+supervises vault's process, the shared persistent disk holds vault
+state, and module upgrades flow through the admin UI rather than
+separate Render redeploys.
+
+#### Render — standalone vault (advanced)
+
+The `render.yaml` Blueprint at the repo root deploys vault as its own
+Render web service, separate from hub. This is the **advanced path** —
+useful when you want vault on its own container (separate scaling,
+isolated logs, vault-only deploy without a hub) but not what the
+typical v0.6 self-host wants. If you're not sure, use the hub-managed
+path above. The standalone Blueprint stays in tree because some
+operators specifically want this shape (vault#341).
+
+#### Other platforms
+
 **Railway** ($5/mo) — Deploy from GitHub, persistent volume, public URL.
 **Fly.io** ($3-5/mo) — `fly launch --copy-config && fly volumes create vault_data --size 1 && fly deploy`
 
