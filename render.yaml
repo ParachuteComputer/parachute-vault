@@ -1,5 +1,20 @@
 # Render Blueprint for self-hosting @openparachute/vault.
 #
+# ADVANCED — STANDALONE VAULT DEPLOY (vault#341)
+# ----------------------------------------------
+# This Blueprint runs vault as its OWN Render service. Most v0.6 users
+# do not want this — they want parachute-hub's render.yaml, which boots
+# hub on Render and then installs vault (and the other modules) via the
+# admin UI at /admin/modules. That's the primary v0.6 self-host story
+# and is documented at:
+#
+#     https://parachute.computer/deploy/render/
+#
+# Keep using this file only if you specifically want vault as its own
+# Render container (separate scaling, separate logs, vault-only deploy
+# without a hub). For the typical case, follow the link above instead.
+# ----------------------------------------------
+#
 # Layout: one `web` service (the vault HTTP server) backed by a persistent
 # disk at /parachute. Vault state lands at /parachute/vault/ (per-vault
 # SQLite DBs, config.yaml, .env, attachments). The hub Blueprint
@@ -102,3 +117,12 @@ services:
       # for any libraries that branch on NODE_ENV.
       - key: NODE_ENV
         value: production
+
+      # Optional: name your first-boot vault (default: "default"). When
+      # vault starts with zero vaults on disk, it auto-creates one named
+      # PARACHUTE_VAULT_NAME (if set + valid) or "default" (otherwise).
+      # Lowercase alphanumeric + hyphens or underscores, 2–32 chars; the
+      # name "list" is reserved. Uncomment and set in the Render dashboard
+      # to pick a name; leave commented to use "default".
+      # - key: PARACHUTE_VAULT_NAME
+      #   sync: false
