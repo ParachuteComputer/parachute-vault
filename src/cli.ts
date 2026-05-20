@@ -2866,6 +2866,12 @@ async function cmdExport(args: string[]) {
   let vaultName = "default";
   let outputPath = "";
   let since: string | undefined;
+  let watch = false;
+  let intervalSeconds = 5;
+  let gitCommit = false;
+  const { DEFAULT_COMMIT_TEMPLATE } = await import("./export-watch.ts");
+  let gitMessageTemplate = DEFAULT_COMMIT_TEMPLATE;
+  let gitPush = false;
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -2892,6 +2898,31 @@ async function cmdExport(args: string[]) {
         process.exit(1);
       }
       since = v;
+    } else if (arg === "--watch") {
+      watch = true;
+    } else if (arg === "--interval") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--interval requires a number of seconds.");
+        process.exit(1);
+      }
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error(`--interval: must be a positive number of seconds (got '${v}')`);
+        process.exit(1);
+      }
+      intervalSeconds = n;
+    } else if (arg === "--git-commit") {
+      gitCommit = true;
+    } else if (arg === "--git-message-template") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--git-message-template requires a value.");
+        process.exit(1);
+      }
+      gitMessageTemplate = v;
+    } else if (arg === "--git-push") {
+      gitPush = true;
     } else {
       positional.push(arg);
     }
@@ -2899,13 +2930,37 @@ async function cmdExport(args: string[]) {
   outputPath = positional[0] ?? "";
 
   if (!outputPath) {
-    console.error("Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>]");
+    console.error(
+      "Usage: parachute-vault export <dir> [--since <iso>] [--vault <name>]\n" +
+        "                                  [--watch [--interval <seconds>]]\n" +
+        "                                  [--git-commit [--git-message-template <tpl>] [--git-push]]",
+    );
     console.error("\nExports a Parachute Vault as portable markdown — round-trippable across");
     console.error("Obsidian / Logseq / Foam / Quartz / Dendron and most markdown SSGs.");
     console.error("\nOptions:");
-    console.error("  --vault <name>       Source vault (default: 'default')");
-    console.error("  --since <iso>        Only export notes whose updated_at >= ISO timestamp");
-    console.error("                       (incremental — useful for git-projection cadences)");
+    console.error("  --vault <name>              Source vault (default: 'default')");
+    console.error("  --since <iso>               Only export notes whose updated_at >= ISO timestamp");
+    console.error("                              (incremental — useful for git-projection cadences)");
+    console.error("  --watch                     Stay alive; re-export incrementally on every");
+    console.error("                              vault write. Polls every --interval seconds.");
+    console.error("  --interval <seconds>        Watch poll interval (default: 5)");
+    console.error("  --git-commit                After each export, `git add -A` + commit in <dir>.");
+    console.error("                              Requires <dir> to be an initialized git repo.");
+    console.error("                              Combine with --watch for auto-history.");
+    console.error("  --git-message-template <t>  Commit message template. Variables:");
+    console.error("                                {{date}}, {{notes_changed}}, {{plural}},");
+    console.error("                                {{first_note_title}}, {{vault_name}}");
+    console.error("                              (default: \"export: {{date}} ({{notes_changed}} note{{plural}})\")");
+    console.error("  --git-push                  After commit, run `git push` (non-fatal on failure).");
+    process.exit(1);
+  }
+
+  if (intervalSeconds !== 5 && !watch) {
+    console.error("--interval only applies with --watch.");
+    process.exit(1);
+  }
+  if ((gitPush || gitMessageTemplate !== DEFAULT_COMMIT_TEMPLATE) && !gitCommit) {
+    console.error("--git-push / --git-message-template only apply with --git-commit.");
     process.exit(1);
   }
 
@@ -2924,25 +2979,180 @@ async function cmdExport(args: string[]) {
 
   const store = getVaultStore(vaultName);
   const assetsDirPath = assetsDir(vaultName);
-  console.log(`Exporting vault "${vaultName}" to ${fullPath}${since ? ` (since ${since})` : ""}`);
-  const stats = await exportVaultToDir(store, {
-    outDir: fullPath,
-    vaultName,
-    assetsDir: assetsDirPath,
-    ...(config.description ? { vaultDescription: config.description } : {}),
-    ...(since ? { since } : {}),
-  });
+  const vaultDescription = config.description;
 
-  console.log(`Exported ${stats.notes} note(s), ${stats.schemas} tag schema(s), ${stats.attachments} attachment(s).`);
-  console.log(`Sidecar: ${fullPath}/.parachute/`);
-  if (stats.filtered_by_since) {
-    console.log(`Incremental: filtered by --since ${since}.`);
+  // Git-repo precheck: fail fast and loud before we run a long-lived loop.
+  if (gitCommit) {
+    await ensureGitRepo(fullPath);
   }
-  if (stats.skipped_traversal > 0) {
-    console.log(`Note: ${stats.skipped_traversal} note(s) skipped (path-traversal). See [export] warnings above.`);
+
+  /**
+   * Run a single export cycle: export → optionally commit/push. Returns the
+   * stats + a freshly-captured cursor for the next incremental run. We
+   * capture the cursor *before* the export starts, so any write that lands
+   * during the export is picked up next cycle (cost: at most one note
+   * re-exported next round when its `updated_at` equals our cursor).
+   */
+  async function runCycle(opts: { sinceCursor?: string; isInitial: boolean }): Promise<{
+    stats: Awaited<ReturnType<typeof exportVaultToDir>>;
+    nextCursor: string;
+    committed: boolean;
+  }> {
+    const nextCursor = new Date().toISOString();
+    if (opts.isInitial) {
+      console.log(
+        `Exporting vault "${vaultName}" to ${fullPath}${opts.sinceCursor ? ` (since ${opts.sinceCursor})` : ""}`,
+      );
+    }
+    const stats = await exportVaultToDir(store, {
+      outDir: fullPath,
+      vaultName,
+      assetsDir: assetsDirPath,
+      ...(vaultDescription ? { vaultDescription } : {}),
+      ...(opts.sinceCursor ? { since: opts.sinceCursor } : {}),
+    });
+
+    if (opts.isInitial) {
+      console.log(
+        `Exported ${stats.notes} note(s), ${stats.schemas} tag schema(s), ${stats.attachments} attachment(s).`,
+      );
+      console.log(`Sidecar: ${fullPath}/.parachute/`);
+      if (stats.filtered_by_since) {
+        console.log(`Incremental: filtered by --since ${opts.sinceCursor}.`);
+      }
+      if (stats.skipped_traversal > 0) {
+        console.log(
+          `Note: ${stats.skipped_traversal} note(s) skipped (path-traversal). See [export] warnings above.`,
+        );
+      }
+      if (stats.skipped_attachments.length > 0) {
+        console.log(
+          `Note: ${stats.skipped_attachments.length} attachment(s) skipped. See [export] warnings above.`,
+        );
+      }
+    } else {
+      // Watch-mode status line: keep tight; the loop logs every interval.
+      if (stats.notes > 0) {
+        console.log(
+          `[watch] exported ${stats.notes} note${stats.notes === 1 ? "" : "s"} (cursor: ${nextCursor})`,
+        );
+      } else {
+        console.log(`[watch] no changes`);
+      }
+    }
+
+    let committed = false;
+    if (gitCommit) {
+      const { runGitCommitCycle } = await import("./export-watch.ts");
+      const commitResult = await runGitCommitCycle({
+        repoDir: fullPath,
+        template: gitMessageTemplate,
+        notesChanged: stats.notes,
+        vaultName,
+        firstNoteTitle: await firstChangedNoteTitle(store, opts.sinceCursor),
+        push: gitPush,
+      });
+      committed = commitResult.committed;
+    }
+
+    return { stats, nextCursor, committed };
   }
-  if (stats.skipped_attachments.length > 0) {
-    console.log(`Note: ${stats.skipped_attachments.length} attachment(s) skipped. See [export] warnings above.`);
+
+  // ---- Single-shot mode ----
+  if (!watch) {
+    await runCycle({ sinceCursor: since, isInitial: true });
+    return;
+  }
+
+  // ---- Watch mode ----
+  // Initial full (or since-filtered) export, then poll every interval.
+  const initial = await runCycle({ sinceCursor: since, isInitial: true });
+  let cursor = initial.nextCursor;
+  console.log(`[watch] polling every ${intervalSeconds}s; press Ctrl-C to stop.`);
+
+  let stopping = false;
+  let inFlight = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const onStop = () => {
+    if (stopping) return;
+    stopping = true;
+    // Clear the interval immediately so the timer can't fire one more
+    // time during the in-flight settle window — `stopping` already guards
+    // re-entry, but symmetry beats relying on that guard.
+    if (timer) clearInterval(timer);
+    console.log("\n[watch] stopping watch");
+    // Give an in-flight cycle a brief moment to settle, then exit. Don't
+    // hang forever — operator hit Ctrl-C, they want out.
+    setTimeout(() => process.exit(0), inFlight ? 250 : 0);
+  };
+  process.on("SIGINT", onStop);
+  process.on("SIGTERM", onStop);
+
+  timer = setInterval(async () => {
+    if (stopping || inFlight) return;
+    inFlight = true;
+    try {
+      const cycle = await runCycle({ sinceCursor: cursor, isInitial: false });
+      cursor = cycle.nextCursor;
+    } catch (err) {
+      // Don't kill the loop on a transient export error — log and keep
+      // polling. Operator can Ctrl-C if they want to bail.
+      console.error(`[watch] export error: ${(err as Error).message ?? err}`);
+    } finally {
+      inFlight = false;
+    }
+  }, intervalSeconds * 1000);
+  // Keep a reference so the timer isn't GC'd; nothing else holds the loop open.
+  timer.unref?.();
+  // Block forever (signal handler is the exit path).
+  await new Promise(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Export-watch glue. The git-shell + commit-message logic lives in
+// `./export-watch.ts` for unit-testability; cli.ts just wires it in.
+// ---------------------------------------------------------------------------
+
+async function ensureGitRepo(dir: string): Promise<void> {
+  const { isGitRepo } = await import("./export-watch.ts");
+  if (!(await isGitRepo(dir))) {
+    console.error(
+      `error: --git-commit requires "${dir}" to be a git repo.\n` +
+        `Initialize it first:\n` +
+        `  cd "${dir}" && git init && git add -A && git commit -m "initial"\n` +
+        `Then re-run the export.`,
+    );
+    process.exit(1);
+  }
+}
+
+/**
+ * Snapshot the title of the first changed note since `cursor` — used as the
+ * `{{first_note_title}}` template variable for single-note commit messages.
+ * Best-effort: returns empty string when nothing matches, or when the cursor
+ * is unset (initial export, where "first changed note" is ambiguous).
+ *
+ * Filters at the DB layer via `dateFilter: { field: "updated_at", from:
+ * cursor }` — earlier versions used `sort: "asc"` + `limit: 1` + a
+ * client-side `stamp >= cursor` post-filter, which fetched the vault's
+ * oldest note and almost always failed the filter, rendering the template
+ * variable as empty in production. See vault#346 reviewer note.
+ */
+async function firstChangedNoteTitle(
+  store: ReturnType<typeof import("./vault-store.ts")["getVaultStore"]>,
+  cursor: string | undefined,
+): Promise<string> {
+  if (!cursor) return "";
+  try {
+    const notes = await store.queryNotes({
+      limit: 1,
+      sort: "asc",
+      dateFilter: { field: "updated_at", from: cursor },
+    });
+    return notes[0]?.path ?? notes[0]?.id ?? "";
+  } catch {
+    // Best-effort; template var defaults to empty.
+    return "";
   }
 }
 
@@ -3175,6 +3385,12 @@ Import/Export:
   parachute-vault export <dir>                        Export vault as portable markdown
                                                        (Obsidian/Logseq/Foam/Quartz-compatible)
   parachute-vault export <dir> --since <iso>          Incremental: only notes updated_at >= ISO
+  parachute-vault export <dir> --watch                Stay alive; re-export on every write
+                                                       (poll every --interval seconds, default 5)
+  parachute-vault export <dir> --git-commit           After export, git add -A + commit in <dir>
+                                                       (combine with --watch for auto-history;
+                                                       template via --git-message-template;
+                                                       --git-push to push after commit)
 
 ── Advanced / standalone ──────────────────────────────────────────────
 

@@ -36,6 +36,72 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.6-rc.6] — 2026-05-20
+
+Aaron's Gitcoin Brain build wants vault as the system of record and a git
+mirror as the auto-history projection — same shape as the `vault-portable-
+export` cookbook's "git-as-projection" recipe, but live instead of cron-
+driven. This rc folds the two missing primitives directly into the CLI so
+the operator wires one command, not a cron + a webhook + a shell script.
+
+### Added
+
+- **`parachute-vault export <dir> --watch [--interval <seconds>]`** — stay
+  alive after the initial export, re-export incrementally on every vault
+  write. Detection is polling on `updated_at >= cursor` (vault writes are
+  HTTP-mediated; the bun:sqlite DB is opaque to filesystem watchers, so
+  polling is the simplest robust signal). Default interval 5s. Each cycle
+  prints a tight status line — `[watch] exported N notes (cursor: ISO)` or
+  `[watch] no changes`. Graceful shutdown on SIGINT/SIGTERM
+  (`[watch] stopping watch`, exit 0).
+
+- **`parachute-vault export <dir> --git-commit [--git-message-template <t>] [--git-push]`**
+  — after each export, `git add -A` + `git commit -m <rendered-template>`
+  in `<dir>`. Repo must already be initialized (fails fast with `git init`
+  guidance, not after sitting in a watch loop emitting the same error every
+  interval). Template variables: `{{date}}`, `{{notes_changed}}`,
+  `{{plural}}` (empty when notes_changed === 1), `{{first_note_title}}`,
+  `{{vault_name}}`. Default template:
+  `export: {{date}} ({{notes_changed}} note{{plural}})`. Empty commits
+  skipped; pure `.parachute/vault.yaml` `exported_at` churn (no real note
+  changes) is detected and skipped too, so a watch loop doesn't grow a
+  commit every interval. `--git-push` is non-fatal on failure — a network
+  blip warns but doesn't kill the loop.
+
+- **Combined `--watch --git-commit`** — the canonical Aaron-Gitcoin-Brain
+  setup. Vault writes flow through to git history automatically with no
+  cron, no webhook, no shell glue:
+
+  ```bash
+  parachute-vault export ~/projections/team-brain --watch --git-commit --git-push
+  ```
+
+  Drop that command in a launchd plist (or `parachute start`-style
+  supervisor) and the git mirror tracks the vault.
+
+### Implementation notes
+
+- No new deps. `git add/commit/push` are shelled out via `Bun.spawn`.
+  Helpers live in `src/export-watch.ts` (`renderCommitMessage`,
+  `shouldCommit`, `runGitCommitCycle`, …) so they're unit-testable without
+  spawning the full CLI.
+- Watch loop uses `setInterval` with an in-flight guard so a slow cycle
+  doesn't stack tasks. Cursor is captured *before* each export runs, so a
+  write that lands mid-export is picked up next cycle (cost: at most one
+  re-exported note when `updated_at` equals the cursor — `>=` semantics).
+- Tests cover the pure helpers, the git shell helpers against real
+  throwaway repos, and three CLI end-to-end scenarios:
+  initial-export-only-on-idle, write-triggers-re-export, and the combined
+  watch+git-commit happy path.
+
+### Cookbook
+
+The `parachute-vault export` recipe in
+`parachute-patterns/cookbook/vault-portable-export.md` now has the
+"live projection" idiom alongside the existing cron-driven version. The
+git-projection design doc on parachute.computer goes long on when to
+reach for which.
+
 ## [0.4.6-rc.5] — 2026-05-20
 
 Three small wins surfaced while Aaron was wiring the Gitcoin Brain
