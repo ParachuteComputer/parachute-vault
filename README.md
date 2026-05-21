@@ -339,16 +339,45 @@ Webhook servers (scribe, narrate) are stateless — they don't need vault's API 
 
 ### On-upload transcription
 
-The trigger system above handles the "tag a note and let a webhook fill in content later" shape. Clients that already know at upload time that an audio file should be transcribed can take a shorter path: `POST /api/notes/{id}/attachments` with `{transcribe: true}` in the body. The vault stamps the attachment with `transcribe_status: "pending"` and the note with `transcribe_stub: true`, then a background worker drains the queue FIFO.
+Two paths feed the same transcription worker; they differ in how the
+result surfaces.
 
-Enable the worker by pointing the server at a Whisper-compatible endpoint:
+**Auto-transcribe (vault#353).** When the operator flips
+`auto_transcribe.enabled: true` in vault's config AND scribe is
+reachable (registered in `~/.parachute/services.json`, or pointed at
+via `SCRIBE_URL`), any audio attachment uploaded to the vault is
+automatically queued for transcription. The worker writes a sibling
+`<attachment-path>.transcript.md` note with the transcript text +
+frontmatter linking back to the audio (`transcript_of`,
+`transcript_status`, `transcript_duration_ms`, etc.). Failures land as
+the same note with `transcript_status: failed` and the cause in
+`transcript_error`; the original audio is preserved. Operators can
+retry a failed transcript via `POST /vault/<name>/api/notes/<note-id>/retry-transcription`.
 
-```
-SCRIBE_URL=http://localhost:3200
-SCRIBE_TOKEN=optional-bearer-token
-```
+**Explicit `transcribe: true` (legacy, Lens flow).** Callers that already
+know at upload time that an audio file should be transcribed pass
+`transcribe: true` to `POST /api/notes/{id}/attachments`. The vault
+stamps the attachment with `transcribe_status: "pending"` and the note
+with `transcribe_stub: true`. The worker replaces the literal
+`_Transcript pending._` placeholder in the note body with the transcript
+on success (or the whole body if no placeholder is present).
 
-The worker POSTs audio as multipart to `${SCRIBE_URL}/v1/audio/transcriptions` and expects `{ text: string }` back. On success it replaces the `_Transcript pending._` placeholder in the note body (or the whole body if the placeholder is absent), clears `transcribe_stub`, and records `transcript` + `transcribe_done_at` on the attachment. If the user edited the note and cleared `transcribe_stub` before the transcript landed, the note is left alone — but the transcript is still stored on the attachment. Failures retry with exponential backoff up to three attempts before flipping `transcribe_status` to `"failed"`.
+Service discovery is automatic — when scribe lands in
+`~/.parachute/services.json` (the canonical hub-maintained registry),
+vault picks up its URL on next restart. The `SCRIBE_URL` env var still
+wins when set. The shared bearer for vault→scribe auth is generated
+once at first boot and persisted to `~/.parachute/vault/.env` as
+`SCRIBE_AUTH_TOKEN`; mirror that value into scribe's
+`SCRIBE_AUTH_TOKEN` env so scribe accepts the Authorization header.
+
+The worker POSTs audio as multipart to
+`${SCRIBE_URL}/v1/audio/transcriptions` and expects `{ text: string }`
+back. On success it records `transcript` + `transcribe_done_at` +
+`transcribe_duration_ms` on the attachment row regardless of the
+result-surface path. Failures retry with exponential backoff up to three
+attempts before flipping `transcribe_status` to `"failed"`; 4xx
+responses carrying `error_code` (e.g. `missing_provider`) are treated as
+terminal on the first failure.
 
 Per-vault `audio_retention` controls what happens to the audio file on disk once the worker reaches a terminal state. It's readable and mutable at runtime via `GET` / `PATCH /api/vault` (under `config.audio_retention`), or by hand-editing `vault.yaml`.
 

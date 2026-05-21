@@ -277,6 +277,24 @@ export interface GlobalConfig {
    * resolved path. See `./mirror-config.ts`.
    */
   mirror?: MirrorConfigType;
+  /**
+   * Auto-transcribe configuration for the vault↔scribe handoff (vault#353,
+   * design 2026-05-21 Part 2). When `enabled: true` AND scribe is discoverable
+   * (`services.json` or `SCRIBE_URL` env), audio attachments uploaded to any
+   * vault are automatically sent to scribe and the resulting transcript lands
+   * as a sibling `<attachment-path>.transcript.md` note.
+   *
+   * URL + bearer are not stored here — URL is resolved per-process from
+   * `services.json` via `scribe-discovery.ts`, and bearer comes from the
+   * `SCRIBE_AUTH_TOKEN` env var (persisted in `~/.parachute/vault/.env`).
+   * The schema's `autoTranscribe.scribeUrl` / `autoTranscribe.scribeBearer`
+   * fields are projection of those resolved values (readOnly / writeOnly),
+   * not separate storage.
+   */
+  auto_transcribe?: {
+    /** Master toggle. Default false; the worker is a no-op when unset. */
+    enabled?: boolean;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1159,22 @@ export function readGlobalConfig(): GlobalConfig {
       const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
       const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
       const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
+      // auto_transcribe block — currently single boolean `enabled` (vault#353).
+      // Parsed as a nested 2-space-indent block so future fields can grow under
+      // it without breaking the regex; only `enabled` is read for v0.6.
+      const autoTranscribeStart = yaml.match(/^auto_transcribe:\s*$/m);
+      let autoTranscribeEnabled: boolean | undefined;
+      if (autoTranscribeStart) {
+        const after = yaml.slice((autoTranscribeStart.index ?? 0) + autoTranscribeStart[0].length);
+        for (const line of after.split("\n")) {
+          if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+          const m = line.match(/^\s+enabled:\s*(true|false)/);
+          if (m) {
+            autoTranscribeEnabled = m[1]! === "true";
+            break;
+          }
+        }
+      }
       const config: GlobalConfig = {
         port: portMatch ? parseInt(portMatch[1]!, 10) : DEFAULT_PORT,
         default_vault: defaultVaultMatch?.[1],
@@ -1152,6 +1186,9 @@ export function readGlobalConfig(): GlobalConfig {
       }
       if (autostartMatch) {
         config.autostart = autostartMatch[1]! === "true";
+      }
+      if (autoTranscribeEnabled !== undefined) {
+        config.auto_transcribe = { enabled: autoTranscribeEnabled };
       }
 
       // Parse backup_codes: a YAML list of quoted bcrypt hashes under
@@ -1297,6 +1334,13 @@ export function writeGlobalConfig(config: GlobalConfig): void {
     lines.push(...serializeMirrorSection(config.mirror));
   }
 
+  if (config.auto_transcribe) {
+    lines.push("auto_transcribe:");
+    if (config.auto_transcribe.enabled !== undefined) {
+      lines.push(`  enabled: ${config.auto_transcribe.enabled}`);
+    }
+  }
+
   // 0600 — owner read/write only. This file may contain the bcrypt password
   // hash and plaintext TOTP secret; it must not be world- or group-readable.
   writeFileSync(globalConfigPath(), lines.join("\n") + "\n", { mode: 0o600 });
@@ -1395,7 +1439,15 @@ export function writeEnvFile(env: Record<string, string>): void {
       lines.push(`${key}=${val}`);
     }
   }
-  writeFileSync(envFilePath(), lines.join("\n") + "\n");
+  // 0600 — owner read/write only. This file holds SCRIBE_AUTH_TOKEN (the
+  // vault↔scribe loopback bearer) and any other secrets the operator drops
+  // in via `parachute-vault config set`. It must not be world- or
+  // group-readable on shared-user machines or Docker images with a loose
+  // umask. Mirrors the writeGlobalConfig pattern above.
+  writeFileSync(envFilePath(), lines.join("\n") + "\n", { mode: 0o600 });
+  // writeFileSync's `mode` only applies on file creation, so chmod an existing
+  // file explicitly in case it was written by an older version at 0644.
+  try { chmodSync(envFilePath(), 0o600); } catch {}
 }
 
 /**

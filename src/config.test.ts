@@ -1,9 +1,12 @@
 import { describe, test, expect } from "bun:test";
+import { statSync } from "fs";
+import { join } from "path";
 import {
   writeVaultConfig,
   readVaultConfig,
   writeGlobalConfig,
   readGlobalConfig,
+  writeEnvFile,
   generateApiKey,
   hashKey,
   verifyKey,
@@ -208,6 +211,29 @@ describe("config", () => {
     );
     const reloaded = readGlobalConfig();
     expect(reloaded.api_keys?.find((k) => k.id === "k_legacy")?.scope).toBe("write");
+  });
+
+  test("writeEnvFile writes .env at 0600 (SCRIBE_AUTH_TOKEN secrecy)", () => {
+    // Regression for vault#354 reviewer finding: the .env holds
+    // SCRIBE_AUTH_TOKEN (the vault↔scribe loopback bearer). On a
+    // shared-user machine or a Docker image with a loose umask, a
+    // world-readable .env would leak the bearer to any local process.
+    //
+    // Resolve the path dynamically from PARACHUTE_HOME (not the
+    // module-load-time `ENV_PATH` constant) so this test is robust to
+    // earlier tests in the suite that mutate PARACHUTE_HOME — writeEnvFile
+    // itself resolves the path dynamically via `envFilePath()`.
+    const envPath = join(process.env.PARACHUTE_HOME!, "vault", ".env");
+    writeEnvFile({ SCRIBE_AUTH_TOKEN: "test-bearer-do-not-leak", PORT: "1940" });
+    const mode = statSync(envPath).mode & 0o777;
+    expect(mode).toBe(0o600);
+
+    // Existing-file branch: writeFileSync's `mode` only applies on
+    // create, so the defensive chmodSync must downgrade an existing
+    // (e.g. 0644-from-an-older-version) .env to 0600 on the next write.
+    writeEnvFile({ SCRIBE_AUTH_TOKEN: "rotated", PORT: "1940" });
+    const mode2 = statSync(envPath).mode & 0o777;
+    expect(mode2).toBe(0o600);
   });
 
   test("round-trips autostart: true|false (#113)", () => {

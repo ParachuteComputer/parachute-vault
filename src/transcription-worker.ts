@@ -54,6 +54,7 @@ import type { Store, Attachment } from "../core/src/types.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
 import type { TriggerIncludeContext } from "./config.ts";
+import { upsertTranscriptNote } from "./transcript-note.ts";
 
 /** Placeholder pattern written by Lens's voice-memo stub. */
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
@@ -139,7 +140,36 @@ interface PendingMeta {
   transcribe_error?: string;
   transcript?: string;
   transcribe_done_at?: string;
+  /**
+   * Marker stamped by the attachment-write code path (vault#353) when the
+   * audio attachment was queued via the auto-transcribe pipeline (mime-type
+   * matched `audio/*` AND `autoTranscribe.enabled === true`). When set to
+   * `"auto"`, the worker materializes a `<attachment-path>.transcript.md`
+   * note on terminal states (success OR failure) so the transcript surface
+   * is uniform regardless of outcome. Absent or set to `"legacy"`, the
+   * worker preserves the original stub-patching behavior (Lens flow).
+   */
+  transcribe_origin?: "auto" | "legacy";
   [k: string]: unknown;
+}
+
+/**
+ * Structured error thrown when scribe returns a 4xx with a recognized
+ * `error_code` — we surface the code on the transcript note's frontmatter
+ * so callers can branch on stable strings instead of regex-matching message
+ * text. Today the canonical code is `missing_provider` (scribe#47).
+ */
+class ScribeApiError extends Error {
+  readonly errorCode?: string;
+  readonly httpStatus: number;
+  readonly retriable: boolean;
+  constructor(message: string, opts: { errorCode?: string; httpStatus: number; retriable: boolean }) {
+    super(message);
+    this.name = "ScribeApiError";
+    this.errorCode = opts.errorCode;
+    this.httpStatus = opts.httpStatus;
+    this.retriable = opts.retriable;
+  }
 }
 
 /**
@@ -216,6 +246,38 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     }
   }
 
+  /**
+   * On a terminal failure for an attachment with `transcribe_origin: "auto"`,
+   * write (or update) a `<attachment-path>.transcript.md` note with
+   * `transcript_status: failed` so the user has a queryable record of the
+   * failure and a target for the retry endpoint. Best-effort: any error
+   * materializing the transcript note is logged, never propagated — the
+   * attachment metadata write is the durable record of failure.
+   */
+  async function writeFailureTranscriptNote(
+    store: Store,
+    attachment: Attachment,
+    errMsg: string,
+    errorCode: string | undefined,
+    durationMs: number | undefined,
+  ): Promise<void> {
+    try {
+      await upsertTranscriptNote(store, {
+        attachmentPath: attachment.path,
+        attachmentId: attachment.id,
+        attachmentNoteId: attachment.noteId,
+        status: "failed",
+        error: errorCode ? `${errorCode}: ${errMsg}` : errMsg,
+        durationMs,
+      });
+    } catch (err) {
+      logger.error(
+        `[transcribe] failed to write failure transcript note for attachment ${attachment.id}:`,
+        err,
+      );
+    }
+  }
+
   async function processOneLocked(vault: string, attachment: Attachment): Promise<void> {
     const store = opts.getStore(vault);
     // Re-read metadata — the in-memory `attachment` may be stale (the hook
@@ -226,6 +288,10 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     if (meta.transcribe_status !== "pending") return;
 
     const attempts = (meta.transcribe_attempts as number | undefined) ?? 0;
+    // Whether to materialize a transcript note (vault#353 auto-transcribe path)
+    // vs. the legacy stub-patching path (Lens flow). Auto-write notes also
+    // surface failures so the user can retry from the transcript note.
+    const isAutoOrigin = meta.transcribe_origin === "auto";
 
     // Honor backoff — we re-check here in case another tick queued this
     // attachment between the listing and now.
@@ -243,7 +309,11 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         transcribe_status: "failed",
         transcribe_error: "audio file not found",
       });
-      await applyFailureMarker(store, attachment.noteId);
+      if (isAutoOrigin) {
+        await writeFailureTranscriptNote(store, attachment, "audio file not found", undefined, undefined);
+      } else {
+        await applyFailureMarker(store, attachment.noteId);
+      }
       return;
     }
 
@@ -256,9 +326,9 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       context = await fetchContextEntries(store, predicates, logger);
     }
 
-    let transcript: string;
+    let scribeResult: { text: string; durationMs: number };
     try {
-      transcript = await callScribe({
+      scribeResult = await callScribe({
         url: opts.scribeUrl,
         token: opts.scribeToken,
         filePath,
@@ -269,17 +339,34 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         fetchImpl,
       });
     } catch (err) {
-      const nextAttempts = attempts + 1;
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (nextAttempts >= maxAttempts) {
-        logger.error(`[transcribe] giving up on attachment ${attachment.id} after ${nextAttempts} attempts:`, errMsg);
+      const apiErr = err instanceof ScribeApiError ? err : null;
+      // 4xx with structured error code → terminal immediately. Re-POSTing the
+      // same audio at a scribe with no provider configured (or that rejects
+      // our bearer) will keep failing — the operator has to act, retries don't
+      // help. This is the "graceful first-boot path" from design Q5.
+      const nonRetriable = apiErr !== null && !apiErr.retriable;
+      const nextAttempts = attempts + 1;
+      const terminal = nonRetriable || nextAttempts >= maxAttempts;
+
+      if (terminal) {
+        if (nonRetriable) {
+          logger.error(`[transcribe] non-retriable scribe error on attachment ${attachment.id} (status ${apiErr!.httpStatus}${apiErr!.errorCode ? `, ${apiErr!.errorCode}` : ""}):`, errMsg);
+        } else {
+          logger.error(`[transcribe] giving up on attachment ${attachment.id} after ${nextAttempts} attempts:`, errMsg);
+        }
         await store.setAttachmentMetadata(attachment.id, {
           ...meta,
           transcribe_status: "failed",
           transcribe_attempts: nextAttempts,
           transcribe_error: errMsg,
+          ...(apiErr?.errorCode ? { transcribe_error_code: apiErr.errorCode } : {}),
         });
-        await applyFailureMarker(store, attachment.noteId);
+        if (isAutoOrigin) {
+          await writeFailureTranscriptNote(store, attachment, errMsg, apiErr?.errorCode, undefined);
+        } else {
+          await applyFailureMarker(store, attachment.noteId);
+        }
         // retention=never drops the audio on any terminal state, including
         // failure. The user opted in to "I don't want the audio kept around
         // regardless of outcome" — honor it.
@@ -302,23 +389,46 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       return;
     }
 
-    // Success. Apply to note if the caller still wants us to.
-    const note = await store.getNote(attachment.noteId);
-    if (note) {
-      const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
-      if (noteMeta.transcribe_stub === true) {
-        const body = TRANSCRIPT_PLACEHOLDER.test(note.content)
-          ? note.content.replace(TRANSCRIPT_PLACEHOLDER, transcript)
-          : transcript;
-        const { transcribe_stub: _drop, ...restMeta } = noteMeta;
-        try {
-          await store.updateNote(note.id, {
-            content: body,
-            metadata: restMeta,
-            skipUpdatedAt: true,
-          });
-        } catch (err) {
-          logger.error(`[transcribe] failed to apply transcript to note ${note.id}:`, err);
+    const { text: transcript, durationMs } = scribeResult;
+
+    // Auto-origin success: materialize the transcript note (vault#353). The
+    // note's path is `<attachment-path>.transcript.md`, its frontmatter links
+    // back to the audio attachment via `transcript_of`.
+    if (isAutoOrigin) {
+      try {
+        await upsertTranscriptNote(store, {
+          attachmentPath: attachment.path,
+          attachmentId: attachment.id,
+          attachmentNoteId: attachment.noteId,
+          status: "complete",
+          text: transcript,
+          durationMs,
+        });
+      } catch (err) {
+        // Note write failure doesn't invalidate the transcript — it's still
+        // stored on the attachment row below. Log + continue so retention
+        // still applies and the attachment row reflects success.
+        logger.error(`[transcribe] failed to write transcript note for attachment ${attachment.id}:`, err);
+      }
+    } else {
+      // Legacy stub-patching path (Lens voice memo flow).
+      const note = await store.getNote(attachment.noteId);
+      if (note) {
+        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+        if (noteMeta.transcribe_stub === true) {
+          const body = TRANSCRIPT_PLACEHOLDER.test(note.content)
+            ? note.content.replace(TRANSCRIPT_PLACEHOLDER, transcript)
+            : transcript;
+          const { transcribe_stub: _drop, ...restMeta } = noteMeta;
+          try {
+            await store.updateNote(note.id, {
+              content: body,
+              metadata: restMeta,
+              skipUpdatedAt: true,
+            });
+          } catch (err) {
+            logger.error(`[transcribe] failed to apply transcript to note ${note.id}:`, err);
+          }
         }
       }
     }
@@ -330,10 +440,12 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       transcribe_status: "done",
       transcribe_attempts: attempts + 1,
       transcribe_done_at: new Date().toISOString(),
+      transcribe_duration_ms: durationMs,
       transcript,
     };
     delete doneMeta.transcribe_backoff_until;
     delete doneMeta.transcribe_error;
+    delete doneMeta.transcribe_error_code;
     await store.setAttachmentMetadata(attachment.id, doneMeta);
 
     // Retention: drop the file but keep the row so the transcript stays
@@ -458,6 +570,24 @@ export function registerTranscriptionHook(
   });
 }
 
+/**
+ * Call scribe's `POST /v1/audio/transcriptions` with the audio file + optional
+ * context part. Returns the transcript text plus the wall-clock duration of
+ * the request, so the worker can surface `transcript_duration_ms` on the
+ * transcript note.
+ *
+ * Failure modes (encoded as throws):
+ *   - 4xx with a JSON body carrying `error_code`: throws `ScribeApiError`
+ *     with the code (`missing_provider` etc.). Treated as a non-retriable
+ *     terminal failure — re-POSTing the same audio at the same broken scribe
+ *     would just fail the same way; the operator has to act.
+ *   - 4xx without `error_code` (auth, malformed multipart): throws
+ *     `ScribeApiError` with the body text. Non-retriable.
+ *   - 5xx, network error, or timeout: throws a plain `Error`. Retriable —
+ *     the worker's backoff path picks it up.
+ *   - 200 with missing/invalid `text` field: throws a plain `Error`.
+ *     Retriable (could be a transient provider-output glitch).
+ */
 async function callScribe(args: {
   url: string;
   token?: string;
@@ -467,9 +597,10 @@ async function callScribe(args: {
   context: ContextPayload | null;
   timeoutMs: number;
   fetchImpl: typeof fetch;
-}): Promise<string> {
+}): Promise<{ text: string; durationMs: number }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), args.timeoutMs);
+  const startedAt = Date.now();
   try {
     const fileBuffer = readFileSync(args.filePath);
     const file = new File([fileBuffer], args.filename, { type: args.mimeType });
@@ -488,14 +619,42 @@ async function callScribe(args: {
       signal: controller.signal,
     });
     if (!resp.ok) {
-      throw new Error(`scribe returned ${resp.status}: ${await resp.text().catch(() => "")}`);
+      const body = await resp.text().catch(() => "");
+      // Try to extract structured error_code from JSON body (scribe#47).
+      let errorCode: string | undefined;
+      let errorMessage: string | undefined;
+      try {
+        const parsed = JSON.parse(body) as { error?: string; error_code?: string; message?: string };
+        if (typeof parsed.error_code === "string") errorCode = parsed.error_code;
+        if (typeof parsed.error === "string") errorMessage = parsed.error;
+        else if (typeof parsed.message === "string") errorMessage = parsed.message;
+      } catch {
+        // Not JSON — leave errorCode undefined; the raw body becomes the message.
+      }
+      // 4xx is terminal (re-POSTing the same audio at the same broken scribe
+      // will just fail again). 5xx is retriable — provider hiccup, will likely
+      // succeed on backoff.
+      const retriable = resp.status >= 500;
+      const message = errorMessage
+        ?? (errorCode ? `scribe ${errorCode}` : `scribe returned ${resp.status}: ${body}`);
+      throw new ScribeApiError(message, {
+        errorCode,
+        httpStatus: resp.status,
+        retriable,
+      });
     }
     const result = await resp.json() as { text?: string };
     if (typeof result.text !== "string") {
       throw new Error("scribe response missing text field");
     }
-    return result.text;
+    return { text: result.text, durationMs: Date.now() - startedAt };
   } finally {
     clearTimeout(timer);
   }
 }
+
+/**
+ * Re-export the structured error type so tests + callers can `instanceof`-check
+ * for terminal-failure semantics.
+ */
+export { ScribeApiError };
