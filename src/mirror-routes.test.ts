@@ -269,6 +269,31 @@ describe("handleMirrorPut", () => {
     await manager.stop();
   });
 
+  test("accepts disable-only PUT with external location and no external_path at all", async () => {
+    // Reviewer-flagged regression: previously `validateMirrorConfigShape`
+    // ran the cross-field "external requires external_path" rule
+    // unconditionally, so `{enabled: false, location: "external"}` (no
+    // path) returned 400. The rule now gates on `enabled`, matching
+    // the disable-should-never-fail-on-path-issues intent of the
+    // route-layer filesystem check skip.
+    home = tmp("mirror-put-disable-nopath-");
+    const { manager } = makeManager(home);
+    const req = new Request("http://x/admin/mirror", {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled: false,
+        location: "external",
+        // no external_path
+      }),
+    });
+    const res = await handleMirrorPut(req, manager);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { config: MirrorConfig; status: { enabled: boolean } };
+    expect(body.status.enabled).toBe(false);
+    expect(body.config.external_path).toBeNull();
+    await manager.stop();
+  });
+
   test("PUT restarts watch loop with new interval", async () => {
     home = tmp("mirror-put-restart-");
     const { manager } = makeManager(home);
@@ -295,6 +320,61 @@ describe("handleMirrorPut", () => {
     const res2 = await handleMirrorPut(req2, manager);
     expect(res2.status).toBe(200);
     expect(manager.getStatus().watch_running).toBe(false);
+    await manager.stop();
+  });
+
+  test("two PUTs fired in quick succession both apply; manager ends in the second config's state", async () => {
+    // Reviewer concern: a second PUT entering `reload()` while the
+    // first PUT's `stop()` is still inside its 250ms in-flight settle
+    // window could theoretically race the `stopping` flag. JS's
+    // microtask-serialized awaits make this safe in practice — each
+    // PUT's reload→start chain runs to completion on its own tick
+    // before the next runs — but pinning the expected outcome with a
+    // test documents the behavior + catches a regression if the
+    // serialization ever relaxes.
+    //
+    // What we assert:
+    //   - Both PUTs return 200 (no crash, no stuck-in-flight).
+    //   - After both resolve, the manager is in the SECOND config's
+    //     shape (last-writer-wins; not a stale first-config state
+    //     leaking through).
+    home = tmp("mirror-put-concurrent-");
+    const { manager } = makeManager(home);
+    const put = (body: Record<string, unknown>) =>
+      handleMirrorPut(
+        new Request("http://x/admin/mirror", {
+          method: "PUT",
+          body: JSON.stringify(body),
+        }),
+        manager,
+      );
+    const [res1, res2] = await Promise.all([
+      put({
+        enabled: true,
+        location: "internal",
+        watch: true,
+        auto_commit: false,
+        interval_seconds: 1,
+      }),
+      put({
+        enabled: true,
+        location: "internal",
+        watch: true,
+        auto_commit: false,
+        interval_seconds: 2,
+      }),
+    ]);
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    // Both PUTs read the same config-storage seam (deps.writeMirrorConfig)
+    // and serialize through the manager's async start() under the
+    // microtask queue. Final config reflects whichever PUT entered
+    // `reload()` last — practically the second one — but the salient
+    // assertion is "the manager isn't stuck": enabled + watch_running.
+    const status = manager.getStatus();
+    expect(status.enabled).toBe(true);
+    expect(status.watch_running).toBe(true);
+    expect(manager.getConfig().interval_seconds).toBe(2);
     await manager.stop();
   });
 });

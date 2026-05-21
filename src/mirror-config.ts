@@ -398,13 +398,19 @@ export function validateMirrorConfigShape(
     out.interval_seconds = blob.interval_seconds;
   }
 
-  // Cross-field rule: external requires external_path.
-  if (out.location === "external" && !out.external_path) {
+  // Cross-field rule: external requires external_path — but ONLY when
+  // the mirror is enabled. Disable-only PUTs (and disabled persisted
+  // configs in general) shouldn't fail validation on path-related
+  // issues; the operator might be turning off a mirror whose external
+  // path went missing without first fixing the path. The filesystem
+  // check in `validateExternalPath` is also gated on enabled at the
+  // route layer for the same reason.
+  if (out.enabled && out.location === "external" && !out.external_path) {
     return {
       ok: false,
       field: "external_path",
       error:
-        '`external_path` is required when `location` is "external". Provide an absolute path to an existing git repository.',
+        '`external_path` is required when `location` is "external" and `enabled` is true. Provide an absolute path to an existing git repository.',
     };
   }
 

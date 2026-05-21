@@ -29,7 +29,7 @@ import { resolveScribeAuthToken } from "./scribe-env.ts";
 import { resolveBindHostname } from "./bind.ts";
 import { MirrorManager } from "./mirror-manager.ts";
 import { setMirrorManager } from "./mirror-registry.ts";
-import { buildMirrorDeps } from "./mirror-deps.ts";
+import { buildMirrorDeps, resolveMirrorVaultName } from "./mirror-deps.ts";
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -209,7 +209,11 @@ const hostname = resolveBindHostname();
 // ---------------------------------------------------------------------------
 let mirrorManager: MirrorManager | null = null;
 {
-  const mirrorVaultName = globalConfig.default_vault ?? listVaults()[0] ?? null;
+  // Canonicalized in `mirror-deps.ts:resolveMirrorVaultName` so the
+  // binding rule (default_vault → first listed vault → null) lives in
+  // exactly one place; multi-vault-mirror work (design-doc open
+  // question 2) only has to touch one site.
+  const mirrorVaultName = resolveMirrorVaultName(listVaults);
   if (mirrorVaultName) {
     try {
       mirrorManager = new MirrorManager(buildMirrorDeps(mirrorVaultName));

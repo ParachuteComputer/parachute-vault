@@ -219,6 +219,22 @@ describe("validateMirrorConfigShape", () => {
     if (!r.ok) expect(r.field).toBe("external_path");
   });
 
+  test("accepts external + missing external_path when disabled (operator turning off a broken mirror)", () => {
+    // Regression for the reviewer-flagged disable-only case: an operator
+    // PUTting `{enabled: false, location: "external"}` (no path) must
+    // succeed. Disable should never fail validation on path issues.
+    const r = validateMirrorConfigShape({
+      enabled: false,
+      location: "external",
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.enabled).toBe(false);
+      expect(r.config.location).toBe("external");
+      expect(r.config.external_path).toBeNull();
+    }
+  });
+
   test("accepts external + external_path", () => {
     const r = validateMirrorConfigShape({
       enabled: true,

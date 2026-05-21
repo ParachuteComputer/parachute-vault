@@ -32,8 +32,8 @@ import {
 import type { MirrorManager } from "./mirror-manager.ts";
 
 /**
- * `GET /vault/<name>/admin/mirror` — return the persisted config + the
- * runtime status the manager is currently tracking.
+ * `GET /vault/<name>/.parachute/mirror` — return the persisted config +
+ * the runtime status the manager is currently tracking.
  *
  * Always returns 200 (auth was already enforced upstream). When no
  * mirror config has ever been written, returns the defaults — the
@@ -53,8 +53,9 @@ export function handleMirrorGet(manager: MirrorManager): Response {
 }
 
 /**
- * `PUT /vault/<name>/admin/mirror` — accept a JSON body with the mirror
- * config block, validate, persist, restart the in-process lifecycle.
+ * `PUT /vault/<name>/.parachute/mirror` — accept a JSON body with the
+ * mirror config block, validate, persist, restart the in-process
+ * lifecycle.
  *
  * Request shape: same JSON as the MirrorConfig type — { enabled,
  * location, external_path, watch, auto_commit, auto_push,
@@ -64,11 +65,14 @@ export function handleMirrorGet(manager: MirrorManager): Response {
  * Validation surface:
  *   - JSON shape: location ∈ {internal, external}, types match, etc.
  *     Returns 400 with `field`-localized error on failure.
- *   - For location=external + enabled=true: the supplied external_path
+ *   - For enabled=true + location=external: the supplied external_path
  *     must exist on the filesystem AND be a git repo. Returns 400
  *     with an actionable error message on failure.
- *   - For location=external + enabled=false: skip the filesystem
- *     check (operator might be disabling a no-longer-valid path).
+ *   - For enabled=false (any location): skip BOTH the cross-field
+ *     "external requires external_path" check AND the filesystem
+ *     check. Disable should never fail validation on path-related
+ *     issues — the operator's just trying to turn off a mirror whose
+ *     path may have gone away.
  *
  * Response: 200 with the new config + status snapshot.
  */
