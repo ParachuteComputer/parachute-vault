@@ -36,6 +36,49 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.4] - 2026-05-21
+
+feat(vault): enable WAL mode for multi-process SQLite concurrency (#326).
+
+The vault SQLite database now runs in **WAL** (write-ahead logging) journal
+mode by default. Before this change `journal_mode` defaulted to the SQLite
+classic `DELETE` rollback journal — fine for a single-process daemon, but
+incompatible with concurrent multi-process access patterns. `parachute-runner`
+polling `tag:job` while the user writes notes through the running daemon is
+exactly that pattern, and `vault#323`'s `daemon-busy` guard on `import` was
+the symptom: a second connection couldn't get past the writer's lock.
+
+Under WAL: a single writer plus an arbitrary number of concurrent readers
+all see consistent snapshots. The new `applyConnectionPragmas` helper in
+`core/src/schema.ts` is invoked on every Database open via the existing
+`initSchema` entry point and the refactored `openVaultDb` — it sets:
+
+  - `PRAGMA journal_mode = WAL`
+  - `PRAGMA synchronous = NORMAL` (safe + recommended pairing per SQLite docs)
+  - `PRAGMA wal_autocheckpoint = 1000` (explicit default — 1000 pages ≈ 4MB)
+  - `PRAGMA foreign_keys = ON`
+
+It also verifies WAL actually took effect (capturing the return value of
+the `PRAGMA journal_mode = WAL` statement) and logs a one-time `[vault]
+WAL mode could not be enabled` warning when an underlying filesystem (NFS,
+some FUSE / Docker volume drivers) silently refuses the WAL flip. Operators
+on those filesystems retain single-writer semantics and now know it.
+
+**Backwards compatibility**: existing vaults created in DELETE journal mode
+are migrated to WAL on next open by SQLite itself — no data migration, no
+schema bump. **Backup compatibility**: `parachute-vault backup` already
+uses `VACUUM INTO` (WAL-safe by design), so the snapshot/restore path is
+unchanged. Manual hand-copies of `vault.db` should now also copy the
+`vault.db-wal` and `vault.db-shm` sidecars if the database is open and
+in-flight — documented in `README.md`.
+
+Long-term followup tracked at vault#326 is the **single-writer** rail
+(option 2 in the original issue): route the CLI's write-side commands
+through the daemon's HTTP/MCP surface when the daemon is running, so two
+processes never compete for the writer slot. This PR delivers option 1
+(the read-side win) so multi-reader patterns like `parachute-runner` work
+today; the writer-routing piece stays on the roadmap.
+
 ## [0.4.8-rc.3] - 2026-05-21
 
 feat(vault): self-register manifest + installDir at startup (#266).

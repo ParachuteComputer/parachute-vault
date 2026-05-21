@@ -67,6 +67,9 @@ A mental model for "where is my data?" and "what can I poke at?" after the one-c
       default/
         vault.db            # the SQLite database — notes, tags, links, attachments,
                             # per-vault tokens, OAuth clients + codes, tag schemas
+        vault.db-wal        # WAL journal (write-ahead log) — transient, recreated
+                            # on demand. Carries pending writes between checkpoints.
+        vault.db-shm        # WAL shared-memory index — transient, recreated on demand.
         vault.yaml          # per-vault config — description (sent as MCP session
                             # instruction), published_tag override, legacy api_keys
         assets/             # per-vault uploaded attachments (audio, images)
@@ -75,6 +78,8 @@ A mental model for "where is my data?" and "what can I poke at?" after the one-c
 `~/.parachute/` itself is the ecosystem root shared across sibling services — `services.json` and `well-known/` live at the root and are managed by the top-level CLI. Everything vault owns is scoped under `~/.parachute/vault/`. Pre-0.3 installs kept vault state directly at the root; any legacy paths still there are auto-migrated into `vault/` on first post-upgrade run (see CHANGELOG).
 
 `config.yaml` is the one file written at 0600 because it holds the bcrypt owner-password hash and the plaintext TOTP secret. `.env` is written with your umask default (typically 0644); if you add webhook API keys there, tighten the mode yourself. SQLite DBs follow your umask.
+
+The vault SQLite database runs in **WAL** (write-ahead logging) journal mode for multi-process concurrent access — the daemon, CLI tools, and out-of-process consumers (e.g. `parachute-runner` polling `tag:job`) can read concurrently while the daemon writes, without lock contention. WAL adds two sidecar files alongside `vault.db`: `vault.db-wal` (the journal) and `vault.db-shm` (shared-memory index). Both are recreated on demand; **don't back them up separately** — `parachute-vault backup` snapshots only `vault.db` via `VACUUM INTO`, which produces a consistent full-DB copy without needing the sidecars. If you copy a vault by hand, `vault.db` alone is sufficient on a checkpointed database; if you must capture an in-flight write, copy all three files. If WAL can't be enabled (NFS, some FUSE / Docker volume drivers don't support the `-shm` region), vault logs `[vault] WAL mode could not be enabled` on startup and falls back to the legacy single-writer mode.
 
 ### Registered externally
 
