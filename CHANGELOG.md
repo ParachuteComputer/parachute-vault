@@ -36,6 +36,85 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.7-rc.2] — 2026-05-21
+
+fix(vault): export detects case-collision on case-insensitive filesystems
+(closes [#327](https://github.com/ParachuteComputer/parachute-vault/issues/327)).
+
+The original 0.4.5-rc.2 fix landed silent auto-disambiguation —
+`Journal/Foo.md` and `Journal/foo.md` would both export on macOS APFS
+default, but the second note got an `__<id-short>` filename suffix with
+no signal printed to the operator. The "silent" half of "silent note loss"
+wasn't actually solved — operators with case-colliding vaults still had
+no way to notice without poring through the typed `ExportStats` return.
+
+This rc closes the gap two ways:
+
+### Added
+
+- **CLI surfaces case-collision auto-disambiguation explicitly.** When
+  `parachute-vault export` lands on a case-insensitive filesystem and
+  detects collisions, every disambiguated path now prints to stderr with
+  a `Warning:` prefix + a one-line summary count + a pointer to the new
+  `--strict-case-collision` flag and #327. Watch mode prints a per-cycle
+  `[watch] case-collision: N disambiguated path(s) this cycle` line, so
+  the moment a new collision appears in a running mirror loop, the
+  operator sees it.
+
+- **`--strict-case-collision` CLI flag + `failOnCaseCollision: boolean`
+  on `ExportOptions`** — opt-in fail-fast. When set, the export pre-
+  scans the (already-loaded) note list for lowercased-path conflicts
+  before any write lands on disk and throws a typed `CaseCollisionError`
+  naming every colliding path + the actionable instruction
+  ("Rename one of them in the vault before re-exporting, or run from a
+  case-sensitive filesystem"). N-way collisions
+  (`Foo.md` + `foo.md` + `FOO.md`) and multi-group collisions
+  (independent `(Bar, bar)` + `(Baz, baz)` pairs) both surface in a
+  single error so the operator fixes the whole set in one pass — no
+  paint-by-numbers re-export cycle.
+
+- **`CaseCollisionError` exported from `core/src/portable-md.ts`** with
+  a `collisions: Array<Array<{ note_id, path, extension }>>` field for
+  programmatic callers. The CLI catches it in both single-shot and
+  watch-initial paths, prints the actionable message, and exits non-zero
+  so scripts catch failures deterministically.
+
+### Decision: default remains auto-disambiguate; strict mode is opt-in
+
+The 0.4.5 fix's auto-disambiguation path is preserved as the default
+because (a) it's lossless — both notes land on disk with the canonical
+path intact in frontmatter and round-trip cleanly through import, and
+(b) hard-failing every cycle would block the new vault-sync mirror
+loop ([#348](https://github.com/ParachuteComputer/parachute-vault/issues/348))
+the moment a colliding pair appears, with no path forward but rolling
+back the feature. Strict mode is the one-shot CLI flow's escape hatch
+when the operator wants to be forced to fix the source-of-truth.
+
+### Tests
+
+Seven new tests under `core/src/portable-md.test.ts` →
+`describe("case-collision detection (vault#327)")`:
+
+- `failOnCaseCollision` throws `CaseCollisionError` with both paths +
+  the actionable instruction enumerated in `.message`.
+- `failOnCaseCollision` is a no-op when the FS is case-sensitive (probe
+  override forces the path).
+- `failOnCaseCollision` is a no-op on case-insensitive FS when nothing
+  collides (single-note pre-scan walks clean).
+- Three-way collision lists all three paths in the error.
+- Two independent collision groups both surface.
+- Directory-level case difference (`Notes/foo` vs `notes/foo`) is
+  detected by the lowercased-path key.
+- Default (no opt-in) still auto-disambiguates — back-compat contract
+  pinned.
+
+### Suite
+
+- `bun test ./core/src/` — 536 pass (+7 over `rc.1`), 0 fail
+- `bun test ./src/` — 1086 pass (unchanged), 0 fail
+- `bun run typecheck` — clean
+- `bunx biome check src/ core/src/` — clean
+
 ## [0.4.7-rc.1] — 2026-05-20
 
 Phase A1 of the vault-sync arc — the persistent, vault-managed counterpart
