@@ -36,6 +36,70 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.3] - 2026-05-21
+
+feat(vault): self-register manifest + installDir at startup (#266).
+
+POC for retiring `parachute-hub`'s `FIRST_PARTY_FALLBACKS[vault]` vendored
+manifest. Hub currently ships a hard-coded `VAULT_FALLBACK` block in
+`service-spec.ts` because (a) bun-link dev mode never runs the hub install
+path so `installDir` isn't stamped on the services.json row, and (b) v0.5
+vault didn't ship its own `.parachute/module.json` so hub had no manifest
+to read at lifecycle time. The endgame — every first-party module
+self-registers its manifest + installDir on startup, hub's vendored
+fallbacks retire one by one — starts here.
+
+### What ships
+
+- **`src/module-manifest.ts`** — narrow reader for the package's own
+  `.parachute/module.json`. Resolves the package root via
+  `import.meta.url` (works for both `bun src/cli.ts` dev runs and the
+  published-package `parachute-vault` binary). Validates only the fields
+  vault stamps onto services.json today (name, manifestName, displayName,
+  tagline, kind, port, paths, health, stripPrefix); full validation is
+  hub's job at install time.
+- **`src/self-register.ts`** — boot-time self-registration. Reads the
+  local manifest + computes installDir (the directory containing
+  `package.json` + `.parachute/module.json`) and upserts a row into
+  `~/.parachute/services.json` carrying both. Idempotent: re-runs report
+  `changed: false` when nothing actually shifts. Routed through the
+  existing merge-preserving `upsertService` so hub-stamped fields on the
+  row (e.g. `installDir` from `parachute-hub#84`, anything future)
+  survive each self-registration pass.
+- **`src/server.ts` boot wires** `selfRegister({ version: pkg.version })`
+  right after the vault auto-creation block. Failure modes (manifest
+  missing, services.json unreadable, write failure) log a warning and
+  continue — boot must not fail on bookkeeping.
+- **CLI registration paths converge** — `cmdInit` and `cmdCreate`
+  previously called `upsertService` directly with a hand-built entry that
+  omitted displayName/tagline/stripPrefix/installDir. Both now route
+  through `selfRegister` so the row from `parachute-vault init` matches
+  the row from server boot. Drops two `upsertService` call sites and the
+  duplicated `buildVaultServicePaths` (the helper moves into
+  `self-register.ts` as the canonical implementation).
+
+### Design choice — filesystem-direct rather than HTTP
+
+In v0.6 (single-container, hub-as-supervisor) hub and vault share the
+same filesystem; writing directly to `services.json` with the existing
+merge-preserving `upsertService` is the simplest shape that works today
+without growing a hub-side endpoint. v0.7 (multi-container cloud) will
+need a hub `POST /api/modules/self-register` so a module on a different
+container can register without filesystem access to the operator's
+`~/.parachute/`. That endpoint is filed as a separate hub follow-up;
+this PR's `selfRegister` function is forward-compatible — it's the
+single seam that would swap from filesystem to HTTP transport.
+
+### Forward-compatibility with hub's vendored fallback
+
+`FIRST_PARTY_FALLBACKS[vault]` in hub remains in place until every
+first-party module ships self-registration reliably (notes, scribe,
+runner have their own follow-up issues). The fallback is additive today:
+hub reads vault's `installDir` from the self-registered row when
+present, and falls back to the vendored manifest only when the row is
+missing — which is exactly the state a fresh `bun add @openparachute/vault`
+produces before vault has booted once.
+
 ## [0.4.8-rc.2] - 2026-05-21
 
 feat(vault): query-notes opaque cursor for since-last-checked agent loops (#313).
