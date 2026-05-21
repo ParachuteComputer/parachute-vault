@@ -36,6 +36,87 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.7-rc.1] — 2026-05-20
+
+Phase A1 of the vault-sync arc — the persistent, vault-managed counterpart
+to the manual `parachute-vault export --watch --git-commit` CLI mode that
+shipped in `0.4.6` (#346). Vault now reads a `mirror:` block from
+`config.yaml` at boot, bootstraps an internal or external git mirror per
+the operator's choice, and (optionally) runs the export-watch loop
+in-process — no external cron, no separate shell loop, no manual restart
+after a config change. See the design doc:
+[`parachute.computer/design/2026-05-20-vault-as-git-projection.md`](https://github.com/ParachuteComputer/parachute.computer/blob/main/design/2026-05-20-vault-as-git-projection.md).
+
+The CLI primitive from #346 is unchanged; this rc adds the persistent
+form alongside it.
+
+### Added
+
+- **`mirror:` block in `config.yaml`** — eight fields (`enabled`,
+  `location`, `external_path`, `watch`, `auto_commit`, `auto_push`,
+  `commit_template`, `interval_seconds`). Default `enabled: false` so
+  vaults upgrading across this PR boundary see zero behavior change
+  until they explicitly opt in. Parsed alongside the existing top-level
+  keys via the same hand-rolled YAML conventions as `triggers:` /
+  `backup:`. Implementation: `src/mirror-config.ts`.
+
+- **Boot-time mirror lifecycle** — when `mirror.enabled: true`, the
+  vault server resolves the path, bootstraps an internal mirror if
+  needed (`mkdir` + `git init` + initial commit), runs an initial
+  full export to bring the mirror to current state, and (if
+  `watch: true`) arms an in-process polling loop that re-exports +
+  optionally commits on every interval. The watch loop reuses the
+  `runGitCommitCycle` helper from #346 — same commit shape, same
+  skip rules for `.parachute/`-only churn. Implementation:
+  `src/mirror-manager.ts`.
+
+- **Two mirror-location modes**:
+  - `internal` → `~/.parachute/vault/data/<vault>/mirror/`. Vault-
+    managed; recreated automatically if missing on next boot.
+    Bootstrap refuses to clobber a pre-existing non-empty, non-git
+    directory — operator chooses cleanup explicitly.
+  - `external` → operator-picked path; must exist and be a git repo
+    before vault attempts a write. Designed for Obsidian / GitHub /
+    shared backups.
+
+- **`GET /vault/<name>/.parachute/mirror`** — admin-gated read of the
+  persisted mirror config + the runtime status (resolved path, watch
+  status, last export timestamp, last commit sha, most recent error).
+  Returns defaults when no `mirror:` block has been written yet so
+  the future hub admin SPA always renders against a consistent shape.
+
+- **`PUT /vault/<name>/.parachute/mirror`** — admin-gated update of
+  the mirror config. Validates JSON shape + (when `enabled: true`)
+  the external path exists and is a git repository. Atomic write to
+  `config.yaml`, then in-process restart of the watch loop with the
+  new shape — no vault restart needed. Disable-only `{enabled:
+  false}` PUTs skip the path validation so an operator can disable
+  a mirror whose path has gone missing. Errors are 400 with
+  actionable messages naming the offending field.
+
+- **`MirrorManager` lifecycle controller** — singleton per-process
+  with `start` / `stop` / `reload` / `runNow` semantics, status
+  tracking, and shutdown drain wired into the existing
+  `SIGINT`/`SIGTERM` handlers. Dependency-injected `runExport`,
+  `firstChangedNoteTitle`, `readMirrorConfig`, `writeMirrorConfig`
+  for unit-testability — tests instantiate the manager directly
+  without spawning a vault server.
+
+- **URL note** — the design doc names the endpoint `/admin/mirror`,
+  but `/vault/<name>/admin/*` is already mounted to the admin SPA's
+  static-file bundle (#252). The mirror API lives under
+  `.parachute/mirror` instead, sibling to the existing
+  `.parachute/config` + `.parachute/info` per the module-protocol
+  convention. The hub Phase A2 SPA (future PR) will call this URL
+  directly.
+
+### Out of scope for Phase A1
+
+- Hub admin SPA page for configuring mirrors — Phase A2, future PR.
+- Bidirectional sync (Architecture B from the design doc) — deferred
+  pending demand signal.
+- UI history surface in the vault SPA — Phase A1.5 or A2.
+
 ## [0.4.6] — 2026-05-20
 
 Stable release covering the multi-user companion + Gitcoin Brain enablement. Cumulative changes since `0.4.5`:

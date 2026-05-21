@@ -33,6 +33,12 @@ import { join } from "path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from "fs";
 import crypto from "node:crypto";
 
+import {
+  parseMirrorConfig as parseMirrorSectionFromYaml,
+  serializeMirrorConfig as serializeMirrorSection,
+  type MirrorConfig as MirrorConfigType,
+} from "./mirror-config.ts";
+
 // ---------------------------------------------------------------------------
 // Paths
 //
@@ -263,6 +269,14 @@ export interface GlobalConfig {
   autostart?: boolean;
   /** Backup configuration: schedule, retention, destinations. */
   backup?: BackupConfig;
+  /**
+   * Persistent vault-managed mirror configuration (vault-sync Phase A1).
+   * Unset when the operator has never touched the mirror block; defaults to
+   * `enabled: false` semantics in that case. When `enabled: true`, the
+   * vault server bootstraps and optionally watches a git mirror at the
+   * resolved path. See `./mirror-config.ts`.
+   */
+  mirror?: MirrorConfigType;
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1201,12 @@ export function readGlobalConfig(): GlobalConfig {
       // Parse backup section
       config.backup = parseBackup(yaml);
 
+      // Parse mirror section (vault-sync Phase A1). Imported lazily via a
+      // narrow helper to keep config.ts free of a top-level cycle into the
+      // mirror module — `mirror-config.ts` imports `vaultDir` from here.
+      const mirror = parseMirrorSectionFromYaml(yaml);
+      if (mirror) config.mirror = mirror;
+
       return config;
     }
   } catch {}
@@ -1271,6 +1291,10 @@ export function writeGlobalConfig(config: GlobalConfig): void {
 
   if (config.backup) {
     lines.push(...serializeBackup(config.backup));
+  }
+
+  if (config.mirror) {
+    lines.push(...serializeMirrorSection(config.mirror));
   }
 
   // 0600 — owner read/write only. This file may contain the bcrypt password
