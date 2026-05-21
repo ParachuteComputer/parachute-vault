@@ -2872,6 +2872,7 @@ async function cmdExport(args: string[]) {
   const { DEFAULT_COMMIT_TEMPLATE } = await import("./export-watch.ts");
   let gitMessageTemplate = DEFAULT_COMMIT_TEMPLATE;
   let gitPush = false;
+  let strictCaseCollision = false;
 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -2923,6 +2924,8 @@ async function cmdExport(args: string[]) {
       gitMessageTemplate = v;
     } else if (arg === "--git-push") {
       gitPush = true;
+    } else if (arg === "--strict-case-collision") {
+      strictCaseCollision = true;
     } else {
       positional.push(arg);
     }
@@ -2952,6 +2955,12 @@ async function cmdExport(args: string[]) {
     console.error("                                {{first_note_title}}, {{vault_name}}");
     console.error("                              (default: \"export: {{date}} ({{notes_changed}} note{{plural}})\")");
     console.error("  --git-push                  After commit, run `git push` (non-fatal on failure).");
+    console.error("  --strict-case-collision     On case-insensitive filesystems (macOS APFS-default,");
+    console.error("                              Windows NTFS, FAT/exFAT), abort the export if two notes");
+    console.error("                              have paths differing only by case (vault#327).");
+    console.error("                              Without this flag, colliding notes are auto-disambiguated");
+    console.error("                              with an `__<id-short>` filename suffix (lossless; both");
+    console.error("                              files land, canonical path preserved in frontmatter).");
     process.exit(1);
   }
 
@@ -3010,6 +3019,7 @@ async function cmdExport(args: string[]) {
       assetsDir: assetsDirPath,
       ...(vaultDescription ? { vaultDescription } : {}),
       ...(opts.sinceCursor ? { since: opts.sinceCursor } : {}),
+      ...(strictCaseCollision ? { failOnCaseCollision: true } : {}),
     });
 
     if (opts.isInitial) {
@@ -3030,6 +3040,28 @@ async function cmdExport(args: string[]) {
           `Note: ${stats.skipped_attachments.length} attachment(s) skipped. See [export] warnings above.`,
         );
       }
+      // vault#327 Phase 2 — surface case-collision auto-disambiguation
+      // explicitly. The previous fix landed the logic silently; the
+      // operator had no signal that filenames had been munged. Now we
+      // print the count + every disambiguated path so the operator can
+      // (a) audit, (b) decide whether to rename a colliding note in
+      // the vault and re-export, or (c) re-run with
+      // --strict-case-collision to refuse the disambiguation entirely.
+      if (stats.disambiguated_paths.length > 0) {
+        const n = stats.disambiguated_paths.length;
+        console.warn(
+          `Warning: ${n} note${n === 1 ? "" : "s"} had path${n === 1 ? "" : "s"} that ` +
+          `differ only by case on this case-insensitive filesystem. ` +
+          `Auto-disambiguated on disk (canonical paths preserved in frontmatter):`,
+        );
+        for (const d of stats.disambiguated_paths) {
+          console.warn(`  - ${d.original_path} → ${d.disambiguated_filename} (id: ${d.note_id})`);
+        }
+        console.warn(
+          `Re-run with --strict-case-collision to abort instead, or rename one of each ` +
+          `colliding pair in the vault before re-exporting. See vault#327.`,
+        );
+      }
     } else {
       // Watch-mode status line: keep tight; the loop logs every interval.
       if (stats.notes > 0) {
@@ -3038,6 +3070,17 @@ async function cmdExport(args: string[]) {
         );
       } else {
         console.log(`[watch] no changes`);
+      }
+      // Watch-mode: log new disambiguations per cycle. Operators running
+      // a long-lived watch loop want to be notified the moment a
+      // collision shows up — they can fix it at the source without
+      // waiting for the next manual full export.
+      if (stats.disambiguated_paths.length > 0) {
+        const n = stats.disambiguated_paths.length;
+        console.warn(
+          `[watch] case-collision: ${n} disambiguated path${n === 1 ? "" : "s"} this cycle ` +
+          `(see vault#327; --strict-case-collision to abort instead).`,
+        );
       }
     }
 
@@ -3058,15 +3101,44 @@ async function cmdExport(args: string[]) {
     return { stats, nextCursor, committed };
   }
 
+  // Import the typed CaseCollisionError once so both the single-shot and
+  // watch-initial paths can render it the same way. vault#327 Phase 2.
+  const { CaseCollisionError } = await import("../core/src/portable-md.ts");
+
   // ---- Single-shot mode ----
   if (!watch) {
-    await runCycle({ sinceCursor: since, isInitial: true });
+    try {
+      await runCycle({ sinceCursor: since, isInitial: true });
+    } catch (err) {
+      if (err instanceof CaseCollisionError) {
+        // The error's own message already includes the actionable
+        // instruction ("Rename one of them..."). Print verbatim + exit
+        // non-zero so scripts catch the failure deterministically.
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     return;
   }
 
   // ---- Watch mode ----
   // Initial full (or since-filtered) export, then poll every interval.
-  const initial = await runCycle({ sinceCursor: since, isInitial: true });
+  let initial: Awaited<ReturnType<typeof runCycle>>;
+  try {
+    initial = await runCycle({ sinceCursor: since, isInitial: true });
+  } catch (err) {
+    if (err instanceof CaseCollisionError) {
+      console.error(err.message);
+      console.error(
+        "\n--strict-case-collision is enabled; refusing to start the watch loop until the " +
+        "collision is resolved in the vault. Re-export without --strict-case-collision to " +
+        "auto-disambiguate instead.",
+      );
+      process.exit(1);
+    }
+    throw err;
+  }
   let cursor = initial.nextCursor;
   console.log(`[watch] polling every ${intervalSeconds}s; press Ctrl-C to stop.`);
 
