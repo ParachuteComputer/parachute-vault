@@ -206,30 +206,77 @@ Body: `{"tags": ["a", "b"]}`.
 #### `POST /notes/{id}/attachments`
 Body: `{"path": "files/a.png", "mimeType": "image/png", "transcribe"?: boolean}`.
 
-When `transcribe: true` and the file is audio, the server queues a
-transcription job: `attachment.metadata.transcribe_status = "pending"` is
-set, and `note.metadata.transcribe_stub = true` is written as the opt-in to
-overwrite content when the transcript lands. A background worker (enabled
-by setting `SCRIBE_URL` on the server) drains the queue FIFO, one at a
-time, calling `${SCRIBE_URL}/v1/audio/transcriptions` with the audio as
-multipart `file` and expecting `{ text: string }` back.
+There are **two transcription paths**; both feed the same worker but
+differ in how the transcript surface is materialized.
 
-On success:
-- If `note.metadata.transcribe_stub === true`, the worker replaces the
-  literal `_Transcript pending._` placeholder in the note body with the
-  transcript, or the whole body if the placeholder is absent. The stub
-  marker is cleared. A user edit clearing `transcribe_stub` before the
-  transcript arrives opts out of the overwrite.
-- `attachment.metadata.transcribe_status` becomes `"done"` and
-  `transcript` + `transcribe_done_at` are recorded on the attachment even
-  when the note opted out, so the transcript is always addressable.
+**Path A — explicit caller opt-in (`transcribe: true`).** Legacy flow,
+used by Lens's voice memo client. Server queues a transcription job:
+`attachment.metadata.transcribe_status = "pending"` is set, and
+`note.metadata.transcribe_stub = true` is written as the opt-in to
+overwrite content when the transcript lands. On success the worker
+replaces the literal `_Transcript pending._` placeholder in the note
+body with the transcript (or the whole body if the placeholder is
+absent). A user edit clearing `transcribe_stub` before the transcript
+arrives opts out of the overwrite.
 
-On failure, the worker retries with exponential backoff up to three
-attempts before setting `transcribe_status = "failed"` and capturing
-`transcribe_error`.
+**Path B — auto-transcribe (vault#353).** When `mimeType` starts with
+`audio/` AND `auto_transcribe.enabled === true` AND scribe is
+discoverable, the attachment is queued automatically — no caller flag
+needed. Instead of patching the source note, the worker materializes a
+sibling `<attachment-path>.transcript.md` note with frontmatter:
+
+```yaml
+title: Transcript of <filename>
+tags: [transcript, capture]
+transcript_of: <attachment-path>
+transcript_attachment_id: <id>
+transcript_status: complete | failed
+transcript_duration_ms: <ms>
+transcript_error: <cause — failed only>
+```
+
+On success the transcript text is the note body. On failure (no
+provider configured, scribe down, timeout) the same note is written
+with `transcript_status: failed`, empty body, and the cause in
+`transcript_error`. The original audio attachment is never deleted by
+this path — operators can retry via the dedicated endpoint below.
+
+Across both paths, `attachment.metadata.transcribe_status` becomes
+`"done"` and `transcript` + `transcribe_done_at` + `transcribe_duration_ms`
+are recorded on the attachment row, so the transcript is always
+addressable from the attachment side too. On failure the worker retries
+5xx / network errors with exponential backoff (up to three attempts);
+4xx errors with structured `error_code` (e.g. `missing_provider`) are
+treated as terminal on the first failure since re-POSTing the same audio
+at a broken scribe just fails the same way.
 
 The queue lives in the DB (`attachments` table), so a server restart
 resumes pending work without replay.
+
+#### `POST /notes/{id}/retry-transcription`
+
+Re-enqueues the original audio attachment for a transcript note whose
+`transcript_status` is `failed`. Returns 202 on success:
+
+```json
+{
+  "status": "queued",
+  "attachment_id": "<id>",
+  "attachment_path": "<path>",
+  "transcript_note_id": "<id>",
+  "worker": "kicked" | "sweep-only"
+}
+```
+
+Error branches:
+- `400 invalid_target` — target note has no `transcript_status` frontmatter (not a transcript note).
+- `400 not_failed` — transcript already succeeded; nothing to retry.
+- `400 missing_attachment_id` — transcript note lacks `transcript_attachment_id` (likely written by an older vault version).
+- `404 attachment_missing` — original audio attachment row has been deleted.
+- `404 audio_missing` — original audio file no longer exists on disk (e.g. `audio_retention: never` already unlinked it).
+
+The same transcript note is overwritten in place; the note id is
+preserved across retries.
 
 #### `GET /notes/{id}/attachments`
 Returns `Attachment[]`.

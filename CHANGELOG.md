@@ -36,6 +36,99 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.1] — 2026-05-21
+
+feat(vault): auto-transcribe voice uploads via scribe (vault#353).
+
+Part 2 of the [vault↔scribe connection design](https://github.com/ParachuteComputer/parachute.computer/blob/main/design/2026-05-21-scribe-config-and-vault-scribe-connect.md)
+(site#52). When an audio attachment lands in a vault — via Notes capture,
+the REST API, or any other write path — and the operator has enabled
+auto-transcribe, vault forwards the audio to scribe asynchronously and
+materializes the result as a sibling `<attachment-path>.transcript.md`
+note. Failures (no provider configured, scribe down, timeout) surface as
+the same transcript note with `transcript_status: failed` plus the cause
+in `transcript_error`. The original audio attachment is never deleted by
+this path — it's preserved for retry.
+
+### What ships
+
+- **Inline audio-detect on attachment write.** `POST /vault/<name>/api/notes/<id>/attachments`
+  inspects the incoming `mime_type`; when it starts with `audio/` AND
+  `auto_transcribe.enabled === true` AND scribe is discoverable, the
+  attachment is stamped with `transcribe_status: pending` +
+  `transcribe_origin: "auto"`. The existing transcription worker picks it
+  up via the `attachment:created` hook (single-digit-ms event-driven path)
+  or the 30s sweep (safety net).
+- **Service discovery via `~/.parachute/services.json`** (`scribe-discovery.ts`).
+  Vault locates scribe by reading the canonical hub-maintained registry
+  on first call; the `SCRIBE_URL` env var still wins when set. Cached
+  for process lifetime; restart vault to pick up a re-registered scribe.
+- **Bearer generation at first boot** (`scribe-env.ts:ensureScribeBearer`).
+  When neither `SCRIBE_AUTH_TOKEN` nor the legacy `SCRIBE_TOKEN` is set,
+  vault generates a 32-byte base64url bearer and persists it to
+  `~/.parachute/vault/.env`. Idempotent — subsequent boots see the
+  existing value and don't rotate. Operators are expected to mirror the
+  generated bearer into scribe's `SCRIBE_AUTH_TOKEN`; without that
+  mirror, transcription fails gracefully with a 401 captured on the
+  transcript note.
+- **Transcript-note materialization** (`transcript-note.ts`). The
+  worker's auto-origin path writes a note at `<attachment-path>.transcript`
+  with frontmatter linking back to the original audio:
+
+  ```yaml
+  title: Transcript of <filename>
+  transcript_of: <attachment-path>
+  transcript_attachment_id: <attachment id>
+  transcript_status: complete | failed
+  transcript_duration_ms: <ms>
+  transcript_error: <cause — failed only>
+  ```
+
+  Body is the transcript text on success, empty on failure. Tags are
+  `[transcript, capture]`. A typed link `transcript_of` is also
+  materialized so vault graph queries surface the relation without
+  walking frontmatter.
+- **Retry endpoint.** `POST /vault/<name>/api/notes/<note-id>/retry-transcription`
+  re-enqueues the original audio attachment by flipping its
+  `transcribe_status` back to `pending` and kicking the worker.
+  Validates the target is a failed transcript note, surfaces clear
+  error branches (`invalid_target`, `not_failed`,
+  `missing_attachment_id`, `attachment_missing`, `audio_missing`).
+  202 on success. The same transcript note is overwritten in place;
+  the note id is preserved across retries.
+- **Config schema grows `autoTranscribe.*`** (`module-config.ts`). Three
+  fields per the design's Q4:
+  - `autoTranscribe.enabled` — boolean toggle, default false. Persisted
+    in `~/.parachute/vault/config.yaml` under the new `auto_transcribe`
+    block.
+  - `autoTranscribe.scribeUrl` — readOnly. Effective value resolved
+    per-process via `scribe-discovery.ts` (services.json or env override).
+  - `autoTranscribe.scribeBearer` — writeOnly. Never returned by GET.
+    Sourced from `SCRIBE_AUTH_TOKEN`.
+
+  Legacy `scribe_url` / `scribe_token` are kept as deprecated aliases
+  for one release so existing hub admin SPA renders don't regress.
+
+### What's deferred to v0.7
+
+- **Hub-issued JWT replaces the shared bearer.** The loopback shared
+  secret is the v0.6 stepping stone per design Q2. Vault swaps the
+  bearer for a hub-minted JWT with scope `scribe:transcribe` when
+  hub-as-issuer lands; scribe's existing `hub-jwt.ts` validation seam
+  is already in place. No wire-shape change — only the token contents.
+- **Live-tail of transcription progress** (websocket / SSE from scribe).
+  Today's flow is fire-and-write-when-done.
+- **Audio retention `until_transcribed` polish.** Today's worker already
+  honors the retention enum; no change needed for v0.6.
+- **Auto-retry on transient 5xx with backoff cap.** Already implemented
+  for the legacy worker path — extends naturally to auto-origin in a
+  future PR.
+
+### Versioning
+
+`0.4.8-rc.1`. New rc chain for a feature PR (per governance Rule 2 —
+RC versioning at the target stable, not as separate patches).
+
 ## [0.4.7-rc.3] — 2026-05-21
 
 fix(vault): `mcp-install` admin-scope path no longer round-trips to hub
