@@ -2543,6 +2543,182 @@ describe("HTTP /notes", async () => {
       expect(body.map((n) => n.content)).toEqual(["new"]);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // POST /notes/:id/retry-transcription — vault#353 design Q5.
+  //
+  // The endpoint re-enqueues a failed transcript by flipping the matching
+  // attachment back to `transcribe_status: pending`. The worker (or sweep)
+  // picks it up. These tests exercise the request shape + error branches;
+  // the actual re-transcription is covered in transcription-worker.test.ts's
+  // auto-origin section.
+  // -------------------------------------------------------------------------
+  describe("POST /notes/:id/retry-transcription", async () => {
+    async function seedFailedTranscript(opts: {
+      audioPath?: string;
+      noteId?: string;
+      transcriptId?: string;
+      omitAttachmentId?: boolean;
+    } = {}): Promise<{ owner: { id: string }; attachmentId: string; transcriptId: string; audioPath: string }> {
+      const audioPath = opts.audioPath ?? `${opts.noteId ?? "src"}/voice.webm`;
+      const ownerId = opts.noteId ?? "src-note";
+      const owner = await store.createNote("# Voice\n", { id: ownerId });
+      const att = await store.addAttachment(owner.id, audioPath, "audio/webm", {
+        transcribe_status: "failed",
+        transcribe_origin: "auto",
+        transcribe_error: "no transcription provider configured",
+      });
+      // Seed the failed transcript note exactly as the worker would have.
+      const transcriptMeta: Record<string, unknown> = {
+        transcript_of: audioPath,
+        transcript_status: "failed",
+        transcript_error: "missing_provider: no transcription provider configured",
+      };
+      if (!opts.omitAttachmentId) transcriptMeta.transcript_attachment_id = att.id;
+      await store.createNote("", {
+        id: opts.transcriptId ?? "transcript-1",
+        path: `${audioPath}.transcript`,
+        tags: ["transcript", "capture"],
+        metadata: transcriptMeta,
+      });
+      // Audio file present on disk so the retry doesn't 404 on audio_missing.
+      const assetsRoot = join(tmpDir, "assets");
+      mkdirSync(join(assetsRoot, audioPath.split("/").slice(0, -1).join("/")), { recursive: true });
+      writeFileSync(join(assetsRoot, audioPath), Buffer.from([1, 2, 3]));
+      process.env.ASSETS_DIR = assetsRoot;
+      return { owner: { id: ownerId }, attachmentId: att.id, transcriptId: opts.transcriptId ?? "transcript-1", audioPath };
+    }
+
+    test("happy path: flips attachment to pending and returns 202", async () => {
+      const { attachmentId, transcriptId } = await seedFailedTranscript();
+      const res = await handleNotes(
+        mkReq("POST", `/notes/${transcriptId}/retry-transcription`),
+        store,
+        `/${transcriptId}/retry-transcription`,
+        "default",
+      );
+      expect(res.status).toBe(202);
+      const body = await res.json() as any;
+      expect(body.status).toBe("queued");
+      expect(body.attachment_id).toBe(attachmentId);
+      expect(body.transcript_note_id).toBe(transcriptId);
+
+      // Attachment metadata reset.
+      const att = await store.getAttachment(attachmentId);
+      expect(att?.metadata?.transcribe_status).toBe("pending");
+      expect(att?.metadata?.transcribe_origin).toBe("auto");
+      // Stale failure state cleared.
+      expect(att?.metadata?.transcribe_error).toBeUndefined();
+      expect(att?.metadata?.transcribe_attempts).toBeUndefined();
+
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("404 when transcript note doesn't exist", async () => {
+      const res = await handleNotes(
+        mkReq("POST", "/notes/no-such-id/retry-transcription"),
+        store,
+        "/no-such-id/retry-transcription",
+        "default",
+      );
+      expect(res.status).toBe(404);
+    });
+
+    test("400 invalid_target when target is not a transcript note", async () => {
+      await store.createNote("regular note", { id: "regular" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/regular/retry-transcription"),
+        store,
+        "/regular/retry-transcription",
+        "default",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error).toBe("invalid_target");
+    });
+
+    test("400 not_failed when transcript already succeeded", async () => {
+      const audioPath = "memo/done.webm";
+      const owner = await store.createNote("voice", { id: "src-done" });
+      const att = await store.addAttachment(owner.id, audioPath, "audio/webm");
+      await store.createNote("the spoken words", {
+        id: "transcript-done",
+        path: `${audioPath}.transcript`,
+        metadata: {
+          transcript_of: audioPath,
+          transcript_attachment_id: att.id,
+          transcript_status: "complete",
+        },
+      });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/transcript-done/retry-transcription"),
+        store,
+        "/transcript-done/retry-transcription",
+        "default",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error).toBe("not_failed");
+      expect(body.transcript_status).toBe("complete");
+    });
+
+    test("400 missing_attachment_id when frontmatter lacks the id", async () => {
+      await seedFailedTranscript({
+        transcriptId: "transcript-no-id",
+        noteId: "src-no-id",
+        omitAttachmentId: true,
+      });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/transcript-no-id/retry-transcription"),
+        store,
+        "/transcript-no-id/retry-transcription",
+        "default",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error).toBe("missing_attachment_id");
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("404 attachment_missing when the attachment row no longer exists", async () => {
+      const owner = await store.createNote("voice", { id: "src-stale" });
+      await store.createNote("", {
+        id: "transcript-stale",
+        path: "memo/stale.webm.transcript",
+        metadata: {
+          transcript_of: "memo/stale.webm",
+          transcript_attachment_id: "deleted-attachment-id",
+          transcript_status: "failed",
+          transcript_error: "missing_provider",
+        },
+      });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/transcript-stale/retry-transcription"),
+        store,
+        "/transcript-stale/retry-transcription",
+        "default",
+      );
+      expect(res.status).toBe(404);
+      const body = await res.json() as any;
+      expect(body.error).toBe("attachment_missing");
+    });
+
+    test("405 on GET (must POST)", async () => {
+      await seedFailedTranscript({
+        transcriptId: "transcript-405",
+        noteId: "src-405",
+        audioPath: "memo/405.webm",
+      });
+      const res = await handleNotes(
+        mkReq("GET", "/notes/transcript-405/retry-transcription"),
+        store,
+        "/transcript-405/retry-transcription",
+        "default",
+      );
+      expect(res.status).toBe(405);
+      delete process.env.ASSETS_DIR;
+    });
+  });
 });
 
 describe("HTTP GET /notes?format=graph", async () => {

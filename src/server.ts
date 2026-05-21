@@ -24,8 +24,11 @@ import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { route } from "./routing.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
+import { setTranscriptionWorker } from "./transcription-registry.ts";
 import { assetsDir } from "./routes.ts";
-import { resolveScribeAuthToken } from "./scribe-env.ts";
+import { resolveScribeAuthToken, ensureScribeBearer } from "./scribe-env.ts";
+import { getCachedScribeUrl } from "./scribe-discovery.ts";
+import { readEnvFile, setEnvVar } from "./config.ts";
 import { resolveBindHostname } from "./bind.ts";
 import { MirrorManager } from "./mirror-manager.ts";
 import { setMirrorManager } from "./mirror-registry.ts";
@@ -47,8 +50,9 @@ function registerConfiguredTriggers(): void {
   // both will process the same attachments. The trigger's `missing_metadata`
   // guard keeps it idempotent once the worker marks `transcript` on the
   // attachment, but the noise is worth flagging.
-  if (process.env.SCRIBE_URL) {
-    const scribeHost = safeHost(process.env.SCRIBE_URL);
+  const probedScribeUrl = getCachedScribeUrl();
+  if (probedScribeUrl) {
+    const scribeHost = safeHost(probedScribeUrl);
     for (const t of config.triggers) {
       if (t.action.send !== "attachment") continue;
       if (scribeHost && safeHost(t.action.webhook) === scribeHost) {
@@ -74,17 +78,35 @@ loadEnvFile();
 registerConfiguredTriggers();
 
 /**
- * Start the transcription worker if SCRIBE_URL is configured. The worker
- * polls every vault for attachments with `metadata.transcribe_status = "pending"`
- * and sends the audio to scribe. Absent SCRIBE_URL, the worker stays off
- * — `{transcribe: true}` uploads still enqueue, they just wait.
+ * Start the transcription worker if scribe is discoverable. Scribe URL
+ * resolution order (per `scribe-discovery.ts`): `SCRIBE_URL` env var, then
+ * `~/.parachute/services.json` `parachute-scribe` entry, then nothing.
+ *
+ * Bearer generation (vault#353): if neither `SCRIBE_AUTH_TOKEN` nor the
+ * legacy `SCRIBE_TOKEN` is set, generate a fresh 32-byte base64url bearer
+ * and persist it to vault's `.env` so subsequent restarts use the same
+ * value. Idempotent — calls after the first see the existing token. The
+ * operator (or hub install) is expected to mirror this bearer to scribe's
+ * `SCRIBE_AUTH_TOKEN`; without that mirror, scribe will reject the
+ * Authorization header on a 401 and transcription fails with a friendly
+ * error captured on the transcript note.
  */
+const scribeUrl = getCachedScribeUrl();
 let transcriptionWorker: TranscriptionWorker | null = null;
-if (process.env.SCRIBE_URL) {
+if (scribeUrl) {
+  // Generate + persist the shared bearer on first boot. Subsequent boots
+  // pick up the existing value and don't rotate. Loading the .env back
+  // into process.env happens above (`loadEnvFile()`); we re-load here to
+  // pick up the just-written value without restart.
+  const { created, token } = ensureScribeBearer(readEnvFile, setEnvVar);
+  if (created) {
+    process.env.SCRIBE_AUTH_TOKEN = token;
+    console.log("[transcribe] generated SCRIBE_AUTH_TOKEN (32 bytes, base64url) — mirror this value into scribe's config");
+  }
   transcriptionWorker = startTranscriptionWorker({
     vaultList: () => listVaults(),
     getStore: (name) => getVaultStore(name),
-    scribeUrl: process.env.SCRIBE_URL,
+    scribeUrl,
     scribeToken: resolveScribeAuthToken(),
     resolveAssetsDir: (vault) => assetsDir(vault),
     getAudioRetention: (vault) => readVaultConfig(vault)?.audio_retention ?? "keep",
@@ -97,9 +119,12 @@ if (process.env.SCRIBE_URL) {
     transcriptionWorker,
     (store) => getVaultNameForStore(store as never),
   );
-  console.log(`[transcribe] worker started → ${process.env.SCRIBE_URL}`);
+  // Expose the worker to the REST retry endpoint so retries kick immediately
+  // instead of waiting for the sweep. Idempotent on second boot.
+  setTranscriptionWorker(transcriptionWorker);
+  console.log(`[transcribe] worker started → ${scribeUrl}`);
 } else {
-  console.log("[transcribe] worker disabled (set SCRIBE_URL to enable)");
+  console.log("[transcribe] worker disabled (no scribe in services.json and SCRIBE_URL unset)");
 }
 
 if (process.env.VAULT_AUTH_TOKEN?.trim()) {
