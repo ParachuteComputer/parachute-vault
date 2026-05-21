@@ -103,7 +103,7 @@ import type { TokenPermission } from "./token-store.ts";
 import { resolveCreateTokenFlags, VAULT_SCOPES } from "./scopes.ts";
 import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { upsertService, ServicesManifestError } from "./services-manifest.ts";
+import { selfRegister } from "./self-register.ts";
 import {
   hasOwnerPassword,
   setOwnerPassword,
@@ -245,27 +245,6 @@ switch (command) {
 // Command implementations
 // ---------------------------------------------------------------------------
 
-/**
- * Compute the `paths` array for the parachute-vault entry in services.json.
- * One entry advertises every vault on this server; `paths[0]` is the
- * canonical mount the hub stamps into `.well-known/parachute.json`, so the
- * default vault sorts first when one is set. With no vaults yet, fall back
- * to "/" so an early-init registration is still well-formed.
- */
-function buildVaultServicePaths(
-  defaultVault: string | undefined,
-  vaults: string[],
-): string[] {
-  if (vaults.length === 0) return ["/"];
-  if (defaultVault && vaults.includes(defaultVault)) {
-    return [
-      `/vault/${defaultVault}`,
-      ...vaults.filter((v) => v !== defaultVault).map((v) => `/vault/${v}`),
-    ];
-  }
-  return vaults.map((v) => `/vault/${v}`);
-}
-
 async function cmdInit(args: string[] = []) {
   ensureConfigDirSync();
 
@@ -363,24 +342,24 @@ async function cmdInit(args: string[] = []) {
   // by name, preserving entries for other services. Non-fatal on failure —
   // init can complete without the manifest, just with a warning.
   //
+  // `selfRegister` stamps the full manifest-sourced row (displayName, tagline,
+  // stripPrefix, installDir) from `.parachute/module.json` — the same shape
+  // server boot writes via the self-registration pass (vault#266). Keeping
+  // the two write paths in lockstep means `parachute-vault init` and the
+  // first server boot agree on the row contents; without that, a re-init
+  // would silently lose the manifest fields the boot pass had added.
+  //
   // `paths[0]` is the canonical mount point — the hub uses it for the
   // `.well-known/parachute.json` URL and for `parachute expose`, so the
   // default vault always sorts first. Remaining vaults follow so the hub
   // well-known and paraclaw's attach picker see every vault on this server.
   // Re-running init re-registers the full set; that doubles as the
   // recovery path for installs whose services.json is stale (#208).
-  try {
-    upsertService({
-      name: "parachute-vault",
-      port: globalConfig.port || DEFAULT_PORT,
-      paths: buildVaultServicePaths(globalConfig.default_vault, allVaults),
-      health: "/health",
-      version: pkg.version,
-    });
-  } catch (err) {
-    const msg = err instanceof ServicesManifestError ? err.message : String(err);
-    console.error(`  Warning: could not update ~/.parachute/services.json: ${msg}`);
-  }
+  selfRegister({
+    version: pkg.version,
+    warn: (msg) => console.error(`  Warning: ${msg}`),
+    log: () => {}, // CLI init has its own status lines; suppress duplicate noise.
+  });
 
   // 2b. Migrate existing legacy keys into per-vault token tables
   for (const v of listVaults()) {
@@ -862,19 +841,16 @@ function cmdCreate(args: string[]) {
   // attach picker see this vault. cmdInit registers on first run; cmdCreate
   // adds the new path on every subsequent vault. Without this, vaults
   // created after init were invisible to the hub (#208).
-  // Warnings go to stderr to keep --json stdout clean for the orchestrator.
-  try {
-    upsertService({
-      name: "parachute-vault",
-      port: globalConfig.port || DEFAULT_PORT,
-      paths: buildVaultServicePaths(globalConfig.default_vault, listVaults()),
-      health: "/health",
-      version: pkg.version,
-    });
-  } catch (err) {
-    const msg = err instanceof ServicesManifestError ? err.message : String(err);
-    console.error(`Warning: could not update ~/.parachute/services.json: ${msg}`);
-  }
+  //
+  // Routed through `selfRegister` (vault#266) so the row carries the full
+  // manifest-sourced metadata (displayName, tagline, stripPrefix, installDir)
+  // — same shape server boot writes. Warnings go to stderr to keep --json
+  // stdout clean for the orchestrator.
+  selfRegister({
+    version: pkg.version,
+    warn: (msg) => console.error(`Warning: ${msg}`),
+    log: () => {}, // CLI create has its own status lines.
+  });
 
   if (jsonMode) {
     const payload = {

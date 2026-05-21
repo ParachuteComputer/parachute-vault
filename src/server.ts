@@ -33,6 +33,8 @@ import { resolveBindHostname } from "./bind.ts";
 import { MirrorManager } from "./mirror-manager.ts";
 import { setMirrorManager } from "./mirror-registry.ts";
 import { buildMirrorDeps, resolveMirrorVaultName } from "./mirror-deps.ts";
+import { selfRegister } from "./self-register.ts";
+import pkg from "../package.json" with { type: "json" };
 
 // Register webhook triggers from global config. Replaces the old hardcoded
 // tts-hook and transcription-hook with config-driven webhooks.
@@ -175,6 +177,14 @@ if (listVaults().length === 0) {
     console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
   }
 }
+
+// vault#266 — self-register manifest + installDir into services.json so
+// hub's discovery / admin SPA can find vault without a `parachute install
+// vault` round-trip. Idempotent (re-runs produce the same row when nothing
+// changed); never throws (boot must not fail on bookkeeping). The merge-
+// preserving `upsertService` ensures any hub-stamped fields on the row
+// survive — see self-register.ts header for the v0.6 vs v0.7 design note.
+selfRegister({ version: pkg.version });
 
 // Migrate tag schemas from vault.yaml → DB for each vault.
 // Only inserts schemas that don't already exist in the DB (safe across restarts).
