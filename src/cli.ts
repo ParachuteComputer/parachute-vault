@@ -943,6 +943,11 @@ function takeArgValue(args: string[], name: string): { value?: string; missingVa
  * Targeting:
  *   --scope <verb>        vault:read | vault:write | vault:admin (default: vault:read).
  *                         For --mint, expands to vault:<vault-name>:<verb>.
+ *                         vault:admin requires --legacy-pat — hub policy makes
+ *                         per-vault admin non-requestable via mint-token (it's
+ *                         operator-only, minted only through the session-
+ *                         cookie-gated admin SPA endpoint), so --mint + admin
+ *                         is rejected pre-flight.
  *   --install-scope <s>   local (default) | user | project. local writes to
  *                         ~/.claude.json under projects[<cwd>].mcpServers
  *                         (private, this directory only — matches Claude
@@ -1331,6 +1336,28 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     bearer = fullToken;
   } else {
     // mode === "mint"
+    // Pre-flight: hub policy rejects `vault:<name>:admin` via the public
+    // mint-token endpoint. Per-vault admin is operator-only, mintable
+    // only through the session-cookie-gated `/admin/vault-admin-token/:name`
+    // SPA path. Calling hub with admin would surface a 400:
+    //   "Hub mint-token rejected (HTTP 400, invalid_scope):
+    //    scope vault:default:admin is not requestable via mint-token;
+    //    use OAuth flow or operator rotation"
+    // Fail early with the actionable remediation rather than letting
+    // the operator chase the hub's wire-level error. See
+    // `parachute-hub/src/scope-explanations.ts` (VAULT_ADMIN_RE) and
+    // `parachute-hub/src/api-mint-token.ts` (non-requestable guard).
+    if (verb === "admin") {
+      console.error(
+        "Hub policy: vault:<name>:admin is not requestable via mint-token " +
+          "(per-vault admin is operator-only, minted only by the session-cookie-gated " +
+          "admin SPA at <hub>/admin/vaults/" + vaultName + ").\n" +
+          "  Fix: use `--legacy-pat --scope vault:admin` to mint a vault-DB pvt_* with admin scope " +
+          "(the right shape for an MCP entry needing schema management).\n" +
+          "  Or:  drop --scope to default to vault:read (least privilege), or use --scope vault:write.",
+      );
+      process.exit(1);
+    }
     const operatorToken = readOperatorToken();
     if (!operatorToken) {
       console.error(
@@ -3392,7 +3419,13 @@ Vaults:
                                             (any shape) instead of minting.
                                             --legacy-pat: mint a vault-DB pvt_*
                                             token (deprecated; for self-hosted-
-                                            without-hub setups).
+                                            without-hub setups). Also the only
+                                            path for --scope vault:admin — hub
+                                            policy reserves per-vault admin for
+                                            operator-only minting (the admin SPA
+                                            session-cookie path), so --mint
+                                            --scope vault:admin is rejected
+                                            pre-flight.
                                             --install-scope local (default) writes
                                             ~/.claude.json under
                                             projects[<cwd>].mcpServers (this

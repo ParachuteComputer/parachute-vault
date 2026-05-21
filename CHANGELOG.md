@@ -36,6 +36,67 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.7-rc.3] — 2026-05-21
+
+fix(vault): `mcp-install` admin-scope path no longer round-trips to hub
+mint-token (which rejects it by policy).
+
+### Symptom
+
+Running `parachute vault mcp-install`, picking the `admin` option in the
+interactive auth prompt, surfaced:
+
+```
+Hub mint-token rejected (HTTP 400, invalid_scope): scope vault:default:admin
+is not requestable via mint-token; use OAuth flow or operator rotation
+```
+
+The mint-token endpoint has always rejected `vault:<name>:admin` — per-vault
+admin is non-requestable by hub policy (see
+[`parachute-hub/src/scope-explanations.ts`](https://github.com/ParachuteComputer/parachute-hub/blob/main/src/scope-explanations.ts)'s
+`VAULT_ADMIN_RE` + `api-mint-token.ts`'s non-requestable guard). It's mintable
+only through the session-cookie-gated `/admin/vault-admin-token/<name>` SPA
+endpoint. Vault's `mcp-install` flow shipped this latent bug since vault#291
+introduced the `--mint` mode; it stayed latent until an operator exercised
+the admin branch.
+
+### Fixed
+
+- **Interactive flow auto-routes `admin` → `legacy-pat`.** Picking "admin"
+  at the auth prompt now mints a vault-DB `pvt_*` with full admin
+  permissions (the right shape for a local MCP entry needing schema
+  management) and prints a one-line explanation of the auto-route so the
+  switch isn't silent. Prompt help text updated to telegraph the routing
+  upfront.
+
+- **Flag-driven `--mint --scope vault:admin` rejected pre-flight.** The
+  combination errors out with an actionable remediation before any
+  operator-token / hub-origin check, pointing at
+  `--legacy-pat --scope vault:admin` (the working path) and naming the
+  admin SPA at `<hub>/admin/vaults/<name>` for operators who'd rather use
+  the browser path. The rejection happens locally — no hub round-trip.
+
+- **Docs + help text.** The `mcp-install` function docstring, the inline
+  `--legacy-pat` description in `parachute-vault --help`, and the
+  interactive prompt's help block all now say "admin requires
+  --legacy-pat" explicitly. Removes the trap where the help text listed
+  `vault:admin` as a `--scope` choice with no caveat.
+
+### Tests
+
+- `src/mcp-install-interactive.test.ts` — the existing
+  `"typing 'admin' produces vault:admin mint"` test was inverted: it
+  pinned the buggy behavior. Replaced with a regression test that
+  asserts (a) `mode === "legacy-pat"`, (b) `scope === "vault:admin"`,
+  and (c) the user-facing explanation appears in the captured log.
+- `src/mcp-install.test.ts` — new
+  `"rejects --mint --scope vault:admin pre-flight"` test exercising
+  Aaron's exact CLI invocation. Pins the remediation message wording
+  (`--legacy-pat --scope vault:admin`) and verifies the reject fires
+  *before* the operator-token / hub-origin checks (no "Hub unreachable"
+  / "No hub origin configured" leak when the operator wasn't going to
+  reach the hub anyway).
+
 ## [0.4.7-rc.2] — 2026-05-21
 
 fix(vault): export detects case-collision on case-insensitive filesystems
