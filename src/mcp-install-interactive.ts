@@ -190,7 +190,9 @@ export async function runInteractiveInstall(
         "Choices:",
         "  Enter       → mint a hub JWT with vault:read scope (recommended).",
         "  write       → mint with vault:write (mutations).",
-        "  admin       → mint with vault:admin (schema management).",
+        "  admin       → mint a vault-DB pvt_* with vault:admin (schema management;",
+        "                hub policy reserves per-vault admin for operator-only paths,",
+        "                so this auto-routes to legacy-pat).",
         "  paste       → use an existing token instead of minting.",
         "  legacy      → mint a vault-DB pvt_* (self-hosted-without-hub).",
       ].join("\n"),
@@ -209,10 +211,27 @@ export async function runInteractiveInstall(
       // operator gets the same control they get when widening a hub
       // JWT's scope. (vault#292 review F2.)
       scope = await askScope(io);
+    } else if (answer === "admin") {
+      // `vault:<name>:admin` is non-requestable via hub mint-token by
+      // policy — only the session-cookie-gated `/admin/vault-admin-token/:name`
+      // endpoint can mint per-vault admin scopes (see
+      // `parachute-hub/src/scope-explanations.ts:VAULT_ADMIN_RE` and
+      // `api-mint-token.ts`'s non-requestable guard). Hub returns
+      // HTTP 400 invalid_scope: "scope vault:<name>:admin is not
+      // requestable via mint-token; use OAuth flow or operator rotation".
+      //
+      // Auto-route to legacy-pat which mints a vault-DB pvt_* with full
+      // permissions — that's the right shape for an operator who wants
+      // admin scope on a local MCP entry. Print a one-line explanation
+      // so the switch isn't silent.
+      io.log("  → admin requires a vault-DB pvt_* (hub policy: per-vault admin");
+      io.log("    is operator-only, not mintable via the public mint-token API).");
+      io.log("    Switching to legacy-pat mode with vault:admin scope.");
+      mode = "legacy-pat";
+      scope = "vault:admin";
     } else {
       mode = "mint";
       if (answer === "write") scope = "vault:write";
-      else if (answer === "admin") scope = "vault:admin";
     }
   } else {
     // No hub-mint path available — explain why and offer the alternatives.

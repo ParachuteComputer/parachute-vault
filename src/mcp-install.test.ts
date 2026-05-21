@@ -522,6 +522,46 @@ describe("mcp-install flag parsing", () => {
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toMatch(/No hub origin configured/);
   });
+
+  test("rejects --mint --scope vault:admin pre-flight (hub policy: per-vault admin is non-requestable)", () => {
+    // Regression for the symptom Aaron hit on hub 0.5.12-rc.2 / vault
+    // 0.4.7-rc.1: `parachute vault mcp-install` with the "admin" mint
+    // option sent `vault:default:admin` to `POST /api/auth/mint-token`,
+    // and hub responded:
+    //
+    //   Hub mint-token rejected (HTTP 400, invalid_scope):
+    //   scope vault:default:admin is not requestable via mint-token;
+    //   use OAuth flow or operator rotation
+    //
+    // The combination is invalid by hub policy (see
+    // `parachute-hub/src/scope-explanations.ts:VAULT_ADMIN_RE` and
+    // `api-mint-token.ts`'s non-requestable guard) — per-vault admin
+    // is operator-only, mintable only through the session-cookie-gated
+    // `/admin/vault-admin-token/:name` SPA path.
+    //
+    // The fix rejects the combination pre-flight in vault's mcp-install
+    // with a clear remediation pointing at `--legacy-pat --scope vault:admin`
+    // (which mints a vault-DB pvt_* with admin scope — the right shape
+    // for a local MCP entry needing schema management).
+    setupBareVault(tmp, "default");
+    fs.writeFileSync(path.join(tmp, "operator.token"), "operator-bearer-stub");
+    const res = runCli(
+      ["mcp-install", "--mint", "--scope", "vault:admin"],
+      tmp,
+      { PARACHUTE_HUB_ORIGIN: "https://hub.example.org" },
+    );
+    expect(res.exitCode).toBe(1);
+    // Surface the policy reason so the operator knows why this combo is
+    // rejected (not a transient bug).
+    expect(res.stderr).toMatch(/not requestable via mint-token/);
+    // Point at the working remediation.
+    expect(res.stderr).toMatch(/--legacy-pat --scope vault:admin/);
+    // Pre-flight must fire BEFORE the operator-token / hub-origin checks
+    // pass the request to the network — no "Hub unreachable" / "No hub
+    // origin configured" leak.
+    expect(res.stderr).not.toMatch(/No hub origin configured/);
+    expect(res.stderr).not.toMatch(/Hub unreachable/);
+  });
 });
 
 // ---------------------------------------------------------------------------
