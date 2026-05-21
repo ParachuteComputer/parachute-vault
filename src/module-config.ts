@@ -15,15 +15,27 @@
  * PUT /.parachute/config is Phase 3 — not implemented here.
  *
  * Fields currently described:
- *   - audio_retention: per-vault enum, backed by VaultConfig.audio_retention.
- *   - scribe_url:      env var SCRIBE_URL (read-only for now — there is no
- *                      yaml slot yet, so PUT won't come online until Phase 3).
- *   - scribe_token:    env var SCRIBE_TOKEN, writeOnly (never returned).
- *   - port:            GlobalConfig.port, exposed read-only so the hub can
- *                      display it without round-tripping through /health.
+ *   - audio_retention:      per-vault enum, backed by VaultConfig.audio_retention.
+ *   - port:                 GlobalConfig.port, exposed read-only.
+ *   - autoTranscribe.*:     vault↔scribe handoff (vault#353, design 2026-05-21
+ *                           Part 2). Three nested fields per design Q4:
+ *       - enabled:          boolean toggle, default false (persisted in
+ *                           GlobalConfig.auto_transcribe.enabled).
+ *       - scribeUrl:        readOnly — resolved per-process from
+ *                           `~/.parachute/services.json` via
+ *                           `scribe-discovery.ts`. Operators can't point at an
+ *                           arbitrary scribe; the discovery layer is the gate.
+ *       - scribeBearer:     writeOnly — sourced from SCRIBE_AUTH_TOKEN env var.
+ *                           Hub install generates one at first boot
+ *                           (see scribe-env.ts:ensureScribeBearer); manual
+ *                           rotation is via `parachute-vault config set`.
+ *   - scribe_url / scribe_token (deprecated): kept under their legacy names
+ *                           through one release for the hub admin SPA's prior
+ *                           render path; new code should read autoTranscribe.*.
  */
 
 import type { VaultConfig, GlobalConfig } from "./config.ts";
+import { resolveScribeUrl } from "./scribe-discovery.ts";
 
 export interface ModuleConfigSchema {
   $schema: string;
@@ -49,20 +61,54 @@ export function buildConfigSchema(): ModuleConfigSchema {
         description:
           "What to do with audio attachments after transcription. `keep` leaves the file on disk; `until_transcribed` unlinks on successful transcribe (keeps on failure for retry); `never` unlinks on any terminal state (including failure — no retries).",
       },
+      autoTranscribe: {
+        type: "object",
+        title: "Auto-transcribe voice uploads",
+        description:
+          "When enabled, audio attachments (mime-type prefix `audio/`) are automatically sent to scribe and the resulting transcript lands as a sibling `<attachment-path>.transcript.md` note. Scribe must be reachable for transcription to succeed; failures are recorded as a transcript note with `transcript_status: failed`.",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: false,
+            title: "Enable auto-transcription",
+            description:
+              "Master toggle. When false, audio uploads land normally without any scribe interaction.",
+          },
+          scribeUrl: {
+            type: "string",
+            format: "uri",
+            readOnly: true,
+            title: "Scribe URL",
+            description:
+              "URL of the scribe service. Auto-populated from `~/.parachute/services.json` at vault startup (or from the SCRIBE_URL env var when set). Read-only — operators can't point at an arbitrary scribe.",
+          },
+          scribeBearer: {
+            type: "string",
+            writeOnly: true,
+            title: "Scribe auth bearer",
+            description:
+              "Shared bearer for the vault→scribe loopback contract. Hub install generates one at first boot. Write-only — never returned by GET.",
+          },
+        },
+      },
+      // Legacy aliases kept for back-compat with callers that read the
+      // pre-vault#353 shape. New consumers should read `autoTranscribe.*`.
       scribe_url: {
         type: "string",
         format: "uri",
-        title: "Scribe URL",
+        title: "Scribe URL (deprecated alias)",
         description:
-          "URL of the Scribe service for transcription. Empty disables the background worker. Currently sourced from the SCRIBE_URL env var; a PUT slot lands in Phase 3.",
+          "Legacy alias for `autoTranscribe.scribeUrl`. Will be removed in a future release.",
         readOnly: true,
+        deprecated: true,
       },
       scribe_token: {
         type: "string",
-        title: "Scribe auth token",
+        title: "Scribe auth token (deprecated alias)",
         description:
-          "Optional bearer token for Scribe. Stored in the SCRIBE_TOKEN env var today. Write-only — never returned by GET.",
+          "Legacy alias for `autoTranscribe.scribeBearer`. Will be removed in a future release.",
         writeOnly: true,
+        deprecated: true,
       },
       port: {
         type: "integer",
@@ -77,18 +123,28 @@ export function buildConfigSchema(): ModuleConfigSchema {
 }
 
 /**
- * Effective config values, with `writeOnly` fields stripped. `scribe_token` is
- * declared `writeOnly` and is never returned here, even when SCRIBE_TOKEN is
- * set in the environment.
+ * Effective config values, with `writeOnly` fields stripped. `scribeBearer`
+ * (and its legacy alias `scribe_token`) are declared `writeOnly` and never
+ * returned, even when set in the environment.
  */
 export function buildConfigValues(
   vaultConfig: VaultConfig,
   globalConfig: GlobalConfig,
   env: { SCRIBE_URL?: string | undefined } = process.env as { SCRIBE_URL?: string },
 ): Record<string, unknown> {
+  // Resolve scribe URL through the discovery layer so the GET shape reflects
+  // what the worker will actually use (services.json > SCRIBE_URL > unset).
+  // Pass env through so the test harness's override is honored.
+  const scribeUrl = resolveScribeUrl(env as NodeJS.ProcessEnv) ?? "";
   return {
     audio_retention: vaultConfig.audio_retention ?? "keep",
-    scribe_url: env.SCRIBE_URL ?? "",
+    autoTranscribe: {
+      enabled: globalConfig.auto_transcribe?.enabled ?? false,
+      scribeUrl,
+    },
+    // Legacy alias mirrors `autoTranscribe.scribeUrl` so hubs reading the
+    // pre-vault#353 shape don't regress.
+    scribe_url: scribeUrl,
     port: globalConfig.port,
   };
 }
