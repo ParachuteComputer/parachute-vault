@@ -3167,6 +3167,26 @@ async function cmdExport(args: string[]) {
       const cycle = await runCycle({ sinceCursor: cursor, isInitial: false });
       cursor = cycle.nextCursor;
     } catch (err) {
+      // CaseCollisionError under --strict-case-collision means the
+      // operator opted into "abort on any collision". A new collision
+      // that appears mid-watch (e.g. an LLM client just wrote
+      // `Inbox/Foo` to a vault that already had `Inbox/foo`) must NOT
+      // be swallowed into the generic [watch] export-error log — the
+      // strict-mode guarantee would silently degrade after the initial
+      // export. Print the full collision message + actionable hint and
+      // stop the loop via the same SIGINT-style pathway used by Ctrl-C
+      // (clears timer, gives in-flight work a 250ms settle window).
+      // Exits non-zero so supervisors / git-watch sidecars catch it.
+      if (err instanceof CaseCollisionError) {
+        console.error(err.message);
+        console.error(
+          "Resolve the collision in the vault or re-run without --strict-case-collision to fall back to auto-disambiguate mode.",
+        );
+        stopping = true;
+        if (timer) clearInterval(timer);
+        setTimeout(() => process.exit(1), 0);
+        return;
+      }
       // Don't kill the loop on a transient export error — log and keep
       // polling. Operator can Ctrl-C if they want to bail.
       console.error(`[watch] export error: ${(err as Error).message ?? err}`);

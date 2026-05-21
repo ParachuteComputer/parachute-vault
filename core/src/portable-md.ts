@@ -685,11 +685,17 @@ export class CaseCollisionError extends Error {
       "Export failed: case-collision detected on case-insensitive filesystem.",
       "The following notes have paths that differ only by case:",
     ];
-    for (const group of collisions) {
+    // Separate distinct collision groups with `  ---` so operators
+    // reading the error in a terminal can tell where one (Foo.md /
+    // foo.md) pair ends and the next (Bar.md / bar.md) begins. Without
+    // a separator, multi-group output runs together as an unbroken
+    // bullet list. vault#350.
+    collisions.forEach((group, idx) => {
+      if (idx > 0) lines.push("  ---");
       for (const entry of group) {
         lines.push(`  - ${entry.path}.${entry.extension} (note id: ${entry.note_id})`);
       }
-    }
+    });
     lines.push(
       "Rename one of them in the vault before re-exporting, or run from a case-sensitive filesystem.",
     );
@@ -803,15 +809,27 @@ export async function exportVaultToDir(
   // `failOnCaseCollision: true`, surface every collision group in one
   // typed error BEFORE any write lands on disk — partial-export-then-
   // throw would leave the operator with a half-mirrored output dir to
-  // clean up. The pre-scan walks the (already-loaded) note list,
-  // builds lowercased keys, and collects N-way groups. When no
+  // clean up. The pre-scan walks every note in the vault (NOT
+  // since-filtered: a since-filter belongs in the write loop —
+  // collisions can involve one old + one new path, and a since-only
+  // pre-scan would miss those entirely, silently degrading the strict
+  // guarantee on every poll cycle after the initial export). When no
   // collisions exist on a case-insensitive FS, the pre-scan is a
   // no-op (cheap); on a case-sensitive FS it's skipped entirely.
+  //
+  // Perf: the pre-scan calls `noteToPortable` (3 DB queries per note:
+  // links, attachments, content). The main loop below also calls
+  // `noteToPortable` — without caching, every note that ALSO passes
+  // the since-filter would be serialized twice (~2x the DB round-
+  // trips on a large strict-mode export). Stash every pre-scan result
+  // in `prescanPortables` and reuse it below; cache-miss falls back
+  // to a fresh `noteToPortable` for safety. vault#350.
+  const prescanPortables = new Map<string, PortableNote>();
   if (opts.failOnCaseCollision && !caseSensitive) {
     const groups = new Map<string, Array<{ note_id: string; path: string; extension: string }>>();
     for (const note of allNotes) {
-      if (since && !shouldIncludeForSince(note, since)) continue;
       const portable = await noteToPortable(note, store);
+      prescanPortables.set(portable.id, portable);
       if (!portable.path) continue; // _unpathed/<id>.<ext> is case-stable
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
@@ -831,7 +849,10 @@ export async function exportVaultToDir(
 
   for (const note of allNotes) {
     if (since && !shouldIncludeForSince(note, since)) continue;
-    const portable = await noteToPortable(note, store);
+    // Reuse a pre-scan result when strict-mode populated the cache;
+    // otherwise serialize fresh. Same PortableNote shape either way,
+    // so the rest of the loop is untouched. vault#350.
+    const portable = prescanPortables.get(note.id) ?? (await noteToPortable(note, store));
     let relPath = portableExportFilePath(portable);
 
     // Decide whether this note's filename needs disambiguation
