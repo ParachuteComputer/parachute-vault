@@ -1575,6 +1575,119 @@ describe("HTTP /notes", async () => {
     expect(body.map((n) => n.content)).toEqual(["modified"]);
   });
 
+  // ---- Cursor pagination (vault#313) ----
+  //
+  // Opaque cursors for since-last-checked agent loops. The full engine
+  // semantics live in core.test.ts; these tests pin the HTTP plumbing:
+  // wrapped {notes, next_cursor} envelope when ?cursor= is set, structured
+  // 400s on bad cursor, and end-to-end resume across calls.
+  test("GET /notes?cursor=... returns {notes, next_cursor} envelope", async () => {
+    await store.createNote("a", { id: "cur-rest-a" });
+    await store.createNote("b", { id: "cur-rest-b" });
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-04-01T00:00:00.000Z", "cur-rest-a");
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-04-02T00:00:00.000Z", "cur-rest-b");
+
+    // Mint a starting cursor via the store (we don't expose a "first cursor"
+    // endpoint — the first call's response carries the cursor). Simulate
+    // the first call by querying without a cursor and reading
+    // next_cursor from a follow-up call shape.
+    const seed = await store.queryNotesPaged({});
+    const cursor = seed.next_cursor;
+
+    // No new writes after seed → second call is empty but still returns
+    // an envelope.
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=${encodeURIComponent(cursor)}`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body).toHaveProperty("notes");
+    expect(body).toHaveProperty("next_cursor");
+    expect(Array.isArray(body.notes)).toBe(true);
+    expect(body.notes).toHaveLength(0);
+    expect(typeof body.next_cursor).toBe("string");
+  });
+
+  test("GET /notes (no cursor) returns legacy flat-array shape", async () => {
+    await store.createNote("a", { id: "noCur-a" });
+    const res = await handleNotes(mkReq("GET", "/notes"), store, "");
+    const body = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+  });
+
+  test("GET /notes?cursor=<stale> returns 400 cursor_query_mismatch", async () => {
+    await store.createNote("a", { tags: ["x"], id: "cm-a" });
+    await store.createNote("b", { tags: ["y"], id: "cm-b" });
+    const seed = await store.queryNotesPaged({ tags: ["x"] });
+
+    // Reuse on a different tag — engine raises cursor_query_mismatch.
+    const res = await handleNotes(
+      mkReq("GET", `/notes?tag=y&cursor=${encodeURIComponent(seed.next_cursor)}`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("cursor_query_mismatch");
+  });
+
+  test("GET /notes?cursor=<garbage> returns 400 cursor_invalid", async () => {
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=not-a-real-cursor`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("cursor_invalid");
+  });
+
+  test("GET /notes?cursor=...&near[note_id]=x rejects with INVALID_QUERY", async () => {
+    const a = await store.createNote("anchor", { id: "n1" });
+    const seed = await store.queryNotesPaged({});
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=${encodeURIComponent(seed.next_cursor)}&near[note_id]=${a.id}`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("INVALID_QUERY");
+  });
+
+  test("GET /notes?cursor=... resumes correctly across calls (end-to-end)", async () => {
+    // Three notes spread across distinct updated_at watermarks. First
+    // call returns the first batch, second call (with cursor) returns
+    // only the note written after the cursor was minted.
+    const a = await store.createNote("first", { id: "e2e-a" });
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-04-01T00:00:00.000Z", a.id);
+    const b = await store.createNote("second", { id: "e2e-b" });
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-04-02T00:00:00.000Z", b.id);
+
+    const seed = await store.queryNotesPaged({});
+    expect(seed.notes.map((n) => n.id).sort()).toEqual(["e2e-a", "e2e-b"]);
+
+    // Write a third note that lands AFTER the cursor's watermark.
+    const c = await store.createNote("third", { id: "e2e-c" });
+    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
+      .run("2026-04-03T00:00:00.000Z", c.id);
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=${encodeURIComponent(seed.next_cursor)}&include_content=true`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.notes.map((n: any) => n.id)).toEqual(["e2e-c"]);
+  });
+
   test("GET /notes?has_links=false returns only orphaned notes", async () => {
     const a = await store.createNote("src", { id: "qa" });
     const b = await store.createNote("tgt", { id: "qb" });

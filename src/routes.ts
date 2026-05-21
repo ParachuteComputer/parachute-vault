@@ -565,55 +565,88 @@ async function handleNotesInner(
       const tags = parseQueryList(url, "tag");
       const bracket = parseMetaBrackets(url);
       if (bracket.error) return bracket.error;
+      // Opaque cursor for "since last checked" agent loops (vault#313).
+      // When present, switches the response shape to {notes, next_cursor}
+      // and routes through queryNotesPaged for keyset pagination. Mutually
+      // exclusive with the `near` graph-neighborhood scope (rebuilding the
+      // neighborhood per page isn't stable) — rejected below.
+      const cursorParam = parseQuery(url, "cursor");
+      const nearNoteIdEarly = parseQuery(url, "near[note_id]");
+      if (cursorParam && nearNoteIdEarly) {
+        return json(
+          {
+            error: "cursor is incompatible with near (graph neighborhood). Resolve the neighborhood first, then iterate with cursor over the resulting note set.",
+            code: "INVALID_QUERY",
+          },
+          400,
+        );
+      }
       let results: Note[];
+      let nextCursor: string | null = null;
+      const queryOpts = {
+        tags,
+        tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+        excludeTags: parseQueryList(url, "exclude_tag"),
+        hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
+        hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+        path: parseQuery(url, "path") ?? undefined,
+        pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+        // Extension filter (vault#328). Accepts repeated `extension=`
+        // params for the array form: `?extension=csv&extension=yaml`.
+        // `parseQueryList` already returns undefined when no params
+        // are present, so the filter is silently skipped on a plain
+        // GET without the extension query.
+        extension: parseExtensionFilter(url),
+        metadata: bracket.metadata,
+        // Date-range precedence chain (highest to lowest):
+        //   1. Bracket-style `meta[created_at][gte]=…` (canonical).
+        //   2. Flat `date_field=…&date_from=…&date_to=…` (deprecated).
+        //   3. Legacy `date_from=…&date_to=…` (no date_field, deprecated)
+        //      — filters on `n.created_at` by definition.
+        // The engine rejects combinations of `dateFilter` with the legacy
+        // `dateFrom`/`dateTo`, so we never set both shapes simultaneously.
+        ...(bracket.dateFilter
+          ? { dateFilter: bracket.dateFilter }
+          : parseQuery(url, "date_field")
+            ? {
+                dateFilter: {
+                  field: parseQuery(url, "date_field")!,
+                  from: parseQuery(url, "date_from") ?? undefined,
+                  to: parseQuery(url, "date_to") ?? undefined,
+                },
+              }
+            : {
+                dateFrom: parseQuery(url, "date_from") ?? undefined,
+                dateTo: parseQuery(url, "date_to") ?? undefined,
+              }),
+        sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
+        orderBy: parseQuery(url, "order_by") ?? undefined,
+        limit: parseInt10(parseQuery(url, "limit")) ?? 50,
+        offset: parseInt10(parseQuery(url, "offset")),
+        cursor: cursorParam ?? undefined,
+      };
       try {
-        results = await store.queryNotes({
-          tags,
-          tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
-          excludeTags: parseQueryList(url, "exclude_tag"),
-          hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
-          hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
-          path: parseQuery(url, "path") ?? undefined,
-          pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
-          // Extension filter (vault#328). Accepts repeated `extension=`
-          // params for the array form: `?extension=csv&extension=yaml`.
-          // `parseQueryList` already returns undefined when no params
-          // are present, so the filter is silently skipped on a plain
-          // GET without the extension query.
-          extension: parseExtensionFilter(url),
-          metadata: bracket.metadata,
-          // Date-range precedence chain (highest to lowest):
-          //   1. Bracket-style `meta[created_at][gte]=…` (canonical).
-          //   2. Flat `date_field=…&date_from=…&date_to=…` (deprecated).
-          //   3. Legacy `date_from=…&date_to=…` (no date_field, deprecated)
-          //      — filters on `n.created_at` by definition.
-          // The engine rejects combinations of `dateFilter` with the legacy
-          // `dateFrom`/`dateTo`, so we never set both shapes simultaneously.
-          ...(bracket.dateFilter
-            ? { dateFilter: bracket.dateFilter }
-            : parseQuery(url, "date_field")
-              ? {
-                  dateFilter: {
-                    field: parseQuery(url, "date_field")!,
-                    from: parseQuery(url, "date_from") ?? undefined,
-                    to: parseQuery(url, "date_to") ?? undefined,
-                  },
-                }
-              : {
-                  dateFrom: parseQuery(url, "date_from") ?? undefined,
-                  dateTo: parseQuery(url, "date_to") ?? undefined,
-                }),
-          sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
-          orderBy: parseQuery(url, "order_by") ?? undefined,
-          limit: parseInt10(parseQuery(url, "limit")) ?? 50,
-          offset: parseInt10(parseQuery(url, "offset")),
-        });
+        if (cursorParam) {
+          const page = await store.queryNotesPaged(queryOpts);
+          results = page.notes;
+          nextCursor = page.next_cursor;
+        } else {
+          results = await store.queryNotes(queryOpts);
+        }
       } catch (e: any) {
         // QueryError (non-indexed order_by, unknown operator, ...) surfaces
         // here. Duck-type on `name` + `code` — core is a separate module, so
         // `instanceof` is fragile across bundling boundaries.
         if (e && e.name === "QueryError") {
           return json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400);
+        }
+        // CursorError carries a structured code (cursor_invalid /
+        // cursor_query_mismatch) so the agent loop can distinguish a
+        // malformed cursor from a hash-mismatch and react appropriately
+        // (the latter typically means the agent changed its filter and
+        // should drop the cursor + restart from scratch).
+        if (e && e.name === "CursorError") {
+          return json({ error: e.message, code: e.code ?? "cursor_invalid" }, 400);
         }
         throw e;
       }
@@ -683,9 +716,14 @@ async function handleNotesInner(
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
+        // Cursor mode wraps the list in {notes, next_cursor} so an agent
+        // loop can chain calls without tracking a watermark client-side.
+        // Legacy callers (no `cursor` param) still get the flat array.
+        if (cursorParam) return json({ notes: enrichedOut, next_cursor: nextCursor });
         return json(enrichedOut);
       }
 
+      if (cursorParam) return json({ notes: output, next_cursor: nextCursor });
       return json(output);
     }
 
