@@ -764,6 +764,105 @@ describe("export CLI: --watch", () => {
   );
 
   test(
+    "--strict-case-collision: mid-watch collision stops the loop with the full error + hint",
+    async () => {
+      // vault#350 reviewer fix. Before: the watch polling timer's
+      // generic catch swallowed a CaseCollisionError thrown by a
+      // post-initial-export poll, logging only `[watch] export error:
+      // ...` and continuing to spin. The strict-mode guarantee
+      // ("refuse to continue when a collision appears") evaporated
+      // after the initial export.
+      //
+      // Scenario: start --watch --strict-case-collision against a
+      // vault whose initial state has no collisions (so the watch
+      // loop boots). Write a colliding note out-of-band. On the next
+      // poll cycle, runCycle throws CaseCollisionError; the watch
+      // catch path should now (a) print the full err.message to
+      // stderr including every colliding path, (b) print the
+      // actionable hint, (c) exit non-zero.
+      //
+      // The CLI doesn't expose `caseSensitiveOverride`, so this test
+      // is meaningful only on a case-insensitive FS (macOS APFS
+      // default, Windows NTFS default). On a case-sensitive Linux
+      // ext4, the pre-scan is a no-op by design and the path under
+      // test never fires — skip rather than assert a behavior that
+      // can't manifest there.
+      const { probeCaseSensitive } = await import("../core/src/portable-md.ts");
+      if (probeCaseSensitive(exportDir)) {
+        console.log(
+          "skipping mid-watch strict-collision test on case-sensitive FS — the strict pre-scan is a no-op here",
+        );
+        return;
+      }
+      const watch = spawnWatchCli(
+        [
+          "export",
+          exportDir,
+          "--watch",
+          "--interval",
+          "1",
+          "--strict-case-collision",
+        ],
+        tmp,
+      );
+      try {
+        // Initial export must succeed (seed has no collision).
+        await watch.awaitLine((l) => l.includes("Exported 1 note"), 10_000);
+        await watch.awaitLine((l) => l.includes("[watch] polling every 1s"), 5_000);
+
+        // Inject a collision: existing seed is `Inbox/seed`; write
+        // `Inbox/SEED` so the lowercased (path, ext) key collides.
+        const { clearVaultStoreCache, getVaultStore } = await import("./vault-store.ts");
+        clearVaultStoreCache();
+        const store = getVaultStore("default");
+        await store.createNote("# upper\n", {
+          id: "01HZB222222222222222222222",
+          path: "Inbox/SEED",
+        });
+        clearVaultStoreCache();
+      } catch (err) {
+        watch.proc.kill("SIGKILL");
+        throw err;
+      }
+
+      // The strict-mode catch path exits the process. Wait for it.
+      // Use a guarded race so a hung process doesn't eat the full
+      // 30s suite budget — surface a useful failure message instead.
+      const exit = await Promise.race([
+        watch.proc.exited,
+        new Promise<number>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `CLI did not exit within 15s of collision injection.\n` +
+                    `stdout:\n${watch.seenLines.join("\n")}\n` +
+                    `stderr:\n${watch.seenStderr.join("\n")}`,
+                ),
+              ),
+            15_000,
+          ),
+        ),
+      ]).catch((err) => {
+        watch.proc.kill("SIGKILL");
+        throw err;
+      });
+      // Non-zero exit: strict mode refused to continue.
+      expect(exit).not.toBe(0);
+
+      const stderr = watch.seenStderr.join("\n");
+      // Full collision message: header line + every colliding path.
+      expect(stderr).toContain("case-collision detected");
+      expect(stderr).toContain("Inbox/seed.md");
+      expect(stderr).toContain("Inbox/SEED.md");
+      // Actionable hint (the new line added by this fix).
+      expect(stderr).toContain("Resolve the collision in the vault");
+      expect(stderr).toContain("--strict-case-collision");
+    },
+    30_000,
+  );
+
+  test(
     "--watch + --git-commit: vault write → re-export → auto-commit → continues",
     async () => {
       initGitRepo(exportDir);

@@ -25,6 +25,7 @@ import { tmpdir } from "os";
 
 import { SqliteStore } from "./store.js";
 import {
+  CaseCollisionError,
   emitYamlDoc,
   exportVaultToDir,
   importPortableVault,
@@ -1550,5 +1551,251 @@ describe("case-collision detection (vault#327)", async () => {
     expect(upper!.content).toBe("month,total\n2026-01,9000");
     expect(lower!.path).toBe("Tabular/budget-2026");
     expect(lower!.content).toBe("month,total\n2026-01,1");
+  });
+
+  // ---------------------------------------------------------------------------
+  // failOnCaseCollision — strict mode (vault#327 Phase 2)
+  // ---------------------------------------------------------------------------
+  //
+  // The default behavior (auto-disambiguate) is lossless but silent on the
+  // wire — the CLI didn't surface it before #vault-rc.2. Strict mode is the
+  // opt-in fail-fast path: throws `CaseCollisionError` with every colliding
+  // path enumerated, so the operator can rename one of each pair in the
+  // vault before re-exporting.
+
+  it("failOnCaseCollision throws CaseCollisionError on case-insensitive FS", async () => {
+    await store.createNote("# in Balance", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/2025-05-26 Technology in Balance",
+    });
+    await store.createNote("# in balance", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/2025-05-26 Technology in balance",
+    });
+
+    const outDir = join(tmpBase, "strict-throw");
+    let thrown: unknown;
+    try {
+      await exportVaultToDir(store, {
+        outDir,
+        vaultName: "test",
+        exportedAt: "2026-05-15T00:00:00.000Z",
+        caseSensitiveOverride: false,
+        failOnCaseCollision: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(CaseCollisionError);
+    const err = thrown as CaseCollisionError;
+    expect(err.collisions).toHaveLength(1);
+    expect(err.collisions[0]).toHaveLength(2);
+    const ids = err.collisions[0]!.map((c) => c.note_id).sort();
+    expect(ids).toEqual(["2025-05-26-09-15-42-aaaaaa", "2025-05-26-09-15-42-bbbbbb"]);
+    // Error message names BOTH paths + the actionable instruction.
+    expect(err.message).toContain("Journal/2025-05-26 Technology in Balance");
+    expect(err.message).toContain("Journal/2025-05-26 Technology in balance");
+    expect(err.message).toContain("Rename one of them");
+    // Pre-scan throws BEFORE any per-note file write. The .parachute/
+    // sidecar dir is still created (cheap, idempotent), but no per-note
+    // .md file landed.
+    expect(existsSync(join(outDir, "Journal/2025-05-26 Technology in Balance.md"))).toBe(false);
+  });
+
+  it("failOnCaseCollision is a no-op when FS is case-sensitive", async () => {
+    // Same fixture as above, but force the case-sensitive code path. The
+    // strict flag becomes a no-op — both files land at their canonical
+    // paths, no error.
+    await store.createNote("# in Balance", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/2025-05-26 Technology in Balance",
+    });
+    await store.createNote("# in balance", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/2025-05-26 Technology in balance",
+    });
+
+    const outDir = join(tmpBase, "strict-cs");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: true,
+      failOnCaseCollision: true,
+    });
+    expect(stats.notes).toBe(2);
+    expect(stats.disambiguated_paths).toHaveLength(0);
+  });
+
+  it("failOnCaseCollision is a no-op on case-insensitive FS when nothing collides", async () => {
+    // One note. Strict mode + case-insensitive FS — should not throw,
+    // should ship clean. Pre-scan walks the (single-note) list and
+    // finds no collision groups.
+    await store.createNote("# solo", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/Solo Note",
+    });
+
+    const outDir = join(tmpBase, "strict-solo");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: false,
+      failOnCaseCollision: true,
+    });
+    expect(stats.notes).toBe(1);
+    expect(stats.disambiguated_paths).toHaveLength(0);
+    expect(existsSync(join(outDir, "Journal/Solo Note.md"))).toBe(true);
+  });
+
+  it("three-way collision lists all three paths in the error", async () => {
+    // Foo.md + foo.md + FOO.md — all share the same lowercased
+    // `(path, ext)` slot. CaseCollisionError.collisions[0] should
+    // include every one of them so the operator sees the full set in
+    // a single error report, not a paint-by-numbers re-export cycle.
+    await store.createNote("# upper-camel", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/Foo",
+    });
+    await store.createNote("# lower", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/foo",
+    });
+    await store.createNote("# all-caps", {
+      id: "2025-05-26-09-15-42-cccccc",
+      path: "Journal/FOO",
+    });
+
+    const outDir = join(tmpBase, "strict-3way");
+    let thrown: unknown;
+    try {
+      await exportVaultToDir(store, {
+        outDir,
+        vaultName: "test",
+        exportedAt: "2026-05-15T00:00:00.000Z",
+        caseSensitiveOverride: false,
+        failOnCaseCollision: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(CaseCollisionError);
+    const err = thrown as CaseCollisionError;
+    expect(err.collisions).toHaveLength(1);
+    expect(err.collisions[0]).toHaveLength(3);
+    const paths = err.collisions[0]!.map((c) => c.path).sort();
+    expect(paths).toEqual(["Journal/FOO", "Journal/Foo", "Journal/foo"]);
+    expect(err.message).toContain("Journal/FOO");
+    expect(err.message).toContain("Journal/Foo");
+    expect(err.message).toContain("Journal/foo");
+  });
+
+  it("multiple independent collision groups all surface", async () => {
+    // Two distinct collision groups: (Bar.md, bar.md) and (Baz.md,
+    // baz.md). Both groups should appear in the error so the operator
+    // doesn't have to fix-rebuild-fix in a loop. Pairs are independent —
+    // resolving one doesn't reveal the other.
+    await store.createNote("# bar-upper", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Bar",
+    });
+    await store.createNote("# bar-lower", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "bar",
+    });
+    await store.createNote("# baz-upper", {
+      id: "2025-05-26-09-15-42-cccccc",
+      path: "Baz",
+    });
+    await store.createNote("# baz-lower", {
+      id: "2025-05-26-09-15-42-dddddd",
+      path: "baz",
+    });
+
+    const outDir = join(tmpBase, "strict-multi-group");
+    let thrown: unknown;
+    try {
+      await exportVaultToDir(store, {
+        outDir,
+        vaultName: "test",
+        exportedAt: "2026-05-15T00:00:00.000Z",
+        caseSensitiveOverride: false,
+        failOnCaseCollision: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(CaseCollisionError);
+    const err = thrown as CaseCollisionError;
+    expect(err.collisions).toHaveLength(2);
+    const allIds = err.collisions.flat().map((c) => c.note_id).sort();
+    expect(allIds).toEqual([
+      "2025-05-26-09-15-42-aaaaaa",
+      "2025-05-26-09-15-42-bbbbbb",
+      "2025-05-26-09-15-42-cccccc",
+      "2025-05-26-09-15-42-dddddd",
+    ]);
+  });
+
+  it("directory-level case difference triggers collision detection", async () => {
+    // Two notes at `Notes/foo` and `notes/foo` — the basename matches
+    // but the parent dir differs only by case. On a case-insensitive
+    // FS, both files would land in the same directory because
+    // `Notes/` and `notes/` resolve to the same inode. Verify the
+    // lowercased-path key catches this: `notes/foo.md`.
+    await store.createNote("# notes-upper", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Notes/foo",
+    });
+    await store.createNote("# notes-lower", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "notes/foo",
+    });
+
+    const outDir = join(tmpBase, "strict-dir-case");
+    let thrown: unknown;
+    try {
+      await exportVaultToDir(store, {
+        outDir,
+        vaultName: "test",
+        exportedAt: "2026-05-15T00:00:00.000Z",
+        caseSensitiveOverride: false,
+        failOnCaseCollision: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(CaseCollisionError);
+    const err = thrown as CaseCollisionError;
+    expect(err.collisions).toHaveLength(1);
+    expect(err.collisions[0]).toHaveLength(2);
+  });
+
+  it("default (no failOnCaseCollision) still auto-disambiguates — back-compat", async () => {
+    // The new strict mode is opt-in. Leaving failOnCaseCollision unset
+    // (or false) keeps the existing lossless auto-disambiguation path
+    // unchanged. This pins the back-compat contract — watch/mirror
+    // loops that don't opt in to strict mode never see a thrown
+    // CaseCollisionError on a colliding vault.
+    await store.createNote("# upper", {
+      id: "2025-05-26-09-15-42-aaaaaa",
+      path: "Journal/Note",
+    });
+    await store.createNote("# lower", {
+      id: "2025-05-26-09-15-42-bbbbbb",
+      path: "Journal/note",
+    });
+
+    const outDir = join(tmpBase, "default-disambig");
+    const stats = await exportVaultToDir(store, {
+      outDir,
+      vaultName: "test",
+      exportedAt: "2026-05-15T00:00:00.000Z",
+      caseSensitiveOverride: false,
+      // failOnCaseCollision deliberately omitted — default behavior.
+    });
+    expect(stats.notes).toBe(2);
+    expect(stats.disambiguated_paths).toHaveLength(1);
   });
 });
