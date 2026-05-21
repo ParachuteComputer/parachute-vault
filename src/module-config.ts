@@ -72,7 +72,7 @@ export function buildConfigSchema(): ModuleConfigSchema {
             default: false,
             title: "Enable auto-transcription",
             description:
-              "Master toggle. When false, audio uploads land normally without any scribe interaction.",
+              "Master toggle. When false, audio uploads land normally without any scribe interaction. Global — persisted in `GlobalConfig.auto_transcribe.enabled` and applies to every vault on this server. Per-vault control is a future enhancement when multi-vault deployments need it.",
           },
           scribeUrl: {
             type: "string",

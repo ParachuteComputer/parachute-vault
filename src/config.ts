@@ -1439,7 +1439,15 @@ export function writeEnvFile(env: Record<string, string>): void {
       lines.push(`${key}=${val}`);
     }
   }
-  writeFileSync(envFilePath(), lines.join("\n") + "\n");
+  // 0600 — owner read/write only. This file holds SCRIBE_AUTH_TOKEN (the
+  // vault↔scribe loopback bearer) and any other secrets the operator drops
+  // in via `parachute-vault config set`. It must not be world- or
+  // group-readable on shared-user machines or Docker images with a loose
+  // umask. Mirrors the writeGlobalConfig pattern above.
+  writeFileSync(envFilePath(), lines.join("\n") + "\n", { mode: 0o600 });
+  // writeFileSync's `mode` only applies on file creation, so chmod an existing
+  // file explicitly in case it was written by an older version at 0644.
+  try { chmodSync(envFilePath(), 0o600); } catch {}
 }
 
 /**
