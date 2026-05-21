@@ -510,6 +510,21 @@ async function handleNotesInner(
         return json(result);
       }
 
+      // Cursor + full-text search is mutually exclusive (vault#313 reviewer).
+      // FTS owns its own ordering (relevance, not updated_at), so a cursor
+      // would skip rows. MCP rejects this combo at `core/src/mcp.ts`; REST
+      // would otherwise route into the `if (search)` branch below and
+      // silently drop the cursor. Reject here for surface parity.
+      if (search && parseQuery(url, "cursor")) {
+        return json(
+          {
+            error: "cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.",
+            code: "INVALID_QUERY",
+          },
+          400,
+        );
+      }
+
       // Full-text search
       if (search) {
         const searchTags = parseQueryList(url, "tag");

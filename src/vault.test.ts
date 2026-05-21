@@ -1659,6 +1659,64 @@ describe("HTTP /notes", async () => {
     expect(body.code).toBe("INVALID_QUERY");
   });
 
+  test("GET /notes?cursor=...&search=... rejects with INVALID_QUERY (vault#355 reviewer)", async () => {
+    // REST used to silently drop the cursor and route into the FTS branch.
+    // MCP rejects this combo explicitly at core/src/mcp.ts — REST now does
+    // the same. Surface parity, no silent corruption.
+    await store.createNote("the quick brown fox", { id: "s1" });
+    const seed = await store.queryNotesPaged({});
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=${encodeURIComponent(seed.next_cursor)}&search=fox`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("INVALID_QUERY");
+  });
+
+  test("GET /notes?cursor=...&sort=desc rejects with INVALID_QUERY", async () => {
+    // Descending iteration with a watermark cursor would skip newly-written
+    // rows. queryNotesPaged surfaces this as a QueryError; the REST handler
+    // catches and translates to 400. Asserts the surface parity with MCP
+    // even though the guard sits at the core layer.
+    await store.createNote("a", { id: "sd-a" });
+    const seed = await store.queryNotesPaged({});
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=${encodeURIComponent(seed.next_cursor)}&sort=desc`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("INVALID_QUERY");
+  });
+
+  test("GET /notes?cursor=...&order_by=... rejects with INVALID_QUERY", async () => {
+    // Cursor pagination forces order by updated_at; order_by is mutually
+    // exclusive. Same surface-parity assertion as the sort=desc test.
+    await store.createNote("a", { id: "ob-a" });
+    const seed = await store.queryNotesPaged({});
+    const res = await handleNotes(
+      mkReq("GET", `/notes?cursor=${encodeURIComponent(seed.next_cursor)}&order_by=created_at`),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("INVALID_QUERY");
+  });
+
+  test("GET /notes?search=fox (without cursor) still works after the cursor+search guard", async () => {
+    // Sanity check: the cursor+search guard must not regress plain FTS.
+    await store.createNote("the quick brown fox", { id: "ss-a" });
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox"), store, "");
+    expect(res.status).toBe(200);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].id).toBe("ss-a");
+  });
+
   test("GET /notes?cursor=... resumes correctly across calls (end-to-end)", async () => {
     // Three notes spread across distinct updated_at watermarks. First
     // call returns the first batch, second call (with cursor) returns
