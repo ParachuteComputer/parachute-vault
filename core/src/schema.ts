@@ -201,11 +201,107 @@ CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
 `;
 
 /**
+ * Connection-level pragmas applied on every Database open, in the order they
+ * appear here.
+ *
+ * `journal_mode = WAL` is a persistent, DB-level setting (lives in the SQLite
+ * header). Once any writer flips a DB into WAL it stays in WAL across opens
+ * and processes — so daemon + CLI + parachute-runner + any read-side tool
+ * see the same mode. Re-applying on every open is cheap and idempotent;
+ * SQLite returns the current mode either way.
+ *
+ * `synchronous = NORMAL` is the safe, recommended pairing with WAL per the
+ * SQLite docs: fsync only at checkpoint rather than on every commit. Crash
+ * safety is preserved (WAL frames are still ordered + checksummed); the only
+ * cost vs FULL is that an OS-level crash *between* checkpoints might lose
+ * the last transaction. Acceptable for a knowledge graph that's snapshotted
+ * by `VACUUM INTO` for backups.
+ *
+ * `wal_autocheckpoint = 1000` is SQLite's default; we set it explicitly so
+ * the contract is visible in code rather than implicit. 1000 pages ≈ 4MB
+ * before a passive checkpoint is triggered on the next write.
+ *
+ * `foreign_keys = ON` is per-connection (not persistent) — must be re-applied
+ * on every open. Migrations occasionally disable it transiently (see
+ * migrateToV14's BEGIN IMMEDIATE block); the boot path re-enables.
+ *
+ * WAL requires a filesystem that supports memory-mapped shared-memory
+ * (the `-shm` sidecar). NFS, some FUSE mounts, and a few Docker volume
+ * drivers don't qualify and silently fall back to the prior journal mode
+ * (typically `delete`). `applyConnectionPragmas` detects this and returns
+ * `wal: false` so the caller can log a warning — operators on those
+ * filesystems should know they've lost multi-process concurrency.
+ */
+const APPLY_PRAGMAS_LOGGED = new WeakSet<Database>();
+
+export interface ConnectionPragmaResult {
+  /** True when the connection ended up in WAL mode. False means the FS doesn't support WAL. */
+  wal: boolean;
+  /** The actual journal_mode SQLite reports — "wal", "delete", "memory", etc. */
+  journalMode: string;
+}
+
+/**
+ * Apply connection-level pragmas (journal mode, synchronous, FK enforcement)
+ * and verify WAL took effect. Idempotent — safe to call multiple times on
+ * the same connection. Logs a one-time warning per connection when WAL
+ * couldn't be applied.
+ *
+ * Exported for read-side callers (auth-status, mirror-manager, etc.) that
+ * open a Database directly without going through initSchema. Setting
+ * `journal_mode` on a read-only handle is a no-op but harmless; the
+ * useful state is set by whichever writer opens first.
+ */
+export function applyConnectionPragmas(db: Database): ConnectionPragmaResult {
+  // PRAGMA journal_mode returns a row { journal_mode: "wal" } on success.
+  // Use `.get()` (not `.exec()`) so we capture the result. Some bun:sqlite
+  // versions throw on readonly handles attempting to set journal_mode; treat
+  // that as "we couldn't set it, just read the current value" and recover.
+  let journalMode: string;
+  try {
+    const row = db.prepare("PRAGMA journal_mode = WAL").get() as { journal_mode?: string } | null;
+    journalMode = (row?.journal_mode ?? "").toLowerCase();
+  } catch {
+    // Most likely: readonly handle. Read-only opens never write the DB
+    // header, so they can't change journal_mode — but they can still query
+    // the current mode, which is set by the most recent writer.
+    const row = db.prepare("PRAGMA journal_mode").get() as { journal_mode?: string } | null;
+    journalMode = (row?.journal_mode ?? "").toLowerCase();
+  }
+  const wal = journalMode === "wal";
+
+  // synchronous + wal_autocheckpoint only matter when WAL is active. They're
+  // harmless under DELETE mode but the rationale is WAL-specific, so gate
+  // them on the success path. Both are best-effort — wrap in try to keep
+  // readonly handles (which reject writes) from failing the whole open.
+  if (wal) {
+    try { db.exec("PRAGMA synchronous = NORMAL"); } catch {}
+    try { db.exec("PRAGMA wal_autocheckpoint = 1000"); } catch {}
+  } else if (journalMode !== "memory" && !APPLY_PRAGMAS_LOGGED.has(db)) {
+    // `journalMode === "memory"` ⇒ this is a `:memory:` database, an
+    // explicit choice (tests, ephemeral probes) rather than a filesystem
+    // limitation. Suppress the warning so the test suite stays quiet;
+    // real on-disk vaults that can't host WAL (NFS, some FUSE/Docker
+    // volume drivers) still surface the diagnostic.
+    APPLY_PRAGMAS_LOGGED.add(db);
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[vault] WAL mode could not be enabled (journal_mode=${journalMode || "unknown"}). ` +
+      `The underlying filesystem may not support WAL (NFS, some FUSE/Docker volume drivers). ` +
+      `Multi-process concurrent access will be limited to a single writer at a time.`,
+    );
+  }
+
+  try { db.exec("PRAGMA foreign_keys = ON"); } catch {}
+
+  return { wal, journalMode };
+}
+
+/**
  * Initialize database schema. Idempotent — safe to call on every startup.
  */
 export function initSchema(db: Database): void {
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
+  applyConnectionPragmas(db);
 
   // Check if we need to migrate from v2
   const hasOldTables = hasTable(db, "things");

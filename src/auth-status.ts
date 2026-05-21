@@ -40,6 +40,10 @@ export interface AuthStatusResponse {
  * caller's signal to degrade `hasTokens` to `null`.
  */
 function vaultHasTokens(dbPath: string): boolean {
+  // Readonly handle — no pragma application here. Journal mode is a
+  // persistent DB-header setting written by the first writer (the daemon's
+  // BunSqliteStore via openVaultDb), so this probe sees WAL automatically
+  // and is safe under concurrent writes.
   const db = new Database(dbPath, { readonly: true });
   try {
     const row = db.prepare("SELECT 1 FROM tokens LIMIT 1").get();
