@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Store, Note, Link, Attachment, QueryOpts } from "./types.js";
+import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage } from "./types.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
@@ -225,6 +225,16 @@ export class BunSqliteStore implements Store {
 
   async queryNotes(opts: QueryOpts): Promise<Note[]> {
     return noteOps.queryNotes(this.db, this.expandQueryTags(opts));
+  }
+
+  async queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage> {
+    // Hierarchy expansion happens internally — but importantly the cursor's
+    // query_hash is computed from the CALLER'S opts (pre-expansion), so a
+    // tag hierarchy edit between calls invalidates the cursor (different
+    // descendant set → different rows match → caller should restart). The
+    // alternative — hash the expanded set — would silently keep returning
+    // stale results from a hierarchy snapshot the caller never saw.
+    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(opts));
   }
 
   /**

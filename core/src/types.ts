@@ -116,6 +116,30 @@ export interface QueryOpts {
   orderBy?: string;
   limit?: number;
   offset?: number;
+  /**
+   * Opaque cursor for "since last checked" agent loops (vault#313).
+   * When passed, the engine decodes it, verifies its `query_hash` matches
+   * the current query (mismatch → CursorError `cursor_query_mismatch`),
+   * and adds a keyset predicate that returns only rows newer than the
+   * cursor's `updated_at`/`id` watermark. Forces `orderBy = updated_at`
+   * (with `id` as a stable tiebreaker) so the watermark math is sound.
+   *
+   * Cursors are minted by `queryNotesPaged` (engine) and surfaced via
+   * the `query-notes` MCP tool's `next_cursor` field; callers should
+   * treat the string as opaque.
+   */
+  cursor?: string;
+}
+
+/**
+ * Cursor-paginated query result (vault#313). Returned by
+ * `queryNotesPaged`/`storeQueryNotesPaged`. `next_cursor` always advances —
+ * even on an empty result page — so an agent loop can persist a single
+ * watermark and keep polling.
+ */
+export interface QueryNotesPage {
+  notes: Note[];
+  next_cursor: string;
 }
 
 /** Note summary — everything except content. Used in link results. */
@@ -184,6 +208,14 @@ export interface Store {
   syncAllWikilinks(): Promise<{ synced: number; totalAdded: number; totalRemoved: number }>;
   deleteNote(id: string): Promise<void>;
   queryNotes(opts: QueryOpts): Promise<Note[]>;
+  /**
+   * Cursor-paginated `queryNotes` (vault#313). Returns the same notes plus
+   * an opaque `next_cursor` string the caller can pass on the next call
+   * to resume from the watermark of the LAST returned row. The cursor is
+   * always present in the response — even on an empty page — so an
+   * agent loop can persist a single watermark and keep polling.
+   */
+  queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
   searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]>;
 
   // Tags

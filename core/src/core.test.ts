@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
 import { initSchema } from "./schema.js";
+import { decodeCursor } from "./cursor.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -1310,6 +1311,262 @@ describe("queryNotes", async () => {
 
     const desc = await store.queryNotes({ sort: "desc" });
     expect(desc[0].content).toBe("Second");
+  });
+
+  // ---- Cursor pagination (vault#313) ----
+  //
+  // Opaque cursors for "since last checked" agent loops. The cursor binds
+  // to the query's filters via sha256 of the result-set-affecting params;
+  // a mismatched cursor raises CursorError. Pagination is keyset on
+  // (updated_at, id) so two notes sharing a millisecond don't get skipped
+  // or doubled across the page boundary.
+  describe("cursor pagination", () => {
+    // Helper: pin a note's updated_at to a known value so cursor math
+    // doesn't race wall-clock writes from the test harness.
+    function pinUpdatedAt(id: string, iso: string) {
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+    }
+
+    it("first call returns notes + a next_cursor string", async () => {
+      await store.createNote("A", { id: "na" });
+      await store.createNote("B", { id: "nb" });
+      const page = await store.queryNotesPaged({ tags: [], limit: 50 });
+      expect(page.notes.length).toBe(2);
+      expect(typeof page.next_cursor).toBe("string");
+      expect(page.next_cursor.length).toBeGreaterThan(0);
+    });
+
+    it("subsequent call with cursor returns only newer notes", async () => {
+      const a = await store.createNote("first", { id: "p1" });
+      pinUpdatedAt(a.id, "2026-04-01T00:00:00.000Z");
+      const b = await store.createNote("second", { id: "p2" });
+      pinUpdatedAt(b.id, "2026-04-02T00:00:00.000Z");
+
+      const page1 = await store.queryNotesPaged({});
+      // Both notes returned, cursor advances to "second"'s watermark.
+      expect(page1.notes.map((n) => n.id).sort()).toEqual(["p1", "p2"]);
+
+      // No new writes yet — second call should be empty.
+      const page2 = await store.queryNotesPaged({ cursor: page1.next_cursor });
+      expect(page2.notes).toHaveLength(0);
+
+      // Now write a new note; third call should return only it.
+      const c = await store.createNote("third", { id: "p3" });
+      pinUpdatedAt(c.id, "2026-04-03T00:00:00.000Z");
+      const page3 = await store.queryNotesPaged({ cursor: page2.next_cursor });
+      expect(page3.notes.map((n) => n.id)).toEqual(["p3"]);
+    });
+
+    it("next_cursor is always returned, even on an empty result page", async () => {
+      // No notes at all — first call returns empty array but still a cursor.
+      const page = await store.queryNotesPaged({});
+      expect(page.notes).toHaveLength(0);
+      expect(typeof page.next_cursor).toBe("string");
+      expect(page.next_cursor.length).toBeGreaterThan(0);
+
+      // Decode it: empty-page sentinel watermark is millis 0 + empty id.
+      const decoded = decodeCursor(page.next_cursor);
+      expect(decoded.last_updated_at).toBe(0);
+      expect(decoded.last_id).toBe("");
+    });
+
+    it("cursor with stale query_hash raises CursorError (cursor_query_mismatch)", async () => {
+      await store.createNote("a", { tags: ["x"], id: "qm1" });
+      await store.createNote("b", { tags: ["y"], id: "qm2" });
+
+      const page1 = await store.queryNotesPaged({ tags: ["x"] });
+      expect(page1.notes.map((n) => n.id)).toEqual(["qm1"]);
+
+      // Reuse the cursor with a different query — must reject loudly.
+      try {
+        await store.queryNotesPaged({ tags: ["y"], cursor: page1.next_cursor });
+        throw new Error("expected CursorError");
+      } catch (err: any) {
+        expect(err.name).toBe("CursorError");
+        expect(err.code).toBe("cursor_query_mismatch");
+      }
+    });
+
+    it("cursor with malformed payload raises CursorError (cursor_invalid)", async () => {
+      try {
+        await store.queryNotesPaged({ cursor: "not-a-real-cursor-!!!" });
+        throw new Error("expected CursorError");
+      } catch (err: any) {
+        expect(err.name).toBe("CursorError");
+        expect(err.code).toBe("cursor_invalid");
+      }
+    });
+
+    it("tiebreaker: two notes at the same updated_at use id as the secondary sort key", async () => {
+      const ts = "2026-04-15T00:00:00.000Z";
+      const a = await store.createNote("alpha", { id: "tb-a" });
+      const b = await store.createNote("beta", { id: "tb-b" });
+      const c = await store.createNote("gamma", { id: "tb-c" });
+      pinUpdatedAt(a.id, ts);
+      pinUpdatedAt(b.id, ts);
+      pinUpdatedAt(c.id, ts);
+
+      // Page 1 with limit=2: should return a + b (id-ascending tiebreaker).
+      const page1 = await store.queryNotesPaged({ limit: 2 });
+      expect(page1.notes.map((n) => n.id)).toEqual(["tb-a", "tb-b"]);
+
+      // Page 2 with the cursor: should return c (id > "tb-b" at same ms).
+      // Note: c is queried with the same query_hash since limit is
+      // excluded from the hash inputs by design.
+      const page2 = await store.queryNotesPaged({ limit: 2, cursor: page1.next_cursor });
+      expect(page2.notes.map((n) => n.id)).toEqual(["tb-c"]);
+    });
+
+    it("cursor advances correctly when notes share a millisecond on the page boundary", async () => {
+      // Two notes share the exact updated_at the cursor was minted at.
+      // The keyset predicate must include the larger-id one but NOT
+      // duplicate the cursor's own note.
+      const ts = "2026-04-15T12:34:56.789Z";
+      const a = await store.createNote("first-at-ts", { id: "ms-a" });
+      pinUpdatedAt(a.id, ts);
+
+      const page1 = await store.queryNotesPaged({ limit: 50 });
+      expect(page1.notes.map((n) => n.id)).toEqual(["ms-a"]);
+
+      // Now write a note that lands at the EXACT same updated_at (race
+      // window between pages). Its id sorts AFTER "ms-a".
+      const b = await store.createNote("second-at-same-ts", { id: "ms-b" });
+      pinUpdatedAt(b.id, ts);
+
+      const page2 = await store.queryNotesPaged({ cursor: page1.next_cursor });
+      // Must NOT include "ms-a" (we already saw it), MUST include "ms-b"
+      // (its id sorts after the cursor's last_id at the same timestamp).
+      expect(page2.notes.map((n) => n.id)).toEqual(["ms-b"]);
+    });
+
+    it("cursor invariance across reboots: a serialized cursor still resumes correctly", async () => {
+      // Cursors are self-contained — they don't reference any server-side
+      // state. Simulate a reboot by tearing down the DB+store and replaying
+      // the same data; the cursor minted on instance #1 must work against
+      // instance #2 with the same query.
+      const a1 = await store.createNote("note-1", { id: "reboot-1", path: "n1" });
+      pinUpdatedAt(a1.id, "2026-04-01T00:00:00.000Z");
+      const a2 = await store.createNote("note-2", { id: "reboot-2", path: "n2" });
+      pinUpdatedAt(a2.id, "2026-04-02T00:00:00.000Z");
+
+      const page1 = await store.queryNotesPaged({ limit: 1 });
+      expect(page1.notes.map((n) => n.id)).toEqual(["reboot-1"]);
+      const cursor = page1.next_cursor;
+
+      // Simulate a process restart with a fresh DB seeded the same way.
+      db.close();
+      db = new Database(":memory:");
+      store = new SqliteStore(db);
+      const a1b = await store.createNote("note-1", { id: "reboot-1", path: "n1" });
+      pinUpdatedAt(a1b.id, "2026-04-01T00:00:00.000Z");
+      const a2b = await store.createNote("note-2", { id: "reboot-2", path: "n2" });
+      pinUpdatedAt(a2b.id, "2026-04-02T00:00:00.000Z");
+
+      // The cursor is opaque-but-portable: encodes only millis + id + hash,
+      // none of which depend on server-side session state.
+      const page2 = await store.queryNotesPaged({ limit: 1, cursor });
+      expect(page2.notes.map((n) => n.id)).toEqual(["reboot-2"]);
+    });
+
+    it("cursor mode rejects sort: desc (descending iteration would skip new writes)", async () => {
+      await store.createNote("a");
+      const page = await store.queryNotesPaged({});
+      try {
+        await store.queryNotesPaged({ cursor: page.next_cursor, sort: "desc" });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("INVALID_QUERY");
+        expect(err.message.toLowerCase()).toContain("ascending");
+      }
+    });
+
+    it("cursor mode rejects orderBy (mutually exclusive with updated_at keyset)", async () => {
+      const { declareField } = await import("./indexed-fields.js");
+      declareField(db, "priority", "INTEGER", "task");
+      await store.createNote("a", { metadata: { priority: 1 } });
+      const page = await store.queryNotesPaged({});
+      try {
+        await store.queryNotesPaged({ cursor: page.next_cursor, orderBy: "priority" });
+        throw new Error("expected QueryError");
+      } catch (err: any) {
+        expect(err.name).toBe("QueryError");
+        expect(err.code).toBe("INVALID_QUERY");
+        expect(err.message.toLowerCase()).toContain("order_by");
+      }
+    });
+
+    it("cursor + tag filter: only notes matching the filter advance the watermark", async () => {
+      // Cursor pagination composes with the rest of the query — the
+      // watermark tracks the last note that matched the filter, not the
+      // last note in the vault.
+      const a = await store.createNote("task-1", { tags: ["task"], id: "ct-1" });
+      pinUpdatedAt(a.id, "2026-04-01T00:00:00.000Z");
+      const b = await store.createNote("not-a-task", { tags: ["other"], id: "ct-2" });
+      pinUpdatedAt(b.id, "2026-04-02T00:00:00.000Z");
+      const c = await store.createNote("task-2", { tags: ["task"], id: "ct-3" });
+      pinUpdatedAt(c.id, "2026-04-03T00:00:00.000Z");
+
+      const page1 = await store.queryNotesPaged({ tags: ["task"] });
+      expect(page1.notes.map((n) => n.id).sort()).toEqual(["ct-1", "ct-3"]);
+
+      const page2 = await store.queryNotesPaged({
+        tags: ["task"],
+        cursor: page1.next_cursor,
+      });
+      expect(page2.notes).toHaveLength(0);
+    });
+
+    it("query_hash is stable across key-order permutations of the same query", async () => {
+      // Two semantically-equivalent queries differing only in JS object key
+      // order must produce the same cursor binding — otherwise an SDK that
+      // reshuffles parameters between calls would silently invalidate the
+      // cursor.
+      const { computeQueryHash } = await import("./cursor.js");
+      const h1 = computeQueryHash({
+        tags: ["a", "b"],
+        path: "Projects",
+        metadata: { status: "open" },
+      });
+      const h2 = computeQueryHash({
+        metadata: { status: "open" },
+        path: "Projects",
+        tags: ["a", "b"],
+      });
+      expect(h1).toBe(h2);
+
+      // ...and tag-array order is irrelevant (different SDKs may sort).
+      const h3 = computeQueryHash({
+        tags: ["b", "a"],
+        path: "Projects",
+        metadata: { status: "open" },
+      });
+      expect(h3).toBe(h1);
+    });
+
+    it("MCP query-notes: cursor mode returns {notes, next_cursor} envelope", async () => {
+      await store.createNote("a", { id: "mcp-a" });
+      await store.createNote("b", { id: "mcp-b" });
+
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+
+      // First call without cursor returns flat array (legacy shape).
+      const firstResult = await query.execute({}) as unknown;
+      expect(Array.isArray(firstResult)).toBe(true);
+
+      // Get a cursor by minting one ourselves via the store.
+      const seed = await store.queryNotesPaged({});
+
+      // Second call with cursor returns the wrapped envelope.
+      const envelope = await query.execute({ cursor: seed.next_cursor }) as any;
+      expect(envelope).toHaveProperty("notes");
+      expect(envelope).toHaveProperty("next_cursor");
+      expect(Array.isArray(envelope.notes)).toBe(true);
+      // No new writes since seed → empty page, cursor still advances.
+      expect(envelope.notes).toHaveLength(0);
+      expect(typeof envelope.next_cursor).toBe("string");
+    });
   });
 
   it("limits results", async () => {
