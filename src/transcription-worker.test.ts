@@ -867,3 +867,253 @@ describe("transcription worker — hook-driven", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// vault#353 — auto-origin path: materialize <attachment-path>.transcript.md
+// notes on success AND on terminal failure (so the retry endpoint has a
+// surface to act on). The legacy `transcribe_stub`-patching path remains
+// unchanged; these tests pin the new behavior for attachments stamped with
+// `transcribe_origin: "auto"`.
+// ---------------------------------------------------------------------------
+
+describe("transcription worker — auto-origin (vault#353)", () => {
+  test("success: materializes <path>.transcript with frontmatter + body", async () => {
+    const owner = await store.createNote("# Voice memo\n", { id: "auto-1" });
+    seedAudio("memos/auto-1.webm");
+    await store.addAttachment(owner.id, "memos/auto-1.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_origin: "auto",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "this is the spoken text" }]),
+    });
+    try {
+      const processed = await worker.tick();
+      expect(processed).toBe(1);
+    } finally {
+      await worker.stop();
+    }
+
+    // The transcript note exists, with the expected shape.
+    const transcript = await store.getNoteByPath("memos/auto-1.webm.transcript");
+    expect(transcript).not.toBeNull();
+    expect(transcript!.content).toBe("this is the spoken text");
+    expect(transcript!.tags).toContain("transcript");
+    expect((transcript!.metadata as any)?.transcript_status).toBe("complete");
+    expect((transcript!.metadata as any)?.transcript_of).toBe("memos/auto-1.webm");
+    expect(typeof (transcript!.metadata as any)?.transcript_duration_ms).toBe("number");
+
+    // Source note is NOT touched (no stub patching on auto-origin).
+    const sourceNote = await store.getNote("auto-1");
+    expect(sourceNote!.content).toBe("# Voice memo\n");
+
+    // Attachment row also reflects success — sweep + retry hit the same row.
+    const [att] = await store.getAttachments(owner.id);
+    expect(att.metadata?.transcribe_status).toBe("done");
+  });
+
+  test("missing_provider 400: terminal failure on first try → failed transcript note", async () => {
+    const owner = await store.createNote("# Voice memo\n", { id: "auto-mp" });
+    seedAudio("memos/auto-mp.webm");
+    await store.addAttachment(owner.id, "memos/auto-mp.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_origin: "auto",
+    });
+
+    // Custom fetchImpl that returns the structured 400 missing_provider
+    // payload (scribe#47 shape).
+    const fetchImpl: typeof fetch = (async () => {
+      return new Response(
+        JSON.stringify({
+          error: "no transcription provider configured",
+          error_code: "missing_provider",
+        }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const worker = makeWorker({ fetchImpl, maxAttempts: 5 });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const transcript = await store.getNoteByPath("memos/auto-mp.webm.transcript");
+    expect(transcript).not.toBeNull();
+    expect(transcript!.content).toBe("");
+    expect((transcript!.metadata as any)?.transcript_status).toBe("failed");
+    expect((transcript!.metadata as any)?.transcript_error).toContain("missing_provider");
+
+    // 4xx is terminal — attempts tracked but status went straight to failed,
+    // not parked in pending with backoff.
+    const [att] = await store.getAttachments(owner.id);
+    expect(att.metadata?.transcribe_status).toBe("failed");
+    expect((att.metadata as any)?.transcribe_error_code).toBe("missing_provider");
+  });
+
+  test("5xx timeout: retries with backoff (NOT terminal on first failure)", async () => {
+    const owner = await store.createNote("# Voice memo\n", { id: "auto-503" });
+    seedAudio("memos/auto-503.webm");
+    await store.addAttachment(owner.id, "memos/auto-503.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_origin: "auto",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "upstream timeout", status: 503 }]),
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    // 5xx is retriable — attachment goes back to pending with backoff.
+    // The transcript note is NOT materialized yet (the failure isn't terminal
+    // and we don't want to surface intermediate failures to the user).
+    const [att] = await store.getAttachments(owner.id);
+    expect(att.metadata?.transcribe_status).toBe("pending");
+    expect(att.metadata?.transcribe_backoff_until).toBeTruthy();
+
+    const transcript = await store.getNoteByPath("memos/auto-503.webm.transcript");
+    expect(transcript).toBeNull();
+  });
+
+  test("audio gone: terminal failure → failed transcript note materialized", async () => {
+    const owner = await store.createNote("# Voice memo\n", { id: "auto-gone" });
+    // No seedAudio call — the file is missing.
+    await store.addAttachment(owner.id, "memos/auto-gone.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_origin: "auto",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "should never run" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const transcript = await store.getNoteByPath("memos/auto-gone.webm.transcript");
+    expect(transcript).not.toBeNull();
+    expect((transcript!.metadata as any)?.transcript_status).toBe("failed");
+    expect((transcript!.metadata as any)?.transcript_error).toBe("audio file not found");
+  });
+
+  test("legacy stub flow unchanged: no transcript note materialized for transcribe_stub-only", async () => {
+    await store.createNote(
+      "# Voice\n\n_Transcript pending._\n",
+      { id: "legacy-1", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/legacy-1.webm");
+    await store.addAttachment("legacy-1", "memos/legacy-1.webm", "audio/webm", {
+      transcribe_status: "pending",
+      // Legacy path: NO transcribe_origin: "auto".
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "stub-patched" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    // The note body was patched in place (legacy behavior).
+    const note = await store.getNote("legacy-1");
+    expect(note!.content).toBe("# Voice\n\nstub-patched\n");
+
+    // No transcript note was created.
+    const transcript = await store.getNoteByPath("memos/legacy-1.webm.transcript");
+    expect(transcript).toBeNull();
+  });
+
+  test("retry path: failed transcript is overwritten in place on success", async () => {
+    const owner = await store.createNote("# Voice memo\n", { id: "auto-retry" });
+    seedAudio("memos/auto-retry.webm");
+    await store.addAttachment(owner.id, "memos/auto-retry.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_origin: "auto",
+    });
+
+    // Pass 1: missing_provider failure → failed transcript note materialized.
+    const fetch400: typeof fetch = (async () => {
+      return new Response(
+        JSON.stringify({ error: "missing", error_code: "missing_provider" }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+    const worker1 = makeWorker({ fetchImpl: fetch400 });
+    try { await worker1.tick(); } finally { await worker1.stop(); }
+
+    const failed = await store.getNoteByPath("memos/auto-retry.webm.transcript");
+    expect(failed).not.toBeNull();
+    const failedId = failed!.id;
+    expect((failed!.metadata as any)?.transcript_status).toBe("failed");
+
+    // Pass 2: re-enqueue by flipping the attachment back to pending (this is
+    // what the retry endpoint does) + give scribe a successful response.
+    const [att] = await store.getAttachments(owner.id);
+    await store.setAttachmentMetadata(att.id, {
+      ...(att.metadata ?? {}),
+      transcribe_status: "pending",
+      transcribe_origin: "auto",
+    });
+    const worker2 = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "second time's the charm" }]),
+    });
+    try { await worker2.tick(); } finally { await worker2.stop(); }
+
+    const success = await store.getNoteByPath("memos/auto-retry.webm.transcript");
+    expect(success).not.toBeNull();
+    // Same note id — updated in place, not a fresh row.
+    expect(success!.id).toBe(failedId);
+    expect(success!.content).toBe("second time's the charm");
+    expect((success!.metadata as any)?.transcript_status).toBe("complete");
+    expect((success!.metadata as any)?.transcript_error).toBeUndefined();
+  });
+
+  test("concurrent uploads: 5 audio files yield 5 transcript notes (no path collision)", async () => {
+    const owners: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const note = await store.createNote(`# Voice ${i}\n`, { id: `concurrent-${i}` });
+      owners.push(note.id);
+      seedAudio(`memos/concurrent-${i}.webm`);
+      await store.addAttachment(note.id, `memos/concurrent-${i}.webm`, "audio/webm", {
+        transcribe_status: "pending",
+        transcribe_origin: "auto",
+      });
+    }
+
+    // Same transcript body to each. The worker drains FIFO.
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([
+        { text: "transcript-0" },
+        { text: "transcript-1" },
+        { text: "transcript-2" },
+        { text: "transcript-3" },
+        { text: "transcript-4" },
+      ]),
+    });
+    try {
+      const processed = await worker.tick();
+      expect(processed).toBe(5);
+    } finally {
+      await worker.stop();
+    }
+
+    // 5 transcript notes — one per audio file. The bodies map to FIFO order;
+    // we just assert each note exists with `complete` status.
+    for (let i = 0; i < 5; i++) {
+      const t = await store.getNoteByPath(`memos/concurrent-${i}.webm.transcript`);
+      expect(t).not.toBeNull();
+      expect((t!.metadata as any)?.transcript_status).toBe("complete");
+    }
+  });
+});

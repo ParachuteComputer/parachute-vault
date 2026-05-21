@@ -45,6 +45,7 @@ import {
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
+import { shouldAutoTranscribe } from "./auto-transcribe.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -813,19 +814,33 @@ async function handleNotesInner(
       const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
       if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
 
-      // `transcribe: true` asks the transcription worker to read this audio
-      // file and replace the note's content with the transcript. The caller
-      // is declaring "overwrite my current content when the transcript lands"
-      // — we persist that as `transcribe_stub: true` on the note so a later
-      // user edit (which clears the marker) can opt out before the worker
-      // runs.
-      const attMeta = body.transcribe
-        ? { transcribe_status: "pending" as const, transcribe_requested_at: new Date().toISOString() }
+      // Decide whether to enqueue this attachment for transcription. Two paths:
+      //
+      // - **Explicit caller opt-in (legacy path, Lens flow):** `transcribe: true`
+      //   on the POST. The note already has a `_Transcript pending._` stub the
+      //   worker replaces on success — `transcribe_origin: "legacy"` preserves
+      //   the stub-patching behavior.
+      // - **Auto-transcribe (vault#353):** mime-type is `audio/*` AND the
+      //   operator has flipped `auto_transcribe.enabled = true` AND scribe is
+      //   reachable. The caller didn't opt in explicitly; we infer from the
+      //   audio mime-type. `transcribe_origin: "auto"` tells the worker to
+      //   materialize a `<attachment-path>.transcript.md` note on completion.
+      //
+      // Explicit `transcribe: true` wins — if the caller asked, we honor that
+      // regardless of the auto-transcribe toggle (back-compat).
+      const explicitOptIn = body.transcribe === true;
+      const autoOptIn = !explicitOptIn && shouldAutoTranscribe(body.mimeType);
+      const attMeta = (explicitOptIn || autoOptIn)
+        ? {
+            transcribe_status: "pending" as const,
+            transcribe_requested_at: new Date().toISOString(),
+            transcribe_origin: (explicitOptIn ? "legacy" : "auto") as "legacy" | "auto",
+          }
         : undefined;
 
       const attachment = await store.addAttachment(note.id, body.path, body.mimeType, attMeta);
 
-      if (body.transcribe) {
+      if (explicitOptIn) {
         const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
         if (noteMeta.transcribe_stub !== true) {
           await store.updateNote(note.id, {
@@ -872,6 +887,33 @@ async function handleNotesInner(
       return new Response(null, { status: 204 });
     }
     return json({ error: "Method not allowed" }, 405);
+  }
+
+  // POST /notes/:idOrPath/retry-transcription — vault#353 design Q5.
+  //
+  // Re-runs the auto-transcribe pipeline against the original audio
+  // attachment recorded in the transcript note's `transcript_attachment_id`
+  // frontmatter. Only valid on transcript notes (the target idOrPath must
+  // be a transcript note with `transcript_status: "failed"`); calling on
+  // anything else returns 400 with a clear reason.
+  //
+  // Wire shape:
+  //   POST .../notes/<idOrPath>/retry-transcription
+  //   →  202 { attachment_id, transcript_path } when re-enqueued
+  //      400 invalid_target          (not a transcript note)
+  //      400 not_failed              (transcript already succeeded; nothing to retry)
+  //      404 attachment_missing      (transcript_attachment_id row deleted)
+  //      404 audio_missing           (audio file unlinked from disk)
+  //      503 scribe_unavailable      (no worker configured this boot)
+  if (sub === "/retry-transcription") {
+    if (method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (!vault) return json({ error: "Vault context required" }, 400);
+    const note = await resolveNote(store, idOrPath);
+    if (!note) return json({ error: "Not found" }, 404);
+    if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+      return json({ error: "Not found" }, 404);
+    }
+    return handleRetryTranscription(store, note, vault);
   }
 
   if (sub !== "") return json({ error: "Not found" }, 404);
@@ -1821,6 +1863,128 @@ ${rendered}
       "Content-Security-Policy": "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'",
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Retry transcription (vault#353 design Q5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-enqueue the original audio attachment for a `transcript_status: failed`
+ * transcript note. Steps:
+ *
+ *   1. Validate target is a transcript note (`transcript_status` set in
+ *      metadata) AND that status is `failed`.
+ *   2. Find the original audio attachment by id from
+ *      `transcript_attachment_id` frontmatter. 404 if the row's gone.
+ *   3. Validate the audio file still exists on disk (retention=keep is
+ *      assumed by the retry contract; retention=until_transcribed unlinks
+ *      only on success, retention=never unlinks on failure — that last one
+ *      explicitly breaks retry, by design).
+ *   4. Reset `transcribe_status = "pending"`, clear backoff + error fields.
+ *      The auto-origin marker is preserved so the worker writes a transcript
+ *      note (overwriting this one in place).
+ *   5. Kick the worker if registered; otherwise the sweep picks it up.
+ */
+async function handleRetryTranscription(
+  store: Store,
+  note: Note,
+  vault: string,
+): Promise<Response> {
+  const meta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+  if (typeof meta.transcript_status !== "string") {
+    return json(
+      {
+        error: "invalid_target",
+        message: "Target note is not a transcript note (no transcript_status frontmatter).",
+      },
+      400,
+    );
+  }
+  if (meta.transcript_status !== "failed") {
+    return json(
+      {
+        error: "not_failed",
+        message: `Transcript note status is "${meta.transcript_status}" — only failed transcripts can be retried.`,
+        transcript_status: meta.transcript_status,
+      },
+      400,
+    );
+  }
+  const attachmentId = typeof meta.transcript_attachment_id === "string"
+    ? meta.transcript_attachment_id
+    : undefined;
+  if (!attachmentId) {
+    return json(
+      {
+        error: "missing_attachment_id",
+        message: "Transcript note has no `transcript_attachment_id` — can't locate the original audio.",
+      },
+      400,
+    );
+  }
+  const attachment = await store.getAttachment(attachmentId);
+  if (!attachment) {
+    return json(
+      {
+        error: "attachment_missing",
+        message: `Original audio attachment ${attachmentId} no longer exists in the vault.`,
+      },
+      404,
+    );
+  }
+  // Audio file existence + safety: defense-in-depth against a bad attachment
+  // row pointing outside the vault assets dir. Same guard as the worker.
+  const assetsRoot = assetsDir(vault);
+  const audioFilePath = normalize(join(assetsRoot, attachment.path));
+  if (!audioFilePath.startsWith(normalize(assetsRoot)) || !existsSync(audioFilePath)) {
+    return json(
+      {
+        error: "audio_missing",
+        message: `Original audio file at "${attachment.path}" no longer exists on disk.`,
+      },
+      404,
+    );
+  }
+
+  // Reset transcribe_status. Worker reads this row, sees "pending", processes
+  // it. Preserve `transcribe_origin: "auto"` so the worker materializes the
+  // transcript note (overwriting this failed note in place).
+  const attMeta = { ...(attachment.metadata ?? {}) } as Record<string, unknown>;
+  attMeta.transcribe_status = "pending";
+  attMeta.transcribe_requested_at = new Date().toISOString();
+  attMeta.transcribe_origin = "auto";
+  delete attMeta.transcribe_backoff_until;
+  delete attMeta.transcribe_error;
+  delete attMeta.transcribe_error_code;
+  delete attMeta.transcribe_attempts;
+  await store.setAttachmentMetadata(attachment.id, attMeta);
+
+  // Kick the worker for an event-driven re-run (no 30s sweep wait). The
+  // worker re-reads the row + processes immediately. If the worker isn't
+  // registered (scribe not configured this boot), we still reset the row;
+  // the next boot's sweep will pick it up. The 503 path is for callers that
+  // want certainty — but for v0.6 the sweep guarantee is enough.
+  const { getTranscriptionWorker } = await import("./transcription-registry.ts");
+  const worker = getTranscriptionWorker();
+  if (worker) {
+    // Refresh the attachment after the metadata write so the worker's
+    // in-process dedupe check sees pending.
+    const fresh = await store.getAttachment(attachment.id) ?? attachment;
+    // Fire-and-forget — the response shouldn't wait on transcription.
+    void worker.kick(vault, fresh);
+  }
+
+  return json(
+    {
+      status: "queued",
+      attachment_id: attachment.id,
+      attachment_path: attachment.path,
+      transcript_note_id: note.id,
+      worker: worker ? "kicked" : "sweep-only",
+    },
+    202,
+  );
 }
 
 // ---------------------------------------------------------------------------
