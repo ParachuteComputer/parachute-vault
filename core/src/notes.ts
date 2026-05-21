@@ -1,5 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import type { Note, NoteIndex, QueryOpts, VaultStats } from "./types.js";
+import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
 import {
   buildOperatorClause,
@@ -7,6 +7,17 @@ import {
   QueryError,
   requireIndexedField,
 } from "./query-operators.js";
+import {
+  CURSOR_VERSION,
+  CursorError,
+  computeQueryHash,
+  decodeCursor,
+  encodeCursor,
+  isoToMillis,
+  millisToIso,
+  type CursorPayload,
+  type QueryHashInputs,
+} from "./cursor.js";
 
 let idCounter = 0;
 
@@ -663,9 +674,68 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
+  // ---- Cursor predicate (vault#313) ----
+  //
+  // When a cursor is present, decode it, verify its query_hash matches the
+  // current query, and add a keyset predicate of the form:
+  //
+  //   (updated_at > last_updated_at)
+  //     OR (updated_at = last_updated_at AND id > last_id)
+  //
+  // The cursor also forces ORDER BY n.updated_at ASC, n.id ASC so the
+  // watermark math is sound — paginating by updated_at while ordering
+  // by created_at would skip rows whose update timestamp differs from
+  // their creation timestamp. `orderBy` and `sort: "desc"` are mutually
+  // exclusive with cursor mode (a "since last checked" loop wants
+  // ascending updated_at, full stop); we reject with INVALID_QUERY so
+  // callers don't silently get a broken iteration.
+  let cursorPayload: CursorPayload | null = null;
+  if (opts.cursor) {
+    if (opts.orderBy) {
+      throw new QueryError(
+        `cursor and order_by are mutually exclusive — cursor pagination forces order by updated_at`,
+        "INVALID_QUERY",
+      );
+    }
+    if (opts.sort === "desc") {
+      throw new QueryError(
+        `cursor pagination requires ascending sort by updated_at — descending sort with a cursor would skip newly-written rows`,
+        "INVALID_QUERY",
+      );
+    }
+    cursorPayload = decodeCursor(opts.cursor);
+    const expectedHash = computeQueryHash(toQueryHashInputs(opts));
+    if (cursorPayload.query_hash !== expectedHash) {
+      throw new CursorError(
+        `cursor was minted for a different query — drop the cursor and restart iteration`,
+        "cursor_query_mismatch",
+      );
+    }
+    // Translate the millis watermark back to an ISO string for the SQL
+    // comparison. SQLite's `n.updated_at` is TEXT in canonical ISO form
+    // (the store's `toISOString()` output), and ISO timestamps sort
+    // lexicographically in the same order as their millisecond epochs
+    // when they all use the same canonical form — which every timestamp
+    // vault mints does. Cursors minted on heterogeneous timestamps
+    // (e.g. an import that preserved unusual formatting) are still
+    // safe: we round-trip the cursor's millis through `new Date()`'s
+    // canonical ISO so the comparison is apples-to-apples.
+    const cursorIso = millisToIso(cursorPayload.last_updated_at);
+    conditions.push(
+      "(n.updated_at > ? OR (n.updated_at = ? AND n.id > ?))",
+    );
+    params.push(cursorIso, cursorIso, cursorPayload.last_id);
+  }
+
   const direction = opts.sort === "desc" ? "DESC" : "ASC";
   let orderBy: string;
-  if (opts.orderBy) {
+  if (opts.cursor) {
+    // Cursor mode forces a deterministic keyset order. `id` is the
+    // tiebreaker — without it, two notes sharing an `updated_at` would
+    // be at the mercy of SQLite's row order and the next page could
+    // miss or duplicate one.
+    orderBy = "n.updated_at ASC, n.id ASC";
+  } else if (opts.orderBy) {
     requireIndexedField(db, opts.orderBy);
     // `orderBy` came from indexed_fields (validated on declaration), so
     // the column name is safe to interpolate. Append created_at as a
@@ -695,6 +765,98 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     note.tags = getNoteTags(db, note.id);
     return note;
   });
+}
+
+/**
+ * Extract the result-set-affecting subset of `QueryOpts` for cursor hashing.
+ *
+ * `cursor`, `limit`, `offset`, `_tagsExpanded` (internal cache key) are
+ * excluded — they don't change which rows match, just how many or how
+ * the iteration advances. See `core/src/cursor.ts` for the rationale.
+ */
+function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
+  return {
+    tags: opts.tags,
+    tagMatch: opts.tagMatch,
+    excludeTags: opts.excludeTags,
+    hasTags: opts.hasTags,
+    hasLinks: opts.hasLinks,
+    path: opts.path,
+    pathPrefix: opts.pathPrefix,
+    extension: opts.extension,
+    ids: opts.ids,
+    metadata: opts.metadata,
+    dateFrom: opts.dateFrom,
+    dateTo: opts.dateTo,
+    dateFilter: opts.dateFilter,
+    sort: opts.sort,
+    orderBy: opts.orderBy,
+  };
+}
+
+/**
+ * Cursor-paginated wrapper around `queryNotes` (vault#313).
+ *
+ * Always returns `{ notes, next_cursor }`. `next_cursor` advances even on
+ * an empty result page — the caller can persist a single watermark and
+ * keep polling without special-casing the empty-page condition. The
+ * empty-page cursor's `last_updated_at` is the larger of:
+ *   - the prior cursor's `last_updated_at` (when `opts.cursor` was set), or
+ *   - the prior cursor's `last_updated_at` (defaults to 0 when not).
+ *
+ * Holding the watermark at the prior value on an empty page is the
+ * conservative choice: if a note is written between this call and the
+ * next at a timestamp BEFORE wall-clock-now (clock skew, batch import
+ * with explicit `created_at`), advancing the watermark to `now()` would
+ * skip it. The watermark advances only when actual rows are returned.
+ *
+ * First-call semantics (`opts.cursor` absent): query_hash is computed
+ * from the result-set-affecting opts and bound into the minted cursor.
+ * If zero rows match, the returned cursor encodes
+ * `last_updated_at = 0, last_id = ""` so the next call returns
+ * everything written since (the keyset predicate
+ * `updated_at > 0 OR (updated_at = 0 AND id > "")` matches every row
+ * with a non-null `updated_at` greater than the unix epoch).
+ */
+export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
+  const notes = queryNotes(db, opts);
+  const queryHash = computeQueryHash(toQueryHashInputs(opts));
+
+  // Watermark math: pick the larger of (last returned row, prior cursor
+  // watermark, sentinel). When the page is empty, fall back to the prior
+  // cursor's watermark — see the JSDoc rationale above.
+  let lastUpdatedAt = 0;
+  let lastId = "";
+  if (opts.cursor) {
+    // Re-decode (we already validated in queryNotes); this is cheap.
+    const prior = decodeCursor(opts.cursor);
+    lastUpdatedAt = prior.last_updated_at;
+    lastId = prior.last_id;
+  }
+  if (notes.length > 0) {
+    // queryNotes with a cursor orders by (updated_at ASC, id ASC), so
+    // the last note in the array is the new watermark. When no cursor
+    // was passed, the SQL is ordered by created_at; we still want the
+    // cursor to advance to the MAX (updated_at, id) of this page so
+    // the next call resumes correctly. Compute the max explicitly.
+    for (const note of notes) {
+      const updatedIso = note.updatedAt ?? note.createdAt;
+      const ms = isoToMillis(updatedIso);
+      if (ms > lastUpdatedAt || (ms === lastUpdatedAt && note.id > lastId)) {
+        lastUpdatedAt = ms;
+        lastId = note.id;
+      }
+    }
+  }
+
+  const next_cursor = encodeCursor({
+    v: CURSOR_VERSION,
+    last_updated_at: lastUpdatedAt,
+    last_id: lastId,
+    query_hash: queryHash,
+  });
+
+  return { notes, next_cursor };
 }
 
 export function searchNotes(

@@ -36,6 +36,66 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.2] - 2026-05-21
+
+feat(vault): query-notes opaque cursor for since-last-checked agent loops (#313).
+
+Agent loops (Gitcoin Brain, parachute-runner, any "give me what's new"
+polling consumer) previously had to track an `updated_at` watermark
+client-side and pass it back as `date_filter: { field: "updated_at",
+from: <iso> }`. Brittle — wall-clock races at the millisecond boundary
+could miss or double-count rows, and every consumer reinvented the
+watermark bookkeeping.
+
+`query-notes` now accepts an optional `cursor` parameter. The response
+shape switches to `{notes, next_cursor}`; the cursor is opaque
+(base64url-encoded JSON internally) and self-contained, so it survives
+process restarts and works across deployments. Pass the `next_cursor`
+back on the next call to receive only notes created or updated since
+the prior page.
+
+### What ships
+
+- **New `cursor: string` parameter** on the `query-notes` MCP tool and
+  the `GET /vault/<name>/api/notes` REST endpoint. When present, switches
+  the response to `{notes, next_cursor}` and routes through a new
+  `Store.queryNotesPaged()` method backed by keyset pagination on
+  `(updated_at, id)` — the id is a tiebreaker for the rare two-notes-at-
+  the-same-millisecond case so neither row is skipped nor doubled across
+  page boundaries.
+- **Cursor binds to the query** via sha256 of the result-set-affecting
+  filters (tag, path, metadata, date filters, etc. — `limit`/`offset` and
+  output-shape params are excluded). Reusing a cursor on a different
+  query raises a structured `400 cursor_query_mismatch` rather than
+  silently returning wrong rows.
+- **`next_cursor` is always present**, even on an empty result page —
+  the watermark advances only when actual rows are returned, so a
+  polling agent can persist a single string and keep calling without
+  special-casing the empty case.
+- **Backwards compatible.** Existing callers (no `cursor` param) get
+  the legacy flat-array shape; nothing changes for them. `dateFilter`
+  remains the lower-level primitive for absolute date ranges — cursor
+  and dateFilter coexist (cursor is "since last checked," dateFilter is
+  "between X and Y").
+- **Engine-level constraints**: cursor mode rejects `sort: desc` (a
+  descending iteration would skip newly-written rows) and `order_by`
+  (incompatible with the updated_at keyset). MCP-level: cursor is also
+  rejected with full-text `search` (FTS has its own ordering) and
+  `near` (graph neighborhoods aren't cursor-stable). All four return
+  `400 INVALID_QUERY` so the agent loop fails loud rather than silent.
+
+### Engineering notes
+
+`core/src/cursor.ts` is the canonical home for the codec — `encodeCursor`,
+`decodeCursor`, `computeQueryHash` (with stable key-order canonicalization
+so SDK-side reshuffling doesn't invalidate cursors), plus the
+`CursorError` class with `cursor_invalid` / `cursor_query_mismatch`
+codes. Tests pin the codec in `core/src/cursor.test.ts`; integration
+against `queryNotesPaged` lives in `core/src/core.test.ts` under
+`describe("cursor pagination")`. HTTP plumbing tests in
+`src/vault.test.ts` under `HTTP /notes` exercise the wrapped envelope,
+the structured 400s, and an end-to-end resume across calls.
+
 ## [0.4.8-rc.1] — 2026-05-21
 
 feat(vault): auto-transcribe voice uploads via scribe (vault#353).

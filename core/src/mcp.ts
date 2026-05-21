@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
+import { QueryError } from "./query-operators.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -189,6 +190,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           sort: { type: "string", enum: ["asc", "desc"], description: "Sort by created_at" },
           limit: { type: "number", description: "Max results (default 50)" },
           offset: { type: "number", description: "Pagination offset (default 0)" },
+          cursor: {
+            type: "string",
+            description:
+              "Opaque cursor for 'since last checked' agent loops (vault#313). First call: omit. The response will include `next_cursor` — pass it on the subsequent call to receive only notes created or updated since the prior page. The cursor binds to the query's filters (tag, path, metadata, etc.); changing them between calls returns a structured `cursor_query_mismatch` error. Pagination via cursor orders results by `updated_at ASC` and is mutually exclusive with `order_by` and `sort: \"desc\"`. The response shape switches to `{notes, next_cursor}` when this parameter is present.",
+          },
           include_content: { type: "boolean", description: "Include note content (default: true for single, false for list)" },
           include_metadata: {
             oneOf: [
@@ -254,8 +260,32 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
         }
 
+        // --- Cursor mode (vault#313) ---
+        // When the caller passes `cursor`, the response shape switches to
+        // `{notes, next_cursor}` and `queryNotesPaged` handles the keyset
+        // pagination. Cursor mode is incompatible with full-text search
+        // (FTS owns its own ordering — relevance, not updated_at) and
+        // graph-neighborhood scoping (`near` would have to rebuild the
+        // neighborhood every call to be cursor-stable; we punt for now).
+        // Both surface as INVALID_QUERY rather than silently returning
+        // wrong rows.
+        const cursorMode = typeof params.cursor === "string" && params.cursor.length > 0;
+        if (cursorMode && params.search) {
+          throw new QueryError(
+            `cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.`,
+            "INVALID_QUERY",
+          );
+        }
+        if (cursorMode && params.near) {
+          throw new QueryError(
+            `cursor is incompatible with near (graph neighborhood). Resolve the neighborhood first, then iterate with cursor + ids.`,
+            "INVALID_QUERY",
+          );
+        }
+
         // --- Full-text search ---
         let results: Note[];
+        let nextCursor: string | null = null;
         if (params.search) {
           // Normalize tag param
           const tags = normalizeTags(params.tag);
@@ -277,12 +307,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           // unknown keys silently; aliasing here closes the silent-no-op gap.
           const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
           const excludeTags = normalizeTags(excludeTagsRaw);
-          // Route through `store.queryNotes` (not `noteOps.queryNotes`) so
-          // tag-hierarchy expansion fires for MCP callers the same as for
-          // HTTP REST callers — `tag: "manual"` matches descendants declared
-          // via `_tags/*` config notes. The previous direct-noteOps call
-          // bypassed the wrapper and silently dropped hierarchy expansion.
-          results = await store.queryNotes({
+          // Route through `store.queryNotes`/`queryNotesPaged` (not the raw
+          // `noteOps` exports) so tag-hierarchy expansion fires for MCP
+          // callers the same as for HTTP REST callers — `tag: "manual"`
+          // matches descendants declared via `_tags/*` config notes. The
+          // previous direct-noteOps call bypassed the wrapper and silently
+          // dropped hierarchy expansion.
+          const queryOpts = {
             tags,
             tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
             excludeTags,
@@ -307,7 +338,15 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             orderBy: params.order_by as string | undefined,
             limit: (params.limit as number) ?? 50,
             offset: params.offset as number | undefined,
-          });
+            cursor: cursorMode ? (params.cursor as string) : undefined,
+          };
+          if (cursorMode) {
+            const page = await store.queryNotesPaged(queryOpts);
+            results = page.notes;
+            nextCursor = page.next_cursor;
+          } else {
+            results = await store.queryNotes(queryOpts);
+          }
         }
 
         // For full-text search the post-filter is still the right shape — FTS
@@ -347,9 +386,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             if (params.include_attachments) enriched.attachments = await store.getAttachments(n.id);
             enrichedOut.push(enriched);
           }
+          // Cursor mode wraps the list in `{notes, next_cursor}` so callers can
+          // chain calls without tracking a watermark client-side. Legacy
+          // callers (no `cursor` param) still get the flat array.
+          if (cursorMode) return { notes: enrichedOut, next_cursor: nextCursor };
           return enrichedOut;
         }
 
+        if (cursorMode) return { notes: output, next_cursor: nextCursor };
         return output;
       },
     },

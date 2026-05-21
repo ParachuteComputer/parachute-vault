@@ -178,9 +178,25 @@ function applyTagScopeWrappers(
     const allowed = await getAllowed();
     const result = await orig(params);
     if (!allowed) return result;
-    // Single-note shape (`{...note}` with `id`) vs list shape (array).
+    // Three possible response shapes:
+    //   - Array (legacy list, no cursor)
+    //   - `{notes, next_cursor}` (cursor mode, vault#313)
+    //   - `{...note}` with `id`+`tags` (single-note by id)
     if (Array.isArray(result)) {
       return result.filter((n: any) => noteWithinTagScope(n, allowed, rawTags));
+    }
+    if (
+      result &&
+      typeof result === "object" &&
+      "notes" in result &&
+      Array.isArray((result as any).notes) &&
+      "next_cursor" in result
+    ) {
+      const r = result as { notes: any[]; next_cursor: string | null };
+      return {
+        notes: r.notes.filter((n: any) => noteWithinTagScope(n, allowed, rawTags)),
+        next_cursor: r.next_cursor,
+      };
     }
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
