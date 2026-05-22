@@ -97,7 +97,7 @@ token's scope list. Verbs and inheritance:
 |---|---|---|
 | `read` | `GET`, `HEAD`, `OPTIONS` on `/api/*` | `write`, `admin` |
 | `write` | `POST`, `PATCH`, `PUT`, `DELETE` on `/api/*` | `admin` |
-| `admin` | `/tokens/*`, `/.parachute/config` (read), `/.parachute/mirror` (read+write); also `DELETE /api/notes/{id}` server-level enforcement | — |
+| `admin` | `/tokens/*`, `/.parachute/config` (read), `/.parachute/mirror` (read+write) | — |
 
 A grant satisfies a (vault, verb) request if either:
 
