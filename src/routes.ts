@@ -1308,7 +1308,7 @@ async function handleNotesInner(
     }
   }
 
-  // DELETE /notes/:idOrPath — admin only (enforced at server level)
+  // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
   if (method === "DELETE") {
     const note = await resolveNote(store, idOrPath);
     if (!note) return json({ error: "Not found" }, 404);
