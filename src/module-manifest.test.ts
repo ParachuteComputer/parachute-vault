@@ -40,14 +40,13 @@ describe("module-manifest", () => {
     });
   });
 
-  test("readSelfManifest parses a valid manifest", () => {
+  test("readSelfManifest parses a valid manifest (no kind — hub#301 Phase B)", () => {
     withTempPackageRoot(
       {
         name: "vault",
         manifestName: "parachute-vault",
         displayName: "Vault",
         tagline: "Test tagline",
-        kind: "api",
         port: 1940,
         paths: ["/vault/default"],
         health: "/vault/default/health",
@@ -58,9 +57,30 @@ describe("module-manifest", () => {
         expect(m?.name).toBe("vault");
         expect(m?.manifestName).toBe("parachute-vault");
         expect(m?.displayName).toBe("Vault");
-        expect(m?.kind).toBe("api");
+        expect(m?.kind).toBeUndefined();
         expect(m?.port).toBe(1940);
         expect(m?.paths).toEqual(["/vault/default"]);
+      },
+    );
+  });
+
+  test("readSelfManifest tolerates a legacy manifest that still includes kind", () => {
+    // hub#301 Phase B retired the `kind` field, but legacy manifests on
+    // pinned installs may still include it. The reader accepts it without
+    // erroring; the field is never branched on.
+    withTempPackageRoot(
+      {
+        name: "vault",
+        manifestName: "parachute-vault",
+        kind: "api",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+      },
+      (root) => {
+        const m = readSelfManifest(root);
+        expect(m).not.toBeNull();
+        expect(m?.kind).toBe("api");
       },
     );
   });
@@ -73,7 +93,7 @@ describe("module-manifest", () => {
 
   test("readSelfManifest throws when required field missing", () => {
     withTempPackageRoot(
-      { name: "vault" /* missing manifestName / port / paths / health / kind */ },
+      { name: "vault" /* missing manifestName / port / paths / health */ },
       (root) => {
         expect(() => readSelfManifest(root)).toThrow(/missing required/);
       },
@@ -83,11 +103,12 @@ describe("module-manifest", () => {
   test("readSelfManifest reads the actual shipped manifest in the repo", () => {
     // Smoke test the real shipped file — guards against ever shipping a
     // malformed manifest. Uses the real resolvePackageRoot (which finds
-    // the repo root in tests).
+    // the repo root in tests). Post hub#301 Phase B, the shipped manifest
+    // no longer includes `kind`.
     const m = readSelfManifest();
     expect(m).not.toBeNull();
     expect(m?.manifestName).toBe("parachute-vault");
-    expect(m?.kind).toBe("api");
+    expect(m?.kind).toBeUndefined();
     expect(m?.port).toBe(1940);
   });
 });

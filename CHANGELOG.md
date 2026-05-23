@@ -36,6 +36,12 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.5] - 2026-05-23
+
+### Removed
+
+- Dropped `kind` field from `.parachute/module.json`. Hub's validator made the field optional in hub#327; this PR completes the cleanup per hub#301 Phase B (kind retirement). No behavior change — vault was never branched-on by kind.
+
 ## [0.4.8-rc.4] - 2026-05-21
 
 feat(vault): enable WAL mode for multi-process SQLite concurrency (#326).
