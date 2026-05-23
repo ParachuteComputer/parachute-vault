@@ -40,7 +40,12 @@ to `@latest`.
 
 ### Removed
 
-- Dropped `kind` field from `.parachute/module.json`. Hub's validator made the field optional in hub#327; this PR completes the cleanup per hub#301 Phase B (kind retirement). No behavior change — vault was never branched-on by kind.
+- Dropped `kind` field from `.parachute/module.json`. Hub's validator made the field optional in hub#327; this PR completes the cleanup per hub#330 Phase B (kind retirement). No behavior change — vault was never branched-on by kind.
+
+### Changed
+
+- `VaultModuleManifest.kind` is now optional (mirrors hub#327's posture). The required-field check on `health` was split out of the prior combined `health`/`kind` validation. Legacy manifests still ship-and-parse fine; new manifests omit the field. Deprecation note added in the type docstring.
+- `self-register.test.ts` fixture dropped `kind` to match the new canonical manifest shape.
 
 ## [0.4.8-rc.4] - 2026-05-21
 

@@ -39,7 +39,6 @@ const TEST_MANIFEST: VaultModuleManifest = {
   manifestName: "parachute-vault",
   displayName: "Vault",
   tagline: "Test tagline",
-  kind: "api",
   port: 1940,
   paths: ["/vault/default"],
   health: "/vault/default/health",
