@@ -36,7 +36,14 @@ export interface VaultModuleManifest {
   readonly manifestName: string;
   readonly displayName?: string;
   readonly tagline?: string;
-  readonly kind: ModuleKind;
+  /**
+   * Deprecated as of hub#301 Phase B (kind retirement, 2026-05-23). Hub's
+   * validator dropped `kind` from required-fields in hub#327; vault no
+   * longer ships the field in `.parachute/module.json`. Kept here as
+   * optional only so an older shipped manifest (pinned legacy install)
+   * still parses without throwing — the field is never branched on.
+   */
+  readonly kind?: ModuleKind;
   readonly port: number;
   readonly paths: readonly string[];
   readonly health: string;
@@ -87,8 +94,11 @@ export function readSelfManifest(
   if (typeof parsed.port !== "number" || !Array.isArray(parsed.paths)) {
     throw new Error(`${path}: manifest missing required "port" / "paths"`);
   }
-  if (typeof parsed.health !== "string" || typeof parsed.kind !== "string") {
-    throw new Error(`${path}: manifest missing required "health" / "kind"`);
+  if (typeof parsed.health !== "string") {
+    throw new Error(`${path}: manifest missing required "health"`);
   }
+  // `kind` is retired as of hub#301 Phase B — hub#327 made it optional in
+  // the hub-side validator, and vault no longer ships it. If a legacy
+  // manifest still includes the field, accept it; just don't require it.
   return parsed as unknown as VaultModuleManifest;
 }
