@@ -911,7 +911,6 @@ describe("/.parachute/info + /.parachute/icon.svg", () => {
       tagline: string;
       version: string;
       iconUrl: string;
-      kind: string;
     };
     expect(body).toEqual({
       name: "parachute-vault",
@@ -919,8 +918,11 @@ describe("/.parachute/info + /.parachute/icon.svg", () => {
       tagline: expect.stringContaining("knowledge graph"),
       version: pkg.version,
       iconUrl: "/vault/journal/.parachute/icon.svg",
-      kind: "api",
     });
+    // `kind` retired from the info-endpoint response per hub#330 (companion
+    // to vault#359's module.json drop). Pin its absence so regressions are
+    // surfaced — the shape is a locked contract with the hub.
+    expect(body).not.toHaveProperty("kind");
   });
 
   test("info iconUrl is vault-scoped and points at a live icon handler", async () => {

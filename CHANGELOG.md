@@ -36,6 +36,12 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.6] - 2026-05-23
+
+### Removed
+
+- Dropped `kind` field from the `/.parachute/info` runtime endpoint response. Companion to vault#359's module.json drop — kind is no longer part of vault's external contract. Closes part of hub#340.
+
 ## [0.4.8-rc.5] - 2026-05-23
 
 ### Removed
