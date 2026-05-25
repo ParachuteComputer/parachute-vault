@@ -36,6 +36,16 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.8] - 2026-05-25
+
+### Fixed
+
+- Unblock Linux release CI for the `web/ui/dist` shipping fix (rc.7 was burned — release CI failed at the test gate before publish; rc.8 re-issues the same payload with the test fixes below). Two pre-existing Linux-only test bugs that had never surfaced because vault tests had never run on Linux until vault#361's tag-triggered workflow landed:
+  - **`runBackup` wrote the tarball into the directory it was reading.** `assembleTarball` runs `tar -czf <out> -C <stagingDir> <entries>` where `entries = readdirSync(stagingDir)`. The prior layout put the output at `stagingDir/__out__/<name>.tar.gz`, so `__out__` was in `entries` and tar enumerated the subdir while also writing to it. GNU tar (Linux) treats "file changed as we read it" as fatal; BSD tar (macOS) tolerates the race. Fix: write the tarball to a sibling tempdir, completely outside tar's input set. Affects 3 backup integration tests + 1 `vault backup` CLI test.
+  - **`seedVaultWithNotes` polluted `process.env.HOME` without restoring it.** The helper sets HOME so the deferred re-import of `vault-store.ts` reads the test's isolated PARACHUTE_HOME. It never restored either env var, so the polluted value leaked into `resolveInstallTarget` tests in the same process — that function reads `process.env.HOME` directly (Bun caches `os.homedir()` at process start). Fix: capture HOME/PARACHUTE_HOME at module load, restore in afterEach of every describe that calls `seedVaultWithNotes`. Affects 2 install-target tests.
+
+  Closes vault#363.
+
 ## [0.4.8-rc.7] - 2026-05-25
 
 ### Fixed
