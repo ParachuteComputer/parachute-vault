@@ -9,9 +9,12 @@ root:
 - `/vault/{name}/api/...` — the REST surface for one vault
 - `/vault/{name}/mcp[/*]` — the MCP endpoint (not covered here; see
   `core/src/mcp.ts`)
-- `/vault/{name}/oauth/{register,authorize,token}` and the matching
-  `.well-known/*` documents — OAuth 2.1 + PKCE + DCR. See
-  [`docs/auth-model.md`](./auth-model.md).
+- `/vault/{name}/.well-known/oauth-{protected-resource,authorization-server}`
+  — OAuth discovery; both documents forward to the hub as the authorization
+  server. See [`docs/auth-model.md`](./auth-model.md). (The matching
+  `/vault/{name}/oauth/{register,authorize,token}` endpoints were retired
+  in vault 0.4.x — workstream E — and now return `410 Gone`. Hub is the
+  issuer; install it to drive the OAuth flow.)
 - `/vault/{name}/view/{idOrPath}` — auth-aware HTML rendering of published
   notes.
 

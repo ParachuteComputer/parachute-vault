@@ -3,68 +3,54 @@
 Reference for how Parachute Vault authenticates and authorizes requests. The
 **vault is auth-gated by default**: every route that touches vault data
 requires a credential. The narrow set of genuinely public routes (OAuth
-discovery, the service-info card, published notes) is listed explicitly in
-§2.
+discovery forwarders, the service-info card, published notes) is listed
+explicitly in §2.
 
-This doc describes what the server does today. For the OAuth-issuer story
-that sits above this layer in the ecosystem, see
+**Vault is OAuth resource-server-only.** It does not mint OAuth tokens, render
+a consent UI, or accept dynamic-client-registration requests. The
+authorization server is the hub (`@openparachute/hub`) — install it to drive
+the OAuth flow. Vault validates the hub's signed JWTs; the discovery
+endpoints below are forwarders that point clients at the hub.
+
+For the OAuth-issuer story that sits above this layer, see
 [`design/2026-04-20-hub-as-portal-oauth-and-service-catalog.md`](../../parachute.computer/design/2026-04-20-hub-as-portal-oauth-and-service-catalog.md).
+
+> **History.** Vault used to ship a standalone OAuth 2.1 + PKCE + DCR
+> issuer with a server-rendered consent page protected by an owner password
+> (+ optional TOTP). That posture was retired in vault 0.4.x (workstream E
+> of the UX audit, 2026-05-25). Operators on that posture should install
+> the hub — see [`UPGRADING.md`](../UPGRADING.md#workstream-e--standalone-oauth-retired).
 
 ## 1. Mechanisms
 
-Two first-class paths. Either works on its own; both can be active at once.
-A third, legacy path exists for back-compat.
+### Hub-issued JWT (the OAuth path)
 
-### OAuth 2.1 + PKCE + DCR
+The hub signs JWTs (RS256, keys advertised at `<hub>/.well-known/jwks.json`).
+Vault validates them via `validateHubJwt` (`src/hub-jwt.ts`):
 
-The browser-based flow third-party clients use to connect. Implements:
+- `iss` must equal the hub origin (`PARACHUTE_HUB_ORIGIN`, defaulting to
+  `http://127.0.0.1:1939`).
+- `aud` is strict-checked against `vault.<name>` so a token stamped for one
+  vault can't reach another.
+- `scope` claim carries OAuth-standard scopes (see "API tokens" below for the
+  scope vocabulary).
+- A `vault_scope` claim provides per-user vault pinning (multi-user Phase 1).
 
-- **RFC 7591** Dynamic Client Registration — `POST /vault/<name>/oauth/register`
-- **RFC 6749 / OAuth 2.1** authorization code grant with **PKCE (S256 required)** —
-  `GET/POST /vault/<name>/oauth/authorize`, `POST /vault/<name>/oauth/token`
-- **RFC 8414** Authorization Server Metadata — `/.well-known/oauth-authorization-server`
-- **RFC 9728** Protected Resource Metadata — `/.well-known/oauth-protected-resource`
+Discovery surface vault still serves so clients can find the hub:
 
-Both path-append (`/vault/<name>/.well-known/<type>`) and path-insert
-(`/.well-known/<type>/vault/<name>`) discovery shapes are served; the
-path-insert form is what strict clients (e.g. Claude Code's MCP SDK) probe.
+- **RFC 9728** Protected Resource Metadata —
+  `/vault/<name>/.well-known/oauth-protected-resource` advertises the MCP
+  endpoint as the protected resource and names the hub as the authorization
+  server.
+- **RFC 8414** Authorization Server Metadata —
+  `/vault/<name>/.well-known/oauth-authorization-server` returns hub-rooted
+  issuer + endpoint URLs. Both path-append
+  (`/vault/<name>/.well-known/<type>`) and path-insert
+  (`/.well-known/<type>/vault/<name>`) shapes are served; the path-insert
+  form is what strict clients (e.g. Claude Code's MCP SDK) probe.
 
 **Clients that use this flow today:** claude.ai, ChatGPT, Claude Desktop,
 Claude Code, the Notes PWA.
-
-**Setup the owner must do first:**
-
-1. Run `parachute vault set-password` — bcrypt hash (cost 12) stored in
-   `~/.parachute/vault/config.yaml` as `owner_password_hash`. Minimum 12 chars.
-   Until this is set, the consent page falls back to legacy vault-token
-   auth (see §5).
-2. *(Optional)* Run `parachute vault 2fa enroll` — TOTP secret + backup codes
-   stored in the same global config. Requires an owner password to already
-   be set. After enrollment, the consent page additionally demands a TOTP
-   code or backup code.
-
-**Credential storage:**
-
-| Item | Location |
-|---|---|
-| Owner password hash | `~/.parachute/vault/config.yaml` (`owner_password_hash`) |
-| TOTP secret + backup codes | `~/.parachute/vault/config.yaml` (`totp_secret`, backup codes) |
-| Registered OAuth clients | Per-vault SQLite `oauth_clients` table |
-| Auth codes (10-min TTL, single-use) | Per-vault SQLite `oauth_codes` table, pinned to issuing vault |
-| Minted tokens | Per-vault SQLite `tokens` table (same table as API tokens) |
-
-**Token shape:** the successful `/oauth/token` exchange mints a standard
-`pvt_…` bearer token (see below) and returns it with `scope`, `vault`,
-`iss`, and a `services` catalog for ecosystem peers.
-
-**Rate limiting:** per-IP at the consent POST. 10 failed owner-auth
-attempts within 60 s triggers a 15-minute lockout (429 with `Retry-After`).
-In-memory; resets on process restart. Does not apply to the token endpoint
-or to bearer-auth attempts elsewhere.
-
-**Scopes the consent page offers:** `full` (maps to
-`vault:read vault:write vault:admin`) or `read` (maps to `vault:read`).
-The `scope=` query param is a hint — the user's radio-button selection wins.
 
 ### API tokens (Bearer)
 
@@ -148,18 +134,21 @@ route registered in `src/routing.ts`, `src/routes.ts`, and `src/mcp-http.ts`.
 | `/.well-known/oauth-protected-resource/vault/<name>[/mcp]` | GET | None (RFC 9728 discovery) | `200 <metadata>` or `404` if vault not found | Public by spec — advertises where to authenticate. |
 | `/.well-known/oauth-authorization-server/vault/<name>[/mcp]` | GET | None (RFC 8414 discovery) | `200 <metadata>` or `404` if vault not found | Public by spec. |
 
-### Per-vault OAuth flow (`/vault/<name>/…`)
-
-These endpoints **are the auth**, so they cannot require auth themselves.
+### Per-vault OAuth discovery (`/vault/<name>/…`)
 
 | Path | Method | Auth required | Response |
 |---|---|---|---|
-| `/oauth/register` | POST | None (RFC 7591 DCR) | `201 {client_id, client_name, redirect_uris, …}` |
-| `/oauth/authorize` | GET | None (renders consent HTML) | `200 <consent page>` or `400 <error page>` |
-| `/oauth/authorize` | POST | Consent-form credentials (owner password or legacy vault token, plus TOTP/backup code if 2FA is on) | `302` to `redirect_uri?code=…` on success; re-renders consent on failure; `429` if rate-limited |
-| `/oauth/token` | POST | PKCE code_verifier + client_id + redirect_uri | `200 {access_token, token_type:"bearer", scope, vault, iss, services}` or `400 {error:"invalid_grant", …}` |
-| `/.well-known/oauth-protected-resource` | GET | None (discovery) | `200 <metadata>` |
-| `/.well-known/oauth-authorization-server` | GET | None (discovery) | `200 <metadata>` |
+| `/oauth/register` | POST | — (retired) | `410 {error:"oauth_endpoint_removed", protected_resource_metadata: "…"}` |
+| `/oauth/authorize` | GET/POST | — (retired) | `410` (same shape) |
+| `/oauth/token` | POST | — (retired) | `410` (same shape) |
+| `/.well-known/oauth-protected-resource` | GET | None (discovery) | `200 {resource, authorization_servers: [<hub-origin>], …}` |
+| `/.well-known/oauth-authorization-server` | GET | None (discovery) | `200 {issuer: <hub-origin>, authorization_endpoint: <hub>/oauth/authorize, …}` (forwarder document) |
+
+The `/oauth/{register,authorize,token}` endpoints returned vault-side OAuth
+issuance until vault 0.4.x. They now return `410 Gone` with a pointer to
+the protected-resource metadata so confused clients can rediscover the new
+issuer (the hub). The discovery documents stay live, forwarding clients to
+the hub's OAuth endpoints.
 
 ### Per-vault service info + icon (hub integration)
 
@@ -213,19 +202,20 @@ works on its own, and running both is fine.
 
 ### Path A: "I want humans (claude.ai, ChatGPT, Claude Desktop, …) to use this"
 
+OAuth lives on the hub. Install it:
+
 ```
-parachute vault set-password        # set the owner password
-parachute vault 2fa enroll          # (optional) add TOTP + backup codes
+parachute install hub
 ```
 
 Then, in the client:
 
 - Add the vault's MCP URL (`https://…/vault/<name>/mcp`) as a connector.
 - The client does OAuth discovery → DCR → authorize → token exchange
-  automatically.
-- On the consent page, enter the owner password (and TOTP if enabled),
-  pick `Full access` or `Read-only access`, and click Authorize.
-- The client stores the minted `pvt_…` token and uses it from then on.
+  against the hub (the discovery documents vault serves forward there
+  automatically).
+- The hub renders the consent page; sign-in there with your hub credentials.
+- The client stores the minted hub JWT and uses it from then on.
 
 ### Path B: "I want a script or agent to use this"
 
@@ -289,11 +279,6 @@ that as part of the threat model, not as a bug.
 Honest list. Things a user might trip over, or that the launch copy
 should be careful about.
 
-- **OAuth does not strictly require an owner password.** If none is set,
-  the consent page falls back to asking for a `pvt_…` vault token as
-  proof of ownership. This works, but means the "launch flow" is still
-  operable without ever running `set-password`. Recommended: require the
-  password in docs, even though the server doesn't enforce it.
 - **CLI-created tokens still default to full scope.** `parachute vault
   tokens create` with no flags produces a token with
   `vault:read vault:write vault:admin`, unchanged for back-compat.
@@ -306,12 +291,13 @@ should be careful about.
   (no vault in the URL), auth scans every vault's token table, so an
   OAuth-minted token still works there. A CLI-created token is only
   valid against the vault it was created in.
-- **Rate limiting only applies to the OAuth consent POST.** Ten failed
-  owner-auth attempts in 60 s → 15-minute per-IP lockout. There is **no
-  bearer-token brute-force limit** — an attacker hammering
-  `/vault/<name>/api/notes` with random `pvt_…` guesses is not rate
-  limited. The guessing space (≈190 bits) makes this academic but worth
-  knowing when planning exposure.
+- **No per-IP rate limit on bearer-token brute-force.** An attacker
+  hammering `/vault/<name>/api/notes` with random `pvt_…` guesses is not
+  rate limited at the vault layer. The guessing space (≈190 bits) makes
+  this academic but worth knowing when planning exposure. (The per-IP
+  rate limiter that used to gate the standalone OAuth consent POST was
+  retired alongside the consent page in vault 0.4.x; the hub-owned
+  consent surface has its own rate limit.)
 - **Public-by-design endpoints leak structural info.** `/health` (with
   auth) and `/vaults/list` (by default, disable with `discovery:
   disabled`) reveal which vaults exist. `/.well-known/oauth-*` reveals
@@ -333,8 +319,3 @@ should be careful about.
   authorization server from a REST 401 — that's fine (clients that care
   use the MCP path), but REST API consumers must read the OAuth
   metadata document explicitly.
-- **`TRUST_PROXY=1` is not the default.** Rate limiting uses the socket
-  peer IP unless `TRUST_PROXY` is set, in which case it honors
-  `X-Forwarded-For`. A deployment behind Cloudflare Tunnel / nginx
-  without `TRUST_PROXY=1` will rate-limit against the proxy's IP
-  (typically loopback), effectively disabling per-user lockout.

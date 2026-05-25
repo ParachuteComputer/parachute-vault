@@ -388,17 +388,11 @@ async function cmdInit(args: string[] = []) {
     console.log();
   }
 
-  // 5b. Owner password is only needed for OAuth consent (browser-based
-  // clients like claude.ai / ChatGPT / Claude Desktop). Those paths are
-  // coming in the next few weeks; until then, skip the prompt. Users who
-  // want to expose the vault publicly today can set one manually via
-  // `parachute-vault set-password`.
-  if (!hasOwnerPassword()) {
-    console.log();
-    console.log("Public exposure + web-AI connectors (claude.ai, ChatGPT, etc.) are coming soon.");
-    console.log("  When you're ready to expose this vault publicly, run:");
-    console.log("    parachute-vault set-password    # required for OAuth consent");
-  }
+  // 5b. OAuth consent now runs on the hub (workstream E, 2026-05-25). Vault
+  // no longer renders its own consent page, so no owner-password prompt
+  // belongs in `vault init`. Operators who want to expose vault publicly to
+  // browser-based clients should run `parachute install hub`; the hub owns
+  // the consent surface, the sign-in flow, and the JWT issuance.
 
   // 6. Install daemon (platform-aware). Idempotent — safe to re-run after
   // a folder move; this refreshes ~/.parachute/server-path and bounces the
@@ -554,8 +548,8 @@ async function promptVaultName(): Promise<string> {
 
 async function promptForOwnerPassword(purpose: string): Promise<boolean> {
   console.log(`\n${purpose}`);
-  console.log("  Used on the OAuth consent page to authorize third-party clients");
-  console.log("  (Claude Web, Claude Desktop, etc.) to access this vault.");
+  console.log("  Legacy field — vault's standalone OAuth consent was retired in 0.4.x.");
+  console.log("  Stored in config.yaml for hub's expose-posture-check only.");
   console.log(`  Minimum 12 characters.\n`);
 
   while (true) {
@@ -584,6 +578,16 @@ async function promptForOwnerPassword(purpose: string): Promise<boolean> {
 }
 
 async function cmdSetPassword(args: string[]) {
+  // Legacy command (workstream E, 2026-05-25). Vault's standalone OAuth
+  // consent page was retired; this command now only writes the
+  // `owner_password_hash` field that hub's `expose public` posture-check
+  // reads. It no longer gates any auth flow inside vault. Set hub
+  // credentials with `parachute auth set-password`.
+  console.warn(
+    "[deprecated] vault's standalone OAuth consent was retired in 0.4.x; OAuth runs on the hub.\n" +
+      "             This command writes a legacy YAML field but no longer gates auth inside vault.\n" +
+      "             Set hub credentials with `parachute auth set-password`.\n",
+  );
   const wantsClear = args.includes("--clear") || args.includes("--unset");
   if (wantsClear) {
     if (!hasOwnerPassword()) {
@@ -594,7 +598,7 @@ async function cmdSetPassword(args: string[]) {
       ? " Note: 2FA management operations will require your authenticator app or a backup code instead."
       : "";
     const ok = await confirm(
-      `Remove the owner password? OAuth consent will fall back to vault-token auth.${twoFaNote}`,
+      `Remove the owner password? (Legacy field — vault's standalone OAuth consent was retired in 0.4.x; OAuth runs on the hub now.)${twoFaNote}`,
       false,
     );
     if (!ok) {
@@ -675,6 +679,16 @@ async function confirmForTwoFactor(purpose: string): Promise<boolean> {
 }
 
 async function cmd2fa(args: string[]) {
+  // Legacy command (workstream E, 2026-05-25). See cmdSetPassword for the
+  // full deprecation story. 2FA on vault used to layer on top of the
+  // owner-password gate for the standalone OAuth consent page; both have
+  // been retired. The CLI still manages the legacy YAML fields for
+  // back-compat.
+  console.warn(
+    "[deprecated] vault's standalone OAuth consent was retired in 0.4.x; OAuth runs on the hub.\n" +
+      "             This command writes legacy YAML fields but no longer gates auth inside vault.\n",
+  );
+
   const sub = args[0] ?? "status";
 
   if (sub === "status") {
@@ -742,7 +756,7 @@ async function cmd2fa(args: string[]) {
     for (const code of result.backupCodes) {
       console.log(`  ${code}`);
     }
-    console.log("\n2FA is now active for OAuth consent on this vault.");
+    console.log("\n2FA is now recorded in the legacy YAML field. (See deprecation note above.)");
     return;
   }
 
@@ -3458,12 +3472,18 @@ Tokens:
   parachute-vault tokens create --expires 30d     Expiring token
   parachute-vault tokens revoke <token-id>        Revoke a token (default vault)
 
-OAuth:
-  parachute-vault set-password             Set/change the owner password (for consent page)
+OAuth — owner password + 2FA (LEGACY):
+  Vault's standalone OAuth consent page was retired in 0.4.x (workstream E).
+  OAuth runs on the hub now. These commands still write the legacy YAML
+  fields (hub's \`expose public\` posture-check reads them), but they
+  don't gate any consent flow inside vault. Set hub credentials with
+  \`parachute auth set-password\`.
+
+  parachute-vault set-password             Set/change owner password (legacy YAML field)
   parachute-vault set-password --clear     Remove the owner password
   parachute-vault 2fa status               Show 2FA state
   parachute-vault 2fa enroll               Enable TOTP 2FA (QR + backup codes)
-  parachute-vault 2fa disable              Disable 2FA (requires password)
+  parachute-vault 2fa disable              Disable 2FA
   parachute-vault 2fa backup-codes         Regenerate backup codes
 
 Config:

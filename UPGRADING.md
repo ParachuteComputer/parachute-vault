@@ -4,6 +4,101 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## Workstream E — standalone OAuth retired
+
+**Hub is now a hard requirement** for OAuth-based clients to connect to
+vault. Vault no longer ships a built-in OAuth issuer.
+
+This affects operators who configured vault to run without hub. There
+are none in the current user base; this is a forward-facing
+simplification, documented here for anyone who would otherwise discover
+the change post-upgrade. The few existing beta operators came in on the
+precursor "vault + CLI" combo (CLI was renamed to hub) and are tracked
+through a separate upgrade pathway.
+
+### What changed
+
+Vault used to ship a standalone OAuth 2.1 + PKCE + DCR issuer with a
+server-rendered consent page protected by an owner password (+ optional
+TOTP). That code lived in `src/oauth.ts` and was reachable at
+`/vault/<name>/oauth/{register,authorize,token}` when vault ran without
+the hub. The retirement deletes:
+
+- `src/oauth.ts` (the standalone issuer + consent UI) entirely.
+- The DCR / authorize / token endpoints — `/vault/<name>/oauth/*` now
+  returns `410 Gone` with a pointer to the protected-resource metadata.
+- The in-memory per-IP rate limiter on the consent POST (no traffic to
+  limit on a route that no longer exists).
+- The end-to-end OAuth-flow tests in `src/oauth.test.ts` and
+  `src/auth.test.ts` (per-vault token coherence is still pinned by the
+  remaining tests).
+
+What survives:
+
+- The discovery documents at
+  `/vault/<name>/.well-known/oauth-{protected-resource,authorization-server}`
+  (both the path-append and path-insert RFC 8414/9728 shapes) still respond
+  `200` — but the metadata they return forwards every authorization-server
+  endpoint to the hub origin. A client that probes vault's discovery URL
+  rediscovers the hub.
+- The `tokens` table, the bearer-token surface, the `pvt_*` CLI tokens,
+  and hub-issued-JWT validation are all unchanged. Existing CLI-minted
+  tokens keep authenticating.
+- The `oauth_clients` and `oauth_codes` SQLite tables stay (harmless
+  empty rows; cleaning them up is a future migration).
+- The `parachute-vault set-password` / `parachute-vault 2fa *` CLI
+  commands still write `owner_password_hash` / `totp_secret` to
+  `config.yaml` because hub's `parachute expose public` posture-check
+  reads those YAML fields. They print a deprecation warning and no
+  longer gate any auth flow inside vault.
+
+### If you were running vault standalone (no hub)
+
+Browser-based OAuth clients (Claude Desktop, Parachute Daily, claude.ai
+integrations, ChatGPT) stop working after the upgrade. To restore:
+
+```bash
+parachute install hub
+parachute start hub
+```
+
+Hub binds `127.0.0.1:1939` by default. Set `PARACHUTE_HUB_ORIGIN` for vault
+(in `~/.parachute/vault/.env`) if the hub is reachable on a non-default
+origin; otherwise the loopback default works for single-host installs.
+
+Your existing vault data (SQLite DBs, `vault.yaml`, `pvt_*` tokens in the
+`tokens` table) is **fully compatible** — no schema migration is needed.
+Hub adds an OAuth layer on top of the same data shape vault has always had.
+
+CLI-driven bearer tokens (`parachute-vault tokens create`,
+`~/.claude.json` entries written by `parachute-vault mcp-install`,
+`VAULT_AUTH_TOKEN`) keep working unchanged. The retirement only affects
+the browser-based OAuth handshake.
+
+### If you were already running vault-fronted-by-hub
+
+No action required. Clients re-handshake against the hub on next connect.
+The discovery documents vault serves now forward there explicitly (which
+they already did when `PARACHUTE_HUB_ORIGIN` was set; this change makes the
+hub-rooted forward unconditional).
+
+### If you were exposing vault publicly (Tailscale Funnel, Cloudflare Tunnel, reverse proxy)
+
+If you were exposing vault, you'll also need to expose the hub (or front
+both behind the same domain) — the discovery documents now name the hub
+origin, and a remote OAuth client that resolves the discovery URL must
+be able to reach the hub at that origin to complete the handshake. A
+loopback-only hub paired with a publicly-exposed vault leaves clients
+unable to authorize.
+
+### Cross-repo follow-up
+
+- **Hub's `expose public` posture-check** (`parachute-hub/src/vault/auth-status.ts`)
+  reads `owner_password_hash` and `totp_secret` from vault's `config.yaml`
+  to score the deployment's auth posture. The fields and the hub side need
+  retirement together once hub gains its own posture-check; tracked as a
+  follow-up issue.
+
 ## 0.2.4 → 0.4.5
 
 **Most beta users are on `0.2.4`** (the launch version, 2026-04-18).

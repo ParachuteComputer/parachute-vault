@@ -25,8 +25,6 @@ import {
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { generateToken, createToken } from "./token-store.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
-import { handleRegister, handleAuthorizePost, handleToken } from "./oauth.ts";
-import crypto from "node:crypto";
 
 let tmpHome: string;
 let prevHome: string | undefined;
@@ -235,116 +233,11 @@ describe("auth — cross-vault isolation", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// End-to-end: OAuth flow → resulting token authenticates against its vault
-// ---------------------------------------------------------------------------
-
-describe("OAuth-minted tokens — per-vault coherence", () => {
-  // These tests drive the OAuth handlers directly (no HTTP), then take the
-  // resulting access_token and verify it resolves at endpoints addressing
-  // its issuing vault — and only its issuing vault.
-
-  async function runOAuthFlow(vaultName: string): Promise<string> {
-    const store = getVaultStore(vaultName);
-    const db = store.db;
-
-    // Seed an owner token so consent passes in legacy-token mode.
-    const { fullToken: ownerToken } = generateToken();
-    createToken(db, ownerToken, { label: "owner", permission: "full" });
-
-    // 1. Register client
-    const regRes = await handleRegister(
-      new Request(`https://vault.test/vault/${vaultName}/oauth/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          client_name: "Daily",
-          redirect_uris: ["parachute://oauth/callback"],
-        }),
-      }),
-      db,
-    );
-    const { client_id } = (await regRes.json()) as { client_id: string };
-
-    // 2. PKCE + authorize
-    const codeVerifier = crypto.randomBytes(32).toString("base64url");
-    const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
-    const authRes = await handleAuthorizePost(
-      new Request(`https://vault.test/vault/${vaultName}/oauth/authorize`, {
-        method: "POST",
-        body: new URLSearchParams({
-          action: "authorize",
-          client_id,
-          redirect_uri: "parachute://oauth/callback",
-          code_challenge: codeChallenge,
-          code_challenge_method: "S256",
-          scope: "full",
-          owner_token: ownerToken,
-        }),
-      }),
-      db,
-      { vaultName },
-    );
-    const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
-
-    // 3. Token exchange
-    const tokRes = await handleToken(
-      new Request(`https://vault.test/vault/${vaultName}/oauth/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          code_verifier: codeVerifier,
-          client_id,
-          redirect_uri: "parachute://oauth/callback",
-        }).toString(),
-      }),
-      db,
-      vaultName,
-    );
-    const tokBody = (await tokRes.json()) as { access_token: string; vault: string };
-    expect(tokBody.vault).toBe(vaultName);
-    return tokBody.access_token;
-  }
-
-  test("OAuth-minted token works at /vault/<name>/api/* and /vault/<name>/mcp", async () => {
-    seedVault("journal", { isDefault: true });
-    const token = await runOAuthFlow("journal");
-    const cfg = readVaultConfig("journal")!;
-    const store = getVaultStore("journal");
-
-    // /vault/journal/api/* and /vault/journal/mcp both reach this auth call.
-    const vaultAuth = await authenticateVaultRequest(bearer(token), cfg, store.db);
-    expect("error" in vaultAuth).toBe(false);
-
-    // /vaults (authenticated listing) uses authenticateGlobalRequest.
-    const global = await authenticateGlobalRequest(bearer(token));
-    expect("error" in global).toBe(false);
-  });
-
-  test("named-vault OAuth: token works for its vault, rejected by others", async () => {
-    seedVault("journal", { isDefault: true });
-    seedVault("work");
-    const token = await runOAuthFlow("work");
-    const workCfg = readVaultConfig("work")!;
-    const workStore = getVaultStore("work");
-
-    // Valid at work's own endpoints.
-    const scoped = await authenticateVaultRequest(bearer(token), workCfg, workStore.db);
-    expect("error" in scoped).toBe(false);
-
-    // Global auth finds the token in work's DB.
-    const global = await authenticateGlobalRequest(bearer(token));
-    expect("error" in global).toBe(false);
-
-    // Isolation: the token is NOT usable against the journal vault.
-    const journalCfg = readVaultConfig("journal")!;
-    const journalStore = getVaultStore("journal");
-    const crossCheck = await authenticateVaultRequest(bearer(token), journalCfg, journalStore.db);
-    expect("error" in crossCheck).toBe(true);
-  });
-});
+// The "End-to-end OAuth flow" suite was retired alongside the standalone
+// OAuth issuer in workstream E (vault#366). Per-vault token coherence is
+// still pinned by the v16 binding tests above and by `tokens-routes.test.ts`
+// (mint-via-CLI → present at /vault/<name>/* surfaces); the OAuth handshake
+// itself has moved entirely to the hub.
 
 // ---------------------------------------------------------------------------
 // Legacy YAML global keys — scope must round-trip through the parser
