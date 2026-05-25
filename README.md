@@ -66,7 +66,9 @@ A mental model for "where is my data?" and "what can I poke at?" after the one-c
     vaults/                 # one subdirectory per vault
       default/
         vault.db            # the SQLite database — notes, tags, links, attachments,
-                            # per-vault tokens, OAuth clients + codes, tag schemas
+                            # per-vault tokens, tag schemas (oauth_clients +
+                            # oauth_codes tables persist post-workstream-E but
+                            # are vestigial — no issuer writes to them anymore)
         vault.db-wal        # WAL journal (write-ahead log) — transient, recreated
                             # on demand. Carries pending writes between checkpoints.
         vault.db-shm        # WAL shared-memory index — transient, recreated on demand.
@@ -77,7 +79,7 @@ A mental model for "where is my data?" and "what can I poke at?" after the one-c
 
 `~/.parachute/` itself is the ecosystem root shared across sibling services — `services.json` and `well-known/` live at the root and are managed by the top-level CLI. Everything vault owns is scoped under `~/.parachute/vault/`. Pre-0.3 installs kept vault state directly at the root; any legacy paths still there are auto-migrated into `vault/` on first post-upgrade run (see CHANGELOG).
 
-`config.yaml` is the one file written at 0600 because it holds the bcrypt owner-password hash and the plaintext TOTP secret. `.env` is written with your umask default (typically 0644); if you add webhook API keys there, tighten the mode yourself. SQLite DBs follow your umask.
+`config.yaml` is the one file written at 0600 because it holds the bcrypt owner-password hash and the plaintext TOTP secret (legacy fields kept for hub's expose-posture-check; the standalone consent flow they used to gate was retired in 0.4.x — workstream E). `.env` is written with your umask default (typically 0644); if you add webhook API keys there, tighten the mode yourself. SQLite DBs follow your umask.
 
 The vault SQLite database runs in **WAL** (write-ahead logging) journal mode for multi-process concurrent access — the daemon, CLI tools, and out-of-process consumers (e.g. `parachute-runner` polling `tag:job`) can read concurrently while the daemon writes, without lock contention. WAL adds two sidecar files alongside `vault.db`: `vault.db-wal` (the journal) and `vault.db-shm` (shared-memory index). Both are recreated on demand; **don't back them up separately** — `parachute-vault backup` snapshots only `vault.db` via `VACUUM INTO`, which produces a consistent full-DB copy without needing the sidecars. If you copy a vault by hand, `vault.db` alone is sufficient on a checkpointed database; if you must capture an in-flight write, copy all three files. If WAL can't be enabled (NFS, some FUSE / Docker volume drivers don't support the `-shm` region), vault logs `[vault] WAL mode could not be enabled` on startup and falls back to the legacy single-writer mode.
 
@@ -87,7 +89,7 @@ The vault SQLite database runs in **WAL** (write-ahead logging) journal mode for
 - **Linux + systemd**: a user service named `parachute-vault.service` (managed via `systemctl --user`).
 - **Neither of the above**: `vault init` prints a reminder to start the server yourself (`bun src/server.ts` or Docker). No service registration.
 
-The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST, MCP, and OAuth routes. `parachute-vault status` is the fast check; `parachute-vault url` prints just the URL for use in scripts.
+The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST, MCP, and OAuth-discovery routes (the issuer itself lives on the hub — see "OAuth lives on the hub" below). `parachute-vault status` is the fast check; `parachute-vault url` prints just the URL for use in scripts.
 
 ### `~/.claude.json`
 
@@ -99,9 +101,17 @@ The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST,
 
 If you said yes to (2), the `pvt_...` token is printed prominently at the end — it's the same token baked into `~/.claude.json` (if you also said yes to (1)). It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Just mint a new one: `parachute-vault tokens create`. Tokens are SHA-256 hashed at rest in each vault's `vault.db`.
 
-### Owner password (for OAuth, coming soon)
+### OAuth lives on the hub
 
-`vault init` doesn't prompt for an owner password — the password is only needed for OAuth consent, which is what browser-based clients (claude.ai, ChatGPT, Claude Desktop) use, and those paths are coming in the next few weeks. When you're ready to expose the vault publicly, set one with `parachute-vault set-password` (and optionally `parachute-vault 2fa enroll`). See [Connecting a client → Owner password](#owner-password-needed-for-oauth).
+Vault is OAuth resource-server-only. The authorization flow — DCR, consent page, code-for-token exchange — lives on the [hub](https://github.com/ParachuteComputer/parachute-hub). Install it once you want browser-based clients (Claude Desktop, Parachute Daily, etc.) to connect:
+
+```bash
+parachute install hub
+```
+
+The hub fronts every vault on the host with a single consent surface, signs JWTs that vault validates against the hub's JWKS, and renders the operator UI. Vault still serves OAuth discovery (`/.well-known/oauth-*`) but the metadata documents forward clients to the hub. See [`docs/auth-model.md`](docs/auth-model.md) for the validation contract.
+
+> Vault shipped its own standalone OAuth issuer through 0.4.7. It was retired in 0.4.x — workstream E. If you're upgrading from a standalone-vault posture, see [`UPGRADING.md`](UPGRADING.md#workstream-e--standalone-oauth-retired).
 
 ## Connecting a client
 
@@ -109,22 +119,10 @@ Two ways to authenticate — pick based on the client, not the deployment:
 
 | Path | When to use | User action |
 |---|---|---|
-| **OAuth 2.1 + PKCE (browser flow)** | Claude Desktop, Parachute Daily, any third-party MCP client set up interactively | Click "Add integration", enter server URL, a browser opens to the vault's consent page, you enter the owner password, done — no token ever touches your clipboard |
+| **OAuth 2.1 + PKCE (browser flow, via hub)** | Claude Desktop, Parachute Daily, any third-party MCP client set up interactively | Click "Add integration", enter the vault MCP URL, a browser opens to the **hub's** consent page, sign in with hub credentials, done — no token ever touches your clipboard |
 | **Bearer token** | Claude Code (auto-wired by `vault init`), CLI scripts, cron jobs, any non-interactive caller | `curl -H "Authorization: Bearer pvt_..."` — the token is printed once at `vault init` (save it) or minted on demand with `parachute-vault tokens create` |
 
-Both paths end up with the same kind of token in the vault's DB — a `pvt_` string, scoped to one vault and one permission level (`full` or `read`). OAuth just moves the "how does the client get that token" step from "human copy-pastes it" to "browser-based handshake with the owner's consent."
-
-### Owner password (needed for OAuth)
-
-`vault init` prompts you to set an owner password (minimum 12 characters). This is what the OAuth consent page asks for when a client requests access. If you skip the prompt, OAuth still works but the consent page falls back to asking for a vault token instead — functional but clunky. Set it later with:
-
-```bash
-parachute-vault set-password                # set / change
-parachute-vault set-password --clear        # remove (reverts to token fallback)
-parachute-vault 2fa enroll                  # optional: add TOTP 2FA on top
-```
-
-Password and 2FA secrets live in `~/.parachute/vault/config.yaml` at mode 0600 (bcrypt hash + base32 TOTP secret).
+The OAuth path mints a hub-signed JWT that vault validates against the hub's JWKS. The bearer-token path mints a `pvt_` opaque token straight from vault's local DB. Either works for any client; pick based on whether you want a human-driven consent step.
 
 ### Claude Code
 
@@ -148,19 +146,19 @@ To re-point Claude Code at a different vault, change `default_vault` in `~/.para
 
 ### Claude Desktop (OAuth)
 
-For Claude Desktop — or any install where the server is on a different machine from the client — use the browser-based OAuth flow:
+For Claude Desktop — or any install where the server is on a different machine from the client — use the browser-based OAuth flow. **The flow runs against the hub**, not vault, so make sure you've run `parachute install hub` first:
 
 1. Claude Desktop → Settings → Integrations → Add MCP server.
 2. Enter the URL: `https://vault.yourdomain.com/vault/{name}/mcp` (replace `{name}` with your vault name — e.g. `default`). **Do not paste a bearer token** — leave the auth field empty.
-3. An OAuth-capable MCP client discovers the vault's authorization server at `/vault/{name}/.well-known/oauth-authorization-server`, registers itself via Dynamic Client Registration (RFC 7591), and opens your browser to the vault's consent page.
-4. Enter your owner password (plus TOTP code / backup code if 2FA is enabled), pick a scope (`full` or `read`), click Authorize.
-5. Browser redirects back. The connection is live. The client now holds a `pvt_` token scoped to this vault.
+3. The MCP client discovers vault's protected-resource metadata at `/vault/{name}/.well-known/oauth-protected-resource`, which names the **hub** as the authorization server. It then drives the OAuth flow against the hub: DCR, browser-opened consent page, code exchange.
+4. Sign in to the hub with your hub credentials, pick a scope (`full` or `read`), click Authorize.
+5. Browser redirects back. The connection is live. The client now holds a hub-signed JWT scoped to this vault.
 
 If you'd rather skip OAuth — e.g. you're scripting the setup — Claude Desktop also accepts a bearer token via the integration's auth header field. Use a token from `parachute-vault tokens create` (or the one from `vault init` if you still have it). This is the "manual bearer" fallback; OAuth is the recommended path.
 
 ### Parachute Daily (mobile)
 
-Daily uses the same OAuth flow. On first launch: enter the server URL, pick the vault from the drop-down (populated from the public `GET /vaults/list` endpoint), tap **Connect to Vault**. The same consent-page handoff runs in your phone's browser, then redirects back to the app via the `parachute://oauth/callback` deep link. The app stores the `pvt_` token in platform secure storage.
+Daily uses the same OAuth flow (hub-fronted). On first launch: enter the server URL, pick the vault from the drop-down (populated from the public `GET /vaults/list` endpoint), tap **Connect to Vault**. The consent handoff runs in your phone's browser against the hub, then redirects back to the app via the `parachute://oauth/callback` deep link. The app stores the hub-signed JWT in platform secure storage.
 
 ### Multi-vault
 
@@ -174,7 +172,7 @@ parachute-vault remove work --yes
 
 **The default vault is managed for you.** `vault init` creates `default` on first install and records it as `default_vault` in `~/.parachute/config.yaml`. `vault create <name>` promotes the newly-created vault to default when no default exists or when the configured default points at a missing vault. `vault remove <name>` promotes the sole survivor when you delete the default and one vault remains; if multiple remain after removing the default, it clears the setting and tells you to edit `config.yaml` yourself. There is no `vault set-default` subcommand — to point the server at a different existing vault, edit the `default_vault:` line in `~/.parachute/config.yaml` and `parachute-vault restart`.
 
-**URL shape.** Every vault-touching route lives under `/vault/{name}/...`: `/vault/{name}/mcp`, `/vault/{name}/oauth/authorize`, `/vault/{name}/api/notes`, `/vault/{name}/view/{id}`. There is no unscoped fallback — pick the vault in the URL even if you only have one. OAuth tokens are scoped to the vault in their issuing URL; cross-vault substitution is rejected at the OAuth layer (an auth code minted for one vault cannot be redeemed at another vault's token endpoint).
+**URL shape.** Every vault-touching route lives under `/vault/{name}/...`: `/vault/{name}/mcp`, `/vault/{name}/api/notes`, `/vault/{name}/view/{id}`, `/vault/{name}/.well-known/oauth-*` (discovery forwarders). There is no unscoped fallback — pick the vault in the URL even if you only have one. OAuth tokens are scoped to the vault named in the audience claim (`aud=vault.<name>`); cross-vault substitution is rejected at the auth layer.
 
 **Listing vaults from a client.** The authenticated `GET /vaults` endpoint returns full vault metadata. The public `GET /vaults/list` endpoint returns names only, no metadata, no auth required — this is what Parachute Daily's vault picker calls before the user authenticates. Operators who want to hide the vault list from unauthenticated callers can set `discovery: disabled` in `~/.parachute/vault/config.yaml` to make `/vaults/list` return 404.
 
@@ -206,13 +204,18 @@ parachute-vault mcp-install --dry-run      # describe the write without touching
 parachute-vault mcp-config gitcoin         # emit JSON for `claude -p --mcp-config "$(...)"`
 parachute-vault mcp-config gitcoin --env-vars   # template form with ${PARACHUTE_HUB_URL}/${PARACHUTE_VAULT_TOKEN}
 
-# OAuth — owner password + 2FA
-parachute-vault set-password               # set/change the owner password (OAuth consent page)
-parachute-vault set-password --clear       # remove the owner password (falls back to vault-token auth)
+# OAuth — owner password + 2FA (legacy, no longer wired up)
+# vault's standalone OAuth consent page was retired in 0.4.x (workstream E);
+# OAuth now runs on the hub. These commands still write to config.yaml for
+# hub's `expose public` posture-check (which reads the same fields), but
+# they don't gate any consent flow inside vault. Set hub credentials with
+# `parachute auth set-password` instead.
+parachute-vault set-password               # set/change owner password (legacy YAML field)
+parachute-vault set-password --clear       # remove the owner password
 parachute-vault 2fa status                 # show 2FA state + remaining backup codes
 parachute-vault 2fa enroll                 # enroll TOTP (shows QR + prints one-time backup codes)
-parachute-vault 2fa disable                # disable 2FA (requires password or TOTP/backup code)
-parachute-vault 2fa backup-codes           # regenerate backup codes (invalidates the old set)
+parachute-vault 2fa disable                # disable 2FA
+parachute-vault 2fa backup-codes           # regenerate backup codes
 
 # Tokens
 parachute-vault tokens                     # list all tokens across all vaults
@@ -793,7 +796,7 @@ The checks, in the order they're emitted:
 - **Daemon won't start after a port change.** `~/.parachute/vault/.env` has the new `PORT=...` but the daemon is still trying to bind the old one, or something else already holds the new port. `parachute-vault doctor` surfaces both conditions. Fix the holder (or pick a different port) and `parachute-vault restart`.
 - **MCP entry is stale after moving the repo.** launchd/systemd keeps pointing at the old path. `doctor` flags this as a failed `server.ts at pointer target` check; `parachute-vault init` from the new location rewrites the pointer, wrapper, and daemon registration.
 - **Claude Code shows no vault tools.** Check in order: (1) is the daemon up (`parachute-vault status`)? (2) does `~/.claude.json` have a `parachute-vault` entry with both `url` and a valid `Authorization` header? (3) does the URL's vault name match an existing vault? `parachute-vault doctor` catches the first two. A missing or stale `Authorization` header after a bare `vault mcp-install` is the usual culprit for #2 — see the Claude Code section of [Connecting a client](#connecting-a-client) for how to rewrite it.
-- **Claude Desktop / Daily won't connect via OAuth.** If the owner-password prompt was skipped at `vault init`, the consent page falls back to requiring a vault token in place of the password (functional but clunky). Set one now with `parachute-vault set-password`. If 2FA is enrolled, have your authenticator app ready before starting the flow; lost TOTP access recovers via the backup codes printed at enrollment.
+- **Claude Desktop / Daily won't connect via OAuth.** Check the hub is installed and running (`parachute status hub`) — OAuth runs there, not on vault. If you're upgrading from a standalone-vault install where vault used to render its own consent page, run `parachute install hub` to bring up the issuer. See [`UPGRADING.md`](UPGRADING.md#workstream-e--standalone-oauth-retired).
 - **Scheduled backups aren't running.** On macOS: `doctor` flags `backup agent: not loaded` when `schedule` isn't `manual` but the launchd agent is missing — rerun `parachute-vault backup --schedule <freq>` to reinstall it. On Linux: systemd-timer support for backup isn't shipped yet, so `--schedule daily` silently skips the scheduler. Run `parachute-vault backup` from cron (or similar) until that lands.
 - **Manual `curl` against `/vault/<name>/mcp` returns `406 Not Acceptable`.** The MCP HTTP transport requires both `application/json` and `text/event-stream` in the `Accept` header (it negotiates between the JSON response and the SSE streaming variant). Claude Code's `--mcp-config` http transport sets this automatically — the symptom only shows up when you probe the endpoint by hand. The fix:
 

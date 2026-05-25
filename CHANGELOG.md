@@ -36,6 +36,21 @@ to `@latest`.
 
 ## [Unreleased]
 
+### Removed (BREAKING)
+
+- **Retired vault's standalone OAuth issuer (workstream E of the UX audit; Aaron's decision 2026-05-25).** Vault is OAuth resource-server-only now; the hub is required to drive any browser-based OAuth flow. Concrete changes:
+  - Deleted `src/oauth.ts` (the DCR + authorize + token + consent-page surface) and `src/oauth.test.ts` (~3.1k lines combined). The end-to-end OAuth-flow tests in `src/auth.test.ts` were also retired.
+  - `/vault/<name>/oauth/{register,authorize,token}` now returns `410 Gone` with a `protected_resource_metadata` pointer so disoriented clients can rediscover the new issuer.
+  - The per-IP rate limiter on the consent POST was retired (no traffic to limit on a route that no longer exists).
+  - The discovery endpoints `/vault/<name>/.well-known/oauth-{protected-resource,authorization-server}` (both path-append and path-insert RFC 8414/9728 shapes) stay live, but the metadata they return now unconditionally forwards every authorization-server endpoint to the hub origin (resolved via `PARACHUTE_HUB_ORIGIN`, defaulting to the canonical `http://127.0.0.1:1939` loopback).
+  - Discovery moved to a new `src/oauth-discovery.ts` (~90 lines, was the only thing keeping `oauth.ts` around).
+  - The `oauth_clients` + `oauth_codes` SQLite tables are left in place (harmless when empty; cleanup is a future migration so operators upgrading from a hot-write vault don't lose pending rows mid-upgrade).
+  - The CLI commands `parachute-vault set-password` and `parachute-vault 2fa *` are kept as compat surfaces — they still write to the legacy YAML fields (`owner_password_hash`, `totp_secret`) because hub's `parachute expose public` posture-check reads them — but they print a deprecation warning and no longer gate any auth flow inside vault. Retirement of those YAML fields is a follow-up issue tracked alongside hub's posture-check rewrite.
+
+  The visible motivation: vault's consent page rendered with `#0066cc` blue + Helvetica + an owner-token field that looked like a different product, on a configuration that hub-as-portal was supposed to obsolete. The audit (`parachute-hub/AUDIT-UI-UX.md` §2.4 + §6 Q1) flagged it as "the worst of both"; Aaron chose retirement over reskin.
+
+  See [`UPGRADING.md`](./UPGRADING.md#workstream-e--standalone-oauth-retired) for the operator-facing migration guidance. Vault data, the `tokens` table, CLI-minted `pvt_*` tokens, and hub-issued-JWT validation are all unchanged — only the browser-based OAuth handshake moved to the hub.
+
 ## [0.4.8-rc.8] - 2026-05-25
 
 ### Fixed

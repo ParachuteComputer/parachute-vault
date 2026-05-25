@@ -2,8 +2,9 @@
  * Validation for vault names.
  *
  * Vault names appear in URLs (`/vault/<name>/mcp`, `/vault/<name>/api/*`),
- * the SQLite filename, and the OAuth consent page — anything that breaks
- * URL routing or filesystem assumptions has to be rejected up front.
+ * the SQLite filename, and the JWT audience claim (`aud: vault.<name>`) —
+ * anything that breaks URL routing or filesystem assumptions has to be
+ * rejected up front.
  *
  * Rule: lowercase alphanumeric + hyphens or underscores, 2–32 chars, with
  * `list` reserved. Used by the `init` prompt, the `--vault-name` flag, and

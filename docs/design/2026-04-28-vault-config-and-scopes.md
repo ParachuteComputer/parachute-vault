@@ -29,7 +29,7 @@ This is the structural source of the ambiguity. Code already half-knows there ar
 
 ### How auth works today
 
-- **Vault as OAuth issuer (Phase 0/1):** vault mints `pvt_*` opaque tokens. `oauth.ts` checks `authCode.vault_name !== vaultName` before issuing — vault-issued tokens are vault-pinned by construction.
+- ~~**Vault as OAuth issuer (Phase 0/1):** vault mints `pvt_*` opaque tokens. `oauth.ts` checks `authCode.vault_name !== vaultName` before issuing — vault-issued tokens are vault-pinned by construction.~~ **(Retired 2026-05-25 — workstream E. Vault is OAuth resource-server-only; hub is the issuer. CLI-minted `pvt_*` tokens still exist as a non-OAuth path.)**
 - **Hub as OAuth issuer (Phase B2):** hub signs JWTs (RS256), vault validates via JWKS fetched from the hub origin. `validateHubJwt` enforces `iss` strictly. **`aud` is parsed but not strict-checked** (acknowledged TODO in the source). Scopes ride in the `scope` claim as a whitespace-separated string.
 - **Routing:** `routing.ts` dispatches `/vault/<name>/...` and calls `requireScope(auth, scopeForMethod(method))`. The check knows which vault is being accessed (it's right there in the URL) but never compares that to anything in the token.
 - **Scope shape:** `scopes.ts` parses `vault:<name>:<verb>` but `normalizeScope` collapses it to `vault:<verb>` ("Phase 2 synonym"). The shape exists; the enforcement does not.

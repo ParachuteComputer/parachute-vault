@@ -133,6 +133,11 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 
 -- OAuth: registered clients (Dynamic Client Registration)
+-- VESTIGIAL after vault 0.4.x workstream E (2026-05-25). The standalone
+-- OAuth issuer that wrote these rows was retired (hub is the issuer now;
+-- vault is resource-server-only). The tables are left in place so an
+-- upgrade doesn't trip on a missing column for any operator who still
+-- has rows mid-upgrade. A future migration will drop them.
 CREATE TABLE IF NOT EXISTS oauth_clients (
   client_id TEXT PRIMARY KEY,
   client_name TEXT,
@@ -141,9 +146,9 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 );
 
 -- OAuth: authorization codes (single-use, short-lived)
--- vault_name pins the code to the vault it was issued for. handleToken
--- must verify it matches the requested vault — otherwise a code issued
--- under /vaults/A/oauth/authorize could be redeemed at /vaults/B/oauth/token.
+-- VESTIGIAL — see oauth_clients above. The vault_name column survives
+-- as a sentinel of the per-vault-pinning invariant that used to apply
+-- when vault was the issuer.
 CREATE TABLE IF NOT EXISTS oauth_codes (
   code TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,

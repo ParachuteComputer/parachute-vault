@@ -15,8 +15,9 @@
  *   /vaults/list                       — public vault-name discovery (can be
  *                                        disabled globally via config)
  *   /vaults                            — authenticated vault metadata list
- *   /vault/<name>/.well-known/*        — per-vault OAuth discovery
- *   /vault/<name>/oauth/{register,authorize,token}
+ *   /vault/<name>/.well-known/oauth-*  — discovery forwarder; metadata names
+ *                                        the hub as the authorization server
+ *                                        (vault is resource-server only)
  *   /vault/<name>/mcp[/*]              — MCP endpoint (Bearer auth)
  *   /vault/<name>/view/<idOrPath>      — auth-aware HTML view
  *   /vault/<name>/public/<noteId>      — legacy alias → /view redirect
@@ -26,6 +27,13 @@
  * There is deliberately no compat for the old `/api/*`, `/mcp`, `/oauth/*`,
  * `/view/*`, or `/vaults/<name>/*` prefixes. Clients must re-authenticate
  * after the upgrade and point at the new URLs.
+ *
+ * **No standalone OAuth issuer.** vault does not mint OAuth tokens or
+ * render a consent UI. Hub is the issuer; vault validates hub-signed
+ * JWTs (see `auth.ts` + `hub-jwt.ts`). The discovery endpoints above are
+ * forwarders that point clients at the hub. The standalone surface that
+ * lived in `src/oauth.ts` was retired in vault#XXX (workstream E of the
+ * UX audit, 2026-05-25).
  */
 
 import pkg from "../package.json" with { type: "json" };
@@ -60,15 +68,10 @@ import { handleTokens } from "./tokens-routes.ts";
 import {
   handleProtectedResource,
   handleAuthorizationServer,
-  handleRegister,
-  handleAuthorizeGet,
-  handleAuthorizePost,
-  handleToken,
   getBaseUrl,
-} from "./oauth.ts";
+} from "./oauth-discovery.ts";
 import { handleConfigSchema, handleConfig } from "./module-config.ts";
 import { buildAuthStatus } from "./auth-status.ts";
-import { getAuthorizeRateLimiter } from "./owner-auth.ts";
 import { handleMirrorGet, handleMirrorPut } from "./mirror-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 
@@ -167,7 +170,6 @@ function handleParachuteIcon(): Response {
 export async function route(
   req: Request,
   path: string,
-  clientIp?: string,
 ): Promise<Response> {
   // ---------------------------------------------------------------------
   // OAuth discovery — RFC 8414 §3.1 / RFC 9728 §3 path-insertion form.
@@ -325,41 +327,25 @@ export async function route(
     });
   }
 
-  // OAuth flow endpoints (no auth — these ARE the auth).
+  // The legacy `/oauth/{register,authorize,token}` flow on vault was retired
+  // when the standalone OAuth issuer was removed (vault#XXX, workstream E of
+  // the UX audit). Hub is the issuer now; vault is resource-server only. A
+  // request landing here is from a client that hasn't been re-pointed at the
+  // hub yet — surface a clear 410 Gone with a discovery pointer so the client
+  // (or its operator) knows where the authorization server moved.
   if (subpath === "/oauth/register" || subpath === "/oauth/authorize" || subpath === "/oauth/token") {
-    const store = getVaultStore(vaultName);
-    if (subpath === "/oauth/register") return handleRegister(req, store.db);
-    if (subpath === "/oauth/authorize") {
-      const gc = readGlobalConfig();
-      const ownerPasswordHash = gc.owner_password_hash ?? null;
-      const totpSecret = gc.totp_secret ?? null;
-      const totpEnrolled = typeof totpSecret === "string" && totpSecret.length > 0;
-      if (req.method === "GET") {
-        return handleAuthorizeGet(
-          req,
-          store.db,
-          vaultConfig.name,
-          ownerPasswordHash,
-          totpEnrolled,
-        );
-      }
-      if (req.method === "POST") {
-        return handleAuthorizePost(req, store.db, {
-          vaultName: vaultConfig.name,
-          clientIp,
-          ownerPasswordHash,
-          totpSecret,
-          // Per-vault rate-limit instance — prevents brute-force traffic on
-          // one vault's consent flow from locking out IPs trying to authorize
-          // against an unrelated vault (#93).
-          rateLimiter: getAuthorizeRateLimiter(vaultConfig.name),
-        });
-      }
-      return Response.json({ error: "method_not_allowed" }, { status: 405 });
-    }
-    // handleToken pins the OAuth code to the issuing vault (prevents
-    // cross-vault code replay) and echoes `vault: <name>` in the response.
-    if (subpath === "/oauth/token") return handleToken(req, store.db, vaultName);
+    const base = getBaseUrl(req);
+    return Response.json(
+      {
+        error: "oauth_endpoint_removed",
+        error_description:
+          "Vault no longer hosts an OAuth issuer. The hub is the authorization server. " +
+          "Discover its endpoints via the protected-resource metadata.",
+        protected_resource_metadata:
+          `${base}/vault/${vaultName}/.well-known/oauth-protected-resource`,
+      },
+      { status: 410 },
+    );
   }
 
   // Parachute service-info + icon (no auth, CORS *). The CLI hub page at

@@ -455,19 +455,21 @@ describe("per-vault routing under /vault/<name>/", () => {
     expect(res.status).toBe(401);
   });
 
-  test("/vault/<name>/oauth/register reaches the OAuth handler", async () => {
+  test("/vault/<name>/oauth/* returns 410 Gone (standalone issuer retired — workstream E)", async () => {
+    // The standalone OAuth issuer on vault was removed in vault#XXX once hub
+    // became required. The 410 carries a pointer to the protected-resource
+    // metadata so a confused client can rediscover the new issuer (the hub).
     createVault("journal");
-    const path = "/vault/journal/oauth/register";
-    const res = await route(
-      new Request(`http://localhost:1940${path}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_name: "test", redirect_uris: ["https://x.example/cb"] }),
-      }),
-      path,
-    );
-    expect(res.status).not.toBe(500);
-    expect([201, 400]).toContain(res.status);
+    for (const subpath of ["/oauth/register", "/oauth/authorize", "/oauth/token"]) {
+      const path = `/vault/journal${subpath}`;
+      const res = await route(new Request(`http://localhost:1940${path}`), path);
+      expect(res.status).toBe(410);
+      const body = (await res.json()) as { error: string; protected_resource_metadata: string };
+      expect(body.error).toBe("oauth_endpoint_removed");
+      expect(body.protected_resource_metadata).toBe(
+        "http://localhost:1940/vault/journal/.well-known/oauth-protected-resource",
+      );
+    }
   });
 
   test("unknown vault returns 404 before hitting auth", async () => {
@@ -475,7 +477,6 @@ describe("per-vault routing under /vault/<name>/", () => {
     for (const path of [
       "/vault/nonexistent/mcp",
       "/vault/nonexistent/api/notes",
-      "/vault/nonexistent/oauth/register",
     ]) {
       const res = await route(new Request(`http://localhost:1940${path}`), path);
       expect(res.status).toBe(404);
@@ -591,15 +592,22 @@ describe("MCP 401 WWW-Authenticate challenge (RFC 9728)", () => {
 // ---------------------------------------------------------------------------
 // Per-vault OAuth discovery (RFC 8414 / RFC 9728, path-append form).
 //
-// For a resource at `/vault/<name>/mcp`, clients fetch metadata from
+// After workstream E (2026-05-25), vault is resource-server-only — hub is
+// the OAuth issuer. The discovery endpoints stay served at
 //   /vault/<name>/.well-known/oauth-protected-resource
 //   /vault/<name>/.well-known/oauth-authorization-server
-// All endpoints in the AS metadata are vault-scoped so a client that
-// discovers the AS at that URL can drive the full authorization flow.
+// but the metadata they return forwards every authorization-server endpoint
+// to the hub origin. The `resource` URL still names the vault's MCP path
+// (that's the resource being protected); the AS pointer is the hub.
+//
+// `PARACHUTE_HUB_ORIGIN` defaults to `http://127.0.0.1:1939` when unset
+// (canonical hub loopback). Tests below assert against that default.
 // ---------------------------------------------------------------------------
 
-describe("per-vault OAuth discovery", () => {
-  test("/vault/<name>/.well-known/oauth-authorization-server returns vault-scoped AS metadata", async () => {
+const HUB_ORIGIN = "http://127.0.0.1:1939";
+
+describe("per-vault OAuth discovery (hub-rooted after workstream E)", () => {
+  test("AS metadata names the hub as issuer + endpoints", async () => {
     createVault("journal");
     const path = "/vault/journal/.well-known/oauth-authorization-server";
     const res = await route(new Request(`http://localhost:1940${path}`), path);
@@ -609,21 +617,23 @@ describe("per-vault OAuth discovery", () => {
       authorization_endpoint: string;
       token_endpoint: string;
       registration_endpoint: string;
+      jwks_uri: string;
     };
-    expect(body.issuer).toBe("http://localhost:1940/vault/journal");
-    expect(body.authorization_endpoint).toBe("http://localhost:1940/vault/journal/oauth/authorize");
-    expect(body.token_endpoint).toBe("http://localhost:1940/vault/journal/oauth/token");
-    expect(body.registration_endpoint).toBe("http://localhost:1940/vault/journal/oauth/register");
+    expect(body.issuer).toBe(HUB_ORIGIN);
+    expect(body.authorization_endpoint).toBe(`${HUB_ORIGIN}/oauth/authorize`);
+    expect(body.token_endpoint).toBe(`${HUB_ORIGIN}/oauth/token`);
+    expect(body.registration_endpoint).toBe(`${HUB_ORIGIN}/oauth/register`);
+    expect(body.jwks_uri).toBe(`${HUB_ORIGIN}/.well-known/jwks.json`);
   });
 
-  test("/vault/<name>/.well-known/oauth-protected-resource returns vault-scoped PRM", async () => {
+  test("PRM names the vault's MCP endpoint and points at the hub as AS", async () => {
     createVault("journal");
     const path = "/vault/journal/.well-known/oauth-protected-resource";
     const res = await route(new Request(`http://localhost:1940${path}`), path);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { resource: string; authorization_servers: string[] };
     expect(body.resource).toBe("http://localhost:1940/vault/journal/mcp");
-    expect(body.authorization_servers).toEqual(["http://localhost:1940/vault/journal"]);
+    expect(body.authorization_servers).toEqual([HUB_ORIGIN]);
   });
 
   test("unknown vault returns 404 rather than boilerplate metadata", async () => {
@@ -637,7 +647,28 @@ describe("per-vault OAuth discovery", () => {
     }
   });
 
-  test("x-forwarded-* headers propagate into the generated metadata URLs", async () => {
+  test("x-forwarded-* headers propagate into the PRM `resource` URL", async () => {
+    // The resource URL still tracks the vault's external origin (it's the
+    // protected resource the client just hit); the AS pointer is always the
+    // hub, independent of the inbound request's origin.
+    createVault("journal");
+    const path = "/vault/journal/.well-known/oauth-protected-resource";
+    const res = await route(
+      new Request(`http://127.0.0.1:1940${path}`, {
+        headers: {
+          "x-forwarded-host": "vault.example.com",
+          "x-forwarded-proto": "https",
+        },
+      }),
+      path,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { resource: string; authorization_servers: string[] };
+    expect(body.resource).toBe("https://vault.example.com/vault/journal/mcp");
+    expect(body.authorization_servers).toEqual([HUB_ORIGIN]);
+  });
+
+  test("AS metadata ignores x-forwarded-* (hub origin is config, not request-derived)", async () => {
     createVault("journal");
     const path = "/vault/journal/.well-known/oauth-authorization-server";
     const res = await route(
@@ -651,16 +682,16 @@ describe("per-vault OAuth discovery", () => {
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { issuer: string; registration_endpoint: string };
-    expect(body.issuer).toBe("https://vault.example.com/vault/journal");
-    expect(body.registration_endpoint).toBe(
-      "https://vault.example.com/vault/journal/oauth/register",
-    );
+    expect(body.issuer).toBe(HUB_ORIGIN);
+    expect(body.registration_endpoint).toBe(`${HUB_ORIGIN}/oauth/register`);
   });
 
-  test("end-to-end flow: WWW-Authenticate → PRM → AS metadata → registration_endpoint is live", async () => {
-    // On 401, follow the challenge to the PRM, then follow
-    // PRM.authorization_servers[0] to the AS metadata, then hit the
-    // `registration_endpoint`. Every hop must resolve.
+  test("end-to-end flow: WWW-Authenticate → PRM → hub AS metadata pointer", async () => {
+    // On 401, follow the challenge to the PRM, then read
+    // PRM.authorization_servers[0] — it must point at the hub origin. The
+    // hub side of the test (fetching the AS metadata at the hub itself)
+    // lives in hub's test suite; here we just verify vault stops at the
+    // right pointer.
     createVault("journal");
 
     // Step 1: unauthenticated MCP → 401 + WWW-Authenticate.
@@ -675,29 +706,9 @@ describe("per-vault OAuth discovery", () => {
     const prmRes = await route(new Request(`http://localhost:1940${prmPath}`), prmPath);
     expect(prmRes.status).toBe(200);
     const prm = (await prmRes.json()) as { authorization_servers: string[] };
-    const asBase = prm.authorization_servers[0]; // "http://localhost:1940/vault/journal"
 
-    // Step 3: AS metadata lives at `{asBase}/.well-known/oauth-authorization-server`.
-    const asBasePath = new URL(asBase).pathname; // "/vault/journal"
-    const asMetaPath = `${asBasePath}/.well-known/oauth-authorization-server`;
-    const asRes = await route(new Request(`http://localhost:1940${asMetaPath}`), asMetaPath);
-    expect(asRes.status).toBe(200);
-    const asMeta = (await asRes.json()) as { registration_endpoint: string };
-
-    // Step 4: the advertised registration_endpoint must be live.
-    const regPath = new URL(asMeta.registration_endpoint).pathname;
-    const regRes = await route(
-      new Request(`http://localhost:1940${regPath}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          client_name: "Test",
-          redirect_uris: ["https://example.com/cb"],
-        }),
-      }),
-      regPath,
-    );
-    expect(regRes.status).toBe(201);
+    // Step 3: the AS pointer is the hub. Clients drive the flow from there.
+    expect(prm.authorization_servers).toEqual([HUB_ORIGIN]);
   });
 });
 
@@ -716,7 +727,7 @@ describe("per-vault OAuth discovery", () => {
 // ---------------------------------------------------------------------------
 
 describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
-  test("AS metadata at path-insertion short form returns vault-scoped endpoints", async () => {
+  test("AS metadata at path-insertion short form names the hub", async () => {
     createVault("journal");
     const path = "/.well-known/oauth-authorization-server/vault/journal";
     const res = await route(new Request(`http://localhost:1940${path}`), path);
@@ -727,10 +738,10 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
       token_endpoint: string;
       registration_endpoint: string;
     };
-    expect(body.issuer).toBe("http://localhost:1940/vault/journal");
-    expect(body.authorization_endpoint).toBe("http://localhost:1940/vault/journal/oauth/authorize");
-    expect(body.token_endpoint).toBe("http://localhost:1940/vault/journal/oauth/token");
-    expect(body.registration_endpoint).toBe("http://localhost:1940/vault/journal/oauth/register");
+    expect(body.issuer).toBe(HUB_ORIGIN);
+    expect(body.authorization_endpoint).toBe(`${HUB_ORIGIN}/oauth/authorize`);
+    expect(body.token_endpoint).toBe(`${HUB_ORIGIN}/oauth/token`);
+    expect(body.registration_endpoint).toBe(`${HUB_ORIGIN}/oauth/register`);
   });
 
   test("AS metadata at path-insertion long form (/mcp suffix) also works", async () => {
@@ -741,7 +752,7 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
     const res = await route(new Request(`http://localhost:1940${path}`), path);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { issuer: string };
-    expect(body.issuer).toBe("http://localhost:1940/vault/journal");
+    expect(body.issuer).toBe(HUB_ORIGIN);
   });
 
   test("PRM at path-insertion short form returns vault-scoped resource", async () => {
@@ -751,7 +762,7 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { resource: string; authorization_servers: string[] };
     expect(body.resource).toBe("http://localhost:1940/vault/journal/mcp");
-    expect(body.authorization_servers).toEqual(["http://localhost:1940/vault/journal"]);
+    expect(body.authorization_servers).toEqual([HUB_ORIGIN]);
   });
 
   test("PRM at path-insertion long form (/mcp suffix) also works", async () => {
@@ -808,7 +819,9 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
     }
   });
 
-  test("x-forwarded-* headers propagate through path-insertion URLs", async () => {
+  test("AS metadata at path-insertion is hub-rooted regardless of x-forwarded-*", async () => {
+    // Hub origin is configuration, not request-derived. Proxies forwarding
+    // x-forwarded-host don't override the issuer.
     createVault("journal");
     const path = "/.well-known/oauth-authorization-server/vault/journal";
     const res = await route(
@@ -822,16 +835,17 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { issuer: string; registration_endpoint: string };
-    expect(body.issuer).toBe("https://vault.example.com/vault/journal");
-    expect(body.registration_endpoint).toBe(
-      "https://vault.example.com/vault/journal/oauth/register",
-    );
+    expect(body.issuer).toBe(HUB_ORIGIN);
+    expect(body.registration_endpoint).toBe(`${HUB_ORIGIN}/oauth/register`);
   });
 
-  test("end-to-end: 401 → PRM (path-insertion) → AS (path-insertion) → DCR lands", async () => {
-    // Exact handshake Claude Code's MCP OAuth SDK performs. If any hop
-    // 404s, auth cascade-fails — this is the launch-blocker regression
-    // we're fixing.
+  test("end-to-end: 401 → PRM (path-insertion) → AS pointer is the hub", async () => {
+    // Exact handshake Claude Code's MCP OAuth SDK performs. After
+    // workstream E the chain stops at "AS = hub origin"; the live
+    // registration_endpoint lives on the hub (covered by hub's tests).
+    // Both the path-append PRM (named by the WWW-Authenticate challenge)
+    // and the path-insertion PRM (what strict clients probe) must
+    // return the same hub pointer.
     createVault("journal");
 
     // Step 1: unauth MCP → 401 + WWW-Authenticate with PRM pointer.
@@ -841,9 +855,7 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
     const challenge = mcpRes.headers.get("WWW-Authenticate")!;
     const prmUrl = challenge.match(/resource_metadata="([^"]+)"/)![1];
 
-    // The challenge still points at the path-append PRM (we emit one URL
-    // in the header). Strict clients ignore the hint and probe the
-    // path-insertion form regardless — that's the path we care about here.
+    // Step 2: path-insertion PRM also resolves and names the hub.
     const prmInsertPath = "/.well-known/oauth-protected-resource/vault/journal";
     const prmRes = await route(
       new Request(`http://localhost:1940${prmInsertPath}`),
@@ -851,41 +863,30 @@ describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
     );
     expect(prmRes.status).toBe(200);
     const prm = (await prmRes.json()) as { authorization_servers: string[] };
-    const asBase = prm.authorization_servers[0]; // http://localhost:1940/vault/journal
+    expect(prm.authorization_servers).toEqual([HUB_ORIGIN]);
 
-    // Step 2: fetch AS metadata via path-insertion. The issuer path is
-    // everything after the host — here, `/vault/journal`.
-    const asBasePath = new URL(asBase).pathname;
-    const asInsertPath = `/.well-known/oauth-authorization-server${asBasePath}`;
+    // Step 3: AS metadata via path-insertion on the vault path returns
+    // hub-rooted endpoints — strict clients that probe AS via the vault
+    // path (rather than following the PRM pointer) still land at the hub.
+    const asInsertPath = `/.well-known/oauth-authorization-server/vault/journal`;
     const asRes = await route(
       new Request(`http://localhost:1940${asInsertPath}`),
       asInsertPath,
     );
     expect(asRes.status).toBe(200);
-    const asMeta = (await asRes.json()) as { registration_endpoint: string };
+    const asMeta = (await asRes.json()) as { issuer: string; registration_endpoint: string };
+    expect(asMeta.issuer).toBe(HUB_ORIGIN);
+    expect(asMeta.registration_endpoint).toBe(`${HUB_ORIGIN}/oauth/register`);
 
-    // Step 3: registration_endpoint must be live.
-    const regPath = new URL(asMeta.registration_endpoint).pathname;
-    const regRes = await route(
-      new Request(`http://localhost:1940${regPath}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          client_name: "Test",
-          redirect_uris: ["https://example.com/cb"],
-        }),
-      }),
-      regPath,
-    );
-    expect(regRes.status).toBe(201);
-
-    // Path-append PRM URL in the challenge header must still resolve —
-    // we haven't broken the back-compat path.
+    // Step 4: path-append PRM URL in the challenge header still resolves
+    // and agrees with the path-insertion answer.
     const prmAppendRes = await route(
       new Request(prmUrl),
       new URL(prmUrl).pathname,
     );
     expect(prmAppendRes.status).toBe(200);
+    const prmAppend = (await prmAppendRes.json()) as { authorization_servers: string[] };
+    expect(prmAppend.authorization_servers).toEqual([HUB_ORIGIN]);
   });
 });
 

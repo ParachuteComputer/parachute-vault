@@ -1,14 +1,29 @@
 /**
- * Owner authentication for the OAuth consent page.
+ * Owner-password storage + verification.
  *
- * The "owner" is the person who set up this vault — identified by a password
- * stored globally in config.yaml (owner_password_hash). The password is used
- * to prove ownership when authorizing third-party OAuth clients.
+ * **Vestigial after vault#XXX (workstream E of the UX audit, 2026-05-25).**
+ * The owner password used to authenticate the vault's standalone OAuth
+ * consent page (the one rendered by the now-deleted `src/oauth.ts`). With
+ * hub required and consent moved to the hub, the password no longer
+ * protects anything inside vault. The module is kept because:
  *
- * Password hashing uses Bun.password (bcrypt, cost 12 by default) — no deps.
+ *   1. Hub's `expose public` preflight reads `owner_password_hash` /
+ *      `totp_secret` from vault's `config.yaml` to score auth posture
+ *      (`parachute-hub/src/vault/auth-status.ts`). Removing the YAML
+ *      surface in lockstep would turn every install's preflight
+ *      score into "wide-open" until hub ships its own posture check.
+ *   2. The CLI `set-password` / `2fa enroll` commands keep working for
+ *      operators on the legacy posture mid-migration.
  *
- * Rate limiting is per-IP, in-memory. Acceptable for v1: resets on restart,
- * doesn't handle multi-process deployments. Tighten later if needed.
+ * Retirement is tracked as a follow-up; this file should go away once
+ * the hub-side preflight is updated to score hub credentials instead of
+ * vault credentials.
+ *
+ * The per-IP `RateLimiter` (formerly in this file) was deleted alongside
+ * the consent page — there's no traffic to limit on a route that no
+ * longer exists.
+ *
+ * Password hashing uses Bun.password (bcrypt, cost 12 by default).
  */
 
 import { readGlobalConfig, writeGlobalConfig } from "./config.ts";
@@ -71,145 +86,3 @@ export async function verifyOwnerPassword(password: string, hash: string): Promi
   }
 }
 
-// ---------------------------------------------------------------------------
-// Rate limiting
-// ---------------------------------------------------------------------------
-
-interface RateLimitEntry {
-  failures: number;
-  firstFailureAt: number;
-  lockedUntil: number | null;
-}
-
-/**
- * Per-IP rate limiter for consent-page attempts.
- *
- * Policy:
- *   - Up to MAX_FAILURES failed attempts within WINDOW_MS → lockout
- *   - Lockout lasts LOCKOUT_MS
- *   - A successful attempt clears the IP's counter
- *   - Hard cap on entry count — when full, the oldest insertion is evicted
- *     before a new one is recorded. Prevents memory exhaustion via IP /
- *     client_id enumeration (#93).
- */
-export class RateLimiter {
-  private entries = new Map<string, RateLimitEntry>();
-
-  constructor(
-    private readonly maxFailures = 10,
-    private readonly windowMs = 60_000,
-    private readonly lockoutMs = 15 * 60_000,
-    private readonly maxEntries = 10_000,
-  ) {}
-
-  /**
-   * Check whether an IP is currently allowed to attempt auth.
-   * Returns `{ allowed: false, retryAfterSec }` if locked out.
-   */
-  check(ip: string): { allowed: true } | { allowed: false; retryAfterSec: number } {
-    const entry = this.entries.get(ip);
-    if (!entry) return { allowed: true };
-
-    const now = Date.now();
-    if (entry.lockedUntil && entry.lockedUntil > now) {
-      return { allowed: false, retryAfterSec: Math.ceil((entry.lockedUntil - now) / 1000) };
-    }
-
-    // Expired lockout or old window — reset and allow
-    if (entry.lockedUntil && entry.lockedUntil <= now) {
-      this.entries.delete(ip);
-      return { allowed: true };
-    }
-    if (now - entry.firstFailureAt > this.windowMs) {
-      this.entries.delete(ip);
-      return { allowed: true };
-    }
-
-    return { allowed: true };
-  }
-
-  /** Record a failed attempt. Triggers lockout if threshold reached. */
-  recordFailure(ip: string): void {
-    const now = Date.now();
-    const entry = this.entries.get(ip);
-
-    if (!entry || now - entry.firstFailureAt > this.windowMs) {
-      this.evictIfFull();
-      this.entries.set(ip, {
-        failures: 1,
-        firstFailureAt: now,
-        lockedUntil: null,
-      });
-      return;
-    }
-
-    entry.failures += 1;
-    if (entry.failures >= this.maxFailures) {
-      entry.lockedUntil = now + this.lockoutMs;
-    }
-  }
-
-  /** Record a successful attempt. Clears the IP's counter. */
-  recordSuccess(ip: string): void {
-    this.entries.delete(ip);
-  }
-
-  /** For tests: drop all state. */
-  reset(): void {
-    this.entries.clear();
-  }
-
-  /** Current entry count — exposed for tests + observability. */
-  size(): number {
-    return this.entries.size;
-  }
-
-  /**
-   * Evict the oldest insertion(s) until size < maxEntries. Map preserves
-   * insertion order, so `keys().next().value` is the oldest. We re-insert
-   * on window-rollover (delete + new set), so insertion order tracks
-   * recency-of-failure closely enough for FIFO eviction.
-   */
-  private evictIfFull(): void {
-    while (this.entries.size >= this.maxEntries) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest === undefined) break;
-      this.entries.delete(oldest);
-    }
-  }
-}
-
-/**
- * Singleton rate limiter — kept for back-compat with callers that don't pass
- * through per-vault routing. Fresh callers should prefer
- * `getAuthorizeRateLimiter(vaultName)` so traffic on one vault's consent flow
- * doesn't lock out IPs on another vault's consent flow (#93).
- *
- * @deprecated Use `getAuthorizeRateLimiter(vaultName)` instead. The singleton
- * cross-pollutes per-vault consent traffic — one vault under brute-force can
- * lock out IPs on every other vault's consent page.
- */
-export const authorizeRateLimit = new RateLimiter();
-
-/**
- * Per-vault rate limiter registry. The vault count is admin-bounded (vaults
- * are created via CLI, not by clients) so this Map can grow only with operator
- * action — no attacker-driven growth path. Each instance carries the
- * default 10,000-entry IP cap, scoped to its vault (#93).
- */
-const vaultAuthorizeRateLimiters = new Map<string, RateLimiter>();
-
-/** Lazily get-or-create the rate limiter for a given vault. */
-export function getAuthorizeRateLimiter(vaultName: string): RateLimiter {
-  let limiter = vaultAuthorizeRateLimiters.get(vaultName);
-  if (!limiter) {
-    limiter = new RateLimiter();
-    vaultAuthorizeRateLimiters.set(vaultName, limiter);
-  }
-  return limiter;
-}
-
-/** For tests: drop all per-vault limiters. */
-export function resetVaultAuthorizeRateLimiters(): void {
-  vaultAuthorizeRateLimiters.clear();
-}
