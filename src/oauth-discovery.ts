@@ -15,7 +15,7 @@
  *     name the hub)
  *
  * The standalone OAuth issuer that previously lived in `src/oauth.ts` was
- * retired in vault#XXX (workstream E of the UX audit). Hub is now a hard
+ * retired in vault#366 (workstream E of the UX audit). Hub is now a hard
  * requirement; vault never mints OAuth tokens itself, never renders a
  * consent UI, never accepts `/oauth/authorize|token|register` requests.
  * Operators who need OAuth install the hub and front vault with it.

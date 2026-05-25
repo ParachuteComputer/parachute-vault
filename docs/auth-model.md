@@ -319,8 +319,3 @@ should be careful about.
   authorization server from a REST 401 — that's fine (clients that care
   use the MCP path), but REST API consumers must read the OAuth
   metadata document explicitly.
-- **`TRUST_PROXY=1` is not the default.** Rate limiting uses the socket
-  peer IP unless `TRUST_PROXY` is set, in which case it honors
-  `X-Forwarded-For`. A deployment behind Cloudflare Tunnel / nginx
-  without `TRUST_PROXY=1` will rate-limit against the proxy's IP
-  (typically loopback), effectively disabling per-user lockout.

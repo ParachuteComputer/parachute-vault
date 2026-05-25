@@ -234,7 +234,7 @@ describe("auth — cross-vault isolation", () => {
 });
 
 // The "End-to-end OAuth flow" suite was retired alongside the standalone
-// OAuth issuer in workstream E (vault#XXX). Per-vault token coherence is
+// OAuth issuer in workstream E (vault#366). Per-vault token coherence is
 // still pinned by the v16 binding tests above and by `tokens-routes.test.ts`
 // (mint-via-CLI → present at /vault/<name>/* surfaces); the OAuth handshake
 // itself has moved entirely to the hub.

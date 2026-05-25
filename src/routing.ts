@@ -32,7 +32,7 @@
  * render a consent UI. Hub is the issuer; vault validates hub-signed
  * JWTs (see `auth.ts` + `hub-jwt.ts`). The discovery endpoints above are
  * forwarders that point clients at the hub. The standalone surface that
- * lived in `src/oauth.ts` was retired in vault#XXX (workstream E of the
+ * lived in `src/oauth.ts` was retired in vault#366 (workstream E of the
  * UX audit, 2026-05-25).
  */
 
@@ -328,7 +328,7 @@ export async function route(
   }
 
   // The legacy `/oauth/{register,authorize,token}` flow on vault was retired
-  // when the standalone OAuth issuer was removed (vault#XXX, workstream E of
+  // when the standalone OAuth issuer was removed (vault#366, workstream E of
   // the UX audit). Hub is the issuer now; vault is resource-server only. A
   // request landing here is from a client that hasn't been re-pointed at the
   // hub yet — surface a clear 410 Gone with a discovery pointer so the client

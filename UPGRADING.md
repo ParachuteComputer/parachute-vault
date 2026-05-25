@@ -9,6 +9,13 @@ what's actually been published to npm.
 **Hub is now a hard requirement** for OAuth-based clients to connect to
 vault. Vault no longer ships a built-in OAuth issuer.
 
+This affects operators who configured vault to run without hub. There
+are none in the current user base; this is a forward-facing
+simplification, documented here for anyone who would otherwise discover
+the change post-upgrade. The few existing beta operators came in on the
+precursor "vault + CLI" combo (CLI was renamed to hub) and are tracked
+through a separate upgrade pathway.
+
 ### What changed
 
 Vault used to ship a standalone OAuth 2.1 + PKCE + DCR issuer with a
@@ -74,6 +81,15 @@ No action required. Clients re-handshake against the hub on next connect.
 The discovery documents vault serves now forward there explicitly (which
 they already did when `PARACHUTE_HUB_ORIGIN` was set; this change makes the
 hub-rooted forward unconditional).
+
+### If you were exposing vault publicly (Tailscale Funnel, Cloudflare Tunnel, reverse proxy)
+
+If you were exposing vault, you'll also need to expose the hub (or front
+both behind the same domain) — the discovery documents now name the hub
+origin, and a remote OAuth client that resolves the discovery URL must
+be able to reach the hub at that origin to complete the handshake. A
+loopback-only hub paired with a publicly-exposed vault leaves clients
+unable to authorize.
 
 ### Cross-repo follow-up
 

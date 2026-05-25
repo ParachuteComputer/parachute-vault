@@ -1,7 +1,7 @@
 /**
  * Owner-password storage + verification.
  *
- * **Vestigial after vault#XXX (workstream E of the UX audit, 2026-05-25).**
+ * **Vestigial after vault#366 (workstream E of the UX audit, 2026-05-25).**
  * The owner password used to authenticate the vault's standalone OAuth
  * consent page (the one rendered by the now-deleted `src/oauth.ts`). With
  * hub required and consent moved to the hub, the password no longer

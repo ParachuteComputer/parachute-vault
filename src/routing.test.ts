@@ -456,7 +456,7 @@ describe("per-vault routing under /vault/<name>/", () => {
   });
 
   test("/vault/<name>/oauth/* returns 410 Gone (standalone issuer retired — workstream E)", async () => {
-    // The standalone OAuth issuer on vault was removed in vault#XXX once hub
+    // The standalone OAuth issuer on vault was removed in vault#366 once hub
     // became required. The 410 carries a pointer to the protected-resource
     // metadata so a confused client can rediscover the new issuer (the hub).
     createVault("journal");

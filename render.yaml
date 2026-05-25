@@ -94,13 +94,6 @@ services:
       - key: VAULT_AUTH_TOKEN
         sync: false
 
-      # Trust proxy headers — Render terminates TLS upstream and passes
-      # the client IP via X-Forwarded-For. Without this, vault's
-      # per-IP OAuth-consent rate limiter sees Render's load balancer
-      # IP for every request.
-      - key: TRUST_PROXY
-        value: "1"
-
       # Optional: scribe-service URL for the transcription worker. If
       # set, vault polls scribe for attachments tagged
       # `transcribe_status=pending`. Leave unset on a vault-only deploy.
