@@ -36,6 +36,12 @@ to `@latest`.
 
 ## [Unreleased]
 
+## [0.4.8-rc.7] - 2026-05-25
+
+### Fixed
+
+- Ship the built admin SPA bundle (`web/ui/dist/`) in the published npm tarball. Previously, any vault installed via `bun add -g @openparachute/vault` (e.g. hub's supervised vault on cloud deploys) hit a 503 on `/vault/<name>/admin/*`: "vault admin SPA bundle not found — run `bun run build` in web/ui/ to produce dist/". The 503 came from `src/admin-spa.ts` finding no `web/ui/dist/` on disk because `package.json` `files:` never shipped the SPA bundle and there was no build hook. PR adds `web/ui/dist` to `files:`, a `build:spa` script, a `postinstall` (gated on `web/ui/` existing — no-op for npm-installed consumers), and a `prepack` so the SPA always rebuilds before publish. Mirrors hub's pattern. Closes vault#362.
+
 ## [0.4.8-rc.6] - 2026-05-23
 
 ### Removed
