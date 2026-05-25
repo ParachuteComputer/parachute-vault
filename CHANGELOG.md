@@ -34,7 +34,11 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
-## [Unreleased]
+## [0.4.8-rc.9] - 2026-05-25
+
+### Added
+
+- **Vault declares `uiUrl: "/admin/"` in `.parachute/module.json` (workstream C of the UX audit).** Vault now ships the multi-instance form of `uiUrl` per the just-merged [patterns/module-ui-declaration.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md) flip (vault#367). Hub's well-known fan-out (hub#371) prepends each instance's mount path so `/vault/<name>/admin/` surfaces as a discovery tile per vault. Replaces the previously-hardcoded "Browse Vault" tile in hub.ts; the operator surface is now data-driven from this declaration.
 
 ### Removed (BREAKING)
 
