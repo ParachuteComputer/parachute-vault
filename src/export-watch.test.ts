@@ -37,6 +37,25 @@ import {
 
 const CLI = path.resolve(import.meta.dir, "cli.ts");
 
+// Capture HOME / PARACHUTE_HOME at module load so `seedVaultWithNotes`'s
+// in-process env mutation (required for the deferred `vault-store.ts`
+// re-import to see PARACHUTE_HOME) can be reverted between tests. Without
+// this, the polluted HOME leaks into later tests in the same process — most
+// visibly into `resolveInstallTarget` (mcp-install.test.ts), which reads
+// `process.env.HOME` directly and would otherwise return paths under the
+// tmpdir. Linux-only failure because macOS BSD developers were less likely
+// to notice in dev; CI on Linux exposed it after the tag-triggered release
+// workflow landed (vault#361). See vault#363.
+const ORIG_HOME = process.env.HOME;
+const ORIG_PARACHUTE_HOME = process.env.PARACHUTE_HOME;
+
+function restoreHomeEnv(): void {
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
+  if (ORIG_PARACHUTE_HOME === undefined) delete process.env.PARACHUTE_HOME;
+  else process.env.PARACHUTE_HOME = ORIG_PARACHUTE_HOME;
+}
+
 // ---------------------------------------------------------------------------
 // Shared test helpers
 // ---------------------------------------------------------------------------
@@ -439,6 +458,7 @@ describe("export CLI: single-shot", () => {
     clearVaultStoreCache();
     fs.rmSync(tmp, { recursive: true, force: true });
     fs.rmSync(exportDir, { recursive: true, force: true });
+    restoreHomeEnv();
   });
 
   test("--git-commit requires an initialized git repo (clear error)", () => {
@@ -702,6 +722,7 @@ describe("export CLI: --watch", () => {
     clearVaultStoreCache();
     fs.rmSync(tmp, { recursive: true, force: true });
     fs.rmSync(exportDir, { recursive: true, force: true });
+    restoreHomeEnv();
   });
 
   test(

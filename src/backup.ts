@@ -572,9 +572,21 @@ export async function runBackup(opts?: {
     vaultsDir: opts?.vaultsDir,
   });
 
+  // Write the tarball to a SIBLING tempdir, not inside stagingDir.
+  //
+  // Why: `assembleTarball` runs `tar -czf <out> -C <stagingDir> <entries>`
+  // where `entries = readdirSync(stagingDir)`. If the output path lives
+  // inside stagingDir (e.g. `stagingDir/__out__/...`), that subdir shows
+  // up in `entries` and tar enumerates it while ALSO writing to it.
+  // GNU tar (Linux) treats "file changed as we read it" as fatal and
+  // aborts; BSD tar (macOS) tolerates it. The sibling-tempdir layout
+  // keeps the output completely out of tar's input set on both platforms.
+  // See vault#363.
+  const outDir = mkdtempSync(join(tmpdir(), "parachute-backup-out-"));
+
   try {
     const tarName = backupFilename(timestamp);
-    const tarballPath = join(stagingDir, "__out__", tarName);
+    const tarballPath = join(outDir, tarName);
     await assembleTarball(stagingDir, tarballPath);
     const bytes = statSync(tarballPath).size;
 
@@ -594,9 +606,11 @@ export async function runBackup(opts?: {
 
     return { tarballPath, timestamp, bytes, destinations: results, contents };
   } finally {
-    // The staging dir has the only copy of the tarball that isn't at a
-    // destination; destinations have already been written. Safe to clean.
+    // The staging dir + out dir have the only copies of the tarball that
+    // aren't at a destination; destinations have already been written. Safe
+    // to clean both.
     try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+    try { rmSync(outDir, { recursive: true, force: true }); } catch {}
   }
 }
 
