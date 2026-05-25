@@ -12,14 +12,18 @@
     "core/src",
     "core/package.json",
     ".parachute",
-    "tsconfig.json"
+    "tsconfig.json",
+    "web/ui/dist"
   ],
   "scripts": {
     "start": "bun src/server.ts",
     "cli": "bun src/cli.ts",
     "test": "bun test ./src/",
     "test:core": "cd core && node --experimental-vm-modules node_modules/vitest/dist/cli.js run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:spa": "cd web/ui && bun install --frozen-lockfile && bun run build",
+    "postinstall": "if [ -d web/ui ]; then bun run build:spa; fi",
+    "prepack": "bun run build:spa"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
