@@ -34,6 +34,12 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.4.8-rc.10] - 2026-05-26
+
+### Fixed
+
+- **`selfRegister` now derives `health` from the primary vault path instead of hardcoding the manifest template (#369).** Pre-fix, `selfRegister` wrote `health: manifest.health` verbatim — where `manifest.health` is the placeholder template `/vault/default/health` from `.parachute/module.json`. The `paths` array was already built dynamically via `buildVaultServicePaths`, so a vault named anything other than `default` (caught in the wild on a Render rebuild walkthrough with a vault named `vault`) produced `paths: ["/vault/vault"]` paired with `health: "/vault/default/health"`. Hub's per-module health probe targets the configured `health` URL and 404'd on every probe even when the vault was healthy. Health is now `paths[0] + "/health"`. The change-detection comparison was updated to compare against the derived value so idempotent re-registers don't log spurious "changed" lines.
+
 ## [0.4.8-rc.9] - 2026-05-25
 
 ### Added
