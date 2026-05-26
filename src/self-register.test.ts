@@ -117,6 +117,39 @@ describe("self-register", () => {
     });
   });
 
+  test("health path follows the primary vault name (closes vault#369)", () => {
+    // Regression: pre-fix self-register used `manifest.health` verbatim
+    // (which is `/vault/default/health`) regardless of the actual vault
+    // name. A hub-bundled wizard that lets the operator name their vault
+    // `notes` produced a services.json entry with `paths: ["/vault/notes"]`
+    // but `health: "/vault/default/health"`, so hub's per-module health
+    // probe hit a 404 even on a healthy vault. The fix derives health from
+    // paths[0]. Caught in the wild on a Render rebuild walkthrough.
+    withParachuteHome((home) => {
+      const { log, warn } = captureLogs();
+      selfRegister({
+        version: "0.4.8-rc.3",
+        log,
+        warn,
+        readManifest: () => TEST_MANIFEST,
+        resolvePackageRoot: () => "/fake/install/dir",
+        // Vault named something other than "default" — the manifest fallback
+        // path `/vault/default` should NOT leak into the health URL.
+        listVaults: () => ["notes"],
+        readGlobalConfig: () => ({ port: 1940, default_vault: "notes" }),
+      });
+      const parsed = JSON.parse(readFileSync(join(home, "services.json"), "utf8")) as {
+        services: { paths: string[]; health: string }[];
+      };
+      const row = parsed.services[0];
+      expect(row.paths).toEqual(["/vault/notes"]);
+      expect(row.health).toBe("/vault/notes/health");
+      // Sanity: health should never be the literal manifest template
+      // when a real vault exists with a different name.
+      expect(row.health).not.toBe("/vault/default/health");
+    });
+  });
+
   test("idempotent — re-running reports no changes", () => {
     withParachuteHome(() => {
       const { log, warn } = captureLogs();

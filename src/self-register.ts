@@ -163,6 +163,19 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
   const paths = buildVaultServicePaths(globalConfig.default_vault, vaults, manifest.paths);
   const port = globalConfig.port ?? DEFAULT_PORT;
 
+  // Derive the health path from the primary path (paths[0]) rather than
+  // using `manifest.health` verbatim. The manifest's `health` is
+  // `/vault/default/health` — a template literal where `default` is the
+  // placeholder vault name. When the operator named their vault something
+  // other than `default` (e.g. `notes`, `journal`, or — caught in the wild
+  // on a Render rebuild — just `vault`), the manifest's `default` doesn't
+  // get rewritten and the hub's per-module health probe ends up hitting
+  // `/vault/default/health` against a vault that lives at `/vault/<other>/`,
+  // returning 404 even when the vault is healthy. Build health off paths[0]
+  // so the path follows the primary vault by construction. Closes vault#369.
+  const primaryPath = paths[0] ?? "/vault/default";
+  const health = `${primaryPath}/health`;
+
   // Build the entry with manifest-sourced metadata (displayName, tagline,
   // stripPrefix) layered on top of the operationally-determined fields
   // (port from config, paths from current vault list, version from
@@ -178,7 +191,7 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
     name: manifest.manifestName,
     port,
     paths,
-    health: manifest.health,
+    health,
     version: deps.version,
     installDir,
   };
@@ -212,7 +225,7 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
     priorRow.version !== deps.version ||
     priorRow.port !== port ||
     JSON.stringify(priorRow.paths) !== JSON.stringify(paths) ||
-    priorRow.health !== manifest.health ||
+    priorRow.health !== health ||
     (priorRow as { displayName?: string }).displayName !== manifest.displayName ||
     (priorRow as { tagline?: string }).tagline !== manifest.tagline ||
     (priorRow as { stripPrefix?: boolean }).stripPrefix !== manifest.stripPrefix;
