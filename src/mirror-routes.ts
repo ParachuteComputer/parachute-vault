@@ -1,8 +1,9 @@
 /**
  * HTTP surface for the mirror lifecycle.
  *
- *   GET  /vault/<name>/.parachute/mirror — read current config + runtime status
- *   PUT  /vault/<name>/.parachute/mirror — update config + reload watch loop
+ *   GET  /vault/<name>/.parachute/mirror         — read current config + runtime status
+ *   PUT  /vault/<name>/.parachute/mirror         — update config + reload watch loop
+ *   POST /vault/<name>/.parachute/mirror/run-now — fire a one-shot export+commit+push pass
  *
  * URL note: the design doc names this `/admin/mirror`, but vault's
  * existing routing already mounts the admin SPA's static-file bundle at
@@ -132,6 +133,44 @@ export async function handleMirrorPut(
     {
       config: manager.getConfig(),
       status,
+    },
+    { headers: { "Access-Control-Allow-Origin": "*" } },
+  );
+}
+
+/**
+ * `POST /vault/<name>/.parachute/mirror/run-now` — fire a one-shot export
+ * cycle right now (export → optional commit → optional push), using the
+ * persisted config. Same response shape as GET so the admin SPA reuses
+ * one decoder for both initial-load and after-trigger refresh.
+ *
+ * Refuses to fire (400) when the mirror is disabled: `runNow()` would
+ * already no-op in that case, but returning a 200 with stale status
+ * lets a misclick look successful. The 400 is the actionable surface
+ * — "enable the mirror first, then re-trigger."
+ *
+ * Mutating verb, vault:admin-gated upstream in `routing.ts` (alongside
+ * the GET/PUT). Auth is already enforced by the time this handler runs.
+ */
+export async function handleMirrorRunNow(
+  manager: MirrorManager,
+): Promise<Response> {
+  const status = manager.getStatus();
+  if (!status.enabled) {
+    return Response.json(
+      {
+        error: "Mirror not enabled",
+        message:
+          "Mirror must be enabled (and successfully bootstrapped) before a manual run can fire. Enable it via PUT /.parachute/mirror first.",
+      },
+      { status: 400 },
+    );
+  }
+  const updated = await manager.runNow();
+  return Response.json(
+    {
+      config: manager.getConfig(),
+      status: updated,
     },
     { headers: { "Access-Control-Allow-Origin": "*" } },
   );

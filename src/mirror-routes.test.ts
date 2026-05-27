@@ -16,7 +16,11 @@ import {
   MirrorManager,
   type MirrorDeps,
 } from "./mirror-manager.ts";
-import { handleMirrorGet, handleMirrorPut } from "./mirror-routes.ts";
+import {
+  handleMirrorGet,
+  handleMirrorPut,
+  handleMirrorRunNow,
+} from "./mirror-routes.ts";
 
 // Same env-restore pattern as mirror-manager.test.ts — keeps HOME +
 // PARACHUTE_HOME from leaking between test files.
@@ -375,6 +379,60 @@ describe("handleMirrorPut", () => {
     expect(status.enabled).toBe(true);
     expect(status.watch_running).toBe(true);
     expect(manager.getConfig().interval_seconds).toBe(2);
+    await manager.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /.parachute/mirror/run-now
+// ---------------------------------------------------------------------------
+
+describe("handleMirrorRunNow", () => {
+  let home: string;
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("returns 400 when mirror is disabled (avoids stale-status no-op)", async () => {
+    home = tmp("mirror-runnow-disabled-");
+    const { manager, exportCalls } = makeManager(home);
+    const res = await handleMirrorRunNow(manager);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toContain("not enabled");
+    // The disabled-guard short-circuits BEFORE manager.runNow(), so no
+    // export attempt happens — pinning this distinguishes the guard from
+    // a "200 with stale status" pass-through that would have looked
+    // identical to the operator.
+    expect(exportCalls()).toHaveLength(0);
+  });
+
+  test("fires an export pass and returns the updated config+status on success", async () => {
+    home = tmp("mirror-runnow-happy-");
+    const { manager, deps, exportCalls } = makeManager(home);
+    deps.writeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+      watch: false,
+      auto_commit: false,
+    });
+    await manager.start();
+    // The initial export from start() already ran once. We pin the
+    // delta — run-now must trigger a SECOND export pass and the
+    // response must carry the updated status.
+    const exportsBefore = exportCalls().length;
+    const res = await handleMirrorRunNow(manager);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      config: MirrorConfig;
+      status: { enabled: boolean; last_export_at: string | null; mirror_path: string };
+    };
+    expect(body.config.enabled).toBe(true);
+    expect(body.status.enabled).toBe(true);
+    expect(body.status.last_export_at).not.toBeNull();
+    expect(body.status.mirror_path).toContain("mirror");
+    expect(exportCalls().length).toBe(exportsBefore + 1);
     await manager.stop();
   });
 });

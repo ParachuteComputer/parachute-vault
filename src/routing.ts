@@ -72,7 +72,7 @@ import {
 } from "./oauth-discovery.ts";
 import { handleConfigSchema, handleConfig } from "./module-config.ts";
 import { buildAuthStatus } from "./auth-status.ts";
-import { handleMirrorGet, handleMirrorPut } from "./mirror-routes.ts";
+import { handleMirrorGet, handleMirrorPut, handleMirrorRunNow } from "./mirror-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 
 /**
@@ -508,6 +508,39 @@ export async function route(
     }
     if (req.method === "GET") return handleMirrorGet(manager);
     if (req.method === "PUT") return handleMirrorPut(req, manager);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/run-now — fire a one-shot export+commit+push pass.
+  // Same admin gate as the GET/PUT above; same manager presence check.
+  // POST-only — a GET would imply "read the result of running" which
+  // isn't the verb (the rolling status is already available on the
+  // parent GET endpoint).
+  if (subpath === "/.parachute/mirror/run-now") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager();
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method === "POST") return handleMirrorRunNow(manager);
     return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 

@@ -1822,3 +1822,76 @@ describe("/vault/<name>/.parachute/mirror — auth + dispatch", () => {
     expect([405, 503]).toContain(res.status);
   });
 });
+
+// ---------------------------------------------------------------------------
+// /vault/<name>/.parachute/mirror/run-now — manual-trigger endpoint added
+// alongside the SPA UI. Tests pin the auth gate matches the parent
+// endpoint; handler-shape coverage lives in mirror-routes.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("/vault/<name>/.parachute/mirror/run-now — auth + dispatch", () => {
+  test("unauthenticated → 401", async () => {
+    createVault("journal");
+    const p = "/vault/journal/.parachute/mirror/run-now";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, { method: "POST" }),
+      p,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("vault:read token → 403 insufficient_scope", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const { fullToken } = generateToken();
+    createToken(store.db, fullToken, {
+      label: "reader",
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+    const p = "/vault/journal/.parachute/mirror/run-now";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${fullToken}` },
+      }),
+      p,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+  });
+
+  test("admin token reaches the handler — 503 when manager not wired, 400 when wired+disabled", async () => {
+    // Mirrors the parent endpoint's harness behavior: test ordering
+    // determines whether a previous test wired a manager. Either way
+    // the auth gate passed, which is what this routing-level test pins.
+    createVault("journal");
+    const token = createAdminToken("journal");
+    const p = "/vault/journal/.parachute/mirror/run-now";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      p,
+    );
+    expect([400, 503]).toContain(res.status);
+  });
+
+  test("non-POST methods return 405 when manager is wired", async () => {
+    createVault("journal");
+    const token = createAdminToken("journal");
+    const p = "/vault/journal/.parachute/mirror/run-now";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      p,
+    );
+    // 503 short-circuits the method check when no manager is wired.
+    expect([405, 503]).toContain(res.status);
+  });
+});
