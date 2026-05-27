@@ -19,8 +19,11 @@
  *   - port:                 GlobalConfig.port, exposed read-only.
  *   - autoTranscribe.*:     vault↔scribe handoff (vault#353, design 2026-05-21
  *                           Part 2). Three nested fields per design Q4:
- *       - enabled:          boolean toggle, default false (persisted in
- *                           GlobalConfig.auto_transcribe.enabled).
+ *       - enabled:          boolean toggle, default true when scribe is
+ *                           reachable (persisted in
+ *                           GlobalConfig.auto_transcribe.enabled). Default
+ *                           flipped from off → on so installing scribe is
+ *                           the only opt-in signal needed.
  *       - scribeUrl:        readOnly — resolved per-process from
  *                           `~/.parachute/services.json` via
  *                           `scribe-discovery.ts`. Operators can't point at an
@@ -69,10 +72,10 @@ export function buildConfigSchema(): ModuleConfigSchema {
         properties: {
           enabled: {
             type: "boolean",
-            default: false,
+            default: true,
             title: "Enable auto-transcription",
             description:
-              "Master toggle. When false, audio uploads land normally without any scribe interaction. Global — persisted in `GlobalConfig.auto_transcribe.enabled` and applies to every vault on this server. Per-vault control is a future enhancement when multi-vault deployments need it.",
+              "Master toggle. Default on — audio uploads transcribe automatically when scribe is reachable. Set to false to disable. Global — persisted in `GlobalConfig.auto_transcribe.enabled` and applies to every vault on this server. Per-vault control is a future enhancement when multi-vault deployments need it.",
           },
           scribeUrl: {
             type: "string",
@@ -139,7 +142,10 @@ export function buildConfigValues(
   return {
     audio_retention: vaultConfig.audio_retention ?? "keep",
     autoTranscribe: {
-      enabled: globalConfig.auto_transcribe?.enabled ?? false,
+      // Match shouldAutoTranscribe's `?? true` so the admin SPA displays
+      // the same value runtime uses. An unset config row shows `true`
+      // because that's what vault will actually do on the next audio upload.
+      enabled: globalConfig.auto_transcribe?.enabled ?? true,
       scribeUrl,
     },
     // Legacy alias mirrors `autoTranscribe.scribeUrl` so hubs reading the

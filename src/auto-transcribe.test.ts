@@ -69,11 +69,16 @@ describe("shouldAutoTranscribe", () => {
     })).toBe(false);
   });
 
-  test("skips when enabled is unset (no auto_transcribe block in config)", () => {
+  test("fires when enabled is unset — unset config means ON", () => {
+    // Default behavior (no `auto_transcribe` block in config) is opt-out:
+    // once an operator has scribe reachable, audio attachments transcribe
+    // automatically. Operators wanting it OFF set
+    // `auto_transcribe.enabled: false` explicitly. Previously default-off;
+    // flipped to default-on so installing scribe is the only opt-in signal.
     expect(shouldAutoTranscribe("audio/wav", {
       readGlobalConfigImpl: readGlobalConfig(undefined),
       getCachedScribeUrlImpl: scribePresent,
-    })).toBe(false);
+    })).toBe(true);
   });
 
   test("skips when scribe URL is undefined (no services.json entry, no env)", () => {
