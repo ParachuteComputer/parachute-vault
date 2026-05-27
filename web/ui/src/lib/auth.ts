@@ -68,3 +68,58 @@ export function clearToken(): void {
 export function _setTokenForTest(token: string | null): void {
   cachedToken = token;
 }
+
+/**
+ * Fallback bootstrap path: when the SPA loads at `/vault/<name>/admin/`
+ * without a `#token=...` fragment (i.e. the operator clicked the vault tile
+ * on hub's discovery page, or refreshed an authenticated tab), attempt to
+ * mint a token from the hub-issued session cookie.
+ *
+ * The hub exposes `GET /admin/vault-admin-token/<name>` for exactly this
+ * trade: it reads the `parachute_hub_session` cookie, verifies the operator
+ * is the first admin, and returns a short-lived `vault:<name>:admin` JWT.
+ * Same-origin fetch carries the cookie automatically (hub serves both `/`
+ * and `/vault/<name>/admin/` from the same origin via its reverse proxy).
+ *
+ * Behavior:
+ *   - On 200: cache the token (same module-scoped slot
+ *     `captureTokenFromFragment` writes to). Subsequent `getToken()` calls
+ *     return it.
+ *   - On 401/403/404 or network error: leave the cache empty. The SPA
+ *     proceeds to its existing `auth-required` empty state, which tells
+ *     the operator to open the page from hub's directory. (404 should be
+ *     impossible — the operator wouldn't have a tile to click for a vault
+ *     that isn't installed — but treat it the same as 401 for safety.)
+ *
+ * Why fragment-first, cookie-second: the `Manage` button mints via fragment
+ * because it doesn't depend on the SPA's mount being same-origin with the
+ * token issuer. The cookie fallback works only when hub and the SPA share
+ * an origin, which is the canonical owner-operated deploy shape but not
+ * universal. Keep both paths — they're complementary, not redundant.
+ *
+ * Idempotent — safe to call multiple times, only sets the cache on a fresh
+ * successful mint.
+ */
+export async function tryMintTokenFromHubSession(vaultName: string): Promise<void> {
+  if (typeof window === "undefined") return;
+  if (cachedToken) return;
+  try {
+    const res = await fetch(
+      `/admin/vault-admin-token/${encodeURIComponent(vaultName)}`,
+      {
+        method: "GET",
+        headers: { accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!res.ok) return;
+    const body = (await res.json()) as { token?: string };
+    if (typeof body.token === "string" && body.token.length > 0) {
+      cachedToken = body.token;
+    }
+  } catch (_e) {
+    // Network / CORS / parse error — silent fallback to the existing
+    // auth-required empty state. The SPA still renders; the operator gets
+    // a clear message to open from the hub directory.
+  }
+}
