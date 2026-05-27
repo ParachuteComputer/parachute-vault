@@ -20,13 +20,10 @@ import { getCachedScribeUrl } from "./scribe-discovery.ts";
  * Returns `true` only when ALL three conditions hold:
  *   1. mime-type starts with `audio/` (case-insensitive).
  *   2. `globalConfig.auto_transcribe?.enabled` is not explicitly false.
- *      Default behavior (when unset) is **ON** — once an operator has
- *      scribe reachable, audio attachments transcribe automatically
- *      without a separate config step. Operators who want it OFF set
- *      `auto_transcribe.enabled: false` explicitly. The default flipped
- *      from off → on 2026-05-27 per Aaron's directive: "for the simpler
- *      orientation, opt-out feels right — if someone installed scribe
- *      they probably want it to fire automatically."
+ *      Default behavior (when unset) is ON — once an operator has scribe
+ *      reachable, audio attachments transcribe automatically without a
+ *      separate config step. Operators who want it OFF set
+ *      `auto_transcribe.enabled: false` explicitly.
  *   3. Scribe is discoverable (services.json entry OR SCRIBE_URL env).
  *
  * The three conditions are independent guards: a single `false` is sufficient
