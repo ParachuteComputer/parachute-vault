@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -118,6 +118,20 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 --
 -- scope_tag / scope_path_prefix are deprecated Phase-0 columns — never
 -- enforced at runtime, kept only for schema stability.
+-- created_via (v19) records the provenance of a token. NULL means the
+-- legacy/unspecified path (CLI, REST mint, YAML import); 'mcp_mint' means
+-- the token was minted by the manage-token MCP tool, which lets the
+-- list/revoke surface of that tool restrict itself to its own session's
+-- mints (no cross-session token management from inside MCP).
+--
+-- parent_jti (v19) is the display id (t_hashprefix) of the token that
+-- minted this one, or the hub-JWT jti claim when minted from a hub
+-- session. Session-pinned list+revoke in manage-token filters on this.
+--
+-- revoked_at (v19) marks soft-revocation. Revoke from manage-token sets
+-- this rather than deleting the row, so the audit trail stays intact and
+-- the second revoke of the same jti is idempotent (returns ok=true).
+-- resolveToken treats a revoked_at-set row as not-found.
 CREATE TABLE IF NOT EXISTS tokens (
   token_hash TEXT PRIMARY KEY,
   label TEXT NOT NULL,
@@ -129,7 +143,10 @@ CREATE TABLE IF NOT EXISTS tokens (
   expires_at TEXT,
   created_at TEXT NOT NULL,
   last_used_at TEXT,
-  vault_name TEXT
+  vault_name TEXT,
+  created_via TEXT,
+  parent_jti TEXT,
+  revoked_at TEXT
 );
 
 -- OAuth: registered clients (Dynamic Client Registration)
@@ -379,6 +396,12 @@ export function initSchema(db: Database): void {
   // Backward-compat by construction — every existing row defaults to "md"
   // (markdown), unchanged in meaning. See vault#328.
   migrateToV18(db);
+
+  // Migrate v18 → v19: add MCP-mint provenance columns to `tokens`
+  // (created_via, parent_jti, revoked_at) for vault#376's manage-token tool.
+  // All three are nullable; existing rows backfill to NULL which means
+  // "non-MCP-minted, not revoked" — identical pre-v19 semantics.
+  migrateToV19(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -949,6 +972,32 @@ function migrateToV18(db: Database): void {
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
+  }
+}
+
+/**
+ * Migrate v18 → v19: add `created_via`, `parent_jti`, `revoked_at` columns
+ * to `tokens` so manage-token can attribute mints to the MCP session that
+ * minted them, scope its list+revoke to those tokens, and soft-revoke
+ * (preserving the audit trail).
+ *
+ * All three columns are nullable; existing rows backfill to NULL with
+ * back-compat semantics — `created_via IS NULL` matches the CLI/REST-mint
+ * provenance, `revoked_at IS NULL` matches "still active". Idempotent —
+ * the column-existence guard means the migration is safe to re-run on a
+ * post-v19 vault. See vault#376.
+ */
+function migrateToV19(db: Database): void {
+  if (!hasTable(db, "tokens")) return;
+  const cols: [string, string][] = [
+    ["created_via", "TEXT"],
+    ["parent_jti", "TEXT"],
+    ["revoked_at", "TEXT"],
+  ];
+  for (const [col, type] of cols) {
+    if (!hasColumn(db, "tokens", col)) {
+      db.exec(`ALTER TABLE tokens ADD COLUMN ${col} ${type}`);
+    }
   }
 }
 

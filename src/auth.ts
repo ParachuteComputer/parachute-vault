@@ -91,6 +91,12 @@ function tryServerWideAuth(
     legacyDerived: false,
     scoped_tags: null,
     vault_name: null,
+    // No stable session id for the env-var operator token — every request
+    // is the operator-bearer, not a minted session. manage-token's session
+    // pin is a no-op for this caller (it'd still mint, but list/revoke
+    // would see no other operator mints; that's fine — env-var-bearer is
+    // explicitly the operator-channel, not a user surface).
+    caller_jti: null,
   };
 }
 
@@ -120,6 +126,15 @@ export interface AuthResult {
    * legacy / server-wide / hub JWT — no per-vault binding. See vault#257.
    */
   vault_name: string | null;
+  /**
+   * Session identifier (v19). For `pvt_*` tokens this is the display id
+   * (`t_<hashprefix>`) of the presented token. For hub JWTs it's the
+   * `jti` claim, when present. NULL for legacy YAML keys / server-wide
+   * env-var tokens / hub JWTs without a `jti`. Used by the manage-token
+   * MCP tool to stamp child tokens with `parent_jti` so list/revoke can
+   * scope to this session's mints. See vault#376.
+   */
+  caller_jti: string | null;
 }
 
 /**
@@ -134,6 +149,7 @@ function legacyAuthResult(permission: TokenPermission): AuthResult {
     legacyDerived: true,
     scoped_tags: null,
     vault_name: null,
+    caller_jti: null,
   };
 }
 
@@ -285,6 +301,7 @@ export async function authenticateVaultRequest(
           legacyDerived: resolved.legacyDerived,
           scoped_tags: resolved.scoped_tags,
           vault_name: resolved.vault_name,
+          caller_jti: resolved.jti,
         };
       }
     } catch {
@@ -396,7 +413,17 @@ async function authenticateHubJwt(
       hasScope(claims.scopes, SCOPE_WRITE) || hasScope(claims.scopes, SCOPE_ADMIN)
         ? "full"
         : "read";
-    return { permission, scopes: claims.scopes, legacyDerived: false, scoped_tags: null, vault_name: null };
+    return {
+      permission,
+      scopes: claims.scopes,
+      legacyDerived: false,
+      scoped_tags: null,
+      vault_name: null,
+      // claims.jti is `undefined` when the issuer didn't stamp one. Pass it
+      // through verbatim — manage-token's session-pin will be null in that
+      // case, and list/revoke from that session sees no mints.
+      caller_jti: claims.jti ?? null,
+    };
   } catch (err) {
     if (err instanceof HubJwtError) {
       // Revocation-related codes get sanitized client messages: server-side
@@ -511,6 +538,7 @@ export async function authenticateGlobalRequest(
           legacyDerived: resolved.legacyDerived,
           scoped_tags: resolved.scoped_tags,
           vault_name: resolved.vault_name,
+          caller_jti: resolved.jti,
         };
       }
     } catch {

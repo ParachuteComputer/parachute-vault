@@ -30,29 +30,19 @@ import { hasScopeForVault } from "./scopes.ts";
 import type { VaultVerb } from "./scopes.ts";
 
 /**
- * Required verb for each MCP tool. Tools that mutate note/tag state require
- * write; pure query tools need read. `vault-info` is listed as read because
- * read-only callers can fetch stats — the description-update branch inside
- * vault-info performs its own secondary write check (see `overrideVaultInfo`
- * in mcp-tools.ts). Do not assume the outer gate alone protects the inner
- * branch.
+ * Required verb for an MCP tool. Reads `tool.requiredVerb` from the tool
+ * metadata — every core tool stamps this (vault#376) so the filter is data,
+ * not a side-table that can drift. The discovery + dispatch paths below
+ * call this with the tool object so a future tool that forgets to stamp
+ * falls into the default-deny branch.
+ *
+ * Default-deny: unknown tools require `write`. Keeps accidental reads of
+ * a not-yet-mapped mutation tool from slipping past. (`admin` would be
+ * safer-still but would refuse vault-info-style read tools to write-scope
+ * callers; `write` is the right middle ground.)
  */
-const TOOL_REQUIRED_VERB: Record<string, VaultVerb> = {
-  "query-notes": "read",
-  "list-tags": "read",
-  "find-path": "read",
-  "vault-info": "read",
-  "create-note": "write",
-  "update-note": "write",
-  "delete-note": "write",
-  "update-tag": "write",
-  "delete-tag": "write",
-};
-
-function requiredVerbForTool(toolName: string): VaultVerb {
-  // Default-deny: unknown tools require write. Keeps accidental reads of
-  // a not-yet-mapped mutation tool from slipping past.
-  return TOOL_REQUIRED_VERB[toolName] ?? "write";
+function requiredVerbForTool(tool: { requiredVerb?: VaultVerb }): VaultVerb {
+  return tool.requiredVerb ?? "write";
 }
 
 /** Handle scoped MCP at /vault/{name}/mcp (single vault). */
@@ -90,9 +80,12 @@ async function handleMcp(
   // Filter the advertised tool list to what the caller's scopes actually
   // permit for THIS vault. Callers without write don't see mutation tools at
   // all — matches the prior behavior of the read/full permission model but
-  // now driven by per-vault scope inheritance.
+  // now driven by per-vault scope inheritance. With manage-token (vault#376)
+  // requiring `admin`, callers without admin don't see it at all — the AI
+  // never knows it could mint child tokens, eliminating that escalation
+  // vector by listing.
   const visibleTools = mcpTools.filter((t) =>
-    hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t.name)),
+    hasScopeForVault(auth.scopes, vaultName, requiredVerbForTool(t)),
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -106,18 +99,13 @@ async function handleMcp(
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    const neededVerb = requiredVerbForTool(name);
-    if (!hasScopeForVault(auth.scopes, vaultName, neededVerb)) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Forbidden: tool '${name}' requires the 'vault:${neededVerb}' scope (or 'vault:${vaultName}:${neededVerb}'). Granted scopes: ${auth.scopes.join(" ") || "(none)"}.`,
-        }],
-        isError: true,
-      };
-    }
-
-    const tool = mcpTools.find((t) => t.name === name);
+    // Dispatch against the FILTERED tool list — tools the caller can't see
+    // in `tools/list` also can't be called explicitly. This matches the
+    // user-visible contract: "excluded tools throw 'tool not found' if
+    // called explicitly" (vault#376 spec). It also avoids leaking the
+    // existence of admin-only tools (manage-token) to write-scope sessions
+    // via differential error messages.
+    const tool = visibleTools.find((t) => t.name === name);
     if (!tool) {
       return {
         content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
