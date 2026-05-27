@@ -3941,6 +3941,10 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).not.toContain("delete-note");
     expect(toolNames).not.toContain("update-tag");
     expect(toolNames).not.toContain("delete-tag");
+    // Admin tools (vault#376) are hidden too
+    expect(toolNames).not.toContain("manage-token");
+    // Read tier is exactly 4 tools.
+    expect(toolNames.length).toBe(4);
 
     closeAllStores();
   });
@@ -4077,7 +4081,13 @@ describe("stateless MCP transport", async () => {
     expect(res.status).toBe(200); // JSON-RPC envelope is 200 even for tool errors
     const body = await res.json() as any;
     expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("vault:write");
+    // Post-vault#376: hidden tools surface as "Unknown tool" rather than
+    // a verb-specific Forbidden — see mcp-http.ts dispatch-against-
+    // visibleTools rationale. The contract is: tools not in tools/list
+    // also can't be called explicitly. (Differential errors would leak
+    // the existence of admin-only tools to write-scope sessions.)
+    expect(body.result.content[0].text).toContain("Unknown tool");
+    expect(body.result.content[0].text).toContain("create-note");
 
     closeAllStores();
   });
@@ -4125,6 +4135,372 @@ describe("stateless MCP transport", async () => {
     expect(body.result.serverInfo.name).toBe(`parachute-vault/${vaultName}`);
     expect(body.result.capabilities.tools).toBeDefined();
 
+    closeAllStores();
+  });
+});
+
+// ===========================================================================
+// vault#376 — Change 1: scope-filtered tool listing across all three tiers
+// ===========================================================================
+
+describe("MCP tools/list scope tiers (vault#376)", () => {
+  async function listToolNames(scopes: string[], scopedTags: string[] | null = null, vaultPrefix = "scope-tier") {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `${vaultPrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: scopes.includes("vault:write") || scopes.includes("vault:admin") ? "full" : "read",
+      scopes,
+      legacyDerived: false,
+      scoped_tags: scopedTags,
+    } as any);
+    const body = await res.json() as any;
+    const names: string[] = body.result.tools.map((t: any) => t.name);
+    closeAllStores();
+    return names;
+  }
+
+  test("vault:read sees exactly the 4 read tools", async () => {
+    const names = await listToolNames(["vault:read"]);
+    expect(new Set(names)).toEqual(
+      new Set(["query-notes", "list-tags", "find-path", "vault-info"]),
+    );
+    expect(names.length).toBe(4);
+  });
+
+  test("vault:read + vault:write sees the 7 read+write tools", async () => {
+    const names = await listToolNames(["vault:read", "vault:write"]);
+    expect(new Set(names)).toEqual(
+      new Set([
+        "query-notes",
+        "list-tags",
+        "find-path",
+        "vault-info",
+        "create-note",
+        "update-note",
+        "update-tag",
+      ]),
+    );
+    expect(names.length).toBe(7);
+    expect(names).not.toContain("manage-token");
+    // delete-* are admin-tier per vault#376 — hidden from write callers.
+    expect(names).not.toContain("delete-note");
+    expect(names).not.toContain("delete-tag");
+  });
+
+  test("vault:admin sees all 10 tools including manage-token", async () => {
+    const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
+    expect(names).toContain("manage-token");
+    expect(names.length).toBe(10);
+  });
+
+  test("legacy-derived full token sees all 10 tools (back-compat)", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `legacy-token-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+
+    // Legacy permission-derived token: legacyDerived=true, scopes carry the
+    // full admin set per `legacyPermissionToScopes("full")`. Compat shim
+    // means the operator's existing pvt_* tokens minted pre-scope-column
+    // see the full surface (including manage-token), not just the 9 they
+    // had before.
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: true,
+      scoped_tags: null,
+    } as any);
+    const body = await res.json() as any;
+    const names: string[] = body.result.tools.map((t: any) => t.name);
+    expect(names.length).toBe(10);
+    expect(names).toContain("manage-token");
+    closeAllStores();
+  });
+
+  test("excluded tools surface as 'Unknown tool' if called explicitly", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `hidden-call-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+
+    // Write-scope session calling manage-token (admin-only): should look
+    // like the tool doesn't exist, not "Forbidden: requires vault:admin".
+    // Differential messages would leak the admin tool's existence.
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "manage-token", arguments: { action: "list" } },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write"],
+      legacyDerived: false,
+      scoped_tags: null,
+    } as any);
+    const body = await res.json() as any;
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("Unknown tool");
+    expect(body.result.content[0].text).toContain("manage-token");
+    expect(body.result.content[0].text).not.toContain("vault:admin");
+    closeAllStores();
+  });
+});
+
+// ===========================================================================
+// vault#376 — Change 2: manage-token mint/revoke/list
+// ===========================================================================
+
+describe("manage-token MCP tool (vault#376)", () => {
+  async function callTool(
+    vaultName: string,
+    auth: any,
+    toolName: string,
+    args: Record<string, unknown>,
+  ) {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+      }),
+    });
+    const res = await handleScopedMcp(req, vaultName, auth);
+    const body = await res.json() as any;
+    if (body.result?.content?.[0]?.text) {
+      try {
+        return { isError: !!body.result.isError, parsed: JSON.parse(body.result.content[0].text), raw: body };
+      } catch {
+        return { isError: !!body.result.isError, parsed: null, raw: body, text: body.result.content[0].text };
+      }
+    }
+    return { isError: false, parsed: null, raw: body };
+  }
+
+  async function setupAdminSession(prefix: string) {
+    const { writeVaultConfig } = await import("./config.ts");
+    const vaultName = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+    });
+    // Stable caller_jti so list/revoke can find the mints; we don't go
+    // through the actual auth flow here (that would require a real pvt_
+    // token; the unit-level test point is the manage-token logic itself).
+    const auth: any = {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+      scoped_tags: null,
+      vault_name: vaultName,
+      caller_jti: `t_session${Math.random().toString(36).slice(2, 12)}`,
+    };
+    return { vaultName, auth };
+  }
+
+  test("mint with default TTL returns valid token + jti + expires_at ~15min out", async () => {
+    const { vaultName, auth } = await setupAdminSession("mint-default");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const before = Date.now();
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+    });
+    expect(parsed.action).toBe("mint");
+    expect(parsed.token).toMatch(/^pvt_/);
+    expect(parsed.jti).toMatch(/^t_/);
+    const expiresAt = Date.parse(parsed.expires_at);
+    expect(expiresAt - before).toBeGreaterThan(890 * 1000);
+    expect(expiresAt - before).toBeLessThan(910 * 1000);
+    closeAllStores();
+  });
+
+  test("mint with custom TTL=3600 returns expires_at ~1 hour out", async () => {
+    const { vaultName, auth } = await setupAdminSession("mint-max");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const before = Date.now();
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 3600,
+    });
+    expect(parsed.action).toBe("mint");
+    const expiresAt = Date.parse(parsed.expires_at);
+    expect(expiresAt - before).toBeGreaterThan(3590 * 1000);
+    expect(expiresAt - before).toBeLessThan(3610 * 1000);
+    closeAllStores();
+  });
+
+  test("mint with TTL=0 is rejected", async () => {
+    const { vaultName, auth } = await setupAdminSession("mint-zero");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 0,
+    });
+    expect(parsed.error).toBe("invalid_request");
+    closeAllStores();
+  });
+
+  test("mint with TTL=3601 is rejected (over the 3600 cap)", async () => {
+    const { vaultName, auth } = await setupAdminSession("mint-over");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+      ttl_seconds: 3601,
+    });
+    expect(parsed.error).toBe("invalid_request");
+    closeAllStores();
+  });
+
+  test("mint with scope outside caller's subset is rejected", async () => {
+    const { vaultName, auth } = await setupAdminSession("mint-subset");
+    const { closeAllStores } = await import("./vault-store.ts");
+    // Caller's auth carries admin/write/read for THIS vault. Asking for a
+    // scope naming a different vault is the canonical privilege-escalation
+    // surface — must reject.
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:other-vault:write",
+    });
+    expect(parsed.error).toBe("forbidden");
+    expect(parsed.rejected).toBeDefined();
+    closeAllStores();
+  });
+
+  test("revoke own minted token returns ok=true; second revoke is idempotent", async () => {
+    const { vaultName, auth } = await setupAdminSession("revoke-idem");
+    const { closeAllStores } = await import("./vault-store.ts");
+    const mint = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+    });
+    const jti = mint.parsed.jti;
+    const first = await callTool(vaultName, auth, "manage-token", {
+      action: "revoke",
+      jti,
+    });
+    expect(first.parsed.ok).toBe(true);
+    expect(first.parsed.already_revoked).toBe(false);
+    const second = await callTool(vaultName, auth, "manage-token", {
+      action: "revoke",
+      jti,
+    });
+    expect(second.parsed.ok).toBe(true);
+    expect(second.parsed.already_revoked).toBe(true);
+    closeAllStores();
+  });
+
+  test("list returns this session's mints, not other sessions' or CLI mints", async () => {
+    const { vaultName, auth } = await setupAdminSession("list-session");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const { createToken, generateToken } = await import("./token-store.ts");
+
+    // Mint two via manage-token in THIS session.
+    const m1 = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", description: "alpha" });
+    const m2 = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", description: "beta" });
+
+    // Mint one CLI-style (no created_via) and one from another session.
+    const store = getVaultStore(vaultName);
+    createToken(store.db, generateToken().fullToken, {
+      label: "cli-token",
+      permission: "full",
+      scopes: ["vault:read"],
+      vault_name: vaultName,
+    });
+    createToken(store.db, generateToken().fullToken, {
+      label: "other-session-mint",
+      permission: "full",
+      scopes: ["vault:read"],
+      vault_name: vaultName,
+      created_via: "mcp_mint",
+      parent_jti: "t_othersession",
+    });
+
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "list" });
+    expect(parsed.action).toBe("list");
+    const jtis = parsed.tokens.map((t: any) => t.jti);
+    expect(jtis).toContain(m1.parsed.jti);
+    expect(jtis).toContain(m2.parsed.jti);
+    expect(parsed.tokens.length).toBe(2);
+    closeAllStores();
+  });
+
+  test("audit-log integration: minted row carries created_via='mcp_mint' and parent_jti", async () => {
+    const { vaultName, auth } = await setupAdminSession("audit");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+
+    const { parsed } = await callTool(vaultName, auth, "manage-token", {
+      action: "mint",
+      scope: "vault:read",
+    });
+    const jti = parsed.jti;
+    const store = getVaultStore(vaultName);
+    const hashPrefix = jti.slice(2);
+    const row = store.db.prepare(`
+      SELECT created_via, parent_jti, vault_name FROM tokens
+      WHERE token_hash LIKE ?
+    `).get(`sha256:${hashPrefix}%`) as { created_via: string | null; parent_jti: string | null; vault_name: string | null };
+    expect(row.created_via).toBe("mcp_mint");
+    expect(row.parent_jti).toBe(auth.caller_jti);
+    expect(row.vault_name).toBe(vaultName);
     closeAllStores();
   });
 });

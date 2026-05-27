@@ -20,6 +20,18 @@ export interface McpToolDef {
   description: string;
   inputSchema: Record<string, unknown>;
   execute: (params: Record<string, unknown>) => unknown | Promise<unknown>;
+  /**
+   * Minimum scope verb the caller must hold for THIS vault to see + invoke
+   * the tool. `read` for pure queries, `write` for mutations, `admin` for
+   * token-management surfaces (only `manage-token` in the current set —
+   * core's nine tools cap at `write`). The MCP HTTP layer filters
+   * `tools/list` by this field and verb-gates `tools/call` against it; the
+   * filter is the primary defense, the inner gate is defense-in-depth.
+   *
+   * Pre-v19 unstamped tools default to `write` at the dispatch layer so a
+   * future addition that forgets to stamp this gets the safer treatment.
+   */
+  requiredVerb: "read" | "write" | "admin";
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +114,7 @@ export function generateMcpTools(store: Store): McpToolDef[] {
     // =====================================================================
     {
       name: "query-notes",
+      requiredVerb: "read",
       description: `Query notes. Returns notes matching the given filters.
 
 - **Single note**: pass \`id\` (accepts note ID or path, e.g., "Projects/README")
@@ -403,6 +416,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "create-note",
+      requiredVerb: "write",
       description: `Create one or more notes. Pass a single note's fields directly, or pass a \`notes\` array for batch creation. Each note accepts content, path, metadata, tags, links, and created_at.`,
       inputSchema: {
         type: "object",
@@ -518,6 +532,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "update-note",
+      requiredVerb: "write",
       description: `Update one or more notes. Accepts ID or path. Supports content, path, metadata updates plus tag and link mutations.
 
 - Three content-modification modes (mutually exclusive):
@@ -930,6 +945,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "delete-note",
+      // `admin` per vault#376's tier-mapping — destructive, recovery only
+      // via backup. A future-AI with vault:write should be able to amend
+      // notes freely but reaching delete should require an extra explicit
+      // grant. Pre-vault#376 this was effectively `write` (any "full"
+      // permission); the back-compat shim treats legacy permission-derived
+      // tokens as admin so existing pvt_* tokens see no behavior change.
+      requiredVerb: "admin",
       description: "Permanently delete a note and all its tags and links. Accepts ID or path.",
       inputSchema: {
         type: "object",
@@ -950,6 +972,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "list-tags",
+      requiredVerb: "read",
       description: `List tags with usage counts. Pass \`tag\` to get a single tag's full record (description, fields, relationships, parent_names, timestamps). Pass \`include_schema: true\` to include the full record for every tag.`,
       inputSchema: {
         type: "object",
@@ -1004,6 +1027,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "update-tag",
+      requiredVerb: "write",
       description: "Create or update a tag's identity row: description, indexed-field schemas, typed-link relationships, and hierarchy parents. If the tag doesn't exist, it's created. Fields are merged (new keys added, existing keys replaced); relationships and parent_names are replaced wholesale when provided. Pass null for fields/relationships/parent_names to clear that column. See parachute-patterns/patterns/tag-data-model.md.",
       inputSchema: {
         type: "object",
@@ -1159,6 +1183,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "delete-tag",
+      // `admin` per vault#376 — see delete-note rationale. Tag deletion
+      // also drops schemas + indexed-field declarations; it's a strictly
+      // structural change rather than a content edit.
+      requiredVerb: "admin",
       description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged.",
       inputSchema: {
         type: "object",
@@ -1191,6 +1219,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "find-path",
+      requiredVerb: "read",
       description: "Find the shortest path between two notes in the link graph. Accepts IDs or paths. Returns the chain of note IDs and relationships, or null if no path exists.",
       inputSchema: {
         type: "object",
@@ -1215,6 +1244,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "vault-info",
+      // `read` so vault:read callers can fetch stats. The
+      // description-update branch performs an inner write-check (see
+      // overrideVaultInfo in src/mcp-tools.ts) — do not promote this to
+      // `write` or read-only callers lose the stats projection.
+      requiredVerb: "read",
       description: "Get a comprehensive vault projection: name, description, tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, and query hints. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution. Pass `description` to update the vault description (changes how AI agents behave in future sessions). Call this anytime mid-session to refresh schema context.",
       inputSchema: {
         type: "object",

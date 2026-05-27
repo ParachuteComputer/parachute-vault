@@ -63,6 +63,26 @@ export interface Token {
   expires_at: string | null;
   created_at: string;
   last_used_at: string | null;
+  /**
+   * Provenance (v19). 'mcp_mint' = minted via manage-token MCP tool;
+   * NULL = pre-v19 / CLI / REST / YAML-import. Used by manage-token list
+   * to restrict the surface to MCP-session-managed tokens. See vault#376.
+   */
+  created_via: string | null;
+  /**
+   * Session pin (v19). When this token was minted via manage-token, this
+   * is the display id (`t_<prefix>`) of the calling session's token (for
+   * pvt_* MCP sessions) or the hub JWT's jti claim (for hub-issued
+   * sessions). NULL otherwise.
+   */
+  parent_jti: string | null;
+  /**
+   * Soft-revoke timestamp (v19). When set, `resolveToken` returns null
+   * and the row stays in place for audit history. manage-token revoke is
+   * idempotent — calling revoke a second time on the same jti is a no-op
+   * with ok=true. NULL = active.
+   */
+  revoked_at: string | null;
 }
 
 export interface ResolvedToken {
@@ -88,6 +108,12 @@ export interface ResolvedToken {
    * vault. See vault#257.
    */
   vault_name: string | null;
+  /**
+   * Display id (`t_<hashprefix>`) of THIS token. Surfaced so callers that
+   * later mint child tokens (manage-token MCP tool) can stamp parent_jti
+   * without re-derivation. Pre-v19 lookups still compute this on the fly.
+   */
+  jti: string;
 }
 
 /**
@@ -149,6 +175,17 @@ export function createToken(
      */
     vault_name?: string | null;
     expires_at?: string | null;
+    /**
+     * Provenance tag (v19). `'mcp_mint'` for tokens minted via the
+     * manage-token MCP tool; omit/null for CLI / REST / YAML paths.
+     */
+    created_via?: string | null;
+    /**
+     * Session pin (v19). Display id (`t_<prefix>`) or hub JWT `jti` of the
+     * caller that minted this token via manage-token. Used by the
+     * manage-token list/revoke surface to scope itself to one session.
+     */
+    parent_jti?: string | null;
   },
 ): Token {
   const tokenHash = hashKey(fullToken);
@@ -159,10 +196,12 @@ export function createToken(
   const scopedTags = opts.scoped_tags && opts.scoped_tags.length > 0 ? opts.scoped_tags : null;
   const scopedTagsStr = scopedTags ? JSON.stringify(scopedTags) : null;
   const vaultName = opts.vault_name ?? null;
+  const createdVia = opts.created_via ?? null;
+  const parentJti = opts.parent_jti ?? null;
 
   db.prepare(`
-    INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, scope_tag, scope_path_prefix, expires_at, created_at, vault_name)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, scope_tag, scope_path_prefix, expires_at, created_at, vault_name, created_via, parent_jti)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     tokenHash,
     opts.label,
@@ -174,6 +213,8 @@ export function createToken(
     opts.expires_at ?? null,
     now,
     vaultName,
+    createdVia,
+    parentJti,
   );
 
   return {
@@ -187,6 +228,9 @@ export function createToken(
     expires_at: opts.expires_at ?? null,
     created_at: now,
     last_used_at: null,
+    created_via: createdVia,
+    parent_jti: parentJti,
+    revoked_at: null,
   };
 }
 
@@ -200,8 +244,15 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   // preimage, which is computationally infeasible regardless of timing leaks.
   const candidateHash = hashKey(providedToken);
 
+  // Defensive SELECT for revoked_at: the column exists post-v19, but a
+  // freshly-opened ResolvedToken-only test fixture might run on a DB the
+  // migration hasn't touched. SQLite returns NULL for missing columns when
+  // the table is queried via prepared statements only after migration; here
+  // initSchema fires on every store-open path, so the column is guaranteed
+  // present in production. Tests instantiating bare DBs against this
+  // module are expected to call initSchema first.
   const row = db.prepare(`
-    SELECT token_hash, permission, scopes, scoped_tags, expires_at, vault_name
+    SELECT token_hash, permission, scopes, scoped_tags, expires_at, vault_name, revoked_at
     FROM tokens WHERE token_hash = ?
   `).get(candidateHash) as {
     token_hash: string;
@@ -210,9 +261,15 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
     scoped_tags: string | null;
     expires_at: string | null;
     vault_name: string | null;
+    revoked_at: string | null;
   } | null;
 
   if (!row) return null;
+
+  // Soft-revoked tokens never authenticate (v19). The row stays in place
+  // for audit; resolveToken just treats it as not-found from the caller's
+  // perspective.
+  if (row.revoked_at) return null;
 
   // Check expiry
   if (row.expires_at && new Date(row.expires_at) < new Date()) {
@@ -229,8 +286,9 @@ export function resolveToken(db: Database, providedToken: string): ResolvedToken
   const scopes = hasVaultScope ? parsed : legacyPermissionToScopes(permission);
   const legacyDerived = !hasVaultScope;
   const scoped_tags = parseScopedTags(row.scoped_tags);
+  const jti = `t_${row.token_hash.slice(7, 19)}`;
 
-  return { permission, scopes, legacyDerived, scoped_tags, vault_name: row.vault_name };
+  return { permission, scopes, legacyDerived, scoped_tags, vault_name: row.vault_name, jti };
 }
 
 /**
@@ -252,7 +310,8 @@ export function listTokens(
   const params = opts.vaultName ? [opts.vaultName] : [];
   const rows = db.prepare(`
     SELECT token_hash, label, permission, scope_tag, scope_path_prefix,
-           scoped_tags, vault_name, expires_at, created_at, last_used_at
+           scoped_tags, vault_name, expires_at, created_at, last_used_at,
+           created_via, parent_jti, revoked_at
     FROM tokens ${where}
     ORDER BY created_at DESC
   `).all(...params) as (Omit<Token, "scoped_tags"> & { scoped_tags: string | null })[];
@@ -264,6 +323,100 @@ export function listTokens(
     // Derive a short display ID from the hash (first 12 chars after "sha256:")
     id: `t_${r.token_hash.slice(7, 19)}`,
   }));
+}
+
+/**
+ * List tokens minted via the manage-token MCP tool by a given session
+ * (parent_jti). Used by `manage-token` action="list" to scope its surface
+ * to its own session's mints — operators with multiple MCP sessions open
+ * don't see each other's tokens, and CLI/REST-minted tokens never appear.
+ *
+ * Returns metadata only (no token-hash exposure beyond the display id);
+ * the display id is what the caller uses to revoke. Includes `revoked_at`
+ * so the UI can render a tombstone for soft-revoked rows.
+ */
+export function listMcpMintedTokens(
+  db: Database,
+  parentJti: string,
+  vaultName: string,
+): Array<{
+  jti: string;
+  label: string;
+  scopes: string[];
+  scoped_tags: string[] | null;
+  created_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+}> {
+  const rows = db.prepare(`
+    SELECT token_hash, label, scopes, scoped_tags, created_at, expires_at, revoked_at
+    FROM tokens
+    WHERE created_via = 'mcp_mint'
+      AND parent_jti = ?
+      AND vault_name = ?
+    ORDER BY created_at DESC
+  `).all(parentJti, vaultName) as {
+    token_hash: string;
+    label: string;
+    scopes: string | null;
+    scoped_tags: string | null;
+    created_at: string;
+    expires_at: string | null;
+    revoked_at: string | null;
+  }[];
+  return rows.map((r) => ({
+    jti: `t_${r.token_hash.slice(7, 19)}`,
+    label: r.label,
+    scopes: parseScopes(r.scopes),
+    scoped_tags: parseScopedTags(r.scoped_tags),
+    created_at: r.created_at,
+    expires_at: r.expires_at,
+    revoked_at: r.revoked_at,
+  }));
+}
+
+/**
+ * Soft-revoke a token minted via manage-token, scoped to the session that
+ * minted it. Idempotent: revoking an already-revoked or never-existent jti
+ * returns the same shape; second-call to revoke is intentionally still
+ * ok=true so the AI's revoke step doesn't surface a confusing failure on a
+ * retry after a network blip. The row stays in place for audit trail —
+ * resolveToken treats revoked_at-set rows as not-found.
+ *
+ * `parentJti` + `vaultName` scope the lookup: a token minted by a
+ * different MCP session (or against a different vault) returns ok=false.
+ * Returns { ok: true, already_revoked? } when the operation matched a row.
+ */
+export function softRevokeMcpToken(
+  db: Database,
+  jti: string,
+  parentJti: string,
+  vaultName: string,
+): { ok: true; already_revoked: boolean } | { ok: false; reason: "not_found" } {
+  if (!jti.startsWith("t_")) {
+    return { ok: false, reason: "not_found" };
+  }
+  const hashPrefix = jti.slice(2);
+  const row = db.prepare(`
+    SELECT token_hash, revoked_at FROM tokens
+    WHERE token_hash LIKE ?
+      AND created_via = 'mcp_mint'
+      AND parent_jti = ?
+      AND vault_name = ?
+    LIMIT 1
+  `).get(`sha256:${hashPrefix}%`, parentJti, vaultName) as {
+    token_hash: string;
+    revoked_at: string | null;
+  } | null;
+
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.revoked_at) {
+    // Second revoke: idempotent — already done, surface true with the flag.
+    return { ok: true, already_revoked: true };
+  }
+  db.prepare("UPDATE tokens SET revoked_at = ? WHERE token_hash = ?")
+    .run(new Date().toISOString(), row.token_hash);
+  return { ok: true, already_revoked: false };
 }
 
 /**

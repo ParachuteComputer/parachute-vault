@@ -14,14 +14,21 @@ import {
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { hasScopeForVault } from "./scopes.ts";
+import { hasScopeForVault, parseScopes, validateMintedScopes, hasScope, SCOPE_WRITE, SCOPE_ADMIN } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 import {
   expandTokenTagScope,
   noteWithinTagScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
-import { findTokensReferencingTag } from "./token-store.ts";
+import {
+  findTokensReferencingTag,
+  generateToken,
+  createToken,
+  listMcpMintedTokens,
+  softRevokeMcpToken,
+  type TokenPermission,
+} from "./token-store.ts";
 
 /**
  * Filter a vault projection to entries an in-scope tag contributes to.
@@ -109,6 +116,12 @@ export function generateScopedMcpTools(vaultName: string, auth?: AuthResult): Mc
   overrideVaultInfo(tools, vaultName, auth);
   applyTagDependencyGuards(tools, vaultName);
   applyTagScopeWrappers(tools, vaultName, auth);
+
+  // manage-token is server-only (needs token-store + auth context), so it
+  // lives here rather than in core. Always appended to the surface; the
+  // `requiredVerb: "admin"` filter in mcp-http.ts hides it from non-admin
+  // callers. See vault#376.
+  tools.push(buildManageTokenTool(vaultName, auth));
 
   return tools;
 }
@@ -403,4 +416,275 @@ function overrideVaultInfo(
 
     return result;
   };
+}
+
+// ---------------------------------------------------------------------------
+// manage-token (vault#376) — single MCP tool with mint/revoke/list actions
+// ---------------------------------------------------------------------------
+
+/**
+ * TTL bounds for `manage-token` action=mint, in seconds. Short by design:
+ * the design doc (vault#376) calls the tool out as the "AI mints a token
+ * for one-shot scripted work, then revokes immediately" surface. A long
+ * TTL would defeat the safety story — if revoke fails (network blip,
+ * model error), the cap is the backstop. Operators wanting long-lived
+ * tokens still use the REST /vault/<name>/tokens endpoint.
+ */
+const MANAGE_TOKEN_DEFAULT_TTL_SECONDS = 900; // 15 minutes
+const MANAGE_TOKEN_MAX_TTL_SECONDS = 3600; // 1 hour
+
+function permissionForScopes(scopes: string[]): TokenPermission {
+  return hasScope(scopes, SCOPE_WRITE) || hasScope(scopes, SCOPE_ADMIN) ? "full" : "read";
+}
+
+/**
+ * Build the manage-token MCP tool, wired to the calling session's auth.
+ *
+ * Closure-captured context:
+ *   - `vaultName`: every mint pins `vault_name` to this; cross-vault mints
+ *     are rejected by `validateMintedScopes` (it refuses any
+ *     `vault:<other>:<verb>` scope).
+ *   - `auth.scopes`: defense-in-depth subset check on mint. The outer
+ *     filter already required vault:admin to see the tool, but a hand-
+ *     crafted JSON-RPC `tools/call` of `manage-token` from a non-admin
+ *     session would bypass the visibility filter — `validateMintedScopes`
+ *     plus the `hasScopeForVault(auth.scopes, vaultName, "admin")` guard
+ *     below catch that case.
+ *   - `auth.caller_jti`: stamped as `parent_jti` on each mint; list+revoke
+ *     scope to this jti so each MCP session sees only its own mints.
+ *     When NULL (legacy / env-var operator / hub JWT without jti), mints
+ *     still succeed but list/revoke return empty — the operator hits the
+ *     CLI / REST surface instead for revocation in that path.
+ *
+ * The execute function is async (token mint touches the store + DB) and
+ * returns a discriminated-union response shape: `{action, …}` with `action`
+ * matching the requested action. The MCP HTTP layer serializes the result
+ * via `JSON.stringify`, so caller-side parsing keys off the action field.
+ */
+function buildManageTokenTool(vaultName: string, auth: AuthResult | undefined): McpToolDef {
+  return {
+    name: "manage-token",
+    requiredVerb: "admin",
+    description:
+      "Mint, revoke, or list short-TTL vault tokens within this MCP session. " +
+      "Designed for one-shot AI-driven workflows: mint a narrow token, run a " +
+      "script with it, revoke immediately. Token lifetime defaults to 15 min " +
+      "(max 1 hour). Mints are pinned to this vault and to the caller's scope " +
+      "subset — you cannot escalate. List + revoke are scoped to tokens this " +
+      "session minted; CLI/REST-minted tokens are not surfaced here.\n\n" +
+      "Actions (discriminator: `action`):\n" +
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at }\n" +
+      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean }\n" +
+      "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["mint", "revoke", "list"],
+          description: "Which action to perform. Required.",
+        },
+        scope: {
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+          description:
+            "(action=mint) Scope to grant. String like \"vault:write\" or array. Must be a subset of the caller's scope; cross-vault scopes are rejected.",
+        },
+        ttl_seconds: {
+          type: "number",
+          description: `(action=mint) Token lifetime in seconds. Default ${MANAGE_TOKEN_DEFAULT_TTL_SECONDS} (15 min), max ${MANAGE_TOKEN_MAX_TTL_SECONDS} (1 hour). Values outside (0, ${MANAGE_TOKEN_MAX_TTL_SECONDS}] are rejected.`,
+        },
+        description: {
+          type: "string",
+          description: "(action=mint, optional) Free-text label surfaced in the token list + audit trail.",
+        },
+        jti: {
+          type: "string",
+          description: "(action=revoke) The jti (e.g. `t_abc123…`) returned by a prior mint. Revoke is idempotent — second revoke also returns ok=true.",
+        },
+      },
+      required: ["action"],
+    },
+    execute: async (params) => {
+      const action = params.action;
+
+      // Defense-in-depth: the outer filter (mcp-http.ts visibleTools)
+      // already requires vault:admin for this vault to see manage-token,
+      // so reaching execute means the gate passed. A hand-crafted
+      // tools/call bypassing list would still hit the dispatch verb-check
+      // in handleScopedMcp. The block below is a third belt-and-suspenders
+      // check so a refactor of either layer can't lose the invariant
+      // silently.
+      if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
+        return {
+          action,
+          error: "Forbidden",
+          message: `manage-token requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted: ${auth?.scopes.join(" ") || "(none)"}.`,
+        };
+      }
+
+      if (action === "mint") return await mintAction(params, vaultName, auth);
+      if (action === "revoke") return revokeAction(params, vaultName, auth);
+      if (action === "list") return listAction(vaultName, auth);
+
+      return {
+        error: "invalid_request",
+        message: `manage-token: unknown action "${String(action)}" — expected "mint" | "revoke" | "list".`,
+      };
+    },
+  };
+}
+
+async function mintAction(
+  params: Record<string, unknown>,
+  vaultName: string,
+  auth: AuthResult,
+): Promise<Record<string, unknown>> {
+  // Scope parsing: accept string or string[]. Empty/missing is rejected
+  // explicitly (no implicit "full scope" default — manage-token always
+  // narrows). The validateMintedScopes call then enforces:
+  //   - shape (recognized vault scope)
+  //   - vault-pin (cross-vault rejected)
+  //   - subset of caller's scope on this vault.
+  let requested: string[];
+  if (typeof params.scope === "string") {
+    requested = parseScopes(params.scope);
+  } else if (Array.isArray(params.scope)) {
+    requested = params.scope.filter((s): s is string => typeof s === "string" && s.length > 0);
+  } else {
+    return {
+      action: "mint",
+      error: "invalid_request",
+      message: "manage-token mint: `scope` is required (string or string[]).",
+    };
+  }
+  if (requested.length === 0) {
+    return {
+      action: "mint",
+      error: "invalid_request",
+      message: "manage-token mint: at least one scope required.",
+    };
+  }
+
+  const validation = validateMintedScopes(requested, vaultName, auth.scopes);
+  if (!validation.ok) {
+    return {
+      action: "mint",
+      error: "forbidden",
+      message: "manage-token mint: scope rejected (must be a subset of the caller's scope on this vault).",
+      rejected: validation.rejected,
+    };
+  }
+
+  // TTL bounds. Default 900 (15 min); explicit values must satisfy
+  // `0 < ttl <= MANAGE_TOKEN_MAX_TTL_SECONDS`. Zero, negative, NaN, and
+  // beyond-max all reject — the cap is the safety backstop if revoke fails,
+  // so it must be strict.
+  let ttl = MANAGE_TOKEN_DEFAULT_TTL_SECONDS;
+  if (params.ttl_seconds !== undefined && params.ttl_seconds !== null) {
+    if (typeof params.ttl_seconds !== "number" || !Number.isFinite(params.ttl_seconds)) {
+      return {
+        action: "mint",
+        error: "invalid_request",
+        message: "manage-token mint: ttl_seconds must be a finite number.",
+      };
+    }
+    if (params.ttl_seconds <= 0 || params.ttl_seconds > MANAGE_TOKEN_MAX_TTL_SECONDS) {
+      return {
+        action: "mint",
+        error: "invalid_request",
+        message: `manage-token mint: ttl_seconds must be in (0, ${MANAGE_TOKEN_MAX_TTL_SECONDS}]; got ${params.ttl_seconds}.`,
+      };
+    }
+    ttl = params.ttl_seconds;
+  }
+  const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+
+  const description = typeof params.description === "string" && params.description.length > 0
+    ? params.description
+    : null;
+  const label = description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
+
+  const store = getVaultStore(vaultName);
+  const { fullToken } = generateToken();
+  const created = createToken(store.db, fullToken, {
+    label,
+    permission: permissionForScopes(requested),
+    scopes: requested,
+    // Tag scoping: inherit the caller's allowlist verbatim. We don't expose
+    // a `tags` param on manage-token yet — the design doc keeps the v1
+    // surface minimal. When the caller is tag-scoped, the minted token
+    // carries the same allowlist (no narrowing, no widening); when the
+    // caller is unscoped, the mint is unscoped. Future widening of the
+    // surface should re-use tokens-routes.ts' validation path so the rules
+    // stay in lockstep.
+    scoped_tags: auth.scoped_tags,
+    vault_name: vaultName,
+    expires_at: expiresAt,
+    created_via: "mcp_mint",
+    parent_jti: auth.caller_jti,
+  });
+
+  return {
+    action: "mint",
+    token: fullToken,
+    jti: `t_${created.token_hash.slice(7, 19)}`,
+    expires_at: expiresAt,
+    scopes: requested,
+    scoped_tags: auth.scoped_tags,
+    vault_name: vaultName,
+  };
+}
+
+function revokeAction(
+  params: Record<string, unknown>,
+  vaultName: string,
+  auth: AuthResult,
+): Record<string, unknown> {
+  if (typeof params.jti !== "string" || params.jti.length === 0) {
+    return {
+      action: "revoke",
+      ok: false,
+      error: "invalid_request",
+      message: "manage-token revoke: `jti` is required (string).",
+    };
+  }
+  // Session-pin: revoke is restricted to tokens this MCP session minted.
+  // When auth.caller_jti is null (no stable session id — env-var operator,
+  // legacy YAML key, hub JWT without jti), there are no MCP-minted tokens
+  // attributable to this session, so revoke returns not_found.
+  if (!auth.caller_jti) {
+    return {
+      action: "revoke",
+      ok: false,
+      error: "not_found",
+      message: "manage-token revoke: this session has no stable id; revoke via the CLI or REST surface.",
+    };
+  }
+  const store = getVaultStore(vaultName);
+  const result = softRevokeMcpToken(store.db, params.jti, auth.caller_jti, vaultName);
+  if (!result.ok) {
+    // Idempotency: not-found returns ok=true so the AI's "mint → run →
+    // revoke" loop doesn't surface a confusing failure when a network
+    // blip causes a duplicate revoke call. The spec calls this out
+    // explicitly (vault#376). The "already minted by another session"
+    // case also lands here; we don't differentiate (no information leak
+    // about other sessions' jti space).
+    return { action: "revoke", ok: true, note: "no matching token in this session" };
+  }
+  return { action: "revoke", ok: true, already_revoked: result.already_revoked };
+}
+
+function listAction(vaultName: string, auth: AuthResult): Record<string, unknown> {
+  if (!auth.caller_jti) {
+    // No session id → no attributable mints. Return empty list rather
+    // than erroring, so callers can branch on tokens.length without
+    // exception handling.
+    return { action: "list", tokens: [] };
+  }
+  const store = getVaultStore(vaultName);
+  const tokens = listMcpMintedTokens(store.db, auth.caller_jti, vaultName);
+  return { action: "list", tokens };
 }
