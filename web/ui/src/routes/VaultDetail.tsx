@@ -35,6 +35,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
   const name = vaultName ?? params.name;
   const isPerVaultMount = vaultName !== undefined;
   const tokensHref = isPerVaultMount ? "/tokens" : `/vault/${encodeURIComponent(name ?? "")}/tokens`;
+  const mirrorHref = isPerVaultMount ? "/mirror" : `/vault/${encodeURIComponent(name ?? "")}/mirror`;
   const [state, setState] = useState<State>({ kind: "loading" });
 
   useEffect(() => {
@@ -188,6 +189,10 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
           <li>
             <Link to={tokensHref}>Tokens →</Link>
             <span className="dim"> mint, list, and revoke <code>pvt_*</code> tokens</span>
+          </li>
+          <li>
+            <Link to={mirrorHref}>Git backup →</Link>
+            <span className="dim"> mirror this vault to a git repository on a schedule, or on demand</span>
           </li>
           <PermissionsLink vaultName={vault.name} />
         </ul>

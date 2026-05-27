@@ -388,3 +388,59 @@ select:focus {
 .tag-checkbox input[type="checkbox"] {
   margin: 0;
 }
+
+/*
+ * Mirror screen: preset cards (three clickable shapes per the
+ * vault-as-git-projection design doc) + radio rows for location.
+ * Tone-matched to the .stat cards above so the visual rhythm of the
+ * admin SPA stays calm — operators bounce between these screens in
+ * one session.
+ */
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.35rem;
+}
+.preset-card {
+  background: var(--bg-soft);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.preset-card:hover {
+  border-color: var(--accent);
+  background: white;
+}
+.preset-card:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.preset-card strong {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.preset-card .dim {
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.radio-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.92rem;
+  cursor: pointer;
+}
+.radio-row input[type="radio"] {
+  margin: 0;
+}
+

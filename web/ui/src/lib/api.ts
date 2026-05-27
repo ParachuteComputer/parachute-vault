@@ -90,6 +90,118 @@ export async function getVaultDetail(name: string): Promise<VaultDetailResult> {
   return (await res.json()) as VaultDetailResult;
 }
 
+// ---------------------------------------------------------------------------
+// Mirror — `/vault/<name>/.parachute/mirror[/run-now]`
+//
+// The backend's persisted config + runtime status shape, mirrored as
+// TypeScript so the SPA reads/writes the same JSON the server emits.
+// Field semantics live in `src/mirror-config.ts:MirrorConfig` and
+// `src/mirror-manager.ts:MirrorStatus`; the comments here just sketch
+// what each field controls so a reader of the SPA doesn't have to
+// jump out to the backend module.
+// ---------------------------------------------------------------------------
+
+export type MirrorLocation = "internal" | "external";
+
+export interface MirrorConfig {
+  enabled: boolean;
+  /** "internal" → hidden under vault data dir; "external" → operator-picked path. */
+  location: MirrorLocation;
+  /** Required when location=external + enabled. Must exist + be a git repo. */
+  external_path: string | null;
+  /** When true, the manager runs the watch loop in-process. */
+  watch: boolean;
+  /** Per-pass `git add -A && git commit` if true. */
+  auto_commit: boolean;
+  /** Per-commit `git push` if true. Failures non-fatal. */
+  auto_push: boolean;
+  /** Verbatim template; reuses the CLI's variable set (`{{date}}` etc.). */
+  commit_template: string;
+  /** Watch-loop poll interval in seconds. */
+  interval_seconds: number;
+}
+
+export interface MirrorStatus {
+  enabled: boolean;
+  watch_running: boolean;
+  mirror_path: string | null;
+  last_export_at: string | null;
+  last_export_notes_count: number | null;
+  last_commit_sha: string | null;
+  last_error: string | null;
+}
+
+export interface MirrorSnapshot {
+  config: MirrorConfig;
+  status: MirrorStatus;
+}
+
+function mirrorAuthHeaders(): Record<string, string> {
+  const token = getToken();
+  if (!token) {
+    throw new HttpError(401, "no admin token — open this page from the hub directory");
+  }
+  return {
+    accept: "application/json",
+    authorization: `Bearer ${token}`,
+  };
+}
+
+/** GET the persisted mirror config + the current runtime status snapshot. */
+export async function getMirror(vaultName: string): Promise<MirrorSnapshot> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror`,
+    { headers: mirrorAuthHeaders() },
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as MirrorSnapshot;
+}
+
+/**
+ * PUT a new config. The server validates shape (400 on type errors with a
+ * `field`-localized message), filesystem-validates external paths when
+ * enabling, then persists + restarts the lifecycle. Returns the updated
+ * snapshot.
+ */
+export async function putMirror(
+  vaultName: string,
+  config: Partial<MirrorConfig>,
+): Promise<MirrorSnapshot> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror`,
+    {
+      method: "PUT",
+      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(config),
+    },
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as MirrorSnapshot;
+}
+
+/**
+ * POST a manual "run export now" trigger. Returns the updated snapshot.
+ * Server returns 400 if the mirror isn't enabled — the SPA surfaces that
+ * as the configured-but-disabled hint rather than a generic error.
+ */
+export async function runMirrorNow(vaultName: string): Promise<MirrorSnapshot> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/run-now`,
+    {
+      method: "POST",
+      headers: mirrorAuthHeaders(),
+    },
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as MirrorSnapshot;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
