@@ -17,7 +17,7 @@
  * never touch ~/.parachute.
  */
 
-import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, beforeEach, afterEach, afterAll } from "bun:test";
 import { rmSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -605,6 +605,24 @@ describe("MCP 401 WWW-Authenticate challenge (RFC 9728)", () => {
 // ---------------------------------------------------------------------------
 
 const HUB_ORIGIN = "http://127.0.0.1:1939";
+
+// Process-env isolation: sibling test files (tokens-routes.test.ts,
+// auth-hub-jwt.test.ts) set PARACHUTE_HUB_ORIGIN in their own beforeAll
+// hooks. Bun's test runner shares a single process across test files,
+// and when file-ordering puts those before this one, their hook-set
+// value can still be live when our tests run. Restore the default
+// (unset) here so we test against `DEFAULT_HUB_LOOPBACK`. Caught when
+// vault rc.1 release CI failed with "Received: http://127.0.0.1:34295"
+// — a leaked ephemeral port from another test's fixture.
+let _prevHubOriginRouting: string | undefined;
+beforeAll(() => {
+  _prevHubOriginRouting = process.env.PARACHUTE_HUB_ORIGIN;
+  delete process.env.PARACHUTE_HUB_ORIGIN;
+});
+afterAll(() => {
+  if (_prevHubOriginRouting === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
+  else process.env.PARACHUTE_HUB_ORIGIN = _prevHubOriginRouting;
+});
 
 describe("per-vault OAuth discovery (hub-rooted after workstream E)", () => {
   test("AS metadata names the hub as issuer + endpoints", async () => {
