@@ -4185,7 +4185,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names.length).toBe(4);
   });
 
-  test("vault:read + vault:write sees the 7 read+write tools", async () => {
+  test("vault:read + vault:write sees the 9 read+write tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(new Set(names)).toEqual(
       new Set([
@@ -4195,14 +4195,17 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
         "vault-info",
         "create-note",
         "update-note",
+        "delete-note",
         "update-tag",
+        "delete-tag",
       ]),
     );
-    expect(names.length).toBe(7);
+    expect(names.length).toBe(9);
     expect(names).not.toContain("manage-token");
-    // delete-* are admin-tier per vault#376 — hidden from write callers.
-    expect(names).not.toContain("delete-note");
-    expect(names).not.toContain("delete-tag");
+    // Aaron 2026-05-27: delete-* are write-tier (same destructive verb as
+    // update). Only manage-token is admin-gated.
+    expect(names).toContain("delete-note");
+    expect(names).toContain("delete-tag");
   });
 
   test("vault:admin sees all 10 tools including manage-token", async () => {

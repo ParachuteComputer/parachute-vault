@@ -945,13 +945,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "delete-note",
-      // `admin` per vault#376's tier-mapping — destructive, recovery only
-      // via backup. A future-AI with vault:write should be able to amend
-      // notes freely but reaching delete should require an extra explicit
-      // grant. Pre-vault#376 this was effectively `write` (any "full"
-      // permission); the back-compat shim treats legacy permission-derived
-      // tokens as admin so existing pvt_* tokens see no behavior change.
-      requiredVerb: "admin",
+      // `write` — same destructive verb as update-note. Aaron's call
+      // 2026-05-27: "delete- in write; right now the only admin gated
+      // thing is tokens." Reserving `admin` for "operator-only
+      // capabilities" (token mgmt + future config writes). A future
+      // finer-grained model might split `vault:write:no-delete` for
+      // genuinely append-only callers — gating WITHIN write rather
+      // than promoting deletes out of it.
+      requiredVerb: "write",
       description: "Permanently delete a note and all its tags and links. Accepts ID or path.",
       inputSchema: {
         type: "object",
@@ -1183,10 +1184,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     // =====================================================================
     {
       name: "delete-tag",
-      // `admin` per vault#376 — see delete-note rationale. Tag deletion
-      // also drops schemas + indexed-field declarations; it's a strictly
-      // structural change rather than a content edit.
-      requiredVerb: "admin",
+      // `write` — Aaron's call 2026-05-27: admin reserved for token
+      // mgmt + future config writes; deletes are write-tier mutations.
+      // See delete-note rationale.
+      requiredVerb: "write",
       description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged.",
       inputSchema: {
         type: "object",
