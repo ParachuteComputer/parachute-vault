@@ -1,6 +1,7 @@
 import { Link, Route, Routes } from "react-router-dom";
 import { getMountedVaultName } from "./lib/mount.ts";
 import { VaultDetail } from "./routes/VaultDetail.tsx";
+import { VaultMirror } from "./routes/VaultMirror.tsx";
 import { VaultTokens } from "./routes/VaultTokens.tsx";
 import { VaultsList } from "./routes/VaultsList.tsx";
 
@@ -44,6 +45,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<VaultDetail vaultName={mountedVault} />} />
           <Route path="/tokens" element={<VaultTokens vaultName={mountedVault} />} />
+          <Route path="/mirror" element={<VaultMirror vaultName={mountedVault} />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       ) : (
@@ -51,6 +53,7 @@ export function App() {
           <Route path="/" element={<VaultsList />} />
           <Route path="/vault/:name" element={<VaultDetail />} />
           <Route path="/vault/:name/tokens" element={<VaultTokens />} />
+          <Route path="/vault/:name/mirror" element={<VaultMirror />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       )}
