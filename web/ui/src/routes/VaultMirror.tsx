@@ -587,29 +587,48 @@ function ConfigForm({
           />
           Commit after each export
         </label>
-      </div>
-
-      <div className="form-row">
-        <label>
-          <input
-            type="checkbox"
-            checked={config.auto_push}
-            disabled={readOnly}
-            onChange={(e) =>
-              setConfig((prev) => ({ ...prev, auto_push: e.target.checked }))
-            }
-            style={{ width: "auto", marginRight: "0.5rem" }}
-          />
-          Push after each commit
-        </label>
-        {config.auto_push ? (
-          <div className="warn-banner" style={{ marginTop: "0.5rem" }} role="alert">
-            Auto-push requires git credentials configured outside vault (e.g., SSH
-            key, <code>GH_TOKEN</code>). Failed pushes are logged but won't crash the
-            export.
-          </div>
+        {!config.auto_commit ? (
+          <p className="hint" style={{ marginTop: "0.25rem", fontSize: "0.85em" }}>
+            Note: the export cursor still advances after each pass. Subsequent
+            runs only re-export notes written since the last pass — even when
+            triggered manually.
+          </p>
         ) : null}
       </div>
+
+      {config.location === "external" ? (
+        <div className="form-row">
+          <label>
+            <input
+              type="checkbox"
+              checked={config.auto_push}
+              disabled={readOnly}
+              onChange={(e) =>
+                setConfig((prev) => ({ ...prev, auto_push: e.target.checked }))
+              }
+              style={{ width: "auto", marginRight: "0.5rem" }}
+            />
+            Push after each commit
+          </label>
+          {config.auto_push ? (
+            <div className="warn-banner" style={{ marginTop: "0.5rem" }} role="alert">
+              Auto-push requires git credentials configured outside vault (e.g., SSH
+              key, <code>GH_TOKEN</code>). Failed pushes are logged but won't crash the
+              export.
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {/*
+        Internal-location mirrors live under ~/.parachute/vault/data and have
+        no configured git remote — a push would always fail. Hide the checkbox
+        entirely rather than render a disabled one: the option is meaningless,
+        not just unavailable. If a stored config carries auto_push:true +
+        location:internal (e.g. operator switched from external→internal
+        without unticking), the value persists on the config blob until they
+        save a different one — the watch loop just skips pushes because there's
+        no remote. Reviewer-flagged on #380.
+      */}
 
       <div className="form-row">
         <button

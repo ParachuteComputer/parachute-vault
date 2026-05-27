@@ -196,6 +196,45 @@ describe("VaultMirror — admin scope", () => {
     expect(screen.getByText(/Path must exist AND be a git repo/i)).toBeInTheDocument();
   });
 
+  it("hides the Push-after-commit checkbox when location is internal", async () => {
+    // Auto-push is meaningless for internal mirrors (no configured remote).
+    // The form should hide the checkbox entirely rather than show a disabled
+    // one — anything else is confusing UX. Reviewer-flagged on #380.
+    vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+
+    // Default fixture is location=internal — the Push checkbox should be absent.
+    expect(screen.queryByLabelText(/Push after each commit/i)).not.toBeInTheDocument();
+
+    // Flip to external via the Live Mirror preset — the checkbox appears.
+    await user.click(screen.getByRole("button", { name: /Apply Live Mirror preset/i }));
+    expect(screen.getByLabelText(/Push after each commit/i)).toBeInTheDocument();
+  });
+
+  it("shows a cursor-advance hint when auto_commit is unchecked", async () => {
+    // Unchecking Commit-after-each-export doesn't disable the export cursor —
+    // it just suppresses the commit. An operator clicking Run-now expecting
+    // a full snapshot would be surprised; the hint surfaces that gotcha.
+    vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+
+    // No hint while auto_commit is the default (true).
+    expect(screen.queryByText(/export cursor still advances/i)).not.toBeInTheDocument();
+    // Uncheck — hint appears.
+    await user.click(screen.getByLabelText(/Commit after each export/i));
+    expect(screen.getByText(/export cursor still advances/i)).toBeInTheDocument();
+  });
+
   it("Save button calls PUT with the current config", async () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
     vi.mocked(api.putMirror).mockResolvedValue(
