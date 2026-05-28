@@ -41,16 +41,24 @@ mirror:
 now offers "Connect GitHub" (Device Flow — works on any vault host, no
 callback URL setup needed; same flow as `gh auth login`) and "Use
 Personal Access Token" (for GitLab/Gitea/Bitbucket/anything else
-HTTPS+token). Tokens are stored at
-`~/.parachute/vault/.mirror-credentials.yaml` with 0600 perms, never
-appear in API responses, and are embedded into the mirror's
-`.git/config` origin URL for push.
+HTTPS+token). Tokens are stored **per vault** at
+`~/.parachute/vault/data/<vaultName>/.mirror-credentials.yaml` with 0600
+perms, never appear in API responses, and are embedded into the mirror's
+`.git/config` origin URL for push. (Before vault#399 these lived in a
+single server-wide `~/.parachute/vault/.mirror-credentials.yaml`, which
+leaked the first vault's remote + PAT onto every other vault. On first
+boot after upgrade, the legacy server-wide file is migrated to its owning
+vault — the default/first vault the mirror was bound to — and preserved as
+`.mirror-credentials.yaml.bak`. Other vaults start with no mirror
+credentials; configure each separately.)
 
 **Auto-push semantics:**
 
-- `auto_push: true` + `location: internal` is rejected at the backend
-  (internal mirrors have no remote; the watch loop would log push
-  failures forever). Pick `external` if you want pushes.
+- `auto_push: true` + `location: internal` is accepted when git
+  credentials are wired (a PAT or GitHub OAuth saved via the SPA flows —
+  vault sets the mirror's `origin` from them), and rejected only when no
+  credentials are configured (an internal mirror has no remote to push to
+  otherwise). Connect GitHub / paste a PAT first, or pick `external`.
 - The "Push after each commit" checkbox is hidden in the SPA when
   location=internal. (Bare config edit can still set the flag — the
   watch loop logs a non-fatal warning on each push attempt and

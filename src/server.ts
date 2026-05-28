@@ -33,6 +33,7 @@ import { resolveBindHostname } from "./bind.ts";
 import { MirrorManager } from "./mirror-manager.ts";
 import { setMirrorManager } from "./mirror-registry.ts";
 import { buildMirrorDeps, resolveMirrorVaultName } from "./mirror-deps.ts";
+import { migrateLegacyServerWideCredentials } from "./mirror-credentials.ts";
 import { selfRegister } from "./self-register.ts";
 import pkg from "../package.json" with { type: "json" };
 
@@ -249,6 +250,22 @@ let mirrorManager: MirrorManager | null = null;
   // exactly one place; multi-vault-mirror work (design-doc open
   // question 2) only has to touch one site.
   const mirrorVaultName = resolveMirrorVaultName(listVaults);
+  // vault#399: migrate the legacy SERVER-WIDE credentials file
+  // (`<configDir>/vault/.mirror-credentials.yaml`) to the per-vault layout.
+  // Attribute to the mirror-owning vault (default_vault → first listed) —
+  // the same vault the single server-wide mirror was bound to, so the
+  // legacy remote/PAT lands on the vault it actually corresponds to. Other
+  // vaults start with no mirror credentials (configure each separately).
+  // Idempotent + safe: no-op when no legacy file / already migrated, and the
+  // legacy file is renamed `.bak` rather than deleted. Runs even when no
+  // vault exists yet (no-op) so we don't gate the migration on enabled state.
+  try {
+    migrateLegacyServerWideCredentials(mirrorVaultName);
+  } catch (err) {
+    console.warn(
+      `[mirror] legacy credential migration failed (non-fatal): ${(err as Error).message ?? err}`,
+    );
+  }
   if (mirrorVaultName) {
     try {
       mirrorManager = new MirrorManager(buildMirrorDeps(mirrorVaultName));

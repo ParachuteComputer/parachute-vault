@@ -23,16 +23,27 @@
  *     embeds them in the mirror's remote URL. Works against GitHub, GitLab,
  *     Codeberg, Gitea, anything that accepts an HTTPS token in the URL.
  *
- * **Storage:** `<configDir>/vault/.mirror-credentials.yaml`, perms `0o600`,
- * **not encrypted at rest**. Rationale: encryption-at-rest with the key on
- * the same disk doesn't add real security; OS perms ARE the protection. Same
- * trust model as `~/.git-credentials` (which most operators already use).
- * The file is documented as sensitive; redaction in logs is enforced by
- * `sanitizeCredentials` + a discipline of "never log the raw token."
+ * **Storage:** `<configDir>/vault/data/<vaultName>/.mirror-credentials.yaml`,
+ * perms `0o600`, **not encrypted at rest**. Rationale: encryption-at-rest
+ * with the key on the same disk doesn't add real security; OS perms ARE the
+ * protection. Same trust model as `~/.git-credentials` (which most operators
+ * already use). The file is documented as sensitive; redaction in logs is
+ * enforced by `sanitizeCredentials` + a discipline of "never log the raw
+ * token."
+ *
+ * **Per-vault (vault#399).** Credentials — both the PAT and the embedded
+ * `remote_url` — live under each vault's own data dir, alongside its SQLite
+ * DB + vault.yaml. This is the existing per-vault-state pattern. Before
+ * vault#399 they lived in a single SERVER-WIDE file
+ * (`<configDir>/vault/.mirror-credentials.yaml`); that leaked the first
+ * vault's remote + PAT onto every other vault that configured git sync —
+ * pointing vault B at vault A's GitHub repo. The legacy server-wide file is
+ * migrated to its owning vault on first per-vault read (see
+ * `migrateLegacyServerWideCredentials`).
  *
  * **One credential set per vault.** Multi-credential ("I want repo A pushed
- * with token X, repo B with token Y") isn't supported — vault#382 ships one
- * mirror per vault server today; one credential set per vault matches.
+ * with token X, repo B with token Y") within a single vault isn't supported —
+ * vault#382 ships one mirror per vault; one credential set per vault matches.
  */
 
 import {
@@ -98,8 +109,10 @@ export interface PATCredential {
 }
 
 /**
- * The on-disk + on-the-wire shape. One file per vault server (matches the
- * "one mirror per vault server today" invariant from mirror-config.ts).
+ * The on-disk + on-the-wire shape. One file per VAULT (vault#399) — keyed by
+ * the vault's data dir, not the server. Each vault has its own PAT + its own
+ * `remote_url`, so configuring git sync for vault B never reuses vault A's
+ * remote.
  */
 export interface MirrorCredentials {
   /**
@@ -137,23 +150,38 @@ export interface MirrorCredentialsPublic {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-/**
- * Path to the per-vault-server credentials file.
- *
- * Note: this is a SERVER-wide credentials file (`<configDir>/vault/.mirror-credentials.yaml`),
- * not a per-vault file. The mirror manager itself is server-wide (one mirror
- * per vault server today) so the credentials follow that scope. When multi-
- * vault mirroring lands (open question 2 in the design doc), this becomes
- * per-vault and gets keyed by name. Today's shape: one file.
- *
- * Path resolution mirrors `config.ts:vaultHomePath()` — re-reads
- * `PARACHUTE_HOME` on every call so test sandboxes (`PARACHUTE_VAULT_HOME`
- * is a vault-internal var that doesn't override here — we use the canonical
- * `PARACHUTE_HOME` that the rest of vault honors).
- */
-export function mirrorCredentialsPath(): string {
+/** The vault home root — `<configDir>/vault`. Re-reads PARACHUTE_HOME per call. */
+function vaultHomeRoot(): string {
   const root = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
-  return join(root, "vault", ".mirror-credentials.yaml");
+  return join(root, "vault");
+}
+
+/**
+ * Path to a vault's per-vault credentials file (vault#399).
+ *
+ * `<configDir>/vault/data/<vaultName>/.mirror-credentials.yaml` — under the
+ * vault's own data dir, alongside its SQLite DB (`vault.db`) + config
+ * (`vault.yaml`). This is the canonical per-vault-state location; every
+ * vault carries its own PAT + remote_url so git sync for one vault never
+ * reuses another vault's remote.
+ *
+ * Path resolution mirrors `config.ts:vaultDir()` rather than importing it —
+ * mirror-config.ts imports this module and config.ts imports mirror-config.ts,
+ * so importing config.ts here would close an import cycle. We re-derive the
+ * path from `PARACHUTE_HOME` (the canonical override the rest of vault honors)
+ * instead, which keeps this module dependency-light.
+ */
+export function mirrorCredentialsPath(vaultName: string): string {
+  return join(vaultHomeRoot(), "data", vaultName, ".mirror-credentials.yaml");
+}
+
+/**
+ * Path to the LEGACY server-wide credentials file
+ * (`<configDir>/vault/.mirror-credentials.yaml`) used before vault#399.
+ * Retained only so the migration can find + attribute + rename it.
+ */
+export function legacyServerWideCredentialsPath(): string {
+  return join(vaultHomeRoot(), ".mirror-credentials.yaml");
 }
 
 // ---------------------------------------------------------------------------
@@ -344,12 +372,18 @@ export function parseCredentials(yaml: string): MirrorCredentials {
 // ---------------------------------------------------------------------------
 
 /**
- * Read credentials from disk. Returns `null` when the file doesn't exist
- * (operator hasn't connected anything yet); throws when the file is present
- * but unreadable (a permission error is a loud configuration problem).
+ * Read a vault's credentials from disk. Returns `null` when the file doesn't
+ * exist (operator hasn't connected anything yet); throws when the file is
+ * present but unreadable (a permission error is a loud configuration problem).
+ *
+ * vault#399 migration: if the per-vault file is absent but the legacy
+ * server-wide file exists, `migrateLegacyServerWideCredentials` may have
+ * promoted it to THIS vault (when it's the migration target). The migration
+ * runs at boot (server.ts) and is idempotent; this read just picks up
+ * whatever landed on disk.
  */
-export function readCredentials(): MirrorCredentials | null {
-  const path = mirrorCredentialsPath();
+export function readCredentials(vaultName: string): MirrorCredentials | null {
+  const path = mirrorCredentialsPath(vaultName);
   if (!existsSync(path)) return null;
   const raw = readFileSync(path, "utf8");
   return parseCredentials(raw);
@@ -366,8 +400,8 @@ export function readCredentials(): MirrorCredentials | null {
  * surface a 500 with the underlying message — quietly losing credentials
  * would be worse than crashing the request.
  */
-export function writeCredentials(creds: MirrorCredentials): void {
-  const path = mirrorCredentialsPath();
+export function writeCredentials(vaultName: string, creds: MirrorCredentials): void {
+  const path = mirrorCredentialsPath(vaultName);
   const dir = dirname(path);
   // Vault home may not exist yet (tests, fresh installs); create it.
   if (!existsSync(dir)) {
@@ -401,9 +435,98 @@ export function writeCredentials(creds: MirrorCredentials): void {
  * Delete the credentials file. Idempotent — missing file is a no-op (the
  * Disconnect UX should succeed even if the file was already removed).
  */
-export function deleteCredentials(): void {
-  const path = mirrorCredentialsPath();
+export function deleteCredentials(vaultName: string): void {
+  const path = mirrorCredentialsPath(vaultName);
   if (existsSync(path)) unlinkSync(path);
+}
+
+// ---------------------------------------------------------------------------
+// Migration — legacy server-wide → per-vault (vault#399)
+// ---------------------------------------------------------------------------
+
+/**
+ * One-time migration of the legacy server-wide credentials file to the
+ * per-vault layout (vault#399).
+ *
+ * The bug: pre-vault#399, credentials (PAT + embedded `remote_url`) lived in a
+ * single `<configDir>/vault/.mirror-credentials.yaml` shared across ALL
+ * vaults. Configuring git sync for a second vault reused the first vault's
+ * remote, pointing it at the wrong GitHub repo.
+ *
+ * Attribution policy (SAFEST per the design): attribute the legacy creds to
+ * the FIRST vault — the earliest-created one, which is what
+ * `resolveMirrorVaultName()` already bound the single server-wide mirror to.
+ * That's the vault whose remote/PAT the legacy file actually corresponds to.
+ * We do NOT copy the same remote/PAT onto every vault — that would recreate
+ * the leak.
+ *
+ * Safety:
+ *   - No-op when no legacy file exists (fresh installs, already-migrated).
+ *   - No-op when the target vault already has a per-vault file (don't clobber
+ *     creds the operator set post-migration).
+ *   - Leaves the legacy file in place renamed `.bak` (never silently deleted)
+ *     so nothing is lost if attribution was wrong — the operator can recover.
+ *   - Logs the attribution decision clearly.
+ *
+ * @param targetVaultName the vault to attribute the legacy creds to (caller
+ *   passes the result of `resolveMirrorVaultName()`, i.e. default-or-first).
+ * @returns a struct describing what happened, for logging + tests.
+ */
+export function migrateLegacyServerWideCredentials(
+  targetVaultName: string | null,
+):
+  | { migrated: false; reason: "no_legacy_file" | "no_target_vault" | "target_already_has_creds" }
+  | { migrated: true; targetVaultName: string; backupPath: string } {
+  const legacyPath = legacyServerWideCredentialsPath();
+  if (!existsSync(legacyPath)) {
+    return { migrated: false, reason: "no_legacy_file" };
+  }
+  if (!targetVaultName) {
+    // Legacy file present but no vault to attribute it to. Leave it in
+    // place — a future boot (once a vault exists) migrates it.
+    return { migrated: false, reason: "no_target_vault" };
+  }
+  const targetPath = mirrorCredentialsPath(targetVaultName);
+  if (existsSync(targetPath)) {
+    // The target vault already has per-vault creds (operator configured
+    // them post-migration, or a prior migration ran). Don't clobber.
+    // Still rename the legacy file so we don't re-evaluate it forever.
+    const backupPath = `${legacyPath}.bak`;
+    try {
+      if (!existsSync(backupPath)) renameSync(legacyPath, backupPath);
+    } catch {
+      // Non-fatal — worst case we re-check next boot and short-circuit here.
+    }
+    return { migrated: false, reason: "target_already_has_creds" };
+  }
+
+  // Read the legacy creds + write them to the target vault's per-vault file.
+  const raw = readFileSync(legacyPath, "utf8");
+  const creds = parseCredentials(raw);
+  writeCredentials(targetVaultName, creds);
+
+  // Rename the legacy file to .bak rather than deleting — never silently
+  // lose an operator's only copy of a token/remote.
+  const backupPath = `${legacyPath}.bak`;
+  try {
+    renameSync(legacyPath, backupPath);
+  } catch {
+    // If the rename fails (e.g. .bak already exists from a partial prior
+    // run), fall back to unlinking the original — the creds are now safely
+    // in the per-vault file.
+    try {
+      unlinkSync(legacyPath);
+    } catch {
+      // Leave it; the target_already_has_creds branch short-circuits next boot.
+    }
+  }
+
+  console.log(
+    `[mirror] migrated legacy server-wide mirror credentials → vault "${targetVaultName}" (per-vault, vault#399). ` +
+      `Other vaults start with no mirror credentials (configure each separately). ` +
+      `Legacy file preserved at ${backupPath}.`,
+  );
+  return { migrated: true, targetVaultName, backupPath };
 }
 
 // ---------------------------------------------------------------------------

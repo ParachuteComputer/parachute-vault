@@ -112,13 +112,13 @@ afterEach(() => {
 
 describe("authedCloneUrl", () => {
   test("returns null for unparseable URL", () => {
-    expect(authedCloneUrl("not-a-url", { kind: "none" })).toBeNull();
+    expect(authedCloneUrl("not-a-url", { kind: "none" }, "v")).toBeNull();
   });
 
   test("passes git:// URLs verbatim (no userinfo to embed)", () => {
     // `git://github.com/owner/repo.git` parses as a URL with protocol
     // `git:`, not http/https — our helper returns it verbatim.
-    const r = authedCloneUrl("git://github.com/owner/repo.git", { kind: "pat", token: "ghp_x" });
+    const r = authedCloneUrl("git://github.com/owner/repo.git", { kind: "pat", token: "ghp_x" }, "v");
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toBe("git://github.com/owner/repo.git");
     expect(r!.appliedAuth).toBe("none");
@@ -134,7 +134,7 @@ describe("authedCloneUrl", () => {
     const r = authedCloneUrl("git@github.com:owner/repo.git", {
       kind: "pat",
       token: "ghp_should_not_appear",
-    });
+    }, "v");
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toBe("git@github.com:owner/repo.git");
     expect(r!.authedUrl).not.toContain("ghp_should_not_appear");
@@ -145,7 +145,7 @@ describe("authedCloneUrl", () => {
     const r = authedCloneUrl("ssh://git@github.com/owner/repo.git", {
       kind: "pat",
       token: "ghp_x",
-    });
+    }, "v");
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toBe("ssh://git@github.com/owner/repo.git");
     expect(r!.appliedAuth).toBe("none");
@@ -155,7 +155,7 @@ describe("authedCloneUrl", () => {
     const r = authedCloneUrl("https://user:pass@github.com/owner/repo.git", {
       kind: "pat",
       token: "ghp_x",
-    });
+    }, "v");
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toContain("user:pass@");
     expect(r!.appliedAuth).toBe("none");
@@ -165,14 +165,14 @@ describe("authedCloneUrl", () => {
     const r = authedCloneUrl("https://github.com/owner/repo.git", {
       kind: "pat",
       token: "ghp_abc123",
-    });
+    }, "v");
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toContain("x-access-token:ghp_abc123@");
     expect(r!.appliedAuth).toBe("per_call_pat");
   });
 
   test("none auth returns verbatim URL", () => {
-    const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "none" });
+    const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "none" }, "v");
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toBe("https://github.com/owner/repo.git");
     expect(r!.appliedAuth).toBe("none");
@@ -190,7 +190,7 @@ describe("authedCloneUrl", () => {
     });
 
     test("no credentials file → verbatim URL", () => {
-      const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "credentialsFile" });
+      const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "credentialsFile" }, "default");
       expect(r!.appliedAuth).toBe("none");
     });
 
@@ -206,8 +206,8 @@ describe("authedCloneUrl", () => {
           user_id: 1,
         },
       };
-      writeCredentials(creds);
-      const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "credentialsFile" });
+      writeCredentials("default", creds);
+      const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "credentialsFile" }, "default");
       expect(r!.authedUrl).toContain("x-access-token:gho_abc@");
       expect(r!.appliedAuth).toBe("stored_oauth");
     });
@@ -224,8 +224,8 @@ describe("authedCloneUrl", () => {
           user_id: 1,
         },
       };
-      writeCredentials(creds);
-      const r = authedCloneUrl("https://gitlab.com/owner/repo.git", { kind: "credentialsFile" });
+      writeCredentials("default", creds);
+      const r = authedCloneUrl("https://gitlab.com/owner/repo.git", { kind: "credentialsFile" }, "default");
       expect(r!.appliedAuth).toBe("none");
     });
 
@@ -239,8 +239,8 @@ describe("authedCloneUrl", () => {
           label: "GitLab PAT",
         },
       };
-      writeCredentials(creds);
-      const r = authedCloneUrl("https://gitlab.com/owner/repo.git", { kind: "credentialsFile" });
+      writeCredentials("default", creds);
+      const r = authedCloneUrl("https://gitlab.com/owner/repo.git", { kind: "credentialsFile" }, "default");
       expect(r!.authedUrl).toContain("x-access-token:glpat_xyz@");
       expect(r!.appliedAuth).toBe("stored_pat");
     });
@@ -255,8 +255,8 @@ describe("authedCloneUrl", () => {
           label: "GitLab PAT",
         },
       };
-      writeCredentials(creds);
-      const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "credentialsFile" });
+      writeCredentials("default", creds);
+      const r = authedCloneUrl("https://github.com/owner/repo.git", { kind: "credentialsFile" }, "default");
       expect(r!.appliedAuth).toBe("none");
     });
   });

@@ -209,6 +209,8 @@ export class CloneFailedError extends Error {
  *   - `credentialsFile` → if stored creds are GitHub OAuth, embed the
  *     token. If stored creds are a PAT with a saved URL whose host
  *     matches, reuse the stored URL. Otherwise pass the URL verbatim.
+ *     The stored creds are read from the target vault's PER-VAULT file
+ *     (vault#399) — `vaultName` is required for this auth kind.
  *   - `none` → return the URL verbatim.
  *
  * Returns `null` when the URL is unparseable (caller surfaces a 400).
@@ -216,6 +218,7 @@ export class CloneFailedError extends Error {
 export function authedCloneUrl(
   remoteUrl: string,
   auth: ImportAuth,
+  vaultName: string,
 ): { authedUrl: string; appliedAuth: "stored_oauth" | "stored_pat" | "per_call_pat" | "none" } | null {
   // Local-path / SSH-shorthand pass-through. Git accepts three URL shapes:
   //   - HTTPS/HTTP — what we embed auth into below.
@@ -267,8 +270,8 @@ export function authedCloneUrl(
     return { authedUrl: u.toString(), appliedAuth: "per_call_pat" };
   }
 
-  // credentialsFile path — read from disk.
-  const creds = readCredentials();
+  // credentialsFile path — read the target vault's per-vault creds (vault#399).
+  const creds = readCredentials(vaultName);
   if (!creds || !creds.active_method) {
     return { authedUrl: remoteUrl, appliedAuth: "none" };
   }
@@ -372,7 +375,7 @@ export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
   const workDirRoot = opts.workDirRoot ?? tmpdir();
   const cloneTimeoutMs = opts.cloneTimeoutMs ?? 60_000;
 
-  const authResult = authedCloneUrl(opts.remoteUrl, opts.auth);
+  const authResult = authedCloneUrl(opts.remoteUrl, opts.auth, opts.vaultName);
   if (!authResult) {
     inFlight.delete(opts.vaultName);
     throw new CloneFailedError(
