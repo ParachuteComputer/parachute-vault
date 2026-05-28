@@ -1,10 +1,11 @@
 /**
- * VaultTokens smoke tests — list render, scope-gated mutate UI, mint banner
- * single-emit, revoke confirm flow.
+ * VaultTokens smoke tests — hub-JWT list render, scope-gated mutate UI, mint
+ * banner single-emit, revoke confirm flow, and the legacy `pvt_*` section
+ * (shown only when the legacy list is non-empty).
  *
- * `lib/tokens-api.ts` is mocked so the wire isn't touched; `lib/scope.ts` is
- * mocked so we control admin-vs-read gating without crafting JWTs in every
- * test (decode is tested separately in scope.test.ts).
+ * `lib/tokens-api.ts` is mocked so the wire isn't touched; `lib/scope.ts` and
+ * `lib/host-admin-auth.ts` are mocked so we control admin gating + the
+ * forbidden-redirect side effect without crafting JWTs in every test.
  */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -17,17 +18,35 @@ import { VaultTokens } from "./VaultTokens.tsx";
 
 vi.mock("../lib/tokens-api.ts");
 vi.mock("../lib/scope.ts");
+vi.mock("../lib/host-admin-auth.ts", async (importOriginal) => {
+  // Keep the real HostAdminError class (the component does `instanceof`),
+  // stub the redirect side effect.
+  const actual = await importOriginal<typeof import("../lib/host-admin-auth.ts")>();
+  return { ...actual, redirectToAccountHome: vi.fn() };
+});
 
-const tokenFixture = (over: Partial<tokensApi.TokenSummary> = {}): tokensApi.TokenSummary => ({
-  id: "t_abc123",
+const hubFixture = (over: Partial<tokensApi.HubTokenSummary> = {}): tokensApi.HubTokenSummary => ({
+  jti: "j_abc123",
   label: "ci",
+  scopes: ["vault:work:write"],
+  scoped_tags: null,
+  expires_at: null,
+  revoked_at: null,
+  created_at: "2026-05-01T00:00:00Z",
+  ...over,
+});
+
+const legacyFixture = (
+  over: Partial<tokensApi.LegacyTokenSummary> = {},
+): tokensApi.LegacyTokenSummary => ({
+  id: "t_legacy1",
+  label: "old-pvt",
   permission: "full",
   scopes: ["vault:work:write"],
   scoped_tags: null,
   vault_name: "work",
   expires_at: null,
-  created_at: "2026-05-01T00:00:00Z",
-  last_used_at: null,
+  created_at: "2026-01-01T00:00:00Z",
   ...over,
 });
 
@@ -44,9 +63,14 @@ function renderRoute() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // Default the tag-picker fetch to "no tags" so existing tests don't need
-  // to mock it. Per-test cases override this when checking picker behavior.
   vi.mocked(tokensApi.listVaultTags).mockResolvedValue([]);
+  // Default both lists; per-test cases override.
+  vi.mocked(tokensApi.listHubTokens).mockResolvedValue([]);
+  vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([]);
+  // Re-expose the const re-exports the component imports from tokens-api
+  // (vi.mock auto-stubs the module — restore the value exports the form needs).
+  vi.mocked(tokensApi).TTL_DAY_OPTIONS = [30, 90, 180, 365];
+  vi.mocked(tokensApi).DEFAULT_TTL_DAYS = 90;
 });
 
 afterEach(() => {
@@ -58,24 +82,25 @@ describe("VaultTokens — admin scope", () => {
     vi.mocked(scope.hasAdminScope).mockReturnValue(true);
   });
 
-  it("renders the existing-tokens list", async () => {
-    vi.mocked(tokensApi.listTokens).mockResolvedValue([
-      tokenFixture({ label: "ci" }),
-      tokenFixture({ id: "t_def456", label: "paraclaw" }),
+  it("renders the existing hub-token list", async () => {
+    vi.mocked(tokensApi.listHubTokens).mockResolvedValue([
+      hubFixture({ label: "ci" }),
+      hubFixture({ jti: "j_def456", label: "paraclaw" }),
     ]);
 
     renderRoute();
 
     await waitFor(() => expect(screen.getByText("ci")).toBeInTheDocument());
     expect(screen.getByText("paraclaw")).toBeInTheDocument();
-    expect(screen.getByText("t_abc123")).toBeInTheDocument();
+    expect(screen.getByText("j_abc123")).toBeInTheDocument();
   });
 
-  it("shows the mint form and minted-token banner on success", async () => {
-    vi.mocked(tokensApi.listTokens).mockResolvedValue([]);
-    vi.mocked(tokensApi.mintToken).mockResolvedValue({
-      ...tokenFixture({ label: "new-token" }),
-      token: "pvt_super_secret",
+  it("shows the mint form (with TTL dropdown) and minted-token banner on success", async () => {
+    vi.mocked(tokensApi.mintHubToken).mockResolvedValue({
+      jti: "j_new",
+      token: "hub.jwt.value",
+      scope: "vault:work:admin",
+      expires_at: null,
     });
 
     renderRoute();
@@ -84,26 +109,31 @@ describe("VaultTokens — admin scope", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /mint token/i })).toBeInTheDocument(),
     );
-    await user.type(screen.getByLabelText(/label/i), "new-token");
+    // TTL dropdown is present.
+    expect(screen.getByLabelText(/expires after/i)).toBeInTheDocument();
+    await user.type(screen.getByLabelText(/^label/i), "new-token");
     await user.click(screen.getByRole("button", { name: /mint token/i }));
 
     await waitFor(() =>
       expect(screen.getByText(/new token \(shown once\)/i)).toBeInTheDocument(),
     );
-    expect(screen.getByText("pvt_super_secret")).toBeInTheDocument();
-    expect(screen.getByText(/don't dismiss this banner/i)).toBeInTheDocument();
-    expect(tokensApi.mintToken).toHaveBeenCalledWith("work", {
+    // Reveal field is `token` (banner works unchanged) — and it's NOT a pvt_*.
+    expect(screen.getByText("hub.jwt.value")).toBeInTheDocument();
+    expect(screen.queryByText(/pvt_/)).not.toBeInTheDocument();
+    expect(tokensApi.mintHubToken).toHaveBeenCalledWith("work", {
+      verb: "admin",
       label: "new-token",
-      scopes: ["vault:work:admin"],
-      tags: null,
+      scopedTags: [],
+      ttlDays: 90,
     });
   });
 
-  it("attaches a beforeunload guard while the pvt_* banner is showing and detaches on dismiss", async () => {
-    vi.mocked(tokensApi.listTokens).mockResolvedValue([]);
-    vi.mocked(tokensApi.mintToken).mockResolvedValue({
-      ...tokenFixture({ label: "ci" }),
-      token: "pvt_super_secret",
+  it("attaches a beforeunload guard while the reveal banner shows and detaches on dismiss", async () => {
+    vi.mocked(tokensApi.mintHubToken).mockResolvedValue({
+      jti: "j_new",
+      token: "hub.jwt.value",
+      scope: "vault:work:admin",
+      expires_at: null,
     });
 
     const addSpy = vi.spyOn(window, "addEventListener");
@@ -117,7 +147,7 @@ describe("VaultTokens — admin scope", () => {
     );
     expect(addSpy.mock.calls.some(([type]) => type === "beforeunload")).toBe(false);
 
-    await user.type(screen.getByLabelText(/label/i), "ci");
+    await user.type(screen.getByLabelText(/^label/i), "ci");
     await user.click(screen.getByRole("button", { name: /mint token/i }));
 
     await waitFor(() =>
@@ -127,9 +157,6 @@ describe("VaultTokens — admin scope", () => {
     expect(beforeunloadCall).toBeDefined();
     const handler = beforeunloadCall![1] as (e: BeforeUnloadEvent) => void;
 
-    // The handler must call preventDefault + set returnValue so Chrome /
-    // Firefox actually fire the "leave site?" confirm. Browsers gate the
-    // prompt on both signals; missing either makes the guard a no-op.
     const fakeEvent = {
       preventDefault: vi.fn(),
       returnValue: undefined as unknown as string,
@@ -141,31 +168,29 @@ describe("VaultTokens — admin scope", () => {
     await user.click(screen.getByRole("button", { name: /done — i've saved the token/i }));
 
     await waitFor(() =>
-      expect(removeSpy.mock.calls.some(([type, fn]) => type === "beforeunload" && fn === handler)).toBe(true),
+      expect(
+        removeSpy.mock.calls.some(([type, fn]) => type === "beforeunload" && fn === handler),
+      ).toBe(true),
     );
   });
 
-  it("rejects mint when label is empty (no API call, error shown)", async () => {
-    vi.mocked(tokensApi.listTokens).mockResolvedValue([]);
-
+  it("rejects mint when label is empty (button disabled, no API call)", async () => {
     renderRoute();
     const user = userEvent.setup();
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /mint token/i })).toBeInTheDocument(),
     );
-    // Submit button is disabled when label is empty — type then clear to
-    // exercise the form-onSubmit guard rather than the disabled state alone.
-    const labelInput = screen.getByLabelText(/label/i);
+    const labelInput = screen.getByLabelText(/^label/i);
     await user.type(labelInput, "x");
     await user.clear(labelInput);
     expect(screen.getByRole("button", { name: /mint token/i })).toBeDisabled();
-    expect(tokensApi.mintToken).not.toHaveBeenCalled();
+    expect(tokensApi.mintHubToken).not.toHaveBeenCalled();
   });
 
-  it("revoke shows a confirm step before deleting", async () => {
-    vi.mocked(tokensApi.listTokens).mockResolvedValue([tokenFixture()]);
-    vi.mocked(tokensApi.revokeToken).mockResolvedValue();
+  it("revoke keys on jti and shows a confirm step before deleting", async () => {
+    vi.mocked(tokensApi.listHubTokens).mockResolvedValue([hubFixture()]);
+    vi.mocked(tokensApi.revokeHubToken).mockResolvedValue();
 
     renderRoute();
     const user = userEvent.setup();
@@ -175,13 +200,83 @@ describe("VaultTokens — admin scope", () => {
     );
     await user.click(screen.getByRole("button", { name: /^revoke$/i }));
 
-    // Confirm step replaces the bare Revoke button with Confirm + Cancel.
     expect(screen.getByRole("button", { name: /confirm revoke/i })).toBeInTheDocument();
-    expect(tokensApi.revokeToken).not.toHaveBeenCalled();
+    expect(tokensApi.revokeHubToken).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: /confirm revoke/i }));
+    await waitFor(() => expect(tokensApi.revokeHubToken).toHaveBeenCalledWith("j_abc123"));
+  });
+
+  it("shows a 'revoked' pill and hides the revoke button for already-revoked rows", async () => {
+    vi.mocked(tokensApi.listHubTokens).mockResolvedValue([
+      hubFixture({ jti: "j_rev", label: "dead", revoked_at: "2026-05-10T00:00:00Z" }),
+    ]);
+
+    renderRoute();
+
+    await waitFor(() => expect(screen.getByText("dead")).toBeInTheDocument());
+    expect(screen.getByText("revoked")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^revoke$/i })).not.toBeInTheDocument();
+  });
+
+  it("renders scoped_tags pills from permissions.scoped_tags", async () => {
+    vi.mocked(tokensApi.listHubTokens).mockResolvedValue([
+      hubFixture({ jti: "j_tagged", label: "scoped", scoped_tags: ["health", "work"] }),
+    ]);
+
+    renderRoute();
+
+    await waitFor(() => expect(screen.getByText("scoped")).toBeInTheDocument());
+    expect(screen.getByText("#health")).toBeInTheDocument();
+    expect(screen.getByText("#work")).toBeInTheDocument();
+  });
+});
+
+describe("VaultTokens — legacy pvt_* section", () => {
+  beforeEach(() => {
+    vi.mocked(scope.hasAdminScope).mockReturnValue(true);
+  });
+
+  it("hidden when the legacy list is empty (fresh install)", async () => {
+    vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([]);
+
+    renderRoute();
+
     await waitFor(() =>
-      expect(tokensApi.revokeToken).toHaveBeenCalledWith("work", "t_abc123"),
+      expect(screen.getByRole("button", { name: /mint token/i })).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/legacy tokens/i)).not.toBeInTheDocument();
+  });
+
+  it("shown when the legacy list is non-empty, listed via the vault-admin path", async () => {
+    vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([legacyFixture()]);
+
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByText(/legacy tokens/i)).toBeInTheDocument());
+    // listLegacyTokens hit the per-vault surface for THIS vault.
+    expect(tokensApi.listLegacyTokens).toHaveBeenCalledWith("work");
+
+    // Collapsible — defaults closed; expand to reveal the row + revoke.
+    await user.click(screen.getByText(/legacy tokens/i));
+    expect(screen.getByText("old-pvt")).toBeInTheDocument();
+  });
+
+  it("revokes a legacy token via revokeLegacyToken (vault-admin path)", async () => {
+    vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([legacyFixture()]);
+    vi.mocked(tokensApi.revokeLegacyToken).mockResolvedValue();
+
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(screen.getByText(/legacy tokens/i)).toBeInTheDocument());
+    await user.click(screen.getByText(/legacy tokens/i));
+    await user.click(screen.getByRole("button", { name: /^revoke$/i }));
+    await user.click(screen.getByRole("button", { name: /confirm revoke/i }));
+
+    await waitFor(() =>
+      expect(tokensApi.revokeLegacyToken).toHaveBeenCalledWith("work", "t_legacy1"),
     );
   });
 });
@@ -191,8 +286,8 @@ describe("VaultTokens — read scope", () => {
     vi.mocked(scope.hasAdminScope).mockReturnValue(false);
   });
 
-  it("hides the mint form and the per-token revoke buttons", async () => {
-    vi.mocked(tokensApi.listTokens).mockResolvedValue([tokenFixture()]);
+  it("hides the mint form and per-token revoke buttons", async () => {
+    vi.mocked(tokensApi.listHubTokens).mockResolvedValue([hubFixture()]);
 
     renderRoute();
 
