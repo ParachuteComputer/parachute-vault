@@ -465,6 +465,31 @@ describe("VaultMirror — Git remote credentials", () => {
     ).toBeInTheDocument();
   });
 
+  // Reviewer-flagged on vault#388 — substring-matchy existence checks
+  // above don't pin the primary/secondary distinction. Per Aaron's
+  // 2026-05-28 direction, PAT is the primary action (works against any
+  // HTTPS+token git host); GitHub Device Flow is the GitHub-specific
+  // one-click shortcut and gets the .secondary class. A future
+  // refactor that flips them back would now fail this assertion.
+  it("renders PAT as primary action and GitHub as secondary shortcut", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+    );
+    const patBtn = screen.getByRole("button", { name: /Use Personal Access Token/i });
+    const ghBtn = screen.getByRole("button", { name: /Connect GitHub/i });
+    expect(patBtn.className).not.toContain("secondary");
+    expect(ghBtn.className).toContain("secondary");
+  });
+
   it("shows 'Connected to @login' + Disconnect when github_oauth is active", async () => {
     vi.mocked(api.getMirror).mockResolvedValue(
       snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
