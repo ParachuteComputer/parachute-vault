@@ -492,6 +492,66 @@ export function migrateLegacyServerWideConfig(
   return { migrated: true, targetVaultName };
 }
 
+/**
+ * Pure string transform: comment out the server-wide `mirror:` block in a
+ * config.yaml string (vault#400 migration). Prefixes each line of the block
+ * with `# ` so the operator can still see the migrated values + nothing is
+ * silently dropped, and a subsequent boot's `parseMirrorConfig` no longer
+ * sees a LIVE block (so no re-migration — `parseMirrorConfig`'s anchor regex
+ * `^mirror:\s*$` doesn't match `# mirror:`).
+ *
+ * Block boundaries match the parser's stop rule exactly: the block starts at
+ * a 0-indent `mirror:` line and runs until the next 0-indent non-blank line
+ * (the next top-level key). Other top-level keys (port, default_vault, …) are
+ * left byte-for-byte intact; blank lines are preserved verbatim (not
+ * commented). Idempotent: an already-commented config has no live `mirror:`
+ * line, so it passes through unchanged.
+ *
+ * Extracted from server.ts (vault#408 review N3) so the YAML rewriting — which
+ * runs against the operator's real config.yaml — is directly unit-tested.
+ */
+export function commentOutMirrorBlock(yaml: string): string {
+  const lines = yaml.split("\n");
+  const out: string[] = [];
+  let inBlock = false;
+  for (const line of lines) {
+    if (!inBlock && /^mirror:\s*$/.test(line)) {
+      inBlock = true;
+      out.push(`# [vault#400] migrated to per-vault data/<vault>/mirror-config.yaml`);
+      out.push(`# ${line}`);
+      continue;
+    }
+    if (inBlock) {
+      // The block runs until the next top-level (0-indent, non-blank) key.
+      if (/^\S/.test(line) && line.trim().length > 0) {
+        inBlock = false;
+        out.push(line);
+      } else if (line.trim().length === 0) {
+        // Preserve blank lines verbatim (don't comment them).
+        out.push(line);
+      } else {
+        out.push(`# ${line}`);
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/**
+ * File-I/O wrapper around `commentOutMirrorBlock`: read config.yaml at
+ * `configPath`, comment out its `mirror:` block, write it back. No-op when
+ * the file is absent. server.ts passes this (bound to GLOBAL_CONFIG_PATH) as
+ * the migration's `commentOutLegacyBlock` callback. Best-effort — callers
+ * treat a throw as non-fatal.
+ */
+export function commentOutLegacyMirrorBlockFile(configPath: string): void {
+  if (!existsSync(configPath)) return;
+  const yaml = readFileSync(configPath, "utf8");
+  writeFileSync(configPath, commentOutMirrorBlock(yaml));
+}
+
 // ---------------------------------------------------------------------------
 // Path resolution
 // ---------------------------------------------------------------------------

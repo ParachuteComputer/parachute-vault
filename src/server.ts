@@ -16,7 +16,7 @@
  */
 
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath } from "./config.ts";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
@@ -39,6 +39,7 @@ import {
 import { buildMirrorDeps, resolveMirrorVaultName } from "./mirror-deps.ts";
 import { migrateLegacyServerWideCredentials } from "./mirror-credentials.ts";
 import {
+  commentOutLegacyMirrorBlockFile,
   migrateLegacyServerWideConfig,
   readMirrorConfigForVault,
 } from "./mirror-config.ts";
@@ -287,7 +288,7 @@ const hostname = resolveBindHostname();
     migrateLegacyServerWideConfig(
       readGlobalConfig().mirror,
       mirrorVaultName,
-      commentOutLegacyMirrorBlock,
+      () => commentOutLegacyMirrorBlockFile(GLOBAL_CONFIG_PATH),
     );
   } catch (err) {
     console.warn(
@@ -332,45 +333,6 @@ const hostname = resolveBindHostname();
       console.warn(`[mirror] vault "${name}" manager construction failed: ${(err as Error).message ?? err}`);
     }
   }
-}
-
-/**
- * Comment out the legacy server-wide `mirror:` block in config.yaml after
- * its values have been migrated to a per-vault file (vault#400). Prefixes
- * each line of the block with `# ` so the operator can still see the old
- * values + nothing is silently dropped, and a subsequent boot's
- * `parseMirrorConfig` no longer sees a live block (so no re-migration).
- * Best-effort; callers treat a throw as non-fatal.
- */
-function commentOutLegacyMirrorBlock(): void {
-  if (!existsSync(GLOBAL_CONFIG_PATH)) return;
-  const yaml = readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
-  const lines = yaml.split("\n");
-  const out: string[] = [];
-  let inBlock = false;
-  for (const line of lines) {
-    if (!inBlock && /^mirror:\s*$/.test(line)) {
-      inBlock = true;
-      out.push(`# [vault#400] migrated to per-vault data/<vault>/mirror-config.yaml`);
-      out.push(`# ${line}`);
-      continue;
-    }
-    if (inBlock) {
-      // The block runs until the next top-level (0-indent, non-blank) key.
-      if (/^\S/.test(line) && line.trim().length > 0) {
-        inBlock = false;
-        out.push(line);
-      } else if (line.trim().length === 0) {
-        // Preserve blank lines verbatim (don't comment them).
-        out.push(line);
-      } else {
-        out.push(`# ${line}`);
-      }
-      continue;
-    }
-    out.push(line);
-  }
-  writeFileSync(GLOBAL_CONFIG_PATH, out.join("\n"));
 }
 
 const server = Bun.serve({

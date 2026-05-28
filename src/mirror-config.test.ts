@@ -15,6 +15,7 @@ import {
   DEFAULT_SAFETY_NET_SECONDS,
   MAX_SAFETY_NET_SECONDS,
   MIN_SAFETY_NET_SECONDS,
+  commentOutMirrorBlock,
   defaultMirrorConfig,
   parseMirrorConfig,
   resolveMirrorPath,
@@ -494,5 +495,97 @@ describe("validateExternalPath", () => {
     const r = await validateExternalPath(dir);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.resolved_path).toBe(dir);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// commentOutMirrorBlock — vault#400 migration YAML rewrite (extracted from
+// server.ts per vault#408 review N3). Runs against the operator's real
+// config.yaml, so it gets direct coverage here.
+// ---------------------------------------------------------------------------
+
+describe("commentOutMirrorBlock", () => {
+  test("comments out a real serializer-shaped mirror block; leaves other keys intact", () => {
+    // Build the block exactly as serializeMirrorConfig emits it — pins the
+    // real production shape rather than a hand-written approximation.
+    const block = serializeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "external",
+      external_path: "/home/aaron/mirrors/brain",
+      auto_push: true,
+    }).join("\n");
+    const yaml = `port: 1940
+default_vault: brain
+${block}
+auto_transcribe:
+  enabled: true
+`;
+    const out = commentOutMirrorBlock(yaml);
+
+    // No LIVE mirror block survives (the parser anchor won't match).
+    expect(parseMirrorConfig(out)).toBeUndefined();
+    // Every mirror line is commented.
+    expect(out).toContain("# mirror:");
+    expect(out).toContain("#   enabled: true");
+    expect(out).toContain("#   external_path: /home/aaron/mirrors/brain");
+    expect(out).toContain("#   auto_push: true");
+    // Provenance marker added.
+    expect(out).toContain("# [vault#400] migrated to per-vault");
+    // Non-mirror top-level keys untouched (byte-for-byte).
+    expect(out).toContain("port: 1940");
+    expect(out).toContain("default_vault: brain");
+    expect(out).toContain("auto_transcribe:");
+    expect(out).toContain("  enabled: true");
+    // The mirror block must NOT have swallowed the auto_transcribe block —
+    // its child line stays a live (uncommented) 2-space-indent field.
+    expect(out).not.toContain("#   enabled: true\n# auto_transcribe");
+    const at = out.indexOf("auto_transcribe:");
+    expect(out.slice(at)).toContain("\n  enabled: true");
+  });
+
+  test("idempotent — running on already-commented output is a no-op", () => {
+    const block = serializeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+    }).join("\n");
+    const yaml = `port: 1940\n${block}\ndiscovery: enabled\n`;
+    const once = commentOutMirrorBlock(yaml);
+    const twice = commentOutMirrorBlock(once);
+    expect(twice).toBe(once); // second pass changes nothing
+  });
+
+  test("no mirror block → returns input unchanged", () => {
+    const yaml = `port: 1940
+default_vault: brain
+discovery: enabled
+`;
+    expect(commentOutMirrorBlock(yaml)).toBe(yaml);
+  });
+
+  test("mirror block at EOF (no trailing key) is fully commented", () => {
+    const block = serializeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+      auto_commit: false,
+    }).join("\n");
+    const yaml = `port: 1940\n${block}\n`;
+    const out = commentOutMirrorBlock(yaml);
+    expect(parseMirrorConfig(out)).toBeUndefined();
+    expect(out).toContain("#   auto_commit: false");
+    expect(out).toContain("port: 1940"); // live, untouched
+  });
+
+  test("preserves a blank line between the mirror block and the next key", () => {
+    const block = serializeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+    }).join("\n");
+    // Blank line separates the block from `discovery:` — must stay blank
+    // (not commented) and `discovery:` must stay live.
+    const yaml = `port: 1940\n${block}\n\ndiscovery: enabled\n`;
+    const out = commentOutMirrorBlock(yaml);
+    expect(out).toContain("\n\ndiscovery: enabled"); // blank line preserved, key live
+    expect(parseMirrorConfig(out)).toBeUndefined();
   });
 });

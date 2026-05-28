@@ -91,11 +91,6 @@ export function getMirrorManager(vaultName: string): MirrorManager | null {
   return built;
 }
 
-/** True iff a manager is currently registered for `vaultName` (no lazy build). */
-export function hasMirrorManager(vaultName: string): boolean {
-  return managers.has(vaultName);
-}
-
 /** Snapshot of vault names with a live manager. Used by shutdown drain. */
 export function listMirrorManagers(): MirrorManager[] {
   return Array.from(managers.values());

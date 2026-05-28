@@ -49,12 +49,19 @@ import {
   type MirrorCredentials,
 } from "./mirror-credentials.ts";
 import { writeVaultConfig } from "./config.ts";
+import { clearVaultStoreCache } from "./vault-store.ts";
 
 const ORIG_HOME = process.env.HOME;
 const ORIG_PARACHUTE_HOME = process.env.PARACHUTE_HOME;
 
 afterEach(() => {
   clearMirrorManagers();
+  // `getVaultStore` caches SqliteStore handles in a process-wide Map keyed by
+  // vault name. Tests reuse vault names ("alpha"/"beta") across cases in fresh
+  // tempdirs, so without clearing the cache a later case picks up a handle
+  // pointing at a DELETED tempdir → SQLite "disk I/O error" on export. Clear
+  // it every test (matches auth.test.ts / routing.test.ts / export-watch.test.ts).
+  clearVaultStoreCache();
   if (ORIG_HOME === undefined) delete process.env.HOME;
   else process.env.HOME = ORIG_HOME;
   if (ORIG_PARACHUTE_HOME === undefined) delete process.env.PARACHUTE_HOME;
