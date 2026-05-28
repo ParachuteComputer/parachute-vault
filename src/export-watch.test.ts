@@ -27,6 +27,7 @@ import {
   DEFAULT_COMMIT_TEMPLATE,
   gitAddAll,
   gitCommit,
+  gitPush,
   gitUnstageAll,
   isGitRepo,
   listStagedFiles,
@@ -312,6 +313,79 @@ describe("git-shell helpers", () => {
     expect(await listStagedFiles(dir)).toEqual(["a.md"]);
     await gitUnstageAll(dir);
     expect(await listStagedFiles(dir)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. gitPush — first-push upstream tracking (Cut 4 of vault#392)
+//
+// A freshly-bootstrapped mirror has commits but no upstream branch.
+// Bare `git push` fails with "fatal: The current branch X has no upstream
+// branch." gitPush now detects the missing-upstream case and falls back
+// to `git push -u origin <branch>`. Subsequent pushes go bare.
+// ---------------------------------------------------------------------------
+
+describe("gitPush — upstream tracking", () => {
+  let workdir: string;
+  let remote: string;
+  beforeEach(() => {
+    workdir = makeTmp("vault-push-work-");
+    remote = makeTmp("vault-push-remote-");
+    // Bare repo as the "remote" — `git push` to it lands like any real remote.
+    Bun.spawnSync(["git", "init", "--bare", "-q", "-b", "main"], { cwd: remote });
+    initGitRepo(workdir);
+    Bun.spawnSync(["git", "remote", "add", "origin", remote], { cwd: workdir });
+    fs.writeFileSync(path.join(workdir, "seed.md"), "# seed\n");
+    Bun.spawnSync(["git", "add", "-A"], { cwd: workdir });
+    Bun.spawnSync(["git", "commit", "-q", "-m", "initial"], { cwd: workdir });
+  });
+  afterEach(() => {
+    fs.rmSync(workdir, { recursive: true, force: true });
+    fs.rmSync(remote, { recursive: true, force: true });
+  });
+
+  test("first push to a fresh remote establishes upstream tracking", async () => {
+    // Pre-Cut-4 this failed with "no upstream branch."
+    const result = await gitPush(workdir);
+    expect(result.ok).toBe(true);
+    // Verify upstream is now set so subsequent pushes can be bare.
+    const upstream = Bun.spawnSync(
+      ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+      { cwd: workdir, stdout: "pipe" },
+    );
+    expect(upstream.exitCode).toBe(0);
+    expect(
+      new TextDecoder().decode(upstream.stdout).trim(),
+    ).toBe("origin/main");
+  });
+
+  test("subsequent push (upstream already set) succeeds bare", async () => {
+    // First push wires the upstream.
+    await gitPush(workdir);
+    // Make another commit, push again — should succeed.
+    fs.writeFileSync(path.join(workdir, "n.md"), "# n\n");
+    Bun.spawnSync(["git", "add", "-A"], { cwd: workdir });
+    Bun.spawnSync(["git", "commit", "-q", "-m", "second"], { cwd: workdir });
+    const result = await gitPush(workdir);
+    expect(result.ok).toBe(true);
+  });
+
+  test("push with no remote configured surfaces the error (back-compat)", async () => {
+    // Same shape as the existing "no remote" test in runGitCommitCycle —
+    // the branch probe returns a branch but no upstream, gitPush falls
+    // back to `git push -u origin main`, which fails because there's no
+    // `origin` remote configured.
+    const localOnly = makeTmp("vault-push-noremote-");
+    initGitRepo(localOnly);
+    fs.writeFileSync(path.join(localOnly, "x.md"), "# x\n");
+    Bun.spawnSync(["git", "add", "-A"], { cwd: localOnly });
+    Bun.spawnSync(["git", "commit", "-q", "-m", "x"], { cwd: localOnly });
+    const result = await gitPush(localOnly);
+    expect(result.ok).toBe(false);
+    // Doesn't matter what the exact error is — just that it's non-fatal
+    // (gitPush returns rather than throws).
+    expect(typeof result.stderr).toBe("string");
+    fs.rmSync(localOnly, { recursive: true, force: true });
   });
 });
 

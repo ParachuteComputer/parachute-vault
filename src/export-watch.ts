@@ -121,11 +121,72 @@ export async function gitCommit(
   return { ok: exitCode === 0, stderr: stderr.trim() };
 }
 
-/** Run `git push` in `repoDir`. Returns true on success. */
+/**
+ * Run `git push` in `repoDir`. Returns true on success.
+ *
+ * Handles the first-push case: a freshly-bootstrapped mirror has
+ * commits but no upstream tracking, and a bare `git push` fails with
+ * "fatal: The current branch X has no upstream branch." That's
+ * unrecoverable from the operator's POV — they'd have to drop to a
+ * shell and run `git push -u origin main`. The wiring here detects the
+ * missing-upstream case ahead of time and falls back to `git push -u
+ * origin <branch>` so the first push works and every subsequent push
+ * picks up the now-configured tracking.
+ *
+ * Vault#382 carried bare `git push`; this is the Cut 4 fix in the
+ * credentials-save round-trip work.
+ */
 export async function gitPush(
   repoDir: string,
 ): Promise<{ ok: boolean; stderr: string }> {
-  const proc = Bun.spawn(["git", "push"], {
+  // Resolve the current branch name. `git rev-parse --abbrev-ref HEAD`
+  // returns the branch on a checked-out branch (e.g. "main"); on a
+  // detached HEAD it returns "HEAD" — in that case we bail to bare push
+  // since `-u origin HEAD` doesn't mean anything useful.
+  let branch: string | null = null;
+  try {
+    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: repoDir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const branchCode = await branchProc.exited;
+    if (branchCode === 0) {
+      const out = new TextDecoder()
+        .decode(await new Response(branchProc.stdout).arrayBuffer())
+        .trim();
+      if (out.length > 0 && out !== "HEAD") branch = out;
+    }
+  } catch {
+    // Fall through to bare push.
+  }
+
+  // Probe for an existing upstream. `git rev-parse --abbrev-ref
+  // --symbolic-full-name @{u}` exits non-zero when no upstream is
+  // configured for the current branch. Exit 0 + a value → upstream
+  // exists; bare `git push` is fine.
+  let hasUpstream = false;
+  if (branch !== null) {
+    const upstreamProc = Bun.spawn(
+      ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+      {
+        cwd: repoDir,
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const upstreamCode = await upstreamProc.exited;
+    hasUpstream = upstreamCode === 0;
+  }
+
+  // First-push path: `git push -u origin <branch>` to establish
+  // tracking. Subsequent calls take the bare path because hasUpstream
+  // will be true after this lands.
+  const cmd =
+    branch !== null && !hasUpstream
+      ? ["git", "push", "-u", "origin", branch]
+      : ["git", "push"];
+  const proc = Bun.spawn(cmd, {
     cwd: repoDir,
     stdout: "pipe",
     stderr: "pipe",
@@ -190,7 +251,14 @@ export function shouldCommit(stagedFiles: string[], notesChanged: number): {
 
 /**
  * Stage → decide → commit → optionally push. Logs status to stdout/stderr.
- * Returns whether a commit landed.
+ * Returns whether a commit landed and (when push was attempted) the
+ * push outcome — so callers can surface push status in their UIs
+ * without having to grep logs.
+ *
+ * Cut 5: the return shape now includes a `push` field with the outcome
+ * when push was attempted. Tokens are redacted from `push.error` via
+ * the userinfo + `gho_/ghp_/glpat-` regex so log + status surfaces are
+ * safe to display.
  */
 export async function runGitCommitCycle(opts: {
   repoDir: string;
@@ -201,7 +269,11 @@ export async function runGitCommitCycle(opts: {
   push: boolean;
   /** Override for tests — defaults to `new Date().toISOString()`. */
   now?: () => string;
-}): Promise<{ committed: boolean; message?: string }> {
+}): Promise<{
+  committed: boolean;
+  message?: string;
+  push?: { attempted: true; ok: boolean; error?: string };
+}> {
   const now = opts.now ?? (() => new Date().toISOString());
 
   const add = await gitAddAll(opts.repoDir);
@@ -245,11 +317,40 @@ export async function runGitCommitCycle(opts: {
     if (!pushResult.ok) {
       // Non-fatal — a network blip shouldn't kill a watch loop. Warn and
       // move on; the next successful commit's push will catch up history.
-      console.warn(`[git-commit] git push failed (non-fatal): ${pushResult.stderr}`);
-    } else {
-      console.log(`[git-commit] pushed`);
+      const redacted = redactToken(pushResult.stderr);
+      console.warn(`[git-commit] git push failed (non-fatal): ${redacted}`);
+      return {
+        committed: true,
+        message,
+        push: { attempted: true, ok: false, error: redacted },
+      };
     }
+    console.log(`[git-commit] pushed`);
+    return { committed: true, message, push: { attempted: true, ok: true } };
   }
 
   return { committed: true, message };
+}
+
+/**
+ * Redact tokens from a string that came back from `git push` /
+ * `git ls-remote` stderr. Same pattern as `redactRemoteUrl` for full
+ * URLs; also handles bare `gho_*`/`ghp_*`/`glpat-*` tokens that
+ * sometimes show up in git error messages.
+ *
+ * Best-effort — git's error format isn't a stable contract, so we
+ * scrub the obvious patterns and accept that a really unusual
+ * formatting could slip through. The credentials file is the
+ * authoritative store; logs are diagnostic.
+ */
+export function redactToken(text: string): string {
+  return text
+    // userinfo (https://user:token@host/…)
+    .replace(/https?:\/\/[^@\s]+@/g, "https://***@")
+    // bare GitHub OAuth tokens
+    .replace(/gho_[A-Za-z0-9_]{8,}/g, "gho_***")
+    // bare GitHub PATs
+    .replace(/ghp_[A-Za-z0-9_]{8,}/g, "ghp_***")
+    // bare GitLab PATs
+    .replace(/glpat-[A-Za-z0-9_-]{8,}/g, "glpat-***");
 }
