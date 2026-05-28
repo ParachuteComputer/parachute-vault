@@ -59,10 +59,13 @@ export function SignInBanner({ vaultName, status, onRecovered }: SignInBannerPro
 
     const poll = async () => {
       if (cancelled) return;
-      // Skip work when the tab is hidden — schedule another tick so the
-      // visibilitychange listener can immediately fire one on resume.
+      // Skip work when the tab is hidden. Don't reschedule — the
+      // visibilitychange listener below fires an immediate poll on
+      // resume, which then chain-schedules the next tick. Rescheduling
+      // here would burn a setTimeout queue entry every POLL_INTERVAL_MS
+      // for the entire time the tab is backgrounded with no payoff.
+      // Reviewer-flagged on vault#395.
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
-        timer = setTimeout(() => void poll(), POLL_INTERVAL_MS);
         return;
       }
       const result = await ensureToken(vaultName);
