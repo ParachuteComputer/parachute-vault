@@ -105,6 +105,13 @@ interface SignOpts {
    * a hub-minted admin token; provide `["<name>"]` for a non-admin user.
    */
   vaultScope?: string[];
+  /**
+   * `permissions` claim (auth-unification arc, C0). Undefined → omit
+   * entirely (today's hub-JWT shape → unscoped). Provide
+   * `{ scoped_tags: [...] }` for a tag-scoped token, or a deliberately
+   * malformed value to exercise the fail-closed path.
+   */
+  permissions?: unknown;
 }
 
 async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
@@ -115,6 +122,7 @@ async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
     client_id: "test-client",
   };
   if (opts.vaultScope !== undefined) payload.vault_scope = opts.vaultScope;
+  if (opts.permissions !== undefined) payload.permissions = opts.permissions;
   return await new SignJWT(payload)
     .setProtectedHeader({ alg: "RS256", kid: kp.kid })
     .setIssuer(opts.iss)
@@ -517,4 +525,143 @@ describe("authenticateVaultRequest — hub JWT integration", () => {
       warnSpy.mockRestore();
     }
   });
+});
+
+describe("authenticateVaultRequest — hub JWT tag-scoping (auth-unification C0)", () => {
+  // Helper: pull a successful AuthResult out of authenticateVaultRequest,
+  // failing the test loudly if auth returned an error Response.
+  async function authOk(
+    token: string,
+    vaultName: string,
+  ): Promise<import("./auth.ts").AuthResult> {
+    const config = readVaultConfig(vaultName)!;
+    const store = getVaultStore(vaultName);
+    const result = await authenticateVaultRequest(bearer(token), config, store.db);
+    if ("error" in result) {
+      const body = await result.error.json();
+      throw new Error(`expected AuthResult, got ${result.error.status}: ${JSON.stringify(body)}`);
+    }
+    return result;
+  }
+
+  test("permissions.scoped_tags:[health] → AuthResult.scoped_tags=[health]; query-notes enforces (health visible, work hidden)", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    // Seed two notes: one tagged health, one tagged work.
+    await store.createNote("blood pressure log", { path: "h1", tags: ["health"] });
+    await store.createNote("quarterly OKRs", { path: "w1", tags: ["work"] });
+
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:read",
+      permissions: { scoped_tags: ["health"] },
+    });
+
+    const auth = await authOk(token, "journal");
+    // The READ side: the allowlist is lifted off the validated token.
+    expect(auth.scoped_tags).toEqual(["health"]);
+
+    // End-to-end enforcement: the tag-scope-wrapped query-notes tool must
+    // hide the `work` note and surface the `health` note.
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const tools = generateScopedMcpTools("journal", auth);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({})) as any;
+    const notes = Array.isArray(result) ? result : result.notes;
+    const paths = notes.map((n: any) => n.path).sort();
+    expect(paths).toEqual(["h1"]);
+    expect(paths).not.toContain("w1");
+  });
+
+  test("no permissions claim → scoped_tags=null (unscoped, full vault — regression: unchanged)", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("a", { path: "h1", tags: ["health"] });
+    await store.createNote("b", { path: "w1", tags: ["work"] });
+
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:read",
+      // permissions intentionally omitted — today's hub-JWT shape
+    });
+
+    const auth = await authOk(token, "journal");
+    expect(auth.scoped_tags).toBeNull();
+
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const tools = generateScopedMcpTools("journal", auth);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({})) as any;
+    const notes = Array.isArray(result) ? result : result.notes;
+    const paths = notes.map((n: any) => n.path).sort();
+    // Unscoped: BOTH notes visible.
+    expect(paths).toEqual(["h1", "w1"]);
+  });
+
+  test("permissions present but scoped_tags absent → scoped_tags=null (unscoped)", async () => {
+    seedVault("journal");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:read",
+      permissions: { some_other_perm: true },
+    });
+    const auth = await authOk(token, "journal");
+    expect(auth.scoped_tags).toBeNull();
+  });
+
+  test("permissions.scoped_tags:null → scoped_tags=null (explicit unscoped)", async () => {
+    seedVault("journal");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:read",
+      permissions: { scoped_tags: null },
+    });
+    const auth = await authOk(token, "journal");
+    expect(auth.scoped_tags).toBeNull();
+  });
+
+  // ---- Fail-closed cases: present-but-malformed scoped_tags MUST 401, ----
+  // ---- never silently widen to full-vault. ----
+  for (const [label, badValue] of [
+    ["a string", "health"],
+    ["a number", 42],
+    ["an object", { health: true }],
+    ["an array with a non-string", ["health", 5]],
+    ["an array with an empty string", ["health", ""]],
+    ["an empty array", []],
+  ] as Array<[string, unknown]>) {
+    test(`malformed scoped_tags (${label}) → 401 fail-closed (does NOT widen to full vault)`, async () => {
+      seedVault("journal");
+      const token = await signJwt(kp, {
+        iss: fixture.origin,
+        aud: "vault.journal",
+        scope: "vault:journal:read",
+        permissions: { scoped_tags: badValue },
+      });
+      const config = readVaultConfig("journal")!;
+      const store = getVaultStore("journal");
+
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const result = await authenticateVaultRequest(bearer(token), config, store.db);
+        // The whole request is rejected — NOT served with scoped_tags=null
+        // (full vault) or scoped_tags=[] (also full vault on the MCP path).
+        expect("error" in result).toBe(true);
+        if ("error" in result) {
+          expect(result.error.status).toBe(401);
+          const body = (await result.error.json()) as { error: string; message: string };
+          expect(body.error).toBe("Unauthorized");
+          expect(body.message).toContain("malformed tag-scope");
+        }
+        // Audit log carries the diagnostic.
+        expect(warnSpy).toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  }
 });
