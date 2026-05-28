@@ -1535,6 +1535,14 @@ export interface ImportStats {
   skipped_sidecars: Array<{ sidecar_id: string; expected_path: string | null; expected_extension: string | null; reason: string }>;
   /** Set when the caller passed `blowAway: true`; counts notes removed. */
   notes_wiped: number;
+  /**
+   * (tag, field) indexed-field declarations replayed after restoring tag
+   * schemas — materializes the generated columns + indexes a live vault
+   * would have. Without this an imported vault's schemas say `indexed: true`
+   * but the backing columns don't exist until each tag is next `update-tag`'d
+   * (queries fall back to full scans). See the import re-declare fix.
+   */
+  indexes_declared: number;
 }
 
 /**
@@ -1582,6 +1590,7 @@ export async function importPortableVault(
     skipped_attachments: [],
     skipped_sidecars: [],
     notes_wiped: 0,
+    indexes_declared: 0,
   };
 
   // 1. Optional wipe. Notes are deleted via the public Store API so
@@ -2017,6 +2026,37 @@ export async function importPortableVault(
   // content rebuild link rows for the imported notes.
   if (!opts.dryRun) {
     await store.syncAllWikilinks();
+  }
+
+  // 7. Re-declare indexed fields. Step 2 restored tag schemas via
+  // `upsertTagRecord`, which persists `tags.fields` (the schema) but does
+  // NOT materialize the backing generated columns + indexes. Replay
+  // `declareField` for every `indexed: true` field so a fresh import ends
+  // with the same columns a live vault would have — otherwise the imported
+  // schemas advertise `indexed: true` while queries silently full-scan until
+  // each tag is next `update-tag`'d. Idempotent. See the import re-declare fix.
+  if (!opts.dryRun) {
+    stats.indexes_declared = await store.reconcileDeclaredIndexes();
+  } else {
+    // Dry-run: count what WOULD be declared without touching the DB.
+    const schemasDir2 = join(sidecar, "schemas");
+    if (existsSync(schemasDir2)) {
+      for (const entry of readdirSync(schemasDir2)) {
+        if (!entry.endsWith(".yaml")) continue;
+        const fullPath = join(schemasDir2, entry);
+        const resolved = resolvePath(fullPath);
+        if (!isWithinDir(resolved, resolvePath(schemasDir2))) continue;
+        const text = readFileSync(fullPath, "utf-8");
+        const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+        const { frontmatter } = parseFrontmatter(wrapped);
+        const fields = frontmatter.fields;
+        if (fields && typeof fields === "object" && !Array.isArray(fields)) {
+          for (const spec of Object.values(fields as Record<string, { indexed?: boolean }>)) {
+            if (spec?.indexed === true) stats.indexes_declared++;
+          }
+        }
+      }
+    }
   }
 
   return stats;

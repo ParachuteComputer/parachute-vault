@@ -24,6 +24,8 @@ import { join } from "path";
 import { tmpdir } from "os";
 
 import { SqliteStore } from "./store.js";
+import { getIndexedField } from "./indexed-fields.js";
+import { buildVaultProjection } from "./vault-projection.js";
 import {
   CaseCollisionError,
   emitYamlDoc,
@@ -723,6 +725,56 @@ describe("importPortableVault", async () => {
     const schema = await target.getTagSchema("task");
     expect(schema).toBeTruthy();
     expect(schema!.description).toBe("A unit of work");
+  });
+
+  // Fix 2 — import must re-declare indexed fields. The import writes
+  // tags.fields via upsertTagRecord but historically never materialized the
+  // backing generated columns + indexes, so a fresh import advertised
+  // `indexed: true` while queries silently full-scanned. Regression: export a
+  // vault with an indexed field → fresh import → the generated column + index
+  // exist and the field shows in the vault-info indexed_fields catalog.
+  it("re-declares indexed fields on import (column + index + vault-info catalog)", async () => {
+    await store.upsertTagRecord("project", {
+      fields: { status: { type: "string", indexed: true } },
+    });
+    await store.createNote("p", { id: "p", tags: ["project"], metadata: { status: "active" } });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const targetDb = target.db;
+    // Pre-condition: a fresh store has no backing column yet.
+    const colsBefore = (targetDb.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map((r) => r.name);
+    expect(colsBefore).not.toContain("meta_status");
+
+    const stats = await importPortableVault(target, { inDir: outDir });
+    expect(stats.schemas_restored).toBe(1);
+    expect(stats.indexes_declared).toBe(1);
+
+    // The generated column + index now exist — same introspection vault-info
+    // uses to advertise the queryable-field catalog.
+    const colsAfter = (targetDb.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map((r) => r.name);
+    expect(colsAfter).toContain("meta_status");
+    const idxs = (targetDb.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='notes'").all() as { name: string }[]).map((r) => r.name);
+    expect(idxs).toContain("idx_meta_status");
+    expect(getIndexedField(targetDb, "status")?.declarerTags).toEqual(["project"]);
+    // And vault-info lists it.
+    expect(buildVaultProjection(targetDb).indexed_fields.map((f) => f.name)).toContain("status");
+  });
+
+  it("dry-run import counts indexes_declared without materializing columns", async () => {
+    await store.upsertTagRecord("project", {
+      fields: { status: { type: "string", indexed: true } },
+    });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir: outDir, dryRun: true });
+    expect(stats.indexes_declared).toBe(1);
+    // Dry-run touches nothing.
+    const cols = (target.db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map((r) => r.name);
+    expect(cols).not.toContain("meta_status");
   });
 
   it("restores typed links (non-wikilink relationships)", async () => {
