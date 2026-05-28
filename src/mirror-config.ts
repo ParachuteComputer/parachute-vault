@@ -38,6 +38,32 @@ import { DEFAULT_COMMIT_TEMPLATE, isGitRepo } from "./export-watch.ts";
 export type MirrorLocation = "internal" | "external";
 
 /**
+ * How the mirror stays current with vault state.
+ *
+ *   - `events` → in-process hooks fire on every note/tag/attachment
+ *     mutation; the manager debounces them (~500ms) into a single export
+ *     pass. A background safety-net poll (default 1h) catches anything
+ *     missed (direct SQL writes, dropped hook dispatches, restart gaps).
+ *     This is the default for new configs and the post-vault#XXX shape.
+ *   - `manual` → no event subscriptions, no polling. The operator runs
+ *     "Run export now" (admin SPA button or POST `/.parachute/mirror/run-now`)
+ *     or `parachute-vault export` from the CLI on their own cadence.
+ *
+ * The pre-vault#XXX `interval_seconds`-driven watch loop has retired —
+ * existing configs migrate to `events` (when `watch: true`) or `manual`
+ * (when `watch: false`). The legacy field still parses, repurposed as
+ * `safety_net_seconds` when explicit.
+ */
+export type MirrorSyncMode = "events" | "manual";
+
+/** Default safety-net poll interval in seconds (1 hour). */
+export const DEFAULT_SAFETY_NET_SECONDS = 3600;
+/** Minimum safety-net poll interval. Anything tighter would defeat the point of "safety net" — that's what the event path is for. */
+export const MIN_SAFETY_NET_SECONDS = 60;
+/** Maximum safety-net poll interval (24 hours). */
+export const MAX_SAFETY_NET_SECONDS = 86400;
+
+/**
  * The persistent mirror configuration block. Lives under the `mirror:` key
  * in the global config.yaml (one mirror per vault server today — multi-vault
  * mirroring is a future ripple, see open question 2 in the design doc).
@@ -46,32 +72,44 @@ export type MirrorLocation = "internal" | "external";
  *   - `enabled` — master switch. When false (the default for upgrading
  *     vaults), no mirror behavior runs at all. The other fields are
  *     preserved so the operator can flip enabled back on without losing
- *     their location/path/watch settings.
+ *     their location/path/sync_mode settings.
  *   - `location` — "internal" or "external". Drives `resolveMirrorPath`.
  *   - `external_path` — required when location=external. Operator-picked
  *     absolute path. Must exist + be a git repo when first validated.
- *   - `watch` — when true, the manager runs the export-watch loop in the
- *     vault server process. When false, the mirror gets a one-shot export
- *     on boot/config-change only; subsequent updates need an explicit
- *     manual export.
+ *   - `sync_mode` — "events" (subscribe to in-process hooks; debounce ~500ms;
+ *     safety-net poll on top) or "manual" (no auto-fire; operator triggers
+ *     manually). Default "events".
  *   - `auto_commit` — after each export pass, `git add -A && git commit`.
  *     Reuses the existing `runGitCommitCycle` from vault#346.
  *   - `auto_push` — after commit, `git push`. Failures non-fatal.
  *   - `commit_template` — passed verbatim to `renderCommitMessage`. Same
  *     variable set as the CLI: `{{date}}`, `{{notes_changed}}`,
  *     `{{plural}}`, `{{first_note_title}}`, `{{vault_name}}`.
- *   - `interval_seconds` — watch-loop poll interval. Default 5, matching
- *     the CLI flag's default.
+ *   - `safety_net_seconds` — `sync_mode: events` runs an hourly background
+ *     sweep on top of the event-driven path. This field controls the
+ *     interval (default 3600). Clamped to `[MIN_SAFETY_NET_SECONDS,
+ *     MAX_SAFETY_NET_SECONDS]` at validation time.
+ *
+ * Legacy / migration:
+ *   - `watch` (boolean) — pre-vault#XXX field. `true` → `sync_mode: events`,
+ *     `false` → `sync_mode: manual`. Parsed for back-compat; the canonical
+ *     form on the wire is `sync_mode`.
+ *   - `interval_seconds` (positive integer) — pre-vault#XXX watch-loop
+ *     poll interval. Reinterpreted as `safety_net_seconds` when no
+ *     explicit `safety_net_seconds` is present AND the value lies in the
+ *     valid range. Out-of-range / missing → default 3600. The field is
+ *     no longer surfaced in the UI; the SPA stops emitting it but the
+ *     parser keeps accepting it for hand-edited configs.
  */
 export interface MirrorConfig {
   enabled: boolean;
   location: MirrorLocation;
   external_path: string | null;
-  watch: boolean;
+  sync_mode: MirrorSyncMode;
   auto_commit: boolean;
   auto_push: boolean;
   commit_template: string;
-  interval_seconds: number;
+  safety_net_seconds: number;
 }
 
 /**
@@ -85,11 +123,11 @@ export function defaultMirrorConfig(): MirrorConfig {
     enabled: false,
     location: "internal",
     external_path: null,
-    watch: false,
+    sync_mode: "events",
     auto_commit: true,
     auto_push: false,
     commit_template: DEFAULT_COMMIT_TEMPLATE,
-    interval_seconds: 5,
+    safety_net_seconds: DEFAULT_SAFETY_NET_SECONDS,
   };
 }
 
@@ -129,6 +167,13 @@ export function parseMirrorConfig(yaml: string): MirrorConfig | undefined {
   const lines = yaml.slice(startIdx).split("\n");
 
   const config = defaultMirrorConfig();
+  // Track legacy field state for migration: if `sync_mode` is absent and
+  // `watch` is set, derive sync_mode from watch. If `safety_net_seconds`
+  // is absent and `interval_seconds` is set (legacy field), repurpose it.
+  let sawSyncMode = false;
+  let sawSafetyNet = false;
+  let legacyWatch: boolean | null = null;
+  let legacyInterval: number | null = null;
 
   for (const line of lines) {
     // Stop at the next top-level key.
@@ -140,7 +185,7 @@ export function parseMirrorConfig(yaml: string): MirrorConfig | undefined {
     const boolField = (
       name: keyof Pick<
         MirrorConfig,
-        "enabled" | "watch" | "auto_commit" | "auto_push"
+        "enabled" | "auto_commit" | "auto_push"
       >,
     ): boolean => {
       const m = trimmed.match(new RegExp(`^${name}:\\s*(true|false)\\s*$`));
@@ -151,9 +196,21 @@ export function parseMirrorConfig(yaml: string): MirrorConfig | undefined {
       return false;
     };
     if (boolField("enabled")) continue;
-    if (boolField("watch")) continue;
     if (boolField("auto_commit")) continue;
     if (boolField("auto_push")) continue;
+
+    const watchMatch = trimmed.match(/^watch:\s*(true|false)\s*$/);
+    if (watchMatch) {
+      legacyWatch = watchMatch[1] === "true";
+      continue;
+    }
+
+    const syncModeMatch = trimmed.match(/^sync_mode:\s*(events|manual)\s*$/);
+    if (syncModeMatch) {
+      config.sync_mode = syncModeMatch[1] as MirrorSyncMode;
+      sawSyncMode = true;
+      continue;
+    }
 
     const locationMatch = trimmed.match(/^location:\s*(internal|external)\s*$/);
     if (locationMatch) {
@@ -181,15 +238,45 @@ export function parseMirrorConfig(yaml: string): MirrorConfig | undefined {
       continue;
     }
 
+    const safetyNetMatch = trimmed.match(/^safety_net_seconds:\s*(\d+)\s*$/);
+    if (safetyNetMatch) {
+      const n = parseInt(safetyNetMatch[1]!, 10);
+      if (Number.isFinite(n) && n > 0) {
+        config.safety_net_seconds = clampSafetyNet(n);
+        sawSafetyNet = true;
+      }
+      continue;
+    }
+
     const intervalMatch = trimmed.match(/^interval_seconds:\s*(\d+)\s*$/);
     if (intervalMatch) {
       const n = parseInt(intervalMatch[1]!, 10);
-      if (Number.isFinite(n) && n > 0) config.interval_seconds = n;
+      if (Number.isFinite(n) && n > 0) legacyInterval = n;
       continue;
     }
   }
 
+  // Migration: explicit `sync_mode` wins; otherwise derive from `watch`.
+  // A config that carries neither falls through to defaults (events).
+  if (!sawSyncMode && legacyWatch !== null) {
+    config.sync_mode = legacyWatch ? "events" : "manual";
+  }
+  // Migration: explicit `safety_net_seconds` wins; otherwise upgrade
+  // `interval_seconds` (legacy short-cadence values like 5 get clamped
+  // up to MIN_SAFETY_NET_SECONDS — the safety-net path doesn't want
+  // 5-second polls). Out-of-range values fall through to the default.
+  if (!sawSafetyNet && legacyInterval !== null) {
+    config.safety_net_seconds = clampSafetyNet(legacyInterval);
+  }
+
   return config;
+}
+
+/** Clamp safety_net_seconds to the valid range. */
+function clampSafetyNet(n: number): number {
+  if (n < MIN_SAFETY_NET_SECONDS) return MIN_SAFETY_NET_SECONDS;
+  if (n > MAX_SAFETY_NET_SECONDS) return MAX_SAFETY_NET_SECONDS;
+  return n;
 }
 
 /**
@@ -215,12 +302,12 @@ export function serializeMirrorConfig(config: MirrorConfig): string[] {
       `  external_path: ${needsQuote ? `"${config.external_path}"` : config.external_path}`,
     );
   }
-  lines.push(`  watch: ${config.watch}`);
+  lines.push(`  sync_mode: ${config.sync_mode}`);
   lines.push(`  auto_commit: ${config.auto_commit}`);
   lines.push(`  auto_push: ${config.auto_push}`);
   // Templates contain `{{ }}` and frequently `:` — always quote.
   lines.push(`  commit_template: "${config.commit_template.replace(/"/g, '\\"')}"`);
-  lines.push(`  interval_seconds: ${config.interval_seconds}`);
+  lines.push(`  safety_net_seconds: ${config.safety_net_seconds}`);
   return lines;
 }
 
@@ -334,11 +421,24 @@ export function validateMirrorConfigShape(
     }
   }
 
+  // Legacy back-compat: `watch: boolean` translates to sync_mode.
+  // `sync_mode` takes priority if both are present.
   if ("watch" in blob) {
     if (typeof blob.watch !== "boolean") {
-      return { ok: false, field: "watch", error: "`watch` must be boolean." };
+      return { ok: false, error: "`watch` must be boolean." };
     }
-    out.watch = blob.watch;
+    out.sync_mode = blob.watch ? "events" : "manual";
+  }
+
+  if ("sync_mode" in blob) {
+    if (blob.sync_mode !== "events" && blob.sync_mode !== "manual") {
+      return {
+        ok: false,
+        field: "sync_mode",
+        error: '`sync_mode` must be "events" or "manual".',
+      };
+    }
+    out.sync_mode = blob.sync_mode;
   }
 
   if ("auto_commit" in blob) {
@@ -382,7 +482,33 @@ export function validateMirrorConfigShape(
     out.commit_template = blob.commit_template;
   }
 
-  if ("interval_seconds" in blob) {
+  if ("safety_net_seconds" in blob) {
+    if (
+      typeof blob.safety_net_seconds !== "number" ||
+      !Number.isFinite(blob.safety_net_seconds) ||
+      blob.safety_net_seconds <= 0 ||
+      !Number.isInteger(blob.safety_net_seconds)
+    ) {
+      return {
+        ok: false,
+        field: "safety_net_seconds",
+        error: "`safety_net_seconds` must be a positive integer.",
+      };
+    }
+    if (
+      blob.safety_net_seconds < MIN_SAFETY_NET_SECONDS ||
+      blob.safety_net_seconds > MAX_SAFETY_NET_SECONDS
+    ) {
+      return {
+        ok: false,
+        field: "safety_net_seconds",
+        error: `\`safety_net_seconds\` must be between ${MIN_SAFETY_NET_SECONDS} and ${MAX_SAFETY_NET_SECONDS}.`,
+      };
+    }
+    out.safety_net_seconds = blob.safety_net_seconds;
+  } else if ("interval_seconds" in blob) {
+    // Legacy field still accepted for hand-edited configs. Migrate by
+    // clamping into the safety-net range.
     if (
       typeof blob.interval_seconds !== "number" ||
       !Number.isFinite(blob.interval_seconds) ||
@@ -391,11 +517,15 @@ export function validateMirrorConfigShape(
     ) {
       return {
         ok: false,
-        field: "interval_seconds",
         error: "`interval_seconds` must be a positive integer.",
       };
     }
-    out.interval_seconds = blob.interval_seconds;
+    const clamped = blob.interval_seconds < MIN_SAFETY_NET_SECONDS
+      ? MIN_SAFETY_NET_SECONDS
+      : blob.interval_seconds > MAX_SAFETY_NET_SECONDS
+        ? MAX_SAFETY_NET_SECONDS
+        : blob.interval_seconds;
+    out.safety_net_seconds = clamped;
   }
 
   // Cross-field rule: external requires external_path — but ONLY when
@@ -411,6 +541,23 @@ export function validateMirrorConfigShape(
       field: "external_path",
       error:
         '`external_path` is required when `location` is "external" and `enabled` is true. Provide an absolute path to an existing git repository.',
+    };
+  }
+
+  // Cross-field rule: auto_push only makes sense for external mirrors —
+  // internal mirrors live under vault's data dir with no configured
+  // remote. Silent-fail on push was the pre-event-driven behavior; the
+  // backend now rejects the combination so the operator sees the issue
+  // at config time. The UI hides the auto_push checkbox when location
+  // is internal (vault#380's reviewer-flagged nit), so this only fires
+  // when an operator either edits config.yaml by hand or POSTs a bare
+  // JSON body with mismatched fields.
+  if (out.enabled && out.auto_push && out.location === "internal") {
+    return {
+      ok: false,
+      field: "auto_push",
+      error:
+        "`auto_push: true` requires `location: external` (internal mirrors live under the vault data directory and have no configured remote). Switch the location, or set auto_push to false.",
     };
   }
 

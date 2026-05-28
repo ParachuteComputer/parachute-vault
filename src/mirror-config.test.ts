@@ -12,6 +12,9 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  DEFAULT_SAFETY_NET_SECONDS,
+  MAX_SAFETY_NET_SECONDS,
+  MIN_SAFETY_NET_SECONDS,
   defaultMirrorConfig,
   parseMirrorConfig,
   resolveMirrorPath,
@@ -40,11 +43,14 @@ describe("defaultMirrorConfig", () => {
     expect(d.enabled).toBe(false);
     expect(d.location).toBe("internal");
     expect(d.external_path).toBeNull();
-    expect(d.watch).toBe(false);
+    // Post event-driven shift: sync_mode replaces watch. "events" is the
+    // new default — when an operator flips enabled on, hooks subscribe
+    // automatically.
+    expect(d.sync_mode).toBe("events");
     expect(d.auto_commit).toBe(true);
     expect(d.auto_push).toBe(false);
     expect(d.commit_template).toContain("{{date}}");
-    expect(d.interval_seconds).toBe(5);
+    expect(d.safety_net_seconds).toBe(DEFAULT_SAFETY_NET_SECONDS);
   });
 });
 
@@ -58,39 +64,66 @@ describe("parseMirrorConfig", () => {
     expect(parseMirrorConfig("")).toBeUndefined();
   });
 
-  test("parses a fully-specified mirror block", () => {
+  test("parses a fully-specified mirror block (post-event-driven shape)", () => {
     const yaml = [
       "port: 1940",
       "mirror:",
       "  enabled: true",
       "  location: external",
       "  external_path: /home/aaron/mirrors/gitcoin",
-      "  watch: true",
+      "  sync_mode: events",
       "  auto_commit: true",
       "  auto_push: true",
       '  commit_template: "vault: {{notes_changed}} note{{plural}}"',
-      "  interval_seconds: 10",
+      "  safety_net_seconds: 3600",
     ].join("\n");
     const m = parseMirrorConfig(yaml);
     expect(m).toEqual({
       enabled: true,
       location: "external",
       external_path: "/home/aaron/mirrors/gitcoin",
-      watch: true,
+      sync_mode: "events",
       auto_commit: true,
       auto_push: true,
       commit_template: "vault: {{notes_changed}} note{{plural}}",
-      interval_seconds: 10,
+      safety_net_seconds: 3600,
     });
   });
 
   test("partial mirror block fills missing fields from defaults", () => {
-    const yaml = "mirror:\n  enabled: true\n  watch: true\n";
+    const yaml = "mirror:\n  enabled: true\n  sync_mode: manual\n";
     const m = parseMirrorConfig(yaml)!;
     expect(m.enabled).toBe(true);
-    expect(m.watch).toBe(true);
+    expect(m.sync_mode).toBe("manual");
     expect(m.location).toBe("internal");
     expect(m.auto_commit).toBe(true);
+  });
+
+  test("legacy `watch: true` translates to sync_mode: events", () => {
+    const m = parseMirrorConfig("mirror:\n  enabled: true\n  watch: true\n")!;
+    expect(m.sync_mode).toBe("events");
+  });
+
+  test("legacy `watch: false` translates to sync_mode: manual", () => {
+    const m = parseMirrorConfig("mirror:\n  enabled: true\n  watch: false\n")!;
+    expect(m.sync_mode).toBe("manual");
+  });
+
+  test("explicit sync_mode wins over legacy watch", () => {
+    const yaml = "mirror:\n  enabled: true\n  watch: true\n  sync_mode: manual\n";
+    const m = parseMirrorConfig(yaml)!;
+    expect(m.sync_mode).toBe("manual");
+  });
+
+  test("legacy `interval_seconds: 5` clamps up to MIN_SAFETY_NET_SECONDS", () => {
+    const m = parseMirrorConfig("mirror:\n  enabled: true\n  interval_seconds: 5\n")!;
+    expect(m.safety_net_seconds).toBe(MIN_SAFETY_NET_SECONDS);
+  });
+
+  test("explicit safety_net_seconds wins over legacy interval_seconds", () => {
+    const yaml = "mirror:\n  enabled: true\n  interval_seconds: 5\n  safety_net_seconds: 1800\n";
+    const m = parseMirrorConfig(yaml)!;
+    expect(m.safety_net_seconds).toBe(1800);
   });
 
   test("external_path: null is interpreted as null", () => {
@@ -120,11 +153,11 @@ describe("serializeMirrorConfig", () => {
       enabled: true,
       location: "external" as const,
       external_path: "/home/aaron/team-brain",
-      watch: true,
+      sync_mode: "events" as const,
       auto_commit: true,
       auto_push: false,
       commit_template: "export: {{date}} ({{notes_changed}} note{{plural}})",
-      interval_seconds: 5,
+      safety_net_seconds: 3600,
     };
     const yaml = serializeMirrorConfig(original).join("\n") + "\n";
     const parsed = parseMirrorConfig(yaml);
@@ -251,10 +284,88 @@ describe("validateMirrorConfigShape", () => {
     if (!r.ok) expect(r.field).toBe("enabled");
   });
 
-  test("rejects non-integer interval_seconds", () => {
-    const r = validateMirrorConfigShape({ interval_seconds: 0.5 });
+  test("rejects non-integer safety_net_seconds", () => {
+    const r = validateMirrorConfigShape({ safety_net_seconds: 0.5 });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.field).toBe("interval_seconds");
+    if (!r.ok) expect(r.field).toBe("safety_net_seconds");
+  });
+
+  test("rejects safety_net_seconds below MIN", () => {
+    const r = validateMirrorConfigShape({ safety_net_seconds: MIN_SAFETY_NET_SECONDS - 1 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.field).toBe("safety_net_seconds");
+  });
+
+  test("rejects safety_net_seconds above MAX", () => {
+    const r = validateMirrorConfigShape({ safety_net_seconds: MAX_SAFETY_NET_SECONDS + 1 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.field).toBe("safety_net_seconds");
+  });
+
+  test("legacy interval_seconds field clamps + migrates to safety_net_seconds", () => {
+    // Hand-edited config supplies the old field; we still accept it but
+    // route it through the safety-net clamp range.
+    const r = validateMirrorConfigShape({ interval_seconds: 5 });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.config.safety_net_seconds).toBe(MIN_SAFETY_NET_SECONDS);
+  });
+
+  test("rejects unknown sync_mode", () => {
+    const r = validateMirrorConfigShape({ sync_mode: "interval" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.field).toBe("sync_mode");
+  });
+
+  test("accepts sync_mode events / manual", () => {
+    expect((validateMirrorConfigShape({ sync_mode: "events" }) as { config: { sync_mode: string } }).config.sync_mode).toBe("events");
+    expect((validateMirrorConfigShape({ sync_mode: "manual" }) as { config: { sync_mode: string } }).config.sync_mode).toBe("manual");
+  });
+
+  test("legacy watch: true translates to sync_mode: events", () => {
+    const r = validateMirrorConfigShape({ watch: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.config.sync_mode).toBe("events");
+  });
+
+  test("legacy watch: false translates to sync_mode: manual", () => {
+    const r = validateMirrorConfigShape({ watch: false });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.config.sync_mode).toBe("manual");
+  });
+
+  test("rejects auto_push + internal location (validation rather than silent-fail)", () => {
+    // Pre-event-driven shape silently let push fail at runtime for
+    // internal mirrors. Now we reject the combination at config time so
+    // the operator sees the issue immediately.
+    const r = validateMirrorConfigShape({
+      enabled: true,
+      location: "internal",
+      auto_push: true,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.field).toBe("auto_push");
+  });
+
+  test("auto_push + external location is fine", () => {
+    const r = validateMirrorConfigShape({
+      enabled: true,
+      location: "external",
+      external_path: "/tmp/foo",
+      auto_push: true,
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test("auto_push + disabled never errors", () => {
+    // Cross-field rule gates on `enabled`. A disabled config with stale
+    // auto_push: true + internal is the upgrade-path shape; operators
+    // shouldn't have to clear the field to disable.
+    const r = validateMirrorConfigShape({
+      enabled: false,
+      location: "internal",
+      auto_push: true,
+    });
+    expect(r.ok).toBe(true);
   });
 
   test("rejects empty commit_template", () => {
