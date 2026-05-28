@@ -4,6 +4,71 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## Mirror event-driven exports + `sync_mode` schema (0.4.9-rc.5 → 0.4.9-rc.6)
+
+The git-mirror feature flipped from polling to event-driven. The watch
+loop you may have configured around `interval_seconds: 5` is gone — the
+mirror now subscribes to in-process hooks on note/tag/attachment writes
+and exports within ~500ms of each change. A safety-net poll (default
+hourly) catches anything the event path misses (direct SQL writes,
+server restart races).
+
+**Schema rename — silent migration on read:**
+
+| Old field | New field | Behavior |
+|---|---|---|
+| `watch: true` | `sync_mode: "events"` | Existing configs continue to work; the parser translates on read. |
+| `watch: false` | `sync_mode: "manual"` | Same. |
+| `interval_seconds: <N>` | `safety_net_seconds: <N>` | Same value, repurposed as the safety-net cadence. Default flipped from 5s to 3600s (1h). |
+
+Hand-edited `config.yaml` files with the old fields keep working —
+nothing to change. The SPA reads the new field names; the parser writes
+them back on save. If you want to scrub the YAML by hand, the new shape:
+
+```yaml
+mirror:
+  enabled: true
+  location: external
+  external_path: "/home/aaron/notes-mirror"
+  sync_mode: events          # was: watch: true
+  auto_commit: true
+  auto_push: false
+  commit_template: "export: {{date}} ({{notes_changed}} note{{plural}})"
+  safety_net_seconds: 3600   # was: interval_seconds: 5
+```
+
+**New: UI-configurable push credentials.** The admin SPA's mirror page
+now offers "Connect GitHub" (Device Flow — works on any vault host, no
+callback URL setup needed; same flow as `gh auth login`) and "Use
+Personal Access Token" (for GitLab/Gitea/Bitbucket/anything else
+HTTPS+token). Tokens are stored at
+`~/.parachute/vault/.mirror-credentials.yaml` with 0600 perms, never
+appear in API responses, and are embedded into the mirror's
+`.git/config` origin URL for push.
+
+**Auto-push semantics:**
+
+- `auto_push: true` + `location: internal` is rejected at the backend
+  (internal mirrors have no remote; the watch loop would log push
+  failures forever). Pick `external` if you want pushes.
+- The "Push after each commit" checkbox is hidden in the SPA when
+  location=internal. (Bare config edit can still set the flag — the
+  watch loop logs a non-fatal warning on each push attempt and
+  continues.)
+- Auto-push needs credentials configured (either via the new SPA flows
+  or operator-wired SSH/credential-helper). The SPA's warning text
+  updates dynamically: "Will push to @login on GitHub" when configured,
+  the legacy "configured outside vault" warning otherwise.
+
+**Deleted notes now propagate.** Pre-event-driven, deleting a note left
+its `.md` file in the mirror dir indefinitely. The new export pass
+sweeps orphans (notes whose IDs no longer exist in the SQLite). Tag
+schemas + attachment dirs sweep the same way. Symlinks inside the
+mirror dir pointing outside `outDir` are refused by the prune step.
+
+Reference: design doc at [parachute.computer/design/2026-05-20-vault-as-git-projection.md](https://parachute.computer/design/2026-05-20-vault-as-git-projection/),
+propagation tracker at [parachute-patterns/migrations/2026-05-28-mirror-event-driven.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-28-mirror-event-driven.md).
+
 ## Workstream E — standalone OAuth retired
 
 **Hub is now a hard requirement** for OAuth-based clients to connect to
