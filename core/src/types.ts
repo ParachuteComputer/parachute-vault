@@ -342,6 +342,14 @@ export interface Store {
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;
   getAttachments(noteId: string): Promise<Attachment[]>;
   getAttachment(attachmentId: string): Promise<Attachment | null>;
+  /**
+   * Reverse-lookup attachment rows by their vault-internal relative `path`
+   * (`<date>/<filename>`). Returns every row sharing that path (a single
+   * on-disk asset can be referenced by >1 row). Used by the raw
+   * `/api/storage/<date>/<file>` serve path to map a requested file back to
+   * its owning note(s) for tag-scope enforcement.
+   */
+  getAttachmentsByPath(path: string): Promise<Attachment[]>;
   setAttachmentMetadata(attachmentId: string, metadata: Record<string, unknown>): Promise<void>;
   deleteAttachment(noteId: string, attachmentId: string): Promise<{ deleted: boolean; path: string | null; orphaned: boolean }>;
   listAttachmentsByTranscribeStatus(status: "pending" | "failed" | "done", limit?: number): Promise<Attachment[]>;

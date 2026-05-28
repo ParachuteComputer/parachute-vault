@@ -773,6 +773,38 @@ export class BunSqliteStore implements Store {
   }
 
   /**
+   * Reverse-lookup: every attachment row whose `path` column equals the given
+   * vault-internal relative path (`<date>/<filename>`). A single on-disk asset
+   * can be referenced by more than one attachment row (the orphan check in
+   * `deleteAttachment` accounts for that), so this returns an array. Used by
+   * the raw `/api/storage/<date>/<file>` byte-serve path to map a requested
+   * file back to its owning note(s) for tag-scope enforcement — without this,
+   * a tag-scoped token could fetch an out-of-scope note's attachment bytes
+   * directly by path (the path-secrecy-only bypass; see the C0 adversarial
+   * audit finding).
+   */
+  async getAttachmentsByPath(path: string): Promise<Attachment[]> {
+    const rows = this.db.prepare(
+      "SELECT * FROM attachments WHERE path = ? ORDER BY created_at",
+    ).all(path) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string }[];
+
+    return rows.map((r) => {
+      let metadata: Record<string, unknown> | undefined;
+      if (r.metadata && r.metadata !== "{}") {
+        try { metadata = JSON.parse(r.metadata); } catch {}
+      }
+      return {
+        id: r.id,
+        noteId: r.note_id,
+        path: r.path,
+        mimeType: r.mime_type,
+        metadata,
+        createdAt: r.created_at,
+      };
+    });
+  }
+
+  /**
    * Replace the attachment's metadata JSON blob. The caller passes the full
    * merged object — this is a set, not a patch, so partial-field updates
    * don't silently drop other keys.

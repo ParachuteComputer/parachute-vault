@@ -2077,7 +2077,13 @@ const MIME_TYPES: Record<string, string> = {
   ".mp4": "video/mp4",
 };
 
-export async function handleStorage(req: Request, path: string, vault: string): Promise<Response> {
+export async function handleStorage(
+  req: Request,
+  path: string,
+  vault: string,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
   const assets = assetsDir(vault);
 
   if (req.method === "POST" && path === "/upload") {
@@ -2119,6 +2125,37 @@ export async function handleStorage(req: Request, path: string, vault: string): 
     }
     if (!existsSync(filePath)) {
       return json({ error: "Not found" }, 404);
+    }
+
+    // Tag-scope gate (C0 adversarial-audit finding). The note-keyed
+    // attachment surfaces (GET /notes/:id?include_attachments, GET
+    // /notes/:id/attachments, query results) are all gated behind
+    // `noteWithinTagScope`, but this raw byte-serve endpoint historically
+    // shipped bytes purely by filesystem path with only a path-traversal
+    // guard — so a tag-scoped token (scoped to e.g. ["work"]) could fetch
+    // an out-of-scope note's attachment bytes directly if it learned the
+    // storage path. Path secrecy (the 122-bit UUID in the filename) is NOT
+    // an access control. When the token is tag-scoped, reverse-lookup the
+    // requested path → owning attachment row(s) → note_id, and serve only
+    // if at least one owning note is within scope. Unscoped tokens
+    // (tagScope.raw === null) keep the prior behavior verbatim.
+    //
+    // 404 (not 403) on out-of-scope / no-owning-row, matching the
+    // note-level surfaces — don't create an existence oracle that confirms
+    // "this path exists but you can't see it."
+    if (tagScope.raw !== null) {
+      const rows = await store.getAttachmentsByPath(reqPath);
+      let allowed = false;
+      for (const att of rows) {
+        const note = await store.getNote(att.noteId);
+        if (note && noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
+          allowed = true;
+          break;
+        }
+      }
+      if (!allowed) {
+        return json({ error: "Not found" }, 404);
+      }
     }
 
     const stat = statSync(filePath);
