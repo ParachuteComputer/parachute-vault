@@ -7,11 +7,13 @@ import {
   declareField,
   getIndexedField,
   listIndexedFields,
+  pruneOrphanedIndexedFields,
   rebuildIndexes,
   releaseField,
   TYPE_MAP,
   validateFieldName,
 } from "./indexed-fields.js";
+import { buildVaultProjection } from "./vault-projection.js";
 
 let db: Database;
 let store: SqliteStore;
@@ -281,5 +283,154 @@ describe("delete-tag: indexed fields", () => {
     await del.execute({ tag: "project" });
     expect(getIndexedField(db, "status")?.declarerTags).toEqual(["ticket"]);
     expect(notesColumns()).toContain("meta_status");
+  });
+
+  // Bug 1b — the release lives in store.deleteTag now (not the MCP layer), so
+  // every delete entry point releases. Co-declaration sequencing: deleting the
+  // FIRST co-declarer keeps the column; deleting the SECOND drops it.
+  it("co-declaration: delete A keeps column (B holds), then delete B drops it", async () => {
+    const update = findTool("update-tag");
+    const del = findTool("delete-tag");
+    await update.execute({ tag: "asset", fields: { aspect_ratio: { type: "string", indexed: true } } });
+    await update.execute({ tag: "storyboard", fields: { aspect_ratio: { type: "string", indexed: true } } });
+
+    await del.execute({ tag: "asset" });
+    expect(getIndexedField(db, "aspect_ratio")?.declarerTags).toEqual(["storyboard"]);
+    expect(notesColumns()).toContain("meta_aspect_ratio");
+
+    await del.execute({ tag: "storyboard" });
+    expect(getIndexedField(db, "aspect_ratio")).toBeNull();
+    expect(notesColumns()).not.toContain("meta_aspect_ratio");
+    expect(notesIndexes()).not.toContain("idx_meta_aspect_ratio");
+  });
+});
+
+// ===========================================================================
+// Bug 1a — update-tag {fields: null} clears all of this tag's field schemas,
+// dropping the exclusively-declared columns + indexes. `null` (clear-all) must
+// be distinguished from `undefined` (no change). The gitcoin orphaned-fields
+// bug was that `?? {}` collapsed null to a no-op.
+// ===========================================================================
+describe("update-tag: fields null vs undefined", () => {
+  it("fields:null drops the tag's exclusively-declared columns + indexed_fields rows", async () => {
+    const update = findTool("update-tag");
+    await update.execute({
+      tag: "project",
+      fields: { status: { type: "string", indexed: true }, priority: { type: "integer", indexed: true } },
+    });
+    expect(notesColumns()).toContain("meta_status");
+    expect(notesColumns()).toContain("meta_priority");
+
+    await update.execute({ tag: "project", fields: null });
+
+    expect(getIndexedField(db, "status")).toBeNull();
+    expect(getIndexedField(db, "priority")).toBeNull();
+    expect(notesColumns()).not.toContain("meta_status");
+    expect(notesColumns()).not.toContain("meta_priority");
+    expect(notesIndexes()).not.toContain("idx_meta_status");
+    // The tag's fields column is cleared too.
+    const rec = await store.getTagRecord("project");
+    expect(rec?.fields ?? null).toBeNull();
+  });
+
+  it("fields:null no longer lists the fields in the vault-info indexed_fields catalog", async () => {
+    const update = findTool("update-tag");
+    await update.execute({ tag: "project", fields: { status: { type: "string", indexed: true } } });
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).toContain("status");
+
+    await update.execute({ tag: "project", fields: null });
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("status");
+  });
+
+  it("fields:undefined is a no-op — preserves existing field schemas + columns", async () => {
+    const update = findTool("update-tag");
+    await update.execute({ tag: "project", fields: { status: { type: "string", indexed: true } } });
+    // Update only the description; omit fields entirely.
+    await update.execute({ tag: "project", description: "a project" });
+    expect(getIndexedField(db, "status")?.declarerTags).toEqual(["project"]);
+    expect(notesColumns()).toContain("meta_status");
+  });
+
+  it("fields:null respects co-declaration — keeps a field another live tag still declares", async () => {
+    const update = findTool("update-tag");
+    await update.execute({ tag: "asset", fields: { aspect_ratio: { type: "string", indexed: true } } });
+    await update.execute({ tag: "storyboard", fields: { aspect_ratio: { type: "string", indexed: true } } });
+
+    await update.execute({ tag: "asset", fields: null });
+    expect(getIndexedField(db, "aspect_ratio")?.declarerTags).toEqual(["storyboard"]);
+    expect(notesColumns()).toContain("meta_aspect_ratio");
+  });
+});
+
+// ===========================================================================
+// Bug 1c — prune for ALREADY-orphaned fields. The gitcoin case: an
+// indexed_fields row whose every declarer tag has no `tags` row (orphaned by a
+// pre-fix delete/clear that never released). prune finds + drops them; it must
+// NOT touch fields with a live declarer.
+// ===========================================================================
+describe("pruneOrphanedIndexedFields", () => {
+  // Seed an orphaned field directly: declare via the API (creates the tag
+  // row + column), then delete the tag row out from under it WITHOUT going
+  // through the release path — exactly the pre-fix orphaned state.
+  function orphanField(field: string, type: "TEXT" | "INTEGER", tag: string) {
+    declareField(db, field, type, tag);
+    // Drop the tags row directly — simulating the pre-fix delete-tag that
+    // never released. The indexed_fields row + column survive (orphaned).
+    db.prepare("DELETE FROM tags WHERE name = ?").run(tag);
+  }
+
+  it("dry-run reports the orphan without mutating", async () => {
+    orphanField("legacy_status", "TEXT", "ghost");
+    expect(notesColumns()).toContain("meta_legacy_status");
+
+    const plan = pruneOrphanedIndexedFields(db, { dryRun: true });
+    expect(plan).toEqual([{ field: "legacy_status", deadDeclarers: ["ghost"], dropped: true }]);
+    // Nothing changed.
+    expect(getIndexedField(db, "legacy_status")).not.toBeNull();
+    expect(notesColumns()).toContain("meta_legacy_status");
+  });
+
+  it("apply drops the orphaned column + index + row", async () => {
+    orphanField("legacy_status", "TEXT", "ghost");
+    const plan = pruneOrphanedIndexedFields(db, { dryRun: false });
+    expect(plan).toEqual([{ field: "legacy_status", deadDeclarers: ["ghost"], dropped: true }]);
+    expect(getIndexedField(db, "legacy_status")).toBeNull();
+    expect(notesColumns()).not.toContain("meta_legacy_status");
+    expect(notesIndexes()).not.toContain("idx_meta_legacy_status");
+    // No longer advertised by vault-info.
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("legacy_status");
+  });
+
+  it("does NOT touch a field with a live declarer", async () => {
+    const update = findTool("update-tag");
+    await update.execute({ tag: "project", fields: { status: { type: "string", indexed: true } } });
+    const plan = pruneOrphanedIndexedFields(db, { dryRun: false });
+    expect(plan).toEqual([]);
+    expect(getIndexedField(db, "status")?.declarerTags).toEqual(["project"]);
+    expect(notesColumns()).toContain("meta_status");
+  });
+
+  it("trims dead declarers but keeps the column when a live co-declarer remains", async () => {
+    const update = findTool("update-tag");
+    // Two declarers, then orphan only one by deleting its tag row directly.
+    await update.execute({ tag: "asset", fields: { aspect_ratio: { type: "string", indexed: true } } });
+    await update.execute({ tag: "storyboard", fields: { aspect_ratio: { type: "string", indexed: true } } });
+    db.prepare("DELETE FROM tags WHERE name = ?").run("asset"); // orphan one declarer
+
+    const plan = pruneOrphanedIndexedFields(db, { dryRun: false });
+    expect(plan).toEqual([{ field: "aspect_ratio", deadDeclarers: ["asset"], dropped: false }]);
+    // Column kept; storyboard still declares it; asset trimmed from the set.
+    expect(getIndexedField(db, "aspect_ratio")?.declarerTags).toEqual(["storyboard"]);
+    expect(notesColumns()).toContain("meta_aspect_ratio");
+  });
+
+  it("store.pruneIndexedFields surfaces the same plan", async () => {
+    orphanField("legacy_status", "TEXT", "ghost");
+    const dry = await store.pruneIndexedFields({ dryRun: true });
+    expect(dry).toEqual([{ field: "legacy_status", deadDeclarers: ["ghost"], dropped: true }]);
+    expect(getIndexedField(db, "legacy_status")).not.toBeNull(); // dry-run didn't mutate
+    const applied = await store.pruneIndexedFields({ dryRun: false });
+    expect(applied).toEqual([{ field: "legacy_status", deadDeclarers: ["ghost"], dropped: true }]);
+    expect(getIndexedField(db, "legacy_status")).toBeNull();
   });
 });

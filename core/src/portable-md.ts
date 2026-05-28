@@ -1535,6 +1535,14 @@ export interface ImportStats {
   skipped_sidecars: Array<{ sidecar_id: string; expected_path: string | null; expected_extension: string | null; reason: string }>;
   /** Set when the caller passed `blowAway: true`; counts notes removed. */
   notes_wiped: number;
+  /**
+   * (tag, field) indexed-field declarations replayed after restoring tag
+   * schemas — materializes the generated columns + indexes a live vault
+   * would have. Without this an imported vault's schemas say `indexed: true`
+   * but the backing columns don't exist until each tag is next `update-tag`'d
+   * (queries fall back to full scans). See the import re-declare fix.
+   */
+  indexes_declared: number;
 }
 
 /**
@@ -1582,6 +1590,7 @@ export async function importPortableVault(
     skipped_attachments: [],
     skipped_sidecars: [],
     notes_wiped: 0,
+    indexes_declared: 0,
   };
 
   // 1. Optional wipe. Notes are deleted via the public Store API so
@@ -2017,6 +2026,45 @@ export async function importPortableVault(
   // content rebuild link rows for the imported notes.
   if (!opts.dryRun) {
     await store.syncAllWikilinks();
+  }
+
+  // 7. Re-declare indexed fields (belt-and-suspenders + authoritative count).
+  // Step 2 restored tag schemas via `store.upsertTagRecord`, which — now that
+  // the indexed-field lifecycle is centralized in the store — already
+  // materializes the backing generated columns + indexes as it persists each
+  // schema. This explicit reconcile is therefore idempotent on the happy path;
+  // it stays as a safety net (covers any schema written through a path that
+  // skipped the lifecycle) and gives the authoritative `indexes_declared`
+  // count. Without it, a regression in step 2 would silently leave the
+  // imported schemas advertising `indexed: true` while queries full-scan.
+  if (!opts.dryRun) {
+    stats.indexes_declared = await store.reconcileDeclaredIndexes();
+  } else {
+    // Dry-run: count what WOULD be declared without touching the DB. Both
+    // paths count per (tag, field) declaration (a co-declared field counts
+    // once per declaring tag). The one asymmetry: this dry-run counts every
+    // `indexed: true` field including unsupported types, whereas the applied
+    // `reconcileDeclaredIndexes` skips fields whose type can't be indexed —
+    // so the dry-run can over-count by the number of mis-typed indexed
+    // fields. It's a "how much indexing work" signal, not a row-exact promise.
+    const schemasDir2 = join(sidecar, "schemas");
+    if (existsSync(schemasDir2)) {
+      for (const entry of readdirSync(schemasDir2)) {
+        if (!entry.endsWith(".yaml")) continue;
+        const fullPath = join(schemasDir2, entry);
+        const resolved = resolvePath(fullPath);
+        if (!isWithinDir(resolved, resolvePath(schemasDir2))) continue;
+        const text = readFileSync(fullPath, "utf-8");
+        const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+        const { frontmatter } = parseFrontmatter(wrapped);
+        const fields = frontmatter.fields;
+        if (fields && typeof fields === "object" && !Array.isArray(fields)) {
+          for (const spec of Object.values(fields as Record<string, { indexed?: boolean }>)) {
+            if (spec?.indexed === true) stats.indexes_declared++;
+          }
+        }
+      }
+    }
   }
 
   return stats;

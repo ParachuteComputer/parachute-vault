@@ -18,6 +18,7 @@ import {
   type CursorPayload,
   type QueryHashInputs,
 } from "./cursor.js";
+import { releaseField } from "./indexed-fields.js";
 
 let idCounter = 0;
 
@@ -943,11 +944,34 @@ export function listTags(db: Database): { name: string; count: number }[] {
 }
 
 export function deleteTag(db: Database, name: string): { deleted: boolean; notes_untagged: number } {
-  const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(name);
-  if (!exists) return { deleted: false, notes_untagged: 0 };
+  const row = db.prepare("SELECT fields FROM tags WHERE name = ?").get(name) as
+    | { fields: string | null }
+    | undefined;
+  if (!row) return { deleted: false, notes_untagged: 0 };
 
   const countRow = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?").get(name) as { c: number };
   const notesUntagged = countRow.c;
+
+  // Release any indexed fields this tag declared BEFORE the row drops.
+  // `releaseField` only drops the generated column + index when this tag is
+  // the last live declarer (co-declaration guard) — a field co-declared by
+  // another live tag keeps its column and just loses this tag from the set.
+  // This lives in the store-level delete (not the MCP layer) so every caller
+  // — MCP delete-tag, the REST DELETE /tags/:name route, the import
+  // blow-away sweep — releases consistently. See the gitcoin orphaned-fields
+  // bug report.
+  if (row.fields) {
+    try {
+      const fields = JSON.parse(row.fields) as Record<string, { indexed?: boolean }>;
+      for (const [fieldName, spec] of Object.entries(fields)) {
+        if (spec?.indexed === true) {
+          releaseField(db, fieldName, name);
+        }
+      }
+    } catch {
+      // Malformed fields JSON — nothing to release; proceed with the delete.
+    }
+  }
 
   db.prepare("DELETE FROM note_tags WHERE tag_name = ?").run(name);
   db.prepare("DELETE FROM tags WHERE name = ?").run(name);

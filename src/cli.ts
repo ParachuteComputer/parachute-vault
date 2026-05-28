@@ -222,6 +222,9 @@ switch (command) {
   case "export":
     await cmdExport(cmdArgs);
     break;
+  case "schema":
+    await cmdSchema(cmdArgs);
+    break;
   case "help":
   case "--help":
   case "-h":
@@ -3213,6 +3216,92 @@ async function cmdExport(args: string[]) {
 }
 
 // ---------------------------------------------------------------------------
+// Schema maintenance — `parachute-vault schema <subcommand>`
+// ---------------------------------------------------------------------------
+
+/**
+ * `parachute-vault schema prune` — drop orphaned indexed-field columns +
+ * indexes whose declaring tags no longer exist (the gitcoin orphaned-fields
+ * bug). Dry-run by default; `--apply` (alias `--yes`) executes. A field
+ * co-declared by a still-live tag is never dropped — only the dead declarers
+ * are trimmed. Dropping a generated column loses only the index; the source
+ * values stay in notes.metadata, so the column rebuilds when the field is
+ * declared again.
+ */
+async function cmdSchema(args: string[] = []) {
+  const sub = args[0];
+  if (sub !== "prune") {
+    console.error("Usage: parachute-vault schema prune [--vault <name>] [--dry-run|--apply|--yes]");
+    console.error("\nSubcommands:");
+    console.error("  prune    Drop orphaned indexed-field columns whose declaring tags are gone.");
+    console.error("           Dry-run by default (--dry-run is an explicit alias); pass --apply (or --yes) to execute.");
+    process.exit(1);
+  }
+
+  let vaultName = "default";
+  let apply = false;
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--vault") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--vault requires a value.");
+        process.exit(1);
+      }
+      vaultName = v;
+    } else if (arg === "--apply" || arg === "--yes") {
+      apply = true;
+    } else if (arg === "--dry-run") {
+      // Dry-run is the default; accept the flag as an explicit affirmative
+      // for convention + scriptability. --apply wins if both are passed.
+    } else {
+      console.error(`Unknown flag for \`schema prune\`: ${arg}`);
+      process.exit(1);
+    }
+  }
+
+  const config = readVaultConfig(vaultName);
+  if (!config) {
+    console.error(`Vault "${vaultName}" not found.`);
+    process.exit(1);
+  }
+
+  const { getVaultStore } = await import("./vault-store.ts");
+  const store = getVaultStore(vaultName);
+  const plan = await store.pruneIndexedFields({ dryRun: !apply });
+
+  const dropped = plan.filter((p) => p.dropped);
+  const trimmed = plan.filter((p) => !p.dropped);
+
+  if (plan.length === 0) {
+    console.log(`No orphaned indexed fields in vault "${vaultName}". Nothing to prune.`);
+    return;
+  }
+
+  console.log(
+    apply
+      ? `Pruned orphaned indexed fields in vault "${vaultName}":`
+      : `Would prune orphaned indexed fields in vault "${vaultName}" (dry-run):`,
+  );
+  for (const p of dropped) {
+    console.log(
+      `  ${apply ? "DROPPED" : "drop  "} ${p.field}  (dead declarers: ${p.deadDeclarers.join(", ")})`,
+    );
+  }
+  for (const p of trimmed) {
+    console.log(
+      `  ${apply ? "TRIMMED" : "trim  "} ${p.field}  (removed dead declarers: ${p.deadDeclarers.join(", ")}; column kept — still co-declared)`,
+    );
+  }
+  console.log(
+    `\n${apply ? "Dropped" : "Would drop"} ${dropped.length} orphaned field(s); ${apply ? "trimmed" : "would trim"} ${trimmed.length} co-declared field(s).`,
+  );
+  if (!apply) {
+    console.log("Re-run with --apply (or --yes) to execute.");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Export-watch glue. The git-shell + commit-message logic lives in
 // `./export-watch.ts` for unit-testability; cli.ts just wires it in.
 // ---------------------------------------------------------------------------
@@ -3508,6 +3597,16 @@ Import/Export:
                                                        (combine with --watch for auto-history;
                                                        template via --git-message-template;
                                                        --git-push to push after commit)
+
+Schema maintenance:
+  parachute-vault schema prune [--vault <name>]       Drop orphaned indexed-field columns +
+                                                       indexes whose declaring tags no longer
+                                                       exist. Dry-run by default (--dry-run is an
+                                                       explicit alias) — prints the drop plan
+                                                       without changing anything.
+  parachute-vault schema prune --apply                Execute the prune (alias: --yes). Co-declared
+                                                       fields keep their column; a drop loses only
+                                                       the index (data lives in notes.metadata).
 
 ── Advanced / standalone ──────────────────────────────────────────────
 

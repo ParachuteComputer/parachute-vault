@@ -1944,6 +1944,9 @@ describe("MCP tools", async () => {
     expect(names).toContain("delete-tag");
     expect(names).toContain("find-path");
     expect(names).toContain("vault-info");
+    // prune-schema (admin) — drops orphaned indexed-field columns whose
+    // declaring tags are gone. The gitcoin orphaned-fields fix.
+    expect(names).toContain("prune-schema");
     // Six note-schema tools (list/update/delete-note-schema +
     // list/set/delete-schema-mapping) retired in v17 — the standalone
     // note_schemas + schema_mappings subsystem was a parallel path to
@@ -1957,7 +1960,7 @@ describe("MCP tools", async () => {
     // synthesize-notes retired in v17 — replicable with query-notes(near=) +
     // find-path + agent-side aggregation. See vault#268.
     expect(names).not.toContain("synthesize-notes");
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(10);
   });
 
   it("create-note tool works", async () => {

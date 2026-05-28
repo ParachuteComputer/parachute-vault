@@ -236,3 +236,101 @@ export function rebuildIndexes(db: Database): void {
     }
   }
 }
+
+export interface PrunedField {
+  /** The field whose `indexed_fields` row was affected. */
+  field: string;
+  /** Declarer tags that no longer have a `tags` row (removed from the set). */
+  deadDeclarers: string[];
+  /**
+   * True when the field had NO surviving live declarer and was fully dropped
+   * (row + generated column + index). False when at least one live declarer
+   * remained and only the dead declarers were pruned from the set.
+   */
+  dropped: boolean;
+}
+
+/**
+ * Prune orphaned `indexed_fields` declarers — the gitcoin defect.
+ *
+ * A declarer tag is "dead" when no `tags` row carries that name (the tag was
+ * deleted, or its schema was cleared, without releasing the field). For every
+ * `indexed_fields` row:
+ *
+ *   - Drop dead declarers from the set.
+ *   - If NO live declarer remains, drop the whole field — row + generated
+ *     column + index. This is the only data-loss-free drop: the generated
+ *     column is `json_extract(metadata, …)` so the source values stay in
+ *     `notes.metadata`; only the (now-dead) index is lost.
+ *   - If at least one live declarer remains (co-declaration), keep the column
+ *     and just trim the dead names from the declarer set.
+ *
+ * `dryRun` (default) computes the plan without mutating; pass `dryRun: false`
+ * to apply. Returns the per-field plan either way so the CLI / MCP surface can
+ * print what it would (or did) drop.
+ */
+export function pruneOrphanedIndexedFields(
+  db: Database,
+  opts: { dryRun?: boolean } = {},
+): PrunedField[] {
+  const dryRun = opts.dryRun ?? true;
+  const liveTags = new Set(
+    (db.prepare("SELECT name FROM tags").all() as { name: string }[]).map((r) => r.name),
+  );
+  const plan: PrunedField[] = [];
+  for (const f of listIndexedFields(db)) {
+    const deadDeclarers = f.declarerTags.filter((t) => !liveTags.has(t));
+    if (deadDeclarers.length === 0) continue; // every declarer is live — leave it
+    const liveDeclarers = f.declarerTags.filter((t) => liveTags.has(t));
+    const dropped = liveDeclarers.length === 0;
+    plan.push({ field: f.field, deadDeclarers, dropped });
+    if (dryRun) continue;
+    if (dropped) {
+      db.prepare("DELETE FROM indexed_fields WHERE field = ?").run(f.field);
+      dropColumnAndIndex(db, f.field);
+    } else {
+      db.prepare("UPDATE indexed_fields SET declarer_tags = ? WHERE field = ?").run(
+        JSON.stringify(liveDeclarers),
+        f.field,
+      );
+    }
+  }
+  return plan;
+}
+
+/**
+ * Replay `declareField` for every field a tag schema marks `indexed: true`.
+ * Idempotent — used by the portable-md import path so a fresh import ends with
+ * the same generated columns a live vault would have (the import writes
+ * `tags.fields` via `upsertTagRecord` but never materializes the backing
+ * columns). Without this, an imported vault's schemas say `indexed: true` but
+ * queries fall back to full scans until each tag is next `update-tag`'d.
+ *
+ * `tagSchemas` is the post-import set of (tag, fields) pairs. Returns the
+ * number of (tag, field) declarations replayed.
+ */
+export function reconcileDeclaredIndexes(
+  db: Database,
+  tagSchemas: { tag: string; fields?: Record<string, { type: string; indexed?: boolean }> }[],
+): number {
+  let declared = 0;
+  for (const schema of tagSchemas) {
+    if (!schema.fields) continue;
+    for (const [fieldName, spec] of Object.entries(schema.fields)) {
+      if (spec.indexed !== true) continue;
+      const mapped = mapFieldType(spec.type);
+      if (!mapped) continue; // unsupported type for indexing — skip, don't throw
+      try {
+        validateFieldName(fieldName);
+        declareField(db, fieldName, mapped, schema.tag);
+        declared++;
+      } catch (err) {
+        console.error(
+          `[indexed-fields] could not re-declare "${fieldName}" for tag "${schema.tag}" on import:`,
+          err,
+        );
+      }
+    }
+  }
+  return declared;
+}

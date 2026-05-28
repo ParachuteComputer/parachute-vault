@@ -1,8 +1,10 @@
 import type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+import type { PrunedField } from "./indexed-fields.js";
 
 // ---- Re-exports ----
 
 export type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+export type { PrunedField } from "./indexed-fields.js";
 
 // ---- Note ----
 
@@ -277,6 +279,24 @@ export interface Store {
   upsertTagSchema(tag: string, schema: { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }): Promise<{ tag: string; description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }>;
   deleteTagSchema(tag: string): Promise<boolean>;
   getTagSchemaMap(): Promise<Record<string, { description?: string; fields?: Record<string, { type: string; description?: string; enum?: string[]; indexed?: boolean }> }>>;
+
+  // Indexed-field lifecycle — generated columns + indexes on `notes` derived
+  // from tag-declared `indexed: true` fields. See core/src/indexed-fields.ts.
+
+  /**
+   * Prune orphaned `indexed_fields` declarers — declarer tags with no `tags`
+   * row. Fields left with no live declarer are dropped wholesale; co-declared
+   * fields keep their column and lose only the dead declarers. `dryRun`
+   * (default true) returns the plan without mutating.
+   */
+  pruneIndexedFields(opts?: { dryRun?: boolean }): Promise<PrunedField[]>;
+  /**
+   * Replay `declareField` for every `indexed: true` field across all current
+   * tag records, materializing the backing columns + indexes. Idempotent —
+   * used by the import path so a fresh import has the same columns a live
+   * vault would. Returns the count of (tag, field) declarations replayed.
+   */
+  reconcileDeclaredIndexes(): Promise<number>;
 
   // Tag records — full v14 identity row (description + fields + typed
   // relationships + parent_names + timestamps). See

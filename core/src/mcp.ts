@@ -23,8 +23,8 @@ export interface McpToolDef {
   /**
    * Minimum scope verb the caller must hold for THIS vault to see + invoke
    * the tool. `read` for pure queries, `write` for mutations, `admin` for
-   * token-management surfaces (only `manage-token` in the current set —
-   * core's nine tools cap at `write`). The MCP HTTP layer filters
+   * operator-only surfaces (`prune-schema` in core; `manage-token` in the
+   * server layer). The MCP HTTP layer filters
    * `tools/list` by this field and verb-gates `tools/call` against it; the
    * filter is the primary defense, the inner gate is defense-in-depth.
    *
@@ -100,9 +100,9 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Generate the consolidated MCP tools for a vault. Post-v17 surface (9):
+ * Generate the consolidated MCP tools for a vault. Surface (10):
  * query-notes, create-note, update-note, delete-note, list-tags, update-tag,
- * delete-tag, find-path, vault-info.
+ * delete-tag, find-path, vault-info, prune-schema (admin).
  */
 export function generateMcpTools(store: Store): McpToolDef[] {
   const db: Database = (store as any).db;
@@ -1074,12 +1074,23 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         const tag = params.tag as string;
         const existing = tagSchemaOps.getTagRecord(db, tag);
 
-        // ---- fields: shallow-merge into existing (preserves prior keys).
-        const incomingFields = (params.fields as Record<string, TagFieldSchema> | undefined) ?? {};
-        const mergedFields: Record<string, TagFieldSchema> = {
-          ...(existing?.fields ?? {}),
-          ...incomingFields,
-        };
+        // ---- fields: three-way semantics, distinguishing `null` from
+        // `undefined` (do NOT collapse with `?? {}` — that silently turns an
+        // explicit clear-all into a no-op, the gitcoin orphaned-fields bug).
+        //   - undefined  → no change. Preserve every existing field; declare
+        //                  nothing new. mergedFields === existing.fields.
+        //   - null       → clear ALL of this tag's field schemas.
+        //                  mergedFields = {} so the diff below releases every
+        //                  indexed field this tag exclusively declares.
+        //   - object     → shallow-merge into existing (preserves prior keys).
+        const incomingFields =
+          params.fields === null || params.fields === undefined
+            ? {}
+            : (params.fields as Record<string, TagFieldSchema>);
+        const mergedFields: Record<string, TagFieldSchema> =
+          params.fields === null
+            ? {}
+            : { ...(existing?.fields ?? {}), ...incomingFields };
 
         // Validate cross-tag consistency on fields being (re)declared in this
         // call. `type` and `indexed` are global — all declarers must agree.
@@ -1146,34 +1157,18 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           : (params.fields !== undefined ? null : undefined);
         const descriptionPatch =
           params.description === undefined ? undefined : (params.description as string);
+        // The indexed-field lifecycle (declareField for added indexed fields,
+        // releaseField for removed ones, with the co-declaration guard) is
+        // reconciled inside store.upsertTagRecord — the single chokepoint all
+        // callers (MCP, REST PUT /tags/:name, import) share — so it can't be
+        // bypassed. The cross-tag validation above stays here to surface a
+        // clean error before persisting. See the gitcoin orphaned-fields bug.
         const result = await store.upsertTagRecord(tag, {
           ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
           ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
           ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
         });
-
-        // ---- Reconcile indexed-field lifecycle for this tag.
-        const priorIndexed = new Set(
-          Object.entries(existing?.fields ?? {})
-            .filter(([, v]) => v.indexed === true)
-            .map(([k]) => k),
-        );
-        const nextIndexed = new Set(
-          Object.entries(mergedFields)
-            .filter(([, v]) => v.indexed === true)
-            .map(([k]) => k),
-        );
-        for (const fieldName of nextIndexed) {
-          const spec = mergedFields[fieldName]!;
-          const mapped = indexedFieldOps.mapFieldType(spec.type)!;
-          indexedFieldOps.declareField(db, fieldName, mapped, tag);
-        }
-        for (const fieldName of priorIndexed) {
-          if (!nextIndexed.has(fieldName)) {
-            indexedFieldOps.releaseField(db, fieldName, tag);
-          }
-        }
 
         return result;
       },
@@ -1198,19 +1193,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
       },
       execute: async (params) => {
         const tag = params.tag as string;
-        // Release any indexed fields this tag declared before the row
-        // drops. releaseField drops the generated column + index when the
-        // declarer set empties.
-        const schema = tagSchemaOps.getTagSchema(db, tag);
-        if (schema?.fields) {
-          for (const [fieldName, spec] of Object.entries(schema.fields)) {
-            if (spec.indexed === true) {
-              indexedFieldOps.releaseField(db, fieldName, tag);
-            }
-          }
-        }
         // Drop the row outright — description/fields/relationships/parents
         // travel with it. (No more sidecar table to clear separately.)
+        // Indexed-field release is handled inside store.deleteTag →
+        // noteOps.deleteTag so every entry point (MCP, REST, import sweep)
+        // releases consistently with the co-declaration guard. See the
+        // gitcoin orphaned-fields bug report.
         return await store.deleteTag(tag);
       },
     },
@@ -1263,6 +1251,41 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // This is a placeholder — vault-info needs access to vault config,
         // which is only available in the server layer (mcp-tools.ts).
         return { error: "vault-info must be configured by the server layer" };
+      },
+    },
+
+    // =====================================================================
+    // 10. prune-schema — drop orphaned indexed-field columns
+    // =====================================================================
+    {
+      name: "prune-schema",
+      // `admin` — a destructive schema-maintenance op, same tier as
+      // manage-token. Operator-only; hidden from read/write sessions.
+      requiredVerb: "admin",
+      description:
+        "Drop orphaned indexed-field columns + indexes whose declaring tags no longer exist (the result of a deleted tag never releasing its fields). Dry-run by default — returns the drop plan without mutating. Pass `apply: true` to execute. A field co-declared by a still-live tag is never dropped; only the dead declarers are trimmed from its set. Generated columns are derived from notes.metadata JSON, so a drop loses only the index, never source data — declare the field again to rebuild it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          apply: {
+            type: "boolean",
+            description: "Execute the prune. Default false (dry-run — report what would be dropped without changing anything).",
+          },
+        },
+      },
+      execute: async (params) => {
+        const apply = params.apply === true;
+        const plan = await store.pruneIndexedFields({ dryRun: !apply });
+        const dropped = plan.filter((p) => p.dropped);
+        const trimmed = plan.filter((p) => !p.dropped);
+        return {
+          dry_run: !apply,
+          fields_dropped: dropped.map((p) => ({ field: p.field, dead_declarers: p.deadDeclarers })),
+          fields_trimmed: trimmed.map((p) => ({ field: p.field, dead_declarers: p.deadDeclarers })),
+          summary: apply
+            ? `pruned ${dropped.length} orphaned field(s); trimmed dead declarers on ${trimmed.length} co-declared field(s)`
+            : `would prune ${dropped.length} orphaned field(s); would trim dead declarers on ${trimmed.length} co-declared field(s) — pass apply:true to execute`,
+        };
       },
     },
 

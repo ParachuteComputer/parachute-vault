@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
+import { buildVaultProjection } from "../core/src/vault-projection.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
 
@@ -478,7 +479,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(9);
+    expect(tools.length).toBe(10);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -490,6 +491,8 @@ describe("MCP tools", async () => {
     expect(names).toContain("delete-tag");
     expect(names).toContain("find-path");
     expect(names).toContain("vault-info");
+    // prune-schema (admin) — drops orphaned indexed-field columns.
+    expect(names).toContain("prune-schema");
     // Six note-schema MCP tools (list/update/delete-note-schema +
     // list/set/delete-schema-mapping) retired in v17 — vault#267.
     expect(names).not.toContain("list-note-schemas");
@@ -3622,6 +3625,78 @@ describe("HTTP /tags", async () => {
     expect(body.description).toBe("A person");
   });
 
+  // P1 regression (vault#398 review) — the REST PUT path calls
+  // store.upsertTagRecord directly. Before the lifecycle was centralized in
+  // the store, PUT {fields:null} or an indexed:false toggle left the
+  // generated column orphaned (the MCP path released, REST didn't). Assert
+  // via the same PRAGMA table_xinfo / buildVaultProjection introspection the
+  // core lifecycle tests use.
+  function notesMetaCols(): string[] {
+    return (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[])
+      .map((r) => r.name)
+      .filter((n) => n.startsWith("meta_"));
+  }
+
+  test("PUT /tags/:name {fields:null} drops the orphaned generated column", async () => {
+    // Declare an indexed field via REST PUT — column materializes.
+    await handleTags(
+      mkReq("PUT", "/tags/project", { fields: { status: { type: "string", indexed: true } } }),
+      store,
+      "/project",
+    );
+    expect(notesMetaCols()).toContain("meta_status");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).toContain("status");
+
+    // Clear all fields via REST PUT {fields:null} — column must drop.
+    const res = await handleTags(
+      mkReq("PUT", "/tags/project", { fields: null }),
+      store,
+      "/project",
+    );
+    expect(res.status).toBe(200);
+    expect(notesMetaCols()).not.toContain("meta_status");
+    const idxs = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='notes'").all() as { name: string }[]).map((r) => r.name);
+    expect(idxs).not.toContain("idx_meta_status");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("status");
+  });
+
+  test("PUT /tags/:name indexed:false toggle drops the generated column", async () => {
+    await handleTags(
+      mkReq("PUT", "/tags/project", { fields: { status: { type: "string", indexed: true } } }),
+      store,
+      "/project",
+    );
+    expect(notesMetaCols()).toContain("meta_status");
+
+    // Re-PUT the same field with indexed:false — REST merges, so the field
+    // stays in the schema but loses its index → column drops.
+    const res = await handleTags(
+      mkReq("PUT", "/tags/project", { fields: { status: { type: "string", indexed: false } } }),
+      store,
+      "/project",
+    );
+    expect(res.status).toBe(200);
+    expect(notesMetaCols()).not.toContain("meta_status");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("status");
+  });
+
+  test("PUT /tags/:name respects the co-declaration guard (keeps column for a live co-declarer)", async () => {
+    await handleTags(
+      mkReq("PUT", "/tags/asset", { fields: { aspect_ratio: { type: "string", indexed: true } } }),
+      store,
+      "/asset",
+    );
+    await handleTags(
+      mkReq("PUT", "/tags/storyboard", { fields: { aspect_ratio: { type: "string", indexed: true } } }),
+      store,
+      "/storyboard",
+    );
+    // Clear asset's fields — storyboard still declares aspect_ratio → keep.
+    await handleTags(mkReq("PUT", "/tags/asset", { fields: null }), store, "/asset");
+    expect(notesMetaCols()).toContain("meta_aspect_ratio");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).toContain("aspect_ratio");
+  });
+
   test("PUT /tags/:name returns 400 with error_type: invalid_relationships on bad shape", async () => {
     const res = await handleTags(
       mkReq("PUT", "/tags/person", {
@@ -4208,13 +4283,14 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("delete-tag");
   });
 
-  test("vault:admin sees all 10 tools including manage-token", async () => {
+  test("vault:admin sees all 11 tools including manage-token + prune-schema", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
-    expect(names.length).toBe(10);
+    expect(names).toContain("prune-schema");
+    expect(names.length).toBe(11);
   });
 
-  test("legacy-derived full token sees all 10 tools (back-compat)", async () => {
+  test("legacy-derived full token sees all 11 tools (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -4238,8 +4314,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     // Legacy permission-derived token: legacyDerived=true, scopes carry the
     // full admin set per `legacyPermissionToScopes("full")`. Compat shim
     // means the operator's existing pvt_* tokens minted pre-scope-column
-    // see the full surface (including manage-token), not just the 9 they
-    // had before.
+    // see the full admin surface (including manage-token + prune-schema).
     const res = await handleScopedMcp(req, vaultName, {
       permission: "full",
       scopes: ["vault:read", "vault:write", "vault:admin"],
@@ -4248,8 +4323,9 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(10);
+    expect(names.length).toBe(11);
     expect(names).toContain("manage-token");
+    expect(names).toContain("prune-schema");
     closeAllStores();
   });
 
