@@ -1157,34 +1157,18 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           : (params.fields !== undefined ? null : undefined);
         const descriptionPatch =
           params.description === undefined ? undefined : (params.description as string);
+        // The indexed-field lifecycle (declareField for added indexed fields,
+        // releaseField for removed ones, with the co-declaration guard) is
+        // reconciled inside store.upsertTagRecord — the single chokepoint all
+        // callers (MCP, REST PUT /tags/:name, import) share — so it can't be
+        // bypassed. The cross-tag validation above stays here to surface a
+        // clean error before persisting. See the gitcoin orphaned-fields bug.
         const result = await store.upsertTagRecord(tag, {
           ...(descriptionPatch !== undefined ? { description: descriptionPatch } : {}),
           ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
           ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
           ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
         });
-
-        // ---- Reconcile indexed-field lifecycle for this tag.
-        const priorIndexed = new Set(
-          Object.entries(existing?.fields ?? {})
-            .filter(([, v]) => v.indexed === true)
-            .map(([k]) => k),
-        );
-        const nextIndexed = new Set(
-          Object.entries(mergedFields)
-            .filter(([, v]) => v.indexed === true)
-            .map(([k]) => k),
-        );
-        for (const fieldName of nextIndexed) {
-          const spec = mergedFields[fieldName]!;
-          const mapped = indexedFieldOps.mapFieldType(spec.type)!;
-          indexedFieldOps.declareField(db, fieldName, mapped, tag);
-        }
-        for (const fieldName of priorIndexed) {
-          if (!nextIndexed.has(fieldName)) {
-            indexedFieldOps.releaseField(db, fieldName, tag);
-          }
-        }
 
         return result;
       },

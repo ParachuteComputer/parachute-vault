@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
+import { buildVaultProjection } from "../core/src/vault-projection.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
 
@@ -3622,6 +3623,78 @@ describe("HTTP /tags", async () => {
     const body = await res.json() as any;
     expect(body.tag).toBe("person");
     expect(body.description).toBe("A person");
+  });
+
+  // P1 regression (vault#398 review) — the REST PUT path calls
+  // store.upsertTagRecord directly. Before the lifecycle was centralized in
+  // the store, PUT {fields:null} or an indexed:false toggle left the
+  // generated column orphaned (the MCP path released, REST didn't). Assert
+  // via the same PRAGMA table_xinfo / buildVaultProjection introspection the
+  // core lifecycle tests use.
+  function notesMetaCols(): string[] {
+    return (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[])
+      .map((r) => r.name)
+      .filter((n) => n.startsWith("meta_"));
+  }
+
+  test("PUT /tags/:name {fields:null} drops the orphaned generated column", async () => {
+    // Declare an indexed field via REST PUT — column materializes.
+    await handleTags(
+      mkReq("PUT", "/tags/project", { fields: { status: { type: "string", indexed: true } } }),
+      store,
+      "/project",
+    );
+    expect(notesMetaCols()).toContain("meta_status");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).toContain("status");
+
+    // Clear all fields via REST PUT {fields:null} — column must drop.
+    const res = await handleTags(
+      mkReq("PUT", "/tags/project", { fields: null }),
+      store,
+      "/project",
+    );
+    expect(res.status).toBe(200);
+    expect(notesMetaCols()).not.toContain("meta_status");
+    const idxs = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='notes'").all() as { name: string }[]).map((r) => r.name);
+    expect(idxs).not.toContain("idx_meta_status");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("status");
+  });
+
+  test("PUT /tags/:name indexed:false toggle drops the generated column", async () => {
+    await handleTags(
+      mkReq("PUT", "/tags/project", { fields: { status: { type: "string", indexed: true } } }),
+      store,
+      "/project",
+    );
+    expect(notesMetaCols()).toContain("meta_status");
+
+    // Re-PUT the same field with indexed:false — REST merges, so the field
+    // stays in the schema but loses its index → column drops.
+    const res = await handleTags(
+      mkReq("PUT", "/tags/project", { fields: { status: { type: "string", indexed: false } } }),
+      store,
+      "/project",
+    );
+    expect(res.status).toBe(200);
+    expect(notesMetaCols()).not.toContain("meta_status");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("status");
+  });
+
+  test("PUT /tags/:name respects the co-declaration guard (keeps column for a live co-declarer)", async () => {
+    await handleTags(
+      mkReq("PUT", "/tags/asset", { fields: { aspect_ratio: { type: "string", indexed: true } } }),
+      store,
+      "/asset",
+    );
+    await handleTags(
+      mkReq("PUT", "/tags/storyboard", { fields: { aspect_ratio: { type: "string", indexed: true } } }),
+      store,
+      "/storyboard",
+    );
+    // Clear asset's fields — storyboard still declares aspect_ratio → keep.
+    await handleTags(mkReq("PUT", "/tags/asset", { fields: null }), store, "/asset");
+    expect(notesMetaCols()).toContain("meta_aspect_ratio");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).toContain("aspect_ratio");
   });
 
   test("PUT /tags/:name returns 400 with error_type: invalid_relationships on bad shape", async () => {

@@ -4,6 +4,7 @@ import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
+import * as indexedFieldOps from "./indexed-fields.js";
 import {
   pruneOrphanedIndexedFields,
   reconcileDeclaredIndexes,
@@ -553,6 +554,18 @@ export class BunSqliteStore implements Store {
    * Partial upsert of the full tag record. Any patch field left undefined
    * is preserved; pass null to clear. Invalidates the tag-hierarchy cache
    * when `parent_names` is touched.
+   *
+   * Indexed-field lifecycle is reconciled HERE — at the single store
+   * chokepoint every caller (MCP update-tag, REST PUT /tags/:name, import)
+   * funnels through — so no caller can persist a `fields` change without the
+   * matching declareField/releaseField. When `patch.fields` is touched
+   * (object or explicit `null`), the prior-vs-next indexed-field set is
+   * diffed: added indexed fields get `declareField`, removed ones get
+   * `releaseField` (which drops the generated column + index only when this
+   * tag is the last live declarer — the co-declaration guard). `patch.fields
+   * === undefined` (no-touch) skips reconciliation entirely. Centralizing
+   * here is the same discipline as moving delete-release into noteOps.deleteTag
+   * — it closes the REST PUT orphaned-column leak. See the gitcoin bug.
    */
   async upsertTagRecord(
     tag: string,
@@ -563,7 +576,43 @@ export class BunSqliteStore implements Store {
       parent_names?: string[] | null;
     },
   ) {
+    // Snapshot the prior indexed-field set BEFORE the write so the diff below
+    // sees what this tag declared going in. Only needed when `fields` changes.
+    const priorRecord =
+      patch.fields !== undefined ? tagSchemaOps.getTagRecord(this.db, tag) : null;
+
     const result = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
+
+    if (patch.fields !== undefined) {
+      const indexedSet = (fields: Record<string, tagSchemaOps.TagFieldSchema> | null | undefined) =>
+        new Set(
+          Object.entries(fields ?? {})
+            .filter(([, v]) => v.indexed === true)
+            .map(([k]) => k),
+        );
+      const nextFields = patch.fields; // object | null
+      const priorIndexed = indexedSet(priorRecord?.fields);
+      const nextIndexed = indexedSet(nextFields);
+      for (const fieldName of nextIndexed) {
+        const spec = nextFields![fieldName]!;
+        const mapped = indexedFieldOps.mapFieldType(spec.type);
+        // Unmappable type for indexing is a caller error; surface it rather
+        // than silently skipping. MCP/REST validate up-front for a cleaner
+        // message, but this is the backstop at the chokepoint.
+        if (!mapped) {
+          throw new indexedFieldOps.IndexedFieldError(
+            `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
+          );
+        }
+        indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
+      }
+      for (const fieldName of priorIndexed) {
+        if (!nextIndexed.has(fieldName)) {
+          indexedFieldOps.releaseField(this.db, fieldName, tag);
+        }
+      }
+    }
+
     if (patch.parent_names !== undefined) {
       // parent_names drives both query expansion (tag hierarchy) AND, post
       // vault#270, schema inheritance — bust both caches.

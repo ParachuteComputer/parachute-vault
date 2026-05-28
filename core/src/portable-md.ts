@@ -2028,17 +2028,25 @@ export async function importPortableVault(
     await store.syncAllWikilinks();
   }
 
-  // 7. Re-declare indexed fields. Step 2 restored tag schemas via
-  // `upsertTagRecord`, which persists `tags.fields` (the schema) but does
-  // NOT materialize the backing generated columns + indexes. Replay
-  // `declareField` for every `indexed: true` field so a fresh import ends
-  // with the same columns a live vault would have — otherwise the imported
-  // schemas advertise `indexed: true` while queries silently full-scan until
-  // each tag is next `update-tag`'d. Idempotent. See the import re-declare fix.
+  // 7. Re-declare indexed fields (belt-and-suspenders + authoritative count).
+  // Step 2 restored tag schemas via `store.upsertTagRecord`, which — now that
+  // the indexed-field lifecycle is centralized in the store — already
+  // materializes the backing generated columns + indexes as it persists each
+  // schema. This explicit reconcile is therefore idempotent on the happy path;
+  // it stays as a safety net (covers any schema written through a path that
+  // skipped the lifecycle) and gives the authoritative `indexes_declared`
+  // count. Without it, a regression in step 2 would silently leave the
+  // imported schemas advertising `indexed: true` while queries full-scan.
   if (!opts.dryRun) {
     stats.indexes_declared = await store.reconcileDeclaredIndexes();
   } else {
-    // Dry-run: count what WOULD be declared without touching the DB.
+    // Dry-run: count what WOULD be declared without touching the DB. Both
+    // paths count per (tag, field) declaration (a co-declared field counts
+    // once per declaring tag). The one asymmetry: this dry-run counts every
+    // `indexed: true` field including unsupported types, whereas the applied
+    // `reconcileDeclaredIndexes` skips fields whose type can't be indexed —
+    // so the dry-run can over-count by the number of mis-typed indexed
+    // fields. It's a "how much indexing work" signal, not a row-exact promise.
     const schemasDir2 = join(sidecar, "schemas");
     if (existsSync(schemasDir2)) {
       for (const entry of readdirSync(schemasDir2)) {
