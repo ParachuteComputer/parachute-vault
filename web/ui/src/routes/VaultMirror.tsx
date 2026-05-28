@@ -491,6 +491,13 @@ function ConfigForm({
 
       <div className="form-row">
         <label>Presets</label>
+        <p className="dim" style={{ marginTop: 0, marginBottom: "0.5rem", fontSize: "0.9em" }}>
+          <strong>History</strong> is the easiest start — vault manages the
+          mirror folder under its own data dir, no path to pick, no remote
+          to configure. <strong>Live Mirror</strong> + <strong>Manual
+          Export</strong> are for operators who want to point at a visible
+          folder (Obsidian, GitHub).
+        </p>
         <div className="preset-grid">
           {PRESETS.map((preset) => (
             <button
@@ -722,9 +729,16 @@ function ConfigForm({
 
 /**
  * Top-level credentials section. Shows current connection state +
- * affords Connect GitHub / Use PAT / Disconnect.
+ * affords Use PAT / Connect GitHub / Disconnect.
  *
- * The OAuth modal is the primary path: operator clicks "Connect GitHub",
+ * PAT is the primary path because it works against any HTTPS+token git
+ * host (GitHub, GitLab, Gitea, Bitbucket, self-hosted). The GitHub
+ * Device Flow is presented as a one-click shortcut for GitHub users —
+ * same end-state (a token wired into the mirror's remote URL), just
+ * one fewer step. Aaron called this framing 2026-05-28: leading with
+ * "Connect GitHub" implies Parachute is GitHub-only, which it isn't.
+ *
+ * The OAuth modal works like this: operator clicks "Connect GitHub",
  * vault calls GitHub's device-code endpoint, the modal displays the
  * user_code + verification_uri, operator types the code at
  * github.com/login/device, the modal polls until granted, then surfaces a
@@ -835,7 +849,12 @@ function GitRemoteSection({
           ) : null}
         </div>
       ) : (
-        <p className="dim">Not connected. Auto-push won't work until you connect.</p>
+        <p className="dim">
+          Not connected. Auto-push won't work until you connect. Personal
+          Access Token is the universal path (works with GitHub, GitLab,
+          Gitea, Bitbucket, anything that takes an HTTPS token); the GitHub
+          shortcut just saves a step for GitHub users.
+        </p>
       )}
 
       {actionError ? (
@@ -847,15 +866,23 @@ function GitRemoteSection({
       <div className="actions">
         {!connected ? (
           <>
-            <button type="button" onClick={() => setOauthOpen(true)}>
-              Connect GitHub
+            {/*
+              PAT is the primary action — works against any HTTPS+token git
+              host (GitHub, GitLab, Gitea, Bitbucket, self-hosted). The
+              GitHub Device Flow is a convenience shortcut: same result as
+              generating a PAT manually, just one fewer step for GitHub
+              users. Don't lead with the GitHub-specific path; it'd
+              suggest Parachute is GitHub-only.
+            */}
+            <button type="button" onClick={() => setPatOpen(true)}>
+              Use Personal Access Token
             </button>
             <button
               type="button"
               className="secondary"
-              onClick={() => setPatOpen(true)}
+              onClick={() => setOauthOpen(true)}
             >
-              Use Personal Access Token
+              Connect GitHub (one-click for GitHub users)
             </button>
           </>
         ) : (
