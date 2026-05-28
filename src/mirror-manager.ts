@@ -1,20 +1,30 @@
 /**
- * Mirror lifecycle manager — boot-time bootstrap + in-process watch loop.
+ * Mirror lifecycle manager — boot-time bootstrap + event-driven exports.
  *
  * This is the persistent counterpart to vault#346's CLI watch+commit mode.
+ * Post-event-driven shift (vault#382, this PR), the manager replaces the
+ * original `setInterval` polling loop with in-process hook subscriptions.
+ * Every note / tag / attachment mutation fires an event; the manager
+ * debounces them (~500ms) into a single export pass. A background
+ * safety-net poll runs once per `safety_net_seconds` (default 1h) to
+ * catch anything the event path missed — direct SQL writes, dropped
+ * hook dispatches, restart gaps.
+ *
  * Responsibilities:
  *
  *   - On vault server boot: read mirror config, resolve mirror path,
  *     bootstrap (mkdir + git init + initial commit) when internal + new,
  *     trigger an initial export to bring the mirror to current state,
- *     and — if `watch: true` — start an in-process polling loop.
+ *     and — if `sync_mode: events` — subscribe to hooks + arm the
+ *     safety-net poll.
  *
  *   - On config change (via `PUT /admin/mirror` or operator-triggered
- *     reload): stop the current watch loop cleanly, re-resolve, restart
- *     with the new shape.
+ *     reload): tear down all subscriptions + timers, re-resolve,
+ *     restart with the new shape.
  *
- *   - On vault server shutdown: drain in-flight export + cancel the
- *     interval timer cleanly.
+ *   - On vault server shutdown: unsubscribe, cancel any pending
+ *     debounce timer, cancel safety-net poll, let an in-flight export
+ *     finish via the soft settle window.
  *
  * Singleton per-process: one `MirrorManager` instance backs the vault
  * server's lifecycle. Tests instantiate `MirrorManager` directly with
@@ -27,11 +37,28 @@
  * `PARACHUTE_VAULT_NAME` / `default_vault`; the mirror config follows
  * suit. Multi-vault mirror routing is a future ripple (open question 2
  * in the design doc).
+ *
+ * ## Race-condition contract
+ *
+ * - **Burst collapse** — two events within DEBOUNCE_MS produce one
+ *   export pass. The first event arms the timer; subsequent events
+ *   re-arm it.
+ * - **Event during in-flight export** — flag `dirtyDuringFlush`; after
+ *   the in-flight pass completes, run another. No second concurrent
+ *   pass; no missed events.
+ * - **Stop() during in-flight** — like the legacy soft-settle window,
+ *   give the export ~250ms to finish before returning. Subscriptions
+ *   come down BEFORE the settle wait so no further events queue.
+ * - **Safety net during event-driven path** — the poll's tick first
+ *   checks the dirty bit. If clear, it runs a full sweep anyway (catches
+ *   missed events). If set, it skips — the debounce timer's already
+ *   coming.
  */
 
 import { existsSync, mkdirSync, readdirSync, statSync } from "fs";
 
 import {
+  DEFAULT_SAFETY_NET_SECONDS,
   defaultMirrorConfig,
   resolveMirrorPath,
   type MirrorConfig,
@@ -43,6 +70,15 @@ import {
   runGitCommitCycle,
 } from "./export-watch.ts";
 import { vaultDir } from "./config.ts";
+import type { HookRegistry } from "../core/src/hooks.ts";
+
+/**
+ * Debounce window between an event arrival and the export pass it
+ * triggers. 500ms is the sweet spot: long enough to collapse a burst
+ * (typing in a frontend, a batch import) into one export, short enough
+ * that the mirror feels live during normal editing.
+ */
+const DEBOUNCE_MS = 500;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,11 +92,18 @@ import { vaultDir } from "./config.ts";
 export interface MirrorStatus {
   /** True iff `mirror.enabled` is true AND bootstrap succeeded. */
   enabled: boolean;
-  /** True iff a watch interval timer is currently armed. */
+  /**
+   * True iff hook subscriptions are currently active.
+   *
+   * Pre-event-driven this was named after the polling loop; we retain
+   * the name for SPA-shape stability — the SPA's "Watch loop" label
+   * now reflects "events subscribed + safety-net armed". The semantics
+   * shifted, not the API.
+   */
   watch_running: boolean;
   /** Resolved mirror path on disk, or null if disabled / unresolved. */
   mirror_path: string | null;
-  /** ISO timestamp of the most recent export pass (initial or watch). */
+  /** ISO timestamp of the most recent export pass (initial or event-driven or safety-net). */
   last_export_at: string | null;
   /** Notes touched by the most recent export pass. */
   last_export_notes_count: number | null;
@@ -89,6 +132,18 @@ export interface MirrorDeps {
     sinceCursor?: string;
   }) => Promise<{ notes: number }>;
   /**
+   * Run an orphan-prune sweep against the mirror dir. Returns counts so
+   * the manager can log + surface them in status. Optional — when
+   * undefined, the manager skips the prune step (test seam; production
+   * always wires it through `mirror-deps.ts`).
+   */
+  runPrune?: (opts: { outDir: string }) => Promise<{
+    notes_removed: number;
+    sidecars_removed: number;
+    schemas_removed: number;
+    attachment_dirs_removed: number;
+  }>;
+  /**
    * Resolve the first-changed-note title since `cursor`, for the
    * `{{first_note_title}}` commit-template variable. Best-effort — empty
    * string when nothing matches.
@@ -101,6 +156,14 @@ export interface MirrorDeps {
    * via the standard writer — used by `PUT /admin/mirror`.
    */
   writeMirrorConfig: (config: MirrorConfig) => void;
+  /**
+   * Shared in-process hook registry. The manager calls `.onNote()` /
+   * `.onTag()` / `.onAttachment()` on this registry to drive
+   * event-driven exports. Optional — when undefined the manager runs
+   * with only the safety-net poll (back-compat shape for tests that
+   * predate the event-driven path).
+   */
+  hooks?: HookRegistry;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,17 +286,18 @@ export async function bootstrapInternalMirror(
 
 /**
  * Singleton lifecycle controller. Holds the active mirror config, the
- * resolved path, the watch timer (when running), and the rolling status.
+ * resolved path, hook subscriptions (when sync_mode=events), the
+ * safety-net poll timer, the debounce timer, and the rolling status.
  *
  * State transitions:
  *
- *   constructed → start() → [enabled? bootstrap+initial-export+watch?]
+ *   constructed → start() → [enabled? bootstrap + initial-export +
+ *                            subscribe-to-hooks + arm-safety-net?]
  *     ↓                              ↓
- *     stop()                       reload() — stop current loop, re-evaluate
+ *     stop()                       reload() — tear down everything, re-evaluate
  *
- * Re-entrancy: the watch tick uses a `inFlight` guard like the CLI mode so
- * back-to-back ticks (e.g. when an export takes longer than the interval)
- * don't pile up.
+ * Re-entrancy: in-flight + dirtyDuringFlush guards collapse concurrent
+ * triggers into one pass + one follow-up (never two parallel exports).
  */
 export class MirrorManager {
   private deps: MirrorDeps;
@@ -246,9 +310,17 @@ export class MirrorManager {
     last_commit_sha: null,
     last_error: null,
   };
-  private timer: ReturnType<typeof setInterval> | null = null;
+  /** Safety-net poll timer (interval). Null while not armed. */
+  private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
+  /** Debounce timer (single-shot setTimeout). Null when no events pending. */
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Unsubscribe handles returned by `hooks.on*()`. */
+  private unsubscribes: Array<() => void> = [];
   private stopping = false;
+  /** A flush is currently running. Other triggers should not start a new one. */
   private inFlight = false;
+  /** Set when an event/safety-net tick arrives during an in-flight flush. */
+  private dirtyDuringFlush = false;
   /** Most recent export cursor — passed as `--since` to the next pass. */
   private cursor: string | undefined = undefined;
   private currentConfig: MirrorConfig = defaultMirrorConfig();
@@ -354,29 +426,33 @@ export class MirrorManager {
 
     // Initial export — full pass (no cursor) so the mirror starts
     // byte-equivalent to current vault state, regardless of when the
-    // previous mirror was last refreshed.
+    // previous mirror was last refreshed. Also prunes orphans because
+    // the initial pass writes the entire vault; anything left over
+    // from a prior mirror run that doesn't match a current note is by
+    // definition orphaned.
     try {
-      await this.runOneCycle({ isInitial: true });
+      await this.runOneCycle({ isInitial: true, prune: true });
     } catch (err) {
       const msg = (err as Error).message ?? String(err);
       this.status.last_error = `initial export failed: ${msg}`;
       console.warn(`[mirror] ${this.status.last_error}`);
       // Don't disable the manager — operator may want to retry without
-      // restarting the server. Keep status.enabled true so the watch
-      // loop attempts again if armed; the next successful pass clears
-      // last_error.
+      // restarting the server. Keep status.enabled true so the safety-
+      // net loop attempts again if armed; the next successful pass
+      // clears last_error.
     }
 
-    if (config.watch) {
-      this.armWatchTimer();
+    if (config.sync_mode === "events") {
+      this.subscribeToHooks();
+      this.armSafetyNetTimer();
       this.status.watch_running = true;
       console.log(
-        `[mirror] enabled (location: ${config.location}, watch: true) — initial export complete, watch loop running every ${config.interval_seconds}s`,
+        `[mirror] enabled (location: ${config.location}, sync_mode: events) — initial export complete, hooks subscribed, safety-net every ${config.safety_net_seconds}s`,
       );
     } else {
       this.status.watch_running = false;
       console.log(
-        `[mirror] enabled (location: ${config.location}, watch: false) — initial export complete, manual mode`,
+        `[mirror] enabled (location: ${config.location}, sync_mode: manual) — initial export complete, manual mode`,
       );
     }
 
@@ -384,21 +460,43 @@ export class MirrorManager {
   }
 
   /**
-   * Stop the watch loop cleanly. Awaits the in-flight cycle (if any) up to
-   * a soft timeout — don't hang shutdown forever, but give a running
-   * export a chance to finish + write a coherent commit.
+   * Stop the mirror lifecycle cleanly:
+   *   - Unsubscribe from hooks first so no new events queue.
+   *   - Cancel debounce + safety-net timers.
+   *   - Await the in-flight cycle (if any) up to a soft timeout.
    *
    * `preserveStatus: true` is the start()-internal path that keeps the
    * status fields around for the about-to-restart pass; default false
-   * blanks them.
+   * blanks the `watch_running` indicator.
    */
   async stop(opts: { preserveStatus?: boolean } = {}): Promise<void> {
     this.stopping = true;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
+
+    // Unsubscribe BEFORE waiting for in-flight — additional events
+    // arriving after we start the settle wait would re-arm the debounce
+    // timer and stretch the wait indefinitely.
+    for (const off of this.unsubscribes) {
+      try {
+        off();
+      } catch (err) {
+        // Unsubscribe should never throw; defensive log only.
+        console.warn(`[mirror] unsubscribe threw: ${(err as Error).message ?? err}`);
+      }
     }
-    // Brief settle window — match the CLI watch-loop convention.
+    this.unsubscribes = [];
+
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    if (this.safetyNetTimer) {
+      clearInterval(this.safetyNetTimer);
+      this.safetyNetTimer = null;
+    }
+
+    // Brief settle window — give an in-flight export ~250ms to complete
+    // + write a coherent commit. Don't hang shutdown indefinitely; the
+    // export's status will surface a half-finished state on next start.
     const settleMs = 250;
     const start = Date.now();
     while (this.inFlight && Date.now() - start < settleMs) {
@@ -408,6 +506,9 @@ export class MirrorManager {
       this.status.watch_running = false;
     }
     this.stopping = false;
+    // Discard any dirty bit from events that arrived during shutdown —
+    // they'll be picked up on the next start()'s initial export anyway.
+    this.dirtyDuringFlush = false;
   }
 
   /**
@@ -425,26 +526,178 @@ export class MirrorManager {
 
   /**
    * Force a one-shot export cycle right now. Useful for "force re-export"
-   * buttons (future hub UI) + tests that want a deterministic cycle
-   * without waiting on the timer.
+   * buttons (admin SPA) + tests that want a deterministic cycle without
+   * waiting on the debounce or safety-net timer.
+   *
+   * Always runs with prune=true: a manual trigger is an explicit "make
+   * the mirror match vault state right now" request; orphan sweeps are
+   * cheap on typical vaults and the operator probably wanted that
+   * effect anyway.
    */
   async runNow(): Promise<MirrorStatus> {
     if (!this.status.enabled) {
       return this.getStatus();
     }
-    await this.runOneCycle({ isInitial: false });
+    await this.runOneCycle({ isInitial: false, prune: true });
     return this.getStatus();
   }
 
   // Visible-for-test: number of `start()` calls so far.
   _startCount(): number { return this.startCount; }
 
+  // ---------------------------------------------------------------------
+  // Event-driven path
+  // ---------------------------------------------------------------------
+
   /**
-   * Stage → export → commit pipeline for a single cycle. Updates status
-   * fields with the outcome. Errors logged + reflected in `last_error`
-   * but never rethrown out of the watch loop (the loop would die).
+   * Subscribe to note / tag / attachment hooks. Each event arms the
+   * debounce timer (or marks the dirty bit if a flush is already
+   * running). Stop() will call the unsubscribe handles in `unsubscribes`.
+   *
+   * Subscribes to every mutation event the mirror cares about:
+   *   - notes: created, updated, deleted
+   *   - tags: upserted, deleted
+   *   - attachments: created, deleted
    */
-  private async runOneCycle(opts: { isInitial: boolean }): Promise<void> {
+  private subscribeToHooks(): void {
+    const hooks = this.deps.hooks;
+    if (!hooks) {
+      // No hook registry wired — fall back to safety-net only. Logged
+      // once at start; tests that exercise this path inspect status,
+      // not logs.
+      console.warn(
+        `[mirror] sync_mode: events requested but no HookRegistry wired in deps — running with safety-net poll only`,
+      );
+      return;
+    }
+
+    const onMutation = () => {
+      // Cheap pulse — flag dirty + arm the debounce.
+      if (this.inFlight) {
+        this.dirtyDuringFlush = true;
+        return;
+      }
+      this.armDebounce();
+    };
+
+    this.unsubscribes.push(
+      hooks.onNote({
+        name: "mirror-note-mutation",
+        event: ["created", "updated", "deleted"],
+        handler: onMutation,
+      }),
+    );
+    this.unsubscribes.push(
+      hooks.onTag({
+        name: "mirror-tag-mutation",
+        event: ["upserted", "deleted"],
+        handler: onMutation,
+      }),
+    );
+    this.unsubscribes.push(
+      hooks.onAttachment({
+        name: "mirror-attachment-mutation",
+        event: ["created", "deleted"],
+        handler: onMutation,
+      }),
+    );
+  }
+
+  /**
+   * Arm or re-arm the debounce timer. Subsequent calls within
+   * DEBOUNCE_MS reset the timer (classic debounce). When the timer
+   * fires, run an export pass; if events arrived during the export,
+   * run again.
+   */
+  private armDebounce(): void {
+    if (this.stopping) return;
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      void this.runFlush({ prune: false });
+    }, DEBOUNCE_MS);
+    this.debounceTimer.unref?.();
+  }
+
+  /**
+   * Run a single flush — guards against concurrent runs, follows up
+   * with another pass if events arrived mid-flight. The event-driven
+   * fast path uses prune=false (rely on the targeted "deleted" events
+   * for delete propagation; the safety-net + manual-run paths sweep).
+   *
+   * In practice deletions DO need pruning even on the fast path —
+   * `exportVaultToDir` only writes existing notes; the file the
+   * deletion event refers to has to be removed somewhere. The current
+   * implementation runs a full prune sweep on every flush so deletes
+   * propagate within the debounce window. (If profiling shows this is
+   * expensive for very large vaults, a targeted-deletion queue could
+   * replace the sweep on the fast path — recorded as a possible
+   * future optimization in the design doc.)
+   */
+  private async runFlush(opts: { prune: boolean }): Promise<void> {
+    if (this.stopping) return;
+    if (this.inFlight) {
+      // Shouldn't happen given the dirty-bit guards in armDebounce +
+      // safetyNet; defensive only.
+      this.dirtyDuringFlush = true;
+      return;
+    }
+    this.inFlight = true;
+    try {
+      // Event-driven flushes prune-on-flush so deletions actually
+      // propagate. Cost: O(mirror size) per flush — fine for typical
+      // vaults. See doc above on the targeted-queue optimization.
+      await this.runOneCycle({ isInitial: false, prune: true });
+    } catch (err) {
+      const msg = (err as Error).message ?? String(err);
+      this.status.last_error = `event-driven flush failed: ${msg}`;
+      console.warn(`[mirror] ${this.status.last_error}`);
+    } finally {
+      this.inFlight = false;
+    }
+
+    // If events arrived during the flush, run again (one follow-up,
+    // not a loop — armDebounce re-engages if events keep coming).
+    if (this.dirtyDuringFlush && !this.stopping) {
+      this.dirtyDuringFlush = false;
+      this.armDebounce();
+    }
+  }
+
+  /**
+   * Arm the safety-net poll. Runs once per `safety_net_seconds`. When
+   * it fires:
+   *   - If a flush is already pending (debounce armed) or in-flight,
+   *     skip (the event path will catch it).
+   *   - Otherwise, run a full prune+export sweep so anything missed by
+   *     the events (direct SQL writes, dropped dispatches, restart
+   *     gaps) lands in the mirror.
+   */
+  private armSafetyNetTimer(): void {
+    if (this.safetyNetTimer) return;
+    const intervalMs = (
+      this.currentConfig.safety_net_seconds || DEFAULT_SAFETY_NET_SECONDS
+    ) * 1000;
+    this.safetyNetTimer = setInterval(async () => {
+      if (this.stopping) return;
+      if (this.debounceTimer || this.inFlight) {
+        // Event path's already handling things; this poll is a no-op.
+        return;
+      }
+      await this.runFlush({ prune: true });
+    }, intervalMs);
+    this.safetyNetTimer.unref?.();
+  }
+
+  /**
+   * Stage → export → prune (optional) → commit pipeline for a single
+   * cycle. Updates status fields with the outcome. Errors logged +
+   * reflected in `last_error` but never rethrown out of the event
+   * dispatcher (would kill the loop).
+   */
+  private async runOneCycle(opts: { isInitial: boolean; prune: boolean }): Promise<void> {
     const nextCursor = new Date().toISOString();
     const path = this.status.mirror_path!;
     const sinceCursor = opts.isInitial ? undefined : this.cursor;
@@ -459,6 +712,34 @@ export class MirrorManager {
       return;
     }
 
+    // Orphan sweep — removes files in the mirror that don't correspond
+    // to a current vault note/tag/attachment. Counts surface in logs;
+    // the count of removed files is folded into the commit's
+    // `notes_changed` so the commit message reflects the delete too.
+    let prunedNotes = 0;
+    if (opts.prune && this.deps.runPrune) {
+      try {
+        const pruneStats = await this.deps.runPrune({ outDir: path });
+        prunedNotes = pruneStats.notes_removed + pruneStats.sidecars_removed;
+        const removedTotal =
+          pruneStats.notes_removed +
+          pruneStats.sidecars_removed +
+          pruneStats.schemas_removed +
+          pruneStats.attachment_dirs_removed;
+        if (removedTotal > 0) {
+          console.log(
+            `[mirror] prune: removed ${pruneStats.notes_removed} note(s), ${pruneStats.sidecars_removed} sidecar(s), ${pruneStats.schemas_removed} schema(s), ${pruneStats.attachment_dirs_removed} attachment dir(s)`,
+          );
+        }
+      } catch (err) {
+        // Prune failure is non-fatal — the export already wrote the
+        // current state; the next sweep retries.
+        console.warn(
+          `[mirror] prune failed (non-fatal): ${(err as Error).message ?? err}`,
+        );
+      }
+    }
+
     this.cursor = nextCursor;
     this.status.last_export_at = nextCursor;
     this.status.last_export_notes_count = stats.notes;
@@ -471,11 +752,23 @@ export class MirrorManager {
       return;
     }
 
+    // Commit when EITHER notes changed OR orphans were pruned. The
+    // commit message's `notes_changed` reflects the union — operators
+    // reading a "deleted 3 notes" diff in their mirror should see that
+    // count in the commit. (Pre-event-driven this was strictly
+    // notes-from-export; orphan deletes weren't tracked.)
+    const totalChanged = stats.notes + prunedNotes;
+    if (totalChanged === 0) {
+      // Nothing to commit; runGitCommitCycle would no-op anyway, but
+      // skipping early avoids the firstNoteTitle DB lookup.
+      return;
+    }
+
     const firstNoteTitle = await this.deps.firstChangedNoteTitle(sinceCursor);
     const commitResult = await runGitCommitCycle({
       repoDir: path,
       template: this.currentConfig.commit_template,
-      notesChanged: stats.notes,
+      notesChanged: totalChanged,
       vaultName: this.deps.vaultName,
       firstNoteTitle,
       push: this.currentConfig.auto_push,
@@ -492,30 +785,25 @@ export class MirrorManager {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Test seams
+  // ---------------------------------------------------------------------
+
   /**
-   * Arm the watch interval. Tick is in-flight-guarded so a slow export
-   * doesn't pile up parallel runs.
+   * Force the debounce timer to fire immediately (cancel + run flush).
+   * Used by mirror-manager.test.ts to avoid sleeping through 500ms in
+   * every event-driven test case. Not exposed via the public API.
    */
-  private armWatchTimer(): void {
-    if (this.timer) return;
-    const intervalMs = this.currentConfig.interval_seconds * 1000;
-    this.timer = setInterval(async () => {
-      if (this.stopping || this.inFlight) return;
-      this.inFlight = true;
-      try {
-        await this.runOneCycle({ isInitial: false });
-      } catch (err) {
-        // Defensive — runOneCycle already swallows export errors, but
-        // commit/git errors might bubble. Never kill the loop.
-        const msg = (err as Error).message ?? String(err);
-        this.status.last_error = `watch tick failed: ${msg}`;
-        console.warn(`[mirror] ${this.status.last_error}`);
-      } finally {
-        this.inFlight = false;
-      }
-    }, intervalMs);
-    // Don't keep the server process alive purely on the timer; vault
-    // already has the HTTP server + various intervals doing that.
-    this.timer.unref?.();
+  async _flushDebounceForTest(): Promise<void> {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    await this.runFlush({ prune: false });
+  }
+
+  /** Test seam: snapshot of the unsubscribe-handle count. */
+  _subscriptionCount(): number {
+    return this.unsubscribes.length;
   }
 }

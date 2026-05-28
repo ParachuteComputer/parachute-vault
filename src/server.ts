@@ -315,18 +315,31 @@ const server = Bun.serve({
 console.log(`Parachute Vault server listening on http://${hostname}:${server.port}`);
 
 // Graceful shutdown — best-effort drain of in-flight note-mutation hooks.
+//
+// Order matters under the event-driven mirror shape (vault#382):
+//   1. MirrorManager.stop() runs FIRST so it can unsubscribe from hooks
+//      cleanly + cancel its debounce timer. Otherwise the registry drain
+//      below would wait on the manager's hook handler that just queued
+//      itself after a final mutation.
+//   2. Then drain hooks + stop the transcription worker in parallel —
+//      neither depends on the other.
+//
+// The whole thing races a 5s timeout so a stuck handler doesn't hang
+// shutdown indefinitely.
 async function shutdown(signal: string): Promise<void> {
   console.log(`\n[${signal}] shutting down; in-flight hooks: ${defaultHookRegistry.inFlightCount}`);
   try {
     await Promise.race([
-      Promise.all([
-        defaultHookRegistry.drain(),
-        transcriptionWorker?.stop() ?? Promise.resolve(),
-        // Mirror manager: cancel the watch interval + let any in-flight
-        // export cycle settle. `stop` already has its own brief timeout
-        // (250ms) so this doesn't block the larger shutdown race.
-        mirrorManager?.stop() ?? Promise.resolve(),
-      ]),
+      (async () => {
+        // Mirror stop first — unsubscribes + cancels its debounce. Its
+        // internal soft-settle timeout (250ms) bounds the wait.
+        await (mirrorManager?.stop() ?? Promise.resolve());
+        // Then drain hooks + stop the transcription worker in parallel.
+        await Promise.all([
+          defaultHookRegistry.drain(),
+          transcriptionWorker?.stop() ?? Promise.resolve(),
+        ]);
+      })(),
       new Promise<void>((resolve) => setTimeout(resolve, 5000)),
     ]);
   } catch (err) {

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { HookRegistry } from "./hooks.js";
+import { HookRegistry, type DeletedNoteRef, type DeletedAttachmentRef } from "./hooks.js";
 import type { Note } from "./types.js";
 
 let db: Database;
@@ -357,5 +357,324 @@ describe("HookRegistry — HOOK_CONCURRENCY env var parsing", async () => {
     await r.drain();
     expect(maxConcurrent).toBe(1);
     restore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// New event types — deleted notes, tag mutations, deleted attachments
+// (vault#382 — event-driven git-mirror foundation)
+// ---------------------------------------------------------------------------
+
+describe("HookRegistry — deleted note events", () => {
+  let db: Database;
+  let hooks: HookRegistry;
+  let store: SqliteStore;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    hooks = new HookRegistry({ concurrency: 4, logger: silentLogger });
+    store = new SqliteStore(db, { hooks });
+  });
+
+  async function settle(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+  }
+
+  it("default subscription doesn't include 'deleted'", async () => {
+    // Existing hooks pre-deleted-event don't suddenly start receiving
+    // delete shapes they weren't typed for.
+    const fired: string[] = [];
+    hooks.onNote({
+      handler: (note) => {
+        fired.push(note.id);
+      },
+    });
+
+    const note = await store.createNote("hi");
+    await settle();
+    fired.length = 0;
+    await store.deleteNote(note.id);
+    await settle();
+    expect(fired).toEqual([]);
+  });
+
+  it("explicit 'deleted' subscription receives DeletedNoteRef on store.deleteNote", async () => {
+    const seen: Array<{ event: string; id: string; path?: string }> = [];
+    hooks.onNote({
+      event: "deleted",
+      handler: (payload, _store, event) => {
+        // payload here is a DeletedNoteRef (we subscribed to deleted only).
+        const ref = payload as DeletedNoteRef;
+        seen.push({ event: event ?? "deleted", id: ref.id, path: ref.path });
+      },
+    });
+
+    const note = await store.createNote("doomed", { path: "to-delete" });
+    await settle();
+    await store.deleteNote(note.id);
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.event).toBe("deleted");
+    expect(seen[0]!.id).toBe(note.id);
+    expect(seen[0]!.path).toBe("to-delete");
+  });
+
+  it("DeletedNoteRef has no metadata/tags/content (predicate authors take note)", async () => {
+    const observedPayloads: unknown[] = [];
+    hooks.onNote({
+      event: "deleted",
+      handler: (payload) => {
+        observedPayloads.push(payload);
+      },
+    });
+    const n = await store.createNote("with tags", { tags: ["one", "two"], metadata: { color: "blue" } });
+    await settle();
+    await store.deleteNote(n.id);
+    await settle();
+    expect(observedPayloads).toHaveLength(1);
+    const p = observedPayloads[0] as Record<string, unknown>;
+    expect(p.id).toBe(n.id);
+    // Strictly minimal shape — no full Note fields leak through.
+    expect(p.content).toBeUndefined();
+    expect(p.metadata).toBeUndefined();
+    expect(p.tags).toBeUndefined();
+  });
+
+  it("array events allow subscribing to created+updated+deleted in one hook", async () => {
+    const events: string[] = [];
+    hooks.onNote({
+      event: ["created", "updated", "deleted"],
+      handler: (_n, _s, ev) => {
+        events.push(ev ?? "?");
+      },
+    });
+    const n = await store.createNote("lifecycle");
+    await settle();
+    await store.updateNote(n.id, { content: "v2" });
+    await settle();
+    await store.deleteNote(n.id);
+    await settle();
+    expect(events).toEqual(["created", "updated", "deleted"]);
+  });
+
+  it("predicate on a deleted event receives DeletedNoteRef and can filter on path", async () => {
+    const fired: string[] = [];
+    hooks.onNote({
+      event: "deleted",
+      when: (payload) => {
+        const ref = payload as DeletedNoteRef;
+        return ref.path?.startsWith("keep/") === true;
+      },
+      handler: (payload) => {
+        fired.push((payload as DeletedNoteRef).id);
+      },
+    });
+    const a = await store.createNote("a", { path: "keep/one" });
+    const b = await store.createNote("b", { path: "skip/two" });
+    await settle();
+    await store.deleteNote(a.id);
+    await store.deleteNote(b.id);
+    await settle();
+    expect(fired).toEqual([a.id]);
+  });
+});
+
+describe("HookRegistry — tag events", () => {
+  let db: Database;
+  let hooks: HookRegistry;
+  let store: SqliteStore;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    hooks = new HookRegistry({ concurrency: 4, logger: silentLogger });
+    store = new SqliteStore(db, { hooks });
+  });
+
+  async function settle(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+  }
+
+  it("upsertTagRecord dispatches 'upserted'", async () => {
+    const seen: Array<{ tag: string; event: string }> = [];
+    hooks.onTag({
+      handler: (tag, _store, event) => {
+        seen.push({ tag, event: event ?? "?" });
+      },
+    });
+    await store.upsertTagRecord("project", { description: "a project" });
+    await settle();
+    expect(seen).toEqual([{ tag: "project", event: "upserted" }]);
+  });
+
+  it("upsertTagSchema dispatches 'upserted'", async () => {
+    const seen: string[] = [];
+    hooks.onTag({
+      event: "upserted",
+      handler: (tag) => {
+        seen.push(tag);
+      },
+    });
+    await store.upsertTagSchema("meeting", {
+      fields: { duration: { type: "number" } },
+    });
+    await settle();
+    expect(seen).toEqual(["meeting"]);
+  });
+
+  it("deleteTag dispatches 'deleted' only when the tag actually existed", async () => {
+    const seen: string[] = [];
+    hooks.onTag({
+      event: "deleted",
+      handler: (tag) => {
+        seen.push(tag);
+      },
+    });
+    const note = await store.createNote("tagged", { tags: ["mytag"] });
+    await settle();
+
+    // Delete the tag — fires.
+    await store.deleteTag("mytag");
+    await settle();
+    expect(seen).toEqual(["mytag"]);
+
+    // Delete a tag that doesn't exist — no fire.
+    await store.deleteTag("never-existed");
+    await settle();
+    expect(seen).toEqual(["mytag"]);
+    void note; // silence unused
+  });
+
+  it("renameTag dispatches deleted(old) + upserted(new)", async () => {
+    const events: Array<{ tag: string; event: string }> = [];
+    hooks.onTag({
+      handler: (tag, _store, event) => {
+        events.push({ tag, event: event ?? "?" });
+      },
+    });
+    await store.createNote("tagged", { tags: ["old-name"] });
+    await settle();
+    await store.renameTag("old-name", "new-name");
+    await settle();
+    // Order is implementation-defined; assert the set instead.
+    expect(events).toContainEqual({ tag: "old-name", event: "deleted" });
+    expect(events).toContainEqual({ tag: "new-name", event: "upserted" });
+  });
+
+  it("mergeTags dispatches deleted for each source + upserted for target", async () => {
+    const events: Array<{ tag: string; event: string }> = [];
+    hooks.onTag({
+      handler: (tag, _store, event) => {
+        events.push({ tag, event: event ?? "?" });
+      },
+    });
+    await store.createNote("a", { tags: ["src1"] });
+    await store.createNote("b", { tags: ["src2"] });
+    await settle();
+    events.length = 0;
+    await store.mergeTags(["src1", "src2"], "target");
+    await settle();
+    expect(events).toContainEqual({ tag: "src1", event: "deleted" });
+    expect(events).toContainEqual({ tag: "src2", event: "deleted" });
+    expect(events).toContainEqual({ tag: "target", event: "upserted" });
+  });
+
+  it("deleteTagSchema fires 'deleted' for the schema slot", async () => {
+    const seen: string[] = [];
+    hooks.onTag({
+      event: "deleted",
+      handler: (tag) => {
+        seen.push(tag);
+      },
+    });
+    await store.upsertTagSchema("foo", { description: "x" });
+    await settle();
+    const ok = await store.deleteTagSchema("foo");
+    await settle();
+    expect(ok).toBe(true);
+    expect(seen).toEqual(["foo"]);
+  });
+
+  it("predicate filters tag events by name", async () => {
+    const seen: string[] = [];
+    hooks.onTag({
+      when: (tag) => tag.startsWith("_"),
+      handler: (tag) => {
+        seen.push(tag);
+      },
+    });
+    await store.upsertTagRecord("public-tag", { description: "x" });
+    await store.upsertTagRecord("_private-tag", { description: "y" });
+    await settle();
+    expect(seen).toEqual(["_private-tag"]);
+  });
+});
+
+describe("HookRegistry — deleted attachment events", () => {
+  let db: Database;
+  let hooks: HookRegistry;
+  let store: SqliteStore;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    hooks = new HookRegistry({ concurrency: 4, logger: silentLogger });
+    store = new SqliteStore(db, { hooks });
+  });
+
+  async function settle(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+  }
+
+  it("deleteAttachment dispatches 'deleted' with DeletedAttachmentRef", async () => {
+    const seen: DeletedAttachmentRef[] = [];
+    hooks.onAttachment({
+      event: "deleted",
+      handler: (payload) => {
+        seen.push(payload as DeletedAttachmentRef);
+      },
+    });
+    const note = await store.createNote("with-att");
+    const att = await store.addAttachment(note.id, "audio/voice.m4a", "audio/mp4");
+    await settle();
+    await store.deleteAttachment(note.id, att.id);
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.id).toBe(att.id);
+    expect(seen[0]!.noteId).toBe(note.id);
+    expect(seen[0]!.path).toBe("audio/voice.m4a");
+  });
+
+  it("default attachment subscription doesn't include 'deleted' (back-compat)", async () => {
+    const fired: string[] = [];
+    hooks.onAttachment({
+      handler: (att) => {
+        // payload is Attachment | DeletedAttachmentRef; we know default
+        // events doesn't include deleted, so this only sees created.
+        fired.push(att.id);
+      },
+    });
+    const note = await store.createNote("hi");
+    const att = await store.addAttachment(note.id, "f.txt", "text/plain");
+    await settle();
+    fired.length = 0;
+    await store.deleteAttachment(note.id, att.id);
+    await settle();
+    expect(fired).toEqual([]);
+  });
+
+  it("non-existent attachment delete does not dispatch", async () => {
+    const fired: string[] = [];
+    hooks.onAttachment({
+      event: "deleted",
+      handler: (a) => fired.push(a.id),
+    });
+    const note = await store.createNote("hi");
+    await settle();
+    const result = await store.deleteAttachment(note.id, "never-existed-id");
+    await settle();
+    expect(result.deleted).toBe(false);
+    expect(fired).toEqual([]);
   });
 });

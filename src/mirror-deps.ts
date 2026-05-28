@@ -7,8 +7,9 @@
  * vault-store + portable-md.
  */
 
-import { exportVaultToDir } from "../core/src/portable-md.ts";
+import { exportVaultToDir, hasSchemaContent, pruneOrphans } from "../core/src/portable-md.ts";
 
+import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { readGlobalConfig, writeGlobalConfig, readVaultConfig } from "./config.ts";
 import { defaultMirrorConfig, type MirrorConfig } from "./mirror-config.ts";
 import type { MirrorDeps } from "./mirror-manager.ts";
@@ -42,6 +43,41 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
       });
       return { notes: stats.notes };
     },
+    runPrune: async ({ outDir }) => {
+      const store = getVaultStore(vaultName);
+      // Build the valid-id sets the prune sweep needs. Single-query
+      // walk per dimension; cheap on typical vaults.
+      const allNotes = await store.queryNotes({ limit: 1_000_000, sort: "asc" });
+      const validNoteIds = new Set(allNotes.map((n) => n.id));
+      // Tag names with schema content drive the schema sidecars. Filter
+      // through `hasSchemaContent` — a tag whose schema content was wiped
+      // via `deleteTagSchema` keeps its tags-table row (bare name), so a
+      // map-by-name set would leave the stale sidecar in the mirror
+      // indefinitely. Only schema-bearing tags belong in this set.
+      // Reviewer-flagged on vault#382 (Critical #1).
+      const tagRecords = await store.listTagRecords();
+      const validTagNames = new Set(
+        tagRecords.filter((t) => hasSchemaContent(t)).map((t) => t.tag),
+      );
+      // Attachment IDs across all notes (the prune sweep keys on id).
+      const validAttachmentIds = new Set<string>();
+      for (const note of allNotes) {
+        const atts = await store.getAttachments(note.id);
+        for (const a of atts) validAttachmentIds.add(a.id);
+      }
+      const stats = pruneOrphans({
+        outDir,
+        validNoteIds,
+        validTagNames,
+        validAttachmentIds,
+      });
+      return {
+        notes_removed: stats.notes_removed,
+        sidecars_removed: stats.sidecars_removed,
+        schemas_removed: stats.schemas_removed,
+        attachment_dirs_removed: stats.attachment_dirs_removed,
+      };
+    },
     firstChangedNoteTitle: async (cursor) => {
       if (!cursor) return "";
       try {
@@ -62,6 +98,11 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
       global.mirror = config;
       writeGlobalConfig(global);
     },
+    // Share the process-wide hook registry so mirror's subscriptions land
+    // on the same event bus that `BunSqliteStore` dispatches on. This is
+    // load-bearing for the event-driven path; without it, the manager
+    // falls back to safety-net polling only.
+    hooks: defaultHookRegistry,
   };
 }
 

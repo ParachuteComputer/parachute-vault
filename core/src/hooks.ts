@@ -47,7 +47,34 @@
 
 import type { Note, Store, Attachment } from "./types.js";
 
-export type HookEvent = "created" | "updated";
+/**
+ * Note-mutation events. `"created"` and `"updated"` carry the full post-write
+ * `Note`; `"deleted"` carries only `{ id, path }` — the row is gone by
+ * dispatch time, so handlers can't re-read it. Down-stream consumers (e.g.
+ * the git-mirror) match by id/path and react (remove file, etc.). Predicate
+ * authors writing a `when(note)` for `"deleted"` should rely on `note.id` /
+ * `note.path` only; everything else is undefined for the deleted shape.
+ */
+export type HookEvent = "created" | "updated" | "deleted";
+
+/**
+ * Minimal identity payload for a deleted note. The row is gone by dispatch
+ * time, so handlers can't go back to the store for the rest. Path is
+ * optional because notes without a path are legal (e.g. fragments captured
+ * via API without a target slot).
+ */
+export interface DeletedNoteRef {
+  id: string;
+  path?: string;
+}
+
+/**
+ * What a hook handler receives. For `"created"` / `"updated"` it's the full
+ * `Note` row; for `"deleted"` only the id/path remain. This union keeps the
+ * common predicates (path-prefix gates, tag checks for non-deleted shapes)
+ * working unchanged while making the "deleted has less" reality type-safe.
+ */
+export type NoteHookPayload = Note | DeletedNoteRef;
 
 export interface NoteHook {
   /** Events this hook listens for. Defaults to ["created", "updated"]. */
@@ -57,10 +84,26 @@ export interface NoteHook {
    * Should be cheap and synchronous. Idempotency lives here: check
    * whether a marker (e.g. `metadata.audio_rendered_at`) is already set
    * and return false if so.
+   *
+   * For `"deleted"` events the payload is a `DeletedNoteRef` — only
+   * `id` / `path` are populated; tag/metadata/content fields are
+   * undefined. Predicates that read those fields effectively skip
+   * the deleted shape unless they handle the narrower payload.
    */
-  when?: (note: Note) => boolean;
-  /** Handler — runs async, off the request path. Third arg is the event type. */
-  handler: (note: Note, store: Store, event?: HookEvent) => Promise<void> | void;
+  when?: (note: NoteHookPayload) => boolean;
+  /**
+   * Handler — runs async, off the request path. Third arg is the event
+   * type. For `"deleted"` the payload is a `DeletedNoteRef`, not a full
+   * `Note` — the row is gone by dispatch time, so the store can't be
+   * queried for it. Handlers needing more context should stash it ahead
+   * of time on the note's `metadata` and read off the predicate / the
+   * tracking shape rather than re-querying.
+   */
+  handler: (
+    note: NoteHookPayload,
+    store: Store,
+    event?: HookEvent,
+  ) => Promise<void> | void;
   /** Optional label for logs. */
   name?: string;
 }
@@ -70,22 +113,46 @@ interface RegisteredHook extends NoteHook {
 }
 
 /**
- * Attachment-mutation events. Today only `"created"` is dispatched — the
- * transcription worker (and any future attachment-aware feature) registers
- * here to move off its poll-driven steady state and onto the same event bus
- * that note hooks use. Keeping attachments separate from notes means a
- * `NoteHook` predicate doesn't have to learn a second argument shape.
+ * Attachment-mutation events. `"created"` carries the full attachment;
+ * `"deleted"` carries only `{ id, note_id, path }` (the row is gone by
+ * dispatch time, same shape rule as deleted notes).
+ *
+ * Consumers (transcription worker, git-mirror) subscribe here to react to
+ * lifecycle changes without polling. Keeping attachments separate from
+ * notes means a `NoteHook` predicate doesn't have to learn a second
+ * argument shape.
  */
-export type AttachmentHookEvent = "created";
+export type AttachmentHookEvent = "created" | "deleted";
+
+/**
+ * Identity payload for a deleted attachment. The DB row is gone by
+ * dispatch time, so handlers can only react to id/note_id/path; metadata
+ * and timestamps are not preserved.
+ */
+export interface DeletedAttachmentRef {
+  id: string;
+  noteId: string;
+  path: string;
+}
+
+/** Union over what an attachment hook handler may receive. */
+export type AttachmentHookPayload = Attachment | DeletedAttachmentRef;
 
 export interface AttachmentHook {
   /** Events this hook listens for. Defaults to ["created"]. */
   event?: AttachmentHookEvent | AttachmentHookEvent[];
-  /** Sync predicate. Same idempotency contract as `NoteHook.when`. */
-  when?: (attachment: Attachment) => boolean;
-  /** Handler — runs async, off the request path. */
+  /**
+   * Sync predicate. Same idempotency contract as `NoteHook.when`. For
+   * `"deleted"` the payload is a `DeletedAttachmentRef` — predicates
+   * relying on `metadata` / `createdAt` will see `undefined`.
+   */
+  when?: (attachment: AttachmentHookPayload) => boolean;
+  /**
+   * Handler — runs async, off the request path. For `"deleted"` the
+   * payload is a `DeletedAttachmentRef`, not a full `Attachment`.
+   */
   handler: (
-    attachment: Attachment,
+    attachment: AttachmentHookPayload,
     store: Store,
     event?: AttachmentHookEvent,
   ) => Promise<void> | void;
@@ -95,6 +162,37 @@ export interface AttachmentHook {
 
 interface RegisteredAttachmentHook extends AttachmentHook {
   events: Set<AttachmentHookEvent>;
+}
+
+/**
+ * Tag-mutation events. `"upserted"` fires on tag-record create/update
+ * (description, fields, relationships, parent_names — any mutation that
+ * could change the schema sidecar that the git-mirror writes). `"deleted"`
+ * fires when the tag row is removed.
+ *
+ * Why this exists: the export sidecars at `.parachute/schemas/<tag>.yaml`
+ * are part of the mirror's output. Without a tag-mutation event the mirror
+ * has no signal that those files might need to change.
+ */
+export type TagHookEvent = "upserted" | "deleted";
+
+export interface TagHook {
+  /** Events this hook listens for. Defaults to ["upserted", "deleted"]. */
+  event?: TagHookEvent | TagHookEvent[];
+  /** Sync predicate keyed on the tag name. */
+  when?: (tag: string) => boolean;
+  /** Handler — runs async, off the request path. */
+  handler: (
+    tag: string,
+    store: Store,
+    event?: TagHookEvent,
+  ) => Promise<void> | void;
+  /** Optional label for logs. */
+  name?: string;
+}
+
+interface RegisteredTagHook extends TagHook {
+  events: Set<TagHookEvent>;
 }
 
 /**
@@ -139,6 +237,7 @@ export interface HookRegistryOptions {
 export class HookRegistry {
   private hooks: RegisteredHook[] = [];
   private attachmentHooks: RegisteredAttachmentHook[] = [];
+  private tagHooks: RegisteredTagHook[] = [];
   private semaphore: Semaphore;
   private inFlight = new Set<Promise<void>>();
   private logger: { error: (...args: unknown[]) => void };
@@ -150,7 +249,15 @@ export class HookRegistry {
     this.logger = opts.logger ?? console;
   }
 
-  /** Register a hook. Returns an unregister function. */
+  /**
+   * Register a note-mutation hook. Returns an unregister function.
+   *
+   * The default event set is `["created", "updated"]` — explicit
+   * `event: "deleted"` (or include it in the array) is required to
+   * subscribe to deletions. This keeps existing hooks that pre-date the
+   * `"deleted"` event from suddenly receiving a payload shape
+   * (`DeletedNoteRef`) they weren't typed for.
+   */
   onNote(hook: NoteHook): () => void {
     const events = new Set<HookEvent>(
       Array.isArray(hook.event)
@@ -167,7 +274,13 @@ export class HookRegistry {
     };
   }
 
-  /** Register an attachment-mutation hook. Returns an unregister function. */
+  /**
+   * Register an attachment-mutation hook. Returns an unregister function.
+   *
+   * The default event set is `["created"]` only (matches the historical
+   * shape pre-deletion-events). Subscribe to `"deleted"` explicitly when
+   * the handler needs to react to attachment removal.
+   */
   onAttachment(hook: AttachmentHook): () => void {
     const events = new Set<AttachmentHookEvent>(
       Array.isArray(hook.event)
@@ -184,15 +297,38 @@ export class HookRegistry {
     };
   }
 
+  /**
+   * Register a tag-mutation hook. Returns an unregister function. Default
+   * event set is both `"upserted"` and `"deleted"` — symmetric with the
+   * sole consumer's needs (the git-mirror reacts to either to refresh its
+   * schema sidecars).
+   */
+  onTag(hook: TagHook): () => void {
+    const events = new Set<TagHookEvent>(
+      Array.isArray(hook.event)
+        ? hook.event
+        : hook.event
+          ? [hook.event]
+          : (["upserted", "deleted"] as TagHookEvent[]),
+    );
+    const entry: RegisteredTagHook = { ...hook, events };
+    this.tagHooks.push(entry);
+    return () => {
+      const idx = this.tagHooks.indexOf(entry);
+      if (idx >= 0) this.tagHooks.splice(idx, 1);
+    };
+  }
+
   /** Remove all registered hooks. Mostly for tests. */
   clear(): void {
     this.hooks = [];
     this.attachmentHooks = [];
+    this.tagHooks = [];
   }
 
-  /** Count of currently registered hooks (notes + attachments). */
+  /** Count of currently registered hooks (notes + attachments + tags). */
   get size(): number {
-    return this.hooks.length + this.attachmentHooks.length;
+    return this.hooks.length + this.attachmentHooks.length + this.tagHooks.length;
   }
 
   /** Count of currently in-flight handler executions. */
@@ -201,13 +337,19 @@ export class HookRegistry {
   }
 
   /**
-   * Dispatch a mutation event. Matches hooks, schedules their handlers
-   * onto a microtask, and returns immediately. The caller is never
-   * blocked on handler execution.
+   * Dispatch a note-mutation event. Matches hooks, schedules their
+   * handlers onto a microtask, and returns immediately. The caller is
+   * never blocked on handler execution.
    *
    * Must only be called after the triggering SQLite write has committed.
+   *
+   * For `"deleted"` the `note` argument is a `DeletedNoteRef` ({ id,
+   * path }) — the row is gone, so the runtime can't re-read it before
+   * dispatching to handlers. For `"created"` / `"updated"` the full
+   * `Note` is expected; `runHandler` will re-read from the store for
+   * non-deleted events to pick up the latest committed state.
    */
-  dispatch(event: HookEvent, note: Note, store: Store): void {
+  dispatch(event: HookEvent, note: NoteHookPayload, store: Store): void {
     if (this.hooks.length === 0) return;
 
     // Snapshot matches synchronously so subsequent hook registration
@@ -241,13 +383,12 @@ export class HookRegistry {
 
   /**
    * Dispatch an attachment-mutation event. Same post-commit/microtask
-   * contract as `dispatch()` for notes — callers are never blocked on
-   * handler execution, and the triggering SQLite write must already be
-   * committed.
+   * contract as `dispatch()` for notes. For `"deleted"` the payload is
+   * a `DeletedAttachmentRef`; for `"created"` it's the full `Attachment`.
    */
   dispatchAttachment(
     event: AttachmentHookEvent,
-    attachment: Attachment,
+    attachment: AttachmentHookPayload,
     store: Store,
   ): void {
     if (this.attachmentHooks.length === 0) return;
@@ -277,19 +418,61 @@ export class HookRegistry {
     });
   }
 
+  /**
+   * Dispatch a tag-mutation event. Same post-commit / microtask contract
+   * as the note + attachment dispatchers. `tag` is the bare tag name; the
+   * git-mirror handler matches on it to identify which `.parachute/schemas/<tag>.yaml`
+   * sidecar to rewrite or remove.
+   */
+  dispatchTag(event: TagHookEvent, tag: string, store: Store): void {
+    if (this.tagHooks.length === 0) return;
+
+    const matches: RegisteredTagHook[] = [];
+    for (const hook of this.tagHooks) {
+      if (!hook.events.has(event)) continue;
+      try {
+        if (hook.when && !hook.when(tag)) continue;
+      } catch (err) {
+        this.logger.error(
+          `[hooks] predicate threw for ${hook.name ?? "anonymous"} on tag ${tag}:`,
+          err,
+        );
+        continue;
+      }
+      matches.push(hook);
+    }
+    if (matches.length === 0) return;
+
+    queueMicrotask(() => {
+      for (const hook of matches) {
+        const task = this.runTagHandler(hook, event, tag, store);
+        this.inFlight.add(task);
+        task.finally(() => this.inFlight.delete(task));
+      }
+    });
+  }
+
   private async runHandler(
     hook: RegisteredHook,
     event: HookEvent,
-    note: Note,
+    note: NoteHookPayload,
     store: Store,
   ): Promise<void> {
     const release = await this.semaphore.acquire();
     try {
-      // Re-read the note so the handler sees the latest state (another
-      // handler may have written back in between). If the note was
-      // deleted, silently drop.
-      const fresh = (await store.getNote(note.id)) ?? note;
-      await hook.handler(fresh, store, event);
+      // For non-deleted events, re-read the note so the handler sees the
+      // latest committed state (another handler may have written back
+      // between dispatch and this acquisition). For "deleted" events the
+      // row is gone — pass the DeletedNoteRef payload straight through.
+      let payload: NoteHookPayload = note;
+      if (event !== "deleted") {
+        const fresh = await store.getNote(note.id);
+        if (fresh) payload = fresh;
+        // If the note was deleted between dispatch and re-read, fall
+        // back to the dispatch-time payload — same shape as before; the
+        // handler can sense the disappearance via its own predicate.
+      }
+      await hook.handler(payload, store, event);
     } catch (err) {
       this.logger.error(
         `[hooks] handler ${hook.name ?? "anonymous"} threw on ${event} ${note.id}:`,
@@ -303,19 +486,41 @@ export class HookRegistry {
   private async runAttachmentHandler(
     hook: RegisteredAttachmentHook,
     event: AttachmentHookEvent,
-    attachment: Attachment,
+    attachment: AttachmentHookPayload,
     store: Store,
   ): Promise<void> {
     const release = await this.semaphore.acquire();
     try {
-      // Re-read the attachment so the handler sees the latest metadata
-      // (another handler may have written back in between). If the
-      // attachment was deleted, silently drop.
-      const fresh = (await store.getAttachment(attachment.id)) ?? attachment;
-      await hook.handler(fresh, store, event);
+      // Symmetric with runHandler: re-read for non-deleted events,
+      // pass straight through on delete.
+      let payload: AttachmentHookPayload = attachment;
+      if (event !== "deleted") {
+        const fresh = await store.getAttachment(attachment.id);
+        if (fresh) payload = fresh;
+      }
+      await hook.handler(payload, store, event);
     } catch (err) {
       this.logger.error(
         `[hooks] attachment handler ${hook.name ?? "anonymous"} threw on ${event} ${attachment.id}:`,
+        err,
+      );
+    } finally {
+      release();
+    }
+  }
+
+  private async runTagHandler(
+    hook: RegisteredTagHook,
+    event: TagHookEvent,
+    tag: string,
+    store: Store,
+  ): Promise<void> {
+    const release = await this.semaphore.acquire();
+    try {
+      await hook.handler(tag, store, event);
+    } catch (err) {
+      this.logger.error(
+        `[hooks] tag handler ${hook.name ?? "anonymous"} threw on ${event} ${tag}:`,
         err,
       );
     } finally {

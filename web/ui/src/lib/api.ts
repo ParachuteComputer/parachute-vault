@@ -103,22 +103,42 @@ export async function getVaultDetail(name: string): Promise<VaultDetailResult> {
 
 export type MirrorLocation = "internal" | "external";
 
+/**
+ * Event-driven mode subscribes to in-process hooks (note / tag /
+ * attachment mutations) and debounces them into a single export pass;
+ * a background safety-net poll catches anything missed. Manual mode
+ * fires no automatic exports — the operator triggers via the "Run
+ * export now" button or `parachute-vault export` from the CLI.
+ *
+ * Pre-vault#382 `watch: boolean` migrated as: true → "events", false →
+ * "manual". The backend's validator still accepts `watch` as a back-
+ * compat alias.
+ */
+export type MirrorSyncMode = "events" | "manual";
+
 export interface MirrorConfig {
   enabled: boolean;
   /** "internal" → hidden under vault data dir; "external" → operator-picked path. */
   location: MirrorLocation;
   /** Required when location=external + enabled. Must exist + be a git repo. */
   external_path: string | null;
-  /** When true, the manager runs the watch loop in-process. */
-  watch: boolean;
+  /**
+   * `events` (default) → hooks drive exports; mirror stays current as you
+   * write. `manual` → no auto-fire; operator runs exports explicitly.
+   */
+  sync_mode: MirrorSyncMode;
   /** Per-pass `git add -A && git commit` if true. */
   auto_commit: boolean;
   /** Per-commit `git push` if true. Failures non-fatal. */
   auto_push: boolean;
   /** Verbatim template; reuses the CLI's variable set (`{{date}}` etc.). */
   commit_template: string;
-  /** Watch-loop poll interval in seconds. */
-  interval_seconds: number;
+  /**
+   * Background safety-net poll interval in seconds (only matters when
+   * `sync_mode: events`). Default 3600. Clamped to a sane range
+   * server-side; the SPA doesn't surface this directly today.
+   */
+  safety_net_seconds: number;
 }
 
 export interface MirrorStatus {

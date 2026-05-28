@@ -29,7 +29,7 @@ import { join, normalize } from "path";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
 import crypto from "node:crypto";
 import type { Note, Store, Attachment } from "../core/src/types.ts";
-import type { HookRegistry, HookEvent } from "../core/src/hooks.ts";
+import type { HookRegistry, HookEvent, NoteHookPayload } from "../core/src/hooks.ts";
 import type { TriggerConfig, TriggerWhen } from "./config.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
@@ -56,6 +56,10 @@ export function buildPredicate(when: TriggerWhen, triggerName: string): (note: N
   const pendingKey = `${triggerName}_pending_at`;
   const renderedKey = `${triggerName}_rendered_at`;
 
+  // Hook dispatcher passes `NoteHookPayload` (Note | DeletedNoteRef). All
+  // triggers default to events `["created", "updated"]` so deleted shapes
+  // never reach this predicate, but we still type the parameter as Note
+  // — narrowing here keeps the rest of the predicate body unchanged.
   return (note: Note) => {
     const meta = note.metadata as Record<string, unknown> | undefined;
 
@@ -310,8 +314,17 @@ export function registerTriggers(
     const unregister = hooks.onNote({
       name: trigger.name,
       event: events,
-      when: predicate,
-      handler: async (note: Note, store: Store, hookEvent?: HookEvent) => {
+      when: (payload: NoteHookPayload) => {
+        // Triggers don't subscribe to "deleted"; if the union ever
+        // widens via config, the predicate sees a partial shape that
+        // simply doesn't match anything tag/metadata-based and returns
+        // false. Safe by construction.
+        return predicate(payload as Note);
+      },
+      handler: async (payload: NoteHookPayload, store: Store, hookEvent?: HookEvent) => {
+        // Same shape contract as the predicate — triggers don't
+        // subscribe to deleted events, so narrow back to Note.
+        const note = payload as Note;
         const existingMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
 
         // Handler-side re-check (same race-window protection as the old hooks)

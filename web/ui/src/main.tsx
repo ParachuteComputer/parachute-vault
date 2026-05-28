@@ -31,7 +31,7 @@ function mount(): void {
   );
 }
 
-// Fallback bootstrap path (closes vault#XXX / hub-side discovery-tile bug):
+// Fallback bootstrap path (closes vault#382 / hub-side discovery-tile bug):
 // when the operator clicked the **discovery-page** vault tile (hub.ts
 // renders one per vault via `uiUrl: "/admin/"`), the browser landed here
 // without a `#token=...` fragment — the discovery tile is a plain anchor,

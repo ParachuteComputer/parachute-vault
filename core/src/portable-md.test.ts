@@ -19,7 +19,7 @@
 
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync, statSync } from "fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, existsSync, statSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -33,6 +33,7 @@ import {
   parseFrontmatter,
   portableExportFilePath,
   probeCaseSensitive,
+  pruneOrphans,
   SIDECAR_DIR,
   NOTES_META_DIR,
   supportsInlineFrontmatter,
@@ -1797,5 +1798,255 @@ describe("case-collision detection (vault#327)", async () => {
     });
     expect(stats.notes).toBe(2);
     expect(stats.disambiguated_paths).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pruneOrphans (vault#382 — event-driven mirror delete propagation)
+// ---------------------------------------------------------------------------
+
+describe("pruneOrphans", async () => {
+  let tmpBase: string;
+  beforeEach(() => {
+    tmpBase = join(tmpdir(), `parachute-prune-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    mkdirSync(tmpBase, { recursive: true });
+  });
+
+  it("no-op on non-existent directory", () => {
+    const stats = pruneOrphans({
+      outDir: join(tmpBase, "doesnt-exist"),
+      validNoteIds: new Set(),
+      validTagNames: new Set(),
+      validAttachmentIds: new Set(),
+    });
+    expect(stats.notes_removed).toBe(0);
+    expect(stats.unparseable_files).toHaveLength(0);
+  });
+
+  it("removes orphaned note .md file", async () => {
+    const outDir = join(tmpBase, "orphan-note");
+    // First do a real export so the structure is realistic.
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    await store.createNote("alive", { id: "01HFAA", path: "alive" });
+    await store.createNote("doomed", { id: "01HFBB", path: "doomed" });
+    await exportVaultToDir(store, { outDir, vaultName: "t", exportedAt: "2026-01-01T00:00:00.000Z" });
+    expect(existsSync(join(outDir, "alive.md"))).toBe(true);
+    expect(existsSync(join(outDir, "doomed.md"))).toBe(true);
+
+    // Now prune with only "alive" in the valid set.
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(["01HFAA"]),
+      validTagNames: new Set(),
+      validAttachmentIds: new Set(),
+    });
+    expect(stats.notes_removed).toBe(1);
+    expect(existsSync(join(outDir, "alive.md"))).toBe(true);
+    expect(existsSync(join(outDir, "doomed.md"))).toBe(false);
+  });
+
+  it("removes orphaned schema sidecar", async () => {
+    const outDir = join(tmpBase, "orphan-schema");
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    await store.upsertTagRecord("alive-tag", { description: "stays" });
+    await store.upsertTagRecord("doomed-tag", { description: "goes" });
+    await exportVaultToDir(store, { outDir, vaultName: "t", exportedAt: "2026-01-01T00:00:00.000Z" });
+    const schemasDir = join(outDir, SIDECAR_DIR, "schemas");
+    expect(existsSync(join(schemasDir, "alive-tag.yaml"))).toBe(true);
+    expect(existsSync(join(schemasDir, "doomed-tag.yaml"))).toBe(true);
+
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(),
+      validTagNames: new Set(["alive-tag"]),
+      validAttachmentIds: new Set(),
+    });
+    expect(stats.schemas_removed).toBe(1);
+    expect(existsSync(join(schemasDir, "alive-tag.yaml"))).toBe(true);
+    expect(existsSync(join(schemasDir, "doomed-tag.yaml"))).toBe(false);
+  });
+
+  it("removes orphaned attachment directories", async () => {
+    const outDir = join(tmpBase, "orphan-att");
+    // Build the export structure by hand (attachment binaries need
+    // assetsDir wiring; cheaper to just create the dirs).
+    const attachmentsDir = join(outDir, SIDECAR_DIR, "attachments");
+    mkdirSync(attachmentsDir, { recursive: true });
+    mkdirSync(join(attachmentsDir, "att-alive"), { recursive: true });
+    writeFileSync(join(attachmentsDir, "att-alive", "voice.m4a"), "");
+    mkdirSync(join(attachmentsDir, "att-doomed"), { recursive: true });
+    writeFileSync(join(attachmentsDir, "att-doomed", "voice.m4a"), "");
+    // Need .parachute/vault.yaml so the structure is recognized (cheap to fake)
+    writeFileSync(join(outDir, SIDECAR_DIR, "vault.yaml"), "name: t\n");
+
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(),
+      validTagNames: new Set(),
+      validAttachmentIds: new Set(["att-alive"]),
+    });
+    expect(stats.attachment_dirs_removed).toBe(1);
+    expect(existsSync(join(attachmentsDir, "att-alive"))).toBe(true);
+    expect(existsSync(join(attachmentsDir, "att-doomed"))).toBe(false);
+  });
+
+  it("skips unparseable .md files without crashing", async () => {
+    const outDir = join(tmpBase, "unparseable");
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, "no-frontmatter.md"), "just content, no frontmatter\n");
+    writeFileSync(join(outDir, "garbage.md"), "---\nnot-real-yaml\n");
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(),
+      validTagNames: new Set(),
+      validAttachmentIds: new Set(),
+    });
+    // Both files lacked an `id`, so we record them but don't remove.
+    expect(stats.notes_removed).toBe(0);
+    expect(stats.unparseable_files.length).toBeGreaterThanOrEqual(2);
+    expect(existsSync(join(outDir, "no-frontmatter.md"))).toBe(true);
+    expect(existsSync(join(outDir, "garbage.md"))).toBe(true);
+  });
+
+  it("preserves all files when everything is in the valid sets", async () => {
+    const outDir = join(tmpBase, "happy-path");
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    const a = await store.createNote("a", { path: "a" });
+    const b = await store.createNote("b", { path: "b" });
+    await store.upsertTagRecord("tag1", { description: "x" });
+    await exportVaultToDir(store, { outDir, vaultName: "t", exportedAt: "2026-01-01T00:00:00.000Z" });
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set([a.id, b.id]),
+      validTagNames: new Set(["tag1"]),
+      validAttachmentIds: new Set(),
+    });
+    expect(stats.notes_removed).toBe(0);
+    expect(stats.schemas_removed).toBe(0);
+    expect(stats.attachment_dirs_removed).toBe(0);
+    expect(existsSync(join(outDir, "a.md"))).toBe(true);
+    expect(existsSync(join(outDir, "b.md"))).toBe(true);
+  });
+
+  it("removes orphan note + corresponding notes-meta sidecar for csv/yaml notes", async () => {
+    // For non-frontmatter extensions, the sidecar lives at
+    // .parachute/notes-meta/<id>.yaml. Pruning the note should remove
+    // both files.
+    const outDir = join(tmpBase, "orphan-csv");
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    await store.createNote("col1,col2\n1,2\n", {
+      id: "01CSV-DEL",
+      path: "data/table",
+      extension: "csv",
+    });
+    await exportVaultToDir(store, { outDir, vaultName: "t", exportedAt: "2026-01-01T00:00:00.000Z" });
+    const contentFile = join(outDir, "data", "table.csv");
+    const sidecarFile = join(outDir, SIDECAR_DIR, "notes-meta", "01CSV-DEL.yaml");
+    expect(existsSync(contentFile)).toBe(true);
+    expect(existsSync(sidecarFile)).toBe(true);
+
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(), // doom it
+      validTagNames: new Set(),
+      validAttachmentIds: new Set(),
+    });
+    expect(stats.notes_removed).toBe(1);
+    expect(stats.sidecars_removed).toBeGreaterThanOrEqual(1);
+    expect(existsSync(contentFile)).toBe(false);
+    expect(existsSync(sidecarFile)).toBe(false);
+  });
+
+  // Reviewer-flagged regression on vault#382 Critical #2 — pruneOrphans
+  // walks via statSync (follows symlinks); without the safeRm guard a
+  // symlink inside the mirror pointing OUTSIDE outDir would resurface
+  // its target's files as orphans and rmSync would happily delete them
+  // off-tree. The guard resolves each candidate and refuses anything
+  // not under outDir; refusals get recorded in `unparseable_files` so
+  // an operator can see what was skipped.
+  it("refuses to delete files reached via a symlink pointing outside outDir", async () => {
+    const outDir = join(tmpBase, "symlink-attack");
+    const outside = join(tmpBase, "outside");
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+    // A real, sensitive file in `outside/` we don't want pruneOrphans
+    // to touch under any circumstance.
+    const externalFile = join(outside, "do-not-touch.md");
+    writeFileSync(externalFile, "---\nid: 01EXTERNAL\n---\nimportant\n");
+    // A symlink inside outDir pointing at outside/ — walkContentFiles
+    // would normally surface outside/do-not-touch.md as a candidate.
+    try {
+      symlinkSync(outside, join(outDir, "via-link"));
+    } catch {
+      // Some CI sandboxes refuse symlink creation. Skip the test in
+      // that case rather than fail spuriously.
+      return;
+    }
+
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(), // doom every id we see
+      validTagNames: new Set(),
+      validAttachmentIds: new Set(),
+    });
+
+    // Critical assertion: the external file MUST survive.
+    expect(existsSync(externalFile)).toBe(true);
+    // And the refusal MUST be recorded so the operator sees it.
+    expect(
+      stats.unparseable_files.some(
+        (u) => u.path.includes("via-link") || u.reason.includes("outside"),
+      ),
+    ).toBe(true);
+  });
+
+  // Reviewer-flagged regression on vault#382 Critical #1 — pruneOrphans
+  // builds `validTagNames` from ALL tag-table rows in mirror-deps.ts.
+  // After `deleteTagSchema(t)` the schema fields are cleared but the
+  // tag row persists with the bare name, so the sidecar lingers
+  // forever. The fix routes validTagNames through `hasSchemaContent`
+  // before passing into pruneOrphans, and exports the predicate so
+  // mirror-deps can reuse the single source of truth.
+  it("considers a schema-content-free tag the same as a deleted tag for sidecar pruning", async () => {
+    const outDir = join(tmpBase, "stale-schema");
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    await store.upsertTagRecord("bare", {}); // bare-name only
+    await store.upsertTagRecord("with-schema", { description: "real" });
+    await exportVaultToDir(store, {
+      outDir,
+      vaultName: "t",
+      exportedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const schemasDir = join(outDir, SIDECAR_DIR, "schemas");
+    // The bare tag SHOULDN'T have a sidecar; the schema-bearing one
+    // SHOULD. This confirms the export-writer's contract before the
+    // prune step.
+    expect(existsSync(join(schemasDir, "bare.yaml"))).toBe(false);
+    expect(existsSync(join(schemasDir, "with-schema.yaml"))).toBe(true);
+
+    // Now seed a stale sidecar for `bare` (simulating "the operator
+    // previously had a schema for `bare`, then cleared it via
+    // `deleteTagSchema`"). pruneOrphans should remove this iff the
+    // caller correctly filtered validTagNames by hasSchemaContent.
+    writeFileSync(join(schemasDir, "bare.yaml"), 'name: "bare"\ndescription: "stale"\n');
+    expect(existsSync(join(schemasDir, "bare.yaml"))).toBe(true);
+
+    // Filtered set — only `with-schema` has hasSchemaContent === true.
+    const validTagNames = new Set(["with-schema"]);
+    const stats = pruneOrphans({
+      outDir,
+      validNoteIds: new Set(),
+      validTagNames,
+      validAttachmentIds: new Set(),
+    });
+
+    expect(stats.schemas_removed).toBe(1);
+    expect(existsSync(join(schemasDir, "bare.yaml"))).toBe(false);
+    expect(existsSync(join(schemasDir, "with-schema.yaml"))).toBe(true);
   });
 });

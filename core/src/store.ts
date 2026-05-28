@@ -217,10 +217,23 @@ export class BunSqliteStore implements Store {
   }
 
   async deleteNote(id: string): Promise<void> {
-    // Read before delete so we can invalidate config caches on the way out.
+    // Read before delete so we can invalidate config caches on the way out
+    // AND so the post-delete hook dispatch carries the minimum payload
+    // ({ id, path }). The full note can't be reconstructed post-delete —
+    // by design, hooks subscribing to "deleted" receive a DeletedNoteRef,
+    // not a Note.
     const existing = noteOps.getNote(this.db, id);
     noteOps.deleteNote(this.db, id);
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
+    // Dispatch even when `existing` was null — the caller asked for a
+    // deletion, and downstream consumers (e.g. the mirror) reconcile via
+    // id. Path is undefined in that case; the mirror sweep will catch
+    // any orphans missed by the targeted-removal fast path.
+    this.hooks.dispatch(
+      "deleted",
+      { id, ...(existing?.path ? { path: existing.path } : {}) },
+      this,
+    );
   }
 
   async queryNotes(opts: QueryOpts): Promise<Note[]> {
@@ -340,6 +353,10 @@ export class BunSqliteStore implements Store {
     // and may have declared `fields` powering schema validation.
     this._tagHierarchy = null;
     this._schemaConfig = null;
+    // Fire "deleted" only when SOMETHING happened (the underlying
+    // deleteTag returns `deleted: false` when the tag didn't exist).
+    // The git-mirror reacts to this by sweeping the schema sidecar.
+    if (result.deleted) this.hooks.dispatchTag("deleted", name, this);
     return result;
   }
 
@@ -352,6 +369,16 @@ export class BunSqliteStore implements Store {
     // the schema-config by parent_names + fields content.
     this._tagHierarchy = null;
     this._schemaConfig = null;
+    // Rename = delete-then-upsert from the perspective of any consumer
+    // that keys schema artifacts on the tag name (e.g. the git-mirror's
+    // `.parachute/schemas/<tag>.yaml` sidecar file). Fire both events
+    // so the consumer drops the old artifact and writes the new one.
+    // Only dispatch when the rename actually happened — error returns
+    // ({ error: ... }) shouldn't notify subscribers about phantom moves.
+    if ("renamed" in result) {
+      this.hooks.dispatchTag("deleted", oldName, this);
+      this.hooks.dispatchTag("upserted", newName, this);
+    }
     return result;
   }
 
@@ -365,6 +392,15 @@ export class BunSqliteStore implements Store {
     // bust the schema cache — `fields` declarations follow tag identity.
     this._tagHierarchy = null;
     this._schemaConfig = null;
+    // Each merged source vanishes from the tag set; the target's
+    // schema may have absorbed fields/relationships from the sources.
+    // Fire "deleted" for each source and "upserted" for the target so
+    // the mirror sweeps the source sidecars and rewrites the target.
+    for (const source of sources) {
+      if (source === target) continue;
+      this.hooks.dispatchTag("deleted", source, this);
+    }
+    this.hooks.dispatchTag("upserted", target, this);
     return result;
   }
 
@@ -440,12 +476,26 @@ export class BunSqliteStore implements Store {
     // `fields` drives validation — bust the schema cache so the next
     // create/update sees the new declarations.
     this._schemaConfig = null;
+    // The tag schema sidecar in the mirror needs to track this. Fire
+    // "upserted" regardless of whether the row was created or modified
+    // — the mirror writes the sidecar fresh either way.
+    this.hooks.dispatchTag("upserted", tag, this);
     return result;
   }
 
   async deleteTagSchema(tag: string) {
     const result = tagSchemaOps.deleteTagSchema(this.db, tag);
-    if (result) this._schemaConfig = null;
+    if (result) {
+      this._schemaConfig = null;
+      // Schema-only delete: the tag may still exist as a name in the
+      // hierarchy, but the sidecar lost its content. Mirror reacts by
+      // sweeping the sidecar file. (If the underlying row was reduced
+      // to a bare name with no schema content, hasSchemaContent() in
+      // exportVaultToDir already wouldn't have written it on the next
+      // export pass — the targeted delete is the fast path; the sweep
+      // is the safety net.)
+      this.hooks.dispatchTag("deleted", tag, this);
+    }
     return result;
   }
 
@@ -494,6 +544,11 @@ export class BunSqliteStore implements Store {
       this._tagHierarchy = null;
       this._schemaConfig = null;
     }
+    // Tag-mutation event for the git-mirror and any other downstream
+    // consumer. Fire "upserted" on every successful tag-record write —
+    // schema/relationship/parent-name mutations all alter the sidecar
+    // contents the mirror persists.
+    this.hooks.dispatchTag("upserted", tag, this);
     return result;
   }
 
@@ -599,6 +654,17 @@ export class BunSqliteStore implements Store {
     const other = this.db.prepare(
       "SELECT 1 FROM attachments WHERE path = ? LIMIT 1",
     ).get(row.path);
+
+    // Post-delete event for downstream consumers (e.g. the git-mirror's
+    // sweep of `.parachute/attachments/<id>/...`). Payload is the
+    // DeletedAttachmentRef — the row is gone, so we pass only id /
+    // note_id / path.
+    this.hooks.dispatchAttachment(
+      "deleted",
+      { id: attachmentId, noteId, path: row.path },
+      this,
+    );
+
     return { deleted: true, path: row.path, orphaned: !other };
   }
 
