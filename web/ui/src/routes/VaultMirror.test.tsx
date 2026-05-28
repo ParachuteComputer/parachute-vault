@@ -5,7 +5,7 @@
  * `lib/api.ts` is mocked for the wire surface; `lib/scope.ts` is mocked
  * so admin-vs-read gating is controllable per test without crafting JWTs.
  */
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -44,6 +44,8 @@ vi.mock("../lib/api.ts", async () => {
     listGithubRepos: vi.fn(),
     createGithubRepo: vi.fn(),
     selectGithubRepo: vi.fn(),
+    // Import from git (vault#391).
+    postMirrorImport: vi.fn(),
   };
 });
 vi.mock("../lib/scope.ts");
@@ -615,11 +617,201 @@ describe("VaultMirror — Git remote credentials", () => {
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Use Personal Access Token/i })).toBeInTheDocument(),
     );
-    const tokenInput = screen.getByLabelText(/Token/i) as HTMLInputElement;
-    const urlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
+    // Scope to the PAT modal — vault#391 added an "Import from a git
+    // repo" section below GitRemoteSection which also renders a "Remote
+    // URL" field, so a bare getByLabelText match would be ambiguous.
+    const modal = screen.getByRole("dialog");
+    const tokenInput = within(modal).getByLabelText(/Token/i) as HTMLInputElement;
+    const urlInput = within(modal).getByLabelText(/Remote URL/i) as HTMLInputElement;
     await user.type(tokenInput, "ghp_test1234567890");
     await user.type(urlInput, "https://github.com/aaron/vault.git");
     expect(tokenInput.value).toBe("ghp_test1234567890");
     expect(urlInput.value).toBe("https://github.com/aaron/vault.git");
+  });
+});
+
+// ===========================================================================
+// Import-from-git section (vault#391) — symmetric counterpart to the
+// export flow. Tests the ImportFromGitSection's render, mode toggle,
+// confirm-name gate for Replace, success modal, and error path.
+// ===========================================================================
+
+describe("VaultMirror — Import from git section", () => {
+  beforeEach(() => {
+    vi.mocked(scope.hasAdminScope).mockReturnValue(true);
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: false, location: "internal" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+  });
+
+  it("renders the import section heading + multi-pusher caveat", async () => {
+    renderRoute();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: /Import from a git repo/i }),
+      ).toBeInTheDocument(),
+    );
+    // Matches either the <strong> "One vault per remote." or the rest
+    // of the banner body — getAllByText since both render.
+    const matches = screen.getAllByText(/One vault per remote/i);
+    expect(matches.length).toBeGreaterThan(0);
+  });
+
+  it("hides import section for read-only users", async () => {
+    vi.mocked(scope.hasAdminScope).mockReturnValue(false);
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Git backup for/i })).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("heading", { name: /Import from a git repo/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("toggling Replace requires typing the vault name to enable Start", async () => {
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+
+    const user = userEvent.setup();
+    // Type a URL into the import section's Remote URL field (the one
+    // INSIDE the import section, not the PAT modal which isn't open).
+    const importUrlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
+    await user.type(importUrlInput, "https://github.com/aaron/vault.git");
+
+    // Switch to Replace mode.
+    await user.click(screen.getByRole("radio", { name: /Replace/i }));
+    expect(screen.getByText(/Replace will delete every note/i)).toBeInTheDocument();
+
+    const startBtn = screen.getByRole("button", { name: /Start import/i });
+    expect(startBtn).toBeDisabled();
+
+    // Wrong confirmation — still disabled.
+    const confirm = screen.getByLabelText(/Type vault name to confirm/i) as HTMLInputElement;
+    await user.type(confirm, "wrong");
+    expect(startBtn).toBeDisabled();
+
+    // Right confirmation — enabled.
+    await user.clear(confirm);
+    await user.type(confirm, "work");
+    expect(startBtn).not.toBeDisabled();
+  });
+
+  it("Start import fires postMirrorImport + shows success summary on resolve", async () => {
+    vi.mocked(api.postMirrorImport).mockResolvedValue({
+      notes_imported: 42,
+      tags_imported: 3,
+      attachments_imported: 5,
+      warnings: [],
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    const importUrlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
+    await user.type(importUrlInput, "https://github.com/aaron/vault.git");
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
+    );
+    expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
+      remote_url: "https://github.com/aaron/vault.git",
+      mode: "merge",
+      credentials: { kind: "none" },
+    });
+    // The success summary mentions the counts.
+    expect(screen.getByText(/Imported 42 notes/i)).toBeInTheDocument();
+    // Auto-wire offer surfaces.
+    expect(screen.getByText(/Set this repo as the active mirror remote/i)).toBeInTheDocument();
+  });
+
+  it("one-time PAT credential is sent on Start", async () => {
+    vi.mocked(api.postMirrorImport).mockResolvedValue({
+      notes_imported: 1,
+      tags_imported: 0,
+      attachments_imported: 0,
+      warnings: [],
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/private.git",
+    );
+    await user.click(screen.getByLabelText(/One-time credential/i));
+    const patField = screen.getByPlaceholderText(/ghp_/) as HTMLInputElement;
+    await user.type(patField, "ghp_oneshot_xyz");
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
+        remote_url: "https://github.com/aaron/private.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_oneshot_xyz" },
+      }),
+    );
+  });
+
+  it("uses credentials: null (stored creds) when mirror has saved credentials", async () => {
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        label: "saved",
+        remote_url: "https://github.com/aaron/saved.git",
+        token_preview: "ghp_…1234",
+      },
+    });
+    vi.mocked(api.postMirrorImport).mockResolvedValue({
+      notes_imported: 7,
+      tags_imported: 1,
+      attachments_imported: 0,
+      warnings: [],
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/saved.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
+        remote_url: "https://github.com/aaron/saved.git",
+        mode: "merge",
+        credentials: null,
+      }),
+    );
+  });
+
+  it("surfaces server error message on failure", async () => {
+    vi.mocked(api.postMirrorImport).mockRejectedValue(
+      new api.HttpError(502, "git clone failed for https://***@github.com/missing/repo.git: fatal: not found"),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/missing/repo.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/git clone failed/i)).toBeInTheDocument(),
+    );
   });
 });
