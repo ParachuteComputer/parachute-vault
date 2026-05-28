@@ -10,8 +10,7 @@
  * it). The caller is responsible for stashing it and surfacing the one-time
  * banner; this module just relays the response.
  */
-import { getToken } from "./auth.ts";
-import { HttpError } from "./api.ts";
+import { _authedFetch, HttpError } from "./api.ts";
 
 export interface TokenSummary {
   id: string;
@@ -60,25 +59,12 @@ export interface MintTokenInput {
  * `/` since the server only accepts root tags in the `tags` field).
  */
 export async function listVaultTags(vaultName: string): Promise<{ name: string; count: number }[]> {
-  const res = await fetch(`/vault/${encodeURIComponent(vaultName)}/api/tags`, {
-    headers: authHeaders(),
-  });
+  const res = await _authedFetch(vaultName, `/vault/${encodeURIComponent(vaultName)}/api/tags`);
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
   }
   const body = (await res.json()) as { name: string; count: number }[];
   return Array.isArray(body) ? body : [];
-}
-
-function authHeaders(): Record<string, string> {
-  const token = getToken();
-  if (!token) {
-    throw new HttpError(401, "no admin token — open this page from the hub directory");
-  }
-  return {
-    accept: "application/json",
-    authorization: `Bearer ${token}`,
-  };
 }
 
 async function readError(res: Response): Promise<string> {
@@ -96,9 +82,7 @@ async function readError(res: Response): Promise<string> {
 }
 
 export async function listTokens(vaultName: string): Promise<TokenSummary[]> {
-  const res = await fetch(`/vault/${encodeURIComponent(vaultName)}/tokens`, {
-    headers: authHeaders(),
-  });
+  const res = await _authedFetch(vaultName, `/vault/${encodeURIComponent(vaultName)}/tokens`);
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
   }
@@ -115,9 +99,9 @@ export async function mintToken(vaultName: string, input: MintTokenInput): Promi
   if (input.tags && input.tags.length > 0) body["tags"] = input.tags;
   if (input.expires_at !== undefined) body["expires_at"] = input.expires_at;
 
-  const res = await fetch(`/vault/${encodeURIComponent(vaultName)}/tokens`, {
+  const res = await _authedFetch(vaultName, `/vault/${encodeURIComponent(vaultName)}/tokens`, {
     method: "POST",
-    headers: { ...authHeaders(), "content-type": "application/json" },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -127,12 +111,10 @@ export async function mintToken(vaultName: string, input: MintTokenInput): Promi
 }
 
 export async function revokeToken(vaultName: string, tokenId: string): Promise<void> {
-  const res = await fetch(
+  const res = await _authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/tokens/${encodeURIComponent(tokenId)}`,
-    {
-      method: "DELETE",
-      headers: authHeaders(),
-    },
+    { method: "DELETE" },
   );
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
