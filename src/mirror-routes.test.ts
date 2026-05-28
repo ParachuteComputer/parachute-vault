@@ -26,9 +26,20 @@ import {
   handleAuthGithubRepos,
   handleAuthPat,
   handleMirrorGet,
+  handleMirrorImport,
   handleMirrorPut,
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
+import {
+  _resetImportInFlightForTest,
+  type GitSpawn,
+} from "./mirror-import.ts";
+import { writeVaultConfig } from "./config.ts";
+import { clearVaultStoreCache } from "./vault-store.ts";
+import { exportVaultToDir } from "../core/src/portable-md.ts";
+import { Database } from "bun:sqlite";
+import { SqliteStore } from "../core/src/store.ts";
+import { cpSync, writeFileSync as nodeWriteFileSync } from "node:fs";
 import {
   mirrorCredentialsPath,
   readCredentials,
@@ -845,6 +856,313 @@ describe("auth credential routes — github repos / create-repo", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { full_name: string };
     expect(body.full_name).toBe("aaron/new-vault");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /.parachute/mirror/import — clone-and-import HTTP route (vault#391).
+// ---------------------------------------------------------------------------
+
+/**
+ * Bootstrap a real vault config + db file so getVaultStore('default')
+ * succeeds inside the handler. Returns the home dir for cleanup.
+ */
+async function bootstrapVault(home: string): Promise<void> {
+  process.env.PARACHUTE_HOME = home;
+  process.env.HOME = home;
+  // The minimal layout vault needs to spin up its store: a per-vault
+  // dir at $PARACHUTE_HOME/vault/data/<name> + a `vault.yaml` config.
+  // writeVaultConfig creates these for us.
+  fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+  writeVaultConfig({
+    name: "default",
+    description: "import-test vault",
+    created_at: "2026-05-28T00:00:00.000Z",
+    api_keys: [],
+  });
+  clearVaultStoreCache();
+}
+
+/**
+ * Build a real portable-md vault export, return the path. The clone
+ * spawn-mock copies this into the tempdir to simulate a successful
+ * `git clone`.
+ */
+async function buildExportFixture(): Promise<string> {
+  const fixture = tmp("import-route-fixture-");
+  const exportStore = new SqliteStore(new Database(":memory:"));
+  await exportStore.createNote("alpha body", { id: "n-alpha", path: "alpha", tags: ["t1"] });
+  await exportStore.createNote("beta body", { id: "n-beta", path: "beta" });
+  await exportVaultToDir(exportStore, {
+    outDir: fixture,
+    vaultName: "source",
+    exportedAt: "2026-05-28T00:00:00.000Z",
+  });
+  return fixture;
+}
+
+const spawnCloneSuccess = (fixture: string): GitSpawn => async (argv) => {
+  const destDir = argv[argv.length - 1]!;
+  cpSync(fixture, destDir, { recursive: true });
+  return { exitCode: 0, stderr: "", timedOut: false };
+};
+
+const spawnCloneFail: GitSpawn = async () => ({
+  exitCode: 128,
+  stderr: "fatal: repository not found",
+  timedOut: false,
+});
+
+describe("handleMirrorImport", () => {
+  let home: string;
+  let fixture: string;
+
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    if (fixture) fs.rmSync(fixture, { recursive: true, force: true });
+    _resetImportInFlightForTest();
+    clearVaultStoreCache();
+  });
+
+  test("rejects invalid JSON body with 400", async () => {
+    home = tmp("import-route-badjson-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: "{not-json",
+    });
+    const res = await handleMirrorImport(req, "default");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("invalid_json");
+  });
+
+  test("rejects missing remote_url with 400", async () => {
+    home = tmp("import-route-no-url-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({ mode: "merge" }),
+    });
+    const res = await handleMirrorImport(req, "default");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { field: string };
+    expect(body.field).toBe("remote_url");
+  });
+
+  test("rejects invalid mode with 400", async () => {
+    home = tmp("import-route-bad-mode-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({ remote_url: "https://github.com/a/b.git", mode: "wipe" }),
+    });
+    const res = await handleMirrorImport(req, "default");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { field: string };
+    expect(body.field).toBe("mode");
+  });
+
+  test("rejects per-call PAT without token", async () => {
+    home = tmp("import-route-pat-missing-token-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { field: string };
+    expect(body.field).toBe("credentials.token");
+  });
+
+  test("rejects unknown credentials.kind", async () => {
+    home = tmp("import-route-bad-kind-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "magic" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { field: string };
+    expect(body.field).toBe("credentials.kind");
+  });
+
+  test("success path — merge mode imports notes into target vault", async () => {
+    home = tmp("import-route-success-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spawnCloneSuccess(fixture));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      notes_imported: number;
+      tags_imported: number;
+      attachments_imported: number;
+      warnings: string[];
+      notes_deleted?: number;
+    };
+    expect(body.notes_imported).toBe(2);
+    expect(body.warnings).toEqual([]);
+    expect(body.notes_deleted).toBeUndefined();
+  });
+
+  test("replace mode sets notes_deleted in response", async () => {
+    home = tmp("import-route-replace-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    // Seed the target vault with a local-only note that gets wiped.
+    const { getVaultStore } = await import("./vault-store.ts");
+    const store = getVaultStore("default");
+    await store.createNote("local", { id: "n-local", path: "local" });
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "replace",
+        credentials: { kind: "none" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spawnCloneSuccess(fixture));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      notes_imported: number;
+      notes_deleted: number;
+    };
+    expect(body.notes_imported).toBe(2);
+    expect(body.notes_deleted).toBe(1);
+  });
+
+  test("clone failure returns 502 with redacted message", async () => {
+    home = tmp("import-route-clone-fail-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_secret_xyz" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spawnCloneFail);
+    expect(res.status).toBe(502);
+    const text = await res.text();
+    expect(text).not.toContain("ghp_secret_xyz");
+    const body = JSON.parse(text) as { error_type: string };
+    expect(body.error_type).toBe("clone_failed");
+  });
+
+  test("not-a-vault-export returns 400 with actionable message", async () => {
+    home = tmp("import-route-not-vault-");
+    await bootstrapVault(home);
+    const notAnExport = tmp("import-route-notvault-fixture-");
+    nodeWriteFileSync(path.join(notAnExport, "README.md"), "hello");
+    fixture = notAnExport;
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spawnCloneSuccess(notAnExport));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error_type: string; message: string };
+    expect(body.error_type).toBe("not_a_vault_export");
+    expect(body.message).toContain("vault.yaml");
+  });
+
+  test("uses stored credentials when credentials: null (credentialsFile path)", async () => {
+    home = tmp("import-route-stored-creds-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    // Write a stored PAT credential matching github.com.
+    writeCredentials({
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        token: "ghp_stored_token_xyz",
+        remote_url: "https://x-access-token:ghp_stored_token_xyz@github.com/a/b.git",
+        label: "stored",
+      },
+    });
+    // Assert the spawn argv carries the stored token (proves the
+    // credentialsFile path resolved).
+    let observedArgv: string[] | null = null;
+    const fakeSpawn: GitSpawn = async (argv) => {
+      observedArgv = argv;
+      const destDir = argv[argv.length - 1]!;
+      cpSync(fixture, destDir, { recursive: true });
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: null,
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", fakeSpawn);
+    expect(res.status).toBe(200);
+    // The clone URL should have the stored token embedded.
+    expect(observedArgv).not.toBeNull();
+    expect(observedArgv!.some((arg) => arg.includes("ghp_stored_token_xyz"))).toBe(true);
+  });
+
+  test("per-call PAT override is used when supplied", async () => {
+    home = tmp("import-route-per-call-pat-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    // Stored credentials should be IGNORED when per-call PAT is supplied.
+    writeCredentials({
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        token: "ghp_stored_xyz",
+        remote_url: "https://x-access-token:ghp_stored_xyz@github.com/a/b.git",
+        label: "stored",
+      },
+    });
+    let observedArgv: string[] | null = null;
+    const fakeSpawn: GitSpawn = async (argv) => {
+      observedArgv = argv;
+      const destDir = argv[argv.length - 1]!;
+      cpSync(fixture, destDir, { recursive: true });
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_per_call_only" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", fakeSpawn);
+    expect(res.status).toBe(200);
+    expect(observedArgv).not.toBeNull();
+    const joined = observedArgv!.join(" ");
+    expect(joined).toContain("ghp_per_call_only");
+    expect(joined).not.toContain("ghp_stored_xyz");
   });
 });
 

@@ -82,6 +82,7 @@ import {
   handleAuthGithubSelectRepo,
   handleAuthPat,
   handleMirrorGet,
+  handleMirrorImport,
   handleMirrorPut,
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
@@ -554,6 +555,30 @@ export async function route(
     }
     if (req.method === "POST") return handleMirrorRunNow(manager);
     return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/import — clone a vault export from git + import.
+  // Admin-gated. POST-only. Synchronous (imports finish in <30s for
+  // typical vaults). See mirror-routes.ts:handleMirrorImport for the
+  // request/response shape + error map. Symmetric counterpart to the
+  // export-to-git flow vault#382 + vault#384 shipped.
+  if (subpath === "/.parachute/mirror/import") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (req.method !== "POST") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return handleMirrorImport(req, vaultName);
   }
 
   // /.parachute/mirror/auth/* — UI-configurable git push credentials.

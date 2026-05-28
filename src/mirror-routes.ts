@@ -52,6 +52,17 @@ import {
   type FetchLike,
   type GitHubRepoInfo,
 } from "./github-device-flow.ts";
+import {
+  CloneFailedError,
+  ImportConflictError,
+  NotAVaultExportError,
+  cloneAndImport,
+  type GitSpawn,
+  type ImportAuth,
+  type ImportResult,
+} from "./mirror-import.ts";
+import { getVaultStore } from "./vault-store.ts";
+import { assetsDir } from "./routes.ts";
 
 /**
  * `GET /vault/<name>/.parachute/mirror` — return the persisted config +
@@ -873,4 +884,208 @@ export async function applyCredentialsToMirror(
   // wiring happens in handleAuthGithubSelectRepo. Nothing to apply here
   // until a repo is selected. Caller is responsible for invoking
   // select-repo separately.
+}
+
+// ---------------------------------------------------------------------------
+// Import-from-git route — symmetric counterpart to the mirror export work.
+//
+// `POST /vault/<name>/.parachute/mirror/import` — clone a vault export from
+// a git remote and import it into the named vault.
+//
+// Request body:
+//   {
+//     "remote_url": "https://github.com/aaron/my-vault.git",
+//     "mode": "merge" | "replace",
+//     "credentials": null
+//       | { "kind": "pat", "token": "ghp_..." }
+//       | { "kind": "none" }
+//   }
+//
+// `credentials: null` means "use the stored mirror credentials." Passing
+// `{kind: "pat", token}` is the one-shot path — token doesn't get persisted.
+//
+// Response:
+//   200 { notes_imported, tags_imported, attachments_imported,
+//         notes_deleted?, warnings }
+//   400 { error, error_type, message }  — validation / not-a-vault-export
+//   409 { error, error_type, message }  — concurrent import for this vault
+//   502 { error, message }              — clone failed (auth, network, …)
+//
+// Admin-gated upstream in routing.ts.
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /vault/<name>/.parachute/mirror/import`. See block comment above.
+ *
+ * Synchronous response: imports complete in <30s for typical vaults
+ * (a 1k-note vault clones+imports in well under that bound on Aaron's hardware).
+ * If/when bigger vaults arrive we promote to async polling — for now the
+ * synchronous path keeps the UI flow simple.
+ *
+ * `spawnOverride` is a test seam: lets the test inject a fake git binary.
+ * Production callers omit it; `cloneAndImport` falls back to `defaultGitSpawn`.
+ */
+export async function handleMirrorImport(
+  req: Request,
+  vaultName: string,
+  spawnOverride?: GitSpawn,
+): Promise<Response> {
+  let body: {
+    remote_url?: unknown;
+    mode?: unknown;
+    credentials?: unknown;
+  };
+  try {
+    body = (await req.json()) as Record<string, unknown>;
+  } catch (err) {
+    return Response.json(
+      {
+        error: "Invalid JSON body",
+        error_type: "invalid_json",
+        message: (err as Error).message ?? String(err),
+      },
+      { status: 400 },
+    );
+  }
+
+  const remote_url =
+    typeof body.remote_url === "string" ? body.remote_url.trim() : "";
+  if (remote_url.length === 0) {
+    return Response.json(
+      {
+        error: "remote_url required",
+        error_type: "validation",
+        field: "remote_url",
+        message: "Provide an HTTPS or SSH clone URL.",
+      },
+      { status: 400 },
+    );
+  }
+  const mode = body.mode;
+  if (mode !== "merge" && mode !== "replace") {
+    return Response.json(
+      {
+        error: "mode invalid",
+        error_type: "validation",
+        field: "mode",
+        message: 'mode must be "merge" or "replace".',
+      },
+      { status: 400 },
+    );
+  }
+
+  // Resolve auth shape. The wire format mirrors the internal ImportAuth
+  // type, but tightened: only `kind` and `token` cross the wire. `none`
+  // and `null` both fall through to "use stored credentials" because the
+  // common case is "I configured mirror creds; use them" — and the
+  // shorthand keeps the SPA from having to track which kind to send.
+  let auth: ImportAuth;
+  const creds = body.credentials;
+  if (creds === null || creds === undefined) {
+    auth = { kind: "credentialsFile" };
+  } else if (typeof creds === "object") {
+    const credsObj = creds as Record<string, unknown>;
+    if (credsObj.kind === "pat") {
+      const token = typeof credsObj.token === "string" ? credsObj.token.trim() : "";
+      if (token.length === 0) {
+        return Response.json(
+          {
+            error: "credentials.token required",
+            error_type: "validation",
+            field: "credentials.token",
+            message: 'When credentials.kind is "pat", credentials.token must be a non-empty string.',
+          },
+          { status: 400 },
+        );
+      }
+      auth = { kind: "pat", token };
+    } else if (credsObj.kind === "none") {
+      auth = { kind: "none" };
+    } else if (credsObj.kind === "credentialsFile") {
+      auth = { kind: "credentialsFile" };
+    } else {
+      return Response.json(
+        {
+          error: "credentials.kind invalid",
+          error_type: "validation",
+          field: "credentials.kind",
+          message: 'credentials.kind must be "pat", "credentialsFile", or "none". Or pass credentials: null.',
+        },
+        { status: 400 },
+      );
+    }
+  } else {
+    return Response.json(
+      {
+        error: "credentials invalid",
+        error_type: "validation",
+        field: "credentials",
+        message: "credentials must be an object or null.",
+      },
+      { status: 400 },
+    );
+  }
+
+  // Resolve the target vault's store + assets dir. The route is gated on
+  // `vault:<name>:admin`, so we trust vaultName is real by the time we
+  // reach this code path; defensively re-resolve in case the vault was
+  // deleted between auth and now.
+  const store = getVaultStore(vaultName);
+  const assets = assetsDir(vaultName);
+
+  let result: ImportResult;
+  try {
+    result = await cloneAndImport({
+      vaultName,
+      remoteUrl: remote_url,
+      auth,
+      mode,
+      store,
+      assetsDir: assets,
+      spawn: spawnOverride,
+    });
+  } catch (err) {
+    if (err instanceof ImportConflictError) {
+      return Response.json(
+        {
+          error: "Import already running",
+          error_type: "concurrent_import",
+          message: err.message,
+        },
+        { status: 409 },
+      );
+    }
+    if (err instanceof NotAVaultExportError) {
+      return Response.json(
+        {
+          error: "Not a vault export",
+          error_type: "not_a_vault_export",
+          message: err.message,
+        },
+        { status: 400 },
+      );
+    }
+    if (err instanceof CloneFailedError) {
+      return Response.json(
+        {
+          error: "Clone failed",
+          error_type: "clone_failed",
+          message: err.message,
+        },
+        { status: 502 },
+      );
+    }
+    return Response.json(
+      {
+        error: "Import failed",
+        error_type: "internal",
+        message: (err as Error).message ?? String(err),
+      },
+      { status: 500 },
+    );
+  }
+
+  return Response.json(result, {
+    headers: { "Access-Control-Allow-Origin": "*" },
+  });
 }
