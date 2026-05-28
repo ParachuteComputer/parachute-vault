@@ -1001,6 +1001,336 @@ export async function exportVaultToDir(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Orphan sweep — for git-mirror's delete propagation
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of a `pruneOrphans` pass.
+ */
+export interface PruneOrphansStats {
+  /** Note content files removed (frontmatter id not in `validNoteIds`). */
+  notes_removed: number;
+  /** Sidecar metadata files removed (under `.parachute/notes-meta/`). */
+  sidecars_removed: number;
+  /** Schema sidecars removed (under `.parachute/schemas/`). */
+  schemas_removed: number;
+  /** Attachment directories removed (under `.parachute/attachments/`). */
+  attachment_dirs_removed: number;
+  /**
+   * Files we couldn't parse / classify. Surfaced for operator audit;
+   * the sweep doesn't touch them. Empty when everything classified
+   * cleanly.
+   */
+  unparseable_files: Array<{ path: string; reason: string }>;
+}
+
+/**
+ * Options for the orphan-sweep pass. Run periodically (the mirror manager
+ * arms a safety-net poll, default 1h) and after operator-visible deletions
+ * (the mirror manager's targeted-deletion fast path also calls this for the
+ * touched-set).
+ *
+ * The sweep is the bookkeeping cousin of the event-driven fast path: events
+ * cover the common case (a single note deletion fires "deleted" → mirror
+ * removes that file); the sweep covers anything the fast path missed
+ * (direct SQL writes, app crashes between dispatch and handler, restart
+ * gaps).
+ */
+export interface PruneOrphansOptions {
+  /** Directory to sweep — same shape as an `exportVaultToDir` outDir. */
+  outDir: string;
+  /** Note IDs that should be kept (everything else under the export gets removed). */
+  validNoteIds: Set<string>;
+  /** Tag names that should be kept (other schema sidecars under `.parachute/schemas/` get removed). */
+  validTagNames: Set<string>;
+  /** Attachment IDs that should be kept (other dirs under `.parachute/attachments/` get removed). */
+  validAttachmentIds: Set<string>;
+  /**
+   * Override `extension`-based content-file extension recognition. The
+   * default treats `.md` and `.mdx` as having inline frontmatter (with
+   * `id:` reachable via the file head); everything else needs a sidecar
+   * lookup to know what id owns it.
+   */
+  supportsInlineFrontmatter?: (ext: string) => boolean;
+}
+
+/**
+ * Sweep the export directory for files belonging to notes / tags /
+ * attachments that no longer exist in the vault. Removes them so the
+ * mirror's `git diff` reflects what vault actually has.
+ *
+ * Strategy:
+ *   1. Walk content files. For each `.md` / `.mdx`, parse the frontmatter
+ *      `id` and compare against `validNoteIds`. Mismatch → remove the
+ *      file. Files we can't parse are recorded in `unparseable_files`
+ *      and left alone (best-effort, no destructive guesses).
+ *   2. For non-inline-frontmatter extensions (`.csv`, `.yaml`, etc.),
+ *      check the matching `.parachute/notes-meta/<id>.yaml` sidecar — the
+ *      sidecar carries the canonical `id` + `path` + `extension` triple.
+ *      An orphaned sidecar (no matching content file) is also removed,
+ *      and an orphaned content file (no matching sidecar) without a
+ *      parseable frontmatter is left as unparseable.
+ *   3. Walk `.parachute/schemas/`. Each file is `<tag>.yaml` (after
+ *      filename sanitization). Parse the `name:` field; compare against
+ *      `validTagNames`. Mismatch → remove.
+ *   4. Walk `.parachute/attachments/`. Each subdir name IS the
+ *      attachment id (per `exportVaultToDir`'s layout). Compare against
+ *      `validAttachmentIds`. Mismatch → recursive remove.
+ *
+ * Returns counts so callers can log + decide whether to commit.
+ *
+ * Safe to call on a directory that's never been exported to (returns
+ * zero counts; doesn't create anything).
+ */
+export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
+  const stats: PruneOrphansStats = {
+    notes_removed: 0,
+    sidecars_removed: 0,
+    schemas_removed: 0,
+    attachment_dirs_removed: 0,
+    unparseable_files: [],
+  };
+
+  const outDir = opts.outDir;
+  if (!existsSync(outDir)) return stats;
+
+  const supportsInline = opts.supportsInlineFrontmatter ?? supportsInlineFrontmatter;
+  const sidecarRoot = join(outDir, SIDECAR_DIR);
+  const notesMetaRoot = join(sidecarRoot, NOTES_META_DIR);
+  const schemasRoot = join(sidecarRoot, "schemas");
+  const attachmentsRoot = join(sidecarRoot, "attachments");
+
+  // ---- 1 + 2. Notes + sidecars ----
+  //
+  // First pass: build the sidecar id → { path, extension } map so we can
+  // resolve non-inline-frontmatter content files via their sidecar.
+  // Sidecars whose claimed (path, extension) doesn't map to an existing
+  // content file are tracked as "orphaned sidecar" candidates.
+  const sidecarById = new Map<string, { path: string | null; extension: string | null }>();
+  const sidecarFilesById = new Map<string, string>(); // id → absolute filepath
+  if (existsSync(notesMetaRoot)) {
+    try {
+      for (const entry of readdirSync(notesMetaRoot)) {
+        if (!entry.endsWith(".yaml")) continue;
+        const id = entry.slice(0, -5);
+        const full = join(notesMetaRoot, entry);
+        sidecarFilesById.set(id, full);
+        try {
+          const text = readFileSync(full, "utf-8");
+          const { frontmatter } = parseFrontmatter(`---\n${text}---\n`);
+          sidecarById.set(id, {
+            path: typeof frontmatter.path === "string" ? (frontmatter.path as string) : null,
+            extension: typeof frontmatter.extension === "string" ? (frontmatter.extension as string) : null,
+          });
+        } catch (err) {
+          stats.unparseable_files.push({
+            path: full,
+            reason: `failed to parse sidecar: ${(err as Error).message ?? err}`,
+          });
+        }
+      }
+    } catch (err) {
+      // Notes-meta dir read-error is non-fatal — record + carry on.
+      stats.unparseable_files.push({
+        path: notesMetaRoot,
+        reason: `notes-meta walk failed: ${(err as Error).message ?? err}`,
+      });
+    }
+  }
+
+  // Now walk content files (everything outside the .parachute sidecar).
+  const contentFiles = walkContentFiles(outDir);
+  // Track which sidecars matched a content file so we can also remove
+  // orphaned sidecars (sidecar present but content file gone).
+  const pairedSidecarIds = new Set<string>();
+  for (const filepath of contentFiles) {
+    const ext = extname(filepath).slice(1).toLowerCase();
+    if (supportsInline(ext)) {
+      // Parse frontmatter, read id.
+      try {
+        const raw = readFileSync(filepath, "utf-8");
+        const { frontmatter } = parseFrontmatter(raw);
+        const id = typeof frontmatter.id === "string" ? (frontmatter.id as string) : null;
+        if (!id) {
+          stats.unparseable_files.push({
+            path: filepath,
+            reason: "no `id` in frontmatter",
+          });
+          continue;
+        }
+        if (!opts.validNoteIds.has(id)) {
+          try {
+            rmSync(filepath, { force: true });
+            stats.notes_removed++;
+          } catch (err) {
+            stats.unparseable_files.push({
+              path: filepath,
+              reason: `unlink failed: ${(err as Error).message ?? err}`,
+            });
+          }
+        }
+      } catch (err) {
+        stats.unparseable_files.push({
+          path: filepath,
+          reason: `read failed: ${(err as Error).message ?? err}`,
+        });
+      }
+    } else {
+      // Sidecar-required extension. Find the matching sidecar by
+      // (path, extension) — sidecars are keyed by id, so we sweep the
+      // sidecarById map.
+      const relPath = relative(outDir, filepath).replace(/\\/g, "/");
+      // Strip extension to get the canonical path stored in the sidecar
+      // (vault paths don't carry extensions).
+      const pathNoExt = relPath.slice(0, -(ext.length + 1));
+      let foundId: string | null = null;
+      for (const [id, info] of sidecarById.entries()) {
+        if (
+          info.path === pathNoExt &&
+          (info.extension ?? "md").toLowerCase() === ext
+        ) {
+          foundId = id;
+          break;
+        }
+      }
+      if (!foundId) {
+        // Content file with no sidecar — can't tell which note owns it.
+        // Conservative: leave alone, record as unparseable.
+        stats.unparseable_files.push({
+          path: filepath,
+          reason: "no sidecar metadata could be matched by (path, extension)",
+        });
+        continue;
+      }
+      pairedSidecarIds.add(foundId);
+      if (!opts.validNoteIds.has(foundId)) {
+        // Note is orphaned — remove both content and sidecar.
+        try {
+          rmSync(filepath, { force: true });
+          stats.notes_removed++;
+        } catch (err) {
+          stats.unparseable_files.push({
+            path: filepath,
+            reason: `unlink failed: ${(err as Error).message ?? err}`,
+          });
+        }
+        const sidecarPath = sidecarFilesById.get(foundId);
+        if (sidecarPath) {
+          try {
+            rmSync(sidecarPath, { force: true });
+            stats.sidecars_removed++;
+          } catch (err) {
+            stats.unparseable_files.push({
+              path: sidecarPath,
+              reason: `unlink failed: ${(err as Error).message ?? err}`,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Sweep up orphaned sidecars (sidecar exists but no content file
+  // matched OR sidecar's id isn't in validNoteIds).
+  for (const [id, sidecarPath] of sidecarFilesById.entries()) {
+    if (opts.validNoteIds.has(id) && pairedSidecarIds.has(id)) continue;
+    if (opts.validNoteIds.has(id) && !pairedSidecarIds.has(id)) {
+      // Sidecar refers to a valid note but the content file is gone —
+      // that's an inconsistency, not an orphan. Leave the sidecar so
+      // the next export can rewrite the content file alongside it.
+      continue;
+    }
+    try {
+      rmSync(sidecarPath, { force: true });
+      stats.sidecars_removed++;
+    } catch (err) {
+      stats.unparseable_files.push({
+        path: sidecarPath,
+        reason: `unlink failed: ${(err as Error).message ?? err}`,
+      });
+    }
+  }
+
+  // ---- 3. Schema sidecars ----
+  if (existsSync(schemasRoot)) {
+    try {
+      for (const entry of readdirSync(schemasRoot)) {
+        if (!entry.endsWith(".yaml")) continue;
+        const full = join(schemasRoot, entry);
+        try {
+          const text = readFileSync(full, "utf-8");
+          const { frontmatter } = parseFrontmatter(`---\n${text}---\n`);
+          const name = typeof frontmatter.name === "string" ? (frontmatter.name as string) : null;
+          if (!name) {
+            // Fall back to filename — sanitizeTagFilename replaces `/`
+            // with `__`, so reverse for the lookup.
+            const fromFilename = entry.slice(0, -5).replace(/__/g, "/");
+            if (!opts.validTagNames.has(fromFilename)) {
+              rmSync(full, { force: true });
+              stats.schemas_removed++;
+            }
+            continue;
+          }
+          if (!opts.validTagNames.has(name)) {
+            rmSync(full, { force: true });
+            stats.schemas_removed++;
+          }
+        } catch (err) {
+          stats.unparseable_files.push({
+            path: full,
+            reason: `schema sweep failed: ${(err as Error).message ?? err}`,
+          });
+        }
+      }
+    } catch (err) {
+      stats.unparseable_files.push({
+        path: schemasRoot,
+        reason: `schemas walk failed: ${(err as Error).message ?? err}`,
+      });
+    }
+  }
+
+  // ---- 4. Attachment directories ----
+  if (existsSync(attachmentsRoot)) {
+    try {
+      for (const entry of readdirSync(attachmentsRoot)) {
+        const full = join(attachmentsRoot, entry);
+        let stat;
+        try {
+          stat = statSync(full);
+        } catch (err) {
+          stats.unparseable_files.push({
+            path: full,
+            reason: `stat failed: ${(err as Error).message ?? err}`,
+          });
+          continue;
+        }
+        if (!stat.isDirectory()) continue;
+        // The directory name IS the attachment id (per the export layout).
+        if (!opts.validAttachmentIds.has(entry)) {
+          try {
+            rmSync(full, { recursive: true, force: true });
+            stats.attachment_dirs_removed++;
+          } catch (err) {
+            stats.unparseable_files.push({
+              path: full,
+              reason: `attachment dir remove failed: ${(err as Error).message ?? err}`,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      stats.unparseable_files.push({
+        path: attachmentsRoot,
+        reason: `attachments walk failed: ${(err as Error).message ?? err}`,
+      });
+    }
+  }
+
+  return stats;
+}
+
 function hasSchemaContent(tag: TagRecord): boolean {
   if (tag.description !== undefined && tag.description.length > 0) return true;
   if (tag.fields && Object.keys(tag.fields).length > 0) return true;
