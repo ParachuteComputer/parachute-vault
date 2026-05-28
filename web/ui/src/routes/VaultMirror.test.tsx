@@ -28,6 +28,7 @@ vi.mock("../lib/api.ts", async () => {
     getMirror: vi.fn(),
     putMirror: vi.fn(),
     runMirrorNow: vi.fn(),
+    pushMirrorNow: vi.fn(),
     // Credential surface (vault#384 — UI-configurable push credentials).
     // Default mocks return "no credentials configured" so existing tests
     // see the expected pre-credentials shape. Per-test overrides via
@@ -87,6 +88,10 @@ const snapshotFixture = (
     last_export_notes_count: null,
     last_commit_sha: null,
     last_error: null,
+    last_push_at: null,
+    last_push_sha: null,
+    last_push_error: null,
+    commits_unpushed: null,
     ...Object.fromEntries(
       Object.entries(over).filter(([k]) =>
         [
@@ -96,6 +101,10 @@ const snapshotFixture = (
           "last_export_notes_count",
           "last_commit_sha",
           "last_error",
+          "last_push_at",
+          "last_push_sha",
+          "last_push_error",
+          "commits_unpushed",
         ].includes(k),
       ),
     ),
@@ -291,11 +300,15 @@ describe("VaultMirror — admin scope", () => {
       },
     });
     renderRoute();
+    // Wait for both the mirror snapshot AND the credential status to
+    // resolve — the checkbox visibility depends on `creds.active_method`,
+    // which lives in a separate fetch from the mirror snapshot.
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
     );
-    // Credentials wired + internal location → checkbox visible.
-    expect(screen.getByLabelText(/Push after each commit/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByLabelText(/Push after each commit/i)).toBeInTheDocument(),
+    );
     // Helper copy that explains the cross-location behavior is rendered.
     expect(
       screen.getByText(/vault can push the mirror's commits to your remote/i),
@@ -394,6 +407,123 @@ describe("VaultMirror — admin scope", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.getByRole("button", { name: /Run export now/i })).toBeDisabled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Cut 5: push status fields render in the Status card.
+  // -------------------------------------------------------------------------
+
+  it("renders Last push timestamp + sha when last_push_at is set", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({
+        enabled: true,
+        location: "internal",
+        last_push_at: "2026-05-28T10:30:00.000Z",
+        last_push_sha: "deadbeef1234567890abcdef",
+        commits_unpushed: 0,
+      }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Status/i })).toBeInTheDocument(),
+    );
+    expect(screen.getByText("2026-05-28T10:30:00.000Z")).toBeInTheDocument();
+    // Truncated short sha (first 10).
+    expect(screen.getByText("deadbeef12")).toBeInTheDocument();
+  });
+
+  it("surfaces last_push_error in red when present", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({
+        enabled: true,
+        last_push_error: "fatal: Could not resolve host: github.example.com",
+      }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Last push failed/i)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/Could not resolve host/i)).toBeInTheDocument();
+  });
+
+  it("shows '<N> commits ready to push' hint when commits_unpushed > 0 and no recent push", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({
+        enabled: true,
+        commits_unpushed: 3,
+      }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/3 commits ready to push/i)).toBeInTheDocument(),
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Cut 6: explicit "Push now" button + pushMirrorNow call.
+  // -------------------------------------------------------------------------
+
+  it("Push now button fires pushMirrorNow + refreshes status", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({
+        enabled: true,
+        location: "internal",
+        commits_unpushed: 1,
+      }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        label: "GitHub PAT",
+        remote_url: "https://x-access-token:***@github.com/aaron/v.git",
+        token_preview: "ghp_…1234",
+      },
+    });
+    vi.mocked(api.pushMirrorNow).mockResolvedValue({
+      ...snapshotFixture({
+        enabled: true,
+        location: "internal",
+        last_push_at: "2026-05-28T10:31:00.000Z",
+        last_push_sha: "feedface1234567890abc",
+        commits_unpushed: 0,
+      }),
+      push: { fired: true, pushed: true, sha: "feedface1234567890abc" },
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Push now/i })).toBeInTheDocument(),
+    );
+    const pushBtn = screen.getByRole("button", { name: /Push now/i });
+    expect(pushBtn).not.toBeDisabled();
+    const user = userEvent.setup();
+    await user.click(pushBtn);
+    await waitFor(() => {
+      expect(api.pushMirrorNow).toHaveBeenCalledWith("work");
+    });
+    // The post-push status flows back into the card.
+    await waitFor(() =>
+      expect(screen.getByText("2026-05-28T10:31:00.000Z")).toBeInTheDocument(),
+    );
+  });
+
+  it("Push now is disabled when no credentials are wired AND auto_push is false", async () => {
+    // No remote to push to → button disabled with a tooltip nudge to
+    // wire credentials. (Operators with auto_push on but no creds still
+    // get the button — clicking surfaces last_push_error cleanly.)
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal", auto_push: false }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Push now/i })).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /Push now/i })).toBeDisabled();
   });
 
   it("surfaces a PUT error from the server next to the form", async () => {
@@ -632,6 +762,64 @@ describe("VaultMirror — Git remote credentials", () => {
     // verification_uri rendered as a link.
     const link = screen.getByRole("link", { name: /github\.com\/login\/device/i }) as HTMLAnchorElement;
     expect(link.href).toContain("github.com/login/device");
+  });
+
+  it("surfaces 'Auto-push enabled + first push landed' toast after PAT save (Cut 3 + 6)", async () => {
+    // After PAT save the backend may auto-enable auto_push AND fire an
+    // initial push. The SPA shows a toast with the actual outcome
+    // (sha pushed) so the operator sees the credentials worked.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    vi.mocked(api.postMirrorAuthPat).mockResolvedValue({
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        label: "GitHub PAT",
+        remote_url: "https://x-access-token:***@github.com/a/b.git",
+        token_preview: "ghp_…7890",
+      },
+      auto_push_was_already_enabled: false,
+      auto_push_enabled: true,
+      initial_push: {
+        fired: true,
+        pushed: true,
+        sha: "abc1234567def890",
+      },
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Use Personal Access Token/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Use Personal Access Token/i })).toBeInTheDocument(),
+    );
+    const modal = screen.getByRole("dialog");
+    await user.type(
+      within(modal).getByLabelText(/Token/i),
+      "ghp_test1234567890",
+    );
+    await user.type(
+      within(modal).getByLabelText(/Remote URL/i),
+      "https://github.com/a/b.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Validate & save/i }));
+    // The toast confirms the auto_push + push outcome.
+    await waitFor(() =>
+      expect(screen.getByText(/Credentials saved/i)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(/Auto-push enabled and the first push landed/i),
+    ).toBeInTheDocument();
+    // The pushed sha (truncated to 10) appears.
+    expect(screen.getByText("abc1234567")).toBeInTheDocument();
   });
 
   it("opens the PAT modal and accepts token + remote URL input", async () => {

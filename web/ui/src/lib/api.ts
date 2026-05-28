@@ -149,6 +149,18 @@ export interface MirrorStatus {
   last_export_notes_count: number | null;
   last_commit_sha: string | null;
   last_error: string | null;
+  /**
+   * Push observability — Cut 5 of vault#392. `last_push_at` is the ISO
+   * timestamp of the most recent successful push; `last_push_sha` is the
+   * sha that landed at that time; `last_push_error` is set after a
+   * failed push (cleared on the next successful one). `commits_unpushed`
+   * counts local commits ahead of upstream tracking (null when no
+   * upstream is configured yet — first push hasn't fired).
+   */
+  last_push_at: string | null;
+  last_push_sha: string | null;
+  last_push_error: string | null;
+  commits_unpushed: number | null;
 }
 
 export interface MirrorSnapshot {
@@ -220,6 +232,31 @@ export async function runMirrorNow(vaultName: string): Promise<MirrorSnapshot> {
     throw new HttpError(res.status, await readError(res));
   }
   return (await res.json()) as MirrorSnapshot;
+}
+
+/**
+ * POST a manual "push now" trigger — Cut 6 of vault#392. Distinguished
+ * from `runMirrorNow` in that this only fires `git push` against
+ * already-committed state; it doesn't export or commit. Returns the
+ * updated snapshot + push outcome.
+ */
+export interface MirrorPushNowResponse extends MirrorSnapshot {
+  push:
+    | { fired: false; reason: "not_enabled" | "no_mirror_path" }
+    | { fired: true; pushed: boolean; sha?: string; error?: string };
+}
+export async function pushMirrorNow(vaultName: string): Promise<MirrorPushNowResponse> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/push-now`,
+    {
+      method: "POST",
+      headers: mirrorAuthHeaders(),
+    },
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as MirrorPushNowResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,10 +362,25 @@ export async function pollGithubDeviceFlow(
   return (await res.json()) as DevicePollState;
 }
 
+/**
+ * `MirrorCredentialSaveResult` — Cut 3/Cut 6 extends the PAT-save +
+ * select-repo responses with side-effects of the save: auto_push being
+ * auto-enabled and an initial push being fired. The SPA uses these to
+ * render a toast "Credentials wired + auto-push enabled. Your next
+ * commit will push to <repo>" rather than a silent "saved" confirmation.
+ */
+export interface MirrorCredentialSaveResult extends MirrorCredentialStatus {
+  auto_push_was_already_enabled: boolean;
+  auto_push_enabled: boolean;
+  initial_push:
+    | { fired: false; reason: string }
+    | { fired: true; pushed: boolean; error?: string; sha?: string };
+}
+
 export async function postMirrorAuthPat(
   vaultName: string,
   args: { token: string; remote_url: string; label?: string },
-): Promise<MirrorCredentialStatus> {
+): Promise<MirrorCredentialSaveResult> {
   const res = await fetch(
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/pat`,
     {
@@ -338,7 +390,7 @@ export async function postMirrorAuthPat(
     },
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
-  return (await res.json()) as MirrorCredentialStatus;
+  return (await res.json()) as MirrorCredentialSaveResult;
 }
 
 export async function listGithubRepos(
@@ -368,10 +420,24 @@ export async function createGithubRepo(
   return (await res.json()) as GitHubRepoInfo;
 }
 
+export interface SelectGithubRepoResult {
+  ok: boolean;
+  applied: boolean;
+  owner: string;
+  name: string;
+  remote: string;
+  /** Cut 3/Cut 6 — auto_push side-effects from credential save. */
+  auto_push_was_already_enabled: boolean;
+  auto_push_enabled: boolean;
+  initial_push:
+    | { fired: false; reason: string }
+    | { fired: true; pushed: boolean; error?: string; sha?: string };
+}
+
 export async function selectGithubRepo(
   vaultName: string,
   args: { owner: string; name: string },
-): Promise<{ ok: boolean; applied: boolean; owner: string; name: string; remote: string }> {
+): Promise<SelectGithubRepoResult> {
   const res = await fetch(
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/select-repo`,
     {
@@ -381,13 +447,7 @@ export async function selectGithubRepo(
     },
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
-  return (await res.json()) as {
-    ok: boolean;
-    applied: boolean;
-    owner: string;
-    name: string;
-    remote: string;
-  };
+  return (await res.json()) as SelectGithubRepoResult;
 }
 
 // ---------------------------------------------------------------------------
