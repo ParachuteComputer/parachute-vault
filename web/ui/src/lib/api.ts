@@ -225,9 +225,11 @@ export async function runMirrorNow(vaultName: string): Promise<MirrorSnapshot> {
 // ---------------------------------------------------------------------------
 // Mirror credentials — `/vault/<name>/.parachute/mirror/auth[/*]`
 //
-// UI-configurable git push credentials. Two surfaces: GitHub OAuth Device
-// Flow (preferred), and Personal Access Token fallback. The endpoints
-// don't return secrets — only redacted previews + user metadata.
+// UI-configurable git push credentials. Two surfaces: Personal Access
+// Token (universal — works against any HTTPS+token git host) and GitHub
+// OAuth Device Flow (one-click shortcut for GitHub users, same
+// end-state as a hand-pasted PAT). The endpoints don't return secrets
+// — only redacted previews + user metadata.
 // ---------------------------------------------------------------------------
 
 /** Sanitized public shape — what the server hands back on GET /auth. */
