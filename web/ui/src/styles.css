@@ -444,3 +444,95 @@ select:focus {
   margin: 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Git remote credentials UI — banner variants + OAuth/PAT modals.
+ * ------------------------------------------------------------------------- */
+
+.info-banner {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent-hover);
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 1rem;
+}
+
+.modal {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  width: min(520px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+}
+
+.device-code-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.device-code {
+  font-size: 1.4rem;
+  letter-spacing: 0.1em;
+  padding: 0.6rem 1rem;
+  background: var(--bg-soft);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  user-select: all;
+  flex: 1;
+  text-align: center;
+}
+
+.repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem;
+  background: var(--bg-soft);
+}
+
+.repo-row {
+  background: var(--bg);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.92rem;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.repo-row:hover {
+  border-color: var(--accent);
+  background: white;
+}
+.repo-row:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+

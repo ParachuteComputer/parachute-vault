@@ -28,6 +28,22 @@ vi.mock("../lib/api.ts", async () => {
     getMirror: vi.fn(),
     putMirror: vi.fn(),
     runMirrorNow: vi.fn(),
+    // Credential surface (vault#384 — UI-configurable push credentials).
+    // Default mocks return "no credentials configured" so existing tests
+    // see the expected pre-credentials shape. Per-test overrides via
+    // `vi.mocked(api.getMirrorAuth).mockResolvedValue(...)`.
+    getMirrorAuth: vi.fn().mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    }),
+    deleteMirrorAuth: vi.fn(),
+    startGithubDeviceFlow: vi.fn(),
+    pollGithubDeviceFlow: vi.fn(),
+    postMirrorAuthPat: vi.fn(),
+    listGithubRepos: vi.fn(),
+    createGithubRepo: vi.fn(),
+    selectGithubRepo: vi.fn(),
   };
 });
 vi.mock("../lib/scope.ts");
@@ -404,5 +420,181 @@ describe("VaultMirror — read scope", () => {
     expect(screen.getByText(/read-only token/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Save$/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /Run export now/i })).toBeDisabled();
+  });
+
+  it("hides the Git remote section for read-only sessions (admin scope gates it)", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("heading", { name: /Git remote/i })).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Git remote credentials section (vault#384)
+// ---------------------------------------------------------------------------
+
+describe("VaultMirror — Git remote credentials", () => {
+  beforeEach(() => {
+    vi.mocked(scope.hasAdminScope).mockReturnValue(true);
+  });
+
+  it("shows 'Not connected' + the two connect buttons when no credentials", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/Not connected/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Connect GitHub/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Use Personal Access Token/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows 'Connected to @login' + Disconnect when github_oauth is active", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: "github_oauth",
+      github_oauth: {
+        user_login: "aaron",
+        user_id: 1,
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        token_preview: "gho_…7890",
+      },
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Connected to/i)).toBeInTheDocument(),
+    );
+    // Show the masked token preview, not a raw token.
+    expect(screen.getByText("gho_…7890")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Disconnect/i })).toBeInTheDocument();
+  });
+
+  it("displays the friendly auto_push warning when no credentials but auto_push=true", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({
+        enabled: true,
+        location: "external",
+        external_path: "/tmp/x",
+        auto_push: true,
+      }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Auto-push needs git credentials/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("displays 'Will push to @login' when credentials configured and auto_push=true", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({
+        enabled: true,
+        location: "external",
+        external_path: "/tmp/x",
+        auto_push: true,
+      }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: "github_oauth",
+      github_oauth: {
+        user_login: "aaron",
+        user_id: 1,
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        token_preview: "gho_…7890",
+      },
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Will push to/i)).toBeInTheDocument(),
+    );
+    // Use of @login appears in the auto_push banner; the Connected status
+    // also says the login. Both should be rendered.
+    const matches = screen.getAllByText(/@aaron/);
+    expect(matches.length).toBeGreaterThan(0);
+  });
+
+  it("opens the OAuth modal and displays the user_code after a successful device-code request", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    vi.mocked(api.startGithubDeviceFlow).mockResolvedValue({
+      polling_id: "test_polling_id",
+      user_code: "ABCD-1234",
+      verification_uri: "https://github.com/login/device",
+      expires_in: 900,
+      interval: 5,
+    });
+    vi.mocked(api.pollGithubDeviceFlow).mockResolvedValue({ state: "pending" });
+
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Connect GitHub/i }));
+    await waitFor(() =>
+      expect(screen.getByText("ABCD-1234")).toBeInTheDocument(),
+    );
+    expect(api.startGithubDeviceFlow).toHaveBeenCalledWith("work");
+    // verification_uri rendered as a link.
+    const link = screen.getByRole("link", { name: /github\.com\/login\/device/i }) as HTMLAnchorElement;
+    expect(link.href).toContain("github.com/login/device");
+  });
+
+  it("opens the PAT modal and accepts token + remote URL input", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Use Personal Access Token/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Use Personal Access Token/i })).toBeInTheDocument(),
+    );
+    const tokenInput = screen.getByLabelText(/Token/i) as HTMLInputElement;
+    const urlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
+    await user.type(tokenInput, "ghp_test1234567890");
+    await user.type(urlInput, "https://github.com/aaron/vault.git");
+    expect(tokenInput.value).toBe("ghp_test1234567890");
+    expect(urlInput.value).toBe("https://github.com/aaron/vault.git");
   });
 });

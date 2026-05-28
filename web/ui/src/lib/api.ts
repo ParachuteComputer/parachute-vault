@@ -222,6 +222,172 @@ export async function runMirrorNow(vaultName: string): Promise<MirrorSnapshot> {
   return (await res.json()) as MirrorSnapshot;
 }
 
+// ---------------------------------------------------------------------------
+// Mirror credentials — `/vault/<name>/.parachute/mirror/auth[/*]`
+//
+// UI-configurable git push credentials. Two surfaces: GitHub OAuth Device
+// Flow (preferred), and Personal Access Token fallback. The endpoints
+// don't return secrets — only redacted previews + user metadata.
+// ---------------------------------------------------------------------------
+
+/** Sanitized public shape — what the server hands back on GET /auth. */
+export interface MirrorCredentialStatus {
+  active_method: "github_oauth" | "pat" | null;
+  github_oauth: {
+    user_login: string;
+    user_id: number;
+    scope: string;
+    authorized_at: string;
+    token_preview: string;
+  } | null;
+  pat: {
+    label: string;
+    remote_url: string;
+    token_preview: string;
+  } | null;
+}
+
+export interface DeviceCodeResponse {
+  polling_id: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+  interval: number;
+}
+
+export type DevicePollState =
+  | { state: "pending" }
+  | { state: "slow_down"; interval: number }
+  | { state: "expired"; message?: string }
+  | { state: "denied" }
+  | {
+      state: "granted";
+      user: { login: string; id: number; name: string | null; avatar_url?: string };
+    };
+
+export interface GitHubRepoInfo {
+  owner: string;
+  name: string;
+  full_name: string;
+  private: boolean;
+  html_url: string;
+  description: string | null;
+  updated_at: string;
+  clone_url: string;
+}
+
+export async function getMirrorAuth(vaultName: string): Promise<MirrorCredentialStatus> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth`,
+    { headers: mirrorAuthHeaders() },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as MirrorCredentialStatus;
+}
+
+export async function deleteMirrorAuth(vaultName: string): Promise<MirrorCredentialStatus> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth`,
+    { method: "DELETE", headers: mirrorAuthHeaders() },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as MirrorCredentialStatus;
+}
+
+export async function startGithubDeviceFlow(
+  vaultName: string,
+): Promise<DeviceCodeResponse> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/device-code`,
+    { method: "POST", headers: mirrorAuthHeaders() },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as DeviceCodeResponse;
+}
+
+export async function pollGithubDeviceFlow(
+  vaultName: string,
+  pollingId: string,
+): Promise<DevicePollState> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/poll`,
+    {
+      method: "POST",
+      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ polling_id: pollingId }),
+    },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as DevicePollState;
+}
+
+export async function postMirrorAuthPat(
+  vaultName: string,
+  args: { token: string; remote_url: string; label?: string },
+): Promise<MirrorCredentialStatus> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/pat`,
+    {
+      method: "POST",
+      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(args),
+    },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as MirrorCredentialStatus;
+}
+
+export async function listGithubRepos(
+  vaultName: string,
+): Promise<{ repos: GitHubRepoInfo[]; truncated: boolean }> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/repos`,
+    { headers: mirrorAuthHeaders() },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as { repos: GitHubRepoInfo[]; truncated: boolean };
+}
+
+export async function createGithubRepo(
+  vaultName: string,
+  args: { name: string; description?: string; private?: boolean },
+): Promise<GitHubRepoInfo> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/create-repo`,
+    {
+      method: "POST",
+      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(args),
+    },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as GitHubRepoInfo;
+}
+
+export async function selectGithubRepo(
+  vaultName: string,
+  args: { owner: string; name: string },
+): Promise<{ ok: boolean; applied: boolean; owner: string; name: string; remote: string }> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/select-repo`,
+    {
+      method: "POST",
+      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(args),
+    },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as {
+    ok: boolean;
+    applied: boolean;
+    owner: string;
+    name: string;
+    remote: string;
+  };
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
