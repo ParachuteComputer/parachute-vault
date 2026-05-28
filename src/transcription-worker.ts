@@ -554,10 +554,15 @@ export function registerTranscriptionHook(
   return registry.onAttachment({
     name: "transcription-kickoff",
     event: "created",
-    when: (att) =>
-      (att.metadata as { transcribe_status?: string } | undefined)
-        ?.transcribe_status === "pending",
-    handler: async (attachment, store) => {
+    when: (att) => {
+      // Only "created" payloads reach this predicate (we don't subscribe
+      // to "deleted"), so `metadata` is populated. The union widening
+      // post-deletion-events just means we narrow here defensively.
+      const meta = (att as Attachment).metadata as { transcribe_status?: string } | undefined;
+      return meta?.transcribe_status === "pending";
+    },
+    handler: async (payload, store) => {
+      const attachment = payload as Attachment;
       const vault = resolveVault(store);
       if (!vault) {
         logger.error(
