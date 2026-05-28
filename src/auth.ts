@@ -332,6 +332,75 @@ export async function authenticateVaultRequest(
 }
 
 /**
+ * Sentinel thrown when a hub JWT carries a `permissions.scoped_tags` claim
+ * that is present but malformed (not an array of non-empty strings). See
+ * `parseScopedTagsFromPermissions` for why this MUST fail closed.
+ */
+class MalformedScopedTagsError extends Error {}
+
+/**
+ * Map a validated hub JWT's `permissions` claim into the `scoped_tags`
+ * allowlist for `AuthResult` (auth-unification arc, C0 — the READ side).
+ *
+ * Wire contract (the shape the SPA + manage-token mint sides target):
+ *
+ *   permissions: { scoped_tags: string[] }   // root tag names
+ *
+ * Same semantics as the deprecated `pvt_*` `scoped_tags` DB column: each
+ * entry is a ROOT tag name; the token sees notes carrying that tag or a
+ * sub-tag thereof (hierarchy expansion happens in tag-scope.ts).
+ *
+ * Three outcomes, chosen for a strict FAIL-CLOSED invariant — tag-scoping is
+ * always a RESTRICTION, so a misread must NEVER widen access:
+ *
+ *   1. Claim absent (no `permissions`, or no `scoped_tags` key) → returns
+ *      `null` = UNSCOPED = full vault. This is legitimate and is today's
+ *      behavior for every hub JWT. Absence genuinely means "not tag-scoped".
+ *
+ *   2. `scoped_tags` is a non-empty array of non-empty strings → returns
+ *      that array. The token is tag-scoped; the allowlist is enforced.
+ *
+ *   3. `scoped_tags` is present but MALFORMED — a string, a number, an
+ *      object, an array containing a non-string / empty-string, or an empty
+ *      array `[]` — throws `MalformedScopedTagsError`. The caller REJECTS
+ *      the request (401). We do NOT coerce to `null` or `[]`:
+ *
+ *      - Coercing to `null` would WIDEN a token that was MEANT to be scoped
+ *        up to full-vault — a privilege leak. Forbidden.
+ *      - Coercing to `[]` is NOT reliably fail-closed across enforcement
+ *        paths. The MCP read-tool wrappers fast-path out on
+ *        `scoped_tags.length === 0` (mcp-tools.ts ~L178) and the REST path
+ *        collapses `[]` → null inside `expandTokenTagScope` (tag-scope.ts
+ *        ~L35) — both treat `[]` as UNSCOPED = full vault. So `[]` would
+ *        ALSO widen. (Note: `filterNotesByTagScope`/`noteWithinTagScope`
+ *        would treat a raw `[]` as "matches nothing", but the call sites
+ *        never reach them with `[]` because of the upstream short-circuits —
+ *        the two enforcement paths disagree on `[]`, which is exactly why we
+ *        refuse to manufacture it here.)
+ *
+ *      The only correct fail-closed action for a present-but-unreadable
+ *      scope is to reject the whole request — never serve it wide.
+ */
+function parseScopedTagsFromPermissions(
+  permissions: Record<string, unknown> | undefined,
+): string[] | null {
+  if (!permissions || !("scoped_tags" in permissions)) return null;
+  const raw = permissions.scoped_tags;
+  if (raw === null || raw === undefined) return null; // explicit "unscoped"
+  if (
+    Array.isArray(raw) &&
+    raw.length > 0 &&
+    raw.every((t) => typeof t === "string" && t.length > 0)
+  ) {
+    return raw as string[];
+  }
+  // Present but malformed (incl. `[]`): fail closed — never widen.
+  throw new MalformedScopedTagsError(
+    "hub JWT permissions.scoped_tags is present but not a non-empty array of tag names",
+  );
+}
+
+/**
  * Validate a JWT-shaped bearer and convert the result into an `AuthResult`.
  * The token's scope claim becomes the granted scopes; permission is derived
  * for back-compat with code paths that still branch on `permission` (MCP
@@ -353,6 +422,12 @@ export async function authenticateVaultRequest(
  * unchanged. The 403 (not 401) signals "your credential is valid but
  * doesn't grant access to this vault" — distinct from authentication
  * failures upstream. See hub#283 + scope-guard 0.3.0 for the mint side.
+ *
+ * Tag-scoping (auth-unification arc, C0): the token's `permissions.scoped_tags`
+ * claim (when present and well-formed) maps into `AuthResult.scoped_tags`,
+ * restricting which notes the token sees. A present-but-malformed claim FAILS
+ * CLOSED with a 401 rather than widening to full-vault — see
+ * `parseScopedTagsFromPermissions`.
  */
 async function authenticateHubJwt(
   token: string,
@@ -413,11 +488,15 @@ async function authenticateHubJwt(
       hasScope(claims.scopes, SCOPE_WRITE) || hasScope(claims.scopes, SCOPE_ADMIN)
         ? "full"
         : "read";
+    // C0: read tag-scoping from the validated token's `permissions` claim.
+    // Throws MalformedScopedTagsError (caught below → 401) on a present-but-
+    // malformed claim so we never widen access on a misread.
+    const scoped_tags = parseScopedTagsFromPermissions(claims.permissions);
     return {
       permission,
       scopes: claims.scopes,
       legacyDerived: false,
-      scoped_tags: null,
+      scoped_tags,
       vault_name: null,
       // claims.jti is `undefined` when the issuer didn't stamp one. Pass it
       // through verbatim — manage-token's session-pin will be null in that
@@ -425,6 +504,19 @@ async function authenticateHubJwt(
       caller_jti: claims.jti ?? null,
     };
   } catch (err) {
+    if (err instanceof MalformedScopedTagsError) {
+      // Fail-closed (C0): a present-but-malformed `permissions.scoped_tags`
+      // means the token wanted to be tag-scoped but we can't read the
+      // allowlist. Reject rather than widen to full-vault. The audit log
+      // carries the diagnostic; the client gets a generic 401.
+      console.warn(`[auth] hub JWT rejected: ${err.message}`);
+      return {
+        error: Response.json(
+          { error: "Unauthorized", message: "token has a malformed tag-scope claim" },
+          { status: 401 },
+        ),
+      };
+    }
     if (err instanceof HubJwtError) {
       // Revocation-related codes get sanitized client messages: server-side
       // audit log carries the full diagnostic (jti for `revoked`,

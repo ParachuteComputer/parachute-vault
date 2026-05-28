@@ -87,15 +87,19 @@ interface SignOpts {
   expiresAtSeconds?: number;
   omitKid?: boolean;
   kid?: string;
+  /** `permissions` claim (auth-unification C0). Undefined → omit. */
+  permissions?: unknown;
 }
 
 async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
   const iat = Math.floor(Date.now() / 1000);
   const exp = opts.expiresAtSeconds ?? iat + (opts.ttlSeconds ?? 60);
-  const builder = new SignJWT({
+  const claims: Record<string, unknown> = {
     scope: opts.scope ?? "vault:read vault:write",
     client_id: opts.clientId ?? "test-client",
-  })
+  };
+  if (opts.permissions !== undefined) claims.permissions = opts.permissions;
+  const builder = new SignJWT(claims)
     .setProtectedHeader(opts.omitKid ? { alg: "RS256" } : { alg: "RS256", kid: opts.kid ?? kp.kid })
     .setIssuer(opts.iss ?? "http://issuer.invalid")
     .setSubject(opts.sub ?? "user-1")
@@ -186,6 +190,27 @@ describe("validateHubJwt — happy path", () => {
     const token = await signJwt(kp, { iss: fixture.origin, aud: "vault.work" });
     const claims = await validateHubJwt(token, { expectedAudience: "vault.work" });
     expect(claims.aud).toBe("vault.work");
+  });
+
+  test("permissions claim surfaces on the validated result (C0)", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      permissions: { scoped_tags: ["health", "finance"] },
+    });
+    const claims = await validateHubJwt(token);
+    expect(claims.permissions).toEqual({ scoped_tags: ["health", "finance"] });
+  });
+
+  test("no permissions claim → permissions is undefined", async () => {
+    const token = await signJwt(kp, { iss: fixture.origin });
+    const claims = await validateHubJwt(token);
+    expect(claims.permissions).toBeUndefined();
+  });
+
+  test("non-object permissions claim → permissions is undefined (not surfaced)", async () => {
+    const token = await signJwt(kp, { iss: fixture.origin, permissions: "not-an-object" });
+    const claims = await validateHubJwt(token);
+    expect(claims.permissions).toBeUndefined();
   });
 });
 

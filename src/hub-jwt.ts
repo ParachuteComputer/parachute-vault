@@ -59,6 +59,16 @@ const guard = createScopeGuard({ hubOrigin: () => getHubOrigin() });
  * Scope-shape policy (e.g. "hub-issued tokens may not carry broad
  * `vault:<verb>` scopes") is enforced one layer up in `authenticateHubJwt`,
  * not here — this function stays focused on JWT-level concerns.
+ *
+ * The returned `HubJwtClaims` carries the native `permissions` claim
+ * (scope-guard ≥0.4.0-rc.2 parses + surfaces it; `undefined` when absent or
+ * not a JSON object). Tag-scope enforcement reads `permissions.scoped_tags`
+ * in `authenticateHubJwt` — see auth-unification arc C0.
+ *
+ * jti policy: scope-guard's `createScopeGuard` defaults `allowMissingJti:
+ * false` (per hub#218 / scope-guard #322), so a hub JWT lacking a `jti`
+ * claim is rejected here. Vault doesn't opt out — every hub mint stamps a
+ * jti, and revocation can't be enforced on tokens we can't index.
  */
 export async function validateHubJwt(
   token: string,
