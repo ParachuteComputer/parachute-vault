@@ -16,10 +16,11 @@
  * banner directing them to re-auth instead of getting a 403 toast on
  * every interaction.
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { HttpError } from "../lib/api.ts";
 import { hasAdminScope } from "../lib/scope.ts";
+import { SignInBanner } from "../lib/SignInBanner.tsx";
 import {
   type MintTokenResult,
   type TokenSummary,
@@ -32,7 +33,7 @@ import {
 type LoadState =
   | { kind: "loading" }
   | { kind: "ok"; tokens: TokenSummary[] }
-  | { kind: "auth-required" }
+  | { kind: "auth-required"; status: number | null }
   | { kind: "error"; message: string };
 
 const KNOWN_SCOPE_VERBS = ["read", "write", "admin"] as const;
@@ -63,7 +64,7 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
       .catch((err) => {
         if (cancelled) return;
         if (err instanceof HttpError && (err.status === 401 || err.status === 403)) {
-          setState({ kind: "auth-required" });
+          setState({ kind: "auth-required", status: err.status });
           return;
         }
         const message = err instanceof Error ? err.message : String(err);
@@ -73,6 +74,8 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
       cancelled = true;
     };
   }, [name, reloadTick]);
+
+  const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
 
   // Belt-and-suspenders for the single-emit contract: while the plaintext
   // pvt_* is on screen, prompt the browser's "leave site?" confirm on tab
@@ -144,9 +147,7 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
         <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>Existing tokens</h3>
         {state.kind === "loading" ? <p className="muted">Loading…</p> : null}
         {state.kind === "auth-required" ? (
-          <div className="warn-banner">
-            Open this page from the hub's directory — the "Manage" link supplies the admin token.
-          </div>
+          <SignInBanner vaultName={name} status={state.status} onRecovered={onRecovered} />
         ) : null}
         {state.kind === "error" ? (
           <div className="error-banner">

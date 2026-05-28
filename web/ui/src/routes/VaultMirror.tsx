@@ -23,8 +23,9 @@
  * exclusive territory of the operator's own cron (or the admin SPA's
  * "Run export now" button).
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { SignInBanner } from "../lib/SignInBanner.tsx";
 import {
   HttpError,
   type DeviceCodeResponse,
@@ -56,7 +57,7 @@ import { hasAdminScope } from "../lib/scope.ts";
 type LoadState =
   | { kind: "loading" }
   | { kind: "ok"; snapshot: MirrorSnapshot }
-  | { kind: "auth-required" }
+  | { kind: "auth-required"; status: number | null }
   | { kind: "error"; message: string };
 
 /**
@@ -163,7 +164,7 @@ export function VaultMirror({ vaultName }: { vaultName?: string } = {}) {
       .catch((err) => {
         if (cancelled) return;
         if (err instanceof HttpError && (err.status === 401 || err.status === 403)) {
-          setState({ kind: "auth-required" });
+          setState({ kind: "auth-required", status: err.status });
           return;
         }
         const message = err instanceof Error ? err.message : String(err);
@@ -173,6 +174,8 @@ export function VaultMirror({ vaultName }: { vaultName?: string } = {}) {
       cancelled = true;
     };
   }, [name, reloadTick]);
+
+  const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
 
   if (!name) {
     return (
@@ -198,11 +201,7 @@ export function VaultMirror({ vaultName }: { vaultName?: string } = {}) {
       {state.kind === "loading" ? <p className="muted">Loading…</p> : null}
 
       {state.kind === "auth-required" ? (
-        <div className="warn-banner">
-          Open this page from the hub's directory — the "Manage" link supplies the admin
-          token. Direct loads of <code>/vault/{name}/admin/mirror</code> can't see protected
-          vault data.
-        </div>
+        <SignInBanner vaultName={name} status={state.status} onRecovered={onRecovered} />
       ) : null}
 
       {state.kind === "error" ? (
