@@ -1102,6 +1102,7 @@ function RepoPicker({
   onError: (message: string) => void;
 }) {
   const [repos, setRepos] = useState<GitHubRepoInfo[] | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const [filter, setFilter] = useState("");
   const [picking, setPicking] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -1111,8 +1112,10 @@ function RepoPicker({
   useEffect(() => {
     let cancelled = false;
     listGithubRepos(vaultName)
-      .then(({ repos }) => {
-        if (!cancelled) setRepos(repos);
+      .then(({ repos, truncated }) => {
+        if (cancelled) return;
+        setRepos(repos);
+        setTruncated(Boolean(truncated));
       })
       .catch((err) => {
         if (!cancelled) onError(err instanceof Error ? err.message : String(err));
@@ -1170,6 +1173,14 @@ function RepoPicker({
           onChange={(e) => setFilter(e.target.value)}
         />
       </div>
+
+      {truncated ? (
+        <p className="muted" style={{ fontSize: "0.85em" }}>
+          Showing the first 300 repos. Use the filter above to narrow down — or
+          paste the clone URL directly via Personal Access Token below if your
+          repo isn't here.
+        </p>
+      ) : null}
 
       {repos === null ? <p className="muted">Loading repos…</p> : null}
 

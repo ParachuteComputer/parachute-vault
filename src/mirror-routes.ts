@@ -598,6 +598,19 @@ export async function handleAuthPat(
 
 /**
  * Run `git ls-remote <url>` with a hard timeout, no interactive prompts.
+ *
+ * Threat-model note (reviewer-flagged on vault#384):
+ *   The URL passed here contains the user's token in userinfo position
+ *   (`https://x-access-token:<TOKEN>@host/repo.git`). On Linux that means
+ *   the token sits in `/proc/<pid>/cmdline` for the ~10s probe window,
+ *   readable by any process running as another UID with default perms.
+ *   For vault's threat model (owner-operated, single-user self-host) this
+ *   is acceptable — anyone with shell on the box already has read access
+ *   to `~/.parachute/vault/.mirror-credentials.yaml` (0600) and
+ *   `<mirror>/.git/config` (0644). Same posture as `~/.git-credentials`
+ *   and `~/.netrc`. If we ever ship multi-tenant vault (cloud Tier 2)
+ *   this needs to switch to env-based auth via a credential helper script
+ *   so the token never enters argv.
  */
 async function probeGitLsRemote(
   url: string,

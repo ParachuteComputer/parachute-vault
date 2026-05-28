@@ -157,6 +157,34 @@ describe("serialize + parse round-trip", () => {
     const out = parseCredentials(serializeCredentials(creds));
     expect(out.pat!.label).toBe('PAT with "quotes" and: colons');
   });
+
+  // Reviewer-flagged on vault#384 — without newline escaping a label
+  // containing a literal `\n` produces multi-line YAML that breaks
+  // the per-line section parser. PAT/OAuth tokens never carry newlines
+  // but operator-supplied labels have no such guarantee.
+  test("newlines + carriage returns in label round-trip via escapes", () => {
+    const labelWithLineBreak = "Line one\nLine two";
+    const labelWithCR = "First\rSecond";
+    for (const label of [labelWithLineBreak, labelWithCR]) {
+      const creds: MirrorCredentials = {
+        active_method: "pat",
+        github_oauth: null,
+        pat: {
+          token: "ghp_newline_test_token_12345",
+          remote_url: "https://gitlab.com/team/repo.git",
+          label,
+        },
+      };
+      const serialized = serializeCredentials(creds);
+      // Serialized YAML must NOT contain literal newlines inside the
+      // label scalar (would break section parsing).
+      const labelLine = serialized.split("\n").find((l) => l.includes("label:"))!;
+      expect(labelLine).not.toContain("\n");
+      // Round-trip recovers the original.
+      const out = parseCredentials(serialized);
+      expect(out.pat!.label).toBe(label);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

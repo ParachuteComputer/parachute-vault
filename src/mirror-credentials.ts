@@ -215,10 +215,21 @@ export function serializeCredentials(creds: MirrorCredentials): string {
   return lines.join("\n") + "\n";
 }
 
-/** Quote a YAML scalar when it contains characters that confuse parsers. */
+/**
+ * Quote a YAML scalar when it contains characters that confuse parsers.
+ * `gho_*` / `ghp_*` tokens never carry newlines or special chars, but the
+ * operator-supplied `label` field has no such guarantee — a label with a
+ * literal `\n` would break the parser's per-line section logic. Escape
+ * newlines + carriage returns + backslash + quote inside the quoted form.
+ * Reviewer-flagged on vault#384.
+ */
 function quoteIfNeeded(value: string): string {
-  if (/[:#"'\\]/.test(value) || value.trim() !== value || value.length === 0) {
-    return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  if (/[:#"'\\\n\r]/.test(value) || value.trim() !== value || value.length === 0) {
+    return `"${value
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")}"`;
   }
   return value;
 }
@@ -227,7 +238,12 @@ function quoteIfNeeded(value: string): string {
 function parseScalar(raw: string): string {
   const trimmed = raw.trim();
   if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    return trimmed
+      .slice(1, -1)
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
   }
   return trimmed;
 }
