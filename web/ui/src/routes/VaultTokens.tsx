@@ -1,74 +1,140 @@
 /**
  * `/vault/:name/tokens` — token management.
  *
- * Phase B (vault#217). Three operations against `/vault/<name>/tokens`:
+ * The auth-unification arc (SPA step). New tokens are **hub JWTs** minted via
+ * hub's registry (`/api/auth/*`) with the host-admin bearer
+ * (`host-admin-auth.ts`). The deprecated `pvt_*` mint path is GONE — the only
+ * remaining trace of `pvt_*` is a read-only + revoke-only "Legacy tokens"
+ * section, shown when the vault still has live `pvt_*` rows (until the DROP,
+ * vault#282). Fresh installs never see it.
  *
- *   - **List**     — table of label / scopes / created / last-used.
- *   - **Mint**     — form for label + (optional) scope-narrowing. On 201
- *     the plaintext `pvt_*` is rendered exactly once in a banner with copy
- *     + dismissal warning. Server can't re-emit; we hold it in component
- *     state and lose it on navigation away. Dismissal clears it explicitly.
- *   - **Revoke**   — confirm modal then DELETE.
+ * Three operations on the hub-JWT surface:
+ *   - **List**   — accumulate ALL pages of `/api/auth/tokens`, then
+ *     client-filter to this vault's `vault:<name>:*` rows.
+ *   - **Mint**   — form for label + scope verb + optional tag-allowlist + TTL.
+ *     On 200 the one-time-reveal hub JWT renders in a banner (single-emit;
+ *     the server never re-emits it).
+ *   - **Revoke** — confirm modal then `POST /api/auth/revoke-token { jti }`.
  *
- * Mutate UI is gated on `hasAdminScope(name)`. The vault server requires
- * `vault:<name>:admin` for all three verbs (list, mint, revoke), so the
- * client-side gate is defense-in-depth: a read-scoped session sees a
- * banner directing them to re-auth instead of getting a 403 toast on
- * every interaction.
+ * Mutate UI is gated on `hasAdminScope(name)` (the vault-admin JWT the SPA
+ * already holds). The host-admin bearer is minted lazily by the token API
+ * calls; a friend account (signed in but not the hub admin) gets a 403 from
+ * the host-admin endpoint → we redirect to the issuer's `/account/` home.
+ *
+ * Two independent load states: the hub-JWT list (host-admin bearer) and the
+ * legacy `pvt_*` list (vault-admin bearer). They load + fail independently.
  */
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { HttpError } from "../lib/api.ts";
+import { HostAdminError, redirectToAccountHome } from "../lib/host-admin-auth.ts";
 import { hasAdminScope } from "../lib/scope.ts";
 import { SignInBanner } from "../lib/SignInBanner.tsx";
 import {
-  type MintTokenResult,
-  type TokenSummary,
-  listTokens,
+  DEFAULT_TTL_DAYS,
+  type HubTokenSummary,
+  type LegacyTokenSummary,
+  type MintHubTokenResult,
+  type ScopeVerb,
+  TTL_DAY_OPTIONS,
+  listHubTokens,
+  listLegacyTokens,
   listVaultTags,
-  mintToken,
-  revokeToken,
+  mintHubToken,
+  revokeHubToken,
+  revokeLegacyToken,
 } from "../lib/tokens-api.ts";
 
-type LoadState =
+type HubLoadState =
   | { kind: "loading" }
-  | { kind: "ok"; tokens: TokenSummary[] }
+  | { kind: "ok"; tokens: HubTokenSummary[] }
   | { kind: "auth-required"; status: number | null }
   | { kind: "error"; message: string };
 
-const KNOWN_SCOPE_VERBS = ["read", "write", "admin"] as const;
+type LegacyLoadState =
+  | { kind: "loading" }
+  | { kind: "ok"; tokens: LegacyTokenSummary[] }
+  // Legacy-list auth/error failures are non-fatal — the hub-JWT surface is
+  // the page's primary function. We collapse them to "hidden" so a vault
+  // whose legacy endpoint 401s/errors just doesn't render the section.
+  | { kind: "hidden" };
+
+const KNOWN_SCOPE_VERBS: ScopeVerb[] = ["read", "write", "admin"];
+
+const TTL_LABELS: Record<number, string> = {
+  30: "30 days",
+  90: "90 days",
+  180: "180 days",
+  365: "1 year (max)",
+};
+
+/** Branch a thrown error from a host-admin-backed call into the right load
+ *  disposition. `forbidden` triggers the friend-account redirect as a side
+ *  effect; the returned state is what the caller should set. */
+function dispositionForHubError(err: unknown): HubLoadState {
+  if (err instanceof HostAdminError) {
+    if (err.disposition === "forbidden") {
+      redirectToAccountHome();
+      return { kind: "auth-required", status: 403 };
+    }
+    if (err.disposition === "auth-required") {
+      return { kind: "auth-required", status: err.status };
+    }
+    return { kind: "error", message: err.message };
+  }
+  if (err instanceof HttpError && (err.status === 401 || err.status === 403)) {
+    return { kind: "auth-required", status: err.status };
+  }
+  return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+}
 
 export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
-  // Per-vault mount passes `vaultName` directly (no `:name` segment under
-  // `basename="/vault/<name>/admin"`); stand-alone `/vault/:name/tokens`
-  // reads it from useParams. The presence of the prop also picks the
-  // detail-link shape — `/` under per-vault, `/vault/<name>` stand-alone.
   const params = useParams<{ name: string }>();
   const name = vaultName ?? params.name;
   const isPerVaultMount = vaultName !== undefined;
   const detailHref = isPerVaultMount ? "/" : `/vault/${encodeURIComponent(name ?? "")}`;
-  const [state, setState] = useState<LoadState>({ kind: "loading" });
-  const [minted, setMinted] = useState<MintTokenResult | null>(null);
-  const [confirmingRevokeId, setConfirmingRevokeId] = useState<string | null>(null);
+
+  const [hubState, setHubState] = useState<HubLoadState>({ kind: "loading" });
+  const [legacyState, setLegacyState] = useState<LegacyLoadState>({ kind: "loading" });
+  const [minted, setMinted] = useState<MintHubTokenResult | null>(null);
+  const [confirmingRevokeJti, setConfirmingRevokeJti] = useState<string | null>(null);
+  const [confirmingLegacyId, setConfirmingLegacyId] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
 
+  // Hub-JWT list (host-admin bearer).
   useEffect(() => {
     let cancelled = false;
     if (!name) return;
-    setState({ kind: "loading" });
-    listTokens(name)
+    setHubState({ kind: "loading" });
+    listHubTokens(name)
       .then((tokens) => {
         if (cancelled) return;
-        setState({ kind: "ok", tokens });
+        setHubState({ kind: "ok", tokens });
       })
       .catch((err) => {
         if (cancelled) return;
-        if (err instanceof HttpError && (err.status === 401 || err.status === 403)) {
-          setState({ kind: "auth-required", status: err.status });
-          return;
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        setState({ kind: "error", message });
+        setHubState(dispositionForHubError(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [name, reloadTick]);
+
+  // Legacy pvt_* list (vault-admin bearer). Non-fatal — any failure (or an
+  // empty list) collapses to "hidden", so fresh installs and vaults whose
+  // legacy endpoint 401s simply don't render the section.
+  useEffect(() => {
+    let cancelled = false;
+    if (!name) return;
+    setLegacyState({ kind: "loading" });
+    listLegacyTokens(name)
+      .then((tokens) => {
+        if (cancelled) return;
+        setLegacyState(tokens.length > 0 ? { kind: "ok", tokens } : { kind: "hidden" });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLegacyState({ kind: "hidden" });
       });
     return () => {
       cancelled = true;
@@ -77,11 +143,9 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
 
   const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
 
-  // Belt-and-suspenders for the single-emit contract: while the plaintext
-  // pvt_* is on screen, prompt the browser's "leave site?" confirm on tab
-  // close / refresh / back. Dismissing the banner (the explicit "I've
-  // saved it" path) detaches the listener. Doesn't cover in-SPA navigation
-  // — react-router blocking is a separate, larger surface.
+  // Belt-and-suspenders for the single-emit contract: while the just-minted
+  // token is on screen, prompt the browser's "leave site?" confirm on tab
+  // close / refresh / back. Dismissing the banner detaches the listener.
   useEffect(() => {
     if (!minted) return;
     const handler = (e: BeforeUnloadEvent) => {
@@ -126,14 +190,13 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
       {minted ? <MintBanner result={minted} onDismiss={() => setMinted(null)} /> : null}
 
       {/*
-       * MintForm is hidden while the just-minted banner is showing. The
+       * MintForm is hidden while the just-minted banner is showing — the
        * banner is the single point at which the operator copies the
-       * plaintext pvt_*; if a second mint happens before the first is
-       * saved, the first is gone forever (the server can't re-emit). The
-       * dismissal-then-mint sequence makes that loss impossible by
-       * construction. Keep the gate; don't "fix" it back to always-on.
+       * plaintext token; a second mint before the first is saved would lose
+       * the first forever (the server can't re-emit). The dismissal-then-mint
+       * sequence makes that loss impossible by construction.
        */}
-      {state.kind === "ok" && isAdmin && !minted ? (
+      {hubState.kind === "ok" && isAdmin && !minted ? (
         <MintForm
           vaultName={name}
           onMinted={(result) => {
@@ -145,34 +208,47 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
 
       <div className="section">
         <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>Existing tokens</h3>
-        {state.kind === "loading" ? <p className="muted">Loading…</p> : null}
-        {state.kind === "auth-required" ? (
-          <SignInBanner vaultName={name} status={state.status} onRecovered={onRecovered} />
+        {hubState.kind === "loading" ? <p className="muted">Loading…</p> : null}
+        {hubState.kind === "auth-required" ? (
+          <SignInBanner vaultName={name} status={hubState.status} onRecovered={onRecovered} />
         ) : null}
-        {state.kind === "error" ? (
+        {hubState.kind === "error" ? (
           <div className="error-banner">
-            <code>{state.message}</code>
+            <code>{hubState.message}</code>
           </div>
         ) : null}
-        {state.kind === "ok" ? (
-          <TokenList
-            vaultName={name}
-            tokens={state.tokens}
+        {hubState.kind === "ok" ? (
+          <HubTokenList
+            tokens={hubState.tokens}
             allowRevoke={isAdmin}
-            confirmingRevokeId={confirmingRevokeId}
-            onAskConfirm={setConfirmingRevokeId}
+            confirmingJti={confirmingRevokeJti}
+            onAskConfirm={setConfirmingRevokeJti}
             onRevoked={() => {
-              setConfirmingRevokeId(null);
+              setConfirmingRevokeJti(null);
               setReloadTick((n) => n + 1);
             }}
           />
         ) : null}
       </div>
+
+      {legacyState.kind === "ok" ? (
+        <LegacySection
+          vaultName={name}
+          tokens={legacyState.tokens}
+          allowRevoke={isAdmin}
+          confirmingId={confirmingLegacyId}
+          onAskConfirm={setConfirmingLegacyId}
+          onRevoked={() => {
+            setConfirmingLegacyId(null);
+            setReloadTick((n) => n + 1);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
 
-function MintBanner({ result, onDismiss }: { result: MintTokenResult; onDismiss: () => void }) {
+function MintBanner({ result, onDismiss }: { result: MintHubTokenResult; onDismiss: () => void }) {
   const [copied, setCopied] = useState(false);
   const onCopy = async () => {
     try {
@@ -212,15 +288,13 @@ function MintForm({
   onMinted,
 }: {
   vaultName: string;
-  onMinted: (result: MintTokenResult) => void;
+  onMinted: (result: MintHubTokenResult) => void;
 }) {
   const [label, setLabel] = useState("");
-  const [verb, setVerb] = useState<(typeof KNOWN_SCOPE_VERBS)[number]>("admin");
+  const [verb, setVerb] = useState<ScopeVerb>("admin");
+  const [ttlDays, setTtlDays] = useState<number>(DEFAULT_TTL_DAYS);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Tag-allowlist (root tags only). Empty = unscoped (full vault). The
-  // server enforces (a) each tag exists, (b) subset of caller's allowlist,
-  // (c) no path separators — see patterns/tag-scoped-tokens.md.
   const [availableTags, setAvailableTags] = useState<string[]>([]);
   const [tagsLoadError, setTagsLoadError] = useState<string | null>(null);
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
@@ -230,9 +304,9 @@ function MintForm({
     listVaultTags(vaultName)
       .then((rows) => {
         if (cancelled) return;
-        // Picker only offers root tags — sub-tags inherit at enforcement
-        // time via the `_tags/<name>` hierarchy. The server rejects any
-        // value containing `/`, so filtering here keeps the UI honest.
+        // Picker only offers root tags — sub-tags inherit at enforcement time
+        // via the `_tags/<name>` hierarchy. The server rejects any value with
+        // a `/`, so filtering here keeps the UI honest.
         const roots = rows.map((t) => t.name).filter((n) => !n.includes("/")).sort();
         setAvailableTags(roots);
       })
@@ -266,17 +340,22 @@ function MintForm({
     setSubmitting(true);
     setError(null);
     try {
-      const tagList = [...selectedTags];
-      const result = await mintToken(vaultName, {
+      const result = await mintHubToken(vaultName, {
+        verb,
         label: trimmedLabel,
-        scopes: [`vault:${vaultName}:${verb}`],
-        tags: tagList.length > 0 ? tagList : null,
+        scopedTags: [...selectedTags],
+        ttlDays,
       });
       onMinted(result);
       setLabel("");
       setVerb("admin");
+      setTtlDays(DEFAULT_TTL_DAYS);
       setSelectedTags(new Set());
     } catch (err) {
+      if (err instanceof HostAdminError && err.disposition === "forbidden") {
+        redirectToAccountHome();
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSubmitting(false);
@@ -286,6 +365,10 @@ function MintForm({
   return (
     <form onSubmit={onSubmit} className="section">
       <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>Mint a token</h3>
+      <p className="dim" style={{ margin: "0 0 0.85rem" }}>
+        Issues a hub-signed token (JWT) scoped to this vault. Store it like a password — it's shown
+        once and can't be re-displayed.
+      </p>
       {error ? (
         <div className="error-banner">
           <code>{error}</code>
@@ -307,17 +390,36 @@ function MintForm({
       </div>
       <div className="form-row">
         <label htmlFor="mint-scope">Scope</label>
-        <select
-          id="mint-scope"
-          value={verb}
-          onChange={(e) => setVerb(e.target.value as typeof verb)}
-        >
-          <option value="read">read — query notes only</option>
-          <option value="write">write — query + create/update notes</option>
-          <option value="admin">admin — full control (incl. token mgmt)</option>
+        <select id="mint-scope" value={verb} onChange={(e) => setVerb(e.target.value as ScopeVerb)}>
+          {KNOWN_SCOPE_VERBS.map((v) => (
+            <option key={v} value={v}>
+              {v === "read"
+                ? "read — query notes only"
+                : v === "write"
+                  ? "write — query + create/update notes"
+                  : "admin — full control (incl. token mgmt)"}
+            </option>
+          ))}
         </select>
         <p className="dim" style={{ margin: "0.35rem 0 0" }}>
           Issued as <code>vault:{vaultName}:{verb}</code>. Lower scopes inherit narrower powers.
+        </p>
+      </div>
+      <div className="form-row">
+        <label htmlFor="mint-ttl">Expires after</label>
+        <select
+          id="mint-ttl"
+          value={ttlDays}
+          onChange={(e) => setTtlDays(Number(e.target.value))}
+        >
+          {TTL_DAY_OPTIONS.map((days) => (
+            <option key={days} value={days}>
+              {TTL_LABELS[days] ?? `${days} days`}
+            </option>
+          ))}
+        </select>
+        <p className="dim" style={{ margin: "0.35rem 0 0" }}>
+          The token stops working after this. Rotate before it lapses.
         </p>
       </div>
       <div className="form-row">
@@ -363,19 +465,17 @@ function MintForm({
   );
 }
 
-function TokenList({
-  vaultName,
+function HubTokenList({
   tokens,
   allowRevoke,
-  confirmingRevokeId,
+  confirmingJti,
   onAskConfirm,
   onRevoked,
 }: {
-  vaultName: string;
-  tokens: TokenSummary[];
+  tokens: HubTokenSummary[];
   allowRevoke: boolean;
-  confirmingRevokeId: string | null;
-  onAskConfirm: (id: string | null) => void;
+  confirmingJti: string | null;
+  onAskConfirm: (jti: string | null) => void;
   onRevoked: () => void;
 }) {
   if (tokens.length === 0) {
@@ -384,12 +484,11 @@ function TokenList({
   return (
     <div className="token-list">
       {tokens.map((tok) => (
-        <TokenRow
-          key={tok.id}
-          vaultName={vaultName}
+        <HubTokenRow
+          key={tok.jti}
           token={tok}
           allowRevoke={allowRevoke}
-          confirming={confirmingRevokeId === tok.id}
+          confirming={confirmingJti === tok.jti}
           onAskConfirm={onAskConfirm}
           onRevoked={onRevoked}
         />
@@ -398,7 +497,173 @@ function TokenList({
   );
 }
 
-function TokenRow({
+function HubTokenRow({
+  token,
+  allowRevoke,
+  confirming,
+  onAskConfirm,
+  onRevoked,
+}: {
+  token: HubTokenSummary;
+  allowRevoke: boolean;
+  confirming: boolean;
+  onAskConfirm: (jti: string | null) => void;
+  onRevoked: () => void;
+}) {
+  const [revoking, setRevoking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isRevoked = token.revoked_at !== null;
+
+  const onConfirm = async () => {
+    setRevoking(true);
+    setError(null);
+    try {
+      await revokeHubToken(token.jti);
+      onRevoked();
+    } catch (err) {
+      if (err instanceof HostAdminError && err.disposition === "forbidden") {
+        redirectToAccountHome();
+        return;
+      }
+      setError(err instanceof Error ? err.message : String(err));
+      setRevoking(false);
+    }
+  };
+
+  return (
+    <div className="token-row">
+      <div className="body">
+        <div className="name">
+          <strong>{token.label ?? "(unlabeled)"}</strong>
+          <code className="dim">{token.jti}</code>
+          {isRevoked ? (
+            <code className="scope-tag" title="This token has been revoked and no longer works.">
+              revoked
+            </code>
+          ) : null}
+        </div>
+        <div className="meta">
+          <span className="dim">scopes:</span>{" "}
+          {token.scopes.length > 0 ? (
+            token.scopes.map((s) => (
+              <code key={s} className="scope-tag">
+                {s}
+              </code>
+            ))
+          ) : (
+            <span className="dim">(none)</span>
+          )}
+        </div>
+        {token.scoped_tags && token.scoped_tags.length > 0 ? (
+          <div className="meta">
+            <span className="dim">tags:</span>{" "}
+            {token.scoped_tags.map((t) => (
+              <code key={t} className="scope-tag tag-pill">
+                #{t}
+              </code>
+            ))}
+          </div>
+        ) : null}
+        <div className="meta dim">
+          created {fmtDate(token.created_at)}
+          {token.expires_at ? ` · expires ${fmtDate(token.expires_at)}` : ""}
+          {isRevoked && token.revoked_at ? ` · revoked ${fmtDate(token.revoked_at)}` : ""}
+        </div>
+        {error ? (
+          <div className="error-banner" style={{ marginTop: "0.5rem" }}>
+            <code>{error}</code>
+          </div>
+        ) : null}
+      </div>
+      {allowRevoke && !isRevoked ? (
+        confirming ? (
+          <div className="actions">
+            <button type="button" onClick={onConfirm} disabled={revoking}>
+              {revoking ? "Revoking…" : "Confirm revoke"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => onAskConfirm(null)}
+              disabled={revoking}
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button type="button" className="secondary" onClick={() => onAskConfirm(token.jti)}>
+            Revoke
+          </button>
+        )
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Read-only + revoke-only section for the vault's legacy `pvt_*` tokens.
+ * Rendered only when the legacy list is non-empty (the parent collapses an
+ * empty / failed legacy load to "hidden"). Collapsible — defaults closed so
+ * a vault mid-migration shows it but doesn't lead with it.
+ */
+function LegacySection({
+  vaultName,
+  tokens,
+  allowRevoke,
+  confirmingId,
+  onAskConfirm,
+  onRevoked,
+}: {
+  vaultName: string;
+  tokens: LegacyTokenSummary[];
+  allowRevoke: boolean;
+  confirmingId: string | null;
+  onAskConfirm: (id: string | null) => void;
+  onRevoked: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="section">
+      <h3
+        style={{
+          margin: "0 0 0.5rem",
+          fontSize: "1rem",
+          fontWeight: 500,
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+        onClick={() => setOpen((o) => !o)}
+      >
+        {open ? "▾" : "▸"} Legacy tokens (pre-0.6.0){" "}
+        <span className="dim" style={{ fontWeight: 400 }}>
+          ({tokens.length})
+        </span>
+      </h3>
+      <p className="dim" style={{ margin: "0 0 0.85rem" }}>
+        These <code>pvt_*</code> tokens predate the move to hub-signed tokens. They still work, but
+        the vault can no longer mint new ones — rotate each to a hub token above, then revoke the
+        legacy one here.
+      </p>
+      {open ? (
+        <div className="token-list">
+          {tokens.map((tok) => (
+            <LegacyTokenRow
+              key={tok.id}
+              vaultName={vaultName}
+              token={tok}
+              allowRevoke={allowRevoke}
+              confirming={confirmingId === tok.id}
+              onAskConfirm={onAskConfirm}
+              onRevoked={onRevoked}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function LegacyTokenRow({
   vaultName,
   token,
   allowRevoke,
@@ -407,7 +672,7 @@ function TokenRow({
   onRevoked,
 }: {
   vaultName: string;
-  token: TokenSummary;
+  token: LegacyTokenSummary;
   allowRevoke: boolean;
   confirming: boolean;
   onAskConfirm: (id: string | null) => void;
@@ -420,7 +685,7 @@ function TokenRow({
     setRevoking(true);
     setError(null);
     try {
-      await revokeToken(vaultName, token.id);
+      await revokeLegacyToken(vaultName, token.id);
       onRevoked();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -434,11 +699,6 @@ function TokenRow({
         <div className="name">
           <strong>{token.label}</strong>
           <code className="dim">{token.id}</code>
-          {token.vault_name === null ? (
-            <code className="scope-tag" title="Pre-v16 token, not bound to any vault. Usable across vaults this session can see.">
-              server-wide
-            </code>
-          ) : null}
         </div>
         <div className="meta">
           <span className="dim">scopes:</span>{" "}
@@ -464,7 +724,6 @@ function TokenRow({
         ) : null}
         <div className="meta dim">
           created {fmtDate(token.created_at)}
-          {token.last_used_at ? ` · last used ${fmtDate(token.last_used_at)}` : " · never used"}
           {token.expires_at ? ` · expires ${fmtDate(token.expires_at)}` : ""}
         </div>
         {error ? (
@@ -500,7 +759,6 @@ function TokenRow({
 
 function fmtDate(iso: string): string {
   // v1 shows ISO timestamps verbatim — exact wall-clock UTC is what an
-  // operator wants for incident triage. Phase C may add a relative +
-  // local-time formatting pass once the broader admin UI gets a date util.
+  // operator wants for incident triage.
   return iso;
 }
