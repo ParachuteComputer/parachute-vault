@@ -478,7 +478,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(9);
+    expect(tools.length).toBe(10);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -490,6 +490,8 @@ describe("MCP tools", async () => {
     expect(names).toContain("delete-tag");
     expect(names).toContain("find-path");
     expect(names).toContain("vault-info");
+    // prune-schema (admin) — drops orphaned indexed-field columns.
+    expect(names).toContain("prune-schema");
     // Six note-schema MCP tools (list/update/delete-note-schema +
     // list/set/delete-schema-mapping) retired in v17 — vault#267.
     expect(names).not.toContain("list-note-schemas");
@@ -4208,13 +4210,14 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("delete-tag");
   });
 
-  test("vault:admin sees all 10 tools including manage-token", async () => {
+  test("vault:admin sees all 11 tools including manage-token + prune-schema", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
-    expect(names.length).toBe(10);
+    expect(names).toContain("prune-schema");
+    expect(names.length).toBe(11);
   });
 
-  test("legacy-derived full token sees all 10 tools (back-compat)", async () => {
+  test("legacy-derived full token sees all 11 tools (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -4238,8 +4241,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     // Legacy permission-derived token: legacyDerived=true, scopes carry the
     // full admin set per `legacyPermissionToScopes("full")`. Compat shim
     // means the operator's existing pvt_* tokens minted pre-scope-column
-    // see the full surface (including manage-token), not just the 9 they
-    // had before.
+    // see the full admin surface (including manage-token + prune-schema).
     const res = await handleScopedMcp(req, vaultName, {
       permission: "full",
       scopes: ["vault:read", "vault:write", "vault:admin"],
@@ -4248,8 +4250,9 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(10);
+    expect(names.length).toBe(11);
     expect(names).toContain("manage-token");
+    expect(names).toContain("prune-schema");
     closeAllStores();
   });
 
