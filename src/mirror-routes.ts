@@ -61,6 +61,7 @@ import {
   type ImportAuth,
   type ImportResult,
 } from "./mirror-import.ts";
+import { redactToken } from "./export-watch.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 
@@ -998,10 +999,16 @@ async function maybeFireInitialPush(
     const result = await manager.pushNow();
     return result;
   } catch (err) {
-    console.warn(
-      `[mirror-auth] initial push-now failed (non-fatal): ${(err as Error).message ?? err}`,
-    );
-    return { fired: true, pushed: false, error: (err as Error).message ?? String(err) };
+    // Defense-in-depth: every other push-error site routes through
+    // `redactToken` before surfacing — this catch-block was the one
+    // outlier where a thrown error's `.message` could carry an
+    // un-redacted token from a future code path that throws before the
+    // existing internal redaction runs. Apply the same scrub here.
+    // Reviewer-flagged on vault#392.
+    const rawMessage = (err as Error).message ?? String(err);
+    const safeMessage = redactToken(rawMessage);
+    console.warn(`[mirror-auth] initial push-now failed (non-fatal): ${safeMessage}`);
+    return { fired: true, pushed: false, error: safeMessage };
   }
 }
 

@@ -568,6 +568,20 @@ export function validateMirrorConfigShape(
   // accept the combination — vault has a remote to push to. Operators
   // hitting Aaron's three-stacking-gaps bug (History preset + PAT saved,
   // pushes never fire) get unblocked.
+  //
+  // Asymmetry note (reviewer-flagged on vault#392): external + auto_push +
+  // no vault-stored credentials is INTENTIONALLY not rejected here.
+  // External mirrors are operator-managed paths — operators may have
+  // configured push credentials via system-level git config (SSH agent,
+  // ~/.git-credentials, GH_TOKEN env, `gh auth login`), none of which
+  // vault can detect by reading `.mirror-credentials.yaml`. Rejecting on
+  // "vault doesn't see credentials" would refuse legitimate
+  // operator-managed setups. Push failures on missing credentials surface
+  // via the non-fatal warning path in gitPush — operators see them in
+  // `last_push_error` rather than being blocked at save time. Internal
+  // location is different: internal mirrors live under vault's data
+  // dir, so vault IS the only thing that can wire a remote, which is
+  // why the gate below requires vault-stored credentials specifically.
   if (out.enabled && out.auto_push && out.location === "internal") {
     const readCreds = opts.readCredentials ?? readCredentials;
     let creds: MirrorCredentials | null = null;
