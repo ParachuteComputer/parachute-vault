@@ -627,7 +627,26 @@ function ConfigForm({
         ) : null}
       </div>
 
-      {config.location === "external" ? (
+      {/*
+        Show the auto_push checkbox when EITHER:
+          - location is external (vault doesn't manage the working tree;
+            the operator might have wired their own git remote), OR
+          - credentials are configured (PAT or GitHub OAuth) — at which
+            point vault has a remote to push to regardless of where the
+            working tree lives. The credential save path writes `origin`
+            on the mirror dir whether it's internal or external.
+
+        The old pattern hid the checkbox on internal locations under the
+        assumption "internal = no remote." That breaks the round-trip
+        Aaron hit: History preset (internal) + PAT saved → no way to
+        flip auto_push on from the UI. Now the checkbox renders whenever
+        the operator has a remote to push to.
+
+        Backend validation (mirror-config.ts:validateMirrorConfigShape)
+        mirrors this: auto_push + internal is accepted iff credentials
+        are wired; rejected otherwise with an actionable error.
+      */}
+      {config.location === "external" || creds?.active_method ? (
         <div className="form-row">
           <label>
             <input
@@ -641,6 +660,11 @@ function ConfigForm({
             />
             Push after each commit
           </label>
+          <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.9em" }}>
+            When credentials are configured, vault can push the mirror's commits
+            to your remote regardless of whether the mirror folder lives under
+            vault's data dir or somewhere visible.
+          </p>
           {config.auto_push ? (
             creds?.active_method ? (
               <div className="info-banner" style={{ marginTop: "0.5rem" }} role="status">
@@ -665,16 +689,6 @@ function ConfigForm({
           ) : null}
         </div>
       ) : null}
-      {/*
-        Internal-location mirrors live under ~/.parachute/vault/data and have
-        no configured git remote — a push would always fail. Hide the checkbox
-        entirely rather than render a disabled one: the option is meaningless,
-        not just unavailable. If a stored config carries auto_push:true +
-        location:internal (e.g. operator switched from external→internal
-        without unticking), the value persists on the config blob until they
-        save a different one — the watch loop just skips pushes because there's
-        no remote. Reviewer-flagged on #380.
-      */}
 
       <div className="form-row">
         <button

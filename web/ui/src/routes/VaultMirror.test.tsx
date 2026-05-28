@@ -247,11 +247,18 @@ describe("VaultMirror — admin scope", () => {
     expect(screen.getByText(/Path must exist AND be a git repo/i)).toBeInTheDocument();
   });
 
-  it("hides the Push-after-commit checkbox when location is internal", async () => {
-    // Auto-push is meaningless for internal mirrors (no configured remote).
-    // The form should hide the checkbox entirely rather than show a disabled
-    // one — anything else is confusing UX. Reviewer-flagged on #380.
+  it("hides the Push-after-commit checkbox when internal AND no credentials are wired", async () => {
+    // Pre-credentials: internal mirrors had no remote, so auto_push was
+    // meaningless and the checkbox was hidden. Post-credentials (Cut 2):
+    // the checkbox stays hidden ONLY when both (a) location is internal
+    // AND (b) no credentials are configured — without a remote there's
+    // nothing to push to.
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
     renderRoute();
     const user = userEvent.setup();
 
@@ -259,12 +266,40 @@ describe("VaultMirror — admin scope", () => {
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
     );
 
-    // Default fixture is location=internal — the Push checkbox should be absent.
+    // Default fixture is location=internal + no creds — Push checkbox absent.
     expect(screen.queryByLabelText(/Push after each commit/i)).not.toBeInTheDocument();
 
-    // Flip to external via the Live Mirror preset — the checkbox appears.
+    // Flip to external via the Live Mirror preset — the checkbox appears
+    // even with no creds (operator may have wired a remote manually).
     await user.click(screen.getByRole("button", { name: /Apply Live Mirror preset/i }));
     expect(screen.getByLabelText(/Push after each commit/i)).toBeInTheDocument();
+  });
+
+  it("shows the Push-after-commit checkbox when internal AND credentials are wired (Cut 2)", async () => {
+    // Aaron's three-stacking-gaps bug surfaced here: History preset
+    // (internal location) + PAT saved → no in-UI affordance to enable
+    // auto_push. Now the checkbox renders whenever the operator has a
+    // remote to push to, regardless of where the working tree lives.
+    vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture({ location: "internal" }));
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        label: "GitHub PAT",
+        remote_url: "https://x-access-token:***@github.com/aaron/v.git",
+        token_preview: "ghp_…1234",
+      },
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+    // Credentials wired + internal location → checkbox visible.
+    expect(screen.getByLabelText(/Push after each commit/i)).toBeInTheDocument();
+    // Helper copy that explains the cross-location behavior is rendered.
+    expect(
+      screen.getByText(/vault can push the mirror's commits to your remote/i),
+    ).toBeInTheDocument();
   });
 
   it("shows a cursor-advance hint when auto_commit is unchecked", async () => {
