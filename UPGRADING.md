@@ -52,8 +52,9 @@ appear in API responses, and are embedded into the mirror's
   (internal mirrors have no remote; the watch loop would log push
   failures forever). Pick `external` if you want pushes.
 - The "Push after each commit" checkbox is hidden in the SPA when
-  location=internal. (Bare config edit can still set the flag, but the
-  push will silently no-op.)
+  location=internal. (Bare config edit can still set the flag — the
+  watch loop logs a non-fatal warning on each push attempt and
+  continues.)
 - Auto-push needs credentials configured (either via the new SPA flows
   or operator-wired SSH/credential-helper). The SPA's warning text
   updates dynamically: "Will push to @login on GitHub" when configured,
