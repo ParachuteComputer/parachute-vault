@@ -506,8 +506,8 @@ describe("auth credential routes — GET /auth", () => {
 
   test("returns fully-null sanitized shape when no credentials stored", async () => {
     home = tmp("mirror-auth-empty-");
-    makeManager(home);
-    const res = handleAuthGet();
+    const { manager } = makeManager(home);
+    const res = handleAuthGet(manager);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { active_method: null; github_oauth: null; pat: null };
     expect(body.active_method).toBeNull();
@@ -517,7 +517,7 @@ describe("auth credential routes — GET /auth", () => {
 
   test("returns sanitized shape when github_oauth credentials present (no token leaks)", async () => {
     home = tmp("mirror-auth-oauth-");
-    makeManager(home);
+    const { manager } = makeManager(home);
     const creds: MirrorCredentials = {
       active_method: "github_oauth",
       github_oauth: {
@@ -529,8 +529,8 @@ describe("auth credential routes — GET /auth", () => {
       },
       pat: null,
     };
-    writeCredentials(creds);
-    const res = handleAuthGet();
+    writeCredentials("default", creds);
+    const res = handleAuthGet(manager);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).not.toContain("gho_secret");
@@ -550,7 +550,7 @@ describe("auth credential routes — DELETE /auth", () => {
   test("wipes credentials from disk", async () => {
     home = tmp("mirror-auth-delete-");
     const { manager } = makeManager(home);
-    writeCredentials({
+    writeCredentials("default", {
       active_method: "pat",
       github_oauth: null,
       pat: {
@@ -559,10 +559,10 @@ describe("auth credential routes — DELETE /auth", () => {
         label: "test",
       },
     });
-    expect(fs.existsSync(mirrorCredentialsPath())).toBe(true);
+    expect(fs.existsSync(mirrorCredentialsPath("default"))).toBe(true);
     const res = await handleAuthDelete(manager);
     expect(res.status).toBe(200);
-    expect(fs.existsSync(mirrorCredentialsPath())).toBe(false);
+    expect(fs.existsSync(mirrorCredentialsPath("default"))).toBe(false);
   });
 
   test("idempotent — missing credentials file still 200", async () => {
@@ -686,7 +686,7 @@ describe("auth credential routes — device flow", () => {
     expect(grantBody.user.id).toBe(12345);
     // Credentials persisted; no token leak in response.
     expect(JSON.stringify(grantBody)).not.toContain("gho_real");
-    const saved = readCredentials();
+    const saved = readCredentials("default");
     expect(saved?.active_method).toBe("github_oauth");
     expect(saved?.github_oauth?.access_token).toBe("gho_real1234567890");
     expect(saved?.github_oauth?.user_login).toBe("aaron");
@@ -809,7 +809,7 @@ describe("auth credential routes — credential-save side-effects (Cuts 3 + 6)",
     // Seed github_oauth credentials. select-repo doesn't probe; it just
     // sets origin to github.com/<owner>/<repo>.git. We then rewrite
     // origin to our local bare repo so pushNow has somewhere to land.
-    writeCredentials({
+    writeCredentials("default", {
       active_method: "github_oauth",
       github_oauth: {
         access_token: "gho_fake1234567890abcd",
@@ -865,7 +865,7 @@ describe("auth credential routes — credential-save side-effects (Cuts 3 + 6)",
       auto_push: false,
     });
     await manager.start();
-    writeCredentials({
+    writeCredentials("default", {
       active_method: "github_oauth",
       github_oauth: {
         access_token: "gho_anothertoken12345",
@@ -943,15 +943,15 @@ describe("auth credential routes — github repos / create-repo", () => {
 
   test("repos returns 400 when not connected to GitHub", async () => {
     home = tmp("mirror-auth-repos-noauth-");
-    makeManager(home);
-    const res = await handleAuthGithubRepos();
+    const { manager } = makeManager(home);
+    const res = await handleAuthGithubRepos(manager);
     expect(res.status).toBe(400);
   });
 
   test("repos returns list when authed", async () => {
     home = tmp("mirror-auth-repos-ok-");
-    makeManager(home);
-    writeCredentials({
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
       active_method: "github_oauth",
       github_oauth: {
         access_token: "gho_test1234567890",
@@ -979,7 +979,7 @@ describe("auth credential routes — github repos / create-repo", () => {
         ],
       },
     ]);
-    const res = await handleAuthGithubRepos(fetcher);
+    const res = await handleAuthGithubRepos(manager, fetcher);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { repos: Array<{ full_name: string }> };
     expect(body.repos).toHaveLength(1);
@@ -988,8 +988,8 @@ describe("auth credential routes — github repos / create-repo", () => {
 
   test("create-repo proxies through with mocked fetch", async () => {
     home = tmp("mirror-auth-create-repo-");
-    makeManager(home);
-    writeCredentials({
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
       active_method: "github_oauth",
       github_oauth: {
         access_token: "gho_test1234567890",
@@ -1020,7 +1020,7 @@ describe("auth credential routes — github repos / create-repo", () => {
       method: "POST",
       body: JSON.stringify({ name: "new-vault" }),
     });
-    const res = await handleAuthGithubCreateRepo(req, fetcher);
+    const res = await handleAuthGithubCreateRepo(req, manager, fetcher);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { full_name: string };
     expect(body.full_name).toBe("aaron/new-vault");
@@ -1263,7 +1263,7 @@ describe("handleMirrorImport", () => {
     await bootstrapVault(home);
     fixture = await buildExportFixture();
     // Write a stored PAT credential matching github.com.
-    writeCredentials({
+    writeCredentials("default", {
       active_method: "pat",
       github_oauth: null,
       pat: {
@@ -1301,7 +1301,7 @@ describe("handleMirrorImport", () => {
     await bootstrapVault(home);
     fixture = await buildExportFixture();
     // Stored credentials should be IGNORED when per-call PAT is supplied.
-    writeCredentials({
+    writeCredentials("default", {
       active_method: "pat",
       github_oauth: null,
       pat: {

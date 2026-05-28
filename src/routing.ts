@@ -644,7 +644,7 @@ export async function route(
     }
 
     if (subpath === "/.parachute/mirror/auth") {
-      if (req.method === "GET") return handleAuthGet();
+      if (req.method === "GET") return handleAuthGet(manager);
       if (req.method === "DELETE") return handleAuthDelete(manager);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
@@ -657,11 +657,11 @@ export async function route(
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
     if (subpath === "/.parachute/mirror/auth/github/repos") {
-      if (req.method === "GET") return handleAuthGithubRepos();
+      if (req.method === "GET") return handleAuthGithubRepos(manager);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
     if (subpath === "/.parachute/mirror/auth/github/create-repo") {
-      if (req.method === "POST") return handleAuthGithubCreateRepo(req);
+      if (req.method === "POST") return handleAuthGithubCreateRepo(req, manager);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
     if (subpath === "/.parachute/mirror/auth/github/select-repo") {

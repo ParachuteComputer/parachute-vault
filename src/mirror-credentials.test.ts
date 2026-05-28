@@ -25,6 +25,8 @@ import {
   deleteCredentials,
   emptyCredentials,
   githubAuthedRemoteUrl,
+  legacyServerWideCredentialsPath,
+  migrateLegacyServerWideCredentials,
   mirrorCredentialsPath,
   parseCredentials,
   previewToken,
@@ -194,7 +196,7 @@ describe("serialize + parse round-trip", () => {
 describe("readCredentials / writeCredentials", () => {
   test("returns null when no file exists", () => {
     withSandbox(() => {
-      expect(readCredentials()).toBeNull();
+      expect(readCredentials("default")).toBeNull();
     });
   });
 
@@ -211,8 +213,8 @@ describe("readCredentials / writeCredentials", () => {
         },
         pat: null,
       };
-      writeCredentials(creds);
-      const read = readCredentials();
+      writeCredentials("default", creds);
+      const read = readCredentials("default");
       expect(read).toEqual(creds);
     });
   });
@@ -228,8 +230,8 @@ describe("readCredentials / writeCredentials", () => {
           label: "test",
         },
       };
-      writeCredentials(creds);
-      const p = mirrorCredentialsPath();
+      writeCredentials("default", creds);
+      const p = mirrorCredentialsPath("default");
       const stat = fs.statSync(p);
       const perms = stat.mode & 0o777;
       expect(perms).toBe(0o600);
@@ -241,13 +243,50 @@ describe("readCredentials / writeCredentials", () => {
     process.env.PARACHUTE_HOME = home;
     process.env.HOME = home;
     try {
-      // Note: don't pre-create the vault subdir.
+      // Note: don't pre-create the vault data subdir.
       const creds: MirrorCredentials = { ...emptyCredentials() };
-      writeCredentials(creds);
-      expect(fs.existsSync(path.join(home, "vault", ".mirror-credentials.yaml"))).toBe(true);
+      writeCredentials("default", creds);
+      expect(
+        fs.existsSync(
+          path.join(home, "vault", "data", "default", ".mirror-credentials.yaml"),
+        ),
+      ).toBe(true);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  test("two vaults' credentials are isolated — no bleed (vault#399)", () => {
+    withSandbox(() => {
+      const aCreds: MirrorCredentials = {
+        ...emptyCredentials(),
+        active_method: "pat",
+        pat: {
+          token: "ghp_vaultA1234567890abc",
+          remote_url: "https://x-access-token:ghp_vaultA1234567890abc@github.com/aaron/vault-a.git",
+          label: "vault A",
+        },
+      };
+      const bCreds: MirrorCredentials = {
+        ...emptyCredentials(),
+        active_method: "pat",
+        pat: {
+          token: "ghp_vaultB9876543210xyz",
+          remote_url: "https://x-access-token:ghp_vaultB9876543210xyz@github.com/aaron/vault-b.git",
+          label: "vault B",
+        },
+      };
+      writeCredentials("alpha", aCreds);
+      writeCredentials("beta", bCreds);
+      // Each vault reads back ITS OWN remote + token — never the other's.
+      expect(readCredentials("alpha")).toEqual(aCreds);
+      expect(readCredentials("beta")).toEqual(bCreds);
+      expect(readCredentials("alpha")?.pat?.remote_url).toContain("vault-a.git");
+      expect(readCredentials("beta")?.pat?.remote_url).toContain("vault-b.git");
+      expect(readCredentials("alpha")?.pat?.token).not.toBe(readCredentials("beta")?.pat?.token);
+      // Files live in separate per-vault dirs.
+      expect(mirrorCredentialsPath("alpha")).not.toBe(mirrorCredentialsPath("beta"));
+    });
   });
 
   test("write is atomic — partial file not left on failure path", () => {
@@ -263,17 +302,17 @@ describe("readCredentials / writeCredentials", () => {
         },
         pat: null,
       };
-      writeCredentials(creds);
+      writeCredentials("default", creds);
       // Subsequent write replaces atomically (.tmp rename onto final).
       const updated: MirrorCredentials = {
         ...creds,
         github_oauth: { ...creds.github_oauth!, access_token: "gho_updated123456789" },
       };
-      writeCredentials(updated);
-      const read = readCredentials();
+      writeCredentials("default", updated);
+      const read = readCredentials("default");
       expect(read?.github_oauth?.access_token).toBe("gho_updated123456789");
       // No leftover .tmp file.
-      expect(fs.existsSync(`${mirrorCredentialsPath()}.tmp`)).toBe(false);
+      expect(fs.existsSync(`${mirrorCredentialsPath("default")}.tmp`)).toBe(false);
     });
   });
 });
@@ -281,17 +320,129 @@ describe("readCredentials / writeCredentials", () => {
 describe("deleteCredentials", () => {
   test("idempotent — missing file is a no-op (doesn't throw)", () => {
     withSandbox(() => {
-      expect(() => deleteCredentials()).not.toThrow();
+      expect(() => deleteCredentials("default")).not.toThrow();
     });
   });
 
   test("removes the file when present", () => {
     withSandbox(() => {
-      writeCredentials({ ...emptyCredentials(), active_method: null });
-      expect(fs.existsSync(mirrorCredentialsPath())).toBe(true);
-      deleteCredentials();
-      expect(fs.existsSync(mirrorCredentialsPath())).toBe(false);
+      writeCredentials("default", { ...emptyCredentials(), active_method: null });
+      expect(fs.existsSync(mirrorCredentialsPath("default"))).toBe(true);
+      deleteCredentials("default");
+      expect(fs.existsSync(mirrorCredentialsPath("default"))).toBe(false);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Migration — legacy server-wide → per-vault (vault#399)
+// ---------------------------------------------------------------------------
+
+describe("migrateLegacyServerWideCredentials", () => {
+  function writeLegacyFile(_home: string, creds: MirrorCredentials): string {
+    const legacyPath = legacyServerWideCredentialsPath();
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, serializeCredentials(creds), { mode: 0o600 });
+    return legacyPath;
+  }
+
+  const sampleCreds: MirrorCredentials = {
+    ...emptyCredentials(),
+    active_method: "pat",
+    pat: {
+      token: "ghp_legacy1234567890abc",
+      remote_url: "https://x-access-token:ghp_legacy1234567890abc@github.com/aaron/first-vault.git",
+      label: "legacy",
+    },
+  };
+
+  test("no legacy file → no-op", () => {
+    withSandbox(() => {
+      const r = migrateLegacyServerWideCredentials("default");
+      expect(r.migrated).toBe(false);
+      expect((r as { reason: string }).reason).toBe("no_legacy_file");
+    });
+  });
+
+  test("legacy file → attributed to the FIRST vault, others stay empty", () => {
+    const home = tmp("mirror-migrate-");
+    process.env.PARACHUTE_HOME = home;
+    process.env.HOME = home;
+    try {
+      const legacyPath = writeLegacyFile(home, sampleCreds);
+      const r = migrateLegacyServerWideCredentials("first");
+      expect(r.migrated).toBe(true);
+      // First vault now owns the legacy creds.
+      expect(readCredentials("first")).toEqual(sampleCreds);
+      // A second vault that never had its own file starts EMPTY — the bug
+      // would have made it read the same remote. It must not.
+      expect(readCredentials("second")).toBeNull();
+      // Legacy file preserved as .bak — nothing silently lost.
+      expect(fs.existsSync(legacyPath)).toBe(false);
+      expect(fs.existsSync(`${legacyPath}.bak`)).toBe(true);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("idempotent — second run is a no-op once target has creds", () => {
+    const home = tmp("mirror-migrate-idem-");
+    process.env.PARACHUTE_HOME = home;
+    process.env.HOME = home;
+    try {
+      writeLegacyFile(home, sampleCreds);
+      expect(migrateLegacyServerWideCredentials("first").migrated).toBe(true);
+      // Run again: no legacy file remains, so no-op.
+      const r2 = migrateLegacyServerWideCredentials("first");
+      expect(r2.migrated).toBe(false);
+      // First vault's creds unchanged.
+      expect(readCredentials("first")).toEqual(sampleCreds);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("does not clobber an existing per-vault file", () => {
+    const home = tmp("mirror-migrate-noclobber-");
+    process.env.PARACHUTE_HOME = home;
+    process.env.HOME = home;
+    try {
+      writeLegacyFile(home, sampleCreds);
+      // Target vault already has its own (different) creds.
+      const existing: MirrorCredentials = {
+        ...emptyCredentials(),
+        active_method: "pat",
+        pat: {
+          token: "ghp_already1234567890ab",
+          remote_url: "https://x-access-token:ghp_already1234567890ab@github.com/aaron/already.git",
+          label: "already",
+        },
+      };
+      writeCredentials("first", existing);
+      const r = migrateLegacyServerWideCredentials("first");
+      expect(r.migrated).toBe(false);
+      expect((r as { reason: string }).reason).toBe("target_already_has_creds");
+      // Existing per-vault creds preserved, NOT overwritten by legacy.
+      expect(readCredentials("first")).toEqual(existing);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("no target vault → leaves legacy file in place for a later boot", () => {
+    const home = tmp("mirror-migrate-notarget-");
+    process.env.PARACHUTE_HOME = home;
+    process.env.HOME = home;
+    try {
+      const legacyPath = writeLegacyFile(home, sampleCreds);
+      const r = migrateLegacyServerWideCredentials(null);
+      expect(r.migrated).toBe(false);
+      expect((r as { reason: string }).reason).toBe("no_target_vault");
+      // Legacy file untouched — a future boot (after a vault exists) migrates.
+      expect(fs.existsSync(legacyPath)).toBe(true);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

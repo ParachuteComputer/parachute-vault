@@ -130,7 +130,9 @@ export async function handleMirrorPut(
     );
   }
 
-  const shape = validateMirrorConfigShape(body);
+  // Per-vault (vault#399): bind the auto_push/internal credential gate to
+  // the mirror-owning vault so it reads that vault's own credentials file.
+  const shape = validateMirrorConfigShape(body, { vaultName: manager.getVaultName() });
   if (!shape.ok) {
     return Response.json(
       {
@@ -456,7 +458,8 @@ export async function handleAuthGithubPoll(
       );
     }
     // Persist credentials. Keep any existing PAT — only swap active method.
-    const existing = readCredentials() ?? emptyCredentials();
+    const vaultName = manager.getVaultName();
+    const existing = readCredentials(vaultName) ?? emptyCredentials();
     const next: MirrorCredentials = {
       ...existing,
       active_method: "github_oauth",
@@ -469,7 +472,7 @@ export async function handleAuthGithubPoll(
       },
     };
     try {
-      writeCredentials(next);
+      writeCredentials(vaultName, next);
     } catch (err) {
       return Response.json(
         {
@@ -615,9 +618,12 @@ export async function handleAuthPat(
   }
 
   // Save the userinfo'd URL — that's what gets embedded as `origin` so
-  // bare `git push` works without needing GIT_ASKPASS etc.
+  // bare `git push` works without needing GIT_ASKPASS etc. Per-vault
+  // (vault#399): the PAT + remote_url land in this vault's own file, not a
+  // server-wide one — so configuring vault B never reuses vault A's remote.
+  const vaultName = manager.getVaultName();
   const next: MirrorCredentials = {
-    ...(readCredentials() ?? emptyCredentials()),
+    ...(readCredentials(vaultName) ?? emptyCredentials()),
     active_method: "pat",
     pat: {
       token,
@@ -626,7 +632,7 @@ export async function handleAuthPat(
     },
   };
   try {
-    writeCredentials(next);
+    writeCredentials(vaultName, next);
   } catch (err) {
     return Response.json(
       {
@@ -721,10 +727,11 @@ async function probeGitLsRemote(
 }
 
 /**
- * `GET /.parachute/mirror/auth` — connection status (no secrets).
+ * `GET /.parachute/mirror/auth` — connection status (no secrets). Reads the
+ * mirror-owning vault's per-vault credentials (vault#399).
  */
-export function handleAuthGet(): Response {
-  const creds = readCredentials();
+export function handleAuthGet(manager: MirrorManager): Response {
+  const creds = readCredentials(manager.getVaultName());
   return Response.json(sanitizeCredentials(creds), {
     headers: { "Access-Control-Allow-Origin": "*" },
   });
@@ -735,7 +742,7 @@ export function handleAuthGet(): Response {
  * remote URL on the mirror dir.
  */
 export async function handleAuthDelete(manager: MirrorManager): Promise<Response> {
-  deleteCredentials();
+  deleteCredentials(manager.getVaultName());
   // Strip origin from the mirror dir if one is set.
   const status = manager.getStatus();
   if (status.mirror_path) {
@@ -757,9 +764,10 @@ export async function handleAuthDelete(manager: MirrorManager): Promise<Response
  * the stored OAuth token. Requires `active_method === "github_oauth"`.
  */
 export async function handleAuthGithubRepos(
+  manager: MirrorManager,
   fetchImpl?: FetchLike,
 ): Promise<Response> {
-  const creds = readCredentials();
+  const creds = readCredentials(manager.getVaultName());
   if (!creds || creds.active_method !== "github_oauth" || !creds.github_oauth) {
     return Response.json(
       {
@@ -794,9 +802,10 @@ export async function handleAuthGithubRepos(
  */
 export async function handleAuthGithubCreateRepo(
   req: Request,
+  manager: MirrorManager,
   fetchImpl?: FetchLike,
 ): Promise<Response> {
-  const creds = readCredentials();
+  const creds = readCredentials(manager.getVaultName());
   if (!creds || creds.active_method !== "github_oauth" || !creds.github_oauth) {
     return Response.json(
       {
@@ -849,7 +858,7 @@ export async function handleAuthGithubSelectRepo(
   req: Request,
   manager: MirrorManager,
 ): Promise<Response> {
-  const creds = readCredentials();
+  const creds = readCredentials(manager.getVaultName());
   if (!creds || creds.active_method !== "github_oauth" || !creds.github_oauth) {
     return Response.json(
       {
@@ -1023,7 +1032,7 @@ export async function applyCredentialsToMirror(
 ): Promise<void> {
   const status = manager.getStatus();
   if (!status.mirror_path) return;
-  const creds = readCredentials();
+  const creds = readCredentials(manager.getVaultName());
   if (!creds || !creds.active_method) {
     await unsetGitRemote(status.mirror_path);
     return;

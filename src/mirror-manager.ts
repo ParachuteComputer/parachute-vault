@@ -411,6 +411,15 @@ export class MirrorManager {
   }
 
   /**
+   * The vault this mirror manager belongs to. Credential reads/writes are
+   * per-vault (vault#399); route handlers thread this into the credential
+   * functions so they touch the right vault's `.mirror-credentials.yaml`.
+   */
+  getVaultName(): string {
+    return this.deps.vaultName;
+  }
+
+  /**
    * Read the current config snapshot. Returns a copy so callers can't
    * accidentally mutate the manager's internal state.
    */
@@ -963,7 +972,7 @@ export class MirrorManager {
    */
   private async applyCredentialsToRemote(repoDir: string): Promise<void> {
     try {
-      const creds = readCredentials();
+      const creds = readCredentials(this.deps.vaultName);
       if (!creds || !creds.active_method) {
         // No UI-configured credentials. Leave the remote alone — the
         // operator may have set one up via `git remote add` manually.

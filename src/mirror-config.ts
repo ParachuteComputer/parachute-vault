@@ -387,7 +387,17 @@ export type ShapeValidation = ShapeValidationOk | ShapeValidationError;
  */
 export function validateMirrorConfigShape(
   input: unknown,
-  opts: { readCredentials?: () => MirrorCredentials | null } = {},
+  opts: {
+    /**
+     * Vault whose credentials gate `auto_push + internal`. Required for the
+     * production credential read (per-vault since vault#399). Omitting it
+     * AND `readCredentials` means the auto_push/internal credential check
+     * treats credentials as absent (fail-closed) — fine for callers that
+     * never set that combination.
+     */
+    vaultName?: string;
+    readCredentials?: () => MirrorCredentials | null;
+  } = {},
 ): ShapeValidation {
   if (input === null || typeof input !== "object") {
     return {
@@ -583,7 +593,12 @@ export function validateMirrorConfigShape(
   // dir, so vault IS the only thing that can wire a remote, which is
   // why the gate below requires vault-stored credentials specifically.
   if (out.enabled && out.auto_push && out.location === "internal") {
-    const readCreds = opts.readCredentials ?? readCredentials;
+    // Per-vault credentials (vault#399): bind the read to opts.vaultName.
+    // When neither an injected reader nor a vaultName is supplied, treat
+    // credentials as absent (fail-closed) rather than reading a wrong file.
+    const readCreds =
+      opts.readCredentials ??
+      (opts.vaultName ? () => readCredentials(opts.vaultName!) : () => null);
     let creds: MirrorCredentials | null = null;
     try {
       creds = readCreds();
