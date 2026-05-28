@@ -66,7 +66,9 @@ import {
 import {
   gitAddAll,
   gitCommit,
+  gitPush,
   isGitRepo,
+  redactToken,
   runGitCommitCycle,
 } from "./export-watch.ts";
 import { vaultDir } from "./config.ts";
@@ -115,6 +117,28 @@ export interface MirrorStatus {
   last_commit_sha: string | null;
   /** Last error message (if any). Cleared on the next successful pass. */
   last_error: string | null;
+  /**
+   * Cut 5: push observability — surfaced via GET /admin/mirror so the
+   * operator (and the SPA's Status card) can see whether pushes are
+   * actually landing without grepping `[git-commit]` log lines.
+   *
+   * - `last_push_at` — ISO timestamp of the most recent SUCCESSFUL push.
+   *   Null until the first successful push.
+   * - `last_push_sha` — sha that landed on the remote at `last_push_at`.
+   *   Null when last_push_at is null.
+   * - `last_push_error` — message from the most recent FAILED push.
+   *   Cleared (back to null) on the next successful push. Tokens are
+   *   redacted before this field is set (push paths use the
+   *   `gho_`/`ghp_`/userinfo regex to scrub).
+   * - `commits_unpushed` — count of local commits ahead of upstream
+   *   (`git rev-list --count @{u}..HEAD`). Null when no upstream tracking
+   *   exists yet (first push hasn't fired). 0 when the mirror is fully
+   *   synced; positive when commits are queued.
+   */
+  last_push_at: string | null;
+  last_push_sha: string | null;
+  last_push_error: string | null;
+  commits_unpushed: number | null;
 }
 
 /**
@@ -289,6 +313,32 @@ export async function bootstrapInternalMirror(
 // ---------------------------------------------------------------------------
 
 /**
+ * Cut 5: count local commits ahead of upstream tracking. Implementation:
+ * `git rev-list --count @{u}..HEAD` returns N when N commits are ahead,
+ * 0 when synced, and exit-nonzero when no upstream tracking exists
+ * (the branch has never been pushed with `-u`). The non-zero case maps
+ * to `null` — distinct from "0 ahead" so the SPA can render "no remote
+ * tracking yet" vs "fully synced" differently if desired.
+ */
+async function readCommitsUnpushed(repoDir: string): Promise<number | null> {
+  const proc = Bun.spawn(
+    ["git", "rev-list", "--count", "@{u}..HEAD"],
+    {
+      cwd: repoDir,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) return null; // no upstream configured yet
+  const out = new TextDecoder()
+    .decode(await new Response(proc.stdout).arrayBuffer())
+    .trim();
+  const n = Number(out);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Read the current `origin` URL from a git repo's config, or null when no
  * origin is set. Module-local helper for the credential-application path.
  */
@@ -331,6 +381,10 @@ export class MirrorManager {
     last_export_notes_count: null,
     last_commit_sha: null,
     last_error: null,
+    last_push_at: null,
+    last_push_sha: null,
+    last_push_error: null,
+    commits_unpushed: null,
   };
   /** Safety-net poll timer (interval). Null while not armed. */
   private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
@@ -396,6 +450,10 @@ export class MirrorManager {
         last_export_notes_count: null,
         last_commit_sha: null,
         last_error: null,
+        last_push_at: null,
+        last_push_sha: null,
+        last_push_error: null,
+        commits_unpushed: null,
       };
       return this.getStatus();
     }
@@ -815,6 +873,77 @@ export class MirrorManager {
       const sha = new TextDecoder().decode(await new Response(shaProc.stdout).arrayBuffer()).trim();
       if (sha.length > 0) this.status.last_commit_sha = sha;
     }
+
+    // Cut 5: surface push outcome (success/failure + redacted error).
+    // runGitCommitCycle returns push info iff push was attempted; we
+    // mirror the same shape into status here.
+    if (commitResult.push) {
+      const now = new Date().toISOString();
+      if (commitResult.push.ok) {
+        this.status.last_push_at = now;
+        this.status.last_push_sha = this.status.last_commit_sha;
+        this.status.last_push_error = null;
+      } else if (commitResult.push.error) {
+        this.status.last_push_error = commitResult.push.error;
+      }
+    }
+
+    // Cut 5: track local-commits-ahead-of-upstream so the UI can render
+    // "<N> commits ready to push" subdued helper text.
+    this.status.commits_unpushed = await readCommitsUnpushed(path);
+  }
+
+  /**
+   * Cut 6: fire a `git push` against the current mirror dir, capture
+   * the outcome into status, and return a struct the route handler can
+   * fold into its response.
+   *
+   * Distinguished from `runNow()` which exports + commits + pushes.
+   * `pushNow()` skips export + commit entirely and only pushes whatever
+   * has already been committed. Used by:
+   *   - the credential save path (auto-fire after `auth/pat` /
+   *     `auth/github/select-repo` lands) so the operator sees the
+   *     push happen rather than waiting for the next write
+   *   - the explicit POST /.parachute/mirror/push-now route the SPA's
+   *     "Push now" button hits
+   *
+   * Idempotent against a fully-synced mirror (git push reports "nothing
+   * to push" with exit 0). Failure paths set `last_push_error` for the
+   * status surface.
+   */
+  async pushNow(): Promise<
+    | { fired: false; reason: "not_enabled" | "no_mirror_path" }
+    | { fired: true; pushed: boolean; sha?: string; error?: string }
+  > {
+    if (!this.status.enabled) return { fired: false, reason: "not_enabled" };
+    if (!this.status.mirror_path) return { fired: false, reason: "no_mirror_path" };
+    const path = this.status.mirror_path;
+    const pushResult = await gitPush(path);
+    const now = new Date().toISOString();
+    // Refresh commits_unpushed either way — a no-op push still reflects
+    // the current state (0 ahead if synced, N if push failed mid-way).
+    this.status.commits_unpushed = await readCommitsUnpushed(path);
+    if (pushResult.ok) {
+      // Capture HEAD sha at this point so the UI can show the operator
+      // exactly what landed.
+      const shaProc = Bun.spawn(["git", "rev-parse", "HEAD"], {
+        cwd: path,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await shaProc.exited;
+      const sha = new TextDecoder()
+        .decode(await new Response(shaProc.stdout).arrayBuffer())
+        .trim();
+      this.status.last_push_at = now;
+      if (sha.length > 0) this.status.last_push_sha = sha;
+      this.status.last_push_error = null;
+      return { fired: true, pushed: true, sha: sha.length > 0 ? sha : undefined };
+    }
+    const redacted = redactToken(pushResult.stderr);
+    this.status.last_push_error = redacted;
+    console.warn(`[mirror] push-now failed (non-fatal): ${redacted}`);
+    return { fired: true, pushed: false, error: redacted };
   }
 
   /**

@@ -855,3 +855,107 @@ describe("MirrorManager — event-driven (sync_mode: events)", () => {
     await mgr.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// MirrorManager.pushNow — Cut 6 of vault#392 (credentials → push round-trip)
+//
+// Live `git push` against a local bare repo as the "remote." Tests the
+// status mutations (last_push_at, last_push_sha, last_push_error,
+// commits_unpushed) the SPA renders.
+// ---------------------------------------------------------------------------
+
+describe("MirrorManager.pushNow — push observability", () => {
+  let home: string;
+  let remote: string;
+
+  afterEach(async () => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    if (remote) fs.rmSync(remote, { recursive: true, force: true });
+  });
+
+  test("returns not_enabled when mirror is disabled", async () => {
+    home = tmp("mgr-pushnow-disabled-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: { ...defaultMirrorConfig(), enabled: false },
+    });
+    const mgr = new MirrorManager(deps);
+    await mgr.start();
+    const r = await mgr.pushNow();
+    expect(r.fired).toBe(false);
+    if (r.fired === false) expect(r.reason).toBe("not_enabled");
+  });
+
+  test("first push wires upstream and sets last_push_at + last_push_sha", async () => {
+    // Spin up an enabled internal mirror; wire a local bare repo as
+    // origin; verify pushNow lands the seed commit and updates status.
+    home = tmp("mgr-pushnow-first-");
+    remote = tmp("mgr-pushnow-remote-");
+    Bun.spawnSync(["git", "init", "--bare", "-q", "-b", "main"], { cwd: remote });
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "manual",
+        auto_commit: false,
+      },
+    });
+    const mgr = new MirrorManager(deps);
+    const status = await mgr.start();
+    expect(status.enabled).toBe(true);
+    // Wire origin to the bare repo. The internal-mirror's first commit
+    // (`initial mirror bootstrap`) is sitting on HEAD waiting to push.
+    Bun.spawnSync(["git", "remote", "add", "origin", remote], { cwd: status.mirror_path! });
+
+    const result = await mgr.pushNow();
+    expect(result.fired).toBe(true);
+    if (result.fired) {
+      expect(result.pushed).toBe(true);
+      expect(typeof result.sha).toBe("string");
+    }
+    const after = mgr.getStatus();
+    expect(after.last_push_at).not.toBeNull();
+    expect(after.last_push_sha).not.toBeNull();
+    expect(after.last_push_error).toBeNull();
+    expect(after.commits_unpushed).toBe(0);
+    await mgr.stop();
+  });
+
+  test("push failure surfaces redacted error in last_push_error", async () => {
+    // Wire origin to a non-existent host. Push fails; status reflects
+    // the failure without leaking any potentially-sensitive URL parts.
+    home = tmp("mgr-pushnow-fail-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "manual",
+        auto_commit: false,
+      },
+    });
+    const mgr = new MirrorManager(deps);
+    const status = await mgr.start();
+    Bun.spawnSync(
+      ["git", "remote", "add", "origin", "https://x-access-token:ghp_fake1234567890abcdef@nonexistent.parachute.test/a/b.git"],
+      { cwd: status.mirror_path! },
+    );
+    const result = await mgr.pushNow();
+    expect(result.fired).toBe(true);
+    if (result.fired) expect(result.pushed).toBe(false);
+    const after = mgr.getStatus();
+    expect(after.last_push_error).not.toBeNull();
+    // Redacted — no token leak.
+    expect(after.last_push_error).not.toContain("ghp_fake1234567890");
+    // Last successful push timestamp is unchanged (still null on a
+    // never-succeeded mirror).
+    expect(after.last_push_at).toBeNull();
+    await mgr.stop();
+  }, 30_000);
+});
