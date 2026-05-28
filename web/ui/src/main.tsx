@@ -31,18 +31,26 @@ function mount(): void {
   );
 }
 
-// Fallback bootstrap path (closes vault#382 / hub-side discovery-tile bug):
-// when the operator clicked the **discovery-page** vault tile (hub.ts
-// renders one per vault via `uiUrl: "/admin/"`), the browser landed here
-// without a `#token=...` fragment — the discovery tile is a plain anchor,
-// not a Manage-flow button. Without a token the SPA boots into the
-// "auth-required" empty state ("Open this page from the hub's directory"),
-// which is exactly what the operator just *did*. So if we're under a
-// per-vault mount AND the fragment didn't carry a token, try to mint one
-// from the hub session cookie before mounting React. The hub exposes
-// `/admin/vault-admin-token/<name>` for exactly this trade; same-origin
-// fetch carries the cookie automatically. Silent failure → fall through to
-// the existing auth-required empty state.
+// Silent-refresh bootstrap (covers vault#382 / hub-side discovery-tile
+// bug AND the page-refresh papercut). Two ways the SPA boots without a
+// fragment-supplied token:
+//
+//   1. Operator clicked the **discovery-page** vault tile (hub.ts renders
+//      one per vault via `uiUrl: "/admin/"`). The tile is a plain anchor,
+//      not a Manage-flow button — no token in the URL.
+//   2. Operator hit Cmd+R on an authenticated admin page. The fragment
+//      was scrubbed by `captureTokenFromFragment` on the prior boot and
+//      the in-memory token died with the page. Aaron hits this often
+//      enough that it was a real papercut.
+//
+// In both cases, if we're under a per-vault mount AND the fragment didn't
+// carry a token, mint a fresh one from the hub session cookie before
+// mounting React. The hub exposes `/admin/vault-admin-token/<name>` for
+// exactly this trade; same-origin fetch carries the cookie automatically.
+// On success the SPA boots into a fully-authenticated state. On failure
+// (no hub session, expired session, vault not on this hub) the SPA
+// boots into the `SignInBanner` empty state, which polls + auto-recovers
+// once the operator signs in to the hub in another tab.
 //
 // We chain off a Promise instead of top-level `await` because Vite's
 // default esbuild target (chrome87/safari14) doesn't transpile TLA, and

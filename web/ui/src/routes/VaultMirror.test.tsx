@@ -563,9 +563,13 @@ describe("VaultMirror — auth-required path", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText(/Open this page from the hub's directory/i),
+        screen.getByText(/You're not signed in to the hub/i),
       ).toBeInTheDocument(),
     );
+    // The CTA points to hub's login surface with a `?next=` continuation
+    // so the operator lands back on this page after signing in.
+    const signInLink = screen.getByRole("link", { name: /Sign in to the hub/i });
+    expect(signInLink.getAttribute("href")).toMatch(/^\/login\?next=/);
   });
 });
 

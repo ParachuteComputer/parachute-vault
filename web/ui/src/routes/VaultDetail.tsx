@@ -11,15 +11,16 @@
  * grants table (the OAuth issuer is the source of truth), so the modular
  * play is "vault links to hub" rather than "vault inlines hub data."
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { HttpError, type VaultDetailResult, getVaultDetail } from "../lib/api.ts";
 import { getIssuerOrigin } from "../lib/scope.ts";
+import { SignInBanner } from "../lib/SignInBanner.tsx";
 
 type State =
   | { kind: "loading" }
   | { kind: "ok"; vault: VaultDetailResult }
-  | { kind: "auth-required" }
+  | { kind: "auth-required"; status: number | null }
   | { kind: "missing" }
   | { kind: "error"; message: string };
 
@@ -37,6 +38,8 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
   const tokensHref = isPerVaultMount ? "/tokens" : `/vault/${encodeURIComponent(name ?? "")}/tokens`;
   const mirrorHref = isPerVaultMount ? "/mirror" : `/vault/${encodeURIComponent(name ?? "")}/mirror`;
   const [state, setState] = useState<State>({ kind: "loading" });
+  const [reloadTick, setReloadTick] = useState(0);
+  const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -44,6 +47,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
       setState({ kind: "missing" });
       return;
     }
+    setState({ kind: "loading" });
     getVaultDetail(name)
       .then((vault) => {
         if (cancelled) return;
@@ -53,7 +57,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
         if (cancelled) return;
         if (err instanceof HttpError) {
           if (err.status === 401 || err.status === 403) {
-            setState({ kind: "auth-required" });
+            setState({ kind: "auth-required", status: err.status });
             return;
           }
           if (err.status === 404) {
@@ -69,7 +73,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
     return () => {
       cancelled = true;
     };
-  }, [name]);
+  }, [name, reloadTick]);
 
   if (state.kind === "loading") {
     return (
@@ -86,10 +90,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
         <h2>
           Vault <code>{name}</code>
         </h2>
-        <div className="warn-banner">
-          Open this page from the hub's directory — the "Manage" link supplies the admin token. Direct loads of{" "}
-          <code>/vault/{name}/admin</code> can't see protected vault data.
-        </div>
+        <SignInBanner vaultName={name ?? ""} status={state.status} onRecovered={onRecovered} />
         {isPerVaultMount ? null : <Link to="/">← Back to vaults</Link>}
       </div>
     );

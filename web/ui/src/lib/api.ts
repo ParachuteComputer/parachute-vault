@@ -12,7 +12,7 @@
  * mint, config edit) will require — Phase A only reads, but the same JWT
  * carries enough to do so under the inherit rule (admin ⊇ write ⊇ read).
  */
-import { getToken } from "./auth.ts";
+import { clearToken, ensureToken, getToken } from "./auth.ts";
 
 /**
  * Counts surface in `VaultDetail.tsx`'s Stats section. Field names mirror
@@ -51,6 +51,76 @@ export class HttpError extends Error {
 }
 
 /**
+ * Bearer-authed fetch with a single silent-refresh retry on 401.
+ *
+ * The flow:
+ *   1. Read the cached token via `getToken()`. If missing, try
+ *      `ensureToken(vaultName)` first — covers the page-refresh case where
+ *      the SPA boots without a fragment-supplied token.
+ *   2. Fire the request with `Authorization: Bearer <token>`.
+ *   3. On 401, run `ensureToken(vaultName)` once more (the token may have
+ *      expired between the proactive-refresh window and the operator's
+ *      next action). If the refresh succeeds, retry the original request
+ *      with the new token. If THAT also returns 401, throw HttpError as
+ *      usual — the operator's session is genuinely gone.
+ *
+ * Why a single retry: the API call's job is one round trip; the auth
+ * layer's job is to keep a token in hand. If both fail, the caller's
+ * existing 401 handler renders the auth-required banner, whose poll loop
+ * will then attempt yet another `ensureToken` — but as a banner-level
+ * concern, not a hidden recursion in the fetch wrapper.
+ *
+ * Returns the `Response` for the caller to inspect (`.ok`, `.status`,
+ * `.json()`, …). Doesn't centralize body parsing because the callsites
+ * have heterogenous return shapes.
+ */
+interface AuthedFetchInit extends Omit<RequestInit, "headers"> {
+  headers?: Record<string, string>;
+}
+
+async function authedFetch(
+  vaultName: string,
+  url: string,
+  init: AuthedFetchInit = {},
+): Promise<Response> {
+  let token = getToken();
+  if (!token) {
+    const ensured = await ensureToken(vaultName);
+    if (ensured.kind !== "ok") {
+      throw new HttpError(401, "no admin token — sign in to the hub to refresh");
+    }
+    token = ensured.token;
+  }
+  const { headers: extraHeaders, ...rest } = init;
+  const buildHeaders = (bearer: string): Record<string, string> => ({
+    accept: "application/json",
+    ...(extraHeaders ?? {}),
+    authorization: `Bearer ${bearer}`,
+  });
+  const res = await fetch(url, { ...rest, headers: buildHeaders(token) });
+  if (res.status !== 401) return res;
+  // 401 → try one silent refresh + retry. The cached token might be stale
+  // (expired between proactive ticks; or the hub revoked it). We clear
+  // the cached token first so `ensureToken` is forced to hit the mint
+  // endpoint — without this, a stale-but-not-expired-by-our-clock token
+  // would be handed back unchanged and the retry would 401 again.
+  clearToken();
+  const refreshed = await ensureToken(vaultName);
+  if (refreshed.kind !== "ok") {
+    // Silent refresh also failed — return the original 401 response so
+    // the caller's existing handler renders the auth-required banner.
+    return res;
+  }
+  return fetch(url, { ...rest, headers: buildHeaders(refreshed.token) });
+}
+
+/**
+ * Internal helper exported for tokens-api.ts and any other authed-fetch
+ * caller in the SPA. Keeps the retry-on-401 logic centralized.
+ */
+export { authedFetch as _authedFetch };
+
+/**
  * Public vault-name list. Returns the names of every vault hosted by this
  * server. No auth — operators who want to hide vault existence set
  * `discovery: disabled` in `~/.parachute/vault/config.yaml` (the endpoint
@@ -74,16 +144,7 @@ export async function listVaultNames(): Promise<string[]> {
  * instead of a generic error.
  */
 export async function getVaultDetail(name: string): Promise<VaultDetailResult> {
-  const token = getToken();
-  if (!token) {
-    throw new HttpError(401, "no admin token — open this page from the hub directory");
-  }
-  const res = await fetch(`/vault/${encodeURIComponent(name)}/`, {
-    headers: {
-      accept: "application/json",
-      authorization: `Bearer ${token}`,
-    },
-  });
+  const res = await authedFetch(name, `/vault/${encodeURIComponent(name)}/`);
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
   }
@@ -168,22 +229,11 @@ export interface MirrorSnapshot {
   status: MirrorStatus;
 }
 
-function mirrorAuthHeaders(): Record<string, string> {
-  const token = getToken();
-  if (!token) {
-    throw new HttpError(401, "no admin token — open this page from the hub directory");
-  }
-  return {
-    accept: "application/json",
-    authorization: `Bearer ${token}`,
-  };
-}
-
 /** GET the persisted mirror config + the current runtime status snapshot. */
 export async function getMirror(vaultName: string): Promise<MirrorSnapshot> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror`,
-    { headers: mirrorAuthHeaders() },
   );
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
@@ -201,11 +251,12 @@ export async function putMirror(
   vaultName: string,
   config: Partial<MirrorConfig>,
 ): Promise<MirrorSnapshot> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror`,
     {
       method: "PUT",
-      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(config),
     },
   );
@@ -221,12 +272,10 @@ export async function putMirror(
  * as the configured-but-disabled hint rather than a generic error.
  */
 export async function runMirrorNow(vaultName: string): Promise<MirrorSnapshot> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/run-now`,
-    {
-      method: "POST",
-      headers: mirrorAuthHeaders(),
-    },
+    { method: "POST" },
   );
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
@@ -246,12 +295,10 @@ export interface MirrorPushNowResponse extends MirrorSnapshot {
     | { fired: true; pushed: boolean; sha?: string; error?: string };
 }
 export async function pushMirrorNow(vaultName: string): Promise<MirrorPushNowResponse> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/push-now`,
-    {
-      method: "POST",
-      headers: mirrorAuthHeaders(),
-    },
+    { method: "POST" },
   );
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
@@ -316,18 +363,19 @@ export interface GitHubRepoInfo {
 }
 
 export async function getMirrorAuth(vaultName: string): Promise<MirrorCredentialStatus> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth`,
-    { headers: mirrorAuthHeaders() },
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as MirrorCredentialStatus;
 }
 
 export async function deleteMirrorAuth(vaultName: string): Promise<MirrorCredentialStatus> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth`,
-    { method: "DELETE", headers: mirrorAuthHeaders() },
+    { method: "DELETE" },
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as MirrorCredentialStatus;
@@ -336,9 +384,10 @@ export async function deleteMirrorAuth(vaultName: string): Promise<MirrorCredent
 export async function startGithubDeviceFlow(
   vaultName: string,
 ): Promise<DeviceCodeResponse> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/device-code`,
-    { method: "POST", headers: mirrorAuthHeaders() },
+    { method: "POST" },
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as DeviceCodeResponse;
@@ -348,11 +397,12 @@ export async function pollGithubDeviceFlow(
   vaultName: string,
   pollingId: string,
 ): Promise<DevicePollState> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/poll`,
     {
       method: "POST",
-      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ polling_id: pollingId }),
     },
   );
@@ -381,11 +431,12 @@ export async function postMirrorAuthPat(
   vaultName: string,
   args: { token: string; remote_url: string; label?: string },
 ): Promise<MirrorCredentialSaveResult> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/pat`,
     {
       method: "POST",
-      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(args),
     },
   );
@@ -396,9 +447,9 @@ export async function postMirrorAuthPat(
 export async function listGithubRepos(
   vaultName: string,
 ): Promise<{ repos: GitHubRepoInfo[]; truncated: boolean }> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/repos`,
-    { headers: mirrorAuthHeaders() },
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as { repos: GitHubRepoInfo[]; truncated: boolean };
@@ -408,11 +459,12 @@ export async function createGithubRepo(
   vaultName: string,
   args: { name: string; description?: string; private?: boolean },
 ): Promise<GitHubRepoInfo> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/create-repo`,
     {
       method: "POST",
-      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(args),
     },
   );
@@ -438,11 +490,12 @@ export async function selectGithubRepo(
   vaultName: string,
   args: { owner: string; name: string },
 ): Promise<SelectGithubRepoResult> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/select-repo`,
     {
       method: "POST",
-      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(args),
     },
   );
@@ -489,11 +542,12 @@ export async function postMirrorImport(
   vaultName: string,
   args: MirrorImportRequest,
 ): Promise<MirrorImportResult> {
-  const res = await fetch(
+  const res = await authedFetch(
+    vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/import`,
     {
       method: "POST",
-      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(args),
     },
   );
