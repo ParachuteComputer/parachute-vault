@@ -730,7 +730,7 @@ export async function route(
     });
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
-  if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName);
+  if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);
   if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName });
 
   return Response.json({ error: "Not found" }, { status: 404 });
