@@ -21,6 +21,7 @@ import {
   type MirrorDeps,
 } from "./mirror-manager.ts";
 import { defaultMirrorConfig, type MirrorConfig } from "./mirror-config.ts";
+import { HookRegistry } from "../core/src/hooks.ts";
 
 // Snapshot HOME + PARACHUTE_HOME at module load; restore after every test
 // so the `process.env.HOME = ...` rewrite in `makeFakeDeps` doesn't leak
@@ -82,8 +83,18 @@ function makeFakeDeps(opts: {
   initialConfig?: MirrorConfig | undefined;
   /** Optional override for runExport — return note count per call. */
   runExport?: (call: { outDir: string; sinceCursor?: string }) => Promise<{ notes: number }>;
+  /** Optional override for runPrune. */
+  runPrune?: (call: { outDir: string }) => Promise<{
+    notes_removed: number;
+    sidecars_removed: number;
+    schemas_removed: number;
+    attachment_dirs_removed: number;
+  }>;
+  /** Hook registry for the event-driven path. Tests that exercise hooks pass one. */
+  hooks?: HookRegistry;
 }): MirrorDeps & {
   exportCalls: Array<{ outDir: string; sinceCursor: string | undefined }>;
+  pruneCalls: Array<{ outDir: string }>;
   storedConfig: MirrorConfig | undefined;
 } {
   process.env.PARACHUTE_HOME = opts.parachuteHome;
@@ -92,9 +103,11 @@ function makeFakeDeps(opts: {
   const state: {
     config: MirrorConfig | undefined;
     exportCalls: Array<{ outDir: string; sinceCursor: string | undefined }>;
+    pruneCalls: Array<{ outDir: string }>;
   } = {
     config: opts.initialConfig,
     exportCalls: [],
+    pruneCalls: [],
   };
 
   const base: MirrorDeps = {
@@ -107,11 +120,17 @@ function makeFakeDeps(opts: {
       if (opts.runExport) return opts.runExport(call);
       return { notes: 1 };
     },
+    runPrune: async (call: { outDir: string }) => {
+      state.pruneCalls.push({ outDir: call.outDir });
+      if (opts.runPrune) return opts.runPrune(call);
+      return { notes_removed: 0, sidecars_removed: 0, schemas_removed: 0, attachment_dirs_removed: 0 };
+    },
     firstChangedNoteTitle: async () => "Inbox/fake",
     readMirrorConfig: () => state.config,
     writeMirrorConfig: (c: MirrorConfig) => {
       state.config = c;
     },
+    hooks: opts.hooks,
   };
   // Defining the test-visible getters via defineProperty so the getter
   // bodies run on every access — otherwise an Object.assign snapshots
@@ -120,12 +139,17 @@ function makeFakeDeps(opts: {
     get: () => state.exportCalls,
     enumerable: true,
   });
+  Object.defineProperty(base, "pruneCalls", {
+    get: () => state.pruneCalls,
+    enumerable: true,
+  });
   Object.defineProperty(base, "storedConfig", {
     get: () => state.config,
     enumerable: true,
   });
   return base as MirrorDeps & {
     exportCalls: Array<{ outDir: string; sinceCursor: string | undefined }>;
+    pruneCalls: Array<{ outDir: string }>;
     storedConfig: MirrorConfig | undefined;
   };
 }
@@ -240,7 +264,7 @@ describe("MirrorManager.start — lifecycle matrix", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: false,
+        sync_mode: "manual",
         auto_commit: false, // skip commit cycle for this unit
       },
     });
@@ -268,9 +292,9 @@ describe("MirrorManager.start — lifecycle matrix", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: true,
+        sync_mode: "events",
         auto_commit: false,
-        interval_seconds: 1,
+        safety_net_seconds: 60,
       },
     });
     const mgr = new MirrorManager(deps);
@@ -296,9 +320,9 @@ describe("MirrorManager.start — lifecycle matrix", () => {
         enabled: true,
         location: "external",
         external_path: external,
-        watch: true,
+        sync_mode: "events",
         auto_commit: false,
-        interval_seconds: 1,
+        safety_net_seconds: 60,
       },
     });
     const mgr = new MirrorManager(deps);
@@ -322,7 +346,7 @@ describe("MirrorManager.start — lifecycle matrix", () => {
         enabled: true,
         location: "external",
         external_path: "/definitely/not/a/path/here",
-        watch: true,
+        sync_mode: "events",
       },
     });
     const mgr = new MirrorManager(deps);
@@ -365,7 +389,7 @@ describe("MirrorManager.start — lifecycle matrix", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: false,
+        sync_mode: "manual",
       },
     });
     const mgr = new MirrorManager(deps);
@@ -391,7 +415,7 @@ describe("MirrorManager.start — lifecycle matrix", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: false,
+        sync_mode: "manual",
         auto_commit: false,
       },
     });
@@ -423,9 +447,9 @@ describe("MirrorManager.stop / reload", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: true,
+        sync_mode: "events",
         auto_commit: false,
-        interval_seconds: 1,
+        safety_net_seconds: 60,
       },
     });
     const mgr = new MirrorManager(deps);
@@ -477,7 +501,7 @@ describe("MirrorManager.stop / reload", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: false,
+        sync_mode: "manual",
         auto_commit: false,
       },
     });
@@ -520,7 +544,7 @@ describe("MirrorManager.runNow", () => {
         ...defaultMirrorConfig(),
         enabled: true,
         location: "internal",
-        watch: false,
+        sync_mode: "manual",
         auto_commit: false,
       },
     });
@@ -545,6 +569,289 @@ describe("MirrorManager.runNow", () => {
     await mgr.start();
     await mgr.runNow();
     expect(deps.exportCalls).toHaveLength(0);
+    await mgr.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Event-driven path (vault#XXX) — hook subscriptions, debounce, safety net
+// ---------------------------------------------------------------------------
+
+describe("MirrorManager — event-driven (sync_mode: events)", () => {
+  let home: string;
+  let hooks: HookRegistry;
+  afterEach(async () => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  /** Helper — build a manager pre-wired with hooks + events sync_mode. */
+  async function makeEventDrivenManager(homeArg: string): Promise<{
+    mgr: MirrorManager;
+    hooks: HookRegistry;
+    deps: ReturnType<typeof makeFakeDeps>;
+  }> {
+    fs.mkdirSync(path.join(homeArg, "vault", "data", "default"), { recursive: true });
+    const h = new HookRegistry({ concurrency: 4, logger: { error: () => {} } });
+    const deps = makeFakeDeps({
+      parachuteHome: homeArg,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "events",
+        auto_commit: false,
+      },
+      hooks: h,
+    });
+    const mgr = new MirrorManager(deps);
+    await mgr.start();
+    return { mgr, hooks: h, deps };
+  }
+
+  test("start() subscribes to hooks (3 subscriptions: notes, tags, attachments)", async () => {
+    home = tmp("mgr-ev-sub-");
+    const { mgr } = await makeEventDrivenManager(home);
+    expect((mgr as unknown as { _subscriptionCount: () => number })._subscriptionCount()).toBe(3);
+    await mgr.stop();
+  });
+
+  test("start() does not subscribe when sync_mode: manual", async () => {
+    home = tmp("mgr-ev-manual-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    hooks = new HookRegistry({ concurrency: 4, logger: { error: () => {} } });
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "manual",
+        auto_commit: false,
+      },
+      hooks,
+    });
+    const mgr = new MirrorManager(deps);
+    await mgr.start();
+    expect((mgr as unknown as { _subscriptionCount: () => number })._subscriptionCount()).toBe(0);
+    await mgr.stop();
+  });
+
+  test("one note-mutation event → debounced flush → one extra export", async () => {
+    home = tmp("mgr-ev-debounce-");
+    const { mgr, deps } = await makeEventDrivenManager(home);
+    expect(deps.exportCalls).toHaveLength(1); // initial export
+
+    // Fire a synthetic event via the hook registry. Use a fake store —
+    // the mirror's handler ignores the payload, just marks dirty.
+    const fakeStore = {} as never;
+    hooks = (mgr as unknown as { deps: MirrorDeps }).deps.hooks!;
+    hooks.dispatch("created", { id: "n1", content: "hi", createdAt: new Date().toISOString() } as never, fakeStore);
+    // Let the dispatch microtask + handler run.
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+    // The debounce timer is armed; force it for the test.
+    await (mgr as unknown as { _flushDebounceForTest: () => Promise<void> })._flushDebounceForTest();
+
+    expect(deps.exportCalls).toHaveLength(2);
+    // The non-initial export carries the cursor from the initial pass.
+    expect(deps.exportCalls[1]!.sinceCursor).toBeDefined();
+    // Prune was called (event-driven flush always prunes).
+    expect(deps.pruneCalls.length).toBeGreaterThanOrEqual(2);
+    await mgr.stop();
+  });
+
+  test("burst of events → debounce collapses into one export", async () => {
+    home = tmp("mgr-ev-burst-");
+    const { mgr, deps } = await makeEventDrivenManager(home);
+    expect(deps.exportCalls).toHaveLength(1);
+    const initialPruneCount = deps.pruneCalls.length;
+
+    const fakeStore = {} as never;
+    hooks = (mgr as unknown as { deps: MirrorDeps }).deps.hooks!;
+    for (let i = 0; i < 10; i++) {
+      hooks.dispatch("updated", { id: `n${i}`, content: "v", createdAt: new Date().toISOString() } as never, fakeStore);
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+    await (mgr as unknown as { _flushDebounceForTest: () => Promise<void> })._flushDebounceForTest();
+
+    // All 10 events collapsed into ONE additional export.
+    expect(deps.exportCalls).toHaveLength(2);
+    expect(deps.pruneCalls.length - initialPruneCount).toBe(1);
+    await mgr.stop();
+  });
+
+  test("event during in-flight export → second flush queued", async () => {
+    home = tmp("mgr-ev-during-flight-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    const h = new HookRegistry({ concurrency: 4, logger: { error: () => {} } });
+
+    // Build runExport that holds open for the first event-driven flush
+    // so we can dispatch a second event mid-flight.
+    let releaseFirstFlush: (() => void) | null = null;
+    let exportCallCount = 0;
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "events",
+        auto_commit: false,
+      },
+      hooks: h,
+      runExport: async (_call) => {
+        exportCallCount++;
+        // Only the FIRST event-driven flush blocks (call #2; #1 is initial).
+        if (exportCallCount === 2) {
+          await new Promise<void>((resolve) => {
+            releaseFirstFlush = resolve;
+          });
+        }
+        return { notes: 1 };
+      },
+    });
+    const mgr = new MirrorManager(deps);
+    await mgr.start();
+    expect(exportCallCount).toBe(1);
+
+    const fakeStore = {} as never;
+    h.dispatch("created", { id: "first", content: "x", createdAt: new Date().toISOString() } as never, fakeStore);
+    await Promise.resolve();
+    await Promise.resolve();
+    await h.drain();
+    // Kick off the debounce flush — it'll block on the gate.
+    const flushPromise = (mgr as unknown as { _flushDebounceForTest: () => Promise<void> })._flushDebounceForTest();
+    // Give it a tick to enter runExport.
+    await new Promise((r) => setTimeout(r, 25));
+    expect(exportCallCount).toBe(2);
+
+    // While that one is in flight, dispatch a second event.
+    h.dispatch("updated", { id: "second", content: "y", createdAt: new Date().toISOString() } as never, fakeStore);
+    await Promise.resolve();
+    await Promise.resolve();
+    await h.drain();
+    // Release the first flush — dirtyDuringFlush should re-arm the debounce.
+    releaseFirstFlush!();
+    await flushPromise;
+    // Force the queued debounce too.
+    await (mgr as unknown as { _flushDebounceForTest: () => Promise<void> })._flushDebounceForTest();
+
+    expect(exportCallCount).toBe(3);
+    await mgr.stop();
+  });
+
+  test("stop() unsubscribes hooks + cancels debounce timer", async () => {
+    home = tmp("mgr-ev-stop-");
+    const { mgr, deps } = await makeEventDrivenManager(home);
+    const exportCountBeforeStop = deps.exportCalls.length;
+
+    await mgr.stop();
+    expect((mgr as unknown as { _subscriptionCount: () => number })._subscriptionCount()).toBe(0);
+
+    // Subsequent events should produce no further exports.
+    const h = (mgr as unknown as { deps: MirrorDeps }).deps.hooks!;
+    const fakeStore = {} as never;
+    h.dispatch("created", { id: "ghost", content: "z", createdAt: new Date().toISOString() } as never, fakeStore);
+    await Promise.resolve();
+    await h.drain();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(deps.exportCalls.length).toBe(exportCountBeforeStop);
+  });
+
+  test("manual mode → no subscriptions, only runNow triggers export", async () => {
+    home = tmp("mgr-ev-manual-only-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    const h = new HookRegistry({ concurrency: 4, logger: { error: () => {} } });
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "manual",
+        auto_commit: false,
+      },
+      hooks: h,
+    });
+    const mgr = new MirrorManager(deps);
+    await mgr.start();
+    expect(deps.exportCalls).toHaveLength(1); // initial
+
+    // Events fired now should NOT trigger flushes (no subscriptions).
+    h.dispatch("created", { id: "n1", content: "x", createdAt: new Date().toISOString() } as never, {} as never);
+    await Promise.resolve();
+    await h.drain();
+    expect(deps.exportCalls).toHaveLength(1);
+
+    // runNow still fires.
+    await mgr.runNow();
+    expect(deps.exportCalls).toHaveLength(2);
+    await mgr.stop();
+  });
+
+  test("reload() from events → manual tears down subscriptions", async () => {
+    home = tmp("mgr-ev-swap-mode-");
+    const { mgr, hooks: h } = await makeEventDrivenManager(home);
+    expect((mgr as unknown as { _subscriptionCount: () => number })._subscriptionCount()).toBe(3);
+
+    await mgr.reload({
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+      sync_mode: "manual",
+      auto_commit: false,
+    });
+    expect((mgr as unknown as { _subscriptionCount: () => number })._subscriptionCount()).toBe(0);
+
+    // Confirm a dispatched event in the new mode is a no-op.
+    h.dispatch("created", { id: "n1", content: "x", createdAt: new Date().toISOString() } as never, {} as never);
+    await Promise.resolve();
+    await h.drain();
+    // No additional export beyond the reload's initial pass.
+    await mgr.stop();
+  });
+
+  test("missing hooks dep → falls back to safety-net only (logs warning, doesn't crash)", async () => {
+    home = tmp("mgr-ev-no-hooks-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    // No `hooks` field on deps → manager should still start cleanly.
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "internal",
+        sync_mode: "events",
+        auto_commit: false,
+      },
+      // Intentionally omit `hooks`.
+    });
+    const mgr = new MirrorManager(deps);
+    const status = await mgr.start();
+    expect(status.enabled).toBe(true);
+    expect(status.watch_running).toBe(true);
+    expect((mgr as unknown as { _subscriptionCount: () => number })._subscriptionCount()).toBe(0);
+    await mgr.stop();
+  });
+
+  test("prune is invoked on initial export AND on event-driven flushes", async () => {
+    home = tmp("mgr-ev-prune-");
+    const { mgr, deps } = await makeEventDrivenManager(home);
+    // Initial export should have called prune.
+    expect(deps.pruneCalls.length).toBeGreaterThanOrEqual(1);
+
+    const fakeStore = {} as never;
+    hooks = (mgr as unknown as { deps: MirrorDeps }).deps.hooks!;
+    hooks.dispatch("deleted", { id: "gone", path: "old/note" } as never, fakeStore);
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+    const pruneBefore = deps.pruneCalls.length;
+    await (mgr as unknown as { _flushDebounceForTest: () => Promise<void> })._flushDebounceForTest();
+    expect(deps.pruneCalls.length).toBe(pruneBefore + 1);
     await mgr.stop();
   });
 });

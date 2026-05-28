@@ -298,18 +298,18 @@ describe("handleMirrorPut", () => {
     await manager.stop();
   });
 
-  test("PUT restarts watch loop with new interval", async () => {
+  test("PUT restarts event-driven mirror lifecycle", async () => {
     home = tmp("mirror-put-restart-");
     const { manager } = makeManager(home);
-    // Enable with watch.
+    // Enable with events sync_mode.
     const req1 = new Request("http://x/admin/mirror", {
       method: "PUT",
       body: JSON.stringify({
         enabled: true,
         location: "internal",
-        watch: true,
+        sync_mode: "events",
         auto_commit: false,
-        interval_seconds: 1,
+        safety_net_seconds: 60,
       }),
     });
     const res1 = await handleMirrorPut(req1, manager);
@@ -356,16 +356,16 @@ describe("handleMirrorPut", () => {
       put({
         enabled: true,
         location: "internal",
-        watch: true,
+        sync_mode: "events",
         auto_commit: false,
-        interval_seconds: 1,
+        safety_net_seconds: 60,
       }),
       put({
         enabled: true,
         location: "internal",
-        watch: true,
+        sync_mode: "events",
         auto_commit: false,
-        interval_seconds: 2,
+        safety_net_seconds: 120,
       }),
     ]);
     expect(res1.status).toBe(200);
@@ -378,7 +378,7 @@ describe("handleMirrorPut", () => {
     const status = manager.getStatus();
     expect(status.enabled).toBe(true);
     expect(status.watch_running).toBe(true);
-    expect(manager.getConfig().interval_seconds).toBe(2);
+    expect(manager.getConfig().safety_net_seconds).toBe(120);
     await manager.stop();
   });
 });

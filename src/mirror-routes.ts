@@ -59,9 +59,12 @@ export function handleMirrorGet(manager: MirrorManager): Response {
  * lifecycle.
  *
  * Request shape: same JSON as the MirrorConfig type — { enabled,
- * location, external_path, watch, auto_commit, auto_push,
- * commit_template, interval_seconds }. All fields optional; missing
- * fields fall back to defaults.
+ * location, external_path, sync_mode, auto_commit, auto_push,
+ * commit_template, safety_net_seconds }. All fields optional; missing
+ * fields fall back to defaults. Legacy `watch: boolean` and
+ * `interval_seconds: number` are also accepted (back-compat with
+ * hand-edited configs); they translate to `sync_mode` / `safety_net_seconds`
+ * via `validateMirrorConfigShape`.
  *
  * Validation surface:
  *   - JSON shape: location ∈ {internal, external}, types match, etc.
