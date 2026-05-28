@@ -287,22 +287,13 @@ describe("runInteractiveInstall — decision tree", () => {
     expect(result.scope).toBe("vault:write");
   });
 
-  test("typing 'admin' auto-routes to legacy-pat with vault:admin scope (hub mint-token rejects admin)", async () => {
-    // Regression for the symptom Aaron hit on hub 0.5.12-rc.2 / vault
-    // 0.4.7-rc.1: picking "admin" in the mint prompt sent
-    // `vault:default:admin` to `POST /api/auth/mint-token`, which hub
-    // rejects by policy (per-vault admin is non-requestable; see
-    // `parachute-hub/src/scope-explanations.ts:VAULT_ADMIN_RE` and
-    // `api-mint-token.ts`'s non-requestable guard):
-    //
-    //   Hub mint-token rejected (HTTP 400, invalid_scope):
-    //   scope vault:default:admin is not requestable via mint-token;
-    //   use OAuth flow or operator rotation
-    //
-    // Fix: auto-route "admin" in the interactive prompt to legacy-pat
-    // mode (which mints a vault-DB pvt_* — the right shape for an MCP
-    // entry needing admin permissions), with a printed explanation so
-    // the switch isn't silent.
+  test("typing 'admin' mints a hub JWT with vault:admin scope (hub PR-A / hub#449)", async () => {
+    // As of hub PR-A (hub#449), `POST /api/auth/mint-token` mints
+    // `vault:<name>:admin` when the calling operator bearer carries
+    // `parachute:host:admin` (which the default operator.token does).
+    // So picking "admin" in the mint prompt now resolves to mint mode
+    // with vault:admin scope — the verb extraction downstream narrows
+    // it to `vault:<name>:admin`. No more legacy-pat auto-route.
     const { io, state } = mockIO([
       null,    // accept install-scope default
       "admin",
@@ -311,13 +302,11 @@ describe("runInteractiveInstall — decision tree", () => {
     const result = await runInteractiveInstall(baseCtx(), io);
     expect(result).not.toBe("abort");
     if (result === "abort") return;
-    expect(result.mode).toBe("legacy-pat");
+    expect(result.mode).toBe("mint");
     expect(result.scope).toBe("vault:admin");
-    // The auto-route must surface the reason — silent re-routing would
-    // mislead operators who specifically want a hub JWT.
+    // The branch surfaces that admin mints a scope-narrowed hub JWT.
     const logged = state.logs.join("\n");
-    expect(logged).toMatch(/admin requires a vault-DB pvt_\*/);
-    expect(logged).toMatch(/hub policy/);
+    expect(logged).toMatch(/scope-narrowed hub JWT/);
   });
 
   test("typing 'paste' at the auth prompt switches to token mode + asks for token", async () => {
