@@ -4377,12 +4377,73 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
 // vault#376 — Change 2: manage-token mint/revoke/list
 // ===========================================================================
 
-describe("manage-token MCP tool (vault#376)", () => {
+describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)", () => {
+  // A JWT-shaped bearer the session presents; the manage-token mint path only
+  // forwards JWT-shaped credentials, so tests must thread one through.
+  const JWT_BEARER = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1In0.sig";
+
+  // --- Hub fetch stub --------------------------------------------------------
+  // mintAction/revokeAction call mintHubJwt/revokeHubJwt, which use global
+  // fetch (no fetchImpl seam on that path). Each test installs a stub that
+  // records the requests and returns a canned hub response. We capture every
+  // call so assertions can inspect the URL / Authorization header / body.
+  let realFetch: typeof globalThis.fetch;
+  let hubCalls: Array<{ url: string; init: RequestInit | undefined; body: any }>;
+  let mintSeq: number;
+
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+    hubCalls = [];
+    mintSeq = 0;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  /** Install a hub stub that mints a fresh jti per mint + idempotent revoke. */
+  function installHubStub(opts?: { revokeFails?: "network" | "api-error" }) {
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input);
+      let body: any = undefined;
+      try { body = init?.body ? JSON.parse(String(init.body)) : undefined; } catch {}
+      hubCalls.push({ url, init, body });
+      if (url.endsWith("/api/auth/mint-token")) {
+        const jti = `hub_jti_${++mintSeq}`;
+        const ttl = typeof body?.expires_in === "number" ? body.expires_in : 900;
+        return new Response(
+          JSON.stringify({
+            jti,
+            token: `eyJ.minted.${jti}`,
+            expires_at: new Date(Date.now() + ttl * 1000).toISOString(),
+            scope: body?.scope ?? "",
+            ...(body?.permissions ? { permissions: body.permissions } : {}),
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/auth/revoke-token")) {
+        if (opts?.revokeFails === "network") throw new Error("connection refused");
+        if (opts?.revokeFails === "api-error") {
+          return new Response(
+            JSON.stringify({ error: "insufficient_scope", error_description: "bearer lacks parachute:host:auth" }),
+            { status: 403, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ jti: body?.jti, revoked_at: new Date().toISOString() }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch in test: ${url}`);
+    }) as typeof globalThis.fetch;
+  }
+
   async function callTool(
     vaultName: string,
     auth: any,
     toolName: string,
     args: Record<string, unknown>,
+    callerBearer: string | null = JWT_BEARER,
   ) {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
@@ -4390,6 +4451,7 @@ describe("manage-token MCP tool (vault#376)", () => {
       headers: {
         "content-type": "application/json",
         "accept": "application/json, text/event-stream",
+        ...(callerBearer ? { authorization: `Bearer ${callerBearer}` } : {}),
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -4398,7 +4460,7 @@ describe("manage-token MCP tool (vault#376)", () => {
         params: { name: toolName, arguments: args },
       }),
     });
-    const res = await handleScopedMcp(req, vaultName, auth);
+    const res = await handleScopedMcp(req, vaultName, auth, callerBearer);
     const body = await res.json() as any;
     if (body.result?.content?.[0]?.text) {
       try {
@@ -4410,7 +4472,7 @@ describe("manage-token MCP tool (vault#376)", () => {
     return { isError: false, parsed: null, raw: body };
   }
 
-  async function setupAdminSession(prefix: string) {
+  async function setupAdminSession(prefix: string, scopedTags: string[] | null = null) {
     const { writeVaultConfig } = await import("./config.ts");
     const vaultName = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     writeVaultConfig({
@@ -4418,139 +4480,179 @@ describe("manage-token MCP tool (vault#376)", () => {
       api_keys: [],
       created_at: new Date().toISOString(),
     });
-    // Stable caller_jti so list/revoke can find the mints; we don't go
-    // through the actual auth flow here (that would require a real pvt_
-    // token; the unit-level test point is the manage-token logic itself).
+    // Stable caller_jti so the session-pinned ledger can attribute mints.
+    // Scopes carry the resource-narrowed admin scope so validateMintedScopes +
+    // the visibility filter pass for THIS vault.
     const auth: any = {
       permission: "full",
-      scopes: ["vault:read", "vault:write", "vault:admin"],
+      scopes: [`vault:${vaultName}:read`, `vault:${vaultName}:write`, `vault:${vaultName}:admin`],
       legacyDerived: false,
-      scoped_tags: null,
+      scoped_tags: scopedTags,
       vault_name: vaultName,
       caller_jti: `t_session${Math.random().toString(36).slice(2, 12)}`,
     };
     return { vaultName, auth };
   }
 
-  test("mint with default TTL returns valid token + jti + expires_at ~15min out", async () => {
-    const { vaultName, auth } = await setupAdminSession("mint-default");
+  test("mint proxies to hub mint-token with caller bearer + narrowed scope + ttl", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-proxy");
     const { closeAllStores } = await import("./vault-store.ts");
-    const before = Date.now();
     const { parsed } = await callTool(vaultName, auth, "manage-token", {
       action: "mint",
       scope: "vault:read",
     });
     expect(parsed.action).toBe("mint");
-    expect(parsed.token).toMatch(/^pvt_/);
-    expect(parsed.jti).toMatch(/^t_/);
-    const expiresAt = Date.parse(parsed.expires_at);
-    expect(expiresAt - before).toBeGreaterThan(890 * 1000);
-    expect(expiresAt - before).toBeLessThan(910 * 1000);
+    // Token is now a hub JWT (not pvt_*); jti is hub's returned jti.
+    expect(parsed.token).toMatch(/^eyJ\.minted\./);
+    expect(parsed.jti).toBe("hub_jti_1");
+    expect(parsed.scopes).toEqual([`vault:${vaultName}:read`]);
+    expect(parsed.vault_name).toBe(vaultName);
+    // One hub mint-token call carrying the caller bearer + narrowed scope.
+    const mint = hubCalls.find((c) => c.url.endsWith("/api/auth/mint-token"));
+    expect(mint).toBeDefined();
+    const headers = new Headers(mint!.init?.headers);
+    expect(headers.get("authorization")).toBe(`Bearer ${JWT_BEARER}`);
+    expect(mint!.body.scope).toBe(`vault:${vaultName}:read`);
+    expect(mint!.body.expires_in).toBe(900);
+    expect(mint!.body.permissions).toBeUndefined(); // unscoped caller
     closeAllStores();
   });
 
-  test("mint with custom TTL=3600 returns expires_at ~1 hour out", async () => {
+  test("mint with custom TTL=3600 forwards expires_in=3600", async () => {
+    installHubStub();
     const { vaultName, auth } = await setupAdminSession("mint-max");
     const { closeAllStores } = await import("./vault-store.ts");
-    const before = Date.now();
-    const { parsed } = await callTool(vaultName, auth, "manage-token", {
-      action: "mint",
-      scope: "vault:read",
-      ttl_seconds: 3600,
-    });
-    expect(parsed.action).toBe("mint");
-    const expiresAt = Date.parse(parsed.expires_at);
-    expect(expiresAt - before).toBeGreaterThan(3590 * 1000);
-    expect(expiresAt - before).toBeLessThan(3610 * 1000);
+    await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", ttl_seconds: 3600 });
+    const mint = hubCalls.find((c) => c.url.endsWith("/api/auth/mint-token"));
+    expect(mint!.body.expires_in).toBe(3600);
     closeAllStores();
   });
 
-  test("mint with TTL=0 is rejected", async () => {
+  test("tag-scoped caller's mint includes permissions.scoped_tags", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-scoped", ["task", "project"]);
+    const { closeAllStores } = await import("./vault-store.ts");
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" });
+    expect(parsed.scoped_tags).toEqual(["task", "project"]);
+    const mint = hubCalls.find((c) => c.url.endsWith("/api/auth/mint-token"));
+    expect(mint!.body.permissions).toEqual({ scoped_tags: ["task", "project"] });
+    closeAllStores();
+  });
+
+  test("mint with TTL=0 is rejected locally (no hub call)", async () => {
+    installHubStub();
     const { vaultName, auth } = await setupAdminSession("mint-zero");
     const { closeAllStores } = await import("./vault-store.ts");
-    const { parsed } = await callTool(vaultName, auth, "manage-token", {
-      action: "mint",
-      scope: "vault:read",
-      ttl_seconds: 0,
-    });
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", ttl_seconds: 0 });
     expect(parsed.error).toBe("invalid_request");
+    expect(hubCalls.length).toBe(0);
     closeAllStores();
   });
 
-  test("mint with TTL=3601 is rejected (over the 3600 cap)", async () => {
+  test("mint with TTL=3601 is rejected locally (over the 3600 cap)", async () => {
+    installHubStub();
     const { vaultName, auth } = await setupAdminSession("mint-over");
     const { closeAllStores } = await import("./vault-store.ts");
-    const { parsed } = await callTool(vaultName, auth, "manage-token", {
-      action: "mint",
-      scope: "vault:read",
-      ttl_seconds: 3601,
-    });
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", ttl_seconds: 3601 });
     expect(parsed.error).toBe("invalid_request");
+    expect(hubCalls.length).toBe(0);
     closeAllStores();
   });
 
-  test("mint with scope outside caller's subset is rejected", async () => {
+  test("cross-vault / over-scope request is rejected locally (no hub call)", async () => {
+    installHubStub();
     const { vaultName, auth } = await setupAdminSession("mint-subset");
     const { closeAllStores } = await import("./vault-store.ts");
-    // Caller's auth carries admin/write/read for THIS vault. Asking for a
-    // scope naming a different vault is the canonical privilege-escalation
-    // surface — must reject.
     const { parsed } = await callTool(vaultName, auth, "manage-token", {
       action: "mint",
       scope: "vault:other-vault:write",
     });
     expect(parsed.error).toBe("forbidden");
     expect(parsed.rejected).toBeDefined();
+    expect(hubCalls.length).toBe(0);
     closeAllStores();
   });
 
-  test("revoke own minted token returns ok=true; second revoke is idempotent", async () => {
+  test("non-forwardable session (no JWT bearer) → clear mint error, no hub call", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("mint-nonfwd");
+    const { closeAllStores } = await import("./vault-store.ts");
+    // Env-var operator path: caller_jti present but the presented credential
+    // is a non-JWT secret → mint must refuse with a hub-JWT-required message.
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" }, "operator-env-secret");
+    expect(parsed.error).toBe("forbidden");
+    expect(parsed.message).toContain("hub-JWT session");
+    expect(hubCalls.length).toBe(0);
+    closeAllStores();
+  });
+
+  test("revoke own minted jti posts to hub revoke-token + idempotent second revoke", async () => {
+    installHubStub();
     const { vaultName, auth } = await setupAdminSession("revoke-idem");
     const { closeAllStores } = await import("./vault-store.ts");
-    const mint = await callTool(vaultName, auth, "manage-token", {
-      action: "mint",
-      scope: "vault:read",
-    });
+    const mint = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" });
     const jti = mint.parsed.jti;
-    const first = await callTool(vaultName, auth, "manage-token", {
-      action: "revoke",
-      jti,
-    });
+    const first = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti });
     expect(first.parsed.ok).toBe(true);
     expect(first.parsed.already_revoked).toBe(false);
-    const second = await callTool(vaultName, auth, "manage-token", {
-      action: "revoke",
-      jti,
-    });
+    // First revoke posted to hub revoke-token with the caller bearer + jti.
+    const revoke = hubCalls.find((c) => c.url.endsWith("/api/auth/revoke-token"));
+    expect(revoke).toBeDefined();
+    expect(revoke!.body.jti).toBe(jti);
+    expect(new Headers(revoke!.init?.headers).get("authorization")).toBe(`Bearer ${JWT_BEARER}`);
+    // Second revoke is idempotent and does NOT re-hit hub (already revoked locally).
+    const revokeCallsBefore = hubCalls.filter((c) => c.url.endsWith("/api/auth/revoke-token")).length;
+    const second = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti });
     expect(second.parsed.ok).toBe(true);
     expect(second.parsed.already_revoked).toBe(true);
+    const revokeCallsAfter = hubCalls.filter((c) => c.url.endsWith("/api/auth/revoke-token")).length;
+    expect(revokeCallsAfter).toBe(revokeCallsBefore);
     closeAllStores();
   });
 
-  test("list returns this session's mints, not other sessions' or CLI mints", async () => {
+  test("cannot revoke another session's jti (session-pinned)", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("revoke-other");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const { recordMcpMintLedger } = await import("./token-store.ts");
+    // Seed a ledger row attributed to a DIFFERENT session.
+    const store = getVaultStore(vaultName);
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_other",
+      parentJti: "t_othersession",
+      vaultName,
+      label: "other",
+      scopes: [`vault:${vaultName}:read`],
+      scopedTags: null,
+      expiresAt: new Date(Date.now() + 900_000).toISOString(),
+    });
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti: "hub_jti_other" });
+    // Not in THIS session's ledger → idempotent ok=true, but NO hub revoke call.
+    expect(parsed.ok).toBe(true);
+    expect(hubCalls.filter((c) => c.url.endsWith("/api/auth/revoke-token")).length).toBe(0);
+    closeAllStores();
+  });
+
+  test("list returns this session's hub-JWT mints, not other sessions'", async () => {
+    installHubStub();
     const { vaultName, auth } = await setupAdminSession("list-session");
     const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
-    const { createToken, generateToken } = await import("./token-store.ts");
+    const { recordMcpMintLedger } = await import("./token-store.ts");
 
-    // Mint two via manage-token in THIS session.
     const m1 = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", description: "alpha" });
     const m2 = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read", description: "beta" });
 
-    // Mint one CLI-style (no created_via) and one from another session.
+    // Seed another session's ledger row — must NOT appear in this list.
     const store = getVaultStore(vaultName);
-    createToken(store.db, generateToken().fullToken, {
-      label: "cli-token",
-      permission: "full",
-      scopes: ["vault:read"],
-      vault_name: vaultName,
-    });
-    createToken(store.db, generateToken().fullToken, {
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_foreign",
+      parentJti: "t_othersession",
+      vaultName,
       label: "other-session-mint",
-      permission: "full",
-      scopes: ["vault:read"],
-      vault_name: vaultName,
-      created_via: "mcp_mint",
-      parent_jti: "t_othersession",
+      scopes: [`vault:${vaultName}:read`],
+      scopedTags: null,
+      expiresAt: null,
     });
 
     const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "list" });
@@ -4558,28 +4660,150 @@ describe("manage-token MCP tool (vault#376)", () => {
     const jtis = parsed.tokens.map((t: any) => t.jti);
     expect(jtis).toContain(m1.parsed.jti);
     expect(jtis).toContain(m2.parsed.jti);
+    expect(jtis).not.toContain("hub_jti_foreign");
     expect(parsed.tokens.length).toBe(2);
     closeAllStores();
   });
 
-  test("audit-log integration: minted row carries created_via='mcp_mint' and parent_jti", async () => {
-    const { vaultName, auth } = await setupAdminSession("audit");
+  test("ledger row records parent_jti + hub jti for the minting session", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("ledger");
     const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
-
-    const { parsed } = await callTool(vaultName, auth, "manage-token", {
-      action: "mint",
-      scope: "vault:read",
-    });
-    const jti = parsed.jti;
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" });
     const store = getVaultStore(vaultName);
-    const hashPrefix = jti.slice(2);
-    const row = store.db.prepare(`
-      SELECT created_via, parent_jti, vault_name FROM tokens
-      WHERE token_hash LIKE ?
-    `).get(`sha256:${hashPrefix}%`) as { created_via: string | null; parent_jti: string | null; vault_name: string | null };
-    expect(row.created_via).toBe("mcp_mint");
+    const row = store.db.prepare(
+      "SELECT jti, parent_jti, vault_name FROM mcp_mint_ledger WHERE jti = ?",
+    ).get(parsed.jti) as { jti: string; parent_jti: string; vault_name: string };
+    expect(row.jti).toBe(parsed.jti);
     expect(row.parent_jti).toBe(auth.caller_jti);
     expect(row.vault_name).toBe(vaultName);
+    closeAllStores();
+  });
+
+  // hub#454 made `vault:<N>:admin` sufficient to revoke an in-authority jti
+  // (capability attenuation, symmetric to mint), so the hub round-trip is now
+  // the expected-SUCCESS path. This asserts the success contract end-to-end:
+  // the caller's `vault:<N>:admin` bearer is forwarded, hub returns 200, and
+  // the local ledger row is flipped to revoked.
+  test("revoke success path: caller's vault:admin bearer revokes at hub + marks ledger (hub#454)", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("revoke-success");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const mint = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:admin" });
+    const jti = mint.parsed.jti;
+
+    const res = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti });
+    expect(res.parsed.ok).toBe(true);
+    expect(res.parsed.already_revoked).toBe(false);
+    expect(res.parsed.error).toBeUndefined();
+
+    // Hub revoke-token was called with the caller's vault:admin bearer + jti.
+    const revoke = hubCalls.find((c) => c.url.endsWith("/api/auth/revoke-token"));
+    expect(revoke).toBeDefined();
+    expect(revoke!.body.jti).toBe(jti);
+    expect(new Headers(revoke!.init?.headers).get("authorization")).toBe(`Bearer ${JWT_BEARER}`);
+
+    // Local ledger row is now marked revoked.
+    const store = getVaultStore(vaultName);
+    const row = store.db.prepare(
+      "SELECT revoked_at FROM mcp_mint_ledger WHERE jti = ?",
+    ).get(jti) as { revoked_at: string | null };
+    expect(row.revoked_at).not.toBeNull();
+    closeAllStores();
+  });
+
+  test("caller_jti: null session → list returns empty", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("null-list");
+    const { closeAllStores } = await import("./vault-store.ts");
+    // Env-var operator / legacy session: no stable session id.
+    auth.caller_jti = null;
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "list" });
+    expect(parsed.action).toBe("list");
+    expect(parsed.tokens).toEqual([]);
+    closeAllStores();
+  });
+
+  test("caller_jti: null session → revoke returns not_found, no hub call", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("null-revoke");
+    const { closeAllStores } = await import("./vault-store.ts");
+    auth.caller_jti = null;
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti: "hub_jti_anything" });
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toBe("not_found");
+    expect(hubCalls.filter((c) => c.url.endsWith("/api/auth/revoke-token")).length).toBe(0);
+    closeAllStores();
+  });
+
+  test("list isolation across vaults: vault-A session never sees a vault-B ledger row", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("list-vault-iso");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const { recordMcpMintLedger } = await import("./token-store.ts");
+
+    // Mint one in THIS (vault-A) session.
+    const m1 = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" });
+
+    // Seed a ledger row attributed to the SAME parent_jti but a DIFFERENT
+    // vault — the list query scopes on (parent_jti, vault_name), so this
+    // foreign-vault row must not leak into vault-A's list.
+    const store = getVaultStore(vaultName);
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_vaultB",
+      parentJti: auth.caller_jti, // same session id, different vault
+      vaultName: `${vaultName}-OTHER`,
+      label: "vault-B mint",
+      scopes: [`vault:${vaultName}-OTHER:read`],
+      scopedTags: null,
+      expiresAt: null,
+    });
+
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "list" });
+    const jtis = parsed.tokens.map((t: any) => t.jti);
+    expect(jtis).toContain(m1.parsed.jti);
+    expect(jtis).not.toContain("hub_jti_vaultB");
+    expect(parsed.tokens.length).toBe(1);
+    closeAllStores();
+  });
+
+  // INSERT OR IGNORE (not OR REPLACE): a duplicate jti record (a hub jti
+  // collision — shouldn't happen) must NOT overwrite the existing row, because
+  // that would silently reset a previously-set revoked_at and resurrect a
+  // revoked token.
+  test("recordMcpMintLedger duplicate jti preserves the existing row's revoked_at", async () => {
+    const { vaultName, auth } = await setupAdminSession("ledger-dup");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const { recordMcpMintLedger, markMcpMintLedgerRevoked, findMcpMintLedgerEntry } =
+      await import("./token-store.ts");
+    const store = getVaultStore(vaultName);
+
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_dup",
+      parentJti: auth.caller_jti,
+      vaultName,
+      label: "first",
+      scopes: [`vault:${vaultName}:read`],
+      scopedTags: null,
+      expiresAt: null,
+    });
+    // Revoke it (sets revoked_at).
+    markMcpMintLedgerRevoked(store.db, "hub_jti_dup", auth.caller_jti, vaultName);
+    const before = findMcpMintLedgerEntry(store.db, "hub_jti_dup", auth.caller_jti, vaultName);
+    expect(before!.revoked_at).not.toBeNull();
+
+    // A second record with the same jti must be IGNORED — revoked_at survives.
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_dup",
+      parentJti: auth.caller_jti,
+      vaultName,
+      label: "second (collision)",
+      scopes: [`vault:${vaultName}:read`],
+      scopedTags: null,
+      expiresAt: null,
+    });
+    const after = findMcpMintLedgerEntry(store.db, "hub_jti_dup", auth.caller_jti, vaultName);
+    expect(after!.revoked_at).toBe(before!.revoked_at); // unchanged, not reset to NULL
     closeAllStores();
   });
 });

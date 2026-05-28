@@ -438,7 +438,15 @@ export async function route(
 
   // MCP (per-vault, single-vault session).
   if (isScopedMcp) {
-    return handleScopedMcp(req, vaultName, auth);
+    // Thread the RAW caller bearer (the exact credential the session
+    // presented) into the MCP layer so the manage-token tool can forward it
+    // to hub's mint-token attenuation proxy (vault#403, MGT). Only the raw
+    // validated bearer — never a fabricated one. extractApiKey returns the
+    // same value `authenticateVaultRequest` validated above; non-forwardable
+    // credentials (env-var secret, legacy pvt_*) are handled by manage-token
+    // itself (it only forwards JWT-shaped bearers).
+    const callerBearer = extractApiKey(req);
+    return handleScopedMcp(req, vaultName, auth, callerBearer);
   }
 
   // Bare `/vault/<name>` — single-vault root. Returns name, description,

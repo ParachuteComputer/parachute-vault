@@ -14,7 +14,7 @@ import {
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { hasScopeForVault, parseScopes, validateMintedScopes, hasScope, SCOPE_WRITE, SCOPE_ADMIN } from "./scopes.ts";
+import { hasScopeForVault, parseScopes, validateMintedScopes } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 import {
   expandTokenTagScope,
@@ -23,12 +23,14 @@ import {
 } from "./tag-scope.ts";
 import {
   findTokensReferencingTag,
-  generateToken,
-  createToken,
-  listMcpMintedTokens,
-  softRevokeMcpToken,
-  type TokenPermission,
+  recordMcpMintLedger,
+  listMcpMintedHubJwts,
+  findMcpMintLedgerEntry,
+  markMcpMintLedgerRevoked,
 } from "./token-store.ts";
+import { chooseHubOrigin, mintHubJwt, revokeHubJwt } from "./mcp-install.ts";
+import { looksLikeJwt } from "./hub-jwt.ts";
+import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
 
 /**
  * Filter a vault projection to entries an in-scope tag contributes to.
@@ -109,7 +111,11 @@ export async function getServerInstruction(
  * When omitted (internal callers that only inspect the tool list — no execute
  * path exercised), the description-update branch is disabled entirely.
  */
-export function generateScopedMcpTools(vaultName: string, auth?: AuthResult): McpToolDef[] {
+export function generateScopedMcpTools(
+  vaultName: string,
+  auth?: AuthResult,
+  callerBearer?: string | null,
+): McpToolDef[] {
   const store = getVaultStore(vaultName);
   const tools = generateMcpTools(store);
 
@@ -120,8 +126,9 @@ export function generateScopedMcpTools(vaultName: string, auth?: AuthResult): Mc
   // manage-token is server-only (needs token-store + auth context), so it
   // lives here rather than in core. Always appended to the surface; the
   // `requiredVerb: "admin"` filter in mcp-http.ts hides it from non-admin
-  // callers. See vault#376.
-  tools.push(buildManageTokenTool(vaultName, auth));
+  // callers. See vault#376. The raw caller bearer (vault#403, MGT) is
+  // forwarded to hub's mint-token attenuation proxy on mint.
+  tools.push(buildManageTokenTool(vaultName, auth, callerBearer ?? null));
 
   return tools;
 }
@@ -433,45 +440,70 @@ function overrideVaultInfo(
 const MANAGE_TOKEN_DEFAULT_TTL_SECONDS = 900; // 15 minutes
 const MANAGE_TOKEN_MAX_TTL_SECONDS = 3600; // 1 hour
 
-function permissionForScopes(scopes: string[]): TokenPermission {
-  return hasScope(scopes, SCOPE_WRITE) || hasScope(scopes, SCOPE_ADMIN) ? "full" : "read";
+/**
+ * Resolve the bare hub origin for the mint/revoke proxy calls. Reuses
+ * `chooseHubOrigin` (PARACHUTE_HUB_ORIGIN → expose-state FQDN → loopback) so
+ * the manage-token proxy targets the same hub the rest of vault talks to.
+ * The port is read from global config (same source the server binds on).
+ */
+function resolveHubOrigin(): { url: string; source: string } {
+  let port = DEFAULT_PORT;
+  try {
+    port = readGlobalConfig().port || DEFAULT_PORT;
+  } catch {
+    // Config unreadable (fresh / test fixture) — fall back to the default
+    // port; chooseHubOrigin still honors PARACHUTE_HUB_ORIGIN / expose-state.
+  }
+  return chooseHubOrigin(port);
 }
 
 /**
  * Build the manage-token MCP tool, wired to the calling session's auth.
  *
- * Closure-captured context:
- *   - `vaultName`: every mint pins `vault_name` to this; cross-vault mints
- *     are rejected by `validateMintedScopes` (it refuses any
- *     `vault:<other>:<verb>` scope).
- *   - `auth.scopes`: defense-in-depth subset check on mint. The outer
- *     filter already required vault:admin to see the tool, but a hand-
- *     crafted JSON-RPC `tools/call` of `manage-token` from a non-admin
- *     session would bypass the visibility filter — `validateMintedScopes`
- *     plus the `hasScopeForVault(auth.scopes, vaultName, "admin")` guard
- *     below catch that case.
- *   - `auth.caller_jti`: stamped as `parent_jti` on each mint; list+revoke
- *     scope to this jti so each MCP session sees only its own mints.
- *     When NULL (legacy / env-var operator / hub JWT without jti), mints
- *     still succeed but list/revoke return empty — the operator hits the
- *     CLI / REST surface instead for revocation in that path.
+ * After the auth-unification arc (vault#403, MGT) the tool is a thin proxy to
+ * hub's mint-token attenuation endpoint: it mints short-TTL HUB JWTs, not
+ * deprecated `pvt_*` vault-DB tokens. The DROP step removes the pvt_* mint
+ * infra entirely once every consumer has migrated.
  *
- * The execute function is async (token mint touches the store + DB) and
+ * Closure-captured context:
+ *   - `vaultName`: every mint requests `vault:<vaultName>:<verb>`; cross-vault
+ *     and over-scope requests are rejected locally by `validateMintedScopes`
+ *     (fail-fast) AND by hub's attenuation guard (authoritative).
+ *   - `auth.scopes`: the caller must hold `vault:<vaultName>:admin` to see the
+ *     tool (mcp-http.ts visibleTools filter) and to mint; `validateMintedScopes`
+ *     enforces the requested scope is a same-vault subset of what's held.
+ *   - `auth.caller_jti`: the minting MCP session's id, recorded as the
+ *     `parent_jti` in the local ledger so list/revoke stay session-scoped.
+ *     When NULL (env-var operator / hub JWT without jti) there's no stable
+ *     session id → list returns empty + revoke returns not_found.
+ *   - `callerBearer`: the RAW credential the session presented. Only forwarded
+ *     to hub when JWT-shaped (a hub JWT carrying `vault:<name>:admin`). A
+ *     non-forwardable credential (env-var secret, legacy pvt_*) yields a clear
+ *     "mint requires a hub-JWT session" error rather than a fabricated bearer.
+ *
+ * The execute function is async (mint/revoke do an HTTP round-trip to hub) and
  * returns a discriminated-union response shape: `{action, …}` with `action`
  * matching the requested action. The MCP HTTP layer serializes the result
  * via `JSON.stringify`, so caller-side parsing keys off the action field.
  */
-function buildManageTokenTool(vaultName: string, auth: AuthResult | undefined): McpToolDef {
+function buildManageTokenTool(
+  vaultName: string,
+  auth: AuthResult | undefined,
+  callerBearer: string | null,
+): McpToolDef {
   return {
     name: "manage-token",
     requiredVerb: "admin",
     description:
-      "Mint, revoke, or list short-TTL vault tokens within this MCP session. " +
+      "Mint, revoke, or list short-TTL hub JWTs within this MCP session. " +
       "Designed for one-shot AI-driven workflows: mint a narrow token, run a " +
-      "script with it, revoke immediately. Token lifetime defaults to 15 min " +
-      "(max 1 hour). Mints are pinned to this vault and to the caller's scope " +
-      "subset — you cannot escalate. List + revoke are scoped to tokens this " +
-      "session minted; CLI/REST-minted tokens are not surfaced here.\n\n" +
+      "script with it, revoke immediately. Minted tokens are short-lived hub " +
+      "JWTs (revocable via the hub's token registry), not legacy vault-DB " +
+      "tokens. Lifetime defaults to 15 min (max 1 hour). Mints are pinned to " +
+      "this vault and attenuated to a subset of the caller's scope — you cannot " +
+      "escalate. Minting requires a hub-JWT session holding 'vault:" + vaultName +
+      ":admin'. List + revoke are scoped to tokens this session minted; " +
+      "CLI/REST-minted tokens are not surfaced here.\n\n" +
       "Actions (discriminator: `action`):\n" +
       "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at }\n" +
       "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean }\n" +
@@ -525,8 +557,8 @@ function buildManageTokenTool(vaultName: string, auth: AuthResult | undefined): 
         };
       }
 
-      if (action === "mint") return await mintAction(params, vaultName, auth);
-      if (action === "revoke") return revokeAction(params, vaultName, auth);
+      if (action === "mint") return await mintAction(params, vaultName, auth, callerBearer);
+      if (action === "revoke") return await revokeAction(params, vaultName, auth, callerBearer);
       if (action === "list") return listAction(vaultName, auth);
 
       return {
@@ -537,10 +569,29 @@ function buildManageTokenTool(vaultName: string, auth: AuthResult | undefined): 
   };
 }
 
+/**
+ * Normalize a requested scope to the resource-narrowed `vault:<name>:<verb>`
+ * shape hub expects. Callers may pass either the broad `vault:<verb>` form
+ * (the manage-token v1 surface accepted this) or the explicit
+ * `vault:<name>:<verb>` form. We rewrite the broad form to name THIS vault so
+ * hub's attenuation guard — which only knows resource-narrowed scopes — sees a
+ * `vault:<vaultName>:<verb>` request. A scope already naming a different vault
+ * is left untouched (validateMintedScopes rejects it before we get here).
+ */
+function narrowScopeForVault(scope: string, vaultName: string): string {
+  const parts = scope.split(":");
+  // `vault:<verb>` (2 parts) → `vault:<name>:<verb>`.
+  if (parts.length === 2 && parts[0] === "vault") {
+    return `vault:${vaultName}:${parts[1]}`;
+  }
+  return scope;
+}
+
 async function mintAction(
   params: Record<string, unknown>,
   vaultName: string,
   auth: AuthResult,
+  callerBearer: string | null,
 ): Promise<Record<string, unknown>> {
   // Scope parsing: accept string or string[]. Empty/missing is rejected
   // explicitly (no implicit "full scope" default — manage-token always
@@ -568,6 +619,10 @@ async function mintAction(
     };
   }
 
+  // Fail-fast local guard (defense-in-depth — hub's attenuation is
+  // authoritative): cross-vault + over-scope requests are rejected here with a
+  // clear message before any HTTP round-trip. The caller cannot request a
+  // scope outside their own vault/authority.
   const validation = validateMintedScopes(requested, vaultName, auth.scopes);
   if (!validation.ok) {
     return {
@@ -575,6 +630,31 @@ async function mintAction(
       error: "forbidden",
       message: "manage-token mint: scope rejected (must be a subset of the caller's scope on this vault).",
       rejected: validation.rejected,
+    };
+  }
+
+  // Forwardability: minting is a proxy to hub's attenuation endpoint, so the
+  // caller must present a forwardable hub-JWT bearer carrying
+  // `vault:<name>:admin`. A non-JWT credential (env-var operator secret,
+  // legacy pvt_*) can't be forwarded — and wouldn't carry mint authority at
+  // hub anyway — so fail with a clear, actionable error rather than
+  // fabricating a bearer.
+  //
+  // `looksLikeJwt` is a SYNTACTIC hint only (startsWith("eyJ") — the base64url
+  // of a JWS header `{"`). It does NOT verify the signature, issuer, scopes,
+  // or that the bearer actually grants mint authority. That's intentional:
+  // hub's mint-token attenuation guard is the authoritative gate (it validates
+  // the bearer and rejects anything it couldn't have minted). This check just
+  // avoids forwarding a credential we already know can't be a hub JWT.
+  if (!callerBearer || !looksLikeJwt(callerBearer)) {
+    return {
+      action: "mint",
+      error: "forbidden",
+      message:
+        `manage-token mint requires a hub-JWT session holding 'vault:${vaultName}:admin'. ` +
+        "This session authenticated with a non-forwardable credential (operator " +
+        "env-var token or legacy vault-DB token); mint a token via the hub admin " +
+        "UI / CLI instead, or reconnect MCP with a hub-issued JWT.",
     };
   }
 
@@ -600,49 +680,87 @@ async function mintAction(
     }
     ttl = params.ttl_seconds;
   }
-  const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
   const description = typeof params.description === "string" && params.description.length > 0
     ? params.description
     : null;
   const label = description ?? `mcp-mint (parent=${auth.caller_jti ?? "unknown"})`;
 
-  const store = getVaultStore(vaultName);
-  const { fullToken } = generateToken();
-  const created = createToken(store.db, fullToken, {
-    label,
-    permission: permissionForScopes(requested),
-    scopes: requested,
-    // Tag scoping: inherit the caller's allowlist verbatim. We don't expose
-    // a `tags` param on manage-token yet — the design doc keeps the v1
-    // surface minimal. When the caller is tag-scoped, the minted token
-    // carries the same allowlist (no narrowing, no widening); when the
-    // caller is unscoped, the mint is unscoped. Future widening of the
-    // surface should re-use tokens-routes.ts' validation path so the rules
-    // stay in lockstep.
-    scoped_tags: auth.scoped_tags,
-    vault_name: vaultName,
-    expires_at: expiresAt,
-    created_via: "mcp_mint",
-    parent_jti: auth.caller_jti,
+  // Resolve hub origin (PARACHUTE_HUB_ORIGIN → expose-state FQDN → loopback).
+  const hub = resolveHubOrigin();
+
+  // Build the mint-token request. Scopes are narrowed to the resource-named
+  // `vault:<name>:<verb>` form hub's attenuation guard requires. Tag-scoping
+  // (when the caller is tag-scoped) rides along as `permissions.scoped_tags`
+  // so the minted hub JWT carries the same restriction — vault enforces it on
+  // read via C0 (vault#403). Unscoped callers omit `permissions`.
+  const narrowedScopes = requested.map((s) => narrowScopeForVault(s, vaultName));
+  const permissions =
+    auth.scoped_tags && auth.scoped_tags.length > 0
+      ? { scoped_tags: auth.scoped_tags }
+      : undefined;
+
+  const minted = await mintHubJwt({
+    hubOrigin: hub.url,
+    operatorToken: callerBearer,
+    scope: narrowedScopes.join(" "),
+    expiresInSeconds: ttl,
+    ...(permissions !== undefined ? { permissions } : {}),
   });
+
+  if ("kind" in minted) {
+    // Surface a clear, action-keyed error. Network → "hub unreachable";
+    // api-error → hub's own error_description (e.g. attenuation rejection).
+    if (minted.kind === "network") {
+      return {
+        action: "mint",
+        error: "hub_unreachable",
+        message: `manage-token mint: could not reach hub at ${minted.origin} (${minted.cause}). Check PARACHUTE_HUB_ORIGIN / that the hub is running.`,
+      };
+    }
+    return {
+      action: "mint",
+      error: "hub_rejected",
+      message: `manage-token mint: hub rejected the request (${minted.error}: ${minted.description}).`,
+      hub_status: minted.status,
+    };
+  }
+
+  // Record in the session-pinned ledger so list/revoke can scope to this
+  // session's mints. The signed JWT is never stored — only its jti (the
+  // revocation handle) + display metadata. NULL caller_jti (env-var / no-jti
+  // sessions) can't pass the forwardability gate above, so by here caller_jti
+  // is effectively the JWT's jti; we still guard defensively.
+  const store = getVaultStore(vaultName);
+  if (auth.caller_jti) {
+    recordMcpMintLedger(store.db, {
+      jti: minted.jti,
+      parentJti: auth.caller_jti,
+      vaultName,
+      label,
+      scopes: narrowedScopes,
+      scopedTags: auth.scoped_tags,
+      expiresAt: minted.expires_at,
+    });
+  }
 
   return {
     action: "mint",
-    token: fullToken,
-    jti: `t_${created.token_hash.slice(7, 19)}`,
-    expires_at: expiresAt,
-    scopes: requested,
+    token: minted.token,
+    jti: minted.jti,
+    expires_at: minted.expires_at,
+    scopes: narrowedScopes,
     scoped_tags: auth.scoped_tags,
     vault_name: vaultName,
   };
 }
 
-function revokeAction(
+async function revokeAction(
   params: Record<string, unknown>,
   vaultName: string,
   auth: AuthResult,
-): Record<string, unknown> {
+  callerBearer: string | null,
+): Promise<Record<string, unknown>> {
   if (typeof params.jti !== "string" || params.jti.length === 0) {
     return {
       action: "revoke",
@@ -651,30 +769,82 @@ function revokeAction(
       message: "manage-token revoke: `jti` is required (string).",
     };
   }
-  // Session-pin: revoke is restricted to tokens this MCP session minted.
+  const jti = params.jti;
+
+  // Session-pin: revoke is restricted to hub JWTs THIS MCP session minted.
   // When auth.caller_jti is null (no stable session id — env-var operator,
-  // legacy YAML key, hub JWT without jti), there are no MCP-minted tokens
-  // attributable to this session, so revoke returns not_found.
+  // legacy YAML key, hub JWT without jti), there are no attributable mints,
+  // so revoke returns not_found.
   if (!auth.caller_jti) {
     return {
       action: "revoke",
       ok: false,
       error: "not_found",
-      message: "manage-token revoke: this session has no stable id; revoke via the CLI or REST surface.",
+      message: "manage-token revoke: this session has no stable id; revoke via the hub admin UI / CLI.",
     };
   }
+
   const store = getVaultStore(vaultName);
-  const result = softRevokeMcpToken(store.db, params.jti, auth.caller_jti, vaultName);
-  if (!result.ok) {
-    // Idempotency: not-found returns ok=true so the AI's "mint → run →
-    // revoke" loop doesn't surface a confusing failure when a network
-    // blip causes a duplicate revoke call. The spec calls this out
-    // explicitly (vault#376). The "already minted by another session"
-    // case also lands here; we don't differentiate (no information leak
-    // about other sessions' jti space).
+  const entry = findMcpMintLedgerEntry(store.db, jti, auth.caller_jti, vaultName);
+  if (!entry) {
+    // Idempotency: not-in-this-session's-ledger returns ok=true so the AI's
+    // "mint → run → revoke" loop doesn't surface a confusing failure on a
+    // duplicate revoke or a network-blip retry. The "minted by another
+    // session" case also lands here; we don't differentiate (no information
+    // leak about other sessions' jti space).
     return { action: "revoke", ok: true, note: "no matching token in this session" };
   }
-  return { action: "revoke", ok: true, already_revoked: result.already_revoked };
+  if (entry.revoked_at) {
+    // Already revoked locally — idempotent success, no second hub round-trip.
+    return { action: "revoke", ok: true, already_revoked: true };
+  }
+
+  // Forward the revoke to hub's token registry (the authoritative revocation
+  // surface — vault is resource-server-only). The caller's `vault:<N>:admin`
+  // bearer is forwarded, same as on mint. As of hub#454 this is the
+  // expected-SUCCESS path: hub's revoke-token applies capability attenuation
+  // symmetric to mint, so a `vault:<N>:admin` bearer may revoke any jti whose
+  // scopes it could have minted (and these are exactly the tokens this session
+  // minted within that vault's authority). Hub's revoke-token is idempotent.
+  //
+  // The `"kind" in revoked` branch below is now the EXCEPTION, not the norm —
+  // it only fires on a genuine edge (network blip, or a hub-side rejection
+  // that shouldn't happen for an in-authority jti). When it does, we still
+  // flip the local ledger marker so list reflects the operator's intent, and
+  // surface the hub failure so the caller knows the registry-side revoke may
+  // not have landed (the short TTL is the backstop either way).
+  if (callerBearer && looksLikeJwt(callerBearer)) {
+    const hub = resolveHubOrigin();
+    const revoked = await revokeHubJwt({
+      hubOrigin: hub.url,
+      operatorToken: callerBearer,
+      jti,
+    });
+    if ("kind" in revoked) {
+      // Unexpected hub failure. Local ledger still flips (operator asked to
+      // revoke), but report the hub-side failure so a network blip / scope
+      // gap is visible.
+      markMcpMintLedgerRevoked(store.db, jti, auth.caller_jti, vaultName);
+      if (revoked.kind === "network") {
+        return {
+          action: "revoke",
+          ok: false,
+          error: "hub_unreachable",
+          message: `manage-token revoke: could not reach hub at ${revoked.origin} (${revoked.cause}); local ledger marked revoked but the hub registry may still list it. The token's short TTL is the backstop.`,
+        };
+      }
+      return {
+        action: "revoke",
+        ok: false,
+        error: "hub_rejected",
+        message: `manage-token revoke: hub rejected the request (${revoked.error}: ${revoked.description}); local ledger marked revoked. The token's short TTL is the backstop.`,
+        hub_status: revoked.status,
+      };
+    }
+  }
+
+  markMcpMintLedgerRevoked(store.db, jti, auth.caller_jti, vaultName);
+  return { action: "revoke", ok: true, already_revoked: false };
 }
 
 function listAction(vaultName: string, auth: AuthResult): Record<string, unknown> {
@@ -685,6 +855,9 @@ function listAction(vaultName: string, auth: AuthResult): Record<string, unknown
     return { action: "list", tokens: [] };
   }
   const store = getVaultStore(vaultName);
-  const tokens = listMcpMintedTokens(store.db, auth.caller_jti, vaultName);
+  // Read from the hub-JWT mint ledger (vault#403, MGT) — mints now live in
+  // hub's registry, not the pvt_* tokens table; the ledger is the local
+  // session-attribution index.
+  const tokens = listMcpMintedHubJwts(store.db, auth.caller_jti, vaultName);
   return { action: "list", tokens };
 }

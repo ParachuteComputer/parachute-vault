@@ -27,6 +27,7 @@ import {
   readOperatorToken,
   removeMcpConfig,
   resolveInstallTarget,
+  revokeHubJwt,
 } from "./mcp-install.ts";
 
 const CLI = path.resolve(import.meta.dir, "cli.ts");
@@ -427,6 +428,107 @@ describe("mintHubJwt", () => {
       fetchImpl: mockFetch,
     });
     expect("kind" in res && res.kind === "api-error").toBe(true);
+  });
+
+  test("forwards permissions claim to hub when provided (vault#403, MGT)", async () => {
+    const calls: Array<{ body: any }> = [];
+    const mockFetch: typeof fetch = async (_url, init) => {
+      calls.push({ body: JSON.parse(String(init?.body)) });
+      return new Response(
+        JSON.stringify({
+          jti: "jti-tag",
+          token: "eyJ.signed.jwt",
+          expires_at: "2026-08-09T00:00:00.000Z",
+          scope: "vault:default:read",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    await mintHubJwt({
+      hubOrigin: "https://hub.example",
+      operatorToken: "bearer",
+      scope: "vault:default:read",
+      permissions: { scoped_tags: ["task"] },
+      fetchImpl: mockFetch,
+    });
+    expect(calls[0]!.body.permissions).toEqual({ scoped_tags: ["task"] });
+  });
+
+  test("omits permissions from the body when not provided", async () => {
+    const calls: Array<{ body: any }> = [];
+    const mockFetch: typeof fetch = async (_url, init) => {
+      calls.push({ body: JSON.parse(String(init?.body)) });
+      return new Response(
+        JSON.stringify({
+          jti: "j",
+          token: "eyJ.x.y",
+          expires_at: "2026-08-09T00:00:00.000Z",
+          scope: "vault:default:read",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    await mintHubJwt({
+      hubOrigin: "https://hub.example",
+      operatorToken: "bearer",
+      scope: "vault:default:read",
+      fetchImpl: mockFetch,
+    });
+    expect("permissions" in calls[0]!.body).toBe(false);
+  });
+});
+
+describe("revokeHubJwt (vault#403, MGT)", () => {
+  test("happy path posts jti + caller bearer, returns revoked_at", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const mockFetch: typeof fetch = async (url, init) => {
+      calls.push({ url: String(url), init });
+      return new Response(
+        JSON.stringify({ jti: "hub_jti_1", revoked_at: "2026-05-28T00:00:00.000Z" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    const res = await revokeHubJwt({
+      hubOrigin: "https://hub.example",
+      operatorToken: "caller-bearer",
+      jti: "hub_jti_1",
+      fetchImpl: mockFetch,
+    });
+    expect("revoked_at" in res).toBe(true);
+    expect(calls[0]!.url).toBe("https://hub.example/api/auth/revoke-token");
+    expect(new Headers(calls[0]!.init?.headers).get("authorization")).toBe("Bearer caller-bearer");
+    expect(JSON.parse(String(calls[0]!.init?.body)).jti).toBe("hub_jti_1");
+  });
+
+  test("network error returns { kind: 'network' }", async () => {
+    const mockFetch: typeof fetch = async () => { throw new Error("connection refused"); };
+    const res = await revokeHubJwt({
+      hubOrigin: "https://hub.example",
+      operatorToken: "b",
+      jti: "j",
+      fetchImpl: mockFetch,
+    });
+    expect(res).toEqual({ kind: "network", cause: "connection refused", origin: "https://hub.example" });
+  });
+
+  test("API error surfaces hub error + description", async () => {
+    const mockFetch: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({ error: "insufficient_scope", error_description: "bearer lacks parachute:host:auth" }),
+        { status: 403, headers: { "Content-Type": "application/json" } },
+      );
+    const res = await revokeHubJwt({
+      hubOrigin: "https://hub.example",
+      operatorToken: "b",
+      jti: "j",
+      fetchImpl: mockFetch,
+    });
+    expect(res).toEqual({
+      kind: "api-error",
+      status: 403,
+      error: "insufficient_scope",
+      description: "bearer lacks parachute:host:auth",
+    });
   });
 });
 
