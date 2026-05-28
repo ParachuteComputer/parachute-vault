@@ -639,6 +639,13 @@ async function mintAction(
   // legacy pvt_*) can't be forwarded — and wouldn't carry mint authority at
   // hub anyway — so fail with a clear, actionable error rather than
   // fabricating a bearer.
+  //
+  // `looksLikeJwt` is a SYNTACTIC hint only (startsWith("eyJ") — the base64url
+  // of a JWS header `{"`). It does NOT verify the signature, issuer, scopes,
+  // or that the bearer actually grants mint authority. That's intentional:
+  // hub's mint-token attenuation guard is the authoritative gate (it validates
+  // the bearer and rejects anything it couldn't have minted). This check just
+  // avoids forwarding a credential we already know can't be a hub JWT.
   if (!callerBearer || !looksLikeJwt(callerBearer)) {
     return {
       action: "mint",
@@ -793,11 +800,19 @@ async function revokeAction(
   }
 
   // Forward the revoke to hub's token registry (the authoritative revocation
-  // surface — vault is resource-server-only). The caller's bearer is forwarded
-  // as on mint. Hub's revoke-token is idempotent. If the round-trip fails we
-  // still flip the local ledger marker so list reflects the operator's intent,
-  // but we surface the hub failure so the caller knows the registry-side
-  // revoke may not have landed (the short TTL is the backstop either way).
+  // surface — vault is resource-server-only). The caller's `vault:<N>:admin`
+  // bearer is forwarded, same as on mint. As of hub#454 this is the
+  // expected-SUCCESS path: hub's revoke-token applies capability attenuation
+  // symmetric to mint, so a `vault:<N>:admin` bearer may revoke any jti whose
+  // scopes it could have minted (and these are exactly the tokens this session
+  // minted within that vault's authority). Hub's revoke-token is idempotent.
+  //
+  // The `"kind" in revoked` branch below is now the EXCEPTION, not the norm —
+  // it only fires on a genuine edge (network blip, or a hub-side rejection
+  // that shouldn't happen for an in-authority jti). When it does, we still
+  // flip the local ledger marker so list reflects the operator's intent, and
+  // surface the hub failure so the caller knows the registry-side revoke may
+  // not have landed (the short TTL is the backstop either way).
   if (callerBearer && looksLikeJwt(callerBearer)) {
     const hub = resolveHubOrigin();
     const revoked = await revokeHubJwt({
@@ -806,8 +821,9 @@ async function revokeAction(
       jti,
     });
     if ("kind" in revoked) {
-      // Local ledger still flips (operator asked to revoke), but report the
-      // hub-side failure so a network blip / scope gap is visible.
+      // Unexpected hub failure. Local ledger still flips (operator asked to
+      // revoke), but report the hub-side failure so a network blip / scope
+      // gap is visible.
       markMcpMintLedgerRevoked(store.db, jti, auth.caller_jti, vaultName);
       if (revoked.kind === "network") {
         return {

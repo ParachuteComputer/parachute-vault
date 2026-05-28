@@ -4679,6 +4679,133 @@ describe("manage-token MCP tool (vault#403, MGT — hub-JWT attenuation proxy)",
     expect(row.vault_name).toBe(vaultName);
     closeAllStores();
   });
+
+  // hub#454 made `vault:<N>:admin` sufficient to revoke an in-authority jti
+  // (capability attenuation, symmetric to mint), so the hub round-trip is now
+  // the expected-SUCCESS path. This asserts the success contract end-to-end:
+  // the caller's `vault:<N>:admin` bearer is forwarded, hub returns 200, and
+  // the local ledger row is flipped to revoked.
+  test("revoke success path: caller's vault:admin bearer revokes at hub + marks ledger (hub#454)", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("revoke-success");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const mint = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:admin" });
+    const jti = mint.parsed.jti;
+
+    const res = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti });
+    expect(res.parsed.ok).toBe(true);
+    expect(res.parsed.already_revoked).toBe(false);
+    expect(res.parsed.error).toBeUndefined();
+
+    // Hub revoke-token was called with the caller's vault:admin bearer + jti.
+    const revoke = hubCalls.find((c) => c.url.endsWith("/api/auth/revoke-token"));
+    expect(revoke).toBeDefined();
+    expect(revoke!.body.jti).toBe(jti);
+    expect(new Headers(revoke!.init?.headers).get("authorization")).toBe(`Bearer ${JWT_BEARER}`);
+
+    // Local ledger row is now marked revoked.
+    const store = getVaultStore(vaultName);
+    const row = store.db.prepare(
+      "SELECT revoked_at FROM mcp_mint_ledger WHERE jti = ?",
+    ).get(jti) as { revoked_at: string | null };
+    expect(row.revoked_at).not.toBeNull();
+    closeAllStores();
+  });
+
+  test("caller_jti: null session → list returns empty", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("null-list");
+    const { closeAllStores } = await import("./vault-store.ts");
+    // Env-var operator / legacy session: no stable session id.
+    auth.caller_jti = null;
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "list" });
+    expect(parsed.action).toBe("list");
+    expect(parsed.tokens).toEqual([]);
+    closeAllStores();
+  });
+
+  test("caller_jti: null session → revoke returns not_found, no hub call", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("null-revoke");
+    const { closeAllStores } = await import("./vault-store.ts");
+    auth.caller_jti = null;
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "revoke", jti: "hub_jti_anything" });
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toBe("not_found");
+    expect(hubCalls.filter((c) => c.url.endsWith("/api/auth/revoke-token")).length).toBe(0);
+    closeAllStores();
+  });
+
+  test("list isolation across vaults: vault-A session never sees a vault-B ledger row", async () => {
+    installHubStub();
+    const { vaultName, auth } = await setupAdminSession("list-vault-iso");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const { recordMcpMintLedger } = await import("./token-store.ts");
+
+    // Mint one in THIS (vault-A) session.
+    const m1 = await callTool(vaultName, auth, "manage-token", { action: "mint", scope: "vault:read" });
+
+    // Seed a ledger row attributed to the SAME parent_jti but a DIFFERENT
+    // vault — the list query scopes on (parent_jti, vault_name), so this
+    // foreign-vault row must not leak into vault-A's list.
+    const store = getVaultStore(vaultName);
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_vaultB",
+      parentJti: auth.caller_jti, // same session id, different vault
+      vaultName: `${vaultName}-OTHER`,
+      label: "vault-B mint",
+      scopes: [`vault:${vaultName}-OTHER:read`],
+      scopedTags: null,
+      expiresAt: null,
+    });
+
+    const { parsed } = await callTool(vaultName, auth, "manage-token", { action: "list" });
+    const jtis = parsed.tokens.map((t: any) => t.jti);
+    expect(jtis).toContain(m1.parsed.jti);
+    expect(jtis).not.toContain("hub_jti_vaultB");
+    expect(parsed.tokens.length).toBe(1);
+    closeAllStores();
+  });
+
+  // INSERT OR IGNORE (not OR REPLACE): a duplicate jti record (a hub jti
+  // collision — shouldn't happen) must NOT overwrite the existing row, because
+  // that would silently reset a previously-set revoked_at and resurrect a
+  // revoked token.
+  test("recordMcpMintLedger duplicate jti preserves the existing row's revoked_at", async () => {
+    const { vaultName, auth } = await setupAdminSession("ledger-dup");
+    const { closeAllStores, getVaultStore } = await import("./vault-store.ts");
+    const { recordMcpMintLedger, markMcpMintLedgerRevoked, findMcpMintLedgerEntry } =
+      await import("./token-store.ts");
+    const store = getVaultStore(vaultName);
+
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_dup",
+      parentJti: auth.caller_jti,
+      vaultName,
+      label: "first",
+      scopes: [`vault:${vaultName}:read`],
+      scopedTags: null,
+      expiresAt: null,
+    });
+    // Revoke it (sets revoked_at).
+    markMcpMintLedgerRevoked(store.db, "hub_jti_dup", auth.caller_jti, vaultName);
+    const before = findMcpMintLedgerEntry(store.db, "hub_jti_dup", auth.caller_jti, vaultName);
+    expect(before!.revoked_at).not.toBeNull();
+
+    // A second record with the same jti must be IGNORED — revoked_at survives.
+    recordMcpMintLedger(store.db, {
+      jti: "hub_jti_dup",
+      parentJti: auth.caller_jti,
+      vaultName,
+      label: "second (collision)",
+      scopes: [`vault:${vaultName}:read`],
+      scopedTags: null,
+      expiresAt: null,
+    });
+    const after = findMcpMintLedgerEntry(store.db, "hub_jti_dup", auth.caller_jti, vaultName);
+    expect(after!.revoked_at).toBe(before!.revoked_at); // unchanged, not reset to NULL
+    closeAllStores();
+  });
 });
 
 describe("extractApiKey", () => {

@@ -431,9 +431,13 @@ export function softRevokeMcpToken(
 /**
  * Record a hub-minted JWT in the session-pinned ledger. `jti` is hub's
  * returned jti; `parentJti` is the minting MCP session (the caller's
- * `caller_jti`). Idempotent on `jti` via INSERT OR REPLACE — a hub jti is
- * unique, so a duplicate record (shouldn't happen) overwrites rather than
- * erroring.
+ * `caller_jti`).
+ *
+ * Uses INSERT OR IGNORE, NOT OR REPLACE: hub guarantees jti uniqueness, so a
+ * pre-existing row with this jti shouldn't happen. If it does, it's a real bug
+ * (a hub jti collision) — we log a warning and KEEP the existing row rather
+ * than overwriting it, because OR REPLACE would silently reset a previously-set
+ * `revoked_at` and resurrect a revoked token in the list/revoke surface.
  */
 export function recordMcpMintLedger(
   db: Database,
@@ -448,8 +452,8 @@ export function recordMcpMintLedger(
   },
 ): void {
   const scopedTags = entry.scopedTags && entry.scopedTags.length > 0 ? entry.scopedTags : null;
-  db.prepare(`
-    INSERT OR REPLACE INTO mcp_mint_ledger
+  const result = db.prepare(`
+    INSERT OR IGNORE INTO mcp_mint_ledger
       (jti, parent_jti, vault_name, label, scopes, scoped_tags, created_at, expires_at, revoked_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
   `).run(
@@ -462,6 +466,14 @@ export function recordMcpMintLedger(
     new Date().toISOString(),
     entry.expiresAt,
   );
+  if (result.changes === 0) {
+    // Row already existed — IGNORE swallowed the conflict. Surface it: a hub
+    // jti collision is a real bug worth investigating (the existing row is
+    // left untouched, including any `revoked_at`).
+    console.warn(
+      `[manage-token] mcp_mint_ledger already has a row for jti '${entry.jti}' — skipped insert (kept existing row). A hub jti collision shouldn't happen; investigate.`,
+    );
+  }
 }
 
 /**

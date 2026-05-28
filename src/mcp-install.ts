@@ -367,7 +367,13 @@ export type RevokeHubJwtError =
 
 export interface RevokeHubJwtOpts {
   hubOrigin: string;
-  /** RAW caller bearer (a hub JWT carrying `parachute:host:auth`). */
+  /**
+   * RAW caller bearer. As of hub#454, a `vault:<N>:admin` hub JWT is
+   * sufficient to revoke any jti whose scopes it could have minted (same-vault
+   * capability attenuation, symmetric to mint) — so the manage-token proxy
+   * forwards the caller's own `vault:<N>:admin` bearer here. A
+   * `parachute:host:auth` operator bearer also works (it can revoke anything).
+   */
   operatorToken: string;
   /** The hub jti to revoke. */
   jti: string;
@@ -381,12 +387,17 @@ export interface RevokedHubJwt {
 }
 
 /**
- * POST to `<hub>/api/auth/revoke-token` with `{ jti }`. The bearer must carry
- * `parachute:host:auth` (the manage-token caller's `vault:<name>:admin` does
- * NOT cover this — see the proxy's revokeAction for how it surfaces a
- * partial-success ledger soft-revoke when hub's registry revoke is gated).
- * Idempotent on hub's side. Network failures are caught and returned, not
- * thrown.
+ * POST to `<hub>/api/auth/revoke-token` with `{ jti }`.
+ *
+ * As of hub#454, hub's revoke-token applies capability attenuation symmetric
+ * to mint: a `vault:<N>:admin` bearer may revoke any jti whose scopes it could
+ * have minted (same-vault subsets), and `parachute:host:auth` may revoke
+ * anything. So the manage-token proxy's caller `vault:<N>:admin` bearer is the
+ * expected-success path for revoking tokens it minted within that vault's
+ * authority — `parachute:host:auth` is no longer required.
+ *
+ * Idempotent on hub's side (re-revoking an already-revoked jti returns 200).
+ * Network failures are caught and returned, not thrown.
  */
 export async function revokeHubJwt(opts: RevokeHubJwtOpts): Promise<RevokedHubJwt | RevokeHubJwtError> {
   const url = `${opts.hubOrigin.replace(/\/$/, "")}/api/auth/revoke-token`;
