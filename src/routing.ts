@@ -83,6 +83,7 @@ import {
   handleAuthPat,
   handleMirrorGet,
   handleMirrorImport,
+  handleMirrorPushNow,
   handleMirrorPut,
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
@@ -554,6 +555,38 @@ export async function route(
       );
     }
     if (req.method === "POST") return handleMirrorRunNow(manager);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/push-now — fire `git push` against committed state.
+  // Cut 6 of vault#392. Same admin gate + manager check as run-now;
+  // POST-only. Distinguished from /run-now in that this skips export +
+  // commit, only pushes — for "did my credentials actually work?" flow.
+  if (subpath === "/.parachute/mirror/push-now") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager();
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method === "POST") return handleMirrorPushNow(manager);
     return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 

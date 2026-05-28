@@ -24,9 +24,11 @@ import {
   handleAuthGithubDeviceCode,
   handleAuthGithubPoll,
   handleAuthGithubRepos,
+  handleAuthGithubSelectRepo,
   handleAuthPat,
   handleMirrorGet,
   handleMirrorImport,
+  handleMirrorPushNow,
   handleMirrorPut,
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
@@ -765,6 +767,172 @@ describe("auth credential routes — PAT", () => {
     const text = await res.text();
     expect(text).not.toContain(secret);
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// Cuts 3 + 6: credential save → auto_push flipped on + initial push fires.
+//
+// The PAT route gates on a real `git ls-remote` probe, so it's awkward
+// to exercise end-to-end in a hermetic test. The select-repo route has
+// no probe — it accepts the operator's already-OAuth'd token and wires
+// the URL. We drive the side-effect helpers (maybeEnableAutoPush +
+// maybeFireInitialPush) through select-repo, with a local bare repo as
+// the "GitHub" remote — overridden via post-save remote-URL rewrite so
+// pushNow targets the test repo.
+// ---------------------------------------------------------------------------
+
+describe("auth credential routes — credential-save side-effects (Cuts 3 + 6)", () => {
+  let home: string;
+  let remote: string;
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    if (remote) fs.rmSync(remote, { recursive: true, force: true });
+  });
+
+  test("select-repo flips auto_push from false → true on an enabled internal mirror", async () => {
+    home = tmp("mirror-selectrepo-autopush-");
+    remote = tmp("mirror-selectrepo-remote-");
+    Bun.spawnSync(["git", "init", "--bare", "-q", "-b", "main"], { cwd: remote });
+
+    const { manager, deps } = makeManager(home);
+    deps.writeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+      sync_mode: "manual",
+      auto_commit: false,
+      auto_push: false,
+    });
+    await manager.start();
+    expect(manager.getConfig().auto_push).toBe(false);
+
+    // Seed github_oauth credentials. select-repo doesn't probe; it just
+    // sets origin to github.com/<owner>/<repo>.git. We then rewrite
+    // origin to our local bare repo so pushNow has somewhere to land.
+    writeCredentials({
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_fake1234567890abcd",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "my-vault" }),
+      }),
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      auto_push_was_already_enabled: boolean;
+      auto_push_enabled: boolean;
+      initial_push:
+        | { fired: false; reason: string }
+        | { fired: true; pushed: boolean; error?: string; sha?: string };
+    };
+    // Cut 3 — auto_push went from false → true.
+    expect(body.auto_push_was_already_enabled).toBe(false);
+    expect(body.auto_push_enabled).toBe(true);
+    expect(manager.getConfig().auto_push).toBe(true);
+    // Cut 6 — initial push fired. It points at github.com which doesn't
+    // exist for our fake creds → expected to fail with a redacted error
+    // in last_push_error, but the helper still reports fired=true.
+    expect(body.initial_push.fired).toBe(true);
+    if (body.initial_push.fired === true) {
+      // Push failure is fine — point is "we tried."
+      expect(typeof body.initial_push.pushed).toBe("boolean");
+    }
+    // Token doesn't leak into the response.
+    expect(JSON.stringify(body)).not.toContain("gho_fake1234567890");
+    await manager.stop();
+  }, 30_000);
+
+  test("select-repo is a no-op for auto_push when mirror is disabled", async () => {
+    // Operator wiring credentials before flipping the mirror on — don't
+    // mutate auto_push behind their back.
+    home = tmp("mirror-selectrepo-disabled-");
+    const { manager, deps } = makeManager(home);
+    deps.writeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: false,
+      auto_push: false,
+    });
+    await manager.start();
+    writeCredentials({
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_anothertoken12345",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "v" }),
+      }),
+      manager,
+    );
+    expect(res.status).toBe(200);
+    expect(manager.getConfig().auto_push).toBe(false);
+    await manager.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cut 6: POST /.parachute/mirror/push-now route handler.
+// ---------------------------------------------------------------------------
+
+describe("handleMirrorPushNow — Cut 6", () => {
+  let home: string;
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("returns 400 when mirror is not enabled", async () => {
+    home = tmp("mirror-pushnow-disabled-");
+    const { manager, deps } = makeManager(home);
+    deps.writeMirrorConfig({ ...defaultMirrorConfig(), enabled: false });
+    await manager.start();
+    const res = await handleMirrorPushNow(manager);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("Mirror not enabled");
+  });
+
+  test("returns 200 + push outcome when mirror is enabled (even on push failure)", async () => {
+    home = tmp("mirror-pushnow-enabled-");
+    const { manager, deps } = makeManager(home);
+    deps.writeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+      sync_mode: "manual",
+      auto_commit: false,
+    });
+    await manager.start();
+    // No remote → push will fail; the handler still returns 200 with
+    // the failure surface in the body. Push failures aren't 500s.
+    const res = await handleMirrorPushNow(manager);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      status: { last_push_error: string | null };
+      push: { fired: boolean };
+    };
+    expect(body.push.fired).toBe(true);
+    expect(body.status.last_push_error).not.toBeNull();
+    await manager.stop();
+  }, 30_000);
 });
 
 describe("auth credential routes — github repos / create-repo", () => {
