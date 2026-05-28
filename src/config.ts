@@ -34,8 +34,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSy
 import crypto from "node:crypto";
 
 import {
+  // vault#400: only the PARSE side is used here now — to detect a legacy
+  // server-wide `mirror:` block so the boot migration can relocate it to the
+  // owning vault's per-vault file. `writeGlobalConfig` no longer serializes a
+  // mirror block (per-vault writes live in `mirror-config.ts`).
   parseMirrorConfig as parseMirrorSectionFromYaml,
-  serializeMirrorConfig as serializeMirrorSection,
   type MirrorConfig as MirrorConfigType,
 } from "./mirror-config.ts";
 
@@ -1330,9 +1333,14 @@ export function writeGlobalConfig(config: GlobalConfig): void {
     lines.push(...serializeBackup(config.backup));
   }
 
-  if (config.mirror) {
-    lines.push(...serializeMirrorSection(config.mirror));
-  }
+  // vault#400: mirror config is now PER-VAULT (`data/<vault>/mirror-config.yaml`),
+  // not a server-wide block here. `writeGlobalConfig` deliberately does NOT
+  // re-emit a `mirror:` block — doing so would resurrect the legacy
+  // server-wide config the boot migration just commented out, re-introducing
+  // the "same remote on every vault page" bug. `readGlobalConfig` still parses
+  // a legacy block (below) so the one-time migration can detect + relocate it.
+  // `serializeMirrorSection` remains used by the per-vault writer in
+  // `mirror-config.ts`.
 
   if (config.auto_transcribe) {
     lines.push("auto_transcribe:");

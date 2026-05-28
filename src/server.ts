@@ -31,9 +31,19 @@ import { getCachedScribeUrl } from "./scribe-discovery.ts";
 import { readEnvFile, setEnvVar } from "./config.ts";
 import { resolveBindHostname } from "./bind.ts";
 import { MirrorManager } from "./mirror-manager.ts";
-import { setMirrorManager } from "./mirror-registry.ts";
+import {
+  setMirrorManager,
+  setMirrorManagerFactory,
+  listMirrorManagers,
+} from "./mirror-registry.ts";
 import { buildMirrorDeps, resolveMirrorVaultName } from "./mirror-deps.ts";
 import { migrateLegacyServerWideCredentials } from "./mirror-credentials.ts";
+import {
+  commentOutLegacyMirrorBlockFile,
+  migrateLegacyServerWideConfig,
+  readMirrorConfigForVault,
+} from "./mirror-config.ts";
+import { GLOBAL_CONFIG_PATH } from "./config.ts";
 import { selfRegister } from "./self-register.ts";
 import pkg from "../package.json" with { type: "json" };
 
@@ -232,33 +242,35 @@ const port = parseInt(process.env.PORT ?? "") || globalConfig.port || DEFAULT_PO
 const hostname = resolveBindHostname();
 
 // ---------------------------------------------------------------------------
-// Mirror lifecycle (vault-sync Phase A1).
+// Mirror lifecycle — per-vault (vault#400).
 //
-// Boot-time bootstrap of the persistent mirror manager. Only stands up an
-// active mirror when global config carries `mirror.enabled: true`; otherwise
-// the manager construct + status reflects "disabled" but no filesystem work
-// happens. The HTTP `/admin/mirror` routes can still flip it on at runtime
-// without a vault restart — see routing.ts + mirror-routes.ts.
+// Before vault#400 the server stood up a SINGLE mirror manager bound to the
+// mirror-owning vault (default/first), and every mirror route resolved to it
+// — so every vault's mirror page showed the default vault's config + git
+// remote. Now each vault gets its OWN config (`data/<vault>/mirror-config.yaml`)
+// + its OWN manager. Boot:
 //
-// Failure here is logged and ignored; vault keeps serving. The operator
-// sees the error via `GET /admin/mirror` + the log line.
+//   1. Migrate the legacy SERVER-WIDE credentials file (vault#399) + the
+//      legacy server-wide `mirror:` config block (vault#400) to the
+//      mirror-owning vault (default/first). Other vaults start unconfigured.
+//   2. Install the lazy-build factory so routes can stand up a manager for
+//      any vault on first request (handles a vault configured at runtime
+//      without a restart).
+//   3. Iterate ALL vaults; for each whose per-vault config has
+//      `enabled: true`, build + register + start its manager. Per-vault
+//      failure is logged + isolated — one vault's mirror error never breaks
+//      another vault's mirror or the vault server's serving path.
 // ---------------------------------------------------------------------------
-let mirrorManager: MirrorManager | null = null;
 {
-  // Canonicalized in `mirror-deps.ts:resolveMirrorVaultName` so the
-  // binding rule (default_vault → first listed vault → null) lives in
-  // exactly one place; multi-vault-mirror work (design-doc open
-  // question 2) only has to touch one site.
+  // Canonicalized in `mirror-deps.ts:resolveMirrorVaultName` — the binding
+  // rule (default_vault → first listed vault → null) lives in exactly one
+  // place. Post-vault#400 it's only used for migration attribution.
   const mirrorVaultName = resolveMirrorVaultName(listVaults);
-  // vault#399: migrate the legacy SERVER-WIDE credentials file
-  // (`<configDir>/vault/.mirror-credentials.yaml`) to the per-vault layout.
-  // Attribute to the mirror-owning vault (default_vault → first listed) —
-  // the same vault the single server-wide mirror was bound to, so the
-  // legacy remote/PAT lands on the vault it actually corresponds to. Other
-  // vaults start with no mirror credentials (configure each separately).
-  // Idempotent + safe: no-op when no legacy file / already migrated, and the
-  // legacy file is renamed `.bak` rather than deleted. Runs even when no
-  // vault exists yet (no-op) so we don't gate the migration on enabled state.
+
+  // vault#399: migrate the legacy SERVER-WIDE credentials file to the
+  // per-vault layout, attributed to the mirror-owning vault. Idempotent +
+  // safe (no-op when no legacy file / already migrated; legacy file renamed
+  // `.bak`, never deleted). Runs even with no vaults (no-op).
   try {
     migrateLegacyServerWideCredentials(mirrorVaultName);
   } catch (err) {
@@ -266,29 +278,60 @@ let mirrorManager: MirrorManager | null = null;
       `[mirror] legacy credential migration failed (non-fatal): ${(err as Error).message ?? err}`,
     );
   }
-  if (mirrorVaultName) {
+
+  // vault#400: migrate the legacy server-wide `mirror:` CONFIG block from
+  // config.yaml to the mirror-owning vault's per-vault config file. The
+  // legacy block is commented out in place (preserved for reference), never
+  // silently dropped. Idempotent: no-op when no block / target already
+  // configured. (#399 already moved credentials — we do NOT re-migrate them.)
+  try {
+    migrateLegacyServerWideConfig(
+      readGlobalConfig().mirror,
+      mirrorVaultName,
+      () => commentOutLegacyMirrorBlockFile(GLOBAL_CONFIG_PATH),
+    );
+  } catch (err) {
+    console.warn(
+      `[mirror] legacy config migration failed (non-fatal): ${(err as Error).message ?? err}`,
+    );
+  }
+
+  // Install the lazy-build factory so routes can stand up a per-vault manager
+  // on demand (a vault configured at runtime works without a restart).
+  setMirrorManagerFactory((name) => new MirrorManager(buildMirrorDeps(name)));
+
+  // Stand up every vault whose per-vault config is enabled. Don't block
+  // server startup on slow initial exports — kick each off in the background.
+  const vaults = listVaults();
+  if (vaults.length === 0) {
+    console.log("[mirror] no vaults yet — managers stand up on next restart after a vault exists");
+  }
+  for (const name of vaults) {
+    let cfg;
     try {
-      mirrorManager = new MirrorManager(buildMirrorDeps(mirrorVaultName));
-      setMirrorManager(mirrorManager);
-      // Don't block server startup on a slow initial export — kick it off
-      // in the background, log the outcome. The HTTP server comes up
-      // immediately so OAuth + REST aren't blocked behind a multi-second
-      // export pass.
-      void mirrorManager
+      cfg = readMirrorConfigForVault(name);
+    } catch (err) {
+      console.warn(`[mirror] could not read config for vault "${name}" (skipping): ${(err as Error).message ?? err}`);
+      continue;
+    }
+    if (!cfg?.enabled) continue; // unconfigured / disabled → no manager work
+    try {
+      const mgr = new MirrorManager(buildMirrorDeps(name));
+      setMirrorManager(name, mgr);
+      void mgr
         .start()
         .then((status) => {
           if (!status.enabled && status.last_error) {
-            console.warn(`[mirror] startup error: ${status.last_error}`);
+            console.warn(`[mirror] vault "${name}" startup error: ${status.last_error}`);
           }
         })
         .catch((err) => {
-          console.warn(`[mirror] startup threw: ${(err as Error).message ?? err}`);
+          console.warn(`[mirror] vault "${name}" startup threw: ${(err as Error).message ?? err}`);
         });
     } catch (err) {
-      console.warn(`[mirror] manager construction failed: ${(err as Error).message ?? err}`);
+      // Isolated per-vault: one vault's failure never touches others.
+      console.warn(`[mirror] vault "${name}" manager construction failed: ${(err as Error).message ?? err}`);
     }
-  } else {
-    console.log("[mirror] no vaults yet — manager will be initialized on next restart after a vault exists");
   }
 }
 
@@ -334,10 +377,11 @@ console.log(`Parachute Vault server listening on http://${hostname}:${server.por
 // Graceful shutdown — best-effort drain of in-flight note-mutation hooks.
 //
 // Order matters under the event-driven mirror shape (vault#382):
-//   1. MirrorManager.stop() runs FIRST so it can unsubscribe from hooks
-//      cleanly + cancel its debounce timer. Otherwise the registry drain
-//      below would wait on the manager's hook handler that just queued
-//      itself after a final mutation.
+//   1. Every MirrorManager.stop() runs FIRST (vault#400: drain ALL per-vault
+//      managers, not just one) so they unsubscribe from hooks cleanly +
+//      cancel their debounce timers. Otherwise the registry drain below
+//      would wait on a manager's hook handler that just queued itself after
+//      a final mutation.
 //   2. Then drain hooks + stop the transcription worker in parallel —
 //      neither depends on the other.
 //
@@ -348,9 +392,16 @@ async function shutdown(signal: string): Promise<void> {
   try {
     await Promise.race([
       (async () => {
-        // Mirror stop first — unsubscribes + cancels its debounce. Its
-        // internal soft-settle timeout (250ms) bounds the wait.
-        await (mirrorManager?.stop() ?? Promise.resolve());
+        // Mirror stop first — unsubscribes + cancels each debounce. Each
+        // manager's internal soft-settle timeout (250ms) bounds the wait;
+        // drain them in parallel so total shutdown stays bounded.
+        await Promise.all(
+          listMirrorManagers().map((m) =>
+            m.stop().catch((err) =>
+              console.warn(`[mirror] stop threw during shutdown (non-fatal): ${(err as Error).message ?? err}`),
+            ),
+          ),
+        );
         // Then drain hooks + stop the transcription worker in parallel.
         await Promise.all([
           defaultHookRegistry.drain(),

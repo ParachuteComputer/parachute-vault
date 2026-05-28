@@ -10,8 +10,13 @@
 import { exportVaultToDir, hasSchemaContent, pruneOrphans } from "../core/src/portable-md.ts";
 
 import { defaultHookRegistry } from "../core/src/hooks.ts";
-import { readGlobalConfig, writeGlobalConfig, readVaultConfig } from "./config.ts";
-import { defaultMirrorConfig, type MirrorConfig } from "./mirror-config.ts";
+import { readGlobalConfig, readVaultConfig } from "./config.ts";
+import {
+  defaultMirrorConfig,
+  readMirrorConfigForVault,
+  writeMirrorConfigForVault,
+  type MirrorConfig,
+} from "./mirror-config.ts";
 import type { MirrorDeps } from "./mirror-manager.ts";
 import { assetsDir } from "./routes.ts";
 import { getVaultStore } from "./vault-store.ts";
@@ -24,9 +29,9 @@ import { getVaultStore } from "./vault-store.ts";
  *     CLI mode exactly.
  *   - `firstChangedNoteTitle` → DB query for the most recent note with
  *     `updated_at >= cursor`. Identical to the CLI helper.
- *   - `readMirrorConfig` / `writeMirrorConfig` → round-trip through
- *     `readGlobalConfig` + `writeGlobalConfig`, preserving the rest of
- *     the global config file atomically.
+ *   - `readMirrorConfig` / `writeMirrorConfig` → per-vault config file at
+ *     `data/<vault>/mirror-config.yaml` (vault#400). Each vault carries its
+ *     own mirror config, so configuring vault B never touches vault A's.
  */
 export function buildMirrorDeps(vaultName: string): MirrorDeps {
   return {
@@ -92,11 +97,12 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
         return "";
       }
     },
-    readMirrorConfig: () => readGlobalConfig().mirror,
+    // Per-vault (vault#400): read/write THIS vault's own config file, never
+    // a shared server-wide block. Configuring vault B's mirror leaves vault
+    // A's config untouched.
+    readMirrorConfig: () => readMirrorConfigForVault(vaultName),
     writeMirrorConfig: (config: MirrorConfig) => {
-      const global = readGlobalConfig();
-      global.mirror = config;
-      writeGlobalConfig(global);
+      writeMirrorConfigForVault(vaultName, config);
     },
     // Share the process-wide hook registry so mirror's subscriptions land
     // on the same event bus that `BunSqliteStore` dispatches on. This is
@@ -107,14 +113,17 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
 }
 
 /**
- * Resolve the mirror's owning vault. Today the mirror is per-server
- * (single config block in `config.yaml`), and the natural binding is
- * `default_vault` (the same vault the CLI + MCP wire up by default).
- * If no default is set, fall back to the first listed vault.
+ * Resolve the mirror's "owning" vault — the one the LEGACY server-wide
+ * config + credentials are attributed to during migration.
  *
- * Multi-vault mirror routing is future work (open question 2 in the
- * design doc); this helper localizes the binding decision so a future
- * refactor only touches one site.
+ * Post-vault#400 every vault has its own mirror config + manager (real
+ * multi-vault mirroring), so this is no longer "the one vault that can
+ * mirror." It survives as the migration-attribution target: the legacy
+ * server-wide `mirror:` block (vault#400) and the legacy server-wide
+ * credentials file (vault#399) belong to the vault the single old mirror
+ * was bound to — `default_vault`, or the first listed vault when no default
+ * is set. Localizing the binding here keeps the migration attribution in one
+ * place.
  */
 export function resolveMirrorVaultName(
   listVaults: () => string[],

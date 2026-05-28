@@ -4,11 +4,24 @@
  * Builds on the manual export primitives from vault#346 (`parachute-vault
  * export --watch --git-commit`). This module owns the *persistent* form:
  *
- *   - Schema for the `mirror:` block in `~/.parachute/vault/config.yaml`.
- *   - Parse + serialize that block alongside the existing global config.
+ *   - Schema for the per-vault mirror config block.
+ *   - Parse + serialize that block.
+ *   - Per-vault read/write of the config to `data/<vault>/mirror-config.yaml`
+ *     (vault#400 — see below).
  *   - Resolve the on-disk mirror path (internal vs external).
  *   - Validate the operator-supplied shape (location enum, external_path
  *     existence + git-repo-ness).
+ *
+ * **Per-vault config (vault#400).** Before vault#400, mirror config lived in a
+ * SINGLE server-wide `mirror:` block in `~/.parachute/vault/config.yaml`.
+ * That made every vault's mirror page show the same config + the same git
+ * remote, and configuring vault B clobbered vault A. vault#399 had already
+ * moved credential STORAGE per-vault; vault#400 completes the job by moving
+ * the CONFIG block to `data/<vault>/mirror-config.yaml` — alongside the
+ * per-vault credentials file + the SQLite DB. The legacy server-wide
+ * `mirror:` block is migrated to its owning vault on boot (default/first
+ * vault, matching how the single server-wide mirror was bound); other
+ * vaults start with no mirror config. See `migrateLegacyServerWideConfig`.
  *
  * The lifecycle wiring (boot-time bootstrap, watch loop start/stop/reload)
  * lives in `./mirror-manager.ts`; the HTTP surface lives in
@@ -19,8 +32,16 @@
  * `parachute.computer/design/2026-05-20-vault-as-git-projection.md`.
  */
 
-import { existsSync, statSync } from "fs";
-import { join } from "path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "fs";
+import { dirname, join } from "path";
+import { homedir } from "os";
 
 import { DEFAULT_COMMIT_TEMPLATE, isGitRepo } from "./export-watch.ts";
 import { readCredentials, type MirrorCredentials } from "./mirror-credentials.ts";
@@ -65,9 +86,9 @@ export const MIN_SAFETY_NET_SECONDS = 60;
 export const MAX_SAFETY_NET_SECONDS = 86400;
 
 /**
- * The persistent mirror configuration block. Lives under the `mirror:` key
- * in the global config.yaml (one mirror per vault server today — multi-vault
- * mirroring is a future ripple, see open question 2 in the design doc).
+ * The persistent mirror configuration block. Per-vault since vault#400: each
+ * vault stores its own block in `data/<vault>/mirror-config.yaml` (real
+ * multi-vault mirroring — every vault can mirror to its own git remote).
  *
  * Field semantics:
  *   - `enabled` — master switch. When false (the default for upgrading
@@ -310,6 +331,225 @@ export function serializeMirrorConfig(config: MirrorConfig): string[] {
   lines.push(`  commit_template: "${config.commit_template.replace(/"/g, '\\"')}"`);
   lines.push(`  safety_net_seconds: ${config.safety_net_seconds}`);
   return lines;
+}
+
+// ---------------------------------------------------------------------------
+// Per-vault config storage (vault#400)
+//
+// Each vault's mirror config lives in `data/<vault>/mirror-config.yaml`,
+// alongside its SQLite DB (`vault.db`), config (`vault.yaml`), and per-vault
+// credentials file (`.mirror-credentials.yaml`, vault#399). The file holds
+// the same `mirror:`-prefixed block `serializeMirrorConfig` already emits, so
+// `parseMirrorConfig`/`serializeMirrorConfig` are reused verbatim.
+//
+// Why a separate file from credentials (not folded in): config is
+// non-secret + hand-editable; credentials are 0o600 + token-bearing. Keeping
+// them separate avoids accidentally widening the credentials file's perms,
+// and keeps the credentials migration (vault#399) and config migration
+// (vault#400) cleanly independent.
+//
+// Path resolution mirrors `mirror-credentials.ts` rather than importing
+// `config.ts:vaultDir()` — config.ts imports this module, so importing it
+// back would close a cycle. We re-derive from `PARACHUTE_HOME` (the canonical
+// override the rest of vault honors) instead.
+// ---------------------------------------------------------------------------
+
+/** The vault home root — `<configDir>/vault`. Re-reads PARACHUTE_HOME per call. */
+function vaultHomeRoot(): string {
+  const root = process.env.PARACHUTE_HOME ?? join(homedir(), ".parachute");
+  return join(root, "vault");
+}
+
+/**
+ * Path to a vault's per-vault mirror-config file (vault#400):
+ * `<configDir>/vault/data/<vaultName>/mirror-config.yaml`.
+ */
+export function mirrorConfigPath(vaultName: string): string {
+  return join(vaultHomeRoot(), "data", vaultName, "mirror-config.yaml");
+}
+
+/**
+ * Read a vault's mirror config from its per-vault file. Returns `undefined`
+ * when the file is absent (operator has never configured this vault's
+ * mirror) — distinct from "configured with enabled:false" so callers can
+ * tell "never touched" apart from "explicitly disabled" (same distinction
+ * `parseMirrorConfig` preserves). Callers that just want a usable config
+ * coalesce with `defaultMirrorConfig()`.
+ */
+export function readMirrorConfigForVault(vaultName: string): MirrorConfig | undefined {
+  const path = mirrorConfigPath(vaultName);
+  if (!existsSync(path)) return undefined;
+  try {
+    const raw = readFileSync(path, "utf8");
+    return parseMirrorConfig(raw);
+  } catch {
+    // Unreadable / malformed → treat as "no config" rather than crashing
+    // the boot path or a route. The operator can re-PUT to repair it.
+    return undefined;
+  }
+}
+
+/**
+ * Persist a vault's mirror config to its per-vault file, atomically
+ * (write-temp → rename). Creates the vault data dir if missing (fresh
+ * installs / tests). The file is NOT secret (no tokens — those live in
+ * `.mirror-credentials.yaml`), so default perms are fine.
+ */
+export function writeMirrorConfigForVault(
+  vaultName: string,
+  config: MirrorConfig,
+): void {
+  const path = mirrorConfigPath(vaultName);
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const body = serializeMirrorConfig(config).join("\n") + "\n";
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, body);
+  renameSync(tmp, path);
+}
+
+// ---------------------------------------------------------------------------
+// Migration — legacy server-wide `mirror:` config → per-vault (vault#400)
+// ---------------------------------------------------------------------------
+
+/**
+ * One-time migration of the legacy server-wide `mirror:` config block to the
+ * per-vault layout (vault#400). Symmetric counterpart to vault#399's
+ * `migrateLegacyServerWideCredentials`.
+ *
+ * The bug: pre-vault#400, mirror config lived in a single `mirror:` block in
+ * `<configDir>/vault/config.yaml`, shared across ALL vaults. Every vault's
+ * mirror page rendered that one config (+ the owning vault's git remote);
+ * configuring vault B clobbered vault A.
+ *
+ * Attribution: attribute the legacy block to the mirror-owning vault
+ * (`resolveMirrorVaultName` = default_vault → first listed) — the same vault
+ * the single server-wide mirror was actually bound to. Other vaults start
+ * with no mirror config (they read `undefined` → default disabled).
+ *
+ * Safety:
+ *   - No-op when no legacy block exists (fresh installs, already-migrated).
+ *   - No-op when the target vault already has a per-vault config file (don't
+ *     clobber config the operator set post-migration).
+ *   - The legacy block is preserved (commented out in place) rather than
+ *     silently dropped, so nothing is lost if attribution was wrong.
+ *   - Logs the attribution decision clearly.
+ *
+ * This function is intentionally I/O-light on the config.yaml side: it takes
+ * the raw config.yaml text + a rewriter callback so it doesn't import
+ * `config.ts` (which imports this module). server.ts supplies the read/write.
+ *
+ * @param legacyConfig the `mirror:` block parsed from config.yaml, or
+ *   undefined when there is none. server.ts passes `readGlobalConfig().mirror`.
+ * @param targetVaultName the vault to attribute the legacy config to
+ *   (caller passes `resolveMirrorVaultName()`).
+ * @param commentOutLegacyBlock callback that rewrites config.yaml to comment
+ *   out the `mirror:` block (so it isn't re-migrated + the operator can see
+ *   the old values). Best-effort; failure is non-fatal.
+ * @returns a struct describing what happened, for logging + tests.
+ */
+export function migrateLegacyServerWideConfig(
+  legacyConfig: MirrorConfig | undefined,
+  targetVaultName: string | null,
+  commentOutLegacyBlock: () => void,
+):
+  | { migrated: false; reason: "no_legacy_block" | "no_target_vault" | "target_already_configured" }
+  | { migrated: true; targetVaultName: string } {
+  if (!legacyConfig) {
+    return { migrated: false, reason: "no_legacy_block" };
+  }
+  if (!targetVaultName) {
+    // Legacy block present but no vault to attribute it to. Leave it in
+    // place — a future boot (once a vault exists) migrates it.
+    return { migrated: false, reason: "no_target_vault" };
+  }
+  const targetPath = mirrorConfigPath(targetVaultName);
+  if (existsSync(targetPath)) {
+    // Target vault already has per-vault config. Don't clobber. Still
+    // comment out the legacy block so we don't re-evaluate it every boot.
+    try {
+      commentOutLegacyBlock();
+    } catch {
+      // Non-fatal — worst case we re-check next boot and short-circuit here.
+    }
+    return { migrated: false, reason: "target_already_configured" };
+  }
+
+  writeMirrorConfigForVault(targetVaultName, legacyConfig);
+  try {
+    commentOutLegacyBlock();
+  } catch {
+    // Non-fatal — the config is now in the per-vault file; the legacy block
+    // staying live would just re-migrate to the same place idempotently
+    // (the target_already_configured branch short-circuits next boot).
+  }
+
+  console.log(
+    `[mirror] migrated legacy server-wide mirror config → vault "${targetVaultName}" ` +
+      `(per-vault, vault#400). Other vaults start with no mirror config (configure each ` +
+      `separately). Legacy config.yaml \`mirror:\` block commented out (preserved for reference).`,
+  );
+  return { migrated: true, targetVaultName };
+}
+
+/**
+ * Pure string transform: comment out the server-wide `mirror:` block in a
+ * config.yaml string (vault#400 migration). Prefixes each line of the block
+ * with `# ` so the operator can still see the migrated values + nothing is
+ * silently dropped, and a subsequent boot's `parseMirrorConfig` no longer
+ * sees a LIVE block (so no re-migration — `parseMirrorConfig`'s anchor regex
+ * `^mirror:\s*$` doesn't match `# mirror:`).
+ *
+ * Block boundaries match the parser's stop rule exactly: the block starts at
+ * a 0-indent `mirror:` line and runs until the next 0-indent non-blank line
+ * (the next top-level key). Other top-level keys (port, default_vault, …) are
+ * left byte-for-byte intact; blank lines are preserved verbatim (not
+ * commented). Idempotent: an already-commented config has no live `mirror:`
+ * line, so it passes through unchanged.
+ *
+ * Extracted from server.ts (vault#408 review N3) so the YAML rewriting — which
+ * runs against the operator's real config.yaml — is directly unit-tested.
+ */
+export function commentOutMirrorBlock(yaml: string): string {
+  const lines = yaml.split("\n");
+  const out: string[] = [];
+  let inBlock = false;
+  for (const line of lines) {
+    if (!inBlock && /^mirror:\s*$/.test(line)) {
+      inBlock = true;
+      out.push(`# [vault#400] migrated to per-vault data/<vault>/mirror-config.yaml`);
+      out.push(`# ${line}`);
+      continue;
+    }
+    if (inBlock) {
+      // The block runs until the next top-level (0-indent, non-blank) key.
+      if (/^\S/.test(line) && line.trim().length > 0) {
+        inBlock = false;
+        out.push(line);
+      } else if (line.trim().length === 0) {
+        // Preserve blank lines verbatim (don't comment them).
+        out.push(line);
+      } else {
+        out.push(`# ${line}`);
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/**
+ * File-I/O wrapper around `commentOutMirrorBlock`: read config.yaml at
+ * `configPath`, comment out its `mirror:` block, write it back. No-op when
+ * the file is absent. server.ts passes this (bound to GLOBAL_CONFIG_PATH) as
+ * the migration's `commentOutLegacyBlock` callback. Best-effort — callers
+ * treat a throw as non-fatal.
+ */
+export function commentOutLegacyMirrorBlockFile(configPath: string): void {
+  if (!existsSync(configPath)) return;
+  const yaml = readFileSync(configPath, "utf8");
+  writeFileSync(configPath, commentOutMirrorBlock(yaml));
 }
 
 // ---------------------------------------------------------------------------

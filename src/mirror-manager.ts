@@ -26,17 +26,16 @@
  *     debounce timer, cancel safety-net poll, let an in-flight export
  *     finish via the soft settle window.
  *
- * Singleton per-process: one `MirrorManager` instance backs the vault
- * server's lifecycle. Tests instantiate `MirrorManager` directly with
- * fake deps to exercise lifecycle transitions without spawning a full
- * vault server.
+ * One `MirrorManager` instance PER VAULT (vault#400). The per-vault
+ * registry (`mirror-registry.ts`) holds them keyed by vault name; boot
+ * stands up a manager for each vault whose config is enabled, and the
+ * routes resolve a manager by the URL's vault name. Tests instantiate
+ * `MirrorManager` directly with fake deps to exercise lifecycle
+ * transitions without spawning a full vault server.
  *
- * Phase A1 deliberately surfaces ONE mirror per vault server (matching
- * the design doc's single-mirror-per-vault model). Multi-vault server
- * deployments today already pin one vault per server via
- * `PARACHUTE_VAULT_NAME` / `default_vault`; the mirror config follows
- * suit. Multi-vault mirror routing is a future ripple (open question 2
- * in the design doc).
+ * Each manager is bound to its vault via `deps.vaultName` — its config
+ * read/write, credential reads, and resolved mirror path are all
+ * scoped to that one vault, so vault A's mirror never touches vault B's.
  *
  * ## Race-condition contract
  *
@@ -424,6 +423,30 @@ export class MirrorManager {
    * accidentally mutate the manager's internal state.
    */
   getConfig(): MirrorConfig {
+    return { ...this.currentConfig };
+  }
+
+  /**
+   * The config the operator + SPA should SEE for this vault — distinct from
+   * the live in-memory `getConfig()` only before the manager has started.
+   *
+   * Why this exists (vault#400): routes resolve a per-vault manager via the
+   * registry, which can LAZILY build a manager for a vault that has config
+   * on disk but no running instance yet (e.g. a non-default vault the
+   * operator configured, or a runtime-enabled vault between PUT and the
+   * reload's start). A freshly-constructed-but-never-started manager has
+   * `currentConfig === defaultMirrorConfig()` (disabled), which would make
+   * `GET /vault/<name>/.parachute/mirror` show "disabled" for a vault whose
+   * file says `enabled: true`. Reading the persisted config when we haven't
+   * started yet returns the truth for that vault. Once `start()` has run,
+   * `currentConfig` is authoritative (it reflects the same persisted config
+   * plus any bootstrap outcome).
+   */
+  getEffectiveConfig(): MirrorConfig {
+    if (this.startCount === 0) {
+      const persisted = this.deps.readMirrorConfig();
+      if (persisted) return { ...persisted };
+    }
     return { ...this.currentConfig };
   }
 

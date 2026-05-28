@@ -75,7 +75,11 @@ import { assetsDir } from "./routes.ts";
  * any persistence has happened yet.
  */
 export function handleMirrorGet(manager: MirrorManager): Response {
-  const config = manager.getConfig();
+  // Per-vault (vault#400): `getEffectiveConfig()` returns THIS vault's
+  // persisted config even when the lazily-built manager hasn't started yet,
+  // so a non-default vault's page shows ITS config — never the default
+  // vault's. That's the exact "same remote on every vault page" symptom.
+  const config = manager.getEffectiveConfig();
   const status = manager.getStatus();
   return Response.json(
     {
