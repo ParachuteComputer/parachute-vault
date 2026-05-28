@@ -491,11 +491,15 @@ describe("VaultMirror — admin scope", () => {
       push: { fired: true, pushed: true, sha: "feedface1234567890abc" },
     });
     renderRoute();
+    // The "Push now" button renders once `getMirror` resolves, but its
+    // ENABLED state depends on `getMirrorAuth` (active_method: "pat")
+    // resolving too. Wait for not-disabled rather than asserting it
+    // synchronously after only waiting for presence — the two async loads
+    // can settle a tick apart, which was a flaky failure here.
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /Push now/i })).toBeInTheDocument(),
+      expect(screen.getByRole("button", { name: /Push now/i })).not.toBeDisabled(),
     );
     const pushBtn = screen.getByRole("button", { name: /Push now/i });
-    expect(pushBtn).not.toBeDisabled();
     const user = userEvent.setup();
     await user.click(pushBtn);
     await waitFor(() => {
