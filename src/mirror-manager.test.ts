@@ -574,7 +574,7 @@ describe("MirrorManager.runNow", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Event-driven path (vault#XXX) — hook subscriptions, debounce, safety net
+// Event-driven path (vault#382) — hook subscriptions, debounce, safety net
 // ---------------------------------------------------------------------------
 
 describe("MirrorManager — event-driven (sync_mode: events)", () => {

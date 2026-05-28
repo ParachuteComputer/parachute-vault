@@ -2,7 +2,7 @@
  * Mirror lifecycle manager — boot-time bootstrap + event-driven exports.
  *
  * This is the persistent counterpart to vault#346's CLI watch+commit mode.
- * Post-event-driven shift (vault#XXX, this PR), the manager replaces the
+ * Post-event-driven shift (vault#382, this PR), the manager replaces the
  * original `setInterval` polling loop with in-process hook subscriptions.
  * Every note / tag / attachment mutation fires an event; the manager
  * debounces them (~500ms) into a single export pass. A background

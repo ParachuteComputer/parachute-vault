@@ -362,7 +362,7 @@ describe("HookRegistry — HOOK_CONCURRENCY env var parsing", async () => {
 
 // ---------------------------------------------------------------------------
 // New event types — deleted notes, tag mutations, deleted attachments
-// (vault#XXX — event-driven git-mirror foundation)
+// (vault#382 — event-driven git-mirror foundation)
 // ---------------------------------------------------------------------------
 
 describe("HookRegistry — deleted note events", () => {

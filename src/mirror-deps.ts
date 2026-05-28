@@ -7,7 +7,7 @@
  * vault-store + portable-md.
  */
 
-import { exportVaultToDir, pruneOrphans } from "../core/src/portable-md.ts";
+import { exportVaultToDir, hasSchemaContent, pruneOrphans } from "../core/src/portable-md.ts";
 
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { readGlobalConfig, writeGlobalConfig, readVaultConfig } from "./config.ts";
@@ -49,13 +49,16 @@ export function buildMirrorDeps(vaultName: string): MirrorDeps {
       // walk per dimension; cheap on typical vaults.
       const allNotes = await store.queryNotes({ limit: 1_000_000, sort: "asc" });
       const validNoteIds = new Set(allNotes.map((n) => n.id));
-      // Tag names with schema content drive the schema sidecars. We
-      // include ALL tag names (not just schema-bearing) — the prune
-      // sweep removes a sidecar only when the tag is gone, and a tag
-      // whose schema content was wiped but name persists still has a
-      // sidecar slot the next export will rewrite from scratch.
+      // Tag names with schema content drive the schema sidecars. Filter
+      // through `hasSchemaContent` — a tag whose schema content was wiped
+      // via `deleteTagSchema` keeps its tags-table row (bare name), so a
+      // map-by-name set would leave the stale sidecar in the mirror
+      // indefinitely. Only schema-bearing tags belong in this set.
+      // Reviewer-flagged on vault#382 (Critical #1).
       const tagRecords = await store.listTagRecords();
-      const validTagNames = new Set(tagRecords.map((t) => t.tag));
+      const validTagNames = new Set(
+        tagRecords.filter((t) => hasSchemaContent(t)).map((t) => t.tag),
+      );
       // Attachment IDs across all notes (the prune sweep keys on id).
       const validAttachmentIds = new Set<string>();
       for (const note of allNotes) {

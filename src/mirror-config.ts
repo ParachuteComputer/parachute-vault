@@ -44,12 +44,12 @@ export type MirrorLocation = "internal" | "external";
  *     mutation; the manager debounces them (~500ms) into a single export
  *     pass. A background safety-net poll (default 1h) catches anything
  *     missed (direct SQL writes, dropped hook dispatches, restart gaps).
- *     This is the default for new configs and the post-vault#XXX shape.
+ *     This is the default for new configs and the post-vault#382 shape.
  *   - `manual` → no event subscriptions, no polling. The operator runs
  *     "Run export now" (admin SPA button or POST `/.parachute/mirror/run-now`)
  *     or `parachute-vault export` from the CLI on their own cadence.
  *
- * The pre-vault#XXX `interval_seconds`-driven watch loop has retired —
+ * The pre-vault#382 `interval_seconds`-driven watch loop has retired —
  * existing configs migrate to `events` (when `watch: true`) or `manual`
  * (when `watch: false`). The legacy field still parses, repurposed as
  * `safety_net_seconds` when explicit.
@@ -91,10 +91,10 @@ export const MAX_SAFETY_NET_SECONDS = 86400;
  *     MAX_SAFETY_NET_SECONDS]` at validation time.
  *
  * Legacy / migration:
- *   - `watch` (boolean) — pre-vault#XXX field. `true` → `sync_mode: events`,
+ *   - `watch` (boolean) — pre-vault#382 field. `true` → `sync_mode: events`,
  *     `false` → `sync_mode: manual`. Parsed for back-compat; the canonical
  *     form on the wire is `sync_mode`.
- *   - `interval_seconds` (positive integer) — pre-vault#XXX watch-loop
+ *   - `interval_seconds` (positive integer) — pre-vault#382 watch-loop
  *     poll interval. Reinterpreted as `safety_net_seconds` when no
  *     explicit `safety_net_seconds` is present AND the value lies in the
  *     valid range. Out-of-range / missing → default 3600. The field is

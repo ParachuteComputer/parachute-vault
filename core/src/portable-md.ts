@@ -72,7 +72,7 @@
  * See vault#308.
  */
 
-import { readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from "fs";
+import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from "fs";
 import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
@@ -1101,6 +1101,55 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
   const schemasRoot = join(sidecarRoot, "schemas");
   const attachmentsRoot = join(sidecarRoot, "attachments");
 
+  // Path-traversal guard. `walkContentFiles` uses `statSync` which
+  // follows symlinks — a symlink inside the mirror pointing OUTSIDE
+  // `outDir` would resurface its target's files in the prune sweep,
+  // and a bare `rmSync(filepath)` would delete them off-tree. Every
+  // deletion in this function routes through `safeRm`, which calls
+  // `realpathSync` (resolves through symlinks, unlike syntactic-only
+  // `path.resolve`) and refuses to delete anything that isn't `outDir`
+  // or beneath it after symlink resolution. Refusals get recorded in
+  // `unparseable_files` so an operator can see what was skipped.
+  // Reviewer-flagged on vault#382 (Critical #2).
+  const outDirReal = realpathSync(outDir);
+  const safeRm = (
+    candidate: string,
+    onSuccess: () => void,
+    options: { recursive?: boolean } = {},
+  ): void => {
+    let real: string;
+    try {
+      real = realpathSync(candidate);
+    } catch (err) {
+      // realpathSync throws if the path doesn't exist or is unreadable.
+      // Don't delete what we can't fully resolve.
+      stats.unparseable_files.push({
+        path: candidate,
+        reason: `realpath failed: ${(err as Error).message ?? err}`,
+      });
+      return;
+    }
+    if (!isWithinDir(real, outDirReal)) {
+      stats.unparseable_files.push({
+        path: candidate,
+        reason: "real path resolved outside mirror outDir — refusing to delete (symlink?)",
+      });
+      return;
+    }
+    try {
+      // Delete via the resolved real path; never via the unresolved
+      // candidate (which could route through a symlink we already
+      // determined would escape).
+      rmSync(real, { force: true, recursive: options.recursive ?? false });
+      onSuccess();
+    } catch (err) {
+      stats.unparseable_files.push({
+        path: candidate,
+        reason: `unlink failed: ${(err as Error).message ?? err}`,
+      });
+    }
+  };
+
   // ---- 1 + 2. Notes + sidecars ----
   //
   // First pass: build the sidecar id → { path, extension } map so we can
@@ -1160,15 +1209,9 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
           continue;
         }
         if (!opts.validNoteIds.has(id)) {
-          try {
-            rmSync(filepath, { force: true });
+          safeRm(filepath, () => {
             stats.notes_removed++;
-          } catch (err) {
-            stats.unparseable_files.push({
-              path: filepath,
-              reason: `unlink failed: ${(err as Error).message ?? err}`,
-            });
-          }
+          });
         }
       } catch (err) {
         stats.unparseable_files.push({
@@ -1206,26 +1249,14 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
       pairedSidecarIds.add(foundId);
       if (!opts.validNoteIds.has(foundId)) {
         // Note is orphaned — remove both content and sidecar.
-        try {
-          rmSync(filepath, { force: true });
+        safeRm(filepath, () => {
           stats.notes_removed++;
-        } catch (err) {
-          stats.unparseable_files.push({
-            path: filepath,
-            reason: `unlink failed: ${(err as Error).message ?? err}`,
-          });
-        }
+        });
         const sidecarPath = sidecarFilesById.get(foundId);
         if (sidecarPath) {
-          try {
-            rmSync(sidecarPath, { force: true });
+          safeRm(sidecarPath, () => {
             stats.sidecars_removed++;
-          } catch (err) {
-            stats.unparseable_files.push({
-              path: sidecarPath,
-              reason: `unlink failed: ${(err as Error).message ?? err}`,
-            });
-          }
+          });
         }
       }
     }
@@ -1241,15 +1272,9 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
       // the next export can rewrite the content file alongside it.
       continue;
     }
-    try {
-      rmSync(sidecarPath, { force: true });
+    safeRm(sidecarPath, () => {
       stats.sidecars_removed++;
-    } catch (err) {
-      stats.unparseable_files.push({
-        path: sidecarPath,
-        reason: `unlink failed: ${(err as Error).message ?? err}`,
-      });
-    }
+    });
   }
 
   // ---- 3. Schema sidecars ----
@@ -1267,14 +1292,16 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
             // with `__`, so reverse for the lookup.
             const fromFilename = entry.slice(0, -5).replace(/__/g, "/");
             if (!opts.validTagNames.has(fromFilename)) {
-              rmSync(full, { force: true });
-              stats.schemas_removed++;
+              safeRm(full, () => {
+                stats.schemas_removed++;
+              });
             }
             continue;
           }
           if (!opts.validTagNames.has(name)) {
-            rmSync(full, { force: true });
-            stats.schemas_removed++;
+            safeRm(full, () => {
+              stats.schemas_removed++;
+            });
           }
         } catch (err) {
           stats.unparseable_files.push({
@@ -1309,15 +1336,13 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
         if (!stat.isDirectory()) continue;
         // The directory name IS the attachment id (per the export layout).
         if (!opts.validAttachmentIds.has(entry)) {
-          try {
-            rmSync(full, { recursive: true, force: true });
-            stats.attachment_dirs_removed++;
-          } catch (err) {
-            stats.unparseable_files.push({
-              path: full,
-              reason: `attachment dir remove failed: ${(err as Error).message ?? err}`,
-            });
-          }
+          safeRm(
+            full,
+            () => {
+              stats.attachment_dirs_removed++;
+            },
+            { recursive: true },
+          );
         }
       }
     } catch (err) {
@@ -1331,7 +1356,20 @@ export function pruneOrphans(opts: PruneOrphansOptions): PruneOrphansStats {
   return stats;
 }
 
-function hasSchemaContent(tag: TagRecord): boolean {
+/**
+ * True iff the tag carries content the export writer will emit as a
+ * schema sidecar (`.parachute/schemas/<tag>.yaml`). Bare-name tags
+ * (the `tags` table has a row but description/fields/relationships/
+ * parents are all empty) get no sidecar — and crucially, after
+ * `deleteTagSchema` clears those fields the row persists with the
+ * bare name. Callers building the `validTagNames` set for
+ * `pruneOrphans` MUST filter through this predicate, otherwise the
+ * stale sidecar lingers indefinitely.
+ *
+ * Reviewer-flagged on vault#382: without this filter, a cleared
+ * schema's sidecar never gets pruned.
+ */
+export function hasSchemaContent(tag: TagRecord): boolean {
   if (tag.description !== undefined && tag.description.length > 0) return true;
   if (tag.fields && Object.keys(tag.fields).length > 0) return true;
   if (tag.relationships && Object.keys(tag.relationships).length > 0) return true;

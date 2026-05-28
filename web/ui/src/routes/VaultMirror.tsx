@@ -16,7 +16,7 @@
  * The detailed fields below the presets let custom shapes through
  * without bypassing the form's validation.
  *
- * Post-event-driven shift (vault#XXX): the granular schedule picker
+ * Post-event-driven shift (vault#382): the granular schedule picker
  * (Live/Minute/10min/Hourly/Daily/Manual) has been replaced by a binary
  * sync-mode picker — "On change" (events) and "Manual only" (no
  * auto-fire). The export is event-driven now; time-based cadence is the

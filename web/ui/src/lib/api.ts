@@ -110,7 +110,7 @@ export type MirrorLocation = "internal" | "external";
  * fires no automatic exports — the operator triggers via the "Run
  * export now" button or `parachute-vault export` from the CLI.
  *
- * Pre-vault#XXX `watch: boolean` migrated as: true → "events", false →
+ * Pre-vault#382 `watch: boolean` migrated as: true → "events", false →
  * "manual". The backend's validator still accepts `watch` as a back-
  * compat alias.
  */

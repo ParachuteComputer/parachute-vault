@@ -316,7 +316,7 @@ console.log(`Parachute Vault server listening on http://${hostname}:${server.por
 
 // Graceful shutdown — best-effort drain of in-flight note-mutation hooks.
 //
-// Order matters under the event-driven mirror shape (vault#XXX):
+// Order matters under the event-driven mirror shape (vault#382):
 //   1. MirrorManager.stop() runs FIRST so it can unsubscribe from hooks
 //      cleanly + cancel its debounce timer. Otherwise the registry drain
 //      below would wait on the manager's hook handler that just queued
