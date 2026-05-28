@@ -70,6 +70,10 @@ import {
   runGitCommitCycle,
 } from "./export-watch.ts";
 import { vaultDir } from "./config.ts";
+import {
+  applyToGitRemote,
+  readCredentials,
+} from "./mirror-credentials.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 
 /**
@@ -285,6 +289,24 @@ export async function bootstrapInternalMirror(
 // ---------------------------------------------------------------------------
 
 /**
+ * Read the current `origin` URL from a git repo's config, or null when no
+ * origin is set. Module-local helper for the credential-application path.
+ */
+async function readCurrentOrigin(repoDir: string): Promise<string | null> {
+  const proc = Bun.spawn(["git", "remote", "get-url", "origin"], {
+    cwd: repoDir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) return null;
+  const url = new TextDecoder()
+    .decode(await new Response(proc.stdout).arrayBuffer())
+    .trim();
+  return url.length > 0 ? url : null;
+}
+
+/**
  * Singleton lifecycle controller. Holds the active mirror config, the
  * resolved path, hook subscriptions (when sync_mode=events), the
  * safety-net poll timer, the debounce timer, and the rolling status.
@@ -423,6 +445,16 @@ export class MirrorManager {
 
     this.status.enabled = true;
     this.status.last_error = null;
+
+    // Apply UI-configured credentials to the mirror's git remote, if any.
+    // The PAT path stores the full authed URL; we set it as `origin`.
+    // The GitHub OAuth path only sets `origin` when the operator has
+    // picked a repo (handleAuthGithubSelectRepo writes it then); on a
+    // restart with credentials present but no repo picked yet, this is
+    // a no-op. Failures are non-fatal — the operator's mirror still
+    // exports; they get the original "push needs credentials" feedback
+    // when auto_push fires.
+    await this.applyCredentialsToRemote(path);
 
     // Initial export — full pass (no cursor) so the mirror starts
     // byte-equivalent to current vault state, regardless of when the
@@ -782,6 +814,74 @@ export class MirrorManager {
       await shaProc.exited;
       const sha = new TextDecoder().decode(await new Response(shaProc.stdout).arrayBuffer()).trim();
       if (sha.length > 0) this.status.last_commit_sha = sha;
+    }
+  }
+
+  /**
+   * Apply UI-configured credentials to the mirror dir's `origin`. Called
+   * on every start()/reload() so credential rotations land without
+   * requiring a server restart. Idempotent:
+   *   - active_method=pat → set origin to the stored authed URL
+   *   - active_method=github_oauth + a picked repo → set origin (the
+   *     pick path stores the authed URL in the same flow)
+   *   - active_method=github_oauth + no repo picked → no-op (UI is mid-
+   *     flow)
+   *   - no credentials at all → leave whatever the operator wired by
+   *     hand alone (don't clobber a manually-set remote)
+   *
+   * Never throws — push failures will surface via the existing
+   * non-fatal-warn path in runGitCommitCycle.
+   */
+  private async applyCredentialsToRemote(repoDir: string): Promise<void> {
+    try {
+      const creds = readCredentials();
+      if (!creds || !creds.active_method) {
+        // No UI-configured credentials. Leave the remote alone — the
+        // operator may have set one up via `git remote add` manually.
+        return;
+      }
+      if (creds.active_method === "pat" && creds.pat) {
+        const result = await applyToGitRemote(repoDir, creds.pat.remote_url);
+        if (!result.ok) {
+          console.warn(
+            `[mirror] could not apply PAT remote URL (non-fatal): ${result.error}`,
+          );
+        }
+        return;
+      }
+      // github_oauth: the active token is set, but a repo may not yet be
+      // picked. The select-repo route handler writes the URL; on a
+      // subsequent restart we can't reconstruct the URL without the
+      // owner/repo. Best-effort: if `origin` already points at a github.com
+      // URL, rewrite it with the stored token in case the token rotated.
+      if (creds.active_method === "github_oauth" && creds.github_oauth) {
+        const current = await readCurrentOrigin(repoDir);
+        if (current && current.includes("github.com")) {
+          // Parse owner/repo out of the current URL.
+          const match = current.match(
+            /github\.com[/:]([^/]+)\/([^/.]+?)(?:\.git)?$/,
+          );
+          if (match) {
+            const [, owner, repo] = match;
+            const { githubAuthedRemoteUrl } = await import("./mirror-credentials.ts");
+            const authed = githubAuthedRemoteUrl(
+              creds.github_oauth.access_token,
+              owner!,
+              repo!,
+            );
+            const result = await applyToGitRemote(repoDir, authed);
+            if (!result.ok) {
+              console.warn(
+                `[mirror] could not refresh github_oauth remote URL (non-fatal): ${result.error}`,
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[mirror] credential application failed (non-fatal): ${(err as Error).message ?? err}`,
+      );
     }
   }
 

@@ -72,7 +72,19 @@ import {
 } from "./oauth-discovery.ts";
 import { handleConfigSchema, handleConfig } from "./module-config.ts";
 import { buildAuthStatus } from "./auth-status.ts";
-import { handleMirrorGet, handleMirrorPut, handleMirrorRunNow } from "./mirror-routes.ts";
+import {
+  handleAuthDelete,
+  handleAuthGet,
+  handleAuthGithubCreateRepo,
+  handleAuthGithubDeviceCode,
+  handleAuthGithubPoll,
+  handleAuthGithubRepos,
+  handleAuthGithubSelectRepo,
+  handleAuthPat,
+  handleMirrorGet,
+  handleMirrorPut,
+  handleMirrorRunNow,
+} from "./mirror-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 
 /**
@@ -542,6 +554,67 @@ export async function route(
     }
     if (req.method === "POST") return handleMirrorRunNow(manager);
     return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/auth/* — UI-configurable git push credentials.
+  // GitHub OAuth Device Flow + PAT fallback. All admin-gated; the
+  // routes themselves don't carry secrets in their responses
+  // (mirror-routes.ts redacts via sanitizeCredentials).
+  if (subpath.startsWith("/.parachute/mirror/auth")) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager();
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+
+    if (subpath === "/.parachute/mirror/auth") {
+      if (req.method === "GET") return handleAuthGet();
+      if (req.method === "DELETE") return handleAuthDelete(manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/device-code") {
+      if (req.method === "POST") return handleAuthGithubDeviceCode();
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/poll") {
+      if (req.method === "POST") return handleAuthGithubPoll(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/repos") {
+      if (req.method === "GET") return handleAuthGithubRepos();
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/create-repo") {
+      if (req.method === "POST") return handleAuthGithubCreateRepo(req);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/select-repo") {
+      if (req.method === "POST") return handleAuthGithubSelectRepo(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/pat") {
+      if (req.method === "POST") return handleAuthPat(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return Response.json({ error: "Not found" }, { status: 404 });
   }
 
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);

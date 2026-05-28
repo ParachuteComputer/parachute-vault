@@ -23,16 +23,27 @@
  * exclusive territory of the operator's own cron (or the admin SPA's
  * "Run export now" button).
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   HttpError,
+  type DeviceCodeResponse,
+  type GitHubRepoInfo,
   type MirrorConfig,
+  type MirrorCredentialStatus,
   type MirrorSnapshot,
   type MirrorStatus,
+  createGithubRepo,
+  deleteMirrorAuth,
   getMirror,
+  getMirrorAuth,
+  listGithubRepos,
+  pollGithubDeviceFlow,
+  postMirrorAuthPat,
   putMirror,
   runMirrorNow,
+  selectGithubRepo,
+  startGithubDeviceFlow,
 } from "../lib/api.ts";
 import { hasAdminScope } from "../lib/scope.ts";
 
@@ -218,6 +229,30 @@ function MirrorScreen({
   onSnapshot: (snap: MirrorSnapshot) => void;
 }) {
   const isAdmin = hasAdminScope(vaultName);
+  // Credential status — fetched separately because it lives at a different
+  // endpoint + has its own update cadence (OAuth modal + PAT modal save
+  // both invalidate it).
+  const [creds, setCreds] = useState<MirrorCredentialStatus | null>(null);
+  const [credsError, setCredsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    let cancelled = false;
+    getMirrorAuth(vaultName)
+      .then((c) => {
+        if (!cancelled) setCreds(c);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // 401/403 already covered by parent route's auth gate; other
+        // errors surface as a soft note in the GitRemote section.
+        setCredsError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultName, isAdmin]);
+
   return (
     <>
       <StatusCard
@@ -238,11 +273,21 @@ function MirrorScreen({
         vaultName={vaultName}
         initial={snapshot.config}
         readOnly={!isAdmin}
+        creds={creds}
         onSaved={(snap) => {
           onSnapshot(snap);
           onRefresh();
         }}
       />
+      {isAdmin ? (
+        <GitRemoteSection
+          vaultName={vaultName}
+          creds={creds}
+          credsError={credsError}
+          onCredsChanged={setCreds}
+          locationIsExternal={snapshot.config.location === "external"}
+        />
+      ) : null}
     </>
   );
 }
@@ -347,11 +392,15 @@ function ConfigForm({
   vaultName,
   initial,
   readOnly,
+  creds,
   onSaved,
 }: {
   vaultName: string;
   initial: MirrorConfig;
   readOnly: boolean;
+  /** Credentials snapshot — drives the auto_push warning copy. Null while
+   *  loading; treated identically to "no credentials configured." */
+  creds: MirrorCredentialStatus | null;
   onSaved: (snap: MirrorSnapshot) => void;
 }) {
   const [config, setConfig] = useState<MirrorConfig>(initial);
@@ -577,11 +626,26 @@ function ConfigForm({
             Push after each commit
           </label>
           {config.auto_push ? (
-            <div className="warn-banner" style={{ marginTop: "0.5rem" }} role="alert">
-              Auto-push requires git credentials configured outside vault (e.g., SSH
-              key, <code>GH_TOKEN</code>). Failed pushes are logged but won't crash the
-              export.
-            </div>
+            creds?.active_method ? (
+              <div className="info-banner" style={{ marginTop: "0.5rem" }} role="status">
+                {creds.active_method === "github_oauth" && creds.github_oauth ? (
+                  <>
+                    Will push to <code>@{creds.github_oauth.user_login}</code> on GitHub.
+                  </>
+                ) : creds.active_method === "pat" && creds.pat ? (
+                  <>Will push using saved credential: <code>{creds.pat.label}</code>.</>
+                ) : (
+                  <>Will push using saved credential.</>
+                )}{" "}
+                Failed pushes are logged but won't crash the export.
+              </div>
+            ) : (
+              <div className="warn-banner" style={{ marginTop: "0.5rem" }} role="alert">
+                Auto-push needs git credentials. Either connect GitHub in the{" "}
+                <strong>Git remote</strong> section below, or paste a Personal Access
+                Token + remote URL. Failed pushes are logged but won't crash the export.
+              </div>
+            )
           ) : null}
         </div>
       ) : null}
@@ -649,5 +713,645 @@ function ConfigForm({
         </button>
       </div>
     </form>
+  );
+}
+
+// ===========================================================================
+// Git remote credentials — UI for connecting GitHub OAuth or pasting a PAT.
+// ===========================================================================
+
+/**
+ * Top-level credentials section. Shows current connection state +
+ * affords Connect GitHub / Use PAT / Disconnect.
+ *
+ * The OAuth modal is the primary path: operator clicks "Connect GitHub",
+ * vault calls GitHub's device-code endpoint, the modal displays the
+ * user_code + verification_uri, operator types the code at
+ * github.com/login/device, the modal polls until granted, then surfaces a
+ * repo picker (or a "Create new private repo" form). Picking a repo
+ * writes the embedded-credential URL onto the mirror's `origin`, closes
+ * the flow.
+ *
+ * The PAT modal is the fallback: two fields (token + remote URL) + a
+ * "Validate & save" button. The server runs `git ls-remote` against the
+ * URL with the embedded token to confirm before saving.
+ */
+function GitRemoteSection({
+  vaultName,
+  creds,
+  credsError,
+  onCredsChanged,
+  locationIsExternal,
+}: {
+  vaultName: string;
+  creds: MirrorCredentialStatus | null;
+  credsError: string | null;
+  onCredsChanged: (creds: MirrorCredentialStatus) => void;
+  locationIsExternal: boolean;
+}) {
+  const [oauthOpen, setOauthOpen] = useState(false);
+  const [patOpen, setPatOpen] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const connected = creds?.active_method !== null && creds?.active_method !== undefined;
+
+  const onDisconnect = async () => {
+    if (!confirm("Disconnect git remote credentials? Auto-push will stop working until you reconnect.")) {
+      return;
+    }
+    setDisconnecting(true);
+    setActionError(null);
+    try {
+      const c = await deleteMirrorAuth(vaultName);
+      onCredsChanged(c);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDisconnecting(false);
+    }
+  };
+
+  return (
+    <div className="section">
+      <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>
+        Git remote
+      </h3>
+      <p className="dim" style={{ marginTop: 0 }}>
+        Credentials for <code>auto-push</code>. Stored on this server with{" "}
+        <code>0600</code> file permissions. Never sent to GitHub or any third party.
+      </p>
+
+      {!locationIsExternal ? (
+        <div className="info-banner" style={{ marginBottom: "0.75rem" }} role="status">
+          Internal mirrors live under the vault's data directory and have no remote.
+          Switch the location above to <strong>External</strong> to enable pushing.
+        </div>
+      ) : null}
+
+      {credsError ? (
+        <div className="error-banner" role="alert">
+          Could not load credential status: <code>{credsError}</code>
+        </div>
+      ) : null}
+
+      {connected ? (
+        <div className="kv" style={{ marginBottom: "0.75rem" }}>
+          <div>Status</div>
+          <div>
+            {creds?.active_method === "github_oauth" && creds.github_oauth ? (
+              <>
+                Connected to <code>@{creds.github_oauth.user_login}</code> on GitHub
+              </>
+            ) : creds?.active_method === "pat" && creds.pat ? (
+              <>
+                Custom credential: <code>{creds.pat.label}</code>
+              </>
+            ) : null}
+          </div>
+          {creds?.active_method === "github_oauth" && creds.github_oauth ? (
+            <>
+              <div>Token</div>
+              <div>
+                <code>{creds.github_oauth.token_preview}</code>{" "}
+                <span className="dim">
+                  · scope {creds.github_oauth.scope || "—"} · authorized{" "}
+                  {creds.github_oauth.authorized_at.slice(0, 10)}
+                </span>
+              </div>
+            </>
+          ) : null}
+          {creds?.active_method === "pat" && creds.pat ? (
+            <>
+              <div>Remote</div>
+              <div>
+                <code>{creds.pat.remote_url}</code>
+              </div>
+              <div>Token</div>
+              <div>
+                <code>{creds.pat.token_preview}</code>
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : (
+        <p className="dim">Not connected. Auto-push won't work until you connect.</p>
+      )}
+
+      {actionError ? (
+        <div className="error-banner" role="alert">
+          <code>{actionError}</code>
+        </div>
+      ) : null}
+
+      <div className="actions">
+        {!connected ? (
+          <>
+            <button type="button" onClick={() => setOauthOpen(true)}>
+              Connect GitHub
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setPatOpen(true)}
+            >
+              Use Personal Access Token
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="secondary"
+            onClick={onDisconnect}
+            disabled={disconnecting}
+          >
+            {disconnecting ? "Disconnecting…" : "Disconnect"}
+          </button>
+        )}
+      </div>
+
+      {oauthOpen ? (
+        <GithubOAuthModal
+          vaultName={vaultName}
+          onClose={() => setOauthOpen(false)}
+          onConnected={(c) => {
+            onCredsChanged(c);
+            setOauthOpen(false);
+          }}
+        />
+      ) : null}
+
+      {patOpen ? (
+        <PATModal
+          vaultName={vaultName}
+          onClose={() => setPatOpen(false)}
+          onSaved={(c) => {
+            onCredsChanged(c);
+            setPatOpen(false);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// GitHub OAuth modal — device flow start + poll loop + repo picker.
+// ---------------------------------------------------------------------------
+
+type OAuthPhase =
+  | { kind: "starting" }
+  | { kind: "polling"; code: DeviceCodeResponse; pollIntervalMs: number; startedAt: number }
+  | { kind: "granted"; user: { login: string } }
+  | { kind: "error"; message: string };
+
+function GithubOAuthModal({
+  vaultName,
+  onClose,
+  onConnected,
+}: {
+  vaultName: string;
+  onClose: () => void;
+  onConnected: (creds: MirrorCredentialStatus) => void;
+}) {
+  const [phase, setPhase] = useState<OAuthPhase>({ kind: "starting" });
+  const [now, setNow] = useState(Date.now());
+  const pollAbortRef = useRef<boolean>(false);
+
+  // Tick clock so the countdown ticks down visibly.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Start the device flow on mount.
+  useEffect(() => {
+    let cancelled = false;
+    pollAbortRef.current = false;
+    startGithubDeviceFlow(vaultName)
+      .then((code) => {
+        if (cancelled) return;
+        setPhase({
+          kind: "polling",
+          code,
+          pollIntervalMs: Math.max(code.interval, 1) * 1000,
+          startedAt: Date.now(),
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPhase({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+    return () => {
+      cancelled = true;
+      pollAbortRef.current = true;
+    };
+  }, [vaultName]);
+
+  // Poll loop — re-armed on every phase transition while phase=polling.
+  useEffect(() => {
+    if (phase.kind !== "polling") return;
+    const code = phase.code;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let currentIntervalMs = phase.pollIntervalMs;
+    const tick = async () => {
+      if (cancelled || pollAbortRef.current) return;
+      try {
+        const result = await pollGithubDeviceFlow(vaultName, code.polling_id);
+        if (cancelled) return;
+        if (result.state === "granted") {
+          setPhase({ kind: "granted", user: { login: result.user.login } });
+          return;
+        }
+        if (result.state === "denied") {
+          setPhase({ kind: "error", message: "Authorization denied." });
+          return;
+        }
+        if (result.state === "expired") {
+          setPhase({ kind: "error", message: "The device code expired. Try again." });
+          return;
+        }
+        if (result.state === "slow_down") {
+          currentIntervalMs = result.interval * 1000;
+        }
+        timer = setTimeout(tick, currentIntervalMs);
+      } catch (err) {
+        if (cancelled) return;
+        setPhase({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+    timer = setTimeout(tick, currentIntervalMs);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [phase, vaultName]);
+
+  const copyCode = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      // Clipboard API can fail in HTTP / no-permission contexts. Silent fail.
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal">
+        <div className="list-header">
+          <h3 style={{ margin: 0 }}>Connect GitHub</h3>
+          <button type="button" className="secondary" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        {phase.kind === "starting" ? (
+          <p className="muted">Requesting device code from GitHub…</p>
+        ) : null}
+
+        {phase.kind === "polling" ? (
+          <>
+            <p>
+              <strong>Step 1.</strong> Open{" "}
+              <a href={phase.code.verification_uri} target="_blank" rel="noreferrer">
+                {phase.code.verification_uri}
+              </a>{" "}
+              in your browser.
+            </p>
+            <p>
+              <strong>Step 2.</strong> Enter this code:
+            </p>
+            <div className="device-code-row">
+              <code className="device-code">{phase.code.user_code}</code>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => copyCode(phase.code.user_code)}
+              >
+                Copy
+              </button>
+            </div>
+            <p className="dim">
+              Waiting for authorization…{" "}
+              {formatCountdown(phase.code.expires_in, phase.startedAt, now)}
+            </p>
+          </>
+        ) : null}
+
+        {phase.kind === "granted" ? (
+          <RepoPicker
+            vaultName={vaultName}
+            user={phase.user}
+            onPicked={async (owner, name) => {
+              await selectGithubRepo(vaultName, { owner, name });
+              const c = await getMirrorAuth(vaultName);
+              onConnected(c);
+            }}
+            onError={(message) => setPhase({ kind: "error", message })}
+          />
+        ) : null}
+
+        {phase.kind === "error" ? (
+          <>
+            <div className="error-banner" role="alert">
+              <code>{phase.message}</code>
+            </div>
+            <div className="actions">
+              <button type="button" onClick={() => setPhase({ kind: "starting" })}>
+                Try again
+              </button>
+              <button type="button" className="secondary" onClick={onClose}>
+                Close
+              </button>
+            </div>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function formatCountdown(expiresIn: number, startedAt: number, now: number): string {
+  const elapsed = Math.floor((now - startedAt) / 1000);
+  const remaining = Math.max(0, expiresIn - elapsed);
+  const mins = Math.floor(remaining / 60);
+  const secs = remaining % 60;
+  return `${mins}:${String(secs).padStart(2, "0")} remaining`;
+}
+
+// ---------------------------------------------------------------------------
+// Repo picker — surfaces after a granted device-flow token.
+// ---------------------------------------------------------------------------
+
+function RepoPicker({
+  vaultName,
+  user,
+  onPicked,
+  onError,
+}: {
+  vaultName: string;
+  user: { login: string };
+  onPicked: (owner: string, name: string) => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [repos, setRepos] = useState<GitHubRepoInfo[] | null>(null);
+  const [filter, setFilter] = useState("");
+  const [picking, setPicking] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [showCreate, setShowCreate] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    listGithubRepos(vaultName)
+      .then(({ repos }) => {
+        if (!cancelled) setRepos(repos);
+      })
+      .catch((err) => {
+        if (!cancelled) onError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultName, onError]);
+
+  const filtered = (repos ?? []).filter((r) =>
+    filter.length === 0
+      ? true
+      : r.full_name.toLowerCase().includes(filter.toLowerCase()),
+  );
+
+  const pickRepo = async (owner: string, name: string) => {
+    setPicking(`${owner}/${name}`);
+    try {
+      await onPicked(owner, name);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPicking(null);
+    }
+  };
+
+  const createAndPick = async () => {
+    if (newName.trim().length === 0) return;
+    setCreating(true);
+    try {
+      const repo = await createGithubRepo(vaultName, {
+        name: newName.trim(),
+        description: "Parachute Vault mirror",
+        private: true,
+      });
+      await onPicked(repo.owner, repo.name);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <>
+      <p>
+        Authorized as <code>@{user.login}</code>. Pick a repository to push the mirror to:
+      </p>
+
+      <div className="form-row">
+        <input
+          type="search"
+          placeholder="Filter by name…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+      </div>
+
+      {repos === null ? <p className="muted">Loading repos…</p> : null}
+
+      {repos !== null ? (
+        <div className="repo-list">
+          {filtered.length === 0 && filter.length > 0 ? (
+            <p className="dim">No repos match "{filter}".</p>
+          ) : null}
+          {filtered.length === 0 && filter.length === 0 && repos.length === 0 ? (
+            <p className="dim">You don't own any repos on this account yet.</p>
+          ) : null}
+          {filtered.map((r) => (
+            <button
+              type="button"
+              key={r.full_name}
+              className="repo-row"
+              onClick={() => pickRepo(r.owner, r.name)}
+              disabled={picking !== null}
+            >
+              <span>
+                <strong>{r.name}</strong>
+                {r.private ? <span className="dim"> · private</span> : null}
+              </span>
+              <span className="dim">{r.updated_at.slice(0, 10)}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {!showCreate ? (
+        <div className="actions" style={{ marginTop: "0.75rem" }}>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => setShowCreate(true)}
+          >
+            + Create new private repo
+          </button>
+        </div>
+      ) : (
+        <div className="form-row" style={{ marginTop: "0.75rem" }}>
+          <label htmlFor="new-repo-name">New repo name</label>
+          <input
+            id="new-repo-name"
+            type="text"
+            value={newName}
+            placeholder="my-vault-backup"
+            onChange={(e) => setNewName(e.target.value)}
+          />
+          <div className="actions">
+            <button
+              type="button"
+              onClick={createAndPick}
+              disabled={creating || newName.trim().length === 0}
+            >
+              {creating ? "Creating…" : "Create"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setShowCreate(false)}
+              disabled={creating}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PAT modal — paste a token + remote URL, validate via `git ls-remote`.
+// ---------------------------------------------------------------------------
+
+function PATModal({
+  vaultName,
+  onClose,
+  onSaved,
+}: {
+  vaultName: string;
+  onClose: () => void;
+  onSaved: (creds: MirrorCredentialStatus) => void;
+}) {
+  const [token, setToken] = useState("");
+  const [remoteUrl, setRemoteUrl] = useState("");
+  const [label, setLabel] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      const creds = await postMirrorAuthPat(vaultName, {
+        token: token.trim(),
+        remote_url: remoteUrl.trim(),
+        label: label.trim() || undefined,
+      });
+      onSaved(creds);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal">
+        <div className="list-header">
+          <h3 style={{ margin: 0 }}>Use Personal Access Token</h3>
+          <button type="button" className="secondary" onClick={onClose} disabled={saving}>
+            Close
+          </button>
+        </div>
+        <p className="dim">
+          Works for any provider that supports HTTPS push with a token in the URL
+          (GitHub, GitLab, Codeberg, Gitea, …). The token is stored with{" "}
+          <code>0600</code> file perms on this server.
+        </p>
+        <form onSubmit={onSubmit}>
+          <div className="form-row">
+            <label htmlFor="pat-token">Token</label>
+            <input
+              id="pat-token"
+              type="password"
+              value={token}
+              autoComplete="off"
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="ghp_… or glpat-… or similar"
+              required
+            />
+          </div>
+          <div className="form-row">
+            <label htmlFor="pat-url">Remote URL</label>
+            <input
+              id="pat-url"
+              type="url"
+              value={remoteUrl}
+              onChange={(e) => setRemoteUrl(e.target.value)}
+              placeholder="https://github.com/owner/repo.git"
+              required
+            />
+            <p className="dim" style={{ margin: "0.35rem 0 0" }}>
+              We'll embed your token in the URL before saving (using GitHub's{" "}
+              <code>x-access-token</code> convention). The URL you see on disk will
+              carry the token; ensure the file isn't shared.
+            </p>
+          </div>
+          <div className="form-row">
+            <label htmlFor="pat-label">Label (optional)</label>
+            <input
+              id="pat-label"
+              type="text"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              placeholder="GitHub PAT for backup"
+            />
+          </div>
+          {error ? (
+            <div className="error-banner" role="alert">
+              <code>{error}</code>
+            </div>
+          ) : null}
+          <div className="actions">
+            <button type="submit" disabled={saving}>
+              {saving ? "Validating…" : "Validate & save"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={onClose}
+              disabled={saving}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
   );
 }
