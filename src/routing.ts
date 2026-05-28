@@ -489,15 +489,13 @@ export async function route(
     return handleTokens(req, store, vaultName, auth.scopes, auth.scoped_tags, tokensMatch[1] ?? "");
   }
 
-  // /.parachute/mirror — vault-sync Phase A1. Admin-gated read+write of
-  // the persistent mirror config + runtime status. Lives under
-  // `.parachute/` (alongside info/icon/config) rather than `admin/`
-  // because `/vault/<name>/admin/*` is reserved for the admin SPA's
-  // static-file mount; the API surface goes under `.parachute/` by the
-  // module-protocol convention. Per the design doc, the hub admin SPA
-  // (Phase A2 — future PR) is the eventual primary consumer; for Phase
-  // A1 these endpoints unblock direct API callers and the by-hand
-  // config workflow.
+  // /.parachute/mirror — Admin-gated read+write of THIS vault's persistent
+  // mirror config + runtime status. Per-vault (vault#400): the manager is
+  // resolved by the URL's vault name, so each vault's mirror page reflects
+  // its own config + git remote. Lives under `.parachute/` (alongside
+  // info/icon/config) rather than `admin/` because `/vault/<name>/admin/*`
+  // is reserved for the admin SPA's static-file mount; the API surface goes
+  // under `.parachute/` by the module-protocol convention.
   if (subpath === "/.parachute/mirror") {
     if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
       return Response.json(
@@ -511,19 +509,22 @@ export async function route(
         { status: 403 },
       );
     }
-    const manager = getMirrorManager();
+    // vault#400: resolve the manager for THIS vault (from the URL). The
+    // registry lazily builds one (via the boot-installed factory) for any
+    // existing vault — including a non-default vault or one configured at
+    // runtime — so the handler operates on the right vault's config + status
+    // + git remote, never the default vault's.
+    const manager = getMirrorManager(vaultName);
     if (!manager) {
-      // The boot path constructs a manager when at least one vault
-      // exists; a missing manager here means either a startup error or
-      // a brand-new deploy that hasn't finished first-boot. Surface a
-      // clear 503 rather than a JSON null so the operator + the hub
-      // SPA know it's a service-state issue, not a misconfig on their
-      // end.
+      // Null only when boot hasn't installed the factory yet (startup race
+      // or boot failure). Surface a clear 503 rather than a JSON null so the
+      // operator + the hub SPA know it's a service-state issue, not a
+      // misconfig on their end.
       return Response.json(
         {
           error: "Mirror manager not initialized",
           message:
-            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
         },
         { status: 503 },
       );
@@ -551,13 +552,13 @@ export async function route(
         { status: 403 },
       );
     }
-    const manager = getMirrorManager();
+    const manager = getMirrorManager(vaultName);
     if (!manager) {
       return Response.json(
         {
           error: "Mirror manager not initialized",
           message:
-            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
         },
         { status: 503 },
       );
@@ -583,13 +584,13 @@ export async function route(
         { status: 403 },
       );
     }
-    const manager = getMirrorManager();
+    const manager = getMirrorManager(vaultName);
     if (!manager) {
       return Response.json(
         {
           error: "Mirror manager not initialized",
           message:
-            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
         },
         { status: 503 },
       );
@@ -639,13 +640,13 @@ export async function route(
         { status: 403 },
       );
     }
-    const manager = getMirrorManager();
+    const manager = getMirrorManager(vaultName);
     if (!manager) {
       return Response.json(
         {
           error: "Mirror manager not initialized",
           message:
-            "The vault server hasn't wired a mirror manager yet (no vaults exist, or boot failed). Check logs for [mirror] entries.",
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
         },
         { status: 503 },
       );
