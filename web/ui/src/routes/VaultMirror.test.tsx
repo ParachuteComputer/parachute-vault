@@ -39,12 +39,12 @@ const snapshotFixture = (
     enabled: false,
     location: "internal",
     external_path: null,
-    watch: false,
+    sync_mode: "events",
     auto_commit: true,
     auto_push: false,
     commit_template:
       "export: {{date}} ({{notes_changed}} note{{plural}})",
-    interval_seconds: 5,
+    safety_net_seconds: 3600,
     // override any config-typed fields if passed
     ...Object.fromEntries(
       Object.entries(over).filter(([k]) =>
@@ -52,11 +52,11 @@ const snapshotFixture = (
           "enabled",
           "location",
           "external_path",
-          "watch",
+          "sync_mode",
           "auto_commit",
           "auto_push",
           "commit_template",
-          "interval_seconds",
+          "safety_net_seconds",
         ].includes(k),
       ),
     ),
@@ -114,7 +114,7 @@ describe("VaultMirror — admin scope", () => {
       snapshotFixture({
         enabled: true,
         location: "internal",
-        watch: true,
+        sync_mode: "events",
         watch_running: true,
         mirror_path: "/tmp/vault/mirror",
         last_export_at: "2026-05-27T10:00:00.000Z",
@@ -159,7 +159,7 @@ describe("VaultMirror — admin scope", () => {
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
     );
 
-    // Apply "History" preset → enabled, internal, watch on, interval 5
+    // Apply "History" preset → enabled, internal, sync_mode events
     await user.click(
       screen.getByRole("button", { name: /Apply History preset/i }),
     );
@@ -167,15 +167,48 @@ describe("VaultMirror — admin scope", () => {
     const enableCheckbox = screen.getByLabelText(/Enable mirror/i) as HTMLInputElement;
     expect(enableCheckbox.checked).toBe(true);
 
-    // Schedule resolves to "Live (every 5s)" for interval=5 + watch=true
-    const scheduleSelect = screen.getByLabelText(/Schedule/i) as HTMLSelectElement;
-    expect(scheduleSelect.value).toBe("live");
+    // Sync mode resolves to "events" (the new default for hook-driven exports)
+    const syncModeSelect = screen.getByLabelText(/Sync mode/i) as HTMLSelectElement;
+    expect(syncModeSelect.value).toBe("events");
 
     // Internal radio selected
     const internalRadio = screen.getByLabelText(
       /Internal/i,
     ) as HTMLInputElement;
     expect(internalRadio.checked).toBe(true);
+  });
+
+  it("Manual Export preset switches to sync_mode: manual", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
+    renderRoute();
+    const user = userEvent.setup();
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /Apply Manual Export preset/i }),
+    );
+
+    const syncModeSelect = screen.getByLabelText(/Sync mode/i) as HTMLSelectElement;
+    expect(syncModeSelect.value).toBe("manual");
+    expect(
+      screen.getByText(/No auto-fire. Exports only run when you click/i),
+    ).toBeInTheDocument();
+  });
+
+  it("sync_mode events shows the safety-net hint", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture({ enabled: true, sync_mode: "events" }));
+    renderRoute();
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(/Every change to a note, tag, or attachment triggers an export within/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/safety check runs hourly/i)).toBeInTheDocument();
   });
 
   it("clicking Live Mirror preset switches to external location + reveals path field", async () => {
@@ -238,7 +271,7 @@ describe("VaultMirror — admin scope", () => {
   it("Save button calls PUT with the current config", async () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
     vi.mocked(api.putMirror).mockResolvedValue(
-      snapshotFixture({ enabled: true, location: "internal", watch: true }),
+      snapshotFixture({ enabled: true, location: "internal", sync_mode: "events" }),
     );
 
     renderRoute();

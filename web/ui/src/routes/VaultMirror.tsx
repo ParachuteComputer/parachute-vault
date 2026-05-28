@@ -16,12 +16,12 @@
  * The detailed fields below the presets let custom shapes through
  * without bypassing the form's validation.
  *
- * Schedule preset → `interval_seconds` mapping: friendly labels (Live /
- * Every minute / Hourly / Daily / Manual only) on the picker, the
- * backend's existing integer-seconds field on the wire. "Manual only"
- * is the special case that sets `watch: false` — every other choice
- * implies `watch: true` since the value's meaningless when the watch
- * loop isn't running.
+ * Post-event-driven shift (vault#XXX): the granular schedule picker
+ * (Live/Minute/10min/Hourly/Daily/Manual) has been replaced by a binary
+ * sync-mode picker — "On change" (events) and "Manual only" (no
+ * auto-fire). The export is event-driven now; time-based cadence is the
+ * exclusive territory of the operator's own cron (or the admin SPA's
+ * "Run export now" button).
  */
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -43,54 +43,24 @@ type LoadState =
   | { kind: "error"; message: string };
 
 /**
- * Schedule presets — friendly labels operators recognize, mapped to the
- * backend's `interval_seconds` integer. "Manual only" is the odd one
- * out: it sets `watch: false` instead of choosing an interval, because
- * the interval value is meaningless when the watch loop isn't armed.
+ * Sync-mode picker options. "On change" subscribes to in-process hooks
+ * (note / tag / attachment mutations) and debounces them into a single
+ * export pass; the mirror stays fresh as the operator writes. "Manual
+ * only" disables both events and the safety-net poll; only the "Run
+ * export now" button (or `parachute-vault export` from the CLI) fires
+ * an export.
+ *
+ * No schedule picker — the granular Live/Minute/Hourly options the
+ * pre-event-driven UI offered have retired. Events are the live path;
+ * cron is the cadence path; the operator chooses whichever fits.
  */
-const SCHEDULE_OPTIONS: ReadonlyArray<{
-  value: string;
+const SYNC_MODE_OPTIONS: ReadonlyArray<{
+  value: "events" | "manual";
   label: string;
-  interval?: number;
-  watch: boolean;
 }> = [
-  { value: "live", label: "Live (every 5s)", interval: 5, watch: true },
-  { value: "minute", label: "Every minute", interval: 60, watch: true },
-  { value: "10min", label: "Every 10 minutes", interval: 600, watch: true },
-  { value: "hourly", label: "Hourly", interval: 3600, watch: true },
-  { value: "daily", label: "Daily", interval: 86400, watch: true },
-  { value: "manual", label: "Manual only", watch: false },
+  { value: "events", label: "On change (default)" },
+  { value: "manual", label: "Manual only" },
 ];
-
-/**
- * Map the persisted `(watch, interval_seconds)` pair back to the picker
- * value. Non-exact intervals (operator hand-edited config.yaml to 17s,
- * say) fall through to "live" as the closest aligned default; the
- * underlying `interval_seconds` field is still preserved on the config
- * blob until the operator picks a different option and saves.
- */
-function inferScheduleValue(config: MirrorConfig): string {
-  if (!config.watch) return "manual";
-  const match = SCHEDULE_OPTIONS.find(
-    (opt) => opt.watch && opt.interval === config.interval_seconds,
-  );
-  return match?.value ?? "live";
-}
-
-/**
- * Apply a schedule choice to a config blob. "manual" flips watch off;
- * everything else sets watch=true + the named interval.
- */
-function applySchedule(config: MirrorConfig, value: string): MirrorConfig {
-  const opt = SCHEDULE_OPTIONS.find((o) => o.value === value);
-  if (!opt) return config;
-  if (!opt.watch) return { ...config, watch: false };
-  return {
-    ...config,
-    watch: true,
-    interval_seconds: opt.interval ?? config.interval_seconds,
-  };
-}
 
 /**
  * Preset definitions — the three shapes the design doc names. Each is a
@@ -112,41 +82,39 @@ const PRESETS: ReadonlyArray<Preset> = [
     id: "history",
     label: "History",
     subtext:
-      "Local audit trail. Hidden under vault data. Always-on watch.",
+      "Local audit trail. Hidden under vault data. Events-driven.",
     apply: (current) => ({
       ...current,
       enabled: true,
       location: "internal",
-      watch: true,
+      sync_mode: "events",
       auto_commit: true,
       auto_push: false,
-      interval_seconds: 5,
     }),
   },
   {
     id: "live",
     label: "Live Mirror",
     subtext:
-      "Visible folder. Open in Obsidian, push to GitHub.",
+      "Visible folder. Open in Obsidian, push to GitHub. Events-driven.",
     apply: (current) => ({
       ...current,
       enabled: true,
       location: "external",
-      watch: true,
+      sync_mode: "events",
       auto_commit: true,
       // Don't force-flip auto_push — operator may not have credentials yet.
-      interval_seconds: 5,
     }),
   },
   {
     id: "manual",
     label: "Manual Export",
-    subtext: "Snapshot on demand.",
+    subtext: "Snapshot on demand. No auto-fire.",
     apply: (current) => ({
       ...current,
       enabled: true,
       location: "external",
-      watch: false,
+      sync_mode: "manual",
       auto_commit: true,
       auto_push: false,
     }),
@@ -387,7 +355,6 @@ function ConfigForm({
   onSaved: (snap: MirrorSnapshot) => void;
 }) {
   const [config, setConfig] = useState<MirrorConfig>(initial);
-  const [schedule, setSchedule] = useState<string>(inferScheduleValue(initial));
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [saving, setSaving] = useState(false);
   // Field-level error gets rendered next to that field; the bare
@@ -401,18 +368,15 @@ function ConfigForm({
   // freeze on the first-rendered snapshot and ignore subsequent reloads.
   useEffect(() => {
     setConfig(initial);
-    setSchedule(inferScheduleValue(initial));
   }, [initial]);
 
   const onApplyPreset = (preset: Preset) => {
     const next = preset.apply(config);
     setConfig(next);
-    setSchedule(inferScheduleValue(next));
   };
 
-  const onChangeSchedule = (value: string) => {
-    setSchedule(value);
-    setConfig((prev) => applySchedule(prev, value));
+  const onChangeSyncMode = (value: "events" | "manual") => {
+    setConfig((prev) => ({ ...prev, sync_mode: value }));
   };
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -439,7 +403,9 @@ function ConfigForm({
         const lower = msg.toLowerCase();
         if (lower.includes("external_path")) setErrorField("external_path");
         else if (lower.includes("commit_template")) setErrorField("commit_template");
-        else if (lower.includes("interval_seconds")) setErrorField("interval_seconds");
+        else if (lower.includes("safety_net_seconds")) setErrorField("safety_net_seconds");
+        else if (lower.includes("sync_mode")) setErrorField("sync_mode");
+        else if (lower.includes("auto_push")) setErrorField("auto_push");
         else if (lower.includes("location")) setErrorField("location");
         else setErrorField(null);
       } else {
@@ -554,23 +520,23 @@ function ConfigForm({
       ) : null}
 
       <div className="form-row">
-        <label htmlFor="schedule-select">Schedule</label>
+        <label htmlFor="sync-mode-select">Sync mode</label>
         <select
-          id="schedule-select"
-          value={schedule}
+          id="sync-mode-select"
+          value={config.sync_mode}
           disabled={readOnly}
-          onChange={(e) => onChangeSchedule(e.target.value)}
+          onChange={(e) => onChangeSyncMode(e.target.value as "events" | "manual")}
         >
-          {SCHEDULE_OPTIONS.map((opt) => (
+          {SYNC_MODE_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>
               {opt.label}
             </option>
           ))}
         </select>
         <p className="dim" style={{ margin: "0.35rem 0 0" }}>
-          {schedule === "manual"
-            ? "Watch loop disabled — exports only fire when you click \"Run export now\"."
-            : "Watch loop runs in-process and triggers an export pass at the chosen interval."}
+          {config.sync_mode === "manual"
+            ? "No auto-fire. Exports only run when you click \"Run export now\" (or run `parachute-vault export` from the CLI)."
+            : "Every change to a note, tag, or attachment triggers an export within ~500ms. A background safety check runs hourly to catch anything missed."}
         </p>
       </div>
 
