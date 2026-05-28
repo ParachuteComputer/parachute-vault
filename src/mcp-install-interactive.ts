@@ -190,9 +190,9 @@ export async function runInteractiveInstall(
         "Choices:",
         "  Enter       → mint a hub JWT with vault:read scope (recommended).",
         "  write       → mint with vault:write (mutations).",
-        "  admin       → mint a vault-DB pvt_* with vault:admin (schema management;",
-        "                hub policy reserves per-vault admin for operator-only paths,",
-        "                so this auto-routes to legacy-pat).",
+        "  admin       → mint a hub JWT with vault:<name>:admin (schema management).",
+        "                Requires parachute:host:admin on the operator token (the",
+        "                default operator.token carries it). NOT legacy-pat.",
         "  paste       → use an existing token instead of minting.",
         "  legacy      → mint a vault-DB pvt_* (self-hosted-without-hub).",
       ].join("\n"),
@@ -212,22 +212,13 @@ export async function runInteractiveInstall(
       // JWT's scope. (vault#292 review F2.)
       scope = await askScope(io);
     } else if (answer === "admin") {
-      // `vault:<name>:admin` is non-requestable via hub mint-token by
-      // policy — only the session-cookie-gated `/admin/vault-admin-token/:name`
-      // endpoint can mint per-vault admin scopes (see
-      // `parachute-hub/src/scope-explanations.ts:VAULT_ADMIN_RE` and
-      // `api-mint-token.ts`'s non-requestable guard). Hub returns
-      // HTTP 400 invalid_scope: "scope vault:<name>:admin is not
-      // requestable via mint-token; use OAuth flow or operator rotation".
-      //
-      // Auto-route to legacy-pat which mints a vault-DB pvt_* with full
-      // permissions — that's the right shape for an operator who wants
-      // admin scope on a local MCP entry. Print a one-line explanation
-      // so the switch isn't silent.
-      io.log("  → admin requires a vault-DB pvt_* (hub policy: per-vault admin");
-      io.log("    is operator-only, not mintable via the public mint-token API).");
-      io.log("    Switching to legacy-pat mode with vault:admin scope.");
-      mode = "legacy-pat";
+      // `vault:<name>:admin` is now mintable via hub mint-token when the
+      // operator's bearer carries `parachute:host:admin` (hub PR-A, hub#449).
+      // The default operator.token carries host-admin, so this is the
+      // canonical admin path — no more legacy-pat fallback. The verb
+      // extraction downstream narrows `vault:admin` → `vault:<name>:admin`.
+      io.log("  → admin will be minted as a scope-narrowed hub JWT (vault:" + vaultName + ":admin).");
+      mode = "mint";
       scope = "vault:admin";
     } else {
       mode = "mint";
@@ -243,7 +234,7 @@ export async function runInteractiveInstall(
     const answer = await askPersistent(io, "Which? [paste / legacy]", "paste", {
       help: [
         "  paste  → use an existing bearer (hub JWT, pvt_*, anything).",
-        "  legacy → mint a vault-DB pvt_* token (deprecated, vault#288).",
+        "  legacy → mint a vault-DB pvt_* token (deprecated, vault#282).",
       ].join("\n"),
       validate: (s) => (s === "paste" || s === "legacy" ? null : "expected: paste or legacy"),
     });
@@ -288,7 +279,7 @@ export async function runInteractiveInstall(
   if (mode === "mint") {
     io.log(`  Scope: ${scope} → narrowed to vault:${vaultName}:${scope.split(":")[1]}.`);
   } else if (mode === "legacy-pat") {
-    io.log(`  Scope: ${scope}. The pvt_* token is vault-DB-resident (vault#288 deprecation).`);
+    io.log(`  Scope: ${scope}. The pvt_* token is vault-DB-resident (vault#282 deprecation).`);
   } else {
     // mode === "token" (paste). The pasted bearer carries its own scope
     // claim — we don't inspect or override it; whatever scope the issuer

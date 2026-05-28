@@ -523,44 +523,53 @@ describe("mcp-install flag parsing", () => {
     expect(res.stderr).toMatch(/No hub origin configured/);
   });
 
-  test("rejects --mint --scope vault:admin pre-flight (hub policy: per-vault admin is non-requestable)", () => {
-    // Regression for the symptom Aaron hit on hub 0.5.12-rc.2 / vault
-    // 0.4.7-rc.1: `parachute vault mcp-install` with the "admin" mint
-    // option sent `vault:default:admin` to `POST /api/auth/mint-token`,
-    // and hub responded:
+  test("--mint --scope vault:admin is no longer pre-flight-rejected — it reaches the hub mint call (hub PR-A / hub#449)", () => {
+    // Before hub PR-A (hub#449), vault rejected `--mint --scope vault:admin`
+    // pre-flight because hub's mint-token endpoint refused per-vault admin
+    // by policy. PR-A made hub mint `vault:<name>:admin` when the operator
+    // bearer carries `parachute:host:admin` (the default operator.token
+    // does), so admin is now a normal mint. This test confirms the
+    // pre-flight reject is GONE: admin passes the operator-token + hub-origin
+    // checks and reaches the actual `POST /api/auth/mint-token` call.
     //
-    //   Hub mint-token rejected (HTTP 400, invalid_scope):
-    //   scope vault:default:admin is not requestable via mint-token;
-    //   use OAuth flow or operator rotation
-    //
-    // The combination is invalid by hub policy (see
-    // `parachute-hub/src/scope-explanations.ts:VAULT_ADMIN_RE` and
-    // `api-mint-token.ts`'s non-requestable guard) — per-vault admin
-    // is operator-only, mintable only through the session-cookie-gated
-    // `/admin/vault-admin-token/:name` SPA path.
-    //
-    // The fix rejects the combination pre-flight in vault's mcp-install
-    // with a clear remediation pointing at `--legacy-pat --scope vault:admin`
-    // (which mints a vault-DB pvt_* with admin scope — the right shape
-    // for a local MCP entry needing schema management).
+    // We point at an unreachable loopback origin so the mint fails fast in
+    // the network branch — the assertion is on what's ABSENT (the old
+    // "not requestable" / legacy-pat-remediation copy), proving admin is no
+    // longer special-cased before the network hit.
     setupBareVault(tmp, "default");
     fs.writeFileSync(path.join(tmp, "operator.token"), "operator-bearer-stub");
     const res = runCli(
       ["mcp-install", "--mint", "--scope", "vault:admin"],
       tmp,
-      { PARACHUTE_HUB_ORIGIN: "https://hub.example.org" },
+      { PARACHUTE_HUB_ORIGIN: "http://127.0.0.1:1" },
     );
+    // Still exits 1 (the loopback hub is unreachable), but via the network
+    // branch — not the old admin pre-flight reject.
     expect(res.exitCode).toBe(1);
-    // Surface the policy reason so the operator knows why this combo is
-    // rejected (not a transient bug).
-    expect(res.stderr).toMatch(/not requestable via mint-token/);
-    // Point at the working remediation.
-    expect(res.stderr).toMatch(/--legacy-pat --scope vault:admin/);
-    // Pre-flight must fire BEFORE the operator-token / hub-origin checks
-    // pass the request to the network — no "Hub unreachable" / "No hub
-    // origin configured" leak.
+    // The old policy-reject copy must be gone.
+    expect(res.stderr).not.toMatch(/not requestable via mint-token/);
+    expect(res.stderr).not.toMatch(/--legacy-pat --scope vault:admin/);
+    // It got past the operator-token + hub-origin pre-flight checks.
+    expect(res.stderr).not.toMatch(/No operator token found/);
     expect(res.stderr).not.toMatch(/No hub origin configured/);
-    expect(res.stderr).not.toMatch(/Hub unreachable/);
+    // It actually attempted the mint and hit the network failure branch.
+    expect(res.stderr).toMatch(/Hub unreachable/);
+  });
+
+  test("`--help` text says vault:admin is mintable via --mint (regression guard for hub#449)", () => {
+    // The P0 on vault#397 review: the `usage()` mcp-install block still said
+    // admin "requires --legacy-pat" / "rejected pre-flight" after hub#449 made
+    // it mintable. Three comment blocks were updated but this literal slipped.
+    // This test pins the help string so the regression can't recur silently.
+    const res = runCli(["--help"], tmp);
+    expect(res.exitCode).toBe(0);
+    // Help text wraps across lines, so collapse whitespace before matching.
+    const help = res.stdout.replace(/\s+/g, " ");
+    // Admin is mintable via --mint now.
+    expect(help).toMatch(/--scope vault:admin IS mintable via --mint/);
+    // The old false claims must be gone.
+    expect(help).not.toMatch(/rejected pre-flight/);
+    expect(help).not.toMatch(/the only path for --scope vault:admin/);
   });
 });
 
@@ -835,7 +844,7 @@ describe("mcp-install end-to-end", () => {
     // see what they're opting into.
     expect(res.stderr).toMatch(/--legacy-pat mints a vault-DB pvt_/);
     expect(res.stderr).toMatch(/canonical install going forward/);
-    expect(res.stderr).toMatch(/vault#288/);
+    expect(res.stderr).toMatch(/vault#282/);
     expect(res.stderr).toMatch(/planned removal 0\.6\.0/);
     const config = readJson(path.join(tmp, ".claude.json"));
     const bearer = config.mcpServers["parachute-vault"].headers.Authorization;
