@@ -45,13 +45,34 @@ function requiredVerbForTool(tool: { requiredVerb?: VaultVerb }): VaultVerb {
   return tool.requiredVerb ?? "write";
 }
 
-/** Handle scoped MCP at /vault/{name}/mcp (single vault). */
-export async function handleScopedMcp(req: Request, vaultName: string, auth: AuthResult): Promise<Response> {
+/**
+ * Handle scoped MCP at /vault/{name}/mcp (single vault).
+ *
+ * `callerBearer` is the RAW credential the session presented (from
+ * `extractApiKey`). It's threaded into `generateScopedMcpTools` so the
+ * manage-token tool can forward it to hub's mint-token attenuation proxy
+ * (vault#403, MGT). NULL when the request carried no bearer (auth would have
+ * already rejected) — the tool treats a missing/non-JWT bearer as
+ * non-forwardable and returns a clear error on mint.
+ */
+export async function handleScopedMcp(
+  req: Request,
+  vaultName: string,
+  auth: AuthResult,
+  callerBearer?: string | null,
+): Promise<Response> {
   // Auth flows through to getServerInstruction so the connect-time
   // markdown brief is filtered by `scoped_tags` — symmetric with the
   // JSON `vault-info` wrapper.
   const instruction = await getServerInstruction(vaultName, auth);
-  return handleMcp(req, () => generateScopedMcpTools(vaultName, auth), `parachute-vault/${vaultName}`, vaultName, auth, instruction);
+  return handleMcp(
+    req,
+    () => generateScopedMcpTools(vaultName, auth, callerBearer ?? null),
+    `parachute-vault/${vaultName}`,
+    vaultName,
+    auth,
+    instruction,
+  );
 }
 
 async function handleMcp(
