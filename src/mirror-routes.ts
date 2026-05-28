@@ -61,6 +61,7 @@ import {
   type ImportAuth,
   type ImportResult,
 } from "./mirror-import.ts";
+import { redactToken } from "./export-watch.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 
@@ -206,6 +207,44 @@ export async function handleMirrorRunNow(
     {
       config: manager.getConfig(),
       status: updated,
+    },
+    { headers: { "Access-Control-Allow-Origin": "*" } },
+  );
+}
+
+/**
+ * `POST /vault/<name>/.parachute/mirror/push-now` — Cut 6 of vault#392.
+ *
+ * Fire a push against the currently-committed state of the mirror dir.
+ * Distinguished from `/run-now` which exports + commits + pushes —
+ * `push-now` is the credentials-side flow where the operator just wants
+ * to see "did the credentials I just saved actually work?"
+ *
+ * Returns the post-push status snapshot. Errors (no path, mirror
+ * disabled, push failed) surface as a JSON response — push failures
+ * are NOT 500s because the operator's expected next-step is to look at
+ * `last_push_error` and fix their remote, not "vault crashed."
+ */
+export async function handleMirrorPushNow(
+  manager: MirrorManager,
+): Promise<Response> {
+  const status = manager.getStatus();
+  if (!status.enabled) {
+    return Response.json(
+      {
+        error: "Mirror not enabled",
+        message:
+          "Mirror must be enabled before a push can fire. Enable it via PUT /.parachute/mirror first.",
+      },
+      { status: 400 },
+    );
+  }
+  const result = await manager.pushNow();
+  return Response.json(
+    {
+      config: manager.getConfig(),
+      status: manager.getStatus(),
+      push: result,
     },
     { headers: { "Access-Control-Allow-Origin": "*" } },
   );
@@ -602,9 +641,29 @@ export async function handleAuthPat(
   // resolved + on disk. Non-fatal if the mirror isn't running.
   await applyCredentialsToMirror(manager);
 
-  return Response.json(sanitizeCredentials(next), {
-    headers: { "Access-Control-Allow-Origin": "*" },
-  });
+  // Cut 3: auto-enable auto_push when credentials save. Operator wiring
+  // credentials almost certainly wants pushes to fire — silent
+  // "credentials saved but pushes never happen" is the bug Aaron hit.
+  // If `auto_push` was already true, leave it alone (idempotent).
+  const autoPushChange = await maybeEnableAutoPush(manager);
+
+  // Cut 6: kick off an initial push-now so the operator sees the push
+  // happen immediately rather than waiting for the next write event.
+  // Only when (a) auto_push ended up true AND (b) there are local commits
+  // ahead of the (now-configured) remote.
+  const initialPush = await maybeFireInitialPush(manager, autoPushChange.auto_push_now_enabled);
+
+  return Response.json(
+    {
+      ...sanitizeCredentials(next),
+      auto_push_was_already_enabled: autoPushChange.was_already_enabled,
+      auto_push_enabled: autoPushChange.auto_push_now_enabled,
+      initial_push: initialPush,
+    },
+    {
+      headers: { "Access-Control-Allow-Origin": "*" },
+    },
+  );
 }
 
 /**
@@ -846,6 +905,12 @@ export async function handleAuthGithubSelectRepo(
     }
     applied = true;
   }
+  // Cut 3 / Cut 6: auto-enable auto_push + fire initial push if there's
+  // anything to push. Same logic as handleAuthPat — operator picking a
+  // repo wants the push to fire.
+  const autoPushChange = await maybeEnableAutoPush(manager);
+  const initialPush = await maybeFireInitialPush(manager, autoPushChange.auto_push_now_enabled);
+
   return Response.json(
     {
       ok: true,
@@ -855,9 +920,96 @@ export async function handleAuthGithubSelectRepo(
       // Echo the redacted form back so the SPA can show "pushing to <repo>".
       // No raw token in the response.
       remote: `https://github.com/${owner}/${name}.git`,
+      auto_push_was_already_enabled: autoPushChange.was_already_enabled,
+      auto_push_enabled: autoPushChange.auto_push_now_enabled,
+      initial_push: initialPush,
     },
     { headers: { "Access-Control-Allow-Origin": "*" } },
   );
+}
+
+/**
+ * Cut 3: when credentials save, flip `auto_push` from false → true on
+ * the persisted config. Operators wiring credentials almost certainly
+ * want pushes to fire — silent "credentials saved but no push" was the
+ * three-stacking-gaps bug Aaron hit.
+ *
+ * Idempotent: if `auto_push` was already true, no config write happens.
+ * If `auto_push` is false, write the flipped config via `manager.reload`
+ * — that restarts the lifecycle and applies the credentials to the
+ * remote in the same pass.
+ *
+ * Returns a small struct so the route handler can shape the response:
+ *   - `was_already_enabled` — true iff auto_push was true before this call.
+ *   - `auto_push_now_enabled` — true iff auto_push is true after this call.
+ *
+ * Both being false means the operator deliberately left auto_push off
+ * and we leave it that way (we never touch a config whose mirror is
+ * disabled, and we never flip true → false).
+ */
+async function maybeEnableAutoPush(
+  manager: MirrorManager,
+): Promise<{ was_already_enabled: boolean; auto_push_now_enabled: boolean }> {
+  const config = manager.getConfig();
+  // Don't muck with auto_push when the mirror is disabled — the operator
+  // is configuring credentials before turning the mirror on, which is a
+  // legitimate sequence. They'll flip enabled themselves.
+  if (!config.enabled) {
+    return {
+      was_already_enabled: config.auto_push,
+      auto_push_now_enabled: config.auto_push,
+    };
+  }
+  if (config.auto_push) {
+    return { was_already_enabled: true, auto_push_now_enabled: true };
+  }
+  try {
+    await manager.reload({ ...config, auto_push: true });
+    return { was_already_enabled: false, auto_push_now_enabled: true };
+  } catch (err) {
+    console.warn(
+      `[mirror-auth] could not auto-enable auto_push (non-fatal): ${(err as Error).message ?? err}`,
+    );
+    return { was_already_enabled: false, auto_push_now_enabled: false };
+  }
+}
+
+/**
+ * Cut 6: after credential save, fire a `push-now` immediately so the
+ * operator sees the push happen rather than waiting for the next write
+ * event. Only when (a) auto_push is enabled (we just turned it on, or it
+ * was already on) AND (b) there are local commits to push.
+ *
+ * Best-effort: non-fatal on any failure. Returns a struct the caller
+ * folds into its response.
+ */
+async function maybeFireInitialPush(
+  manager: MirrorManager,
+  autoPushEnabled: boolean,
+): Promise<
+  | { fired: false; reason: "auto_push_disabled" | "no_mirror_path" | "manager_skipped" | "not_enabled" }
+  | { fired: true; pushed: boolean; error?: string; sha?: string }
+> {
+  if (!autoPushEnabled) return { fired: false, reason: "auto_push_disabled" };
+  const status = manager.getStatus();
+  if (!status.mirror_path) return { fired: false, reason: "no_mirror_path" };
+  // Need an active enabled mirror with a resolved path to push from.
+  if (!status.enabled) return { fired: false, reason: "manager_skipped" };
+  try {
+    const result = await manager.pushNow();
+    return result;
+  } catch (err) {
+    // Defense-in-depth: every other push-error site routes through
+    // `redactToken` before surfacing — this catch-block was the one
+    // outlier where a thrown error's `.message` could carry an
+    // un-redacted token from a future code path that throws before the
+    // existing internal redaction runs. Apply the same scrub here.
+    // Reviewer-flagged on vault#392.
+    const rawMessage = (err as Error).message ?? String(err);
+    const safeMessage = redactToken(rawMessage);
+    console.warn(`[mirror-auth] initial push-now failed (non-fatal): ${safeMessage}`);
+    return { fired: true, pushed: false, error: safeMessage };
+  }
 }
 
 /**

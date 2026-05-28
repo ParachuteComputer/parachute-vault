@@ -30,11 +30,13 @@ import {
   type DeviceCodeResponse,
   type GitHubRepoInfo,
   type MirrorConfig,
+  type MirrorCredentialSaveResult,
   type MirrorCredentialStatus,
   type MirrorImportCredentials,
   type MirrorImportResult,
   type MirrorSnapshot,
   type MirrorStatus,
+  type SelectGithubRepoResult,
   createGithubRepo,
   deleteMirrorAuth,
   getMirror,
@@ -43,6 +45,7 @@ import {
   pollGithubDeviceFlow,
   postMirrorAuthPat,
   postMirrorImport,
+  pushMirrorNow,
   putMirror,
   runMirrorNow,
   selectGithubRepo,
@@ -260,7 +263,8 @@ function MirrorScreen({
     <>
       <StatusCard
         status={snapshot.status}
-        enabled={snapshot.config.enabled}
+        config={snapshot.config}
+        creds={creds}
         canRun={isAdmin && snapshot.status.enabled}
         vaultName={vaultName}
         onSnapshot={onSnapshot}
@@ -288,6 +292,12 @@ function MirrorScreen({
           creds={creds}
           credsError={credsError}
           onCredsChanged={setCreds}
+          onCredsSaved={() => {
+            // Refresh the snapshot so the new auto_push + status fields
+            // (last_push_at, last_push_sha, commits_unpushed) land in
+            // the SPA's view of state. Same trigger as putMirror.
+            onRefresh();
+          }}
           locationIsExternal={snapshot.config.location === "external"}
         />
       ) : null}
@@ -303,18 +313,22 @@ function MirrorScreen({
 
 function StatusCard({
   status,
-  enabled,
+  config,
+  creds,
   canRun,
   vaultName,
   onSnapshot,
 }: {
   status: MirrorStatus;
-  enabled: boolean;
+  config: MirrorConfig;
+  creds: MirrorCredentialStatus | null;
   canRun: boolean;
   vaultName: string;
   onSnapshot: (snap: MirrorSnapshot) => void;
 }) {
+  const enabled = config.enabled;
   const [running, setRunning] = useState(false);
+  const [pushing, setPushing] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
 
   const onRun = async () => {
@@ -329,6 +343,26 @@ function StatusCard({
       setRunning(false);
     }
   };
+
+  const onPushNow = async () => {
+    setPushing(true);
+    setRunError(null);
+    try {
+      const snap = await pushMirrorNow(vaultName);
+      onSnapshot(snap);
+    } catch (err) {
+      setRunError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPushing(false);
+    }
+  };
+
+  // Cut 6: disable "Push now" when there's no remote to push to (no
+  // credentials AND auto_push is false). Operators with auto_push on
+  // but no creds yet still get the button — clicking will surface the
+  // missing-credentials error cleanly via last_push_error.
+  const hasRemote = !!creds?.active_method || config.auto_push;
+  const pushDisabled = !canRun || pushing || !hasRemote;
 
   return (
     <div className="section">
@@ -366,7 +400,41 @@ function StatusCard({
             <span className="dim">—</span>
           )}
         </div>
+        {/* Cut 5: push status. Always render the row so the operator
+            can read "never" — silence here was a footgun (Aaron's bug:
+            "did the push actually fire?" with nothing to look at). */}
+        <div>Last push</div>
+        <div>
+          {status.last_push_at ? (
+            <>
+              <code>{status.last_push_at}</code>
+              {status.last_push_sha ? (
+                <span className="dim">
+                  {" "}· <code>{status.last_push_sha.slice(0, 10)}</code>
+                </span>
+              ) : null}
+            </>
+          ) : (
+            <span className="dim">never</span>
+          )}
+        </div>
+        {/* Surface commits_unpushed as a subdued helper when there's
+            work pending and no recent push. Hides when 0 (synced) or
+            null (no upstream yet — too noisy on first-boot). */}
+        {status.commits_unpushed !== null && status.commits_unpushed > 0 ? (
+          <>
+            <div></div>
+            <div className="dim">
+              {status.commits_unpushed} commit{status.commits_unpushed === 1 ? "" : "s"} ready to push
+            </div>
+          </>
+        ) : null}
       </div>
+      {status.last_push_error ? (
+        <div className="error-banner" style={{ marginTop: "1rem" }}>
+          <strong>Last push failed:</strong> <code>{status.last_push_error}</code>
+        </div>
+      ) : null}
       {status.last_error ? (
         <div className="error-banner" style={{ marginTop: "1rem" }}>
           <strong>Last error:</strong> <code>{status.last_error}</code>
@@ -391,6 +459,23 @@ function StatusCard({
           }
         >
           {running ? "Running…" : "Run export now"}
+        </button>
+        <button
+          type="button"
+          className="secondary"
+          onClick={onPushNow}
+          disabled={pushDisabled}
+          title={
+            !enabled
+              ? "Enable the mirror first, then push."
+              : !canRun
+                ? "Admin scope required to push."
+                : !hasRemote
+                  ? "Wire credentials or turn on auto-push to push to a remote."
+                  : undefined
+          }
+        >
+          {pushing ? "Pushing…" : "Push now"}
         </button>
       </div>
     </div>
@@ -627,7 +712,26 @@ function ConfigForm({
         ) : null}
       </div>
 
-      {config.location === "external" ? (
+      {/*
+        Show the auto_push checkbox when EITHER:
+          - location is external (vault doesn't manage the working tree;
+            the operator might have wired their own git remote), OR
+          - credentials are configured (PAT or GitHub OAuth) — at which
+            point vault has a remote to push to regardless of where the
+            working tree lives. The credential save path writes `origin`
+            on the mirror dir whether it's internal or external.
+
+        The old pattern hid the checkbox on internal locations under the
+        assumption "internal = no remote." That breaks the round-trip
+        Aaron hit: History preset (internal) + PAT saved → no way to
+        flip auto_push on from the UI. Now the checkbox renders whenever
+        the operator has a remote to push to.
+
+        Backend validation (mirror-config.ts:validateMirrorConfigShape)
+        mirrors this: auto_push + internal is accepted iff credentials
+        are wired; rejected otherwise with an actionable error.
+      */}
+      {config.location === "external" || creds?.active_method ? (
         <div className="form-row">
           <label>
             <input
@@ -641,6 +745,11 @@ function ConfigForm({
             />
             Push after each commit
           </label>
+          <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.9em" }}>
+            When credentials are configured, vault can push the mirror's commits
+            to your remote regardless of whether the mirror folder lives under
+            vault's data dir or somewhere visible.
+          </p>
           {config.auto_push ? (
             creds?.active_method ? (
               <div className="info-banner" style={{ marginTop: "0.5rem" }} role="status">
@@ -665,16 +774,6 @@ function ConfigForm({
           ) : null}
         </div>
       ) : null}
-      {/*
-        Internal-location mirrors live under ~/.parachute/vault/data and have
-        no configured git remote — a push would always fail. Hide the checkbox
-        entirely rather than render a disabled one: the option is meaningless,
-        not just unavailable. If a stored config carries auto_push:true +
-        location:internal (e.g. operator switched from external→internal
-        without unticking), the value persists on the config blob until they
-        save a different one — the watch loop just skips pushes because there's
-        no remote. Reviewer-flagged on #380.
-      */}
 
       <div className="form-row">
         <button
@@ -764,18 +863,35 @@ function GitRemoteSection({
   creds,
   credsError,
   onCredsChanged,
+  onCredsSaved,
   locationIsExternal,
 }: {
   vaultName: string;
   creds: MirrorCredentialStatus | null;
   credsError: string | null;
   onCredsChanged: (creds: MirrorCredentialStatus) => void;
+  /**
+   * Cut 3/6 — fires AFTER a successful save when the backend
+   * auto-enables auto_push or fires an initial push, with the full save
+   * result. Parent refreshes the mirror snapshot so the new
+   * auto_push + last_push_at land in the SPA's view of state.
+   */
+  onCredsSaved: (result: MirrorCredentialSaveResult | SelectGithubRepoResult) => void;
   locationIsExternal: boolean;
 }) {
   const [oauthOpen, setOauthOpen] = useState(false);
   const [patOpen, setPatOpen] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  /**
+   * Toast surfaced after a successful credential save. Holds the save
+   * result so the toast text can reference the actual push outcome
+   * ("pushed sha abc1234" vs "auto-push enabled, next commit pushes").
+   * Auto-dismisses on the next save or after a click.
+   */
+  const [saveResult, setSaveResult] = useState<
+    MirrorCredentialSaveResult | SelectGithubRepoResult | null
+  >(null);
 
   const connected = creds?.active_method !== null && creds?.active_method !== undefined;
 
@@ -805,10 +921,19 @@ function GitRemoteSection({
         <code>0600</code> file permissions. Never sent to GitHub or any third party.
       </p>
 
-      {!locationIsExternal ? (
+      {/*
+        Pre-Cut-2 this read "Internal mirrors live under … no remote.
+        Switch to External." With Cut 1/2 wired (auto_push works on
+        internal location when credentials are configured), the message
+        only applies when NO credentials are wired yet AND the location
+        is internal — the case where there's genuinely nothing to push
+        to. After credentials land, internal mirrors push fine.
+      */}
+      {!locationIsExternal && !creds?.active_method ? (
         <div className="info-banner" style={{ marginBottom: "0.75rem" }} role="status">
-          Internal mirrors live under the vault's data directory and have no remote.
-          Switch the location above to <strong>External</strong> to enable pushing.
+          Internal mirrors live under the vault's data directory. To push them
+          to a remote, paste a Personal Access Token + remote URL below — that
+          wires the remote and turns on auto-push automatically.
         </div>
       ) : null}
 
@@ -872,6 +997,84 @@ function GitRemoteSection({
         </div>
       ) : null}
 
+      {/* Cut 3 / Cut 6 confirmation toast. Renders after a successful PAT
+          save / OAuth repo pick when the backend auto-enabled auto_push
+          and/or fired an initial push. The copy adapts to the four
+          shapes: was-already-on, just-enabled+pushed, just-enabled+
+          push-failed, just-enabled+nothing-to-push. */}
+      {saveResult ? (
+        <div
+          className="mint-banner"
+          style={{ marginBottom: "0.75rem" }}
+          role="status"
+        >
+          <strong>Credentials saved.</strong>{" "}
+          {(() => {
+            const sr = saveResult;
+            const pushedSha =
+              sr.initial_push.fired && sr.initial_push.pushed
+                ? sr.initial_push.sha
+                : undefined;
+            const pushError =
+              sr.initial_push.fired && !sr.initial_push.pushed
+                ? sr.initial_push.error
+                : undefined;
+            if (sr.auto_push_was_already_enabled) {
+              if (pushedSha) {
+                return (
+                  <>
+                    Auto-push was already on; just pushed{" "}
+                    <code>{pushedSha.slice(0, 10)}</code>.
+                  </>
+                );
+              }
+              if (pushError) {
+                return (
+                  <>
+                    Auto-push was already on; the push attempt failed —
+                    see the Status card above for details.
+                  </>
+                );
+              }
+              return <>Auto-push was already on; nothing to push right now.</>;
+            }
+            if (sr.auto_push_enabled) {
+              if (pushedSha) {
+                return (
+                  <>
+                    Auto-push enabled and the first push landed{" "}
+                    <code>{pushedSha.slice(0, 10)}</code>. Your next commit will
+                    push to the remote too.
+                  </>
+                );
+              }
+              if (pushError) {
+                return (
+                  <>
+                    Auto-push enabled. The initial push attempt failed — see
+                    the Status card above for the error.
+                  </>
+                );
+              }
+              return (
+                <>Auto-push enabled. Your next commit will push to the remote.</>
+              );
+            }
+            return <>Credentials wired. Auto-push remains off; flip it on in
+              Configuration above to push commits automatically.</>;
+          })()}{" "}
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => setSaveResult(null)}
+            style={{ marginLeft: "0.5rem" }}
+            aria-label="Dismiss"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+
       <div className="actions">
         {!connected ? (
           <>
@@ -910,8 +1113,12 @@ function GitRemoteSection({
         <GithubOAuthModal
           vaultName={vaultName}
           onClose={() => setOauthOpen(false)}
-          onConnected={(c) => {
+          onConnected={(c, selectResult) => {
             onCredsChanged(c);
+            if (selectResult) {
+              setSaveResult(selectResult);
+              onCredsSaved(selectResult);
+            }
             setOauthOpen(false);
           }}
         />
@@ -921,8 +1128,10 @@ function GitRemoteSection({
         <PATModal
           vaultName={vaultName}
           onClose={() => setPatOpen(false)}
-          onSaved={(c) => {
-            onCredsChanged(c);
+          onSaved={(result) => {
+            onCredsChanged(result);
+            setSaveResult(result);
+            onCredsSaved(result);
             setPatOpen(false);
           }}
         />
@@ -948,7 +1157,16 @@ function GithubOAuthModal({
 }: {
   vaultName: string;
   onClose: () => void;
-  onConnected: (creds: MirrorCredentialStatus) => void;
+  /**
+   * Cut 3/6: second arg carries the select-repo result so the parent
+   * can surface a confirmation toast with auto_push + initial push
+   * details. Undefined when the modal closes without a repo pick (e.g.
+   * cancel during the device-code phase).
+   */
+  onConnected: (
+    creds: MirrorCredentialStatus,
+    selectResult?: SelectGithubRepoResult,
+  ) => void;
 }) {
   const [phase, setPhase] = useState<OAuthPhase>({ kind: "starting" });
   const [now, setNow] = useState(Date.now());
@@ -1086,9 +1304,9 @@ function GithubOAuthModal({
             vaultName={vaultName}
             user={phase.user}
             onPicked={async (owner, name) => {
-              await selectGithubRepo(vaultName, { owner, name });
+              const selectResult = await selectGithubRepo(vaultName, { owner, name });
               const c = await getMirrorAuth(vaultName);
-              onConnected(c);
+              onConnected(c, selectResult);
             }}
             onError={(message) => setPhase({ kind: "error", message })}
           />
@@ -1300,7 +1518,9 @@ function PATModal({
 }: {
   vaultName: string;
   onClose: () => void;
-  onSaved: (creds: MirrorCredentialStatus) => void;
+  /** Cut 3/6: the result now carries auto_push side-effects + initial
+   *  push outcome so the parent can render a confirmation toast. */
+  onSaved: (result: MirrorCredentialSaveResult) => void;
 }) {
   const [token, setToken] = useState("");
   const [remoteUrl, setRemoteUrl] = useState("");
@@ -1313,12 +1533,12 @@ function PATModal({
     setSaving(true);
     setError(null);
     try {
-      const creds = await postMirrorAuthPat(vaultName, {
+      const result = await postMirrorAuthPat(vaultName, {
         token: token.trim(),
         remote_url: remoteUrl.trim(),
         label: label.trim() || undefined,
       });
-      onSaved(creds);
+      onSaved(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

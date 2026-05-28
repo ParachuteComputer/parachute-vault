@@ -333,17 +333,76 @@ describe("validateMirrorConfigShape", () => {
     if (r.ok) expect(r.config.sync_mode).toBe("manual");
   });
 
-  test("rejects auto_push + internal location (validation rather than silent-fail)", () => {
-    // Pre-event-driven shape silently let push fail at runtime for
-    // internal mirrors. Now we reject the combination at config time so
-    // the operator sees the issue immediately.
-    const r = validateMirrorConfigShape({
-      enabled: true,
-      location: "internal",
-      auto_push: true,
-    });
+  test("rejects auto_push + internal location WHEN no credentials are configured", () => {
+    // Pre-credentials shape: auto_push + internal was rejected outright
+    // (internal mirror = no remote = push would silently fail). Once
+    // credentials are wired (PAT or GitHub OAuth), the credential save
+    // path sets `origin` on the internal repo too — so push IS
+    // meaningful. We keep the rejection only on the no-credentials path,
+    // with a clear error pointing the operator at the credential flow.
+    const r = validateMirrorConfigShape(
+      {
+        enabled: true,
+        location: "internal",
+        auto_push: true,
+      },
+      { readCredentials: () => null },
+    );
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.field).toBe("auto_push");
+    if (!r.ok) {
+      expect(r.field).toBe("auto_push");
+      expect(r.error).toContain("credentials");
+    }
+  });
+
+  test("auto_push + internal IS accepted when PAT credentials are configured", () => {
+    // The three-stacking-gaps bug Aaron hit: History preset (internal
+    // location) + PAT saved → expected pushes to fire. validation was
+    // the first blocker. Now the combination passes when credentials
+    // are present.
+    const r = validateMirrorConfigShape(
+      {
+        enabled: true,
+        location: "internal",
+        auto_push: true,
+      },
+      {
+        readCredentials: () => ({
+          active_method: "pat",
+          github_oauth: null,
+          pat: {
+            token: "ghp_xxxxxxxxxxxxxxxx",
+            remote_url: "https://x-access-token:ghp_xxxxxxxxxxxxxxxx@github.com/a/b.git",
+            label: "test",
+          },
+        }),
+      },
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  test("auto_push + internal IS accepted when github_oauth credentials are configured", () => {
+    const r = validateMirrorConfigShape(
+      {
+        enabled: true,
+        location: "internal",
+        auto_push: true,
+      },
+      {
+        readCredentials: () => ({
+          active_method: "github_oauth",
+          github_oauth: {
+            access_token: "gho_xxxxxxxxxxxx",
+            scope: "repo",
+            authorized_at: "2026-05-28T03:14:15.000Z",
+            user_login: "aaron",
+            user_id: 1,
+          },
+          pat: null,
+        }),
+      },
+    );
+    expect(r.ok).toBe(true);
   });
 
   test("auto_push + external location is fine", () => {
