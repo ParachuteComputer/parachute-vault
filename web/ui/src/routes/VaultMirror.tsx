@@ -31,6 +31,8 @@ import {
   type GitHubRepoInfo,
   type MirrorConfig,
   type MirrorCredentialStatus,
+  type MirrorImportCredentials,
+  type MirrorImportResult,
   type MirrorSnapshot,
   type MirrorStatus,
   createGithubRepo,
@@ -40,6 +42,7 @@ import {
   listGithubRepos,
   pollGithubDeviceFlow,
   postMirrorAuthPat,
+  postMirrorImport,
   putMirror,
   runMirrorNow,
   selectGithubRepo,
@@ -286,6 +289,12 @@ function MirrorScreen({
           credsError={credsError}
           onCredsChanged={setCreds}
           locationIsExternal={snapshot.config.location === "external"}
+        />
+      ) : null}
+      {isAdmin ? (
+        <ImportFromGitSection
+          vaultName={vaultName}
+          creds={creds}
         />
       ) : null}
     </>
@@ -1389,6 +1398,520 @@ function PATModal({
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Import-from-git section — pull a vault state from a remote git repo into
+// THIS vault. Symmetric counterpart to the export flow above.
+//
+// Three credential paths:
+//   1. From connected GitHub — only visible when active_method ===
+//      "github_oauth". Opens a repo picker; selected repo's clone URL
+//      becomes the remote.
+//   2. From a remote URL — paste any HTTPS or SSH URL. Uses stored
+//      credentials if available, otherwise warns.
+//   3. One-time with a different credential — toggle reveals a PAT field
+//      for a one-shot import that doesn't touch stored credentials.
+//
+// Two modes:
+//   - Merge (default) — upsert-by-id; preserves notes that aren't in
+//     the remote.
+//   - Replace — wipe-then-import; remote becomes the new source of
+//     truth. Gated behind a typed-name confirm.
+//
+// After success: offer to set the remote as the active mirror remote
+// so future writes push back here (auto-wire offer).
+// ===========================================================================
+
+type ImportMode = "merge" | "replace";
+
+type ImportPhase =
+  | { kind: "idle" }
+  | { kind: "running"; stage: "cloning" | "importing" }
+  | { kind: "success"; result: MirrorImportResult; remoteUrl: string; mode: ImportMode }
+  | { kind: "error"; message: string };
+
+function ImportFromGitSection({
+  vaultName,
+  creds,
+}: {
+  vaultName: string;
+  creds: MirrorCredentialStatus | null;
+}) {
+  const [remoteUrl, setRemoteUrl] = useState("");
+  const [mode, setMode] = useState<ImportMode>("merge");
+  const [usePerCallPat, setUsePerCallPat] = useState(false);
+  const [perCallPat, setPerCallPat] = useState("");
+  const [phase, setPhase] = useState<ImportPhase>({ kind: "idle" });
+  // Typed-name confirmation for replace mode. The operator types the
+  // literal vault name to unlock the Start button.
+  const [confirmText, setConfirmText] = useState("");
+  // Repo picker overlay state.
+  const [showRepoPicker, setShowRepoPicker] = useState(false);
+
+  const hasGithubOauth =
+    creds?.active_method === "github_oauth" && creds.github_oauth !== null;
+  const hasStoredCreds = creds?.active_method !== null && creds?.active_method !== undefined;
+
+  const replaceConfirmed =
+    mode !== "replace" || confirmText.trim() === vaultName;
+
+  const canStart =
+    phase.kind !== "running" &&
+    remoteUrl.trim().length > 0 &&
+    replaceConfirmed &&
+    (!usePerCallPat || perCallPat.trim().length > 0);
+
+  const onStart = async () => {
+    setPhase({ kind: "running", stage: "cloning" });
+    let credentials: MirrorImportCredentials;
+    if (usePerCallPat) {
+      credentials = { kind: "pat", token: perCallPat.trim() };
+    } else if (hasStoredCreds) {
+      credentials = null; // server uses credentialsFile
+    } else {
+      credentials = { kind: "none" };
+    }
+    try {
+      // Stage flip is a UI nicety — the server is synchronous from our POV
+      // so the spinner copy can hint at "importing" partway through.
+      const stageTimer = window.setTimeout(
+        () => setPhase((p) => (p.kind === "running" ? { kind: "running", stage: "importing" } : p)),
+        1500,
+      );
+      const result = await postMirrorImport(vaultName, {
+        remote_url: remoteUrl.trim(),
+        mode,
+        credentials,
+      });
+      window.clearTimeout(stageTimer);
+      setPhase({ kind: "success", result, remoteUrl: remoteUrl.trim(), mode });
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? `${err.status === 409 ? "Already running. " : ""}${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      setPhase({ kind: "error", message });
+    }
+  };
+
+  const onReset = () => {
+    setPhase({ kind: "idle" });
+    setConfirmText("");
+  };
+
+  return (
+    <div className="section">
+      <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>
+        Import from a git repo
+      </h3>
+      <p className="dim" style={{ marginTop: 0 }}>
+        Pull a vault state from a remote git repo into <strong>this</strong> vault.
+        Use this to load a vault someone has been mirroring, or to sync a vault
+        between machines you control. The remote must be a Parachute vault export
+        (created by <code>parachute-vault export</code> or the mirror's export flow).
+      </p>
+
+      {/*
+        Multi-pusher caveat. Surfaces in both the SPA and the operator
+        doc (parachute.computer/git-backup.njk). Aaron 2026-05-28:
+        "I don't think we need to plan for that too elegantly right
+        now, but it is important to think about." So we warn, we
+        don't detect or block.
+      */}
+      <div className="warn-banner" style={{ marginBottom: "1rem" }} role="note">
+        <strong>One vault per remote.</strong> Multiple vaults pushing to the
+        same git repo isn't a supported shape — the last push wins, and
+        vaults that diverge silently overwrite each other. Today's working
+        pattern is one vault per remote. Active two-way sync is a future
+        direction; for now, do exports from one place and imports as
+        snapshots elsewhere.
+      </div>
+
+      {phase.kind === "success" ? (
+        <ImportSuccessPanel
+          vaultName={vaultName}
+          result={phase.result}
+          remoteUrl={phase.remoteUrl}
+          mode={phase.mode}
+          onReset={onReset}
+        />
+      ) : (
+        <>
+          <div className="form-row">
+            <label htmlFor="import-remote-url">Remote URL</label>
+            <input
+              id="import-remote-url"
+              type="text"
+              value={remoteUrl}
+              placeholder="https://github.com/aaron/my-vault.git"
+              onChange={(e) => setRemoteUrl(e.target.value)}
+              disabled={phase.kind === "running"}
+            />
+            {hasGithubOauth ? (
+              <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.9em" }}>
+                Or{" "}
+                <button
+                  type="button"
+                  onClick={() => setShowRepoPicker(true)}
+                  disabled={phase.kind === "running"}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    color: "var(--accent)",
+                    textDecoration: "underline",
+                    cursor: "pointer",
+                    fontSize: "inherit",
+                  }}
+                >
+                  pick from your GitHub repos
+                </button>
+                .
+              </p>
+            ) : null}
+            {!hasStoredCreds && !usePerCallPat ? (
+              <p className="hint" style={{ marginTop: "0.35rem", fontSize: "0.85em" }}>
+                No saved git credentials. The import will be unauthenticated —
+                works for public repos; private repos will fail with a clear
+                error. Use the one-time credential toggle below if needed.
+              </p>
+            ) : null}
+          </div>
+
+          <div className="form-row">
+            <label>Mode</label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="import-mode"
+                value="merge"
+                checked={mode === "merge"}
+                onChange={() => {
+                  setMode("merge");
+                  setConfirmText("");
+                }}
+                disabled={phase.kind === "running"}
+              />
+              <span>
+                <strong>Merge</strong>{" "}
+                <span className="dim">
+                  — upsert by id. Notes in the remote get created/updated; any
+                  notes that exist only locally <strong>survive</strong>.
+                </span>
+              </span>
+            </label>
+            <label className="radio-row">
+              <input
+                type="radio"
+                name="import-mode"
+                value="replace"
+                checked={mode === "replace"}
+                onChange={() => setMode("replace")}
+                disabled={phase.kind === "running"}
+              />
+              <span>
+                <strong>Replace</strong>{" "}
+                <span className="dim">
+                  — wipe this vault first, then import. The remote becomes the
+                  new source of truth. <strong>Destructive.</strong>
+                </span>
+              </span>
+            </label>
+          </div>
+
+          {mode === "replace" ? (
+            <div className="form-row">
+              <div className="error-banner" role="alert" style={{ marginBottom: "0.5rem" }}>
+                <strong>Replace will delete every note in vault "{vaultName}" before
+                importing.</strong> To confirm, type the vault name below:
+              </div>
+              <input
+                id="import-confirm-name"
+                type="text"
+                value={confirmText}
+                placeholder={vaultName}
+                onChange={(e) => setConfirmText(e.target.value)}
+                disabled={phase.kind === "running"}
+                aria-label="Type vault name to confirm"
+              />
+            </div>
+          ) : null}
+
+          <div className="form-row">
+            <label>
+              <input
+                type="checkbox"
+                checked={usePerCallPat}
+                onChange={(e) => setUsePerCallPat(e.target.checked)}
+                disabled={phase.kind === "running"}
+                style={{ width: "auto", marginRight: "0.5rem" }}
+              />
+              One-time credential for this import only
+            </label>
+            <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.85em" }}>
+              Use a different Personal Access Token just for this clone, without
+              changing your saved credentials.
+            </p>
+            {usePerCallPat ? (
+              <input
+                id="import-per-call-pat"
+                type="password"
+                value={perCallPat}
+                placeholder="ghp_… or similar"
+                onChange={(e) => setPerCallPat(e.target.value)}
+                disabled={phase.kind === "running"}
+                autoComplete="off"
+                style={{ marginTop: "0.5rem" }}
+              />
+            ) : null}
+          </div>
+
+          {phase.kind === "error" ? (
+            <div className="error-banner" role="alert">
+              <code>{phase.message}</code>
+            </div>
+          ) : null}
+
+          <div className="actions">
+            <button
+              type="button"
+              onClick={onStart}
+              disabled={!canStart}
+              title={
+                !replaceConfirmed
+                  ? "Type the vault name to confirm Replace."
+                  : remoteUrl.trim().length === 0
+                    ? "Provide a remote URL."
+                    : usePerCallPat && perCallPat.trim().length === 0
+                      ? "Provide a token for one-time credential."
+                      : undefined
+              }
+            >
+              {phase.kind === "running"
+                ? phase.stage === "cloning"
+                  ? "Cloning…"
+                  : "Importing…"
+                : "Start import"}
+            </button>
+          </div>
+        </>
+      )}
+
+      {showRepoPicker ? (
+        <ImportRepoPickerModal
+          vaultName={vaultName}
+          onClose={() => setShowRepoPicker(false)}
+          onPicked={(cloneUrl) => {
+            setRemoteUrl(cloneUrl);
+            setShowRepoPicker(false);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * After-success panel. Shows the import counts + warnings, and offers
+ * to set the imported-from repo as the active mirror remote (auto-wire).
+ *
+ * The auto-wire offer is the symmetric move: if the operator just
+ * imported FROM a repo, they almost certainly want exports going BACK
+ * to the same repo. Yes triggers select-repo (for github-OAuth case)
+ * or guides the operator to the PAT save flow.
+ *
+ * Aaron's directive: "if there are multiple things pushing to the same
+ * git repository … important to think about" — the offer is opt-in
+ * precisely because mindlessly chaining import → push back risks the
+ * multi-pusher footgun. Operator opts in deliberately.
+ */
+function ImportSuccessPanel({
+  vaultName,
+  result,
+  remoteUrl,
+  mode,
+  onReset,
+}: {
+  vaultName: string;
+  result: MirrorImportResult;
+  remoteUrl: string;
+  mode: ImportMode;
+  onReset: () => void;
+}) {
+  const [wireOffered, setWireOffered] = useState(true);
+  return (
+    <>
+      <div className="mint-banner" role="status" style={{ marginBottom: "0.75rem" }}>
+        <strong>Import succeeded.</strong> Imported {result.notes_imported} note
+        {result.notes_imported === 1 ? "" : "s"}, {result.tags_imported} tag schema
+        {result.tags_imported === 1 ? "" : "s"}, {result.attachments_imported}{" "}
+        attachment{result.attachments_imported === 1 ? "" : "s"}
+        {mode === "replace" && result.notes_deleted !== undefined
+          ? `, wiped ${result.notes_deleted} pre-existing note${result.notes_deleted === 1 ? "" : "s"}`
+          : ""}
+        .
+      </div>
+
+      {result.warnings.length > 0 ? (
+        <details style={{ marginBottom: "0.75rem" }}>
+          <summary>
+            {result.warnings.length} warning{result.warnings.length === 1 ? "" : "s"}{" "}
+            (see details)
+          </summary>
+          <ul style={{ marginTop: "0.5rem" }}>
+            {result.warnings.map((w, i) => (
+              <li key={i}>
+                <code style={{ fontSize: "0.85em" }}>{w}</code>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+
+      {wireOffered ? (
+        <div className="info-banner" style={{ marginBottom: "0.75rem" }} role="status">
+          <p style={{ marginTop: 0 }}>
+            <strong>Set this repo as the active mirror remote?</strong> Future
+            exports from vault <code>{vaultName}</code> would push back to{" "}
+            <code>{remoteUrl}</code>. Skip if you'd rather keep them separate —
+            see the "one vault per remote" note above.
+          </p>
+          <div className="actions">
+            <button
+              type="button"
+              onClick={() => {
+                // We don't auto-wire from here today (the existing
+                // GitRemoteSection above handles credential flow + repo
+                // selection). Closing the offer + scrolling the operator
+                // to the GitRemoteSection is the right next step.
+                setWireOffered(false);
+                document
+                  .querySelector(".section h3")
+                  ?.scrollIntoView({ behavior: "smooth" });
+              }}
+            >
+              Yes — configure mirror push above
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setWireOffered(false)}
+            >
+              No, keep import-only
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="actions">
+        <button type="button" className="secondary" onClick={onReset}>
+          Run another import
+        </button>
+      </div>
+    </>
+  );
+}
+
+/**
+ * Repo picker modal for the import flow. Reuses the existing list-repos
+ * endpoint (the one the export-side picker uses). On pick, populates
+ * the parent's remote URL field with the chosen repo's clone URL.
+ */
+function ImportRepoPickerModal({
+  vaultName,
+  onClose,
+  onPicked,
+}: {
+  vaultName: string;
+  onClose: () => void;
+  onPicked: (cloneUrl: string) => void;
+}) {
+  const [repos, setRepos] = useState<GitHubRepoInfo[] | null>(null);
+  const [truncated, setTruncated] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    listGithubRepos(vaultName)
+      .then(({ repos, truncated }) => {
+        if (cancelled) return;
+        setRepos(repos);
+        setTruncated(Boolean(truncated));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultName]);
+
+  const filtered = (repos ?? []).filter((r) =>
+    filter.length === 0
+      ? true
+      : r.full_name.toLowerCase().includes(filter.toLowerCase()),
+  );
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal">
+        <div className="list-header">
+          <h3 style={{ margin: 0 }}>Pick a repo to import from</h3>
+          <button type="button" className="secondary" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        {error ? (
+          <div className="error-banner" role="alert">
+            <code>{error}</code>
+          </div>
+        ) : null}
+        <div className="form-row">
+          <input
+            type="search"
+            placeholder="Filter by name…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+        </div>
+        {truncated ? (
+          <p className="muted" style={{ fontSize: "0.85em" }}>
+            Showing the first 300 repos. Use the filter above to narrow down.
+          </p>
+        ) : null}
+        {repos === null && !error ? <p className="muted">Loading repos…</p> : null}
+        {repos !== null ? (
+          <div className="repo-list">
+            {filtered.length === 0 && filter.length > 0 ? (
+              <p className="dim">No repos match "{filter}".</p>
+            ) : null}
+            {filtered.length === 0 && filter.length === 0 && repos.length === 0 ? (
+              <p className="dim">You don't own any repos on this account.</p>
+            ) : null}
+            {filtered.map((r) => (
+              <button
+                type="button"
+                key={r.full_name}
+                className="repo-row"
+                onClick={() => onPicked(r.clone_url)}
+              >
+                <span>
+                  <strong>{r.name}</strong>
+                  {r.private ? <span className="dim"> · private</span> : null}
+                </span>
+                <span className="dim">{r.updated_at.slice(0, 10)}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   );

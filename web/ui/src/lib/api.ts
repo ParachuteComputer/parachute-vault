@@ -390,6 +390,57 @@ export async function selectGithubRepo(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Mirror import — `/vault/<name>/.parachute/mirror/import`
+//
+// Symmetric counterpart to the export-to-git flow. Clones a remote git
+// repo into a tempdir, validates it's a vault export, and imports it
+// into THIS vault. See `src/mirror-import.ts` for the worker.
+// ---------------------------------------------------------------------------
+
+/** How to authenticate the clone. See `src/mirror-import.ts:ImportAuth`. */
+export type MirrorImportCredentials =
+  | null // use stored mirror credentials
+  | { kind: "credentialsFile" } // explicit — same as null
+  | { kind: "pat"; token: string } // one-shot, doesn't touch stored creds
+  | { kind: "none" }; // public repo, no auth
+
+export interface MirrorImportRequest {
+  remote_url: string;
+  mode: "merge" | "replace";
+  credentials: MirrorImportCredentials;
+}
+
+export interface MirrorImportResult {
+  notes_imported: number;
+  tags_imported: number;
+  attachments_imported: number;
+  /** Only set when `mode === "replace"`. */
+  notes_deleted?: number;
+  warnings: string[];
+}
+
+/**
+ * POST a clone-and-import request. Returns the import stats on success.
+ * Throws `HttpError` on validation/clone/conflict failures — caller can
+ * surface the status code-specific message to the user.
+ */
+export async function postMirrorImport(
+  vaultName: string,
+  args: MirrorImportRequest,
+): Promise<MirrorImportResult> {
+  const res = await fetch(
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/import`,
+    {
+      method: "POST",
+      headers: { ...mirrorAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(args),
+    },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as MirrorImportResult;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
