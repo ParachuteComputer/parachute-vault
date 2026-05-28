@@ -23,6 +23,7 @@ import { existsSync, statSync } from "fs";
 import { join } from "path";
 
 import { DEFAULT_COMMIT_TEMPLATE, isGitRepo } from "./export-watch.ts";
+import { readCredentials, type MirrorCredentials } from "./mirror-credentials.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -372,12 +373,21 @@ export type ShapeValidation = ShapeValidationOk | ShapeValidationError;
  * `defaultMirrorConfig()`; rejects values that don't conform to the
  * declared types.
  *
- * Does NOT touch the filesystem — operators get a fast 400 on shape
- * errors before vault attempts any filesystem work. Filesystem-level
- * validation (path exists, is a git repo) lives in `validateExternalPath`.
+ * Mostly pure: the one filesystem touch is reading
+ * `.mirror-credentials.yaml` to decide whether `auto_push: true +
+ * location: internal` is acceptable (credentials carry a remote URL, so
+ * "internal mirrors have no remote" no longer holds). The credentials
+ * read is injectable via `opts.readCredentials` so tests stay hermetic;
+ * production callers omit it and pick up the canonical `readCredentials`
+ * from `./mirror-credentials.ts`.
+ *
+ * Filesystem-level validation of `external_path` (exists, is a git repo)
+ * still lives in `validateExternalPath` — that's I/O and stays out of
+ * this function.
  */
 export function validateMirrorConfigShape(
   input: unknown,
+  opts: { readCredentials?: () => MirrorCredentials | null } = {},
 ): ShapeValidation {
   if (input === null || typeof input !== "object") {
     return {
@@ -544,21 +554,46 @@ export function validateMirrorConfigShape(
     };
   }
 
-  // Cross-field rule: auto_push only makes sense for external mirrors —
-  // internal mirrors live under vault's data dir with no configured
-  // remote. Silent-fail on push was the pre-event-driven behavior; the
-  // backend now rejects the combination so the operator sees the issue
-  // at config time. The UI hides the auto_push checkbox when location
-  // is internal (vault#380's reviewer-flagged nit), so this only fires
-  // when an operator either edits config.yaml by hand or POSTs a bare
-  // JSON body with mismatched fields.
+  // Cross-field rule: auto_push + internal location was historically
+  // rejected outright — the assumption being "internal mirrors live under
+  // vault's data dir with no configured remote, so push would always
+  // fail." That assumption no longer holds once credentials are wired:
+  // the credential save path (handleAuthPat / handleAuthGithubSelectRepo)
+  // sets `origin` on the internal repo to the embedded-credential URL,
+  // so `git push` to GitHub/GitLab/etc. is meaningful even when the
+  // working tree lives under `~/.parachute/vault/data/<name>/mirror/`.
+  //
+  // New rule: auto_push + internal is rejected ONLY when no credentials
+  // are configured. If credentials ARE wired (PAT or GitHub OAuth),
+  // accept the combination — vault has a remote to push to. Operators
+  // hitting Aaron's three-stacking-gaps bug (History preset + PAT saved,
+  // pushes never fire) get unblocked.
   if (out.enabled && out.auto_push && out.location === "internal") {
-    return {
-      ok: false,
-      field: "auto_push",
-      error:
-        "`auto_push: true` requires `location: external` (internal mirrors live under the vault data directory and have no configured remote). Switch the location, or set auto_push to false.",
-    };
+    const readCreds = opts.readCredentials ?? readCredentials;
+    let creds: MirrorCredentials | null = null;
+    try {
+      creds = readCreds();
+    } catch {
+      // If the credentials file is unreadable we conservatively fail
+      // closed — same outcome as "no credentials." Better to surface the
+      // actionable "configure credentials first" error than to accept a
+      // config that won't actually push.
+      creds = null;
+    }
+    const hasCredentials = !!(
+      creds &&
+      creds.active_method &&
+      ((creds.active_method === "pat" && creds.pat) ||
+        (creds.active_method === "github_oauth" && creds.github_oauth))
+    );
+    if (!hasCredentials) {
+      return {
+        ok: false,
+        field: "auto_push",
+        error:
+          "Configure git credentials before enabling auto-push on an internal mirror — vault has no remote to push to without them. Connect GitHub or paste a Personal Access Token in the Git remote section, or set auto_push to false.",
+      };
+    }
   }
 
   return { ok: true, config: out };
