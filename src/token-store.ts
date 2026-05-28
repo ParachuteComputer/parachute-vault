@@ -419,6 +419,136 @@ export function softRevokeMcpToken(
   return { ok: true, already_revoked: false };
 }
 
+// ---------------------------------------------------------------------------
+// mcp_mint_ledger — session-pinned index of HUB JWTs minted by manage-token
+// (vault#403, MGT). After the auth-unification arc the tool mints hub JWTs,
+// not pvt_* rows, so the session attribution (parent_jti → minted jti) lives
+// here instead of in the `tokens` table. Rows are NOT credentials — only the
+// hub `jti` (the revocation handle) plus display metadata is stored; the
+// signed token never touches the vault DB.
+// ---------------------------------------------------------------------------
+
+/**
+ * Record a hub-minted JWT in the session-pinned ledger. `jti` is hub's
+ * returned jti; `parentJti` is the minting MCP session (the caller's
+ * `caller_jti`). Idempotent on `jti` via INSERT OR REPLACE — a hub jti is
+ * unique, so a duplicate record (shouldn't happen) overwrites rather than
+ * erroring.
+ */
+export function recordMcpMintLedger(
+  db: Database,
+  entry: {
+    jti: string;
+    parentJti: string;
+    vaultName: string;
+    label: string;
+    scopes: string[];
+    scopedTags: string[] | null;
+    expiresAt: string | null;
+  },
+): void {
+  const scopedTags = entry.scopedTags && entry.scopedTags.length > 0 ? entry.scopedTags : null;
+  db.prepare(`
+    INSERT OR REPLACE INTO mcp_mint_ledger
+      (jti, parent_jti, vault_name, label, scopes, scoped_tags, created_at, expires_at, revoked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    entry.jti,
+    entry.parentJti,
+    entry.vaultName,
+    entry.label,
+    serializeScopes(entry.scopes),
+    scopedTags ? JSON.stringify(scopedTags) : null,
+    new Date().toISOString(),
+    entry.expiresAt,
+  );
+}
+
+/**
+ * List hub JWTs minted by a given MCP session (parent_jti) against a vault.
+ * Mirrors `listMcpMintedTokens`' shape so the manage-token list surface is
+ * unchanged on the wire. Includes `revoked_at` so callers can render a
+ * tombstone for soft-revoked rows.
+ */
+export function listMcpMintedHubJwts(
+  db: Database,
+  parentJti: string,
+  vaultName: string,
+): Array<{
+  jti: string;
+  label: string;
+  scopes: string[];
+  scoped_tags: string[] | null;
+  created_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+}> {
+  const rows = db.prepare(`
+    SELECT jti, label, scopes, scoped_tags, created_at, expires_at, revoked_at
+    FROM mcp_mint_ledger
+    WHERE parent_jti = ? AND vault_name = ?
+    ORDER BY created_at DESC
+  `).all(parentJti, vaultName) as {
+    jti: string;
+    label: string;
+    scopes: string | null;
+    scoped_tags: string | null;
+    created_at: string;
+    expires_at: string | null;
+    revoked_at: string | null;
+  }[];
+  return rows.map((r) => ({
+    jti: r.jti,
+    label: r.label,
+    scopes: parseScopes(r.scopes),
+    scoped_tags: parseScopedTags(r.scoped_tags),
+    created_at: r.created_at,
+    expires_at: r.expires_at,
+    revoked_at: r.revoked_at,
+  }));
+}
+
+/**
+ * Look up a single ledger row by (jti, parent_jti, vault_name) — the
+ * session-pin gate for revoke. Returns null when the jti isn't in THIS
+ * session's ledger (a different session's mint, or a never-minted jti),
+ * which the caller turns into the not_found path. Returns the row (incl.
+ * `revoked_at`) when it belongs to this session.
+ */
+export function findMcpMintLedgerEntry(
+  db: Database,
+  jti: string,
+  parentJti: string,
+  vaultName: string,
+): { jti: string; revoked_at: string | null } | null {
+  const row = db.prepare(`
+    SELECT jti, revoked_at FROM mcp_mint_ledger
+    WHERE jti = ? AND parent_jti = ? AND vault_name = ?
+    LIMIT 1
+  `).get(jti, parentJti, vaultName) as { jti: string; revoked_at: string | null } | null;
+  return row ?? null;
+}
+
+/**
+ * Mark a ledger row revoked (the local attribution-side soft-revoke; the
+ * authoritative revocation happens in hub's registry via the revoke-token
+ * call). Idempotent: a second call on an already-revoked row leaves the
+ * existing timestamp in place. Only flips rows belonging to the given
+ * session — defense-in-depth on top of the caller's `findMcpMintLedgerEntry`
+ * gate.
+ */
+export function markMcpMintLedgerRevoked(
+  db: Database,
+  jti: string,
+  parentJti: string,
+  vaultName: string,
+): void {
+  db.prepare(`
+    UPDATE mcp_mint_ledger SET revoked_at = ?
+    WHERE jti = ? AND parent_jti = ? AND vault_name = ? AND revoked_at IS NULL
+  `).run(new Date().toISOString(), jti, parentJti, vaultName);
+}
+
 /**
  * Find tokens whose `scoped_tags` allowlist references the given root tag.
  * Used by tag-delete and tag-merge to fail-closed (409) when removing a

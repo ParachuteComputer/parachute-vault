@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -149,6 +149,30 @@ CREATE TABLE IF NOT EXISTS tokens (
   revoked_at TEXT
 );
 
+-- mcp_mint_ledger (v20) — session-pinned record of HUB JWTs minted by the
+-- manage-token MCP tool (vault#403, MGT). After the auth-unification arc,
+-- manage-token mints hub JWTs (via hub mint-token attenuation proxy), not
+-- pvt_* vault-DB tokens — so the mints no longer live in the tokens table.
+-- This ledger is a lightweight local index of (parent_jti to minted hub jti)
+-- so the tool list/revoke surface can stay session-scoped: a session sees
+-- and revokes only the hub JWTs it minted. Rows are NOT credentials — the
+-- signed JWT is never stored, only its jti (the revocation handle) plus
+-- display metadata. revoked_at mirrors the tokens-table soft-revoke marker
+-- so a second revoke is idempotent even if the hub round-trip is skipped.
+-- The authoritative revocation state lives in hub token registry; this is
+-- the attribution index only.
+CREATE TABLE IF NOT EXISTS mcp_mint_ledger (
+  jti TEXT PRIMARY KEY,
+  parent_jti TEXT NOT NULL,
+  vault_name TEXT NOT NULL,
+  label TEXT NOT NULL,
+  scopes TEXT,
+  scoped_tags TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  revoked_at TEXT
+);
+
 -- OAuth: registered clients (Dynamic Client Registration)
 -- VESTIGIAL after vault 0.4.x workstream E (2026-05-25). The standalone
 -- OAuth issuer that wrote these rows was retired (hub is the issuer now;
@@ -214,6 +238,10 @@ CREATE INDEX IF NOT EXISTS idx_note_tags_tag ON note_tags(tag_name, note_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id);
+-- Session-pinned manage-token ledger lookup (v20): list/revoke scope on
+-- (parent_jti, vault_name). The mcp_mint_ledger table is created
+-- unconditionally above, so this index is safe in SCHEMA_SQL.
+CREATE INDEX IF NOT EXISTS idx_mcp_mint_ledger_session ON mcp_mint_ledger(parent_jti, vault_name);
 -- idx_tokens_vault_name is created in migrateToV16, not here. SCHEMA_SQL
 -- runs BEFORE migrations; an upgrading v15 vault doesn't yet have the
 -- vault_name column when this section evaluates, so the index has to
@@ -402,6 +430,13 @@ export function initSchema(db: Database): void {
   // All three are nullable; existing rows backfill to NULL which means
   // "non-MCP-minted, not revoked" — identical pre-v19 semantics.
   migrateToV19(db);
+
+  // Migrate v19 → v20: the `mcp_mint_ledger` table (session-pinned record of
+  // hub JWTs minted by the manage-token MCP tool). Created by SCHEMA_SQL's
+  // `CREATE TABLE IF NOT EXISTS` above, so this is a no-op confirmation hook
+  // — present for symmetry with the other migration steps and to anchor the
+  // version bump. See vault#403 (MGT — manage-token mints hub JWTs).
+  migrateToV20(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -999,6 +1034,34 @@ function migrateToV19(db: Database): void {
       db.exec(`ALTER TABLE tokens ADD COLUMN ${col} ${type}`);
     }
   }
+}
+
+/**
+ * Migrate v19 → v20: ensure the `mcp_mint_ledger` table exists. SCHEMA_SQL's
+ * `CREATE TABLE IF NOT EXISTS` already covers fresh vaults AND upgrading
+ * vaults (SCHEMA_SQL runs unconditionally on every open before the migration
+ * steps), so this is a defensive no-op confirmation — there is no ALTER to
+ * perform. Kept as a named step so the version-bump arc reads cleanly and a
+ * future column addition has an obvious home. See vault#403 (MGT).
+ */
+function migrateToV20(db: Database): void {
+  if (hasTable(db, "mcp_mint_ledger")) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mcp_mint_ledger (
+      jti TEXT PRIMARY KEY,
+      parent_jti TEXT NOT NULL,
+      vault_name TEXT NOT NULL,
+      label TEXT NOT NULL,
+      scopes TEXT,
+      scoped_tags TEXT,
+      created_at TEXT NOT NULL,
+      expires_at TEXT,
+      revoked_at TEXT
+    )
+  `);
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_mcp_mint_ledger_session ON mcp_mint_ledger(parent_jti, vault_name)",
+  );
 }
 
 function hasTable(db: Database, name: string): boolean {
