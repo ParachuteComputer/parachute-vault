@@ -257,18 +257,34 @@ export type MintHubJwtError =
 
 export interface MintHubJwtOpts {
   hubOrigin: string;
+  /**
+   * Bearer presented on the mint-token request. For the CLI install path this
+   * is `~/.parachute/operator.token`; for the manage-token MCP proxy
+   * (vault#403, MGT) it's the RAW caller bearer the MCP session presented (a
+   * hub JWT carrying `vault:<name>:admin`). Hub's capability-attenuation guard
+   * (hub#452) decides what the bearer may mint.
+   */
   operatorToken: string;
   scope: string;
   subject?: string;
   expiresInSeconds?: number;
+  /**
+   * Optional `permissions` claim forwarded verbatim to hub's mint-token body
+   * (e.g. `{ scoped_tags: [...] }` so the minted JWT carries the tag
+   * restriction vault enforces via C0). Omitted from the request body when
+   * undefined. See `parachute-hub/src/api-mint-token.ts` (permissions claim).
+   */
+  permissions?: Record<string, unknown>;
   /** Test seam — defaults to global fetch. */
   fetchImpl?: typeof fetch;
 }
 
 /**
- * POST to `<hub>/api/auth/mint-token`. The operator-token bearer must carry
- * `parachute:host:auth` (the admin scope-set covers it). Returns the minted
- * JWT or a discriminated error the caller turns into a clear message.
+ * POST to `<hub>/api/auth/mint-token`. The bearer must carry minting authority
+ * per hub's attenuation rules — `parachute:host:auth` (CLI operator token) or
+ * `vault:<name>:admin` (the manage-token MCP proxy's caller bearer). Returns
+ * the minted JWT or a discriminated error the caller turns into a clear
+ * message.
  *
  * Network errors are caught and returned as `{ kind: "network" }` rather
  * than bubbling — the CLI doesn't want stack traces, and the operator wants
@@ -281,6 +297,7 @@ export async function mintHubJwt(opts: MintHubJwtOpts): Promise<MintedHubJwt | M
     expires_in: opts.expiresInSeconds ?? HUB_MINT_DEFAULT_TTL_SECONDS,
   };
   if (opts.subject) body.subject = opts.subject;
+  if (opts.permissions !== undefined) body.permissions = opts.permissions;
 
   const fetchFn = opts.fetchImpl ?? fetch;
   let res: Response;
@@ -332,6 +349,84 @@ export async function mintHubJwt(opts: MintHubJwtOpts): Promise<MintedHubJwt | M
     expires_at: payload.expires_at,
     scope: payload.scope,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Hub revoke-token client (vault#403, MGT)
+// ---------------------------------------------------------------------------
+
+/**
+ * Discriminated failure modes from `revokeHubJwt`. `network` mirrors
+ * `mintHubJwt`; `api-error` carries hub's `{ error, error_description }`.
+ * Note: hub's revoke-token is idempotent (re-revoking an already-revoked
+ * jti returns 200), so a successful idempotent re-revoke is NOT an error.
+ */
+export type RevokeHubJwtError =
+  | { kind: "network"; cause: string; origin: string }
+  | { kind: "api-error"; status: number; error: string; description: string };
+
+export interface RevokeHubJwtOpts {
+  hubOrigin: string;
+  /** RAW caller bearer (a hub JWT carrying `parachute:host:auth`). */
+  operatorToken: string;
+  /** The hub jti to revoke. */
+  jti: string;
+  /** Test seam — defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+}
+
+export interface RevokedHubJwt {
+  jti: string;
+  revoked_at: string;
+}
+
+/**
+ * POST to `<hub>/api/auth/revoke-token` with `{ jti }`. The bearer must carry
+ * `parachute:host:auth` (the manage-token caller's `vault:<name>:admin` does
+ * NOT cover this — see the proxy's revokeAction for how it surfaces a
+ * partial-success ledger soft-revoke when hub's registry revoke is gated).
+ * Idempotent on hub's side. Network failures are caught and returned, not
+ * thrown.
+ */
+export async function revokeHubJwt(opts: RevokeHubJwtOpts): Promise<RevokedHubJwt | RevokeHubJwtError> {
+  const url = `${opts.hubOrigin.replace(/\/$/, "")}/api/auth/revoke-token`;
+  const fetchFn = opts.fetchImpl ?? fetch;
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${opts.operatorToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ jti: opts.jti }),
+    });
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    return { kind: "network", cause, origin: opts.hubOrigin };
+  }
+
+  if (!res.ok) {
+    let error = "unknown_error";
+    let description = `HTTP ${res.status}`;
+    try {
+      const payload = (await res.json()) as { error?: unknown; error_description?: unknown };
+      if (typeof payload.error === "string") error = payload.error;
+      if (typeof payload.error_description === "string") description = payload.error_description;
+    } catch {}
+    return { kind: "api-error", status: res.status, error, description };
+  }
+
+  const payload = (await res.json()) as Partial<RevokedHubJwt>;
+  if (typeof payload.jti !== "string" || typeof payload.revoked_at !== "string") {
+    return {
+      kind: "api-error",
+      status: res.status,
+      error: "malformed_response",
+      description: "hub revoke-token response is missing required fields (jti/revoked_at)",
+    };
+  }
+  return { jti: payload.jti, revoked_at: payload.revoked_at };
 }
 
 // ---------------------------------------------------------------------------
