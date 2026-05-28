@@ -115,12 +115,39 @@ describe("authedCloneUrl", () => {
     expect(authedCloneUrl("not-a-url", { kind: "none" })).toBeNull();
   });
 
-  test("passes ssh URLs verbatim (no userinfo to embed)", () => {
-    // `git@github.com:owner/repo.git` parses to a URL with protocol `git:`,
-    // not http/https — our helper returns it verbatim.
+  test("passes git:// URLs verbatim (no userinfo to embed)", () => {
+    // `git://github.com/owner/repo.git` parses as a URL with protocol
+    // `git:`, not http/https — our helper returns it verbatim.
     const r = authedCloneUrl("git://github.com/owner/repo.git", { kind: "pat", token: "ghp_x" });
     expect(r).not.toBeNull();
     expect(r!.authedUrl).toBe("git://github.com/owner/repo.git");
+    expect(r!.appliedAuth).toBe("none");
+  });
+
+  // Reviewer-flagged on vault#390 — the original ssh-shorthand assertion
+  // accidentally tested `git://` instead of the `git@host:owner/repo`
+  // shape, leaving the ssh-shorthand regex branch uncovered. SSH
+  // shorthand doesn't parse as `new URL()` (no scheme), so authedCloneUrl
+  // falls through the regex matcher and returns the URL verbatim — there
+  // is no userinfo slot to embed a token into. This test pins that path.
+  test("passes ssh-shorthand URLs verbatim (no scheme, no userinfo slot)", () => {
+    const r = authedCloneUrl("git@github.com:owner/repo.git", {
+      kind: "pat",
+      token: "ghp_should_not_appear",
+    });
+    expect(r).not.toBeNull();
+    expect(r!.authedUrl).toBe("git@github.com:owner/repo.git");
+    expect(r!.authedUrl).not.toContain("ghp_should_not_appear");
+    expect(r!.appliedAuth).toBe("none");
+  });
+
+  test("passes ssh:// URLs verbatim", () => {
+    const r = authedCloneUrl("ssh://git@github.com/owner/repo.git", {
+      kind: "pat",
+      token: "ghp_x",
+    });
+    expect(r).not.toBeNull();
+    expect(r!.authedUrl).toBe("ssh://git@github.com/owner/repo.git");
     expect(r!.appliedAuth).toBe("none");
   });
 

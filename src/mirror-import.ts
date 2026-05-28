@@ -49,6 +49,17 @@
  * against the same vault name. The first lays a marker; the second
  * receives the conflict signal so the HTTP handler can return 409.
  *
+ * **SIGTERM tempdir leak (known, acceptable):** if vault gets killed
+ * mid-clone (SIGINT/SIGTERM during the `Bun.spawn` window), the
+ * `parachute-import-<rand>` tempdir is abandoned on disk. Same posture
+ * as `probeGitLsRemote` in mirror-routes.ts — owner can sweep
+ * `/tmp/parachute-import-*` manually if they care. Adding a signal
+ * handler that cleans up only the in-flight import dir(s) is feasible
+ * but a) requires registering on every server boot, b) interacts
+ * weirdly with the existing graceful-shutdown drain path, c) doesn't
+ * close the OOM-killer / power-loss case anyway. Acceptable as-is for
+ * the self-host threat model.
+ *
  * See vault#391 (the import sibling of #384's export work).
  */
 

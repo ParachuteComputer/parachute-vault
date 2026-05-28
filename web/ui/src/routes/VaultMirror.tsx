@@ -796,7 +796,7 @@ function GitRemoteSection({
   };
 
   return (
-    <div className="section">
+    <div className="section" id="git-remote-section">
       <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>
         Git remote
       </h3>
@@ -1790,10 +1790,14 @@ function ImportSuccessPanel({
                 // GitRemoteSection above handles credential flow + repo
                 // selection). Closing the offer + scrolling the operator
                 // to the GitRemoteSection is the right next step.
+                // Reviewer-flagged on #390: was selecting `.section h3`
+                // (the FIRST `.section` on the page — the StatusCard's
+                // heading near the top), so the scroll landed nowhere
+                // useful. Pinned to the id we added on GitRemoteSection.
                 setWireOffered(false);
                 document
-                  .querySelector(".section h3")
-                  ?.scrollIntoView({ behavior: "smooth" });
+                  .getElementById("git-remote-section")
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" });
               }}
             >
               Yes — configure mirror push above
