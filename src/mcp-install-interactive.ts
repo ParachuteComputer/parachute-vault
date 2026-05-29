@@ -47,7 +47,7 @@ export interface InteractiveIO {
  * shared backend `installMcpConfig`.
  */
 export interface InstallDecision {
-  mode: "mint" | "token" | "legacy-pat";
+  mode: "mint" | "token";
   scope: "vault:read" | "vault:write" | "vault:admin";
   installScope: InstallScope;
   vaultName: string;
@@ -175,9 +175,10 @@ export async function runInteractiveInstall(
     io.log("");
   }
 
-  // 4. Auth mode + scope. The branching point: hub-mint available, or
-  //    not. When neither operator.token nor hub is configured, we fall
-  //    through to paste/legacy.
+  // 4. Auth mode + scope. The branching point: hub-mint available, or not.
+  //    vault#282 Stage 2 dropped the legacy vault-DB pvt_* mint — vault is a
+  //    pure hub resource-server. When no hub-mint path exists, the only option
+  //    is pasting an existing bearer (hub JWT or VAULT_AUTH_TOKEN).
   const canMint = ctx.hubReachable && ctx.operatorTokenPresent;
   let mode: InstallDecision["mode"];
   let scope: InstallDecision["scope"] = "vault:read";
@@ -192,31 +193,23 @@ export async function runInteractiveInstall(
         "  write       → mint with vault:write (mutations).",
         "  admin       → mint a hub JWT with vault:<name>:admin (schema management).",
         "                Requires parachute:host:admin on the operator token (the",
-        "                default operator.token carries it). NOT legacy-pat.",
+        "                default operator.token carries it).",
         "  paste       → use an existing token instead of minting.",
-        "  legacy      → mint a vault-DB pvt_* (self-hosted-without-hub).",
       ].join("\n"),
       validate: (s) => {
-        const ok = ["mint", "write", "admin", "paste", "legacy"];
+        const ok = ["mint", "write", "admin", "paste"];
         return ok.includes(s) ? null : `expected one of: ${ok.join(", ")}`;
       },
     });
     if (answer === "paste") {
       mode = "token";
       pastedToken = await askToken(io);
-    } else if (answer === "legacy") {
-      mode = "legacy-pat";
-      // Legacy path mints a vault-DB pvt_* with scope narrowing — same
-      // verb choice as the mint path. Prompt for it explicitly so the
-      // operator gets the same control they get when widening a hub
-      // JWT's scope. (vault#292 review F2.)
-      scope = await askScope(io);
     } else if (answer === "admin") {
-      // `vault:<name>:admin` is now mintable via hub mint-token when the
+      // `vault:<name>:admin` is mintable via hub mint-token when the
       // operator's bearer carries `parachute:host:admin` (hub PR-A, hub#449).
       // The default operator.token carries host-admin, so this is the
-      // canonical admin path — no more legacy-pat fallback. The verb
-      // extraction downstream narrows `vault:admin` → `vault:<name>:admin`.
+      // canonical admin path. The verb extraction downstream narrows
+      // `vault:admin` → `vault:<name>:admin`.
       io.log("  → admin will be minted as a scope-narrowed hub JWT (vault:" + vaultName + ":admin).");
       mode = "mint";
       scope = "vault:admin";
@@ -225,27 +218,16 @@ export async function runInteractiveInstall(
       if (answer === "write") scope = "vault:write";
     }
   } else {
-    // No hub-mint path available — explain why and offer the alternatives.
+    // No hub-mint path available — explain why and fall back to paste. There
+    // is no local pvt_* mint anymore (vault#282 Stage 2): without a hub, the
+    // operator pastes an existing bearer or sets VAULT_AUTH_TOKEN.
     const reason = !ctx.hubReachable
       ? "no hub origin configured (PARACHUTE_HUB_ORIGIN unset, no active expose-state)"
       : "no operator token at ~/.parachute/operator.token";
     io.log(`Hub-mint isn't available — ${reason}.`);
-    io.log("Two options: paste an existing token, or mint a vault-DB pvt_* (deprecated).");
-    const answer = await askPersistent(io, "Which? [paste / legacy]", "paste", {
-      help: [
-        "  paste  → use an existing bearer (hub JWT, pvt_*, anything).",
-        "  legacy → mint a vault-DB pvt_* token (deprecated, vault#282).",
-      ].join("\n"),
-      validate: (s) => (s === "paste" || s === "legacy" ? null : "expected: paste or legacy"),
-    });
-    if (answer === "paste") {
-      mode = "token";
-      pastedToken = await askToken(io);
-    } else {
-      mode = "legacy-pat";
-      // Same scope prompt as the canMint legacy branch (F2).
-      scope = await askScope(io);
-    }
+    io.log("Paste an existing bearer (a hub JWT, or your VAULT_AUTH_TOKEN operator bearer).");
+    mode = "token";
+    pastedToken = await askToken(io);
   }
   io.log("");
 
@@ -265,8 +247,7 @@ export async function runInteractiveInstall(
     env: ctx.env,
     ...(updateLocation?.entryKey ? { existingEntryKey: updateLocation.entryKey } : {}),
   });
-  const bearerPreview =
-    mode === "token" ? "<your token>" : mode === "mint" ? "<hub-jwt>" : "<pvt_*>";
+  const bearerPreview = mode === "token" ? "<your token>" : "<hub-jwt>";
 
   io.log(`Here's what I'll write to ${targetLabel}:`);
   io.log("");
@@ -278,8 +259,6 @@ export async function runInteractiveInstall(
   io.log("");
   if (mode === "mint") {
     io.log(`  Scope: ${scope} → narrowed to vault:${vaultName}:${scope.split(":")[1]}.`);
-  } else if (mode === "legacy-pat") {
-    io.log(`  Scope: ${scope}. The pvt_* token is vault-DB-resident (vault#282 deprecation).`);
   } else {
     // mode === "token" (paste). The pasted bearer carries its own scope
     // claim — we don't inspect or override it; whatever scope the issuer
@@ -337,29 +316,6 @@ function extractVaultFromUrl(url: string): string | null {
 function pathTail(p: string): string {
   const parts = p.split("/").filter((s) => s.length > 0);
   return parts.slice(-2).join("/") || p;
-}
-
-/**
- * Prompt for scope when minting a vault-DB pvt_* (legacy-pat). Mirrors
- * the mint path's "widen with write/admin" wording so the legacy and
- * hub-mint branches surface scope as the same kind of choice. Mint's
- * own scope prompt is inline at the auth-mode step (legacy is the
- * extra round we couldn't fold there without ambiguity).
- */
-async function askScope(io: InteractiveIO): Promise<InstallDecision["scope"]> {
-  const answer = await askPersistent(io, "Press Enter for vault:read (least privilege), or type 'write' or 'admin' to widen", "read", {
-    help: [
-      "Scopes for the legacy pvt_* token:",
-      "  read   → vault:read (default — listing + reading only).",
-      "  write  → vault:write (mutations: create, update, delete notes).",
-      "  admin  → vault:admin (full, including schema management).",
-    ].join("\n"),
-    validate: (s) => {
-      const ok = ["read", "write", "admin"];
-      return ok.includes(s) ? null : `expected one of: ${ok.join(", ")}`;
-    },
-  });
-  return `vault:${answer}` as InstallDecision["scope"];
 }
 
 /**

@@ -237,12 +237,11 @@ describe("runInteractiveInstall — decision tree", () => {
     expect(state.logs.some((l) => /expected one of/.test(l))).toBe(true);
   });
 
-  test("hub not reachable: walkthrough offers paste vs legacy (no mint option)", async () => {
+  test("hub not reachable: walkthrough falls back to paste-only (vault#282 Stage 2 — no legacy mint)", async () => {
     const { io, state } = mockIO([
-      null,     // accept install-scope default
-      "legacy", // pick legacy-pat
-      null,     // accept default scope (read) on the F2 scope prompt
-      true,     // proceed
+      null,         // accept install-scope default
+      "pasted-jwt", // the bearer (no auth-mode prompt — paste is the only path)
+      true,         // proceed
     ]);
     const result = await runInteractiveInstall(
       baseCtx({ hubReachable: false }),
@@ -250,16 +249,15 @@ describe("runInteractiveInstall — decision tree", () => {
     );
     expect(result).not.toBe("abort");
     if (result === "abort") return;
-    expect(result.mode).toBe("legacy-pat");
-    expect(result.scope).toBe("vault:read");
+    expect(result.mode).toBe("token");
+    expect(result.pastedToken).toBe("pasted-jwt");
     // Auth prompt should explain the no-hub state.
     expect(state.logs.some((l) => /Hub-mint isn't available/.test(l))).toBe(true);
   });
 
-  test("hub reachable but no operator.token: also offers paste vs legacy", async () => {
+  test("hub reachable but no operator.token: also falls back to paste-only", async () => {
     const { io, state } = mockIO([
       null,         // accept install-scope default
-      "paste",      // pick paste
       "pasted-jwt", // the bearer
       true,         // proceed
     ]);
@@ -323,48 +321,23 @@ describe("runInteractiveInstall — decision tree", () => {
     expect(result.pastedToken).toBe("my-existing-jwt");
   });
 
-  test("typing 'legacy' at the auth prompt switches to legacy-pat with default scope", async () => {
-    const { io } = mockIO([
-      null,    // accept install-scope default
-      "legacy",
-      null,    // accept default scope (read) on the F2 scope prompt
+  test("typing 'legacy' at the auth prompt is no longer accepted (vault#282 Stage 2)", async () => {
+    // The 'legacy' choice was removed — the only options are mint / write /
+    // admin / paste. An unrecognized input re-prompts; we then pick paste.
+    const { io, state } = mockIO([
+      null,              // accept install-scope default
+      "legacy",          // no longer a valid choice → validation re-prompt
+      "paste",           // pick paste
+      "my-existing-jwt", // the bearer
       true,
     ]);
     const result = await runInteractiveInstall(baseCtx(), io);
     expect(result).not.toBe("abort");
     if (result === "abort") return;
-    expect(result.mode).toBe("legacy-pat");
-    expect(result.scope).toBe("vault:read");
-  });
-
-  test("legacy-pat path: typing 'write' on the scope prompt widens to vault:write (F2)", async () => {
-    const { io, state } = mockIO([
-      null,       // accept install-scope default
-      "legacy",   // pick legacy-pat
-      "write",    // widen scope
-      true,       // proceed
-    ]);
-    const result = await runInteractiveInstall(baseCtx(), io);
-    expect(result).not.toBe("abort");
-    if (result === "abort") return;
-    expect(result.mode).toBe("legacy-pat");
-    expect(result.scope).toBe("vault:write");
-    // Scope-prompt wording must match the mint path's "least privilege" framing.
-    expect(state.prompts.some((p) => /least privilege/.test(p.question))).toBe(true);
-  });
-
-  test("legacy-pat path (no-hub branch): scope prompt also fires (F2)", async () => {
-    const { io } = mockIO([
-      null,      // accept install-scope default
-      "legacy",  // pick legacy (no-hub branch)
-      "admin",   // widen scope
-      true,      // proceed
-    ]);
-    const result = await runInteractiveInstall(baseCtx({ hubReachable: false }), io);
-    expect(result).not.toBe("abort");
-    if (result === "abort") return;
-    expect(result.mode).toBe("legacy-pat");
-    expect(result.scope).toBe("vault:admin");
+    expect(result.mode).toBe("token");
+    expect(result.pastedToken).toBe("my-existing-jwt");
+    // The validator rejected 'legacy' with the expected-one-of message.
+    expect(state.logs.some((l) => /expected one of/.test(l))).toBe(true);
   });
 
   test("paste path: preview clarifies scope is determined by the pasted token (F2)", async () => {
@@ -466,10 +439,10 @@ describe("runInteractiveInstall — decision tree", () => {
     const result = await runInteractiveInstall(baseCtx(), io);
     expect(result).not.toBe("abort");
     // The help text should have been logged between the two ask calls.
-    // It enumerates the choices (mint / write / admin / paste / legacy);
-    // matching on the "Choices:" header keeps the assertion stable
-    // against future re-wording of individual lines.
-    const helpLogged = state.logs.some((l) => /Choices:/.test(l) && /paste/.test(l) && /legacy/.test(l));
+    // It enumerates the choices (mint / write / admin / paste — vault#282
+    // Stage 2 dropped the legacy pvt_* option); matching on the "Choices:"
+    // header keeps the assertion stable against future re-wording.
+    const helpLogged = state.logs.some((l) => /Choices:/.test(l) && /paste/.test(l));
     expect(helpLogged).toBe(true);
   });
 

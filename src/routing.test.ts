@@ -21,6 +21,7 @@ import { describe, test, expect, beforeAll, beforeEach, afterEach, afterAll } fr
 import { rmSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { generateKeyPair, exportJWK, SignJWT } from "jose";
 
 const testDir = join(
   tmpdir(),
@@ -41,8 +42,52 @@ const {
 // that wipes its PARACHUTE_HOME between runs — it closes stores silently
 // even when the DB files are already gone.
 const { clearVaultStoreCache, getVaultStore } = await import("./vault-store.ts");
-const { generateToken, createToken } = await import("./token-store.ts");
 const { vaultDbPath } = await import("./config.ts");
+const { resetJwksCache, resetRevocationCache } = await import("./hub-jwt.ts");
+
+// ---------------------------------------------------------------------------
+// Hub-JWT mint fixture (vault#282 Stage 2 — vault is a pure hub
+// resource-server, so the only mintable user credential is a hub JWT). A fake
+// hub serves JWKS + an empty revocation list; `mintJwt` signs tokens with the
+// requested narrowed scope so the scope-enforcement matrix below exercises the
+// surviving credential. The scope shape is `vault:<name>:<verb>` (narrowed) —
+// the granted_scopes assertions reflect that.
+// ---------------------------------------------------------------------------
+
+let hubServer: ReturnType<typeof Bun.serve>;
+let signingKey: CryptoKey;
+let publicJwk: Record<string, unknown>;
+let hubFixtureOrigin = "";
+const KID = "routing-test-k1";
+
+async function mintJwt(opts: {
+  vaultName: string;
+  scopes: string[];
+  scopedTags?: string[];
+}): Promise<string> {
+  const iat = Math.floor(Date.now() / 1000);
+  const payload: Record<string, unknown> = {
+    scope: opts.scopes.join(" "),
+    client_id: "routing-test",
+  };
+  if (opts.scopedTags && opts.scopedTags.length > 0) {
+    payload.permissions = { scoped_tags: opts.scopedTags };
+  }
+  return await new SignJWT(payload)
+    .setProtectedHeader({ alg: "RS256", kid: KID })
+    .setIssuer(hubServer ? `http://127.0.0.1:${hubServer.port}` : "")
+    .setSubject("routing-test-user")
+    .setAudience(`vault.${opts.vaultName}`)
+    .setIssuedAt(iat)
+    .setExpirationTime(iat + 60)
+    .setJti(`jti-${Math.random().toString(36).slice(2)}`)
+    .sign(signingKey);
+}
+
+/** Mint a narrowed hub JWT carrying every vault verb (admin) for `vaultName`. */
+function createAdminToken(vaultName: string): Promise<string> {
+  return mintJwt({ vaultName, scopes: [`vault:${vaultName}:admin`] });
+}
 
 function createVault(name: string, description?: string): void {
   writeVaultConfig({
@@ -54,18 +99,38 @@ function createVault(name: string, description?: string): void {
 }
 
 /**
- * Mint an admin-scoped token for `vaultName` and return its bearer value.
- * Used by tests that hit admin-gated endpoints (e.g. /.parachute/config).
+ * Seed a vestigial row directly into a vault's `tokens` table (raw INSERT).
+ * Post-0.6.0 (vault#282 Stage 2) vault no longer mints these, but the table
+ * survives + `/auth/status` probes it for leftover pre-0.6.0 rows. This is how
+ * we exercise the `hasTokens=true` branch now that there's no mint path.
  */
-function createAdminToken(vaultName: string): string {
+function seedVestigialTokenRow(vaultName: string): void {
   const store = getVaultStore(vaultName);
-  const { fullToken } = generateToken();
-  createToken(store.db, fullToken, {
-    label: "test-admin",
-    permission: "full",
-    scopes: ["vault:read", "vault:write", "vault:admin"],
-  });
-  return fullToken;
+  store.db
+    .prepare("INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)")
+    .run(`sha256:vestigial-${Math.random().toString(36).slice(2)}`, "leftover", "full", new Date().toISOString());
+}
+
+/**
+ * Seed a vestigial tag-scoped row (raw INSERT, `scoped_tags` JSON populated).
+ * The tag-delete / -rename / -merge fail-closed guard (`findTokensReferencingTag`)
+ * reads this column. Post-0.6.0 hub-JWT tag scopes live in the JWT claim, not
+ * the DB, so the guard now protects only these vestigial rows — these tests
+ * pin that the DB-row guard still fires.
+ */
+function seedTagScopedRow(vaultName: string, scopedTags: string[], label = "test-tag-scoped"): void {
+  const store = getVaultStore(vaultName);
+  store.db
+    .prepare(
+      "INSERT INTO tokens (token_hash, label, permission, scoped_tags, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .run(
+      `sha256:tagscoped-${Math.random().toString(36).slice(2)}`,
+      label,
+      "read",
+      JSON.stringify(scopedTags),
+      new Date().toISOString(),
+    );
 }
 
 function reset(): void {
@@ -74,7 +139,34 @@ function reset(): void {
   mkdirSync(testDir, { recursive: true });
   mkdirSync(join(testDir, "vault", "data"), { recursive: true });
   writeGlobalConfig({ port: 1940 });
+  // Default every test to the fixture hub origin so the hub-JWT mint path
+  // resolves JWKS + validates `iss`. Describes that assert the loopback
+  // default (OAuth discovery metadata) override this in their own beforeEach.
+  if (hubFixtureOrigin) process.env.PARACHUTE_HUB_ORIGIN = hubFixtureOrigin;
+  resetJwksCache();
+  resetRevocationCache();
 }
+
+beforeAll(async () => {
+  const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
+  signingKey = privateKey;
+  const jwk = await exportJWK(publicKey);
+  publicJwk = { kty: "RSA", n: jwk.n, e: jwk.e, kid: KID, alg: "RS256", use: "sig" };
+  hubServer = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/.well-known/jwks.json") {
+        return Response.json({ keys: [publicJwk] });
+      }
+      if (url.pathname === "/.well-known/parachute-revocation.json") {
+        return Response.json({ generated_at: new Date().toISOString(), jtis: [] });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  hubFixtureOrigin = `http://127.0.0.1:${hubServer.port}`;
+});
 
 beforeEach(() => {
   reset();
@@ -82,6 +174,8 @@ beforeEach(() => {
 
 afterAll(() => {
   clearVaultStoreCache();
+  hubServer?.stop(true);
+  delete process.env.PARACHUTE_HUB_ORIGIN;
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
 });
 
@@ -314,7 +408,7 @@ describe("GET /auth/status (public auth preflight)", () => {
     };
     expect(body.initialized).toBe(false);
     expect(body.vaults).toEqual([]);
-    expect(body.auth_modes).toEqual(["pvt_token", "hub_jwt"]);
+    expect(body.auth_modes).toEqual(["hub_jwt"]);
     expect(body.hasOwnerPassword).toBe(false);
     expect(body.hasTotp).toBe(false);
     // No vaults means hasTokens collapses to false (not null), since there's
@@ -341,19 +435,19 @@ describe("GET /auth/status (public auth preflight)", () => {
     expect(body.hasTokens).toBe(false);
   });
 
-  test("vault with a token: hasTokens=true", async () => {
+  test("vault with a vestigial token row: hasTokens=true", async () => {
     createVault("journal");
-    createAdminToken("journal");
+    seedVestigialTokenRow("journal");
     const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
     const body = (await res.json()) as { hasTokens: boolean | null };
     expect(body.hasTokens).toBe(true);
   });
 
-  test("multiple vaults are all listed; hasTokens=true if any has tokens", async () => {
+  test("multiple vaults are all listed; hasTokens=true if any has a vestigial row", async () => {
     createVault("journal");
     createVault("work");
     getVaultStore("journal");
-    createAdminToken("work");
+    seedVestigialTokenRow("work");
     const res = await route(new Request("http://localhost:1940/auth/status"), "/auth/status");
     const body = (await res.json()) as {
       vaults: { name: string; url: string }[];
@@ -369,7 +463,7 @@ describe("GET /auth/status (public auth preflight)", () => {
     // tokens exist. Otherwise an operator who locked one DB would see a
     // misleading `true` and think auth-state is fully observable.
     createVault("alpha");
-    createAdminToken("alpha");
+    seedVestigialTokenRow("alpha");
     createVault("beta");
     // Replace beta's DB file with a non-SQLite blob; the readonly Database
     // open throws at probe time. clearVaultStoreCache so beta's pre-opened
@@ -396,7 +490,7 @@ describe("GET /auth/status (public auth preflight)", () => {
 
   test("response never leaks secrets, hashes, descriptions, or token counts", async () => {
     createVault("journal", "Private journal — must not appear in /auth/status");
-    createAdminToken("journal");
+    seedVestigialTokenRow("journal");
     writeGlobalConfig({
       port: 1940,
       owner_password_hash: "$2b$10$verysecretpasswordhash",
@@ -606,25 +700,23 @@ describe("MCP 401 WWW-Authenticate challenge (RFC 9728)", () => {
 
 const HUB_ORIGIN = "http://127.0.0.1:1939";
 
-// Process-env isolation: sibling test files (tokens-routes.test.ts,
-// auth-hub-jwt.test.ts) set PARACHUTE_HUB_ORIGIN in their own beforeAll
-// hooks. Bun's test runner shares a single process across test files,
-// and when file-ordering puts those before this one, their hook-set
-// value can still be live when our tests run. Restore the default
-// (unset) here so we test against `DEFAULT_HUB_LOOPBACK`. Caught when
-// vault rc.1 release CI failed with "Received: http://127.0.0.1:34295"
-// — a leaked ephemeral port from another test's fixture.
-let _prevHubOriginRouting: string | undefined;
-beforeAll(() => {
-  _prevHubOriginRouting = process.env.PARACHUTE_HUB_ORIGIN;
-  delete process.env.PARACHUTE_HUB_ORIGIN;
-});
-afterAll(() => {
-  if (_prevHubOriginRouting === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
-  else process.env.PARACHUTE_HUB_ORIGIN = _prevHubOriginRouting;
-});
+// OAuth discovery metadata names the hub LOOPBACK default (1939) as issuer,
+// which means these describes must run with PARACHUTE_HUB_ORIGIN UNSET — the
+// opposite of the JWT-minting describes (which need the fixture origin
+// `reset()` sets). Each discovery describe deletes the env in its own
+// beforeEach (running after the top-level reset()). Caught when vault rc.1
+// release CI failed with "Received: http://127.0.0.1:34295" — a leaked
+// ephemeral port from a fixture; the per-describe override pins it here.
+function useLoopbackHubOrigin(): void {
+  beforeEach(() => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    resetJwksCache();
+    resetRevocationCache();
+  });
+}
 
 describe("per-vault OAuth discovery (hub-rooted after workstream E)", () => {
+  useLoopbackHubOrigin();
   test("AS metadata names the hub as issuer + endpoints", async () => {
     createVault("journal");
     const path = "/vault/journal/.well-known/oauth-authorization-server";
@@ -745,6 +837,7 @@ describe("per-vault OAuth discovery (hub-rooted after workstream E)", () => {
 // ---------------------------------------------------------------------------
 
 describe("OAuth discovery (RFC 8414/9728 path-insertion form)", () => {
+  useLoopbackHubOrigin();
   test("AS metadata at path-insertion short form names the hub", async () => {
     createVault("journal");
     const path = "/.well-known/oauth-authorization-server/vault/journal";
@@ -1049,7 +1142,7 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
 
   test("config returns current values with writeOnly fields excluded", async () => {
     createVault("journal");
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const path = "/vault/journal/.parachute/config";
     const origScribeToken = process.env.SCRIBE_TOKEN;
     const origScribeUrl = process.env.SCRIBE_URL;
@@ -1086,7 +1179,7 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
       created_at: new Date().toISOString(),
       audio_retention: "until_transcribed",
     });
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const path = "/vault/journal/.parachute/config";
     const res = await route(
       new Request(`http://localhost:1940${path}`, {
@@ -1100,7 +1193,7 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
 
   test("config scribe_url falls back to empty string when SCRIBE_URL env is unset", async () => {
     createVault("journal");
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const orig = process.env.SCRIBE_URL;
     delete process.env.SCRIBE_URL;
     try {
@@ -1161,13 +1254,7 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
 
   test("config endpoint rejects a vault:read token with 403 + insufficient_scope", async () => {
     createVault("journal");
-    const store = getVaultStore("journal");
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, {
-      label: "reader",
-      permission: "read",
-      scopes: ["vault:read"],
-    });
+    const fullToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
     const path = "/vault/journal/.parachute/config";
     const res = await route(
       new Request(`http://localhost:1940${path}`, {
@@ -1193,33 +1280,47 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
 // ---------------------------------------------------------------------------
 
 describe("scope enforcement on /api/*", () => {
-  /** Mint a token with the given scopes and return its bearer value. */
-  function mintToken(
+  /**
+   * Mint a bearer for the scope-enforcement matrix.
+   *
+   * - Default: a hub JWT with the requested scopes NARROWED to
+   *   `vault:<name>:<verb>` (vault#282 Stage 2 — the surviving user credential).
+   * - `legacyNullScopes`: a legacy YAML api_key (vault.yaml), the surviving
+   *   "legacy-derived" credential. A `read` scope key resolves to read
+   *   permission; a `write` key to full. `permission='full'` maps to a write
+   *   YAML key, `permission='read'` to a read one.
+   */
+  async function mintToken(
     vaultName: string,
     opts: {
       permission: "full" | "read";
       scopes?: string[];
       legacyNullScopes?: boolean;
     },
-  ): string {
-    const store = getVaultStore(vaultName);
-    const { fullToken } = generateToken();
+  ): Promise<string> {
     if (opts.legacyNullScopes) {
-      // Simulate a pre-v12 token row: NULL scopes column, legacy permission
-      // value. resolveToken should fall back via legacyPermissionToScopes.
-      const { hashKey } = require("./config.ts");
-      const hash = hashKey(fullToken);
-      store.db.prepare(
-        "INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)",
-      ).run(hash, `legacy-${opts.permission}`, opts.permission, new Date().toISOString());
-    } else {
-      createToken(store.db, fullToken, {
-        label: `test-${opts.permission}`,
-        permission: opts.permission,
-        scopes: opts.scopes,
+      const { hashKey, generateApiKey } = require("./config.ts");
+      const { fullKey, keyId } = generateApiKey();
+      const scope = opts.permission === "read" ? "read" : "write";
+      writeVaultConfig({
+        name: vaultName,
+        api_keys: [
+          {
+            id: keyId,
+            label: `legacy-${opts.permission}`,
+            scope,
+            key_hash: hashKey(fullKey),
+            created_at: new Date().toISOString(),
+          },
+        ],
+        created_at: new Date().toISOString(),
       });
+      return fullKey;
     }
-    return fullToken;
+    const narrowed = (opts.scopes ?? [`vault:${opts.permission === "read" ? "read" : "admin"}`]).map(
+      (s) => s.replace(/^vault:/, `vault:${vaultName}:`),
+    );
+    return mintJwt({ vaultName, scopes: narrowed });
   }
 
   function authed(token: string, method = "GET", path: string): Request {
@@ -1231,7 +1332,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("vault:read token permits GET /api/vault", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "read",
       scopes: ["vault:read"],
     });
@@ -1242,7 +1343,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("vault:read token rejected on POST /api/notes with 403 insufficient_scope", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "read",
       scopes: ["vault:read"],
     });
@@ -1262,12 +1363,12 @@ describe("scope enforcement on /api/*", () => {
     const body = (await res.json()) as { error_type?: string; required_scope?: string; granted_scopes?: string[] };
     expect(body.error_type).toBe("insufficient_scope");
     expect(body.required_scope).toBe("vault:write");
-    expect(body.granted_scopes).toEqual(["vault:read"]);
+    expect(body.granted_scopes).toEqual(["vault:journal:read"]);
   });
 
   test("vault:write token permits GET (inheritance: write ⊇ read)", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "full",
       scopes: ["vault:write"],
     });
@@ -1278,7 +1379,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("vault:write token permits POST /api/notes", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "full",
       scopes: ["vault:write"],
     });
@@ -1301,7 +1402,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("vault:admin token permits admin-only /.parachute/config", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "full",
       scopes: ["vault:admin"],
     });
@@ -1312,7 +1413,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("vault:admin token permits GET + POST via inheritance", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "full",
       scopes: ["vault:admin"],
     });
@@ -1337,7 +1438,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("legacy token (NULL scopes, permission='full') still works on writes", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "full",
       legacyNullScopes: true,
     });
@@ -1358,7 +1459,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("legacy token (NULL scopes, permission='read') rejected on writes", async () => {
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "read",
       legacyNullScopes: true,
     });
@@ -1398,16 +1499,12 @@ describe("scope enforcement on /api/*", () => {
     vaultName: string,
     scopes: string[],
     scopedTags: string[],
-  ): string {
-    const store = getVaultStore(vaultName);
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, {
-      label: `test-tag-scoped`,
-      permission: scopes.includes("vault:write") || scopes.includes("vault:admin") ? "full" : "read",
-      scopes,
-      scoped_tags: scopedTags,
-    });
-    return fullToken;
+  ): Promise<string> {
+    // Hub JWT with a narrowed scope + `permissions.scoped_tags` claim — the
+    // tag-allowlist now rides the JWT permissions claim (C0), not a vault-DB
+    // column (vault#282 Stage 2).
+    const narrowed = scopes.map((s) => s.replace(/^vault:/, `vault:${vaultName}:`));
+    return mintJwt({ vaultName, scopes: narrowed, scopedTags });
   }
 
   test("tag-scoped read token: GET /api/notes/:id 404s on out-of-scope note (no existence leak)", async () => {
@@ -1415,7 +1512,7 @@ describe("scope enforcement on /api/*", () => {
     const store = getVaultStore("journal");
     const inScope = await store.createNote("h", { tags: ["health"] });
     const outOfScope = await store.createNote("w", { tags: ["work"] });
-    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["health"]);
 
     const ok = `/vault/journal/api/notes/${inScope.id}`;
     expect((await route(authed(token, "GET", ok), ok)).status).toBe(200);
@@ -1429,7 +1526,7 @@ describe("scope enforcement on /api/*", () => {
     const store = getVaultStore("journal");
     await store.createNote("h", { tags: ["health"] });
     await store.createNote("w", { tags: ["work"] });
-    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["health"]);
 
     const path = "/vault/journal/api/notes";
     const res = await route(authed(token, "GET", path), path);
@@ -1445,7 +1542,7 @@ describe("scope enforcement on /api/*", () => {
     const store = getVaultStore("journal");
     await store.createNote("h", { tags: ["health"] });
     await store.createNote("w", { tags: ["work"] });
-    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["health"]);
 
     const path = "/vault/journal/api/tags";
     const res = await route(authed(token, "GET", path), path);
@@ -1460,7 +1557,7 @@ describe("scope enforcement on /api/*", () => {
     createVault("journal");
     const store = getVaultStore("journal");
     await store.createNote("seed", { tags: ["health"] });
-    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
 
     const path = "/vault/journal/api/notes";
     const res = await route(
@@ -1476,7 +1573,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("tag-scoped write token: POST /api/notes outside allowlist → 403 tag_scope_violation", async () => {
     createVault("journal");
-    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
 
     const path = "/vault/journal/api/notes";
     const res = await route(
@@ -1496,7 +1593,7 @@ describe("scope enforcement on /api/*", () => {
     createVault("journal");
     const store = getVaultStore("journal");
     const outOfScope = await store.createNote("w", { tags: ["work"] });
-    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
 
     const path = `/vault/journal/api/notes/${outOfScope.id}`;
     const res = await route(authed(token, "DELETE", path), path);
@@ -1513,7 +1610,7 @@ describe("scope enforcement on /api/*", () => {
     const store = getVaultStore("journal");
     // No `_tags/health/food` schema is created — this is the orphan case.
     const orphan = await store.createNote("orphan", { tags: ["health/food"] });
-    const token = mintTagScopedToken("journal", ["vault:read"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["health"]);
 
     const path = `/vault/journal/api/notes/${orphan.id}`;
     const res = await route(authed(token, "GET", path), path);
@@ -1522,7 +1619,7 @@ describe("scope enforcement on /api/*", () => {
 
   test("tag-scoped write token: orphan sub-tag write succeeds via string-form root", async () => {
     createVault("journal");
-    const token = mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+    const token = await mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
 
     const path = "/vault/journal/api/notes";
     const res = await route(
@@ -1544,10 +1641,10 @@ describe("scope enforcement on /api/*", () => {
     createVault("journal");
     const store = getVaultStore("journal");
     await store.createNote("h", { tags: ["health"] });
-    // Mint a tag-scoped token that references `health`, then try to delete
-    // `health` with an admin token.
-    mintTagScopedToken("journal", ["vault:read"], ["health"]);
-    const admin = createAdminToken("journal");
+    // Seed a vestigial tag-scoped row referencing `health`, then try to delete
+    // `health` with an admin token — the DB-row guard must 409.
+    seedTagScopedRow("journal", ["health"]);
+    const admin = await createAdminToken("journal");
 
     const path = "/vault/journal/api/tags/health";
     const res = await route(authed(admin, "DELETE", path), path);
@@ -1567,7 +1664,7 @@ describe("scope enforcement on /api/*", () => {
     createVault("journal");
     const store = getVaultStore("journal");
     await store.createNote("h", { tags: ["health"] });
-    const admin = createAdminToken("journal");
+    const admin = await createAdminToken("journal");
 
     const path = "/vault/journal/api/tags/health";
     const res = await route(authed(admin, "DELETE", path), path);
@@ -1578,8 +1675,8 @@ describe("scope enforcement on /api/*", () => {
     createVault("journal");
     const store = getVaultStore("journal");
     await store.createNote("h", { tags: ["health"] });
-    mintTagScopedToken("journal", ["vault:read"], ["health"]);
-    const admin = createAdminToken("journal");
+    seedTagScopedRow("journal", ["health"]);
+    const admin = await createAdminToken("journal");
 
     const path = "/vault/journal/api/tags/health/rename";
     const res = await route(
@@ -1610,8 +1707,8 @@ describe("scope enforcement on /api/*", () => {
     const store = getVaultStore("journal");
     await store.createNote("a", { tags: ["alpha"] });
     await store.createNote("b", { tags: ["beta"] });
-    mintTagScopedToken("journal", ["vault:read"], ["alpha"]);
-    const admin = createAdminToken("journal");
+    seedTagScopedRow("journal", ["alpha"]);
+    const admin = await createAdminToken("journal");
 
     const path = "/vault/journal/api/tags/merge";
     const res = await route(
@@ -1638,7 +1735,7 @@ describe("scope enforcement on /api/*", () => {
     // writes. Without this, a cosmetic `--read` flag could silently allow
     // mutations — the whole point of the review item.
     createVault("journal");
-    const token = mintToken("journal", {
+    const token = await mintToken("journal", {
       permission: "read",
       scopes: ["vault:read"],
     });
@@ -1766,13 +1863,7 @@ describe("/vault/<name>/.parachute/mirror — auth + dispatch", () => {
 
   test("vault:read token → 403 insufficient_scope", async () => {
     createVault("journal");
-    const store = getVaultStore("journal");
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, {
-      label: "reader",
-      permission: "read",
-      scopes: ["vault:read"],
-    });
+    const fullToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
     const p = "/vault/journal/.parachute/mirror";
     const res = await route(
       new Request(`http://localhost:1940${p}`, {
@@ -1793,7 +1884,7 @@ describe("/vault/<name>/.parachute/mirror — auth + dispatch", () => {
     // so operators can tell "manager not initialized" apart from
     // "you used the wrong creds".
     createVault("journal");
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const p = "/vault/journal/.parachute/mirror";
     const res = await route(
       new Request(`http://localhost:1940${p}`, {
@@ -1808,7 +1899,7 @@ describe("/vault/<name>/.parachute/mirror — auth + dispatch", () => {
 
   test("non-GET/PUT methods return 405 when manager isn't wired", async () => {
     createVault("journal");
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const p = "/vault/journal/.parachute/mirror";
     // 503 short-circuits the method check today — that's fine; what we
     // want to assert is that we don't crash + the status is non-2xx.
@@ -1842,13 +1933,7 @@ describe("/vault/<name>/.parachute/mirror/run-now — auth + dispatch", () => {
 
   test("vault:read token → 403 insufficient_scope", async () => {
     createVault("journal");
-    const store = getVaultStore("journal");
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, {
-      label: "reader",
-      permission: "read",
-      scopes: ["vault:read"],
-    });
+    const fullToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
     const p = "/vault/journal/.parachute/mirror/run-now";
     const res = await route(
       new Request(`http://localhost:1940${p}`, {
@@ -1868,7 +1953,7 @@ describe("/vault/<name>/.parachute/mirror/run-now — auth + dispatch", () => {
     // determines whether a previous test wired a manager. Either way
     // the auth gate passed, which is what this routing-level test pins.
     createVault("journal");
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const p = "/vault/journal/.parachute/mirror/run-now";
     const res = await route(
       new Request(`http://localhost:1940${p}`, {
@@ -1882,7 +1967,7 @@ describe("/vault/<name>/.parachute/mirror/run-now — auth + dispatch", () => {
 
   test("non-POST methods return 405 when manager is wired", async () => {
     createVault("journal");
-    const token = createAdminToken("journal");
+    const token = await createAdminToken("journal");
     const p = "/vault/journal/.parachute/mirror/run-now";
     const res = await route(
       new Request(`http://localhost:1940${p}`, {

@@ -3,9 +3,11 @@
  *
  * Tokens carry OAuth-standard whitespace-separated scopes. Two shapes coexist:
  *
- *   - **Broad** `vault:<verb>` — used by `pvt_*` tokens, which are vault-pinned
- *     by storage (each vault has its own tokens DB; a token only resolves
- *     against the vault that minted it).
+ *   - **Broad** `vault:<verb>` — used by legacy YAML api_keys and the
+ *     VAULT_AUTH_TOKEN operator bearer, which are vault-pinned by context
+ *     (the YAML key lives under a specific vault; the operator bearer is
+ *     server-wide full-admin). (The `pvt_*` vault-DB token that also used
+ *     this shape was dropped at 0.6.0 — vault#282 Stage 2.)
  *   - **Narrowed** `vault:<name>:<verb>` — used by hub-issued JWTs, which are
  *     not pinned by storage and so MUST name the resource they grant access
  *     to. Hub JWTs carrying broad `vault:<verb>` are rejected at validation
@@ -113,9 +115,10 @@ export function hasScope(granted: string[], required: string): boolean {
  *
  * Match rules:
  *   - Broad `vault:<verb>` in granted satisfies any vault (the broad scope
- *     has no resource constraint; the caller pins the vault upstream — pvt_*
- *     resolves only against its issuing vault's DB, hub JWTs reject broad
- *     scopes at validation).
+ *     has no resource constraint; the caller pins the vault upstream — a
+ *     legacy YAML key lives under a specific vault, the VAULT_AUTH_TOKEN
+ *     bearer is server-wide full-admin, and hub JWTs reject broad scopes at
+ *     validation).
  *   - Narrowed `vault:<name>:<verb>` satisfies only the matching `vaultName`.
  *   - Verb inheritance `admin ⊇ write ⊇ read` applies in both forms.
  */
@@ -285,95 +288,4 @@ export function parseScopeFlags(
     }
   }
   return { scopes: deduped, error: null };
-}
-
-/**
- * Resolve `parachute vault tokens create` argv into a concrete scope set +
- * legacy `permission` column value, or an actionable error.
- *
- * Precedence is **exclusive**: `--scope`, `--read`, and `--permission` all
- * narrow the token, but combining them is always an error — a user who
- * writes `--scope vault:write --read` almost certainly expects one of the
- * two to win, and silently picking would mint the opposite of what at
- * least one reading intended. Fail loud for anything token-minting.
- *
- * With no narrowing flag, falls back to a full-scope token for back-compat.
- */
-export function resolveCreateTokenFlags(args: string[]): {
-  scopes: string[] | undefined;
-  permission: "full" | "read";
-  error: string | null;
-} {
-  const scopeResult = parseScopeFlags(args);
-  if (scopeResult.error) {
-    return { scopes: undefined, permission: "full", error: scopeResult.error };
-  }
-  const hasScopeFlag = scopeResult.scopes !== null;
-  const hasReadFlag = args.includes("--read");
-  const permIdx = args.indexOf("--permission");
-  const hasPermFlag = permIdx !== -1;
-
-  if (hasScopeFlag && hasReadFlag) {
-    return {
-      scopes: undefined,
-      permission: "full",
-      error:
-        "--scope and --read cannot be combined. Pick one:\n" +
-        "  --read                     # shorthand for --scope vault:read\n" +
-        "  --scope vault:read         # equivalent, explicit\n" +
-        "  --scope vault:write        # write scope",
-    };
-  }
-  if (hasScopeFlag && hasPermFlag) {
-    return {
-      scopes: undefined,
-      permission: "full",
-      error:
-        "--scope and --permission cannot be combined. --scope is the canonical way to narrow a token; --permission is legacy.",
-    };
-  }
-  if (hasReadFlag && hasPermFlag) {
-    return {
-      scopes: undefined,
-      permission: "full",
-      error: "--read and --permission cannot be combined. --read is a shorthand for --permission read.",
-    };
-  }
-
-  if (hasPermFlag) {
-    const rawPerm = args[permIdx + 1];
-    if (!rawPerm || rawPerm.startsWith("--")) {
-      return {
-        scopes: undefined,
-        permission: "full",
-        error: `--permission requires a value ("full" or "read"). Prefer --scope for new scripts.`,
-      };
-    }
-    if (!["full", "read"].includes(rawPerm)) {
-      return {
-        scopes: undefined,
-        permission: "full",
-        error: `Invalid --permission: ${rawPerm}. Must be "full" or "read". Prefer --scope for new scripts.`,
-      };
-    }
-  }
-
-  if (scopeResult.scopes) {
-    const scopes = scopeResult.scopes;
-    const permission: "full" | "read" =
-      scopes.includes(SCOPE_WRITE) || scopes.includes(SCOPE_ADMIN) ? "full" : "read";
-    return { scopes, permission, error: null };
-  }
-  if (hasReadFlag) {
-    return { scopes: [SCOPE_READ], permission: "read", error: null };
-  }
-  if (hasPermFlag) {
-    const rawPerm = args[permIdx + 1];
-    return {
-      scopes: undefined,
-      permission: rawPerm === "read" ? "read" : "full",
-      error: null,
-    };
-  }
-  return { scopes: undefined, permission: "full", error: null };
 }

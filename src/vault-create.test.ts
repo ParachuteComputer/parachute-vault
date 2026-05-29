@@ -60,7 +60,13 @@ describe("vault create --json", () => {
     expect(lines).toHaveLength(1);
     const payload = JSON.parse(lines[0]!);
     expect(payload.name).toBe("myvault");
-    expect(payload.token).toMatch(/^pvt_/);
+    // vault#282 Stage 2: vault no longer mints pvt_* tokens. The contract
+    // hub's admin-vaults.ts requires still holds (`token` is a string). In
+    // this sandbox there's no hub/operator.token, so no token is issued: the
+    // token field is the empty string and `token_guidance` explains why.
+    expect(typeof payload.token).toBe("string");
+    expect(payload.token).toBe("");
+    expect(payload.token_guidance).toContain("No token issued");
     expect(payload.set_as_default).toBe(true);
     expect(payload.paths.vault_dir).toBe(join(home, "vault", "data", "myvault"));
     expect(payload.paths.vault_db).toBe(join(home, "vault", "data", "myvault", "vault.db"));
@@ -177,7 +183,7 @@ describe("vault create — services.json registration (#208)", () => {
   });
 });
 
-describe("vault create (human mode unchanged)", () => {
+describe("vault create (human mode)", () => {
   test("prints multi-line human output without --json", () => {
     const { exitCode, stdout } = runCli(
       ["create", "human"],
@@ -185,8 +191,10 @@ describe("vault create (human mode unchanged)", () => {
     );
     expect(exitCode).toBe(0);
     expect(stdout).toContain('Vault "human" created.');
-    expect(stdout).toContain("API token:");
-    expect(stdout).toContain("Save this");
+    // vault#282 Stage 2: with no hub reachable in this sandbox, no token is
+    // issued — the human output prints the guidance instead of "API token:".
+    expect(stdout).toContain("No token issued");
+    expect(stdout).toContain("Install the hub");
     // Human output should NOT be valid JSON.
     expect(() => JSON.parse(stdout.trim())).toThrow();
   });

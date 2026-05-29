@@ -6,9 +6,9 @@ Agent-native knowledge graph. Notes, tags, links over MCP. Self-hosted, one comm
 
 ```
 parachute-vault init     →  ~/.parachute/vault/ (config, .env, daemon, MCP)
-parachute-vault create   →  new vault (SQLite DB + vault.yaml + pvt_ token)
+parachute-vault create   →  new vault (SQLite DB + vault.yaml; mints a hub JWT when a hub is reachable, else emits guidance — vault#282 Stage 2)
 parachute-vault config   →  manage env vars (PORT, etc.)
-parachute-vault tokens   →  list / create / revoke per-vault tokens
+parachute-vault tokens   →  list / revoke vestigial pre-0.6.0 rows (minting is hub's job now)
 
 CLI  →  Bun server (port 1940)  →  multiple vaults (each its own SQLite DB)
                                          ↑

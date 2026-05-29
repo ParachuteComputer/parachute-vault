@@ -8,11 +8,18 @@
  *
  * What gets exposed:
  *   - `initialized` — at least one vault exists
- *   - `auth_modes`  — accepted bearer formats (pvt_*, hub-issued JWT)
+ *   - `auth_modes`  — accepted bearer formats. As of 0.6.0 (vault#282 Stage 2)
+ *     vault is a pure hub resource-server: the only first-class user
+ *     credential is a hub-issued JWT, so this is `["hub_jwt"]`. (The
+ *     server-wide VAULT_AUTH_TOKEN operator bearer + legacy YAML api_keys
+ *     still authenticate, but they're operator/legacy channels, not the
+ *     advertised first-contact mode.)
  *   - `vaults`      — list of `{ name, url }` for client-side dispatch
  *   - `hasOwnerPassword`, `hasTotp` — OAuth consent prerequisites
- *   - `hasTokens`   — boolean | null. `null` ≈ "we couldn't read all DBs,
- *     don't trust this answer"; `true`/`false` are honest yes/no signals.
+ *   - `hasTokens`   — boolean | null. Probes the vestigial `tokens` table for
+ *     any leftover pre-0.6.0 rows (the table is kept inert as the YAML-import
+ *     landing zone + a future-cosmetic-drop target). `null` ≈ "we couldn't
+ *     read all DBs, don't trust this answer"; `true`/`false` are honest yes/no.
  *
  * What is deliberately NOT exposed: token counts, hashes, descriptions,
  * timestamps, owner-password hash, totp secret, backup codes. The endpoint
@@ -26,7 +33,7 @@ import { listVaults, readGlobalConfig, vaultDbPath } from "./config.ts";
 
 export interface AuthStatusResponse {
   initialized: boolean;
-  auth_modes: ("pvt_token" | "hub_jwt")[];
+  auth_modes: "hub_jwt"[];
   vaults: { name: string; url: string }[];
   hasOwnerPassword: boolean;
   hasTotp: boolean;
@@ -77,7 +84,7 @@ export function buildAuthStatus(): AuthStatusResponse {
   const vaultNames = listVaults();
   return {
     initialized: vaultNames.length > 0,
-    auth_modes: ["pvt_token", "hub_jwt"],
+    auth_modes: ["hub_jwt"],
     vaults: vaultNames.map((name) => ({ name, url: `/vault/${name}` })),
     hasOwnerPassword: typeof globalConfig.owner_password_hash === "string"
       && globalConfig.owner_password_hash.length > 0,

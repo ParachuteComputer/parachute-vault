@@ -4,27 +4,28 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
-## pvt_* token deprecation — will be rejected at 0.6.0
+## pvt_* token removal — REJECTED as of 0.6.0 (BREAKING)
 
-**TL;DR:** `pvt_*` tokens (the opaque `pvt_…` bearers vault mints into its own
-SQLite `tokens` table) are **deprecated**. They still work today — every
-upgrade up to and including the last 0.5.x release keeps authenticating them
-unchanged. At **vault 0.6.0** they will be **rejected with a 401**. Migrate
-each client to a **hub-issued JWT** before you upgrade to 0.6.0.
+**TL;DR:** `pvt_*` tokens (the opaque `pvt_…` bearers vault used to mint into
+its own SQLite `tokens` table) are **gone as of 0.6.0**. Vault no longer mints
+them and no longer validates them — a `pvt_*` bearer now **fails with a 401**.
+This is the BREAKING DROP the prior releases warned about (vault#282 Stage 2).
+If any MCP client or script still presents a `pvt_…` bearer, **migrate it to a
+hub-issued JWT** using the steps below — it has stopped working at 0.6.0.
 
-This is the safe on-ramp: nothing breaks now. Starting with the release that
-ships this notice, every successful `pvt_*` authentication logs a one-time
-warning naming the token's display id and pointing here, so you can find which
-clients still need migrating before the cutover.
+The pre-0.6.0 releases (the last 0.4.x / 0.5.x line) logged a one-time
+`[deprecation] pvt_* token …` warning on every pvt_* auth so you could find
+which clients still needed migrating ahead of this cutover. If you upgraded
+straight from a pvt_*-only install, work through the migration path below.
 
 ### Why this is happening
 
-Vault is becoming a **pure OAuth resource-server**. Granular, revocable,
+Vault is now a **pure OAuth resource-server**. Granular, revocable,
 audience-bound auth is a hub-minted capability — the hub is the single token
 issuer for the ecosystem (it already mints the JWTs that browser-based clients
-use today). `pvt_*` was vault's own pre-hub token type; it predates the hub and
-duplicates a capability that now lives entirely on the hub. Keeping two parallel
-auth surfaces (vault-local `pvt_*` + hub JWTs) is the thing 0.6.0 retires. After
+use today). `pvt_*` was vault's own pre-hub token type; it predated the hub and
+duplicated a capability that now lives entirely on the hub. Keeping two parallel
+auth surfaces (vault-local `pvt_*` + hub JWTs) is what 0.6.0 retired. As of
 0.6.0, vault validates hub-issued JWTs (and the coarse `VAULT_AUTH_TOKEN` /
 `vault.yaml` operator secrets for the no-granular-auth path) and nothing else.
 
@@ -35,24 +36,26 @@ stranded by the removal.
 
 ### Who this affects
 
-If you came up on **vault 0.2.4-era** (vault standalone, no hub) you are
-**100% on `pvt_*`** — every MCP client and script you wired authenticates with
-a `pvt_…` bearer. You are the operator this notice is for. You need to install
-the hub and re-mint each client's token before upgrading to 0.6.0.
+If you came up on **vault 0.2.4-era** (vault standalone, no hub) you were
+**100% on `pvt_*`** — every MCP client and script you wired authenticated with
+a `pvt_…` bearer. You are the operator this affects: those bearers stop working
+at 0.6.0. Install the hub and re-mint each client's token.
 
 If you are **already running vault behind the hub** and your clients connect
 via OAuth (Claude Desktop, claude.ai, Parachute Daily, etc.), those clients
 already use hub JWTs — they need no change. You only need to migrate any
-**scripts or CLI-wired tokens** that still present a `pvt_…` bearer (check your
-logs for the `[deprecation] pvt_* token …` lines).
+**scripts or CLI-wired tokens** that still present a `pvt_…` bearer (your
+pre-0.6.0 logs flagged these with `[deprecation] pvt_* token …` lines).
 
-### Upgrading to the CURRENT release is safe
+### What broke at 0.6.0
 
-You do **not** have to migrate before upgrading to the current (pre-0.6.0)
-release. `pvt_*` keeps authenticating exactly as before — same permission, same
-scopes, same vault binding — and just emits the one-time deprecation warning.
-Use the window between this release and 0.6.0 to migrate at your own pace. The
-deprecation is **non-breaking** until 0.6.0.
+A `pvt_*` bearer now returns **401** on every vault endpoint (per-vault and the
+global `/vaults` surface). `parachute-vault tokens create` was removed (it
+minted pvt_*); `mcp-install --legacy-pat` was removed. Tokens are now exclusively
+hub-issued JWTs. Your existing pvt_* rows stay in the `tokens` table inertly —
+they're harmless and the table is kept as the legacy-YAML import landing zone —
+but nothing validates them. Work through the migration path below to restore
+access for any pvt_*-only client.
 
 ### Migration path (no-hub operator)
 
@@ -92,21 +95,17 @@ deprecation is **non-breaking** until 0.6.0.
    headers) with the freshly-minted JWT. `mcp-install` does this for the MCP
    clients automatically; scripts you wired by hand you update by hand.
 
-4. **Confirm, then cut over.** Watch your vault logs — once no
-   `[deprecation] pvt_* token …` lines appear for a full cycle of your clients'
-   activity, every caller is on a hub JWT. Then upgrade vault to 0.6.0:
-
-   ```bash
-   parachute upgrade vault
-   ```
-
-   At 0.6.0 any remaining `pvt_*` bearer starts returning 401, so finish the
-   re-mint before this step.
+4. **Confirm.** Watch your vault logs — once every caller authenticates with a
+   hub JWT (no 401s from a stale `pvt_…` bearer), you're done. If you upgraded
+   to 0.6.0 before re-minting, do it now: the pvt_* bearers are already
+   401-ing, so re-mint each one and swap the config.
 
 Reference: pvt_* retirement arc tracked at
 [vault#282](https://github.com/ParachuteComputer/parachute-vault/issues/282);
-propagation tracker at
-[parachute-patterns/migrations/2026-05-28-operator-mintable-vault-admin.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-28-operator-mintable-vault-admin.md).
+the Stage-2 DROP propagation tracker is at
+[parachute-patterns/migrations/2026-05-28-pvt-token-drop.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-28-pvt-token-drop.md)
+(the Stage-1 operator-mintable-admin enabler is at
+[2026-05-28-operator-mintable-vault-admin.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-28-operator-mintable-vault-admin.md)).
 
 ## Mirror event-driven exports + `sync_mode` schema (0.4.9-rc.5 → 0.4.9-rc.6)
 
@@ -218,9 +217,10 @@ What survives:
   `200` — but the metadata they return forwards every authorization-server
   endpoint to the hub origin. A client that probes vault's discovery URL
   rediscovers the hub.
-- The `tokens` table, the bearer-token surface, the `pvt_*` CLI tokens,
-  and hub-issued-JWT validation are all unchanged. Existing CLI-minted
-  tokens keep authenticating.
+- The `tokens` table and hub-issued-JWT validation are unchanged here.
+  **(Superseded at 0.6.0 — vault#282 Stage 2 dropped the `pvt_*` CLI tokens +
+  bearer-token mint/validation surface entirely; see the pvt_* removal section
+  at the top of this file. The `tokens` table is kept inert.)**
 - The `oauth_clients` and `oauth_codes` SQLite tables stay (harmless
   empty rows; cleaning them up is a future migration).
 - The `parachute-vault set-password` / `parachute-vault 2fa *` CLI
@@ -243,14 +243,15 @@ Hub binds `127.0.0.1:1939` by default. Set `PARACHUTE_HUB_ORIGIN` for vault
 (in `~/.parachute/vault/.env`) if the hub is reachable on a non-default
 origin; otherwise the loopback default works for single-host installs.
 
-Your existing vault data (SQLite DBs, `vault.yaml`, `pvt_*` tokens in the
-`tokens` table) is **fully compatible** — no schema migration is needed.
-Hub adds an OAuth layer on top of the same data shape vault has always had.
+Your existing vault data (SQLite DBs, `vault.yaml`, and any leftover `pvt_*`
+rows in the `tokens` table) needs no schema migration. Hub adds an OAuth layer
+on top of the same data shape vault has always had. **(At 0.6.0 / vault#282
+Stage 2, the `pvt_*` rows became inert — vault no longer validates them; see
+the pvt_* removal section at the top of this file.)**
 
-CLI-driven bearer tokens (`parachute-vault tokens create`,
-`~/.claude.json` entries written by `parachute-vault mcp-install`,
-`VAULT_AUTH_TOKEN`) keep working unchanged. The retirement only affects
-the browser-based OAuth handshake.
+`VAULT_AUTH_TOKEN` (the server-wide operator bearer) and `~/.claude.json`
+entries holding a **hub JWT** keep working. **(`parachute-vault tokens create`
+was removed at 0.6.0; `mcp-install` now writes a hub JWT, not a `pvt_*`.)**
 
 ### If you were already running vault-fronted-by-hub
 

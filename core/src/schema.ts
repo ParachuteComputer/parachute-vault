@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 
 -- Tokens: API authentication with OAuth-standard scopes.
 --
+-- VESTIGIAL as of 0.6.0 (vault#282 Stage 2). Vault is a pure hub
+-- resource-server: it no longer mints (pvt_*) or validates rows in this
+-- table — auth runs through hub-issued JWTs + VAULT_AUTH_TOKEN + legacy YAML
+-- api_keys only. The table is KEPT (not dropped) because migrateVaultKeys
+-- raw-INSERTs legacy YAML api_keys here as its import landing zone, and
+-- dropping it would trip an upgrade on a missing column for operators with
+-- leftover rows. A future cosmetic migration may drop it alongside
+-- oauth_clients/oauth_codes. 'tokens list' / 'tokens revoke' (CLI) still
+-- read/delete here for cleanup of leftover rows. See the field docs below for
+-- the historical (pre-0.6.0) semantics.
+--
 -- scopes is a whitespace-separated list of granted scopes (OAuth 2.0 §3.3)
 -- — e.g. "vault:read vault:write". Introduced in v12 alongside enforcement;
 -- NULL rows are pre-v12 tokens which fall back to deriving scopes from the
@@ -128,10 +139,9 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 -- minted this one, or the hub-JWT jti claim when minted from a hub
 -- session. Session-pinned list+revoke in manage-token filters on this.
 --
--- revoked_at (v19) marks soft-revocation. Revoke from manage-token sets
--- this rather than deleting the row, so the audit trail stays intact and
--- the second revoke of the same jti is idempotent (returns ok=true).
--- resolveToken treats a revoked_at-set row as not-found.
+-- revoked_at (v19) marked soft-revocation of vault-DB tokens. Vestigial
+-- post-0.6.0 (vault#282 Stage 2) — the validation path that read it
+-- (resolveToken) was removed alongside the pvt_* mint.
 CREATE TABLE IF NOT EXISTS tokens (
   token_hash TEXT PRIMARY KEY,
   label TEXT NOT NULL,
@@ -408,9 +418,10 @@ export function initSchema(db: Database): void {
   migrateToV15(db);
 
   // Migrate v15 → v16: add `vault_name` column to tokens. Existing rows
-  // backfill to NULL ("server-wide / legacy" semantic) — auth accepts
-  // NULL for any vault, so today's pvt_* tokens keep working unchanged.
-  // New mints via per-vault routes write the column explicitly. See vault#257.
+  // backfilled to NULL ("server-wide / legacy" semantic) — at the time auth
+  // accepted NULL for any vault so pre-v16 pvt_* tokens kept working. (pvt_*
+  // validation was dropped at 0.6.0 / vault#282 Stage 2; the column is now
+  // vestigial.) See vault#257.
   migrateToV16(db);
 
   // Migrate v16 → v17: rip the standalone `note_schemas` + `schema_mappings`
@@ -838,12 +849,11 @@ function migrateToV15(db: Database): void {
  * Migrate v15 → v16: per-vault token storage (vault#257).
  *
  * Adds `tokens.vault_name TEXT` (nullable). Existing rows stay NULL —
- * "server-wide / legacy" semantic — and `authenticateVaultRequest`
- * accepts NULL for any vault, so today's pvt_* tokens keep working
- * unchanged. New mints via `/vault/<name>/tokens` write the column
- * explicitly; cross-vault presentation rejects on the row's vault_name
- * mismatch. The complementary index speeds the per-vault listTokens
- * filter in the admin SPA.
+ * "server-wide / legacy" semantic. At the time, `authenticateVaultRequest`
+ * accepted NULL for any vault so pre-v16 pvt_* tokens kept working. (pvt_*
+ * validation + the `/vault/<name>/tokens` mint route were both removed at
+ * 0.6.0 / vault#282 Stage 2 — the column + index are now vestigial; the
+ * index still speeds the per-vault `listTokens` cleanup listing.)
  *
  * Wrapped in BEGIN IMMEDIATE / COMMIT (with try/catch ROLLBACK) per the
  * v14/v15 wrap pattern from vault#251 — the column add and index create

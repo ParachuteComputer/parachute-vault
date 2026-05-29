@@ -1,20 +1,24 @@
 /**
- * Token operations for per-vault token management.
+ * Token operations for the per-vault `tokens` table.
  *
- * Tokens live in each vault's SQLite database (the `tokens` table is part of
- * the vault schema as of v7). All functions take a Database parameter — the
- * vault's own DB connection.
+ * VESTIGIAL as of 0.6.0 (vault#282 Stage 2). Vault is a pure hub
+ * resource-server: it no longer mints (`pvt_*`) or validates rows in this
+ * table. What survives here:
+ *   - `listTokens` / `revokeToken` / `findTokensReferencingTag` — read/clean up
+ *     any leftover pre-0.6.0 rows.
+ *   - `migrateVaultKeys` — the legacy-YAML-api_keys import landing zone (raw
+ *     INSERT; the only writer left).
+ *   - the `mcp_mint_ledger` helpers — hub-JWT attribution for manage-token.
  *
- * Two permission levels:
- *   - "full"  — unrestricted access (CRUD, delete, token management)
- *   - "read"  — query-only (no mutations)
+ * The `Token`/field docs below describe the historical (pre-0.6.0) auth
+ * semantics for the surviving read/cleanup paths; no validation path reads
+ * `scoped_tags` / `vault_name` off these rows anymore.
  *
- * Legacy "admin" and "write" values in the DB are normalized to "full" at
- * read time for backward compatibility.
+ * Permission levels ("full" / "read") and the legacy "admin"/"write" → "full"
+ * normalization are kept for displaying any leftover rows.
  */
 
 import { Database } from "bun:sqlite";
-import crypto from "node:crypto";
 import { hashKey } from "./config.ts";
 import { legacyPermissionToScopes, parseScopes, serializeScopes } from "./scopes.ts";
 
@@ -71,49 +75,17 @@ export interface Token {
   created_via: string | null;
   /**
    * Session pin (v19). When this token was minted via manage-token, this
-   * is the display id (`t_<prefix>`) of the calling session's token (for
-   * pvt_* MCP sessions) or the hub JWT's jti claim (for hub-issued
-   * sessions). NULL otherwise.
+   * is the hub JWT's jti claim of the minting session. NULL otherwise.
+   * (Vestigial post-0.6.0 — no new rows are written; vault no longer mints
+   * vault-DB tokens. See vault#282 Stage 2.)
    */
   parent_jti: string | null;
   /**
-   * Soft-revoke timestamp (v19). When set, `resolveToken` returns null
-   * and the row stays in place for audit history. manage-token revoke is
-   * idempotent — calling revoke a second time on the same jti is a no-op
-   * with ok=true. NULL = active.
+   * Soft-revoke timestamp (v19). Marked the row revoked while keeping it in
+   * place for audit history. Vestigial post-0.6.0 (vault#282 Stage 2) — no
+   * validation path reads these rows anymore. NULL = active.
    */
   revoked_at: string | null;
-}
-
-export interface ResolvedToken {
-  permission: TokenPermission;
-  /**
-   * Granted scopes, parsed from the token row's `scopes` column. Pre-v12
-   * tokens (where the column is NULL) fall back to the legacy permission
-   * → scopes mapping and `legacyDerived` is set true so callers can log
-   * a deprecation warning on first use.
-   */
-  scopes: string[];
-  /** True iff `scopes` was derived from the legacy `permission` column. */
-  legacyDerived: boolean;
-  /**
-   * Tag-allowlist for tag-scoped tokens (root tag names). NULL = unscoped.
-   * See `Token.scoped_tags`.
-   */
-  scoped_tags: string[] | null;
-  /**
-   * Per-vault binding (v16). Non-null = token is bound to this vault;
-   * `authenticateVaultRequest` rejects when the bound vault doesn't match
-   * the request's vault. NULL = legacy / server-wide, accepted for any
-   * vault. See vault#257.
-   */
-  vault_name: string | null;
-  /**
-   * Display id (`t_<hashprefix>`) of THIS token. Surfaced so callers that
-   * later mint child tokens (manage-token MCP tool) can stamp parent_jti
-   * without re-derivation. Pre-v19 lookups still compute this on the fly.
-   */
-  jti: string;
 }
 
 /**
@@ -136,160 +108,14 @@ export function parseScopedTags(raw: string | null): string[] | null {
 
 // ---------------------------------------------------------------------------
 // Token operations
+//
+// vault#282 Stage 2: the pvt_* mint (`generateToken` / `createToken`) and
+// validation (`resolveToken`) were removed at 0.6.0 — vault is a pure hub
+// resource-server and no longer issues or accepts opaque vault-DB tokens.
+// What survives: `listTokens` / `revokeToken` (cleanup of vestigial pre-0.6.0
+// rows), the YAML-import landing zone (`migrateVaultKeys`, raw INSERT), and the
+// `mcp_mint_ledger` machinery (hub-JWT attribution for manage-token).
 // ---------------------------------------------------------------------------
-
-export function generateToken(): { fullToken: string; tokenHash: string } {
-  const random = crypto.randomBytes(32).toString("base64url").slice(0, 32);
-  const fullToken = `pvt_${random}`;
-  return { fullToken, tokenHash: hashKey(fullToken) };
-}
-
-export function createToken(
-  db: Database,
-  fullToken: string,
-  opts: {
-    label: string;
-    permission?: TokenPermission;
-    /**
-     * Explicit OAuth-standard scopes to persist. If omitted, derived from
-     * `permission` (read → [vault:read], anything else → [vault:read,
-     * vault:write, vault:admin]). Written as a whitespace-separated string.
-     */
-    scopes?: string[];
-    /** @deprecated Written to DB but not enforced at runtime. */
-    scope_tag?: string | null;
-    /** @deprecated Written to DB but not enforced at runtime. */
-    scope_path_prefix?: string | null;
-    /**
-     * Tag-allowlist (root tag names). null/undefined → unscoped (full vault
-     * access per `scopes`). When provided, must be already-validated root tag
-     * names per patterns/tag-scoped-tokens.md (no path separators); the mint
-     * endpoint validates against existing tags before passing through.
-     */
-    scoped_tags?: string[] | null;
-    /**
-     * Per-vault binding (v16). Non-null = token can only authenticate
-     * against this vault. NULL = legacy / server-wide; auth accepts the
-     * token for any vault. New mints via per-vault routes set this; the
-     * legacy YAML-import path leaves it NULL. See vault#257.
-     */
-    vault_name?: string | null;
-    expires_at?: string | null;
-    /**
-     * Provenance tag (v19). `'mcp_mint'` for tokens minted via the
-     * manage-token MCP tool; omit/null for CLI / REST / YAML paths.
-     */
-    created_via?: string | null;
-    /**
-     * Session pin (v19). Display id (`t_<prefix>`) or hub JWT `jti` of the
-     * caller that minted this token via manage-token. Used by the
-     * manage-token list/revoke surface to scope itself to one session.
-     */
-    parent_jti?: string | null;
-  },
-): Token {
-  const tokenHash = hashKey(fullToken);
-  const now = new Date().toISOString();
-  const permission = opts.permission ?? "full";
-  const scopes = opts.scopes ?? legacyPermissionToScopes(permission);
-  const scopesStr = serializeScopes(scopes);
-  const scopedTags = opts.scoped_tags && opts.scoped_tags.length > 0 ? opts.scoped_tags : null;
-  const scopedTagsStr = scopedTags ? JSON.stringify(scopedTags) : null;
-  const vaultName = opts.vault_name ?? null;
-  const createdVia = opts.created_via ?? null;
-  const parentJti = opts.parent_jti ?? null;
-
-  db.prepare(`
-    INSERT INTO tokens (token_hash, label, permission, scopes, scoped_tags, scope_tag, scope_path_prefix, expires_at, created_at, vault_name, created_via, parent_jti)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    tokenHash,
-    opts.label,
-    permission,
-    scopesStr,
-    scopedTagsStr,
-    opts.scope_tag ?? null,
-    opts.scope_path_prefix ?? null,
-    opts.expires_at ?? null,
-    now,
-    vaultName,
-    createdVia,
-    parentJti,
-  );
-
-  return {
-    token_hash: tokenHash,
-    label: opts.label,
-    permission,
-    scope_tag: opts.scope_tag ?? null,
-    scope_path_prefix: opts.scope_path_prefix ?? null,
-    scoped_tags: scopedTags,
-    vault_name: vaultName,
-    expires_at: opts.expires_at ?? null,
-    created_at: now,
-    last_used_at: null,
-    created_via: createdVia,
-    parent_jti: parentJti,
-    revoked_at: null,
-  };
-}
-
-/**
- * Resolve a bearer token. Returns the token info if valid, null if not found or expired.
- * Updates last_used_at on successful resolution.
- */
-export function resolveToken(db: Database, providedToken: string): ResolvedToken | null {
-  // Hash-then-lookup: the SQL = comparison on SHA-256 output is not timing-safe,
-  // but this is acceptable — the attacker would need to guess a valid SHA-256
-  // preimage, which is computationally infeasible regardless of timing leaks.
-  const candidateHash = hashKey(providedToken);
-
-  // Defensive SELECT for revoked_at: the column exists post-v19, but a
-  // freshly-opened ResolvedToken-only test fixture might run on a DB the
-  // migration hasn't touched. SQLite returns NULL for missing columns when
-  // the table is queried via prepared statements only after migration; here
-  // initSchema fires on every store-open path, so the column is guaranteed
-  // present in production. Tests instantiating bare DBs against this
-  // module are expected to call initSchema first.
-  const row = db.prepare(`
-    SELECT token_hash, permission, scopes, scoped_tags, expires_at, vault_name, revoked_at
-    FROM tokens WHERE token_hash = ?
-  `).get(candidateHash) as {
-    token_hash: string;
-    permission: string;
-    scopes: string | null;
-    scoped_tags: string | null;
-    expires_at: string | null;
-    vault_name: string | null;
-    revoked_at: string | null;
-  } | null;
-
-  if (!row) return null;
-
-  // Soft-revoked tokens never authenticate (v19). The row stays in place
-  // for audit; resolveToken just treats it as not-found from the caller's
-  // perspective.
-  if (row.revoked_at) return null;
-
-  // Check expiry
-  if (row.expires_at && new Date(row.expires_at) < new Date()) {
-    return null;
-  }
-
-  // Update last_used_at
-  db.prepare("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
-    .run(new Date().toISOString(), row.token_hash);
-
-  const permission = normalizePermission(row.permission);
-  const parsed = parseScopes(row.scopes);
-  const hasVaultScope = parsed.some((s) => s.startsWith("vault:"));
-  const scopes = hasVaultScope ? parsed : legacyPermissionToScopes(permission);
-  const legacyDerived = !hasVaultScope;
-  const scoped_tags = parseScopedTags(row.scoped_tags);
-  const jti = `t_${row.token_hash.slice(7, 19)}`;
-
-  return { permission, scopes, legacyDerived, scoped_tags, vault_name: row.vault_name, jti };
-}
 
 /**
  * List tokens (for CLI display + admin SPA). Never exposes the hash
@@ -323,100 +149,6 @@ export function listTokens(
     // Derive a short display ID from the hash (first 12 chars after "sha256:")
     id: `t_${r.token_hash.slice(7, 19)}`,
   }));
-}
-
-/**
- * List tokens minted via the manage-token MCP tool by a given session
- * (parent_jti). Used by `manage-token` action="list" to scope its surface
- * to its own session's mints — operators with multiple MCP sessions open
- * don't see each other's tokens, and CLI/REST-minted tokens never appear.
- *
- * Returns metadata only (no token-hash exposure beyond the display id);
- * the display id is what the caller uses to revoke. Includes `revoked_at`
- * so the UI can render a tombstone for soft-revoked rows.
- */
-export function listMcpMintedTokens(
-  db: Database,
-  parentJti: string,
-  vaultName: string,
-): Array<{
-  jti: string;
-  label: string;
-  scopes: string[];
-  scoped_tags: string[] | null;
-  created_at: string;
-  expires_at: string | null;
-  revoked_at: string | null;
-}> {
-  const rows = db.prepare(`
-    SELECT token_hash, label, scopes, scoped_tags, created_at, expires_at, revoked_at
-    FROM tokens
-    WHERE created_via = 'mcp_mint'
-      AND parent_jti = ?
-      AND vault_name = ?
-    ORDER BY created_at DESC
-  `).all(parentJti, vaultName) as {
-    token_hash: string;
-    label: string;
-    scopes: string | null;
-    scoped_tags: string | null;
-    created_at: string;
-    expires_at: string | null;
-    revoked_at: string | null;
-  }[];
-  return rows.map((r) => ({
-    jti: `t_${r.token_hash.slice(7, 19)}`,
-    label: r.label,
-    scopes: parseScopes(r.scopes),
-    scoped_tags: parseScopedTags(r.scoped_tags),
-    created_at: r.created_at,
-    expires_at: r.expires_at,
-    revoked_at: r.revoked_at,
-  }));
-}
-
-/**
- * Soft-revoke a token minted via manage-token, scoped to the session that
- * minted it. Idempotent: revoking an already-revoked or never-existent jti
- * returns the same shape; second-call to revoke is intentionally still
- * ok=true so the AI's revoke step doesn't surface a confusing failure on a
- * retry after a network blip. The row stays in place for audit trail —
- * resolveToken treats revoked_at-set rows as not-found.
- *
- * `parentJti` + `vaultName` scope the lookup: a token minted by a
- * different MCP session (or against a different vault) returns ok=false.
- * Returns { ok: true, already_revoked? } when the operation matched a row.
- */
-export function softRevokeMcpToken(
-  db: Database,
-  jti: string,
-  parentJti: string,
-  vaultName: string,
-): { ok: true; already_revoked: boolean } | { ok: false; reason: "not_found" } {
-  if (!jti.startsWith("t_")) {
-    return { ok: false, reason: "not_found" };
-  }
-  const hashPrefix = jti.slice(2);
-  const row = db.prepare(`
-    SELECT token_hash, revoked_at FROM tokens
-    WHERE token_hash LIKE ?
-      AND created_via = 'mcp_mint'
-      AND parent_jti = ?
-      AND vault_name = ?
-    LIMIT 1
-  `).get(`sha256:${hashPrefix}%`, parentJti, vaultName) as {
-    token_hash: string;
-    revoked_at: string | null;
-  } | null;
-
-  if (!row) return { ok: false, reason: "not_found" };
-  if (row.revoked_at) {
-    // Second revoke: idempotent — already done, surface true with the flag.
-    return { ok: true, already_revoked: true };
-  }
-  db.prepare("UPDATE tokens SET revoked_at = ? WHERE token_hash = ?")
-    .run(new Date().toISOString(), row.token_hash);
-  return { ok: true, already_revoked: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +210,9 @@ export function recordMcpMintLedger(
 
 /**
  * List hub JWTs minted by a given MCP session (parent_jti) against a vault.
- * Mirrors `listMcpMintedTokens`' shape so the manage-token list surface is
- * unchanged on the wire. Includes `revoked_at` so callers can render a
- * tombstone for soft-revoked rows.
+ * Returns metadata only (the hub `jti`, label, scopes, timestamps) so the
+ * manage-token list surface stays session-scoped. Includes `revoked_at` so
+ * callers can render a tombstone for soft-revoked rows.
  */
 export function listMcpMintedHubJwts(
   db: Database,

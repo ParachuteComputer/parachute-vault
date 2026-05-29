@@ -1371,25 +1371,30 @@ describe("scoped MCP wrapper", async () => {
 
   // -- Q5: MCP delete-tag dependency check -------------------------------
 
-  test("MCP delete-tag returns tag_in_use_by_tokens when a tag-scoped token references the tag", async () => {
+  test("MCP delete-tag returns tag_in_use_by_tokens when a vestigial tag-scoped token row references the tag", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
-    const { generateToken, createToken } = await import("./token-store.ts");
 
     const vaultName = `tagscope-dep-${Date.now()}`;
     writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
     const store = getVaultStore(vaultName);
     await store.createNote("h", { tags: ["health"] });
 
-    // Mint a tag-scoped token that references "health".
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, {
-      label: "health-claw",
-      permission: "read",
-      scopes: ["vault:read"],
-      scoped_tags: ["health"],
-    });
+    // Seed a vestigial tag-scoped row referencing "health" (raw INSERT —
+    // vault no longer mints these post-0.6.0, but findTokensReferencingTag
+    // still guards the tag-delete path against leftover rows). vault#282.
+    store.db
+      .prepare(
+        "INSERT INTO tokens (token_hash, label, permission, scoped_tags, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        `sha256:health-claw-${Math.random().toString(36).slice(2)}`,
+        "health-claw",
+        "read",
+        JSON.stringify(["health"]),
+        new Date().toISOString(),
+      );
 
     // Unscoped admin attempts to delete `health` via MCP — should 409.
     const tools = generateScopedMcpTools(vaultName);

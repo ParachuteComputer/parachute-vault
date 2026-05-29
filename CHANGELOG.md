@@ -34,6 +34,51 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.6.0-rc.1] - 2026-05-28
+
+### Removed (BREAKING — vault#282 Stage 2)
+
+- **`pvt_*` opaque tokens are dropped.** Vault is now a pure hub
+  resource-server: it no longer mints or validates `pvt_*` vault-DB tokens. A
+  `pvt_*`-prefixed bearer now **fails closed with 401** on both the per-vault
+  and global (`/vaults`) auth surfaces. The surviving auth paths are
+  hub-issued JWTs, the `VAULT_AUTH_TOKEN` server-wide operator bearer, and
+  legacy `vault.yaml` / `config.yaml` api_keys.
+- Removed the REST `POST|GET|DELETE /vault/<name>/tokens` module (pure
+  resource-server — minting is hub's job).
+- Removed `parachute-vault tokens create` (mint a hub JWT via
+  `parachute-vault mcp-install` or `parachute auth mint-token` instead).
+  `tokens list` / `tokens revoke` remain for cleaning up vestigial pre-0.6.0
+  rows.
+- Removed `mcp-install --legacy-pat` and the interactive walkthrough's
+  "legacy" auth choice. Without a hub, `mcp-install` falls back to pasting an
+  existing bearer (`--token`) or `VAULT_AUTH_TOKEN`.
+- Removed the SPA "Legacy tokens" (pvt_*) read/revoke panel.
+- Dropped the dead store functions `generateToken`, `createToken`,
+  `resolveToken`, `ResolvedToken`, `listMcpMintedTokens`, `softRevokeMcpToken`
+  and the Stage-1 `warnPvtDeprecationOnce` deprecation-warning machinery.
+
+### Changed
+
+- **Fresh-vault first credential.** `parachute-vault create` / `init` now mint
+  a hub JWT (`vault:<name>:admin`) when a hub is reachable (operator.token +
+  hub origin — the same path `mcp-install --mint` uses). With no hub reachable
+  they issue no token and print guidance (install the hub, or set
+  `VAULT_AUTH_TOKEN`). The `create --json` `token` field stays a string (a hub
+  JWT, or `""` with a new `token_guidance` field in the standalone case).
+- `/auth/status` `auth_modes` now reports `["hub_jwt"]`.
+
+### Kept (data migration)
+
+- The `tokens` table is **not** dropped — it's left inert as the legacy-YAML
+  import landing zone (`migrateVaultKeys`) and a future-cosmetic-drop target,
+  matching the `oauth_clients` / `oauth_codes` precedent. Existing `pvt_*` rows
+  stay in place (harmless; nothing validates them). No schema migration ships
+  for the DROP.
+
+See [UPGRADING.md](./UPGRADING.md) (pvt_* removal section) and
+[parachute-patterns/migrations/2026-05-28-pvt-token-drop.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-28-pvt-token-drop.md).
+
 ## [0.4.8-rc.10] - 2026-05-26
 
 ### Fixed

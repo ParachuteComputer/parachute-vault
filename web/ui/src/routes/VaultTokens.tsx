@@ -1,12 +1,10 @@
 /**
  * `/vault/:name/tokens` — token management.
  *
- * The auth-unification arc (SPA step). New tokens are **hub JWTs** minted via
- * hub's registry (`/api/auth/*`) with the host-admin bearer
- * (`host-admin-auth.ts`). The deprecated `pvt_*` mint path is GONE — the only
- * remaining trace of `pvt_*` is a read-only + revoke-only "Legacy tokens"
- * section, shown when the vault still has live `pvt_*` rows (until the DROP,
- * vault#282). Fresh installs never see it.
+ * Tokens are **hub JWTs** minted via hub's registry (`/api/auth/*`) with the
+ * host-admin bearer (`host-admin-auth.ts`). vault#282 Stage 2 removed the
+ * legacy `pvt_*` read/revoke section entirely — vault is a pure hub
+ * resource-server and no longer serves vault-DB tokens.
  *
  * Three operations on the hub-JWT surface:
  *   - **List**   — accumulate ALL pages of `/api/auth/tokens`, then
@@ -20,9 +18,6 @@
  * already holds). The host-admin bearer is minted lazily by the token API
  * calls; a friend account (signed in but not the hub admin) gets a 403 from
  * the host-admin endpoint → we redirect to the issuer's `/account/` home.
- *
- * Two independent load states: the hub-JWT list (host-admin bearer) and the
- * legacy `pvt_*` list (vault-admin bearer). They load + fail independently.
  */
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -33,16 +28,13 @@ import { SignInBanner } from "../lib/SignInBanner.tsx";
 import {
   DEFAULT_TTL_DAYS,
   type HubTokenSummary,
-  type LegacyTokenSummary,
   type MintHubTokenResult,
   type ScopeVerb,
   TTL_DAY_OPTIONS,
   listHubTokens,
-  listLegacyTokens,
   listVaultTags,
   mintHubToken,
   revokeHubToken,
-  revokeLegacyToken,
 } from "../lib/tokens-api.ts";
 
 type HubLoadState =
@@ -50,14 +42,6 @@ type HubLoadState =
   | { kind: "ok"; tokens: HubTokenSummary[] }
   | { kind: "auth-required"; status: number | null }
   | { kind: "error"; message: string };
-
-type LegacyLoadState =
-  | { kind: "loading" }
-  | { kind: "ok"; tokens: LegacyTokenSummary[] }
-  // Legacy-list auth/error failures are non-fatal — the hub-JWT surface is
-  // the page's primary function. We collapse them to "hidden" so a vault
-  // whose legacy endpoint 401s/errors just doesn't render the section.
-  | { kind: "hidden" };
 
 const KNOWN_SCOPE_VERBS: ScopeVerb[] = ["read", "write", "admin"];
 
@@ -95,10 +79,8 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
   const detailHref = isPerVaultMount ? "/" : `/vault/${encodeURIComponent(name ?? "")}`;
 
   const [hubState, setHubState] = useState<HubLoadState>({ kind: "loading" });
-  const [legacyState, setLegacyState] = useState<LegacyLoadState>({ kind: "loading" });
   const [minted, setMinted] = useState<MintHubTokenResult | null>(null);
   const [confirmingRevokeJti, setConfirmingRevokeJti] = useState<string | null>(null);
-  const [confirmingLegacyId, setConfirmingLegacyId] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
 
   // Hub-JWT list (host-admin bearer).
@@ -114,27 +96,6 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
       .catch((err) => {
         if (cancelled) return;
         setHubState(dispositionForHubError(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [name, reloadTick]);
-
-  // Legacy pvt_* list (vault-admin bearer). Non-fatal — any failure (or an
-  // empty list) collapses to "hidden", so fresh installs and vaults whose
-  // legacy endpoint 401s simply don't render the section.
-  useEffect(() => {
-    let cancelled = false;
-    if (!name) return;
-    setLegacyState({ kind: "loading" });
-    listLegacyTokens(name)
-      .then((tokens) => {
-        if (cancelled) return;
-        setLegacyState(tokens.length > 0 ? { kind: "ok", tokens } : { kind: "hidden" });
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setLegacyState({ kind: "hidden" });
       });
     return () => {
       cancelled = true;
@@ -230,20 +191,6 @@ export function VaultTokens({ vaultName }: { vaultName?: string } = {}) {
           />
         ) : null}
       </div>
-
-      {legacyState.kind === "ok" ? (
-        <LegacySection
-          vaultName={name}
-          tokens={legacyState.tokens}
-          allowRevoke={isAdmin}
-          confirmingId={confirmingLegacyId}
-          onAskConfirm={setConfirmingLegacyId}
-          onRevoked={() => {
-            setConfirmingLegacyId(null);
-            setReloadTick((n) => n + 1);
-          }}
-        />
-      ) : null}
     </div>
   );
 }
@@ -592,163 +539,6 @@ function HubTokenRow({
           </div>
         ) : (
           <button type="button" className="secondary" onClick={() => onAskConfirm(token.jti)}>
-            Revoke
-          </button>
-        )
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * Read-only + revoke-only section for the vault's legacy `pvt_*` tokens.
- * Rendered only when the legacy list is non-empty (the parent collapses an
- * empty / failed legacy load to "hidden"). Collapsible — defaults closed so
- * a vault mid-migration shows it but doesn't lead with it.
- */
-function LegacySection({
-  vaultName,
-  tokens,
-  allowRevoke,
-  confirmingId,
-  onAskConfirm,
-  onRevoked,
-}: {
-  vaultName: string;
-  tokens: LegacyTokenSummary[];
-  allowRevoke: boolean;
-  confirmingId: string | null;
-  onAskConfirm: (id: string | null) => void;
-  onRevoked: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="section">
-      <h3
-        style={{
-          margin: "0 0 0.5rem",
-          fontSize: "1rem",
-          fontWeight: 500,
-          cursor: "pointer",
-          userSelect: "none",
-        }}
-        onClick={() => setOpen((o) => !o)}
-      >
-        {open ? "▾" : "▸"} Legacy tokens (pre-0.6.0){" "}
-        <span className="dim" style={{ fontWeight: 400 }}>
-          ({tokens.length})
-        </span>
-      </h3>
-      <p className="dim" style={{ margin: "0 0 0.85rem" }}>
-        These <code>pvt_*</code> tokens predate the move to hub-signed tokens. They still work, but
-        the vault can no longer mint new ones — rotate each to a hub token above, then revoke the
-        legacy one here.
-      </p>
-      {open ? (
-        <div className="token-list">
-          {tokens.map((tok) => (
-            <LegacyTokenRow
-              key={tok.id}
-              vaultName={vaultName}
-              token={tok}
-              allowRevoke={allowRevoke}
-              confirming={confirmingId === tok.id}
-              onAskConfirm={onAskConfirm}
-              onRevoked={onRevoked}
-            />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function LegacyTokenRow({
-  vaultName,
-  token,
-  allowRevoke,
-  confirming,
-  onAskConfirm,
-  onRevoked,
-}: {
-  vaultName: string;
-  token: LegacyTokenSummary;
-  allowRevoke: boolean;
-  confirming: boolean;
-  onAskConfirm: (id: string | null) => void;
-  onRevoked: () => void;
-}) {
-  const [revoking, setRevoking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const onConfirm = async () => {
-    setRevoking(true);
-    setError(null);
-    try {
-      await revokeLegacyToken(vaultName, token.id);
-      onRevoked();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setRevoking(false);
-    }
-  };
-
-  return (
-    <div className="token-row">
-      <div className="body">
-        <div className="name">
-          <strong>{token.label}</strong>
-          <code className="dim">{token.id}</code>
-        </div>
-        <div className="meta">
-          <span className="dim">scopes:</span>{" "}
-          {token.scopes.length > 0 ? (
-            token.scopes.map((s) => (
-              <code key={s} className="scope-tag">
-                {s}
-              </code>
-            ))
-          ) : (
-            <span className="dim">(legacy — {token.permission})</span>
-          )}
-        </div>
-        {token.scoped_tags && token.scoped_tags.length > 0 ? (
-          <div className="meta">
-            <span className="dim">tags:</span>{" "}
-            {token.scoped_tags.map((t) => (
-              <code key={t} className="scope-tag tag-pill">
-                #{t}
-              </code>
-            ))}
-          </div>
-        ) : null}
-        <div className="meta dim">
-          created {fmtDate(token.created_at)}
-          {token.expires_at ? ` · expires ${fmtDate(token.expires_at)}` : ""}
-        </div>
-        {error ? (
-          <div className="error-banner" style={{ marginTop: "0.5rem" }}>
-            <code>{error}</code>
-          </div>
-        ) : null}
-      </div>
-      {allowRevoke ? (
-        confirming ? (
-          <div className="actions">
-            <button type="button" onClick={onConfirm} disabled={revoking}>
-              {revoking ? "Revoking…" : "Confirm revoke"}
-            </button>
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => onAskConfirm(null)}
-              disabled={revoking}
-            >
-              Cancel
-            </button>
-          </div>
-        ) : (
-          <button type="button" className="secondary" onClick={() => onAskConfirm(token.id)}>
             Revoke
           </button>
         )
