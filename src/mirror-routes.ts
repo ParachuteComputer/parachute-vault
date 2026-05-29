@@ -62,6 +62,7 @@ import {
   type ImportResult,
 } from "./mirror-import.ts";
 import { redactToken } from "./export-watch.ts";
+import { GitNotInstalledError, ensureGitAvailable } from "./git-preflight.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 
@@ -597,6 +598,26 @@ export async function handleAuthPat(
     );
   }
 
+  // Preflight: the validation probe (`git ls-remote`) and every later push
+  // shell `git`. On a git-less server, surface the friendly, actionable
+  // 503 instead of letting the probe's `Bun.spawn` throw a raw
+  // "Executable not found in $PATH: \"git\"".
+  try {
+    ensureGitAvailable();
+  } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      return Response.json(
+        {
+          error: "git not installed",
+          error_type: "git_not_installed",
+          message: err.message,
+        },
+        { status: 503 },
+      );
+    }
+    throw err;
+  }
+
   // Validate via `git ls-remote <embedded-auth-url>` — uses the same
   // x-access-token shape we'd embed at push time so the probe exercises
   // the actual auth path. If the operator pasted a URL that already has
@@ -1089,11 +1110,16 @@ export async function applyCredentialsToMirror(
  *
  * `spawnOverride` is a test seam: lets the test inject a fake git binary.
  * Production callers omit it; `cloneAndImport` falls back to `defaultGitSpawn`.
+ *
+ * `whichOverride` is a test seam for the git-presence preflight (default
+ * `Bun.which` inside `cloneAndImport`). Inject a fn returning `null` to
+ * exercise the git_not_installed 503 path without uninstalling git.
  */
 export async function handleMirrorImport(
   req: Request,
   vaultName: string,
   spawnOverride?: GitSpawn,
+  whichOverride?: (cmd: string) => string | null,
 ): Promise<Response> {
   let body: {
     remote_url?: unknown;
@@ -1208,8 +1234,21 @@ export async function handleMirrorImport(
       store,
       assetsDir: assets,
       spawn: spawnOverride,
+      which: whichOverride,
     });
   } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      // 503 Service Unavailable — the server isn't configured to do this
+      // yet (git missing). The message tells the operator how to fix it.
+      return Response.json(
+        {
+          error: "git not installed",
+          error_type: "git_not_installed",
+          message: err.message,
+        },
+        { status: 503 },
+      );
+    }
     if (err instanceof ImportConflictError) {
       return Response.json(
         {

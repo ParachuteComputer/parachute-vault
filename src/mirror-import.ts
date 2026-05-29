@@ -73,6 +73,11 @@ import {
 } from "../core/src/portable-md.ts";
 import type { SqliteStore } from "../core/src/store.ts";
 import { redactRemoteUrl, readCredentials } from "./mirror-credentials.ts";
+import {
+  GitNotInstalledError,
+  ensureGitAvailable,
+  isGitNotFoundSpawnError,
+} from "./git-preflight.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -125,6 +130,11 @@ export interface ImportOpts {
   importer?: typeof importPortableVault;
   /** Override the clone timeout (default 60s; test seam to shorten). */
   cloneTimeoutMs?: number;
+  /**
+   * Override the git-presence probe (test seam — defaults to `Bun.which`).
+   * Inject a fn returning `null` to exercise the git-not-installed path.
+   */
+  which?: (cmd: string) => string | null;
 }
 
 /**
@@ -315,19 +325,32 @@ export function authedCloneUrl(
  * exit code + stderr text + timeout flag.
  */
 export const defaultGitSpawn: GitSpawn = async (argv, options) => {
-  const proc = Bun.spawn(argv, {
-    cwd: options.cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      // Kill any system credential helper from intercepting — we want
-      // the clone to use ONLY the URL-embedded credential, not whatever's
-      // in keychain. Same shape as the ls-remote probe.
-      GIT_ASKPASS: "/bin/echo",
-    },
-  });
+  let proc;
+  try {
+    proc = Bun.spawn(argv, {
+      cwd: options.cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        // Kill any system credential helper from intercepting — we want
+        // the clone to use ONLY the URL-embedded credential, not whatever's
+        // in keychain. Same shape as the ls-remote probe.
+        GIT_ASKPASS: "/bin/echo",
+      },
+    });
+  } catch (err) {
+    // Belt-and-suspenders: `cloneAndImport` preflights via
+    // `ensureGitAvailable`, but if a git-missing spawn still slips through
+    // (race, or a future caller that skipped the preflight) rethrow it as
+    // the friendly error rather than leaking Bun's raw
+    // `Executable not found in $PATH: "git"`.
+    if (isGitNotFoundSpawnError(err)) {
+      throw new GitNotInstalledError();
+    }
+    throw err;
+  }
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -365,6 +388,14 @@ export const defaultGitSpawn: GitSpawn = async (argv, options) => {
  * Always cleans up the temp dir.
  */
 export async function cloneAndImport(opts: ImportOpts): Promise<ImportResult> {
+  // Fail fast + clean when git isn't installed — BEFORE the concurrency
+  // marker, tempdir creation, or any spawn. The route maps the resulting
+  // GitNotInstalledError to a friendly 503 (git_not_installed). Without
+  // this, the first `Bun.spawn(["git", ...])` threw a raw
+  // `Executable not found in $PATH: "git"` that only the generic 500 branch
+  // caught — the unhelpful failure mode found live on the gitcoin EC2 box.
+  ensureGitAvailable(opts.which);
+
   if (inFlight.has(opts.vaultName)) {
     throw new ImportConflictError(opts.vaultName);
   }

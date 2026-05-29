@@ -75,6 +75,7 @@ import {
   applyToGitRemote,
   readCredentials,
 } from "./mirror-credentials.ts";
+import { ensureGitAvailable } from "./git-preflight.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 
 /**
@@ -230,7 +231,20 @@ export type BootstrapResult = BootstrapResultOk | BootstrapResultError;
  */
 export async function bootstrapInternalMirror(
   path: string,
+  // Test seam for the git-presence preflight (default `Bun.which`). Inject a
+  // fn returning `null` to exercise the git-not-installed bootstrap path.
+  which?: (cmd: string) => string | null,
 ): Promise<BootstrapResult> {
+  // Preflight: a git-less server can't bootstrap a mirror. Surface the
+  // friendly, actionable message into the bootstrap-error channel so the
+  // caller threads it into mirror status (`last_error`) rather than letting
+  // a raw `Executable not found in $PATH: "git"` crash out of the spawn.
+  try {
+    ensureGitAvailable(which);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+
   if (existsSync(path)) {
     let stat;
     try {
@@ -887,14 +901,25 @@ export class MirrorManager {
     }
 
     const firstNoteTitle = await this.deps.firstChangedNoteTitle(sinceCursor);
-    const commitResult = await runGitCommitCycle({
-      repoDir: path,
-      template: this.currentConfig.commit_template,
-      notesChanged: totalChanged,
-      vaultName: this.deps.vaultName,
-      firstNoteTitle,
-      push: this.currentConfig.auto_push,
-    });
+    let commitResult: Awaited<ReturnType<typeof runGitCommitCycle>>;
+    try {
+      commitResult = await runGitCommitCycle({
+        repoDir: path,
+        template: this.currentConfig.commit_template,
+        notesChanged: totalChanged,
+        vaultName: this.deps.vaultName,
+        firstNoteTitle,
+        push: this.currentConfig.auto_push,
+      });
+    } catch (err) {
+      // git-not-installed (or any commit-cycle throw) lands in status as a
+      // friendly last_error rather than crashing the cycle. Matches the
+      // "errors reflected in last_error, never rethrown" contract above.
+      const msg = (err as Error).message ?? String(err);
+      this.status.last_error = `commit cycle failed: ${msg}`;
+      console.warn(`[mirror] ${this.status.last_error}`);
+      return;
+    }
 
     if (commitResult.committed) {
       // Resolve the new HEAD sha so the status displays the commit that
@@ -950,6 +975,17 @@ export class MirrorManager {
     if (!this.status.enabled) return { fired: false, reason: "not_enabled" };
     if (!this.status.mirror_path) return { fired: false, reason: "no_mirror_path" };
     const path = this.status.mirror_path;
+    // Preflight: git-less server can't push. Surface the friendly message
+    // into last_push_error (the SPA renders it) rather than throwing a raw
+    // "Executable not found" out of the gitPush spawn.
+    try {
+      ensureGitAvailable();
+    } catch (err) {
+      const msg = (err as Error).message ?? String(err);
+      this.status.last_push_error = msg;
+      console.warn(`[mirror] push-now failed: ${msg}`);
+      return { fired: true, pushed: false, error: msg };
+    }
     const pushResult = await gitPush(path);
     const now = new Date().toISOString();
     // Refresh commits_unpushed either way — a no-op push still reflects

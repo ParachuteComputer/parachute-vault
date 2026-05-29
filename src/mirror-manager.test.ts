@@ -215,6 +215,21 @@ describe("bootstrapInternalMirror", () => {
       expect(isGitRepoSync(dir)).toBe(true);
     }
   });
+
+  test("git missing → ok:false with actionable error (status surfaces it, no raw crash)", async () => {
+    // vault#415 — a git-less server can't bootstrap a mirror. The error
+    // channel carries the friendly message that MirrorManager.start threads
+    // into status.last_error, instead of a raw "Executable not found" crash.
+    dir = path.join(tmp("mirror-boot-nogit-"), "mirror");
+    const r = await bootstrapInternalMirror(dir, () => null);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("git is required");
+      expect(r.error).toContain("dnf install git");
+    }
+    // Failed fast at the preflight — the dir was never created.
+    expect(fs.existsSync(dir)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
