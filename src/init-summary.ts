@@ -108,7 +108,6 @@ export function buildInitSummaryLines(input: InitSummaryInput): string[] {
     lines.push(`  - Or add Claude Code back anytime:  parachute-vault mcp-install`);
   } else {
     lines.push(`  - Add Claude Code:  parachute-vault mcp-install`);
-    lines.push(`  - Mint a token:     parachute vault tokens create`);
   }
   lines.push(`  - Check status:     parachute-vault status`);
   lines.push(`  - Edit config:      parachute-vault config`);
