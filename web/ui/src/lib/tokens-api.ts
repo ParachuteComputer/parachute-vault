@@ -1,25 +1,16 @@
 /**
  * HTTP client for the vault admin SPA's tokens page.
  *
- * Two surfaces, two bearers (the auth-unification arc — SPA step):
+ * Tokens are **hub JWTs** (the only mint path — vault#282 Stage 2 dropped the
+ * legacy `pvt_*` read/revoke surface; vault is a pure hub resource-server).
+ * Hub's token registry: `/api/auth/mint-token` (mint), `/api/auth/tokens`
+ * (list), `/api/auth/revoke-token` (revoke), authed with the **host-admin**
+ * bearer from `host-admin-auth.ts` (carries `parachute:host:auth`, which the
+ * list endpoint hard-requires). These mint canonical `vault:<name>:<verb>`
+ * hub JWTs.
  *
- *   1. **Hub JWTs** (the live mint path) — hub's token registry at
- *      `/api/auth/mint-token` (mint), `/api/auth/tokens` (list),
- *      `/api/auth/revoke-token` (revoke). Authed with the **host-admin**
- *      bearer from `host-admin-auth.ts` (carries `parachute:host:auth`, which
- *      the list endpoint hard-requires). These mint canonical
- *      `vault:<name>:<verb>` hub JWTs — the replacement for deprecated
- *      `pvt_*` tokens (vault#282).
- *
- *   2. **Legacy `pvt_*` tokens** (read + revoke only, no mint) — the vault's
- *      own per-vault REST surface at `GET|DELETE /vault/<name>/tokens[/<id>]`,
- *      authed with the **vault-admin** bearer via `api.ts:_authedFetch`. These
- *      rows live in the vault DB until the DROP (vault#282, later); the SPA
- *      surfaces them read-only so an operator can see + rotate them, but can
- *      no longer mint new ones. Fresh installs have none.
- *
- * The two bearers coexist cleanly: host-admin talks to hub's `/api/auth/*`,
- * vault-admin talks to `/vault/<name>/*`.
+ * The tag picker (`listVaultTags`) still uses the **vault-admin** bearer via
+ * `api.ts:_authedFetch` to read `/vault/<name>/api/tags`.
  */
 import { HttpError, _authedFetch } from "./api.ts";
 import { hostAdminAuthedFetch } from "./host-admin-auth.ts";
@@ -217,55 +208,7 @@ export async function revokeHubToken(jti: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy `pvt_*` tokens — read + revoke only (no mint). Vault-admin bearer.
-// ---------------------------------------------------------------------------
-
-/**
- * Legacy `pvt_*` token row (vault DB). Read-only in the SPA — no mint path.
- * Kept until the DROP (vault#282).
- */
-export interface LegacyTokenSummary {
-  id: string;
-  label: string;
-  permission: "read" | "full";
-  scopes: string[];
-  /** Tag-allowlist (root tags). `null` = unscoped. */
-  scoped_tags: string[] | null;
-  /** Vault binding (schema v16). `null` = legacy server-wide token. */
-  vault_name: string | null;
-  expires_at: string | null;
-  created_at: string;
-}
-
-/**
- * List the vault's legacy `pvt_*` tokens. Hits `GET /vault/<name>/tokens`
- * with the VAULT-ADMIN bearer (`_authedFetch`), NOT the host-admin bearer —
- * these rows live in the vault DB, reached through the per-vault REST
- * surface. Returns `[]` on a fresh install (no legacy rows).
- */
-export async function listLegacyTokens(vaultName: string): Promise<LegacyTokenSummary[]> {
-  const res = await _authedFetch(vaultName, `/vault/${encodeURIComponent(vaultName)}/tokens`);
-  if (!res.ok) {
-    throw new HttpError(res.status, await readError(res));
-  }
-  const body = (await res.json()) as { tokens?: LegacyTokenSummary[] };
-  return body.tokens ?? [];
-}
-
-/** Revoke a legacy `pvt_*` token by its vault-DB id. Vault-admin bearer. */
-export async function revokeLegacyToken(vaultName: string, tokenId: string): Promise<void> {
-  const res = await _authedFetch(
-    vaultName,
-    `/vault/${encodeURIComponent(vaultName)}/tokens/${encodeURIComponent(tokenId)}`,
-    { method: "DELETE" },
-  );
-  if (!res.ok) {
-    throw new HttpError(res.status, await readError(res));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tag picker — unchanged. Vault-admin bearer.
+// Tag picker — vault-admin bearer.
 // ---------------------------------------------------------------------------
 
 /**
