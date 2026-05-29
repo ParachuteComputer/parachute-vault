@@ -99,7 +99,7 @@ The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST,
 
 `vault init` asks two explicit questions: (1) install vault as an MCP server in `~/.claude.json`? (2) also surface the access token so you can paste it into other MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or `curl`? Both default yes. Pass `--mcp` / `--no-mcp` and `--token` / `--no-token` for non-interactive installs.
 
-If you said yes to (2), the hub-issued JWT is printed prominently at the end — it's the same token baked into `~/.claude.json` (if you also said yes to (1)). It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Mint a fresh one with `parachute auth mint-token --scope vault:<name>:<verb>` (or rewire an MCP client with `parachute-vault mcp-install`, or use the admin SPA Tokens page). As of vault 0.6.0 (vault#282 Stage 2) vault no longer mints its own `pvt_*` tokens — minting is the hub's job.
+If you said yes to (2), the hub-issued JWT is printed prominently at the end — it's the same token baked into `~/.claude.json` (if you also said yes to (1)). It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Mint a fresh one with `parachute auth mint-token --scope vault:<name>:<verb>` (or rewire an MCP client with `parachute-vault mcp-install`, or use the admin SPA Tokens page). As of vault 0.5.0 (vault#282 Stage 2) vault no longer mints its own `pvt_*` tokens — minting is the hub's job.
 
 ### OAuth lives on the hub
 
@@ -122,7 +122,7 @@ Two ways to authenticate — pick based on the client, not the deployment:
 | **OAuth 2.1 + PKCE (browser flow, via hub)** | Claude Desktop, Parachute Daily, any third-party MCP client set up interactively | Click "Add integration", enter the vault MCP URL, a browser opens to the **hub's** consent page, sign in with hub credentials, done — no token ever touches your clipboard |
 | **Bearer token (hub JWT)** | Claude Code (auto-wired by `vault init`), CLI scripts, cron jobs, any non-interactive caller | `curl -H "Authorization: Bearer <hub-jwt>"` — mint one with `parachute-vault mcp-install` (MCP clients) or `parachute auth mint-token --scope vault:<name>:<verb>` (scripts) |
 
-As of 0.6.0 (vault#282 Stage 2) vault is a **pure hub resource-server**: both paths use a hub-signed JWT that vault validates against the hub's JWKS. (The OAuth path is the interactive browser handshake; the bearer path mints the same kind of JWT non-interactively.) The old vault-local `pvt_*` opaque token was dropped — vault no longer mints or accepts it. The server-wide `VAULT_AUTH_TOKEN` operator bearer remains for the no-granular-auth / cross-container path.
+As of 0.5.0 (vault#282 Stage 2) vault is a **pure hub resource-server**: both paths use a hub-signed JWT that vault validates against the hub's JWKS. (The OAuth path is the interactive browser handshake; the bearer path mints the same kind of JWT non-interactively.) The old vault-local `pvt_*` opaque token was dropped — vault no longer mints or accepts it. The server-wide `VAULT_AUTH_TOKEN` operator bearer remains for the no-granular-auth / cross-container path.
 
 ### Claude Code
 
@@ -219,7 +219,7 @@ parachute-vault 2fa backup-codes           # regenerate backup codes
 # Tokens — vault#282 Stage 2: vault no longer mints its own tokens. Mint a
 # hub JWT with `parachute-vault mcp-install` (MCP clients) or
 # `parachute auth mint-token --scope vault:<name>:<verb>` (scripts).
-parachute-vault tokens                     # list any vestigial pre-0.6.0 token rows (all vaults)
+parachute-vault tokens                     # list any vestigial pre-0.5.0 token rows (all vaults)
 parachute-vault tokens revoke <token-id>   # revoke a vestigial row (default vault; add --vault to target)
 
 # Obsidian
@@ -531,7 +531,7 @@ The SSG / sync pattern. Two equivalent forms — bracket-style is canonical goin
 curl -H "Authorization: Bearer $VAULT_TOKEN" \
   "http://localhost:1940/vault/default/api/notes?meta[updated_at][gte]=2026-04-01T00:00:00Z"
 
-# Flat form (DEPRECATED in 0.4.3; planned removal 0.6.0 per vault#288)
+# Flat form (DEPRECATED in 0.4.3; planned removal in a later 0.x per vault#288)
 curl -H "Authorization: Bearer $VAULT_TOKEN" \
   "http://localhost:1940/vault/default/api/notes?date_field=updated_at&date_from=2026-04-01T00:00:00Z"
 ```
@@ -704,13 +704,13 @@ For wiring up an AI client (Claude Code, Claude Desktop, Parachute Daily), see [
 
 ### Passing the key
 
-As of 0.6.0 (vault#282 Stage 2) vault accepts these bearers at every authenticated endpoint:
+As of 0.5.0 (vault#282 Stage 2) vault accepts these bearers at every authenticated endpoint:
 
 - **Hub-issued JWT** (`eyJ...`) — the user-credential path; what OAuth issues and what `parachute-vault mcp-install` / `parachute auth mint-token` produce. Audience-bound to `vault.<name>`, scope-narrowed (`vault:<name>:<verb>`).
 - **`VAULT_AUTH_TOKEN`** — the server-wide operator bearer (env var; full-admin against any vault on the server).
 - **`pvk_...`** — legacy global API keys from `config.yaml` / per-vault `vault.yaml` (still honored for existing deployments).
 
-The old vault-local `pvt_*` opaque token was **dropped at 0.6.0** — vault no longer mints or accepts it.
+The old vault-local `pvt_*` opaque token was **dropped at 0.5.0** — vault no longer mints or accepts it.
 
 ```bash
 # Header (preferred)
@@ -742,7 +742,7 @@ Two permission levels carry through the JWT scope verb:
 | `read` | Query, list, find-path, vault-info only |
 
 `parachute-vault tokens list` / `tokens revoke` remain only to clean up any
-vestigial pre-0.6.0 rows. Legacy `pvk_...` keys from config.yaml still work at
+vestigial pre-0.5.0 rows. Legacy `pvk_...` keys from config.yaml still work at
 runtime; the `vault keys` CLI commands were removed long ago.
 
 ### Public endpoints

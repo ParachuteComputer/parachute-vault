@@ -1382,7 +1382,7 @@ describe("scoped MCP wrapper", async () => {
     await store.createNote("h", { tags: ["health"] });
 
     // Seed a vestigial tag-scoped row referencing "health" (raw INSERT —
-    // vault no longer mints these post-0.6.0, but findTokensReferencingTag
+    // vault no longer mints these post-0.5.0, but findTokensReferencingTag
     // still guards the tag-delete path against leftover rows). vault#282.
     store.db
       .prepare(

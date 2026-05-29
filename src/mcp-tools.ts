@@ -463,7 +463,7 @@ function resolveHubOrigin(): { url: string; source: string } {
  *
  * After the auth-unification arc (vault#403, MGT) the tool is a thin proxy to
  * hub's mint-token attenuation endpoint: it mints short-TTL HUB JWTs. The
- * `pvt_*` vault-DB mint infra it replaced was removed at 0.6.0 (vault#282
+ * `pvt_*` vault-DB mint infra it replaced was removed at 0.5.0 (vault#282
  * Stage 2 — vault is a pure hub resource-server).
  *
  * Closure-captured context:

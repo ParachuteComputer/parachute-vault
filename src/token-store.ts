@@ -1,16 +1,16 @@
 /**
  * Token operations for the per-vault `tokens` table.
  *
- * VESTIGIAL as of 0.6.0 (vault#282 Stage 2). Vault is a pure hub
+ * VESTIGIAL as of 0.5.0 (vault#282 Stage 2). Vault is a pure hub
  * resource-server: it no longer mints (`pvt_*`) or validates rows in this
  * table. What survives here:
  *   - `listTokens` / `revokeToken` / `findTokensReferencingTag` — read/clean up
- *     any leftover pre-0.6.0 rows.
+ *     any leftover pre-0.5.0 rows.
  *   - `migrateVaultKeys` — the legacy-YAML-api_keys import landing zone (raw
  *     INSERT; the only writer left).
  *   - the `mcp_mint_ledger` helpers — hub-JWT attribution for manage-token.
  *
- * The `Token`/field docs below describe the historical (pre-0.6.0) auth
+ * The `Token`/field docs below describe the historical (pre-0.5.0) auth
  * semantics for the surviving read/cleanup paths; no validation path reads
  * `scoped_tags` / `vault_name` off these rows anymore.
  *
@@ -76,13 +76,13 @@ export interface Token {
   /**
    * Session pin (v19). When this token was minted via manage-token, this
    * is the hub JWT's jti claim of the minting session. NULL otherwise.
-   * (Vestigial post-0.6.0 — no new rows are written; vault no longer mints
+   * (Vestigial post-0.5.0 — no new rows are written; vault no longer mints
    * vault-DB tokens. See vault#282 Stage 2.)
    */
   parent_jti: string | null;
   /**
    * Soft-revoke timestamp (v19). Marked the row revoked while keeping it in
-   * place for audit history. Vestigial post-0.6.0 (vault#282 Stage 2) — no
+   * place for audit history. Vestigial post-0.5.0 (vault#282 Stage 2) — no
    * validation path reads these rows anymore. NULL = active.
    */
   revoked_at: string | null;
@@ -110,9 +110,9 @@ export function parseScopedTags(raw: string | null): string[] | null {
 // Token operations
 //
 // vault#282 Stage 2: the pvt_* mint (`generateToken` / `createToken`) and
-// validation (`resolveToken`) were removed at 0.6.0 — vault is a pure hub
+// validation (`resolveToken`) were removed at 0.5.0 — vault is a pure hub
 // resource-server and no longer issues or accepts opaque vault-DB tokens.
-// What survives: `listTokens` / `revokeToken` (cleanup of vestigial pre-0.6.0
+// What survives: `listTokens` / `revokeToken` (cleanup of vestigial pre-0.5.0
 // rows), the YAML-import landing zone (`migrateVaultKeys`, raw INSERT), and the
 // `mcp_mint_ledger` machinery (hub-JWT attribution for manage-token).
 // ---------------------------------------------------------------------------

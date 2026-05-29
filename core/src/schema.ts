@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 
 -- Tokens: API authentication with OAuth-standard scopes.
 --
--- VESTIGIAL as of 0.6.0 (vault#282 Stage 2). Vault is a pure hub
+-- VESTIGIAL as of 0.5.0 (vault#282 Stage 2). Vault is a pure hub
 -- resource-server: it no longer mints (pvt_*) or validates rows in this
 -- table — auth runs through hub-issued JWTs + VAULT_AUTH_TOKEN + legacy YAML
 -- api_keys only. The table is KEPT (not dropped) because migrateVaultKeys
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 -- leftover rows. A future cosmetic migration may drop it alongside
 -- oauth_clients/oauth_codes. 'tokens list' / 'tokens revoke' (CLI) still
 -- read/delete here for cleanup of leftover rows. See the field docs below for
--- the historical (pre-0.6.0) semantics.
+-- the historical (pre-0.5.0) semantics.
 --
 -- scopes is a whitespace-separated list of granted scopes (OAuth 2.0 §3.3)
 -- — e.g. "vault:read vault:write". Introduced in v12 alongside enforcement;
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 -- session. Session-pinned list+revoke in manage-token filters on this.
 --
 -- revoked_at (v19) marked soft-revocation of vault-DB tokens. Vestigial
--- post-0.6.0 (vault#282 Stage 2) — the validation path that read it
+-- post-0.5.0 (vault#282 Stage 2) — the validation path that read it
 -- (resolveToken) was removed alongside the pvt_* mint.
 CREATE TABLE IF NOT EXISTS tokens (
   token_hash TEXT PRIMARY KEY,
@@ -420,7 +420,7 @@ export function initSchema(db: Database): void {
   // Migrate v15 → v16: add `vault_name` column to tokens. Existing rows
   // backfilled to NULL ("server-wide / legacy" semantic) — at the time auth
   // accepted NULL for any vault so pre-v16 pvt_* tokens kept working. (pvt_*
-  // validation was dropped at 0.6.0 / vault#282 Stage 2; the column is now
+  // validation was dropped at 0.5.0 / vault#282 Stage 2; the column is now
   // vestigial.) See vault#257.
   migrateToV16(db);
 
@@ -852,7 +852,7 @@ function migrateToV15(db: Database): void {
  * "server-wide / legacy" semantic. At the time, `authenticateVaultRequest`
  * accepted NULL for any vault so pre-v16 pvt_* tokens kept working. (pvt_*
  * validation + the `/vault/<name>/tokens` mint route were both removed at
- * 0.6.0 / vault#282 Stage 2 — the column + index are now vestigial; the
+ * 0.5.0 / vault#282 Stage 2 — the column + index are now vestigial; the
  * index still speeds the per-vault `listTokens` cleanup listing.)
  *
  * Wrapped in BEGIN IMMEDIATE / COMMIT (with try/catch ROLLBACK) per the

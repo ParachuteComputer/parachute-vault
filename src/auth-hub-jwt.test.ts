@@ -668,7 +668,7 @@ describe("authenticateVaultRequest — hub JWT tag-scoping (auth-unification C0)
 
 // ---------------------------------------------------------------------------
 // pvt_* DROP (vault#282 Stage 2 — BREAKING). pvt_* tokens were the only
-// non-JWT, non-YAML credential vault used to mint + validate. At 0.6.0 the
+// non-JWT, non-YAML credential vault used to mint + validate. At 0.5.0 the
 // mint + validation were removed entirely: a pvt_*-prefixed bearer is no
 // longer JWT-shaped (skips authenticateHubJwt) and matches no surviving
 // credential, so it 401s. The hub JWT — the migration target — keeps working.

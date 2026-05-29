@@ -7,7 +7,7 @@
  *     VAULT_AUTH_TOKEN operator bearer, which are vault-pinned by context
  *     (the YAML key lives under a specific vault; the operator bearer is
  *     server-wide full-admin). (The `pvt_*` vault-DB token that also used
- *     this shape was dropped at 0.6.0 — vault#282 Stage 2.)
+ *     this shape was dropped at 0.5.0 — vault#282 Stage 2.)
  *   - **Narrowed** `vault:<name>:<verb>` — used by hub-issued JWTs, which are
  *     not pinned by storage and so MUST name the resource they grant access
  *     to. Hub JWTs carrying broad `vault:<verb>` are rejected at validation

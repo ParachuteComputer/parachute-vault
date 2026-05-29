@@ -564,7 +564,7 @@ async function handleNotesInner(
       //
       //   - **Flat date params** (DEPRECATED): `?date_field=created_at&
       //     date_from=…&date_to=…` and the legacy `?date_from=…&date_to=…`.
-      //     Still functional through 0.5.x; planned removal in 0.6.0
+      //     Still functional through 0.5.x; planned removal in a later 0.x
       //     (vault#288). New consumers should use bracket-style.
       //
       // Precedence on overlap: bracket-style wins. If a caller passes both

@@ -23,7 +23,7 @@ export type InitSummaryInput = {
 
 /**
  * Build the post-install summary lines for `vault init`, branched on the
- * (addMcp, addToken, apiKey) decision matrix. Post-0.6.0 the token is a
+ * (addMcp, addToken, apiKey) decision matrix. Post-0.5.0 the token is a
  * hub-issued JWT minted via operator.token; when no hub is reachable `apiKey`
  * is undefined even though the operator opted in (`addToken`/`addMcp`):
  *
