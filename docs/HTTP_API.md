@@ -81,15 +81,19 @@ Three credential types are accepted, in checking order:
 
 | Type | Format | Provenance | Scope claim shape |
 |---|---|---|---|
-| Hub-issued JWT | three dot-separated base64url segments | minted by `parachute-hub` after an OAuth flow | resource-narrowed (`vault:<name>:<verb>`); broad `vault:<verb>` claims are rejected. Also carries a `vault_scope` claim — see below. |
+| Hub-issued JWT | three dot-separated base64url segments | minted by `parachute-hub` after an OAuth flow, or via `parachute auth mint-token` / `parachute-vault mcp-install --mint` | resource-narrowed (`vault:<name>:<verb>`); broad `vault:<verb>` claims are rejected. Also carries a `vault_scope` claim — see below. |
 | Server-wide operator token | `VAULT_AUTH_TOKEN` env var | set by the operator at boot | implicit `vault:admin` against every vault |
-| Vault-pinned `pvt_*` token | `pvt_` followed by base64url, stored hashed in the vault's tokens table | minted via `POST /vault/<name>/tokens` or the CLI | explicit scope list (broad `vault:read` / `vault:write` / `vault:admin`); pinned to the issuing vault and rejected at any other |
+| Legacy `pvk_*` YAML key | bcrypt-hashed in `config.yaml` / `vault.yaml` `api_keys` | pre-0.3 deployments | mapped onto the modern scope set on the fly; emits a deprecation log line |
 
 The legacy `permission: "full" \| "read"` column and unscoped vault.yaml /
-config.yaml api_keys still resolve for back-compat — they're mapped onto the
-modern scope set on the fly and emit a deprecation log line. New deployments
-should use the JWT path; new local tooling should use `pvt_*`. Scheduled for
-removal in v0.6.0 (vault#282).
+config.yaml `pvk_*` api_keys still resolve for back-compat — they're mapped
+onto the modern scope set on the fly and emit a deprecation log line. New
+deployments should use the hub-JWT path (`parachute auth mint-token`).
+
+> **`pvt_*` tokens were dropped at 0.6.0 (vault#282 Stage 2).** Vault no
+> longer mints or accepts the vault-local opaque token; a `pvt_`-prefixed
+> bearer now gets a `401` pointing you at the hub. Use a hub-issued JWT
+> instead.
 
 ### Scopes
 
@@ -100,14 +104,14 @@ token's scope list. Verbs and inheritance:
 |---|---|---|
 | `read` | `GET`, `HEAD`, `OPTIONS` on `/api/*` | `write`, `admin` |
 | `write` | `POST`, `PATCH`, `PUT`, `DELETE` on `/api/*` | `admin` |
-| `admin` | `/tokens/*`, `/.parachute/config` (read), `/.parachute/mirror` (read+write) | — |
+| `admin` | `/.parachute/config` (read), `/.parachute/mirror` (read+write) | — |
 
 A grant satisfies a (vault, verb) request if either:
 
-- the granted scope is broad (`vault:<verb>` from a `pvt_*` token resolved
-  against the requesting vault), or
+- the granted scope is broad (`vault:<verb>` — only from a legacy `pvk_*`
+  YAML key or `VAULT_AUTH_TOKEN`, resolved against the requesting vault), or
 - the granted scope is narrowed and names this vault
-  (`vault:<this-vault>:<verb>`).
+  (`vault:<this-vault>:<verb>` — what hub JWTs carry).
 
 `vault:<other-vault>:<verb>` never satisfies; broad scopes inside hub-issued
 JWTs are rejected at validation.
@@ -877,67 +881,25 @@ restart of the watch loop with the new shape — no vault restart needed.
 - `enabled=false` PUTs skip path validation so an operator can disable a
   mirror whose path has gone missing.
 
-### Token management
+### Token management — minting lives on the hub
 
-#### `GET /vault/{name}/tokens` — `vault:<name>:admin`
-List `pvt_*` tokens scoped to this vault (plus any legacy server-wide
-tokens, which authenticate cross-vault by design). Metadata only — no
-plaintext, no hash.
+The per-vault `/vault/{name}/tokens` REST surface (the old `GET` list,
+`POST` mint, `DELETE` revoke of `pvt_*` tokens) was **removed at 0.6.0**
+(vault#282 Stage 2 — vault is a pure hub resource-server). A request to
+`/vault/{name}/tokens` now falls through to the catch-all `404`.
 
-```json
-{
-  "tokens": [
-    {
-      "id": "t_abc012345678",
-      "label": "Daily sync",
-      "permission": "full",
-      "scopes": ["vault:read", "vault:write"],
-      "scoped_tags": null,
-      "vault_name": "default",
-      "expires_at": null,
-      "created_at": "2026-...",
-      "last_used_at": "2026-..."
-    }
-  ]
-}
-```
+Mint and revoke vault access tokens on the hub instead:
 
-#### `POST /vault/{name}/tokens` — `vault:<name>:admin`
-Mint a new `pvt_*` token. Body:
+- `parachute auth mint-token --scope vault:<name>:<verb>` — mint a scoped
+  hub JWT for scripts.
+- `parachute-vault mcp-install --mint` — mint + wire a JWT into an MCP
+  client config in one step.
+- The admin SPA's **Tokens** page — mint / list / revoke from the browser.
 
-```json
-{
-  "label": "Daily sync",
-  "scopes": ["vault:read", "vault:write"],          // or "scope": "vault:read vault:write"
-  "tags": ["project-a", "project-b"] | null,        // optional tag allowlist
-  "expires_at": "2026-12-31T00:00:00.000Z" | null
-}
-```
-
-Returns the plaintext token **exactly once**:
-
-```json
-{
-  "id": "t_abc012345678",
-  "token": "pvt_...",
-  "label": "...",
-  "scopes": [...],
-  "scoped_tags": [...] | null,
-  "vault_name": "default",
-  "expires_at": null,
-  "created_at": "..."
-}
-```
-
-Defense-in-depth: the caller cannot mint a scope they don't already hold,
-and a tag-scoped caller cannot mint an unscoped token. Failed checks
-return `400` (with `rejected: [...]`) or `403` (with `error_type:
-"tag_scope_violation"`).
-
-#### `DELETE /vault/{name}/tokens/{id}` — `vault:<name>:admin`
-Revoke a token. `{id}` is the `t_…` display id from the list. Returns
-`{revoked: true}` on success; `404` if no token matches; `403` if the
-token is bound to a different vault.
+Hub JWTs are audience-bound (`aud=vault.<name>`) and scope-narrowed; vault
+validates each one against the hub's JWKS per-request and stores nothing.
+See [`docs/auth-model.md`](./auth-model.md) for the full validation
+contract.
 
 ### Maintenance
 
@@ -988,8 +950,8 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
   `include_content: true|false` lean/fat convention. The two surfaces are
   designed to stay in lockstep.
 - [`docs/auth-model.md`](./auth-model.md) — full credential layering
-  (OAuth, JWT, pvt_*, vault.yaml back-compat), discovery, session cookies,
-  rate limiting.
+  (OAuth, hub JWT, `pvk_*` / vault.yaml back-compat), discovery, session
+  cookies, rate limiting.
 - [`CHANGELOG.md`](../CHANGELOG.md) — canonical version history. Notable
   recent entries:
   - 0.4.8 — WAL mode (#326), cursor pagination (#313), auto-transcribe
