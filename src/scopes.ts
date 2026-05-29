@@ -3,9 +3,11 @@
  *
  * Tokens carry OAuth-standard whitespace-separated scopes. Two shapes coexist:
  *
- *   - **Broad** `vault:<verb>` — used by `pvt_*` tokens, which are vault-pinned
- *     by storage (each vault has its own tokens DB; a token only resolves
- *     against the vault that minted it).
+ *   - **Broad** `vault:<verb>` — used by legacy YAML api_keys and the
+ *     VAULT_AUTH_TOKEN operator bearer, which are vault-pinned by context
+ *     (the YAML key lives under a specific vault; the operator bearer is
+ *     server-wide full-admin). (The `pvt_*` vault-DB token that also used
+ *     this shape was dropped at 0.6.0 — vault#282 Stage 2.)
  *   - **Narrowed** `vault:<name>:<verb>` — used by hub-issued JWTs, which are
  *     not pinned by storage and so MUST name the resource they grant access
  *     to. Hub JWTs carrying broad `vault:<verb>` are rejected at validation
@@ -113,9 +115,10 @@ export function hasScope(granted: string[], required: string): boolean {
  *
  * Match rules:
  *   - Broad `vault:<verb>` in granted satisfies any vault (the broad scope
- *     has no resource constraint; the caller pins the vault upstream — pvt_*
- *     resolves only against its issuing vault's DB, hub JWTs reject broad
- *     scopes at validation).
+ *     has no resource constraint; the caller pins the vault upstream — a
+ *     legacy YAML key lives under a specific vault, the VAULT_AUTH_TOKEN
+ *     bearer is server-wide full-admin, and hub JWTs reject broad scopes at
+ *     validation).
  *   - Narrowed `vault:<name>:<verb>` satisfies only the matching `vaultName`.
  *   - Verb inheritance `admin ⊇ write ⊇ read` applies in both forms.
  */

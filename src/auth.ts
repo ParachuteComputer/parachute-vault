@@ -1,27 +1,30 @@
 /**
  * Authentication and authorization for the vault server.
  *
- * Token-based auth with two permission levels:
- *   - "full" — unrestricted access (CRUD + delete + token management)
- *   - "read" — read-only (query, list, find-path, vault-info)
+ * As of 0.6.0 vault is a PURE HUB RESOURCE-SERVER (vault#282 Stage 2). The
+ * opaque `pvt_*` vault-DB token was dropped — vault no longer mints or
+ * validates it. Three auth paths survive:
  *
- * Tokens live in each vault's SQLite database (tokens table, schema v7).
+ *   1. Hub-issued JWT — the user-credential path. JWT-shaped bearers are
+ *      validated against the hub's JWKS (`authenticateHubJwt` → hub-jwt.ts →
+ *      scope-guard), audience-pinned to `vault.<name>`, scope-narrowed.
+ *   2. VAULT_AUTH_TOKEN — the server-wide operator bearer (env var,
+ *      constant-time compare). Short-circuits both auth entry points.
+ *   3. Legacy YAML api_keys — hashed keys in vault.yaml / config.yaml. A
+ *      separate deprecation axis from pvt_*; still validated here.
  *
- * Backward compatibility: config.yaml API keys are still checked as a fallback.
- * Those keys resolve as full-access tokens. Legacy "admin" and "write" values
- * in the DB are normalized to "full" at read time.
+ * Permission levels remain "full" / "read"; legacy "admin"/"write" DB values
+ * normalize to "full" at read time.
  *
- * The unified /mcp endpoint uses only legacy global config.yaml keys, since
- * tokens are per-vault and the unified endpoint spans all vaults.
+ * The unified /mcp endpoint accepts only VAULT_AUTH_TOKEN + global config.yaml
+ * keys — hub JWTs are vault-bound (aud=vault.<name>) and have no single
+ * audience to strict-check on the cross-vault surface.
  */
 
-import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey, listVaults, readVaultConfig } from "./config.ts";
+import { readGlobalConfig, writeVaultConfig, writeGlobalConfig, verifyKey } from "./config.ts";
 import type { VaultConfig, StoredKey } from "./config.ts";
-import { resolveToken } from "./token-store.ts";
 import type { TokenPermission } from "./token-store.ts";
-import type { Database } from "bun:sqlite";
 import crypto from "node:crypto";
-import { getVaultStore } from "./vault-store.ts";
 import {
   findBroadVaultScopes,
   hasScope,
@@ -71,8 +74,8 @@ function constantTimeEquals(a: string, b: string): boolean {
  *
  * The operator-channel auth shape for non-loopback deploys (Render,
  * sibling-container setups, vault#339). Hub uses this to call vault
- * across a container boundary; end-user OAuth tokens still take the
- * per-vault hub-JWT / pvt_* paths below. See `docs/auth-model.md` §2.
+ * across a container boundary; end-user OAuth tokens take the per-vault
+ * hub-JWT path below. See `docs/auth-model.md` §2.
  *
  * Scope set is broad (`vault:admin`) — the env-var bearer is an
  * operator credential, not a user credential. Tag-scoping doesn't
@@ -127,12 +130,11 @@ export interface AuthResult {
    */
   vault_name: string | null;
   /**
-   * Session identifier (v19). For `pvt_*` tokens this is the display id
-   * (`t_<hashprefix>`) of the presented token. For hub JWTs it's the
-   * `jti` claim, when present. NULL for legacy YAML keys / server-wide
-   * env-var tokens / hub JWTs without a `jti`. Used by the manage-token
-   * MCP tool to stamp child tokens with `parent_jti` so list/revoke can
-   * scope to this session's mints. See vault#376.
+   * Session identifier. For hub JWTs this is the `jti` claim, when present.
+   * NULL for legacy YAML keys / server-wide env-var tokens / hub JWTs
+   * without a `jti`. Used by the manage-token MCP tool to stamp child
+   * mints with `parent_jti` so list/revoke can scope to this session's
+   * mints. See vault#376.
    */
   caller_jti: string | null;
 }
@@ -166,40 +168,6 @@ export function warnLegacyOnce(cacheKey: string, context: string): void {
   warnedLegacyTokens.add(cacheKey);
   console.warn(
     `[scopes] legacy permission-based auth used (${context}); migrate to vault:read / vault:write / vault:admin scopes. This compat shim will be removed after the next release.`,
-  );
-}
-
-/**
- * Doc link operators are sent to when a `pvt_*` token authenticates. Points
- * at the pvt_* → hub-JWT migration section of vault's UPGRADING.md.
- */
-const PVT_MIGRATION_DOC =
-  "https://github.com/ParachuteComputer/parachute-vault/blob/main/UPGRADING.md#pvt_-token-deprecation--will-be-rejected-at-060";
-
-// One-shot pvt_* deprecation warning tracker, keyed by the token's display id
-// (`t_<hashprefix>`) so each distinct token warns exactly once per process.
-const warnedPvtTokens = new Set<string>();
-
-/**
- * Log a one-time (per token-hash) deprecation warning for a successfully-
- * authenticated `pvt_*` vault-DB token. Stage 1 of vault#282: pvt_* still
- * AUTHENTICATES and AUTHORIZES exactly as before — this only signals that the
- * credential is on a deprecation clock and will be REJECTED at vault 0.6.0.
- *
- * Keyed on the token's display id (`t_<hashprefix>` — the `jti` ResolvedToken
- * surfaces) so a given token logs once per process regardless of how many
- * requests it makes or whether it carries explicit scopes. Folds in the
- * narrower pre-existing "vault token without scopes column" warning — a legacy-
- * derived pvt_* gets THIS warning, not both, so we never double-warn one token.
- */
-export function warnPvtDeprecationOnce(displayId: string): void {
-  if (warnedPvtTokens.has(displayId)) return;
-  warnedPvtTokens.add(displayId);
-  console.warn(
-    `[deprecation] pvt_* token ${displayId} authenticated — pvt_* tokens are DEPRECATED and will be REJECTED at vault 0.6.0 (vault#282). ` +
-      "Migrate to a hub-issued JWT: run `parachute vault mcp-install` (MCP clients) or " +
-      "`parachute auth mint-token --scope vault:<name>:<verb>` (scripts). " +
-      `Guide: ${PVT_MIGRATION_DOC}.`,
   );
 }
 
@@ -259,21 +227,19 @@ function validateKey(keys: StoredKey[], providedKey: string): StoredKey | null {
 /**
  * Authenticate for a specific vault.
  *
- * Token shape decides the path:
+ * Token shape decides the path (vault#282 Stage 2 — vault is a pure hub
+ * resource-server, the `pvt_*` vault-DB lookup is GONE):
+ *   - VAULT_AUTH_TOKEN match → server-wide operator bearer (checked first).
  *   - JWT-shaped (`eyJ…`) → validate against the hub's JWKS. JWT-shaped tokens
- *     commit to JWT validation; we don't fall through to `pvt_*` lookup on
- *     failure, since a malformed JWT was never going to be a valid local
- *     token anyway.
- *   - Anything else → try the vault's token DB, then legacy YAML keys.
- *
- * Dual-validate window: both paths are live during this release cycle so
- * existing `pvt_*` callers continue to work. A follow-up issue retires the
- * legacy path.
+ *     commit to JWT validation; we don't fall through on failure, since a
+ *     malformed JWT was never going to be a valid local credential anyway.
+ *   - Anything else → legacy YAML api_keys (vault.yaml, then config.yaml).
+ *     A `pvt_*`-prefixed bearer is not JWT-shaped and matches no `key_hash`,
+ *     so it falls through to the 401 — pvt_* is unvalidatable post-DROP.
  */
 export async function authenticateVaultRequest(
   req: Request,
   vaultConfig: VaultConfig,
-  vaultDb?: Database,
 ): Promise<{ error: Response } | AuthResult> {
   const key = extractApiKey(req);
   if (!key) {
@@ -284,8 +250,8 @@ export async function authenticateVaultRequest(
   // a matching bearer authenticates as full/admin against any vault. This
   // is the cross-container path for Render / sibling-service deployments
   // where hub talks to vault over HTTP. Checked first so it short-circuits
-  // both JWT validation and per-vault DB lookups — the operator token is
-  // a credential the operator opts into, not one we'd ever fall through.
+  // JWT validation — the operator token is a credential the operator opts
+  // into, not one we'd ever fall through.
   const serverWide = tryServerWideAuth(key);
   if (serverWide !== null) return serverWide;
 
@@ -301,49 +267,6 @@ export async function authenticateVaultRequest(
       expectedAudience: `vault.${vaultConfig.name}`,
       vaultName: vaultConfig.name,
     });
-  }
-
-  // Try vault's token DB first
-  if (vaultDb) {
-    try {
-      const resolved = resolveToken(vaultDb, key);
-      if (resolved) {
-        // Per-vault binding (v16): tokens minted via /vault/<name>/tokens
-        // carry vault_name = <name>. Reject if presented at a different
-        // vault. NULL = legacy / server-wide; accept anywhere. The DB
-        // lookup itself already filters by per-vault DB scoping (resolve
-        // only succeeds if the token row lives in this vault's DB), so
-        // a mismatch here would only happen if a token row was copied
-        // across vault DBs out-of-band — defense-in-depth.
-        if (resolved.vault_name !== null && resolved.vault_name !== vaultConfig.name) {
-          return {
-            error: Response.json(
-              {
-                error: "Unauthorized",
-                message: `token is bound to vault '${resolved.vault_name}'; cannot be used against vault '${vaultConfig.name}'`,
-              },
-              { status: 403 },
-            ),
-          };
-        }
-        // vault#282 Stage 1: every successful pvt_* (vault-DB token-store)
-        // authentication is on a deprecation clock. One-time per token-hash
-        // (keyed on the display id). Folds in the old narrower "vault token
-        // without scopes column" warning — a legacy-derived pvt_* gets THIS
-        // warning, not both. Auth OUTCOME is unchanged; this only signals.
-        warnPvtDeprecationOnce(resolved.jti);
-        return {
-          permission: resolved.permission,
-          scopes: resolved.scopes,
-          legacyDerived: resolved.legacyDerived,
-          scoped_tags: resolved.scoped_tags,
-          vault_name: resolved.vault_name,
-          caller_jti: resolved.jti,
-        };
-      }
-    } catch {
-      // Token table might not exist yet — fall through to legacy auth
-    }
   }
 
   // Legacy: check per-vault keys from vault.yaml
@@ -383,8 +306,7 @@ class MalformedScopedTagsError extends Error {}
  *
  *   permissions: { scoped_tags: string[] }   // root tag names
  *
- * Same semantics as the deprecated `pvt_*` `scoped_tags` DB column: each
- * entry is a ROOT tag name; the token sees notes carrying that tag or a
+ * Each entry is a ROOT tag name; the token sees notes carrying that tag or a
  * sub-tag thereof (hierarchy expansion happens in tag-scope.ts).
  *
  * Three outcomes, chosen for a strict FAIL-CLOSED invariant — tag-scoping is
@@ -593,10 +515,12 @@ async function authenticateHubJwt(
 }
 
 /**
- * Authenticate for the unified /mcp endpoint.
- * Checks legacy global config.yaml keys first, then falls back to checking
- * each vault's token DB. This allows OAuth-minted pvt_ tokens to work on
- * the unified endpoint.
+ * Authenticate for the unified /mcp endpoint (cross-vault: /vaults metadata,
+ * /health detail). Accepts only VAULT_AUTH_TOKEN + global config.yaml keys
+ * (vault#282 Stage 2 — the per-vault pvt_* DB fallback is GONE). Hub JWTs are
+ * vault-bound (aud=vault.<name>) and have no single audience to strict-check
+ * across every vault, so they're rejected here with a redirect hint to the
+ * per-vault `/vault/<name>/*` surface.
  */
 export async function authenticateGlobalRequest(
   req: Request,
@@ -642,37 +566,6 @@ export async function authenticateGlobalRequest(
       try { writeGlobalConfig(globalConfig); } catch {}
       warnLegacyOnce(`yaml-global:${matched.key_hash}`, "config.yaml api_keys");
       return legacyAuthResult(matched.scope === "read" ? "read" : "full");
-    }
-  }
-
-  // Fall through to vault token DBs — check each vault for the token.
-  // This enables OAuth-minted pvt_ tokens and CLI-created tokens to
-  // authenticate against the unified /mcp endpoint. The token's vault
-  // binding (if any) is propagated via AuthResult.vault_name; downstream
-  // handlers that operate on a specific vault are responsible for
-  // checking that binding matches their target. The unified surface
-  // itself doesn't reject here — a vault-bound token authenticating to
-  // call back into its own vault via /mcp is legitimate.
-  for (const vaultName of listVaults()) {
-    try {
-      const store = getVaultStore(vaultName);
-      const resolved = resolveToken(store.db, key);
-      if (resolved) {
-        // vault#282 Stage 1: pvt_* resolved on the unified surface is on the
-        // same deprecation clock. One-time per token-hash; folds in the old
-        // narrower legacy-scopes warning. Auth OUTCOME unchanged.
-        warnPvtDeprecationOnce(resolved.jti);
-        return {
-          permission: resolved.permission,
-          scopes: resolved.scopes,
-          legacyDerived: resolved.legacyDerived,
-          scoped_tags: resolved.scoped_tags,
-          vault_name: resolved.vault_name,
-          caller_jti: resolved.jti,
-        };
-      }
-    } catch {
-      // Skip vaults that can't be opened
     }
   }
 

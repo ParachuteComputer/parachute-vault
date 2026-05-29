@@ -64,7 +64,6 @@ import {
   type TagScopeCtx,
 } from "./routes.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
-import { handleTokens } from "./tokens-routes.ts";
 import {
   handleProtectedResource,
   handleAuthorizationServer,
@@ -127,12 +126,11 @@ async function withMcpChallenge(
 async function isViewAuthenticated(
   req: Request,
   vaultConfig: VaultConfig | null,
-  vaultDb?: import("bun:sqlite").Database,
 ): Promise<boolean> {
   if (!vaultConfig) return false;
   const key = extractApiKey(req);
   if (!key) return false;
-  const auth = await authenticateVaultRequest(req, vaultConfig, vaultDb);
+  const auth = await authenticateVaultRequest(req, vaultConfig);
   return !("error" in auth);
 }
 
@@ -334,7 +332,7 @@ export async function route(
   const vaultViewMatch = subpath.match(/^\/view\/(.+)$/);
   if (vaultViewMatch && req.method === "GET") {
     const store = getVaultStore(vaultName);
-    const authenticated = await isViewAuthenticated(req, vaultConfig, store.db);
+    const authenticated = await isViewAuthenticated(req, vaultConfig);
     return handleViewNote(store, decodeURIComponent(vaultViewMatch[1]!), {
       authenticated,
       publishedTag: vaultConfig.published_tag,
@@ -395,7 +393,7 @@ export async function route(
     // (worker intervals, TTLs, retention policy) but are still configuration
     // an attacker could use to map the deployment. `vault:admin` keeps the
     // hub's loopback workflow intact while locking out read-only tokens.
-    const configAuth = await authenticateVaultRequest(req, vaultConfig, getVaultStore(vaultName).db);
+    const configAuth = await authenticateVaultRequest(req, vaultConfig);
     if ("error" in configAuth) return configAuth.error;
     if (!hasScopeForVault(configAuth.scopes, vaultName, "admin")) {
       return Response.json(
@@ -430,7 +428,7 @@ export async function route(
   // ---------------------------------------------------------------------
 
   const store = getVaultStore(vaultName);
-  const auth = await authenticateVaultRequest(req, vaultConfig, store.db);
+  const auth = await authenticateVaultRequest(req, vaultConfig);
   const isScopedMcp = subpath === "/mcp" || subpath.startsWith("/mcp/");
   if ("error" in auth) {
     return isScopedMcp ? withMcpChallenge(auth.error, req, vaultName) : auth.error;
@@ -464,30 +462,10 @@ export async function route(
     });
   }
 
-  // /tokens — admin-gated REST surface for minting/listing/revoking pvt_*
-  // tokens. Admin gate applies to every method (POST/GET/DELETE) since both
-  // the plaintext mint and the metadata listing are sensitive — knowing
-  // labels and scopes of issued tokens leaks the deployment's auth shape.
-  // The handler's POST path applies a strict subset check on requested
-  // scopes via `validateMintedScopes` (defense-in-depth: cross-vault and
-  // privilege-escalation rejections survive even if this gate is later
-  // relaxed).
-  const tokensMatch = subpath.match(/^\/tokens(\/.*)?$/);
-  if (tokensMatch) {
-    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
-      return Response.json(
-        {
-          error: "Forbidden",
-          error_type: "insufficient_scope",
-          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
-          required_scope: SCOPE_ADMIN,
-          granted_scopes: auth.scopes,
-        },
-        { status: 403 },
-      );
-    }
-    return handleTokens(req, store, vaultName, auth.scopes, auth.scoped_tags, tokensMatch[1] ?? "");
-  }
+  // The per-vault `/tokens` REST surface (pvt_* mint/list/revoke) was removed
+  // at 0.6.0 (vault#282 Stage 2 — vault is a pure hub resource-server). Hub
+  // JWTs are minted via hub's registry (`/api/auth/mint-token`); a `/tokens`
+  // request now falls through to the catch-all 404 below.
 
   // /.parachute/mirror — Admin-gated read+write of THIS vault's persistent
   // mirror config + runtime status. Per-vault (vault#400): the manager is

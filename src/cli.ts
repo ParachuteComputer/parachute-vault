@@ -98,9 +98,8 @@ import {
 } from "./daemon.ts";
 import { confirm, ask, askPassword, choose } from "./prompt.ts";
 import { resolveBindHostname } from "./bind.ts";
-import { generateToken, createToken, listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
-import type { TokenPermission } from "./token-store.ts";
-import { resolveCreateTokenFlags, VAULT_SCOPES } from "./scopes.ts";
+import { listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
+import { VAULT_SCOPES } from "./scopes.ts";
 import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { selfRegister } from "./self-register.ts";
@@ -161,7 +160,7 @@ switch (command) {
     await cmdInit(cmdArgs);
     break;
   case "create":
-    cmdCreate(cmdArgs);
+    await cmdCreate(cmdArgs);
     break;
   case "list":
   case "ls":
@@ -298,12 +297,19 @@ async function cmdInit(args: string[] = []) {
   // piped installs keep working unchanged.
   const vaults = listVaults();
   let apiKey: string | undefined;
+  // Guidance carried from the bootstrap-credential step — surfaced at the end
+  // when no token could be issued (standalone, no hub) so the operator knows
+  // how to make the vault reachable. vault#282 Stage 2.
+  let credentialGuidance: string | undefined;
   if (vaults.length === 0) {
     const chosenName =
       nameDecision.kind === "name" ? nameDecision.name : await promptVaultName();
     console.log(`Creating vault "${chosenName}"...`);
-    apiKey = createVault(chosenName);
+    const credential = await createVault(chosenName);
+    apiKey = credential.token ?? undefined;
+    credentialGuidance = credential.guidance;
     console.log(`  Created vault: ${chosenName}`);
+    console.log(`  ${credential.guidance}`);
   } else {
     if (vaultNameFlagSupplied) {
       console.log(
@@ -485,25 +491,29 @@ async function cmdInit(args: string[] = []) {
   }
 
   // Mint a token if we need one (for the claude.json entry and/or for
-  // prominent display) and don't already have one from vault creation.
-  // Re-runs of init that opt in will mint a fresh token — old tokens
-  // continue to work; the user can `tokens revoke` the unused ones.
+  // prominent display) and don't already have one from vault creation —
+  // e.g. a re-run of init against an existing vault. vault#282 Stage 2: vault
+  // no longer mints pvt_* tokens, so this is a hub JWT via the operator.token
+  // → hub mint-token path (`mintBootstrapCredential`). When no hub is
+  // reachable, `apiKey` stays undefined and we carry the guidance to the
+  // summary — the operator runs `mcp-install` once a hub is up, or sets
+  // VAULT_AUTH_TOKEN.
   const defaultVault = globalConfig.default_vault || "default";
   const needToken = addMcp || addToken;
   if (needToken && !apiKey) {
-    const store = getVaultStore(defaultVault);
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, { label: "init", permission: "full" });
-    apiKey = fullToken;
+    const credential = await mintBootstrapCredential(defaultVault);
+    apiKey = credential.token ?? undefined;
+    credentialGuidance = credential.guidance;
+    if (!apiKey) console.log(`  ${credential.guidance}`);
   }
 
   if (addMcp) {
-    // Init's bootstrap path stays on the pvt_* shape so a fresh-install
-    // without a hub still works out of the box. Operators with a hub can
-    // re-run `parachute-vault mcp-install` (defaults to hub-mint) to
-    // upgrade. Goes through `buildMcpEntryPlan` for entryKey + url so this
-    // path shares the writer-side invariant with `executeMcpInstall` — a
-    // future URL-shape change can't drift between init and mcp-install.
+    // Goes through `buildMcpEntryPlan` for entryKey + url so this path shares
+    // the writer-side invariant with `executeMcpInstall` — a future URL-shape
+    // change can't drift between init and mcp-install. The bearer is the hub
+    // JWT minted above (omitted when no hub was reachable — the entry is then
+    // written unauthenticated, and the operator re-runs `mcp-install` once a
+    // hub is up).
     const target = resolveInstallTarget("user");
     const { entryKey, url, source } = buildMcpEntryPlan({
       vaultName: defaultVault,
@@ -534,6 +544,7 @@ async function cmdInit(args: string[] = []) {
     bindHost,
     port,
     mcpUrl,
+    noTokenGuidance: credentialGuidance,
   });
   for (const line of lines) console.log(line);
 }
@@ -797,7 +808,7 @@ async function cmd2fa(args: string[]) {
   process.exit(1);
 }
 
-function cmdCreate(args: string[]) {
+async function cmdCreate(args: string[]) {
   // --json: emit a single machine-readable object on stdout instead of the
   // human-friendly multi-line print. Designed for orchestrators (the hub's
   // POST /vaults shells out to this CLI and parses stdout). Errors still go
@@ -835,7 +846,7 @@ function cmdCreate(args: string[]) {
 
   ensureConfigDirSync();
   const wasFirst = listVaults().length === 0;
-  const key = createVault(name);
+  const credential = await createVault(name);
 
   // If this is the only vault now, make it the default so unscoped routes
   // (/mcp, /api/*, /oauth/*) target it. Avoids the "single vault named
@@ -870,9 +881,16 @@ function cmdCreate(args: string[]) {
   });
 
   if (jsonMode) {
+    // Contract (hub's admin-vaults.ts requires `typeof token === "string"`):
+    // emit the minted hub JWT when present. When no hub was reachable
+    // (standalone create — no operator.token / no hub origin), `token` is the
+    // empty string and `token_guidance` carries the operator's next step. Hub
+    // only shells out to `create --json` while IT is the orchestrator (a hub is
+    // running, operator.token present), so that path always mints a real JWT.
     const payload = {
       name,
-      token: key,
+      token: credential.token ?? "",
+      token_guidance: credential.guidance,
       paths: {
         vault_dir: vaultDir(name),
         vault_db: vaultDbPath(name),
@@ -886,8 +904,13 @@ function cmdCreate(args: string[]) {
 
   console.log(`Vault "${name}" created.`);
   console.log(`  Path: ${vaultDir(name)}`);
-  console.log(`  API token: ${key}`);
-  console.log(`  Save this — it will not be shown again.`);
+  if (credential.token) {
+    console.log(`  API token: ${credential.token}`);
+    console.log(`  ${credential.guidance}`);
+    console.log(`  Save this — it will not be shown again.`);
+  } else {
+    console.log(`  ${credential.guidance}`);
+  }
   if (defaultNote) {
     console.log(`  ${defaultNote}`);
   }
@@ -925,13 +948,12 @@ function takeArgValue(args: string[], name: string): { value?: string; missingVa
 
 /**
  * `parachute-vault mcp-install` — install the vault MCP server into an
- * AI client's config. Three auth modes (mutually exclusive):
+ * AI client's config. Two auth modes (mutually exclusive — vault#282 Stage 2
+ * dropped the `--legacy-pat` pvt_* mint; vault is a pure hub resource-server):
  *
  *   --mint                (default) Mint a hub JWT via `POST <hub>/api/auth/mint-token`
  *                         using the local operator token.
- *   --token <bearer>      Use an existing token (hub JWT, pvt_*, anything).
- *   --legacy-pat          Mint a vault-DB `pvt_*` token (deprecated;
- *                         self-hosted-without-hub setups).
+ *   --token <bearer>      Use an existing bearer (hub JWT or VAULT_AUTH_TOKEN).
  *
  * Targeting:
  *   --scope <verb>        vault:read | vault:write | vault:admin (default: vault:read).
@@ -960,7 +982,6 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
   // dead zone when the function body first executes from that dispatch.
   const MCP_INSTALL_FLAG_NAMES = [
     "--mint",
-    "--legacy-pat",
     "--token",
     "--scope",
     "--install-scope",
@@ -982,22 +1003,21 @@ async function cmdMcpInstall(args: string[]): Promise<void> {
     return await cmdMcpInstallInteractive();
   }
 
-  // --- Auth-mode parsing (mutually exclusive) ---
+  // --- Auth-mode parsing (mutually exclusive). vault#282 Stage 2 dropped
+  // --legacy-pat (the pvt_* mint) — vault is a pure hub resource-server, so
+  // the only auth modes are --mint (hub JWT, default) and --token (paste). ---
   const wantMint = args.includes("--mint");
-  const wantLegacy = args.includes("--legacy-pat");
   const tokenArg = takeArgValue(args, "--token");
   if (tokenArg.missingValue) {
     console.error("--token requires a value (the bearer token to embed).");
     process.exit(1);
   }
   const wantToken = tokenArg.value !== undefined;
-  const modesSet = (wantMint ? 1 : 0) + (wantLegacy ? 1 : 0) + (wantToken ? 1 : 0);
-  if (modesSet > 1) {
-    console.error("--mint, --token, and --legacy-pat are mutually exclusive.");
+  if (wantMint && wantToken) {
+    console.error("--mint and --token are mutually exclusive.");
     process.exit(1);
   }
-  const mode: "mint" | "token" | "legacy-pat" =
-    wantToken ? "token" : wantLegacy ? "legacy-pat" : "mint";
+  const mode: "mint" | "token" = wantToken ? "token" : "mint";
 
   // --- Scope parsing. Default vault:read (least-privilege). ---
   const scopeArg = takeArgValue(args, "--scope");
@@ -1132,7 +1152,7 @@ async function cmdMcpInstallInteractive(): Promise<void> {
  * the canonical synthesizer — the JSON shape is owned here once.
  *
  * No state is mutated; this only emits to stdout. The bearer is read from
- * `--token <pvt_...>` or `PARACHUTE_VAULT_TOKEN` env (deliberate — we don't
+ * `--token <bearer>` or `PARACHUTE_VAULT_TOKEN` env (deliberate — we don't
  * mint here, since this is a stdout-piped subprocess where prompting would
  * deadlock the parent script). If neither is present, we exit 1 with a
  * clear stderr message; runners get a fail-fast.
@@ -1149,7 +1169,7 @@ async function cmdMcpInstallInteractive(): Promise<void> {
 async function cmdMcpConfig(args: string[]): Promise<void> {
   const vaultName = args[0];
   if (!vaultName || vaultName.startsWith("--")) {
-    console.error("Usage: parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>] [--env-vars]");
+    console.error("Usage: parachute-vault mcp-config <vault-name> [--token <bearer>] [--base-url <url>] [--env-vars]");
     console.error("");
     console.error("Emits the JSON config consumed by `claude -p --mcp-config '<json>'`.");
     console.error("Pattern: claude -p --mcp-config \"$(parachute-vault mcp-config <name>)\" --strict-mcp-config ...");
@@ -1194,7 +1214,7 @@ async function cmdMcpConfig(args: string[]): Promise<void> {
   const bearer = tokenArg.value ?? process.env.PARACHUTE_VAULT_TOKEN;
   if (!bearer) {
     console.error("No bearer token provided. Pass --token <bearer> or set PARACHUTE_VAULT_TOKEN.");
-    console.error("  Mint a token with: parachute-vault tokens create --vault " + vaultName);
+    console.error("  Mint a hub JWT with: parachute-vault mcp-install --vault " + vaultName + "   (or `parachute auth mint-token`)");
     console.error("  Or use --env-vars to emit the template form (safe to commit; expands at runtime).");
     process.exit(1);
   }
@@ -1221,7 +1241,7 @@ async function cmdMcpConfig(args: string[]): Promise<void> {
 }
 
 interface ExecuteMcpInstallOpts {
-  mode: "mint" | "token" | "legacy-pat";
+  mode: "mint" | "token";
   /** Full scope string (e.g. "vault:read"). The verb segment narrows downstream. */
   rawScope: string;
   installScope: InstallScope;
@@ -1305,27 +1325,6 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     }
     bearer = pastedToken;
     console.log(`Using supplied token (skipping mint).`);
-  } else if (mode === "legacy-pat") {
-    console.error(
-      "Note: --legacy-pat mints a vault-DB pvt_* token. The hub-issued JWT path (--mint, default) " +
-        "is the canonical install going forward; pvt_* support is preserved for self-hosted-without-hub " +
-        "setups, tracked at vault#282, planned removal 0.6.0.",
-    );
-    const store = getVaultStore(vaultName);
-    const { fullToken } = generateToken();
-    // Narrow the pvt_* to the requested verb's scope set when not full-admin.
-    // `scopes: undefined` leaves the token at full vault permissions
-    // (admin); narrowing to a single-scope array gates it to that verb.
-    const createTokenOpts: Parameters<typeof createToken>[2] = {
-      label: "mcp-install",
-      permission: verb === "read" ? "read" : "full",
-      vault_name: vaultName,
-    };
-    if (verb !== "admin") {
-      createTokenOpts.scopes = [rawScope];
-    }
-    createToken(store.db, fullToken, createTokenOpts);
-    bearer = fullToken;
   } else {
     // mode === "mint"
     // `vault:<name>:admin` is mintable via the hub mint-token endpoint as
@@ -1334,15 +1333,16 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
     // operator.token does). No admin pre-flight reject — the narrowScope
     // below produces `vault:<name>:admin` and the hub honors it. This
     // requires a hub running PR-A; older hubs reject admin with HTTP 400
-    // invalid_scope, surfaced via the api-error branch below.
+    // invalid_scope, surfaced via the api-error branch below. There is no
+    // local pvt_* fallback anymore (vault#282 Stage 2) — without a hub, the
+    // operator pastes an existing bearer via `--token` or sets VAULT_AUTH_TOKEN.
     const operatorToken = readOperatorToken();
     if (!operatorToken) {
       console.error(
         "No operator token found at ~/.parachute/operator.token. The default install path " +
           "(--mint) requires a hub-issued operator token to mint scope-narrow JWTs.\n" +
           "  Fix: run `parachute auth rotate-operator` to create one, then re-run.\n" +
-          "  Or:  use `--token <bearer>` to paste an existing token, or `--legacy-pat` to " +
-          "mint a vault-DB pvt_* token (self-hosted-without-hub).",
+          "  Or:  use `--token <bearer>` to paste an existing token, or set VAULT_AUTH_TOKEN.",
       );
       process.exit(1);
     }
@@ -1354,7 +1354,7 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
           "Hub-mint (--mint) needs a real hub URL to call. Either:\n" +
           "  - Start the hub and set PARACHUTE_HUB_ORIGIN, OR\n" +
           "  - Bring up an exposure (`parachute expose tailnet`), OR\n" +
-          "  - Use --legacy-pat to mint a vault-DB pvt_* token instead.",
+          "  - Use --token <bearer> to paste an existing token instead.",
       );
       process.exit(1);
     }
@@ -1371,7 +1371,7 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
           console.error(
             `Hub unreachable at ${result.origin} — ${result.cause}.\n` +
               `  Fix: verify the hub is running and PARACHUTE_HUB_ORIGIN is set, ` +
-              `or use --legacy-pat to skip hub-mint.`,
+              `or use --token <bearer> to skip hub-mint.`,
           );
           break;
         case "api-error":
@@ -1385,8 +1385,8 @@ async function executeMcpInstall(opts: ExecuteMcpInstallOpts): Promise<void> {
           if (result.status === 400 && verb === "admin") {
             console.error(
               "  Hint: minting vault:admin requires a hub with per-vault admin mint support " +
-                "(hub#449). Your hub may predate it — upgrade the hub, or use --legacy-pat for " +
-                "a vault-DB pvt_* admin token instead.",
+                "(hub#449). Your hub may predate it — upgrade the hub, or use --token <bearer> " +
+                "to paste an existing admin token instead.",
             );
           }
           break;
@@ -1578,94 +1578,29 @@ function cmdTokens(args: string[]) {
     }
 
     if (!anyTokens) {
-      console.log("No tokens found. Create one: parachute-vault tokens create");
+      console.log(
+        "No vault-DB tokens found. Vault tokens are now hub-issued JWTs — " +
+          "run `parachute-vault mcp-install` to mint one.",
+      );
     }
     return;
   }
 
-  // parachute-vault tokens create [--vault <name> | --all]
-  //   [--scope vault:read,vault:write | --read | --permission full|read]
-  //   [--expires <duration>] [--label <label>]
-  //
-  // Per-vault binding (v16): the minted token is pinned to <vaultName>
-  // unless --all is passed, in which case the token is server-wide
-  // (vault_name = NULL) and authenticates against any vault. --all is
-  // the explicit opt-out — there's no implicit fall-through to server-wide.
+  // `tokens create` was removed at 0.6.0 (vault#282 Stage 2). Vault no longer
+  // mints its own (pvt_*) tokens — it's a pure hub resource-server. Tokens are
+  // now hub-issued JWTs: run `parachute-vault mcp-install` to mint + wire one
+  // for an MCP client, or `parachute auth mint-token --scope vault:<name>:<verb>`
+  // for scripts. `tokens list` / `tokens revoke` remain for cleaning up any
+  // vestigial pre-0.6.0 rows.
   if (subcmd === "create") {
-    const vaultFlag = args.indexOf("--vault");
-    const allFlag = args.includes("--all");
-    if (allFlag && vaultFlag !== -1) {
-      console.error("--vault and --all are mutually exclusive.");
-      process.exit(1);
-    }
-    const vaultName = vaultFlag !== -1 ? args[vaultFlag + 1] : (readGlobalConfig().default_vault || "default");
-    if (!vaultName) {
-      console.error("--vault requires a value.");
-      process.exit(1);
-    }
-
-    const vc = readVaultConfig(vaultName);
-    if (!vc) {
-      console.error(`Vault "${vaultName}" not found.`);
-      process.exit(1);
-    }
-
-    // Combining --scope / --read / --permission is always an error: a
-    // user minting a token expects exactly one narrowing signal, and
-    // silently picking one would mint the opposite of what the other
-    // reading intended. See resolveCreateTokenFlags.
-    const resolved = resolveCreateTokenFlags(args);
-    if (resolved.error) {
-      console.error(resolved.error);
-      process.exit(1);
-    }
-    const scopes = resolved.scopes;
-    const permission: TokenPermission = resolved.permission;
-
-    const expiresFlag = args.indexOf("--expires");
-    let expiresAt: string | null = null;
-    if (expiresFlag !== -1) {
-      const dur = args[expiresFlag + 1];
-      if (!dur) {
-        console.error("--expires requires a value (e.g. 7d, 30d, 24h, 1y).");
-        process.exit(1);
-      }
-      expiresAt = parseDuration(dur);
-      if (!expiresAt) {
-        console.error(`Invalid duration: ${dur}. Use format like 7d, 30d, 24h, 1y.`);
-        process.exit(1);
-      }
-    }
-
-    const labelFlag = args.indexOf("--label");
-    const label = (labelFlag !== -1 ? args[labelFlag + 1] : undefined) ?? "default";
-
-    const store = getVaultStore(vaultName);
-    const { fullToken } = generateToken();
-    createToken(store.db, fullToken, {
-      label,
-      permission,
-      scopes,
-      expires_at: expiresAt,
-      // v16 binding: pin to the vault we minted in unless --all was passed
-      // (which leaves vault_name NULL = legacy server-wide).
-      vault_name: allFlag ? null : vaultName,
-    });
-
-    const displayScopes = scopes ?? [...VAULT_SCOPES];
-    const heading = allFlag
-      ? `Created server-wide token (authenticates against any vault):`
-      : `Created token for vault "${vaultName}":`;
-    console.log(heading);
-    console.log(`  Token:      ${fullToken}`);
-    console.log(`  Permission: ${permission}`);
-    console.log(`  Scopes:     ${displayScopes.join(" ")}`);
-    if (expiresAt) console.log(`  Expires:    ${expiresAt}`);
-    console.log(`  Label:      ${label}`);
-    if (!allFlag) console.log(`  Vault:      ${vaultName}`);
-    console.log();
-    console.log("Save this token — it will not be shown again.");
-    return;
+    console.error(
+      "`parachute-vault tokens create` was removed at 0.6.0 — vault no longer mints its own tokens.\n" +
+        "  Mint a hub-issued JWT instead:\n" +
+        "    parachute-vault mcp-install --scope vault:<verb>   # wire an MCP client\n" +
+        "    parachute auth mint-token --scope vault:<name>:<verb>   # for scripts\n" +
+        "  See UPGRADING.md (pvt_* token removal, vault#282).",
+    );
+    process.exit(1);
   }
 
   // parachute-vault tokens revoke <token-id> --vault <name>
@@ -1702,23 +1637,6 @@ function cmdTokens(args: string[]) {
   console.error(`Unknown tokens command: ${subcmd}`);
   console.error("Usage: parachute-vault tokens [create | list | revoke <id>]");
   process.exit(1);
-}
-
-function parseDuration(dur: string): string | null {
-  const match = dur.match(/^(\d+)(h|d|w|m|y)$/);
-  if (!match) return null;
-  const n = parseInt(match[1]!, 10);
-  const unit = match[2]!;
-  const now = new Date();
-  switch (unit) {
-    case "h": now.setHours(now.getHours() + n); break;
-    case "d": now.setDate(now.getDate() + n); break;
-    case "w": now.setDate(now.getDate() + n * 7); break;
-    case "m": now.setMonth(now.getMonth() + n); break;
-    case "y": now.setFullYear(now.getFullYear() + n); break;
-    default: return null;
-  }
-  return now.toISOString();
 }
 
 async function cmdServe() {
@@ -3353,7 +3271,86 @@ async function firstChangedNoteTitle(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function createVault(name: string): string {
+/**
+ * Outcome of bootstrapping a fresh vault's first credential (vault#282 Stage 2).
+ *
+ * Vault no longer mints `pvt_*` tokens. The first credential for a new vault is
+ * a hub-issued JWT, minted via the same operator.token → hub mint-token path
+ * `mcp-install --mint` uses (cli.ts ~`cmdMcpInstall`). When no hub is reachable
+ * (standalone install, no operator.token, or no real hub origin), `token` is
+ * null and `guidance` carries the operator's next step.
+ */
+interface VaultCredential {
+  /** Hub-issued JWT scoped to `vault:<name>:admin`, or null when no hub is reachable. */
+  token: string | null;
+  /** Human-readable note: how the token was issued, or why it wasn't. */
+  guidance: string;
+}
+
+/**
+ * Mint the first credential for a freshly-created vault.
+ *
+ * Decision (vault#282 Stage 2): when a hub is reachable (operator.token present
+ * AND a real hub origin resolves), mint a `vault:<name>:admin` hub JWT and
+ * return it as the bootstrap credential — preserving the `create --json`
+ * `token` string contract hub's admin-vaults.ts requires. When no hub is
+ * reachable, return `token: null` plus explicit standalone guidance. There is
+ * no local pvt_* fallback anymore.
+ */
+async function mintBootstrapCredential(name: string): Promise<VaultCredential> {
+  const operatorToken = readOperatorToken();
+  if (!operatorToken) {
+    return {
+      token: null,
+      guidance:
+        "No token issued — no hub operator token at ~/.parachute/operator.token. " +
+        "Install the hub (`bun add -g @openparachute/hub` + `parachute init`) and re-run, " +
+        "or set VAULT_AUTH_TOKEN for an operator-channel bearer.",
+    };
+  }
+  const port = readGlobalConfig().port || DEFAULT_PORT;
+  const hub = chooseHubOrigin(port);
+  if (hub.source === "loopback") {
+    return {
+      token: null,
+      guidance:
+        "No token issued — no hub origin configured (PARACHUTE_HUB_ORIGIN unset, no active " +
+        "expose-state). Start the hub and set PARACHUTE_HUB_ORIGIN (or bring up an exposure), " +
+        "then run `parachute-vault mcp-install`, or set VAULT_AUTH_TOKEN.",
+    };
+  }
+  const result = await mintHubJwt({
+    hubOrigin: hub.url,
+    operatorToken,
+    scope: `vault:${name}:admin`,
+    subject: "parachute-vault-bootstrap",
+  });
+  if ("kind" in result) {
+    const detail =
+      result.kind === "network"
+        ? `hub unreachable at ${result.origin} — ${result.cause}`
+        : `hub mint-token rejected (HTTP ${result.status}, ${result.error}): ${result.description}`;
+    return {
+      token: null,
+      guidance:
+        `No token issued — ${detail}. Verify the hub is running (hub#449 for vault:admin mint), ` +
+        "then run `parachute-vault mcp-install`, or set VAULT_AUTH_TOKEN.",
+    };
+  }
+  return {
+    token: result.token,
+    guidance: `Minted hub JWT (jti=${result.jti}, expires ${result.expires_at}, scope ${result.scope}).`,
+  };
+}
+
+/**
+ * Create a vault's config + DB and mint its first credential.
+ *
+ * Returns the bootstrap credential (a hub JWT, or null + guidance when no hub
+ * is reachable — vault#282 Stage 2). The DB is created lazily via
+ * `getVaultStore` so migrations + schema run; we no longer write any pvt_* row.
+ */
+async function createVault(name: string): Promise<VaultCredential> {
   const config: VaultConfig = {
     name,
     api_keys: [],
@@ -3361,11 +3358,10 @@ function createVault(name: string): string {
   };
   writeVaultConfig(config);
 
-  // Create a pvt_ token in the vault's DB
-  const store = getVaultStore(name);
-  const { fullToken } = generateToken();
-  createToken(store.db, fullToken, { label: "default", permission: "full" });
-  return fullToken;
+  // Touch the store so the vault's SQLite DB + schema are created. No token
+  // row is written — vault is a pure hub resource-server post-0.6.0.
+  getVaultStore(name);
+  return mintBootstrapCredential(name);
 }
 
 interface InstallMcpConfigOpts {
@@ -3472,7 +3468,7 @@ Vaults:
   parachute-vault create <name> [--json]   Create a new vault (--json: emit { name, token, paths, set_as_default })
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
-  parachute-vault mcp-install [--mint|--token <t>|--legacy-pat]
+  parachute-vault mcp-install [--mint|--token <t>]
                               [--scope vault:read|vault:write|vault:admin]
                               [--install-scope local|user|project]
                               [--vault <name>] [--client claude-code]
@@ -3490,11 +3486,11 @@ Vaults:
                                             matches Claude Code's claude-mcp-add
                                             default) with vault:read scope.
                                             --token <t>: paste an existing bearer
-                                            (any shape) instead of minting.
-                                            --legacy-pat: mint a vault-DB pvt_*
-                                            token (deprecated, vault#282; removal
-                                            0.6.0; for self-hosted-without-hub
-                                            setups).
+                                            (hub JWT or VAULT_AUTH_TOKEN) instead of
+                                            minting. (vault#282 Stage 2 removed the
+                                            --legacy-pat pvt_* mint — vault is a pure
+                                            hub resource-server now; without a hub,
+                                            paste a bearer or set VAULT_AUTH_TOKEN.)
                                             --scope vault:admin IS mintable via
                                             --mint (hub#449): hub mints
                                             vault:<name>:admin when the operator
@@ -3522,7 +3518,7 @@ Vaults:
                                             without touching disk or hitting the
                                             hub. Useful for probing.
 
-  parachute-vault mcp-config <vault-name> [--token <pvt_...>] [--base-url <url>]
+  parachute-vault mcp-config <vault-name> [--token <bearer>] [--base-url <url>]
                                           [--env-vars]
                                             Emit the JSON config consumed by
                                             \`claude -p --mcp-config '<json>'\`.
@@ -3540,22 +3536,13 @@ Vaults:
                                             \${PARACHUTE_VAULT_TOKEN} placeholders
                                             (safe to commit; expanded at runtime).
 
-Tokens:
-  parachute-vault tokens                          List tokens (every vault)
+Tokens (vault#282 Stage 2 — vault is a pure hub resource-server; it no longer
+mints its own tokens. Mint a hub-issued JWT with \`parachute-vault mcp-install\`
+or \`parachute auth mint-token --scope vault:<name>:<verb>\`. \`list\` / \`revoke\`
+below operate on any vestigial pre-0.6.0 rows for cleanup.):
+  parachute-vault tokens                          List vault-DB tokens (every vault)
   parachute-vault tokens list --vault <name>      List tokens for one vault only
-  parachute-vault tokens create                   Create a vault-bound token in the default vault
-  parachute-vault tokens create --vault <name>    Create a token bound to a specific vault
-  parachute-vault tokens create --all             Create a server-wide token (vault_name=NULL).
-                                                  Authenticates against any vault — use sparingly,
-                                                  for cross-vault automation only.
-  parachute-vault tokens create --read            Read-only token (shorthand for --scope vault:read)
-  parachute-vault tokens create --scope vault:write
-                                                  Narrow the token's scopes. Accepts a comma-separated
-                                                  list or repeated --scope flags. Valid scopes:
-                                                  vault:read, vault:write, vault:admin.
-  parachute-vault tokens create --label x         Set a label
-  parachute-vault tokens create --expires 30d     Expiring token
-  parachute-vault tokens revoke <token-id>        Revoke a token (default vault)
+  parachute-vault tokens revoke <token-id>        Revoke a vestigial token (default vault)
 
 OAuth — owner password + 2FA (LEGACY):
   Vault's standalone OAuth consent page was retired in 0.4.x (workstream E).

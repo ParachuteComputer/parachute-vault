@@ -461,9 +461,9 @@ function resolveHubOrigin(): { url: string; source: string } {
  * Build the manage-token MCP tool, wired to the calling session's auth.
  *
  * After the auth-unification arc (vault#403, MGT) the tool is a thin proxy to
- * hub's mint-token attenuation endpoint: it mints short-TTL HUB JWTs, not
- * deprecated `pvt_*` vault-DB tokens. The DROP step removes the pvt_* mint
- * infra entirely once every consumer has migrated.
+ * hub's mint-token attenuation endpoint: it mints short-TTL HUB JWTs. The
+ * `pvt_*` vault-DB mint infra it replaced was removed at 0.6.0 (vault#282
+ * Stage 2 — vault is a pure hub resource-server).
  *
  * Closure-captured context:
  *   - `vaultName`: every mint requests `vault:<vaultName>:<verb>`; cross-vault
@@ -478,8 +478,9 @@ function resolveHubOrigin(): { url: string; source: string } {
  *     session id → list returns empty + revoke returns not_found.
  *   - `callerBearer`: the RAW credential the session presented. Only forwarded
  *     to hub when JWT-shaped (a hub JWT carrying `vault:<name>:admin`). A
- *     non-forwardable credential (env-var secret, legacy pvt_*) yields a clear
- *     "mint requires a hub-JWT session" error rather than a fabricated bearer.
+ *     non-forwardable credential (the VAULT_AUTH_TOKEN env-var operator secret)
+ *     yields a clear "mint requires a hub-JWT session" error rather than a
+ *     fabricated bearer.
  *
  * The execute function is async (mint/revoke do an HTTP round-trip to hub) and
  * returns a discriminated-union response shape: `{action, …}` with `action`
@@ -635,8 +636,8 @@ async function mintAction(
 
   // Forwardability: minting is a proxy to hub's attenuation endpoint, so the
   // caller must present a forwardable hub-JWT bearer carrying
-  // `vault:<name>:admin`. A non-JWT credential (env-var operator secret,
-  // legacy pvt_*) can't be forwarded — and wouldn't carry mint authority at
+  // `vault:<name>:admin`. A non-JWT credential (the VAULT_AUTH_TOKEN env-var
+  // operator secret) can't be forwarded — and wouldn't carry mint authority at
   // hub anyway — so fail with a clear, actionable error rather than
   // fabricating a bearer.
   //
