@@ -30,6 +30,7 @@ import { writeVaultConfig, readVaultConfig } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
 import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
 import { resetJwksCache, resetRevocationCache } from "./hub-jwt.ts";
+import { generateToken, createToken } from "./token-store.ts";
 
 interface Keypair {
   privateKey: CryptoKey;
@@ -664,4 +665,118 @@ describe("authenticateVaultRequest — hub JWT tag-scoping (auth-unification C0)
       }
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// pvt_* deprecation warning (vault#282 Stage 1 — soft deprecation, NON-BREAKING)
+//
+// Every successful pvt_* (vault-DB token-store) authentication emits a
+// one-time-per-token deprecation warning signalling that pvt_* tokens will be
+// REJECTED at vault 0.6.0. Auth OUTCOMES are unchanged: the token still
+// validates + authorizes exactly as before. Hub-issued JWTs — the migration
+// target — never trigger the pvt_* warning.
+//
+// The `warnPvtDeprecationOnce` cache is process-global and keyed on the
+// token's display id (`t_<hashprefix>`). Each test mints a fresh random pvt_*,
+// so display ids never collide across tests; the "warns once" assertion holds
+// within a single test by making two requests with the same token.
+// ---------------------------------------------------------------------------
+
+/** Mint a fresh pvt_* token directly into a vault's DB and return it. */
+function mintPvtToken(vaultName: string): string {
+  const store = getVaultStore(vaultName);
+  const { fullToken } = generateToken();
+  createToken(store.db, fullToken, { label: "deprecation-test", permission: "full" });
+  return fullToken;
+}
+
+describe("pvt_* deprecation warning (vault#282 Stage 1)", () => {
+  test("pvt_* auth still SUCCEEDS and emits the deprecation warning once", async () => {
+    seedVault("journal");
+    const token = mintPvtToken("journal");
+    const config = readVaultConfig("journal")!;
+    const store = getVaultStore("journal");
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // First request: auth outcome unchanged (full permission), warning fires.
+      const r1 = await authenticateVaultRequest(bearer(token), config, store.db);
+      expect("error" in r1).toBe(false);
+      if (!("error" in r1)) {
+        expect(r1.permission).toBe("full");
+        expect(r1.scopes).toContain("vault:admin");
+      }
+
+      const deprecationCalls = warnSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("[deprecation]"),
+      );
+      expect(deprecationCalls.length).toBe(1);
+      const msg = String(deprecationCalls[0]![0]);
+      // Shape: names pvt_*, the 0.6.0 rejection, the issue, the mint paths, the guide.
+      expect(msg).toContain("pvt_* token");
+      expect(msg).toContain("DEPRECATED");
+      expect(msg).toContain("REJECTED at vault 0.6.0");
+      expect(msg).toContain("vault#282");
+      expect(msg).toContain("parachute vault mcp-install");
+      expect(msg).toContain("parachute auth mint-token");
+      expect(msg).toContain("UPGRADING.md");
+      // The display id of the presented token appears in the message.
+      expect(msg).toMatch(/pvt_\* token t_[0-9a-f]+ authenticated/);
+
+      // Second request with the SAME token: still authorizes, no second warn.
+      const r2 = await authenticateVaultRequest(bearer(token), config, store.db);
+      expect("error" in r2).toBe(false);
+      const stillOne = warnSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("[deprecation]"),
+      );
+      expect(stillOne.length).toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("pvt_* auth on the global (unified) surface also SUCCEEDS and warns once", async () => {
+    seedVault("journal");
+    const token = mintPvtToken("journal");
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await authenticateGlobalRequest(bearer(token));
+      expect("error" in result).toBe(false);
+      if (!("error" in result)) expect(result.permission).toBe("full");
+
+      const deprecationCalls = warnSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("[deprecation]"),
+      );
+      expect(deprecationCalls.length).toBe(1);
+      expect(String(deprecationCalls[0]![0])).toContain("vault#282");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("hub-JWT auth does NOT emit the pvt_* deprecation warning", async () => {
+    seedVault("journal");
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+    });
+    const config = readVaultConfig("journal")!;
+    const store = getVaultStore("journal");
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await authenticateVaultRequest(bearer(token), config, store.db);
+      // Auth succeeds (the migration target works) ...
+      expect("error" in result).toBe(false);
+      // ... and no pvt_* deprecation warning is emitted for a hub JWT.
+      const deprecationCalls = warnSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("[deprecation]"),
+      );
+      expect(deprecationCalls.length).toBe(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
