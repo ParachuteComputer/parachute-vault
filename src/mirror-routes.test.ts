@@ -245,6 +245,37 @@ describe("handleMirrorPut", () => {
     }
   });
 
+  test("external + git not installed → 503 git_not_installed + actionable message", async () => {
+    // vault#415 nit — handleMirrorPut validates the external path via
+    // validateExternalPath, which shells `git`. On a git-less server it must
+    // return the friendly 503 (consistent with the import route), not let a
+    // raw "Executable not found" crash out. Force the preflight via the
+    // whichOverride seam against a REAL git repo so the only failure is the
+    // preflight.
+    home = tmp("mirror-put-nogit-installed-");
+    const { manager } = makeManager(home);
+    const external = tmp("mirror-put-nogit-target-");
+    initRepo(external);
+    try {
+      const req = new Request("http://x/admin/mirror", {
+        method: "PUT",
+        body: JSON.stringify({
+          enabled: true,
+          location: "external",
+          external_path: external,
+        }),
+      });
+      const res = await handleMirrorPut(req, manager, () => null);
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error_type: string; message: string };
+      expect(body.error_type).toBe("git_not_installed");
+      expect(body.message).toContain("git is required");
+      expect(body.message).toContain("dnf install git");
+    } finally {
+      fs.rmSync(external, { recursive: true, force: true });
+    }
+  });
+
   test("accepts a valid external config, persists, restarts watch", async () => {
     home = tmp("mirror-put-happy-");
     const external = tmp("mirror-put-ext-");
@@ -1256,6 +1287,35 @@ describe("handleMirrorImport", () => {
     const body = (await res.json()) as { error_type: string; message: string };
     expect(body.error_type).toBe("not_a_vault_export");
     expect(body.message).toContain("vault.yaml");
+  });
+
+  test("git not installed returns 503 + git_not_installed + actionable message", async () => {
+    // vault#415 — live bug on a git-less Amazon Linux EC2 box. Force the
+    // preflight (via the whichOverride seam) to see no git; the spawn seam
+    // should never be reached.
+    home = tmp("import-route-nogit-");
+    await bootstrapVault(home);
+    let spawnCalled = false;
+    const spyingSpawn: GitSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/a/b.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+      }),
+    });
+    const res = await handleMirrorImport(req, "default", spyingSpawn, () => null);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error_type: string; message: string };
+    expect(body.error_type).toBe("git_not_installed");
+    expect(body.message).toContain("git is required");
+    expect(body.message).toContain("dnf install git");
+    // Failed fast: the git spawn was never reached.
+    expect(spawnCalled).toBe(false);
   });
 
   test("uses stored credentials when credentials: null (credentialsFile path)", async () => {

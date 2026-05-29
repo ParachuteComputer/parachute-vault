@@ -215,6 +215,21 @@ describe("bootstrapInternalMirror", () => {
       expect(isGitRepoSync(dir)).toBe(true);
     }
   });
+
+  test("git missing → ok:false with actionable error (status surfaces it, no raw crash)", async () => {
+    // vault#415 — a git-less server can't bootstrap a mirror. The error
+    // channel carries the friendly message that MirrorManager.start threads
+    // into status.last_error, instead of a raw "Executable not found" crash.
+    dir = path.join(tmp("mirror-boot-nogit-"), "mirror");
+    const r = await bootstrapInternalMirror(dir, () => null);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toContain("git is required");
+      expect(r.error).toContain("dnf install git");
+    }
+    // Failed fast at the preflight — the dir was never created.
+    expect(fs.existsSync(dir)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -374,6 +389,42 @@ describe("MirrorManager.start — lifecycle matrix", () => {
     const status = await mgr.start();
     expect(status.enabled).toBe(false);
     expect(status.last_error).toContain("isn't a git repository");
+    await mgr.stop();
+    fs.rmSync(external, { recursive: true, force: true });
+  });
+
+  test("external + git not installed → enabled:false with friendly error, never spawns/exports", async () => {
+    // vault#415 nit — the external branch's isGitRepo() check shells `git`
+    // with no preflight; on a git-less server it would throw a raw
+    // "Executable not found in $PATH: \"git\"" and crash start(). The
+    // top-of-start() preflight (forced via the `which` seam) lands the
+    // friendly, actionable message in last_error for the external location.
+    home = tmp("mgr-ext-nogit-installed-");
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    // Use a real, valid external git repo so the ONLY thing that can fail is
+    // the git-presence preflight — proving the preflight (not the path/repo
+    // checks) produced the disabled state.
+    const external = tmp("mgr-ext-nogit-target-");
+    initRepo(external);
+    seedCommit(external);
+    const deps = makeFakeDeps({
+      parachuteHome: home,
+      initialConfig: {
+        ...defaultMirrorConfig(),
+        enabled: true,
+        location: "external",
+        external_path: external,
+        sync_mode: "events",
+      },
+    });
+    const mgr = new MirrorManager(deps);
+    // Force the preflight to see no git on PATH.
+    const status = await mgr.start(() => null);
+    expect(status.enabled).toBe(false);
+    expect(status.last_error).toContain("git is required");
+    expect(status.last_error).toContain("dnf install git");
+    // Never reached export — the preflight bailed before any git work.
+    expect(deps.exportCalls).toHaveLength(0);
     await mgr.stop();
     fs.rmSync(external, { recursive: true, force: true });
   });

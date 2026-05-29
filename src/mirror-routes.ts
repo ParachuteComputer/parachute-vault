@@ -62,6 +62,7 @@ import {
   type ImportResult,
 } from "./mirror-import.ts";
 import { redactToken } from "./export-watch.ts";
+import { GitNotInstalledError, ensureGitAvailable } from "./git-preflight.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 
@@ -120,6 +121,10 @@ export function handleMirrorGet(manager: MirrorManager): Response {
 export async function handleMirrorPut(
   req: Request,
   manager: MirrorManager,
+  // Test seam for the external-path git-presence preflight (default
+  // `Bun.which` inside `validateExternalPath`). Inject a fn returning `null`
+  // to exercise the git_not_installed 503 path without uninstalling git.
+  whichOverride?: (cmd: string) => string | null,
 ): Promise<Response> {
   let body: unknown;
   try {
@@ -154,7 +159,25 @@ export async function handleMirrorPut(
   // to *do* something with an external path. Disabling the mirror by-
   // flipping enabled to false shouldn't fail because the path went away.
   if (config.enabled && config.location === "external" && config.external_path) {
-    const pathCheck = await validateExternalPath(config.external_path);
+    let pathCheck;
+    try {
+      pathCheck = await validateExternalPath(config.external_path, whichOverride);
+    } catch (err) {
+      if (err instanceof GitNotInstalledError) {
+        // 503 git_not_installed — consistent with the import route. The
+        // server can't validate (or later sync) an external git mirror
+        // without git installed; the message tells the operator how to fix.
+        return Response.json(
+          {
+            error: "git not installed",
+            error_type: "git_not_installed",
+            message: err.message,
+          },
+          { status: 503 },
+        );
+      }
+      throw err;
+    }
     if (!pathCheck.ok) {
       return Response.json(
         {
@@ -595,6 +618,26 @@ export async function handleAuthPat(
       },
       { status: 400 },
     );
+  }
+
+  // Preflight: the validation probe (`git ls-remote`) and every later push
+  // shell `git`. On a git-less server, surface the friendly, actionable
+  // 503 instead of letting the probe's `Bun.spawn` throw a raw
+  // "Executable not found in $PATH: \"git\"".
+  try {
+    ensureGitAvailable();
+  } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      return Response.json(
+        {
+          error: "git not installed",
+          error_type: "git_not_installed",
+          message: err.message,
+        },
+        { status: 503 },
+      );
+    }
+    throw err;
   }
 
   // Validate via `git ls-remote <embedded-auth-url>` — uses the same
@@ -1089,11 +1132,16 @@ export async function applyCredentialsToMirror(
  *
  * `spawnOverride` is a test seam: lets the test inject a fake git binary.
  * Production callers omit it; `cloneAndImport` falls back to `defaultGitSpawn`.
+ *
+ * `whichOverride` is a test seam for the git-presence preflight (default
+ * `Bun.which` inside `cloneAndImport`). Inject a fn returning `null` to
+ * exercise the git_not_installed 503 path without uninstalling git.
  */
 export async function handleMirrorImport(
   req: Request,
   vaultName: string,
   spawnOverride?: GitSpawn,
+  whichOverride?: (cmd: string) => string | null,
 ): Promise<Response> {
   let body: {
     remote_url?: unknown;
@@ -1208,8 +1256,21 @@ export async function handleMirrorImport(
       store,
       assetsDir: assets,
       spawn: spawnOverride,
+      which: whichOverride,
     });
   } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      // 503 Service Unavailable — the server isn't configured to do this
+      // yet (git missing). The message tells the operator how to fix it.
+      return Response.json(
+        {
+          error: "git not installed",
+          error_type: "git_not_installed",
+          message: err.message,
+        },
+        { status: 503 },
+      );
+    }
     if (err instanceof ImportConflictError) {
       return Response.json(
         {

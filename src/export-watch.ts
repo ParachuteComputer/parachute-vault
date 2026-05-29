@@ -13,6 +13,8 @@
  * detection. See `parachute-patterns/cookbook/vault-portable-export.md`.
  */
 
+import { ensureGitAvailable } from "./git-preflight.ts";
+
 // ---------------------------------------------------------------------------
 // Commit message templating
 // ---------------------------------------------------------------------------
@@ -269,11 +271,23 @@ export async function runGitCommitCycle(opts: {
   push: boolean;
   /** Override for tests — defaults to `new Date().toISOString()`. */
   now?: () => string;
+  /**
+   * Override the git-presence probe (test seam — defaults to `Bun.which`).
+   * Inject a fn returning `null` to exercise the git-not-installed path.
+   */
+  which?: (cmd: string) => string | null;
 }): Promise<{
   committed: boolean;
   message?: string;
   push?: { attempted: true; ok: boolean; error?: string };
 }> {
+  // Preflight: every step below shells `git`. On a git-less server the first
+  // `Bun.spawn(["git", ...])` would throw a raw "Executable not found" error;
+  // surface the friendly, actionable GitNotInstalledError so callers can
+  // thread it into mirror status (`last_error`) instead of crashing the
+  // watch loop with an opaque message.
+  ensureGitAvailable(opts.which);
+
   const now = opts.now ?? (() => new Date().toISOString());
 
   const add = await gitAddAll(opts.repoDir);

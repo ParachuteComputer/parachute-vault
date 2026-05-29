@@ -45,6 +45,7 @@ import { homedir } from "os";
 
 import { DEFAULT_COMMIT_TEMPLATE, isGitRepo } from "./export-watch.ts";
 import { readCredentials, type MirrorCredentials } from "./mirror-credentials.ts";
+import { ensureGitAvailable } from "./git-preflight.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -888,7 +889,17 @@ export type PathValidation = PathValidationOk | PathValidationError;
  */
 export async function validateExternalPath(
   externalPath: string,
+  // Test seam for the git-presence preflight (default `Bun.which`). Inject a
+  // fn returning `null` to exercise the git-not-installed path.
+  which?: (cmd: string) => string | null,
 ): Promise<PathValidation> {
+  // Preflight: the git-repo check below shells `git`. On a git-less server,
+  // throw the friendly, actionable GitNotInstalledError (which handleMirrorPut
+  // maps to a 503 `git_not_installed`, consistent with the import route)
+  // instead of letting `isGitRepo`'s `Bun.spawn` throw a raw
+  // "Executable not found in $PATH: \"git\"".
+  ensureGitAvailable(which);
+
   if (!existsSync(externalPath)) {
     return {
       ok: false,

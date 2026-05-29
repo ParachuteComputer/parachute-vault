@@ -35,6 +35,7 @@ import {
   runGitCommitCycle,
   shouldCommit,
 } from "./export-watch.ts";
+import { GitNotInstalledError } from "./git-preflight.ts";
 
 const CLI = path.resolve(import.meta.dir, "cli.ts");
 
@@ -503,6 +504,28 @@ describe("runGitCommitCycle", () => {
       push: false,
     });
     expect(result.message).toBe("note: Inbox/DonorMeeting");
+  });
+
+  test("git missing → throws GitNotInstalledError (sync surfaces friendly error, not raw spawn crash)", async () => {
+    // vault#415 — the sync/commit path must surface the actionable
+    // git-not-installed message (which the manager threads into
+    // status.last_error) instead of crashing with a raw "Executable not
+    // found in $PATH". Force the preflight to see no git via the `which`
+    // seam; no real spawn should be reached.
+    fs.writeFileSync(path.join(dir, "Note.md"), "# n\n");
+    await expect(
+      runGitCommitCycle({
+        repoDir: dir,
+        template: DEFAULT_COMMIT_TEMPLATE,
+        notesChanged: 1,
+        vaultName: "default",
+        firstNoteTitle: "Note",
+        push: false,
+        which: () => null,
+      }),
+    ).rejects.toBeInstanceOf(GitNotInstalledError);
+    // The commit cycle bailed at the preflight — no commit landed.
+    expect(gitLogOneline(dir)).toHaveLength(1); // only the seed
   });
 });
 

@@ -30,8 +30,10 @@ import {
   _resetImportInFlightForTest,
   authedCloneUrl,
   cloneAndImport,
+  defaultGitSpawn,
   type GitSpawn,
 } from "./mirror-import.ts";
+import { GitNotInstalledError } from "./git-preflight.ts";
 import {
   emptyCredentials,
   mirrorCredentialsPath,
@@ -546,5 +548,109 @@ describe("cloneAndImport — failures", () => {
     expect(entries.filter((e) => e.startsWith("parachute-import-"))).toEqual([]);
     rmSync(workDirRoot, { recursive: true, force: true });
     rmSync(notAnExport, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cloneAndImport — git not installed (vault#415 — live bug on a git-less EC2)
+// ---------------------------------------------------------------------------
+
+describe("cloneAndImport — git not installed", () => {
+  let assetsDir: string;
+  let store: SqliteStore;
+
+  beforeEach(() => {
+    assetsDir = tmp("import-assets-nogit-");
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  afterEach(() => {
+    if (assetsDir) rmSync(assetsDir, { recursive: true, force: true });
+  });
+
+  test("git missing → GitNotInstalledError, fails fast (no spawn, no tempdir)", async () => {
+    const workDirRoot = tmp("import-workroot-nogit-");
+    let spawnCalled = false;
+    const spyingSpawn: GitSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stderr: "", timedOut: false };
+    };
+    await expect(
+      cloneAndImport({
+        vaultName: "default",
+        remoteUrl: "https://github.com/owner/repo.git",
+        auth: { kind: "none" },
+        mode: "merge",
+        store,
+        assetsDir,
+        spawn: spyingSpawn,
+        workDirRoot,
+        // Force the preflight to see no git on PATH.
+        which: () => null,
+      }),
+    ).rejects.toBeInstanceOf(GitNotInstalledError);
+
+    // Fails fast: the spawner is never reached and no tempdir is created.
+    expect(spawnCalled).toBe(false);
+    const { readdirSync } = await import("node:fs");
+    const entries = readdirSync(workDirRoot);
+    expect(entries.filter((e) => e.startsWith("parachute-import-"))).toEqual([]);
+    rmSync(workDirRoot, { recursive: true, force: true });
+  });
+
+  test("git missing → does not lay an in-flight marker (clean retry after install)", async () => {
+    await expect(
+      cloneAndImport({
+        vaultName: "default",
+        remoteUrl: "https://github.com/owner/repo.git",
+        auth: { kind: "none" },
+        mode: "merge",
+        store,
+        assetsDir,
+        spawn: async () => ({ exitCode: 0, stderr: "", timedOut: false }),
+        which: () => null,
+      }),
+    ).rejects.toBeInstanceOf(GitNotInstalledError);
+    // The preflight runs BEFORE the concurrency marker, so a failed call
+    // leaves no stale in-flight entry blocking the post-install retry.
+    expect(_isImportInFlight("default")).toBe(false);
+  });
+
+  test("git present (injected which) → normal import path still works", async () => {
+    const fixtureDir = await buildExportFixture();
+    try {
+      const result = await cloneAndImport({
+        vaultName: "default",
+        remoteUrl: "https://github.com/owner/repo.git",
+        auth: { kind: "none" },
+        mode: "merge",
+        store,
+        assetsDir,
+        spawn: spawnCloneSuccess(fixtureDir),
+        which: () => "/usr/bin/git",
+      });
+      expect(result.notes_imported).toBe(2);
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test("GitNotInstalledError message is actionable (names install commands)", () => {
+    const msg = new GitNotInstalledError().message;
+    expect(msg).toContain("git is required");
+    expect(msg).toContain("dnf install git");
+    expect(msg).toContain("apt-get install");
+    expect(msg).toContain("brew install git");
+  });
+
+  test("defaultGitSpawn rethrows a git-not-found spawn error as GitNotInstalledError", async () => {
+    // Belt-and-suspenders: spawn a non-existent binary to trigger Bun's
+    // "Executable not found" throw, and confirm the friendly rethrow.
+    // (We can't uninstall git, so spawn an impossible command name.)
+    await expect(
+      defaultGitSpawn(["definitely-not-a-real-binary-xyzzy-git"], {
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toBeInstanceOf(GitNotInstalledError);
   });
 });

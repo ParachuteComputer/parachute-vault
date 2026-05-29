@@ -23,6 +23,7 @@ import {
   validateExternalPath,
   validateMirrorConfigShape,
 } from "./mirror-config.ts";
+import { GitNotInstalledError } from "./git-preflight.ts";
 
 function tmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -495,6 +496,19 @@ describe("validateExternalPath", () => {
     const r = await validateExternalPath(dir);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.resolved_path).toBe(dir);
+  });
+
+  test("git not installed → throws GitNotInstalledError (route maps to 503)", async () => {
+    // vault#415 nit — the isGitRepo() check shells `git`. On a git-less
+    // server, throw the friendly error (handleMirrorPut maps it to 503
+    // git_not_installed) instead of a raw "Executable not found" crash.
+    // Force the preflight via the `which` seam; a real, valid git repo is
+    // used so the ONLY failure source is the preflight.
+    dir = tmp("mirror-validate-nogit-installed-");
+    initRepo(dir);
+    await expect(validateExternalPath(dir, () => null)).rejects.toBeInstanceOf(
+      GitNotInstalledError,
+    );
   });
 });
 
