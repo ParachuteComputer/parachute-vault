@@ -121,6 +121,10 @@ export function handleMirrorGet(manager: MirrorManager): Response {
 export async function handleMirrorPut(
   req: Request,
   manager: MirrorManager,
+  // Test seam for the external-path git-presence preflight (default
+  // `Bun.which` inside `validateExternalPath`). Inject a fn returning `null`
+  // to exercise the git_not_installed 503 path without uninstalling git.
+  whichOverride?: (cmd: string) => string | null,
 ): Promise<Response> {
   let body: unknown;
   try {
@@ -155,7 +159,25 @@ export async function handleMirrorPut(
   // to *do* something with an external path. Disabling the mirror by-
   // flipping enabled to false shouldn't fail because the path went away.
   if (config.enabled && config.location === "external" && config.external_path) {
-    const pathCheck = await validateExternalPath(config.external_path);
+    let pathCheck;
+    try {
+      pathCheck = await validateExternalPath(config.external_path, whichOverride);
+    } catch (err) {
+      if (err instanceof GitNotInstalledError) {
+        // 503 git_not_installed — consistent with the import route. The
+        // server can't validate (or later sync) an external git mirror
+        // without git installed; the message tells the operator how to fix.
+        return Response.json(
+          {
+            error: "git not installed",
+            error_type: "git_not_installed",
+            message: err.message,
+          },
+          { status: 503 },
+        );
+      }
+      throw err;
+    }
     if (!pathCheck.ok) {
       return Response.json(
         {

@@ -245,6 +245,37 @@ describe("handleMirrorPut", () => {
     }
   });
 
+  test("external + git not installed → 503 git_not_installed + actionable message", async () => {
+    // vault#415 nit — handleMirrorPut validates the external path via
+    // validateExternalPath, which shells `git`. On a git-less server it must
+    // return the friendly 503 (consistent with the import route), not let a
+    // raw "Executable not found" crash out. Force the preflight via the
+    // whichOverride seam against a REAL git repo so the only failure is the
+    // preflight.
+    home = tmp("mirror-put-nogit-installed-");
+    const { manager } = makeManager(home);
+    const external = tmp("mirror-put-nogit-target-");
+    initRepo(external);
+    try {
+      const req = new Request("http://x/admin/mirror", {
+        method: "PUT",
+        body: JSON.stringify({
+          enabled: true,
+          location: "external",
+          external_path: external,
+        }),
+      });
+      const res = await handleMirrorPut(req, manager, () => null);
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error_type: string; message: string };
+      expect(body.error_type).toBe("git_not_installed");
+      expect(body.message).toContain("git is required");
+      expect(body.message).toContain("dnf install git");
+    } finally {
+      fs.rmSync(external, { recursive: true, force: true });
+    }
+  });
+
   test("accepts a valid external config, persists, restarts watch", async () => {
     home = tmp("mirror-put-happy-");
     const external = tmp("mirror-put-ext-");

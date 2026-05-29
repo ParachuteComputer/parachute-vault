@@ -75,7 +75,7 @@ import {
   applyToGitRemote,
   readCredentials,
 } from "./mirror-credentials.ts";
-import { ensureGitAvailable } from "./git-preflight.ts";
+import { GitNotInstalledError, ensureGitAvailable } from "./git-preflight.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 
 /**
@@ -480,7 +480,11 @@ export class MirrorManager {
    * Returns the final status snapshot — useful for tests + the PUT
    * endpoint response.
    */
-  async start(): Promise<MirrorStatus> {
+  async start(
+    // Test seam for the git-presence preflight (default `Bun.which`). Inject
+    // a fn returning `null` to exercise the git-not-installed start path.
+    which?: (cmd: string) => string | null,
+  ): Promise<MirrorStatus> {
     this.startCount++;
     await this.stop({ preserveStatus: true });
 
@@ -514,6 +518,24 @@ export class MirrorManager {
       return this.getStatus();
     }
     this.status.mirror_path = path;
+
+    // Preflight git BEFORE branching on location. Both branches shell `git`
+    // (internal → bootstrapInternalMirror; external → isGitRepo). On a
+    // git-less server the external branch's `isGitRepo` would otherwise throw
+    // a raw "Executable not found in $PATH: \"git\"" and crash start();
+    // catching it here lands the friendly, actionable message in
+    // status.last_error (disabled) for either location, uniformly.
+    try {
+      ensureGitAvailable(which);
+    } catch (err) {
+      if (err instanceof GitNotInstalledError) {
+        this.status.enabled = false;
+        this.status.last_error = err.message;
+        console.warn(`[mirror] ${err.message}`);
+        return this.getStatus();
+      }
+      throw err;
+    }
 
     // Internal bootstrap. External path is the operator's responsibility —
     // they should have validated via the PUT endpoint before we hit boot.
@@ -655,9 +677,13 @@ export class MirrorManager {
    * the operator-intended config on disk; on the next vault boot it
    * applies cleanly.
    */
-  async reload(newConfig: MirrorConfig): Promise<MirrorStatus> {
+  async reload(
+    newConfig: MirrorConfig,
+    // Test seam forwarded to `start()` — see `start(which)`.
+    which?: (cmd: string) => string | null,
+  ): Promise<MirrorStatus> {
     this.deps.writeMirrorConfig(newConfig);
-    return this.start();
+    return this.start(which);
   }
 
   /**
