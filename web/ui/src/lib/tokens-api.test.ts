@@ -1,25 +1,20 @@
 /**
- * Tokens REST client — the auth-unification arc (SPA step).
+ * Tokens REST client — hub-JWT surface (vault#282 Stage 2 removed the legacy
+ * pvt_* read/revoke client).
  *
- * Two surfaces under test:
- *   - **Hub JWTs** (`mintHubToken` / `listHubTokens` / `revokeHubToken`) hit
- *     hub's `/api/auth/*` registry with the host-admin bearer. The host-admin
- *     token is minted lazily from `/admin/host-admin-token`, so the mock
- *     fetch routes that URL to a fresh bearer and the `/api/auth/*` URLs to
- *     the registry shapes.
- *   - **Legacy `pvt_*`** (`listLegacyTokens` / `revokeLegacyToken`) hit the
- *     vault's per-vault REST surface with the vault-admin bearer.
+ * `mintHubToken` / `listHubTokens` / `revokeHubToken` hit hub's `/api/auth/*`
+ * registry with the host-admin bearer. The host-admin token is minted lazily
+ * from `/admin/host-admin-token`, so the mock fetch routes that URL to a fresh
+ * bearer and the `/api/auth/*` URLs to the registry shapes.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { _setTokenForTest, clearToken } from "./auth.ts";
+import { clearToken } from "./auth.ts";
 import { clearHostAdminToken } from "./host-admin-auth.ts";
 import { HttpError } from "./api.ts";
 import {
   listHubTokens,
-  listLegacyTokens,
   mintHubToken,
   revokeHubToken,
-  revokeLegacyToken,
 } from "./tokens-api.ts";
 
 interface Call {
@@ -390,50 +385,6 @@ describe("revokeHubToken", () => {
     });
 
     await expect(revokeHubToken("j_abc")).resolves.toBeUndefined();
-  });
-});
-
-describe("legacy pvt_* surface", () => {
-  it("listLegacyTokens hits /vault/<name>/tokens with the VAULT-ADMIN bearer", async () => {
-    _setTokenForTest("vault.admin.jwt");
-    const calls = mockFetch(async () =>
-      new Response(
-        JSON.stringify({
-          tokens: [
-            {
-              id: "t_legacy",
-              label: "old-ci",
-              permission: "full",
-              scopes: ["vault:work:write"],
-              scoped_tags: null,
-              vault_name: "work",
-              expires_at: null,
-              created_at: "2026-01-01T00:00:00Z",
-            },
-          ],
-        }),
-        { status: 200 },
-      ),
-    );
-
-    const tokens = await listLegacyTokens("work");
-
-    expect(tokens).toHaveLength(1);
-    expect(tokens[0]?.label).toBe("old-ci");
-    // Vault-admin bearer + per-vault URL — NOT host-admin, NOT /api/auth/*.
-    expect(calls[0]?.url).toBe("/vault/work/tokens");
-    expect(calls[0]?.auth).toBe("Bearer vault.admin.jwt");
-  });
-
-  it("revokeLegacyToken DELETEs /vault/<name>/tokens/<id> with the vault-admin bearer", async () => {
-    _setTokenForTest("vault.admin.jwt");
-    const calls = mockFetch(async () => new Response(JSON.stringify({ revoked: true }), { status: 200 }));
-
-    await revokeLegacyToken("work", "t_legacy");
-
-    expect(calls[0]?.url).toBe("/vault/work/tokens/t_legacy");
-    expect(calls[0]?.method).toBe("DELETE");
-    expect(calls[0]?.auth).toBe("Bearer vault.admin.jwt");
   });
 });
 

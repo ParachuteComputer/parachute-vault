@@ -551,12 +551,6 @@ describe("mcp-install flag parsing", () => {
     expect(res.stderr).toMatch(/mutually exclusive/);
   });
 
-  test("rejects mutually exclusive --token and --legacy-pat", () => {
-    const res = runCli(["mcp-install", "--token", "abc", "--legacy-pat"], tmp);
-    expect(res.exitCode).toBe(1);
-    expect(res.stderr).toMatch(/mutually exclusive/);
-  });
-
   test("rejects --token without a value", () => {
     const res = runCli(["mcp-install", "--token"], tmp);
     expect(res.exitCode).toBe(1);
@@ -936,21 +930,17 @@ describe("mcp-install end-to-end", () => {
     expect(config.mcpServers["parachute-vault-default"]).toBeUndefined();
   });
 
-  test("--legacy-pat mints a vault-DB pvt_* token and prints deprecation warning", () => {
+  test("--legacy-pat is gone (vault#282 Stage 2) — no pvt_* mint path remains", () => {
+    // The flag was removed: vault is a pure hub resource-server, so there's no
+    // local pvt_* mint. With no operator.token in this sandbox, the default
+    // --mint path can't reach a hub and exits non-zero with actionable
+    // guidance — and crucially no `pvt_*` bearer is ever written.
     setupBareVault(tmp, "default");
     const res = runCli(["mcp-install", "--install-scope", "user", "--legacy-pat"], tmp);
-    expect(res.exitCode).toBe(0);
-    // Deprecation warning lands on stderr (we used `console.error` for the
-    // notice so it's visible without polluting stdout). The message names
-    // the tracking issue + planned-removal milestone so operators can
-    // see what they're opting into.
-    expect(res.stderr).toMatch(/--legacy-pat mints a vault-DB pvt_/);
-    expect(res.stderr).toMatch(/canonical install going forward/);
-    expect(res.stderr).toMatch(/vault#282/);
-    expect(res.stderr).toMatch(/planned removal 0\.6\.0/);
-    const config = readJson(path.join(tmp, ".claude.json"));
-    const bearer = config.mcpServers["parachute-vault"].headers.Authorization;
-    expect(bearer).toMatch(/^Bearer pvt_/);
+    expect(res.exitCode).not.toBe(0);
+    expect(res.stderr).toMatch(/operator token|hub origin/i);
+    expect(res.stdout).not.toMatch(/pvt_/);
+    expect(res.stderr).not.toMatch(/pvt_/);
   });
 
   test("--dry-run describes the write without touching disk or hitting the hub", () => {
@@ -1136,16 +1126,16 @@ describe("mcp-install interactive dispatch", () => {
   });
 
   test("any install-shaping flag bypasses the walkthrough", () => {
-    // --legacy-pat triggers the flag-driven path even on a TTY. The
-    // walkthrough mustn't fire when a flag is present, so its
-    // "Setting up…" banner must not appear in output.
+    // A recognized flag (`--token`) triggers the flag-driven path. The
+    // walkthrough mustn't fire when a flag is present, so its "Setting up…"
+    // banner must not appear in output. (vault#282 Stage 2 removed --legacy-pat
+    // — --token is the deterministic no-hub-needed flag-driven path now.)
     setupBareVault(tmp, "default");
-    const res = runCli(["mcp-install", "--legacy-pat"], tmp);
+    const res = runCli(["mcp-install", "--install-scope", "user", "--token", "hub.jwt.value"], tmp);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).not.toMatch(/Setting up Parachute Vault/);
-    // The deprecation banner *should* show — confirms flag-driven path
-    // ran end-to-end.
-    expect(res.stderr).toMatch(/--legacy-pat mints a vault-DB pvt_/);
+    // The supplied-token path ran end-to-end (skips minting).
+    expect(res.stdout).toMatch(/Using supplied token/);
   });
 });
 

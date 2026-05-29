@@ -36,20 +36,6 @@ const hubFixture = (over: Partial<tokensApi.HubTokenSummary> = {}): tokensApi.Hu
   ...over,
 });
 
-const legacyFixture = (
-  over: Partial<tokensApi.LegacyTokenSummary> = {},
-): tokensApi.LegacyTokenSummary => ({
-  id: "t_legacy1",
-  label: "old-pvt",
-  permission: "full",
-  scopes: ["vault:work:write"],
-  scoped_tags: null,
-  vault_name: "work",
-  expires_at: null,
-  created_at: "2026-01-01T00:00:00Z",
-  ...over,
-});
-
 function renderRoute() {
   return render(
     <MemoryRouter initialEntries={["/vault/work/tokens"]}>
@@ -64,9 +50,8 @@ function renderRoute() {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(tokensApi.listVaultTags).mockResolvedValue([]);
-  // Default both lists; per-test cases override.
+  // Default the hub-token list; per-test cases override.
   vi.mocked(tokensApi.listHubTokens).mockResolvedValue([]);
-  vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([]);
   // Re-expose the const re-exports the component imports from tokens-api
   // (vi.mock auto-stubs the module — restore the value exports the form needs).
   vi.mocked(tokensApi).TTL_DAY_OPTIONS = [30, 90, 180, 365];
@@ -232,52 +217,19 @@ describe("VaultTokens — admin scope", () => {
   });
 });
 
-describe("VaultTokens — legacy pvt_* section", () => {
+describe("VaultTokens — legacy pvt_* section removed (vault#282 Stage 2)", () => {
   beforeEach(() => {
     vi.mocked(scope.hasAdminScope).mockReturnValue(true);
   });
 
-  it("hidden when the legacy list is empty (fresh install)", async () => {
-    vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([]);
+  it("never renders a legacy-tokens section (the pvt_* surface is gone)", async () => {
+    vi.mocked(tokensApi.listHubTokens).mockResolvedValue([hubFixture()]);
 
     renderRoute();
 
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: /mint token/i })).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText("ci")).toBeInTheDocument());
+    // No legacy section, ever — vault no longer serves pvt_* rows.
     expect(screen.queryByText(/legacy tokens/i)).not.toBeInTheDocument();
-  });
-
-  it("shown when the legacy list is non-empty, listed via the vault-admin path", async () => {
-    vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([legacyFixture()]);
-
-    renderRoute();
-    const user = userEvent.setup();
-
-    await waitFor(() => expect(screen.getByText(/legacy tokens/i)).toBeInTheDocument());
-    // listLegacyTokens hit the per-vault surface for THIS vault.
-    expect(tokensApi.listLegacyTokens).toHaveBeenCalledWith("work");
-
-    // Collapsible — defaults closed; expand to reveal the row + revoke.
-    await user.click(screen.getByText(/legacy tokens/i));
-    expect(screen.getByText("old-pvt")).toBeInTheDocument();
-  });
-
-  it("revokes a legacy token via revokeLegacyToken (vault-admin path)", async () => {
-    vi.mocked(tokensApi.listLegacyTokens).mockResolvedValue([legacyFixture()]);
-    vi.mocked(tokensApi.revokeLegacyToken).mockResolvedValue();
-
-    renderRoute();
-    const user = userEvent.setup();
-
-    await waitFor(() => expect(screen.getByText(/legacy tokens/i)).toBeInTheDocument());
-    await user.click(screen.getByText(/legacy tokens/i));
-    await user.click(screen.getByRole("button", { name: /^revoke$/i }));
-    await user.click(screen.getByRole("button", { name: /confirm revoke/i }));
-
-    await waitFor(() =>
-      expect(tokensApi.revokeLegacyToken).toHaveBeenCalledWith("work", "t_legacy1"),
-    );
   });
 });
 

@@ -57,9 +57,9 @@ describe("buildInitSummaryLines", () => {
       expect(out).not.toContain("Baked into ~/.claude.json");
     });
 
-    test("includes the tokens-create-later hint", () => {
+    test("includes the mcp-install-later hint", () => {
       expect(out).toContain("Token in ~/.claude.json");
-      expect(out).toContain("parachute vault tokens create");
+      expect(out).toContain("parachute-vault mcp-install");
     });
 
     test("omits the Bearer curl example", () => {
@@ -103,9 +103,9 @@ describe("buildInitSummaryLines", () => {
       expect(out).toContain("your vault isn't reachable by any client");
     });
 
-    test("points to both recovery paths", () => {
+    test("points to the mcp-install recovery path (hub JWT)", () => {
       expect(out).toContain("parachute-vault mcp-install");
-      expect(out).toContain("parachute vault tokens create");
+      expect(out).toContain("mints a hub JWT");
     });
 
     test("does not print any token", () => {

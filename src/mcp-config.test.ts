@@ -189,8 +189,10 @@ describe("mcp-config CLI", () => {
     expect(res.stderr).toMatch(/--token/);
     expect(res.stderr).toMatch(/PARACHUTE_VAULT_TOKEN/);
     // The error message points operators at the workaround paths so they
-    // can recover without re-reading the docs.
-    expect(res.stderr).toMatch(/parachute-vault tokens create/);
+    // can recover without re-reading the docs. (vault#282 Stage 2: tokens are
+    // hub-issued JWTs now, so the hint names mcp-install, not the removed
+    // `tokens create`.)
+    expect(res.stderr).toMatch(/parachute-vault mcp-install/);
     expect(res.stderr).toMatch(/--env-vars/);
   });
 

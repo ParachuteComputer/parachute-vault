@@ -1,17 +1,24 @@
 /**
- * Tests for the token store — scoped tokens with permissions.
- * Tokens now live inside each vault's SQLite database (schema v7).
+ * Tests for the surviving token-store surface (vault#282 Stage 2).
+ *
+ * Vault no longer mints (`generateToken`/`createToken`) or validates
+ * (`resolveToken`) opaque pvt_* tokens — it's a pure hub resource-server. What
+ * remains in token-store.ts is the vestigial-row cleanup surface
+ * (`listTokens` / `revokeToken` / `findTokensReferencingTag`) and the legacy
+ * YAML-import landing zone (`migrateVaultKeys`, raw INSERT). These tests seed
+ * rows the way the surviving code does (migrateVaultKeys + raw INSERT) rather
+ * than via the removed mint path.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { initSchema } from "../core/src/schema.ts";
+import { hashKey } from "./config.ts";
 import {
-  generateToken,
-  createToken,
-  resolveToken,
   listTokens,
   revokeToken,
+  findTokensReferencingTag,
+  migrateVaultKeys,
 } from "./token-store.ts";
 
 let db: Database;
@@ -25,172 +32,52 @@ afterEach(() => {
   db.close();
 });
 
-describe("token CRUD", () => {
-  test("create and resolve a full-access token", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "test-token", permission: "full" });
+/** Seed a row the way migrateVaultKeys does — raw INSERT, no mint path. */
+function seedRow(
+  label: string,
+  opts: { permission?: string; vault_name?: string | null; scoped_tags?: string[] | null } = {},
+): string {
+  const hash = hashKey(`legacy-${label}-${Math.random()}`);
+  db.prepare(
+    `INSERT INTO tokens (token_hash, label, permission, scoped_tags, created_at, vault_name)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    hash,
+    label,
+    opts.permission ?? "full",
+    opts.scoped_tags ? JSON.stringify(opts.scoped_tags) : null,
+    new Date().toISOString(),
+    opts.vault_name ?? null,
+  );
+  return `t_${hash.slice(7, 19)}`;
+}
 
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved).not.toBeNull();
-    expect(resolved!.permission).toBe("full");
-  });
-
-  test("token with read permission", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, {
-      label: "reader",
-      permission: "read",
-    });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("read");
-  });
-
-  test("default permission is full", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "default-perm" });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("full");
-  });
-
-  test("legacy admin permission normalizes to full", () => {
-    const { fullToken } = generateToken();
-    // Simulate a legacy token by writing "admin" directly to DB
-    const hash = require("./config.ts").hashKey(fullToken);
-    db.prepare("INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)")
-      .run(hash, "legacy-admin", "admin", new Date().toISOString());
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("full");
-  });
-
-  test("legacy write permission normalizes to full", () => {
-    const { fullToken } = generateToken();
-    const hash = require("./config.ts").hashKey(fullToken);
-    db.prepare("INSERT INTO tokens (token_hash, label, permission, created_at) VALUES (?, ?, ?, ?)")
-      .run(hash, "legacy-write", "write", new Date().toISOString());
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.permission).toBe("full");
-  });
-
-  test("expired token is rejected", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, {
-      label: "expired",
-      permission: "full",
-      expires_at: "2020-01-01T00:00:00.000Z", // in the past
-    });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved).toBeNull();
-  });
-
-  test("non-expired token is accepted", () => {
-    const { fullToken } = generateToken();
-    const future = new Date(Date.now() + 86400000).toISOString(); // +1 day
-    createToken(db, fullToken, {
-      label: "valid",
-      permission: "read",
-      expires_at: future,
-    });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved).not.toBeNull();
-    expect(resolved!.permission).toBe("read");
-  });
-
-  test("invalid token returns null", () => {
-    const resolved = resolveToken(db, "pvt_does_not_exist");
-    expect(resolved).toBeNull();
-  });
-
-  test("list tokens shows all tokens", () => {
-    const { fullToken: t1 } = generateToken();
-    const { fullToken: t2 } = generateToken();
-    createToken(db, t1, { label: "first", permission: "full" });
-    createToken(db, t2, { label: "second", permission: "read" });
+describe("listTokens", () => {
+  test("lists all rows with display IDs and normalized permission", () => {
+    seedRow("first", { permission: "full" });
+    seedRow("second", { permission: "read" });
 
     const tokens = listTokens(db);
     expect(tokens.length).toBe(2);
     expect(tokens.some((t) => t.label === "first")).toBe(true);
     expect(tokens.some((t) => t.label === "second")).toBe(true);
-    // Each token should have a display ID
     expect(tokens.every((t) => t.id.startsWith("t_"))).toBe(true);
   });
 
-  test("revoke token by display ID", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "to-revoke" });
+  test("legacy admin/write permission normalizes to full", () => {
+    seedRow("legacy-admin", { permission: "admin" });
+    seedRow("legacy-write", { permission: "write" });
 
     const tokens = listTokens(db);
-    expect(tokens.length).toBe(1);
-
-    const revoked = revokeToken(db, tokens[0].id);
-    expect(revoked).toBe(true);
-
-    const after = listTokens(db);
-    expect(after.length).toBe(0);
-
-    // Token should no longer resolve
-    expect(resolveToken(db, fullToken)).toBeNull();
-  });
-
-  test("revoke non-existent token returns false", () => {
-    expect(revokeToken(db, "t_doesnotexist")).toBe(false);
-  });
-
-  test("resolve updates last_used_at", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "usage-tracking" });
-
-    // Before first use
-    const before = listTokens(db);
-    expect(before[0].last_used_at).toBeNull();
-
-    // Resolve (which should update last_used_at)
-    resolveToken(db, fullToken);
-
-    const after = listTokens(db);
-    expect(after[0].last_used_at).not.toBeNull();
+    expect(tokens.every((t) => t.permission === "full")).toBe(true);
   });
 });
 
-describe("per-vault binding (v16)", () => {
-  test("createToken without vault_name leaves the column NULL (legacy / server-wide)", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "legacy" });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.vault_name).toBeNull();
-
-    const [row] = listTokens(db);
-    expect(row!.vault_name).toBeNull();
-  });
-
-  test("createToken with vault_name binds the token to that vault", () => {
-    const { fullToken } = generateToken();
-    createToken(db, fullToken, { label: "boulder-bound", vault_name: "boulder" });
-
-    const resolved = resolveToken(db, fullToken);
-    expect(resolved!.vault_name).toBe("boulder");
-
-    const [row] = listTokens(db);
-    expect(row!.vault_name).toBe("boulder");
-  });
-
-  test("listTokens with vaultName filter returns matching + legacy NULL tokens", () => {
-    // Per the contract: per-vault listings show tokens bound to THIS vault
-    // plus any server-wide (NULL) tokens. The latter authenticate cross-vault
-    // by design, so the operator should be able to see + revoke them in any
-    // vault's admin UI. Tokens bound to OTHER vaults are excluded.
-    const { fullToken: tA } = generateToken();
-    const { fullToken: tB } = generateToken();
-    const { fullToken: tLegacy } = generateToken();
-    createToken(db, tA, { label: "boulder", vault_name: "boulder" });
-    createToken(db, tB, { label: "default-vault", vault_name: "default" });
-    createToken(db, tLegacy, { label: "server-wide" });
+describe("per-vault filter (v16, vestigial)", () => {
+  test("vaultName filter returns matching + legacy NULL rows", () => {
+    seedRow("boulder", { vault_name: "boulder" });
+    seedRow("default-vault", { vault_name: "default" });
+    seedRow("server-wide", { vault_name: null });
 
     const boulderTokens = listTokens(db, { vaultName: "boulder" });
     expect(boulderTokens.map((t) => t.label).sort()).toEqual(["boulder", "server-wide"]);
@@ -199,23 +86,55 @@ describe("per-vault binding (v16)", () => {
     expect(defaultTokens.map((t) => t.label).sort()).toEqual(["default-vault", "server-wide"]);
 
     // No filter → everything.
-    const all = listTokens(db);
-    expect(all.length).toBe(3);
+    expect(listTokens(db).length).toBe(3);
   });
 });
 
-describe("token generation", () => {
-  test("generated tokens have pvt_ prefix", () => {
-    const { fullToken, tokenHash } = generateToken();
-    expect(fullToken.startsWith("pvt_")).toBe(true);
-    expect(tokenHash.startsWith("sha256:")).toBe(true);
+describe("revokeToken", () => {
+  test("revokes by display ID", () => {
+    const id = seedRow("to-revoke");
+    expect(listTokens(db).length).toBe(1);
+
+    expect(revokeToken(db, id)).toBe(true);
+    expect(listTokens(db).length).toBe(0);
   });
 
-  test("generated tokens are unique", () => {
-    const t1 = generateToken();
-    const t2 = generateToken();
-    expect(t1.fullToken).not.toBe(t2.fullToken);
-    expect(t1.tokenHash).not.toBe(t2.tokenHash);
+  test("returns false for a non-existent id", () => {
+    expect(revokeToken(db, "t_doesnotexist")).toBe(false);
   });
 });
 
+describe("findTokensReferencingTag", () => {
+  test("matches rows whose scoped_tags allowlist names the root tag", () => {
+    seedRow("health-scoped", { scoped_tags: ["health"] });
+    seedRow("work-scoped", { scoped_tags: ["work"] });
+    seedRow("unscoped");
+
+    const matches = findTokensReferencingTag(db, "health");
+    expect(matches.map((m) => m.label)).toEqual(["health-scoped"]);
+  });
+});
+
+describe("migrateVaultKeys — legacy YAML import landing zone", () => {
+  test("imports per-vault + global YAML keys via raw INSERT (idempotent)", () => {
+    const vaultKeys = [
+      { key_hash: hashKey("yaml-vault-key"), label: "vault-key", scope: "read", created_at: "2026-01-01T00:00:00Z" },
+    ];
+    const globalKeys = [
+      { key_hash: hashKey("yaml-global-key"), label: "global-key", created_at: "2026-01-01T00:00:00Z" },
+    ];
+
+    const migrated = migrateVaultKeys(db, vaultKeys, globalKeys);
+    expect(migrated).toBe(2);
+
+    const tokens = listTokens(db);
+    expect(tokens.map((t) => t.label).sort()).toEqual(["global-key", "vault-key"]);
+    // Per-vault read key keeps read permission; global key becomes full.
+    expect(tokens.find((t) => t.label === "vault-key")?.permission).toBe("read");
+    expect(tokens.find((t) => t.label === "global-key")?.permission).toBe("full");
+
+    // Re-running skips already-imported hashes (idempotent).
+    expect(migrateVaultKeys(db, vaultKeys, globalKeys)).toBe(0);
+    expect(listTokens(db).length).toBe(2);
+  });
+});
