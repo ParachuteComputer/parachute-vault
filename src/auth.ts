@@ -1,7 +1,7 @@
 /**
  * Authentication and authorization for the vault server.
  *
- * As of 0.6.0 vault is a PURE HUB RESOURCE-SERVER (vault#282 Stage 2). The
+ * As of 0.5.0 vault is a PURE HUB RESOURCE-SERVER (vault#282 Stage 2). The
  * opaque `pvt_*` vault-DB token was dropped — vault no longer mints or
  * validates it. Three auth paths survive:
  *
@@ -310,7 +310,7 @@ function droppedPvtTokenResponse(): Response {
     {
       error: "Unauthorized",
       message:
-        "pvt_* tokens are no longer supported (vault 0.6.0). Re-add this vault via your hub to get an access token.",
+        "pvt_* tokens are no longer supported (vault 0.5.0). Re-add this vault via your hub to get an access token.",
     },
     { status: 401 },
   );

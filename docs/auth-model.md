@@ -55,7 +55,7 @@ Claude Code, the Notes PWA.
 ### API tokens (Bearer)
 
 Long-lived tokens for scripts, agents, and any client that won't drive a
-browser through consent. As of vault 0.6.0 (vault#282 Stage 2) these are
+browser through consent. As of vault 0.5.0 (vault#282 Stage 2) these are
 **hub-issued JWTs** — vault no longer mints its own opaque tokens.
 
 **Format:** a hub-signed JWT (RS256), the same shape the OAuth flow issues.
@@ -65,7 +65,7 @@ See "Hub-issued JWT (the OAuth path)" above for the validation contract.
 **Provenance + storage:** minted and tracked on the hub, not in vault. Vault
 validates each presented JWT against the hub's JWKS per-request; it stores no
 token plaintext or hash. (A vestigial per-vault `tokens` table persists in
-older DBs from pre-0.6.0 minting — it's no longer written to; `parachute-vault
+older DBs from pre-0.5.0 minting — it's no longer written to; `parachute-vault
 tokens list` / `revoke` exist only to clean those rows up.)
 
 **Scopes** (carried in the JWT `scope` claim):
@@ -98,11 +98,11 @@ The admin SPA's **Tokens** page is the GUI equivalent — mint, list, and revoke
 hub JWTs from the browser. `parachute-vault tokens` retains only:
 
 ```
-parachute-vault tokens                     # list vestigial pre-0.6.0 token rows (all vaults)
+parachute-vault tokens                     # list vestigial pre-0.5.0 token rows (all vaults)
 parachute-vault tokens revoke <token-id>   # revoke a vestigial row
 ```
 
-`parachute-vault tokens create` was **removed at 0.6.0** — it now exits 1 with
+`parachute-vault tokens create` was **removed at 0.5.0** — it now exits 1 with
 a pointer to `parachute auth mint-token`. Minting and revocation live on the
 hub; vault is a pure resource-server.
 
@@ -284,7 +284,7 @@ should be careful about.
 - **Mint the narrowest scope you need.** `parachute auth mint-token`
   takes an explicit `--scope vault:<name>:<verb>`; a `vault:<name>:read`
   JWT can't mutate, which keeps blast radius small if it leaks. There's no
-  full-scope default to trip over post-0.6.0 — minting moved to the hub,
+  full-scope default to trip over post-0.5.0 — minting moved to the hub,
   and the hub asks for a scope. (vault#282 Stage 2 removed
   `parachute-vault tokens create`, whose no-flag default *was* full scope.)
 - **Hub JWTs are audience-bound, not per-vault-DB.** A hub JWT is stamped
@@ -292,7 +292,7 @@ should be careful about.
   carries its vault in the token, not in a per-vault SQLite row. A token
   for one vault is rejected at any other (audience strict-check +
   `vault_scope` defense-in-depth). The old per-vault `pvt_*` DB tokens
-  this bullet used to describe were dropped at 0.6.0.
+  this bullet used to describe were dropped at 0.5.0.
 - **No per-IP rate limit on bearer-token brute-force.** An attacker
   hammering `/vault/<name>/api/notes` with forged bearers is not rate
   limited at the vault layer. Hub JWTs are RS256-signed (forgery needs the

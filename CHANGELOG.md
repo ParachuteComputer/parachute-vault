@@ -34,7 +34,7 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
-## [0.6.0-rc.1] - 2026-05-28
+## [0.5.0-rc.1] - 2026-05-28
 
 ### Removed (BREAKING — vault#282 Stage 2)
 
@@ -48,7 +48,7 @@ to `@latest`.
   resource-server — minting is hub's job).
 - Removed `parachute-vault tokens create` (mint a hub JWT via
   `parachute-vault mcp-install` or `parachute auth mint-token` instead).
-  `tokens list` / `tokens revoke` remain for cleaning up vestigial pre-0.6.0
+  `tokens list` / `tokens revoke` remain for cleaning up vestigial pre-0.5.0
   rows.
 - Removed `mcp-install --legacy-pat` and the interactive walkthrough's
   "legacy" auth choice. Without a hub, `mcp-install` falls back to pasting an
@@ -2101,7 +2101,7 @@ Two PRs landed under the rc chain:
   `lte` / `in` / `not_in` / `exists` — to HTTP consumers via
   `?meta[field][op]=value`. Bracket-style is the canonical shape going
   forward; the flat `date_field=…&date_from=…&date_to=…` form is
-  deprecated (planned removal 0.6.0, tracked at vault#288).
+  deprecated (planned removal in a later 0.x, tracked at vault#288).
 
 ### Write path
 
@@ -2190,7 +2190,7 @@ through with a consistent shape.
   `?date_to=` (and the legacy bare-`date_from`/`date_to` shape) remain
   functional through the 0.5.x line — no behavior change for existing
   consumers — but bracket-style is canonical going forward. Planned removal
-  in 0.6.0; tracked at vault#288. On overlap (a request that supplies both
+  in a later 0.x; tracked at vault#288. On overlap (a request that supplies both
   forms), bracket wins.
 
 ### Parser hardening (review folds on initial implementation)

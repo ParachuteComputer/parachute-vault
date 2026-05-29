@@ -90,7 +90,7 @@ config.yaml `pvk_*` api_keys still resolve for back-compat — they're mapped
 onto the modern scope set on the fly and emit a deprecation log line. New
 deployments should use the hub-JWT path (`parachute auth mint-token`).
 
-> **`pvt_*` tokens were dropped at 0.6.0 (vault#282 Stage 2).** Vault no
+> **`pvt_*` tokens were dropped at 0.5.0 (vault#282 Stage 2).** Vault no
 > longer mints or accepts the vault-local opaque token; a `pvt_`-prefixed
 > bearer now gets a `401` pointing you at the hub. Use a hub-issued JWT
 > instead.
@@ -430,7 +430,7 @@ Query params:
     filters through the same grammar.
   - **Flat (deprecated)**: `date_field=created_at&date_from=ISO&date_to=ISO`
     and the legacy two-param `date_from=ISO&date_to=ISO` (implicit
-    `created_at`). Still functional through 0.5.x; removal in 0.6.0
+    `created_at`). Still functional through 0.5.x; removal in a later 0.x
     (vault#288). Bracket-style wins on overlap.
 
 - **Metadata filters (bracket-style)**
@@ -884,7 +884,7 @@ restart of the watch loop with the new shape — no vault restart needed.
 ### Token management — minting lives on the hub
 
 The per-vault `/vault/{name}/tokens` REST surface (the old `GET` list,
-`POST` mint, `DELETE` revoke of `pvt_*` tokens) was **removed at 0.6.0**
+`POST` mint, `DELETE` revoke of `pvt_*` tokens) was **removed at 0.5.0**
 (vault#282 Stage 2 — vault is a pure hub resource-server). A request to
 `/vault/{name}/tokens` now falls through to the catch-all `404`.
 

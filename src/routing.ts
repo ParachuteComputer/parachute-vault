@@ -463,7 +463,7 @@ export async function route(
   }
 
   // The per-vault `/tokens` REST surface (pvt_* mint/list/revoke) was removed
-  // at 0.6.0 (vault#282 Stage 2 — vault is a pure hub resource-server). Hub
+  // at 0.5.0 (vault#282 Stage 2 — vault is a pure hub resource-server). Hub
   // JWTs are minted via hub's registry (`/api/auth/mint-token`); a `/tokens`
   // request now falls through to the catch-all 404 below.
 

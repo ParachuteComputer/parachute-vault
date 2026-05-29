@@ -100,8 +100,8 @@ function createVault(name: string, description?: string): void {
 
 /**
  * Seed a vestigial row directly into a vault's `tokens` table (raw INSERT).
- * Post-0.6.0 (vault#282 Stage 2) vault no longer mints these, but the table
- * survives + `/auth/status` probes it for leftover pre-0.6.0 rows. This is how
+ * Post-0.5.0 (vault#282 Stage 2) vault no longer mints these, but the table
+ * survives + `/auth/status` probes it for leftover pre-0.5.0 rows. This is how
  * we exercise the `hasTokens=true` branch now that there's no mint path.
  */
 function seedVestigialTokenRow(vaultName: string): void {
@@ -114,7 +114,7 @@ function seedVestigialTokenRow(vaultName: string): void {
 /**
  * Seed a vestigial tag-scoped row (raw INSERT, `scoped_tags` JSON populated).
  * The tag-delete / -rename / -merge fail-closed guard (`findTokensReferencingTag`)
- * reads this column. Post-0.6.0 hub-JWT tag scopes live in the JWT claim, not
+ * reads this column. Post-0.5.0 hub-JWT tag scopes live in the JWT claim, not
  * the DB, so the guard now protects only these vestigial rows — these tests
  * pin that the DB-row guard still fires.
  */

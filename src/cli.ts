@@ -1586,15 +1586,15 @@ function cmdTokens(args: string[]) {
     return;
   }
 
-  // `tokens create` was removed at 0.6.0 (vault#282 Stage 2). Vault no longer
+  // `tokens create` was removed at 0.5.0 (vault#282 Stage 2). Vault no longer
   // mints its own (pvt_*) tokens — it's a pure hub resource-server. Tokens are
   // now hub-issued JWTs: run `parachute-vault mcp-install` to mint + wire one
   // for an MCP client, or `parachute auth mint-token --scope vault:<name>:<verb>`
   // for scripts. `tokens list` / `tokens revoke` remain for cleaning up any
-  // vestigial pre-0.6.0 rows.
+  // vestigial pre-0.5.0 rows.
   if (subcmd === "create") {
     console.error(
-      "`parachute-vault tokens create` was removed at 0.6.0 — vault no longer mints its own tokens.\n" +
+      "`parachute-vault tokens create` was removed at 0.5.0 — vault no longer mints its own tokens.\n" +
         "  Mint a hub-issued JWT instead:\n" +
         "    parachute-vault mcp-install --scope vault:<verb>   # wire an MCP client\n" +
         "    parachute auth mint-token --scope vault:<name>:<verb>   # for scripts\n" +
@@ -3359,7 +3359,7 @@ async function createVault(name: string): Promise<VaultCredential> {
   writeVaultConfig(config);
 
   // Touch the store so the vault's SQLite DB + schema are created. No token
-  // row is written — vault is a pure hub resource-server post-0.6.0.
+  // row is written — vault is a pure hub resource-server post-0.5.0.
   getVaultStore(name);
   return mintBootstrapCredential(name);
 }
@@ -3539,7 +3539,7 @@ Vaults:
 Tokens (vault#282 Stage 2 — vault is a pure hub resource-server; it no longer
 mints its own tokens. Mint a hub-issued JWT with \`parachute-vault mcp-install\`
 or \`parachute auth mint-token --scope vault:<name>:<verb>\`. \`list\` / \`revoke\`
-below operate on any vestigial pre-0.6.0 rows for cleanup.):
+below operate on any vestigial pre-0.5.0 rows for cleanup.):
   parachute-vault tokens                          List vault-DB tokens (every vault)
   parachute-vault tokens list --vault <name>      List tokens for one vault only
   parachute-vault tokens revoke <token-id>        Revoke a vestigial token (default vault)

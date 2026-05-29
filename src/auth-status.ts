@@ -8,7 +8,7 @@
  *
  * What gets exposed:
  *   - `initialized` — at least one vault exists
- *   - `auth_modes`  — accepted bearer formats. As of 0.6.0 (vault#282 Stage 2)
+ *   - `auth_modes`  — accepted bearer formats. As of 0.5.0 (vault#282 Stage 2)
  *     vault is a pure hub resource-server: the only first-class user
  *     credential is a hub-issued JWT, so this is `["hub_jwt"]`. (The
  *     server-wide VAULT_AUTH_TOKEN operator bearer + legacy YAML api_keys
@@ -17,7 +17,7 @@
  *   - `vaults`      — list of `{ name, url }` for client-side dispatch
  *   - `hasOwnerPassword`, `hasTotp` — OAuth consent prerequisites
  *   - `hasTokens`   — boolean | null. Probes the vestigial `tokens` table for
- *     any leftover pre-0.6.0 rows (the table is kept inert as the YAML-import
+ *     any leftover pre-0.5.0 rows (the table is kept inert as the YAML-import
  *     landing zone + a future-cosmetic-drop target). `null` ≈ "we couldn't
  *     read all DBs, don't trust this answer"; `true`/`false` are honest yes/no.
  *

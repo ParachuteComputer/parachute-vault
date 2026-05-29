@@ -1,7 +1,7 @@
 /**
  * Auth invariants — vault as a pure hub resource-server (vault#282 Stage 2).
  *
- * The `pvt_*` opaque vault-DB token was dropped at 0.6.0: vault no longer
+ * The `pvt_*` opaque vault-DB token was dropped at 0.5.0: vault no longer
  * mints or validates it. The surviving auth surfaces tested here are:
  *   - VAULT_AUTH_TOKEN — the server-wide operator bearer.
  *   - Legacy YAML api_keys (vault.yaml / config.yaml) — hashed keys.
@@ -91,7 +91,7 @@ describe("auth — pvt_* tokens are unvalidatable (fail closed)", () => {
   // API key" a non-pvt_ bad token gets) — the prefix is the user-meaningful
   // signal that the mechanism was dropped, not that the key was mistyped.
   const PVT_MESSAGE =
-    "pvt_* tokens are no longer supported (vault 0.6.0). Re-add this vault via your hub to get an access token.";
+    "pvt_* tokens are no longer supported (vault 0.5.0). Re-add this vault via your hub to get an access token.";
 
   test("a pvt_* bearer is 401-rejected with the dropped-token message on the per-vault surface", async () => {
     seedVault("journal");
