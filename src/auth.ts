@@ -169,6 +169,40 @@ export function warnLegacyOnce(cacheKey: string, context: string): void {
   );
 }
 
+/**
+ * Doc link operators are sent to when a `pvt_*` token authenticates. Points
+ * at the pvt_* → hub-JWT migration section of vault's UPGRADING.md.
+ */
+const PVT_MIGRATION_DOC =
+  "https://github.com/ParachuteComputer/parachute-vault/blob/main/UPGRADING.md#pvt_-token-deprecation--will-be-rejected-at-060";
+
+// One-shot pvt_* deprecation warning tracker, keyed by the token's display id
+// (`t_<hashprefix>`) so each distinct token warns exactly once per process.
+const warnedPvtTokens = new Set<string>();
+
+/**
+ * Log a one-time (per token-hash) deprecation warning for a successfully-
+ * authenticated `pvt_*` vault-DB token. Stage 1 of vault#282: pvt_* still
+ * AUTHENTICATES and AUTHORIZES exactly as before — this only signals that the
+ * credential is on a deprecation clock and will be REJECTED at vault 0.6.0.
+ *
+ * Keyed on the token's display id (`t_<hashprefix>` — the `jti` ResolvedToken
+ * surfaces) so a given token logs once per process regardless of how many
+ * requests it makes or whether it carries explicit scopes. Folds in the
+ * narrower pre-existing "vault token without scopes column" warning — a legacy-
+ * derived pvt_* gets THIS warning, not both, so we never double-warn one token.
+ */
+export function warnPvtDeprecationOnce(displayId: string): void {
+  if (warnedPvtTokens.has(displayId)) return;
+  warnedPvtTokens.add(displayId);
+  console.warn(
+    `[deprecation] pvt_* token ${displayId} authenticated — pvt_* tokens are DEPRECATED and will be REJECTED at vault 0.6.0 (vault#282). ` +
+      "Migrate to a hub-issued JWT: run `parachute vault mcp-install` (MCP clients) or " +
+      "`parachute auth mint-token --scope vault:<name>:<verb>` (scripts). " +
+      `Guide: ${PVT_MIGRATION_DOC}.`,
+  );
+}
+
 /** Read-only tools (the only tools allowed for "read" permission). */
 const READ_TOOLS = new Set([
   "query-notes",
@@ -292,9 +326,12 @@ export async function authenticateVaultRequest(
             ),
           };
         }
-        if (resolved.legacyDerived) {
-          warnLegacyOnce(`vault-token:${vaultConfig.name ?? ""}`, "vault token without scopes column");
-        }
+        // vault#282 Stage 1: every successful pvt_* (vault-DB token-store)
+        // authentication is on a deprecation clock. One-time per token-hash
+        // (keyed on the display id). Folds in the old narrower "vault token
+        // without scopes column" warning — a legacy-derived pvt_* gets THIS
+        // warning, not both. Auth OUTCOME is unchanged; this only signals.
+        warnPvtDeprecationOnce(resolved.jti);
         return {
           permission: resolved.permission,
           scopes: resolved.scopes,
@@ -621,9 +658,10 @@ export async function authenticateGlobalRequest(
       const store = getVaultStore(vaultName);
       const resolved = resolveToken(store.db, key);
       if (resolved) {
-        if (resolved.legacyDerived) {
-          warnLegacyOnce(`vault-token:${vaultName}`, "vault token without scopes column");
-        }
+        // vault#282 Stage 1: pvt_* resolved on the unified surface is on the
+        // same deprecation clock. One-time per token-hash; folds in the old
+        // narrower legacy-scopes warning. Auth OUTCOME unchanged.
+        warnPvtDeprecationOnce(resolved.jti);
         return {
           permission: resolved.permission,
           scopes: resolved.scopes,

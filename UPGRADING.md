@@ -4,6 +4,110 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## pvt_* token deprecation — will be rejected at 0.6.0
+
+**TL;DR:** `pvt_*` tokens (the opaque `pvt_…` bearers vault mints into its own
+SQLite `tokens` table) are **deprecated**. They still work today — every
+upgrade up to and including the last 0.5.x release keeps authenticating them
+unchanged. At **vault 0.6.0** they will be **rejected with a 401**. Migrate
+each client to a **hub-issued JWT** before you upgrade to 0.6.0.
+
+This is the safe on-ramp: nothing breaks now. Starting with the release that
+ships this notice, every successful `pvt_*` authentication logs a one-time
+warning naming the token's display id and pointing here, so you can find which
+clients still need migrating before the cutover.
+
+### Why this is happening
+
+Vault is becoming a **pure OAuth resource-server**. Granular, revocable,
+audience-bound auth is a hub-minted capability — the hub is the single token
+issuer for the ecosystem (it already mints the JWTs that browser-based clients
+use today). `pvt_*` was vault's own pre-hub token type; it predates the hub and
+duplicates a capability that now lives entirely on the hub. Keeping two parallel
+auth surfaces (vault-local `pvt_*` + hub JWTs) is the thing 0.6.0 retires. After
+0.6.0, vault validates hub-issued JWTs (and the coarse `VAULT_AUTH_TOKEN` /
+`vault.yaml` operator secrets for the no-granular-auth path) and nothing else.
+
+Every capability `pvt_*` provided has a hub-minted equivalent already shipped:
+read/write/admin scopes, per-vault binding, tag-scoped tokens, and
+session-managed mint/revoke via the `manage-token` MCP tool. Nothing is
+stranded by the removal.
+
+### Who this affects
+
+If you came up on **vault 0.2.4-era** (vault standalone, no hub) you are
+**100% on `pvt_*`** — every MCP client and script you wired authenticates with
+a `pvt_…` bearer. You are the operator this notice is for. You need to install
+the hub and re-mint each client's token before upgrading to 0.6.0.
+
+If you are **already running vault behind the hub** and your clients connect
+via OAuth (Claude Desktop, claude.ai, Parachute Daily, etc.), those clients
+already use hub JWTs — they need no change. You only need to migrate any
+**scripts or CLI-wired tokens** that still present a `pvt_…` bearer (check your
+logs for the `[deprecation] pvt_* token …` lines).
+
+### Upgrading to the CURRENT release is safe
+
+You do **not** have to migrate before upgrading to the current (pre-0.6.0)
+release. `pvt_*` keeps authenticating exactly as before — same permission, same
+scopes, same vault binding — and just emits the one-time deprecation warning.
+Use the window between this release and 0.6.0 to migrate at your own pace. The
+deprecation is **non-breaking** until 0.6.0.
+
+### Migration path (no-hub operator)
+
+1. **Install the hub.** It's the OAuth issuer — vault delegates the whole
+   authorization flow to it.
+
+   ```bash
+   bun add -g @openparachute/hub
+   parachute init
+   ```
+
+   `parachute init` sets up the hub on `127.0.0.1:1939` and wires the JWT mint
+   path. (If vault must reach the hub on a non-default origin, set
+   `PARACHUTE_HUB_ORIGIN` in `~/.parachute/vault/.env`.)
+
+2. **Re-mint each client's token as a hub JWT.**
+
+   - **MCP clients** (Claude Code, Claude Desktop, Daily) — re-run the install
+     helper; it now writes a hub-minted JWT into the client config instead of a
+     `pvt_*`:
+
+     ```bash
+     parachute vault mcp-install
+     ```
+
+   - **Scripts / headless callers** — mint a scoped JWT directly and use it as
+     the bearer:
+
+     ```bash
+     parachute auth mint-token --scope vault:<name>:<verb>
+     ```
+
+     where `<name>` is the vault and `<verb>` is `read`, `write`, or `admin`.
+
+3. **Swap the configs.** Replace the old `pvt_…` value anywhere you hard-coded
+   it (`~/.claude.json` MCP entries, script env vars, `Authorization: Bearer`
+   headers) with the freshly-minted JWT. `mcp-install` does this for the MCP
+   clients automatically; scripts you wired by hand you update by hand.
+
+4. **Confirm, then cut over.** Watch your vault logs — once no
+   `[deprecation] pvt_* token …` lines appear for a full cycle of your clients'
+   activity, every caller is on a hub JWT. Then upgrade vault to 0.6.0:
+
+   ```bash
+   parachute upgrade vault
+   ```
+
+   At 0.6.0 any remaining `pvt_*` bearer starts returning 401, so finish the
+   re-mint before this step.
+
+Reference: pvt_* retirement arc tracked at
+[vault#282](https://github.com/ParachuteComputer/parachute-vault/issues/282);
+propagation tracker at
+[parachute-patterns/migrations/2026-05-28-operator-mintable-vault-admin.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-28-operator-mintable-vault-admin.md).
+
 ## Mirror event-driven exports + `sync_mode` schema (0.4.9-rc.5 → 0.4.9-rc.6)
 
 The git-mirror feature flipped from polling to event-driven. The watch
