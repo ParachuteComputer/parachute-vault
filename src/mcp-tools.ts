@@ -435,7 +435,8 @@ function overrideVaultInfo(
  * for one-shot scripted work, then revokes immediately" surface. A long
  * TTL would defeat the safety story — if revoke fails (network blip,
  * model error), the cap is the backstop. Operators wanting long-lived
- * tokens still use the REST /vault/<name>/tokens endpoint.
+ * tokens mint a hub-issued JWT via the hub mint-token flow (the REST
+ * /vault/<name>/tokens endpoint was removed with the pvt_* drop, vault#282).
  */
 const MANAGE_TOKEN_DEFAULT_TTL_SECONDS = 900; // 15 minutes
 const MANAGE_TOKEN_MAX_TTL_SECONDS = 3600; // 1 hour
