@@ -87,7 +87,13 @@ function bearer(token: string): Request {
 describe("auth — pvt_* tokens are unvalidatable (fail closed)", () => {
   const PVT = "pvt_deadbeefdeadbeefdeadbeefdeadbeef";
 
-  test("a pvt_* bearer is 401-rejected on the per-vault surface", async () => {
+  // The pointed message a pvt_*-shaped bearer gets (vs the generic "Invalid
+  // API key" a non-pvt_ bad token gets) — the prefix is the user-meaningful
+  // signal that the mechanism was dropped, not that the key was mistyped.
+  const PVT_MESSAGE =
+    "pvt_* tokens are no longer supported (vault 0.6.0). Re-add this vault via your hub to get an access token.";
+
+  test("a pvt_* bearer is 401-rejected with the dropped-token message on the per-vault surface", async () => {
     seedVault("journal");
     const journalConfig = readVaultConfig("journal")!;
 
@@ -95,10 +101,13 @@ describe("auth — pvt_* tokens are unvalidatable (fail closed)", () => {
     expect("error" in result).toBe(true);
     if ("error" in result) {
       expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as { error: string; message: string };
+      expect(body.error).toBe("Unauthorized");
+      expect(body.message).toBe(PVT_MESSAGE);
     }
   });
 
-  test("a pvt_* bearer is 401-rejected on the global (/vaults) surface", async () => {
+  test("a pvt_* bearer is 401-rejected with the dropped-token message on the global (/vaults) surface", async () => {
     seedVault("journal", { isDefault: true });
     seedVault("work");
 
@@ -106,6 +115,9 @@ describe("auth — pvt_* tokens are unvalidatable (fail closed)", () => {
     expect("error" in result).toBe(true);
     if ("error" in result) {
       expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as { error: string; message: string };
+      expect(body.error).toBe("Unauthorized");
+      expect(body.message).toBe(PVT_MESSAGE);
     }
   });
 
@@ -117,10 +129,27 @@ describe("auth — pvt_* tokens are unvalidatable (fail closed)", () => {
       const journalConfig = readVaultConfig("journal")!;
       const result = await authenticateVaultRequest(bearer(PVT), journalConfig);
       expect("error" in result).toBe(true);
-      if ("error" in result) expect(result.error.status).toBe(401);
+      if ("error" in result) {
+        expect(result.error.status).toBe(401);
+        const body = (await result.error.json()) as { message: string };
+        expect(body.message).toBe(PVT_MESSAGE);
+      }
     } finally {
       if (prev === undefined) delete process.env.VAULT_AUTH_TOKEN;
       else process.env.VAULT_AUTH_TOKEN = prev;
+    }
+  });
+
+  test("a non-pvt_ invalid bearer keeps the generic message (no behavior change)", async () => {
+    seedVault("journal");
+    const journalConfig = readVaultConfig("journal")!;
+
+    const result = await authenticateVaultRequest(bearer("notavalidkey123"), journalConfig);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as { message: string };
+      expect(body.message).toBe("Invalid API key");
     }
   });
 

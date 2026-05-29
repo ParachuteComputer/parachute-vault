@@ -288,7 +288,32 @@ export async function authenticateVaultRequest(
     }
   }
 
+  if (looksLikeDroppedPvtToken(key)) {
+    return { error: droppedPvtTokenResponse() };
+  }
   return { error: Response.json({ error: "Unauthorized", message: "Invalid API key" }, { status: 401 }) };
+}
+
+/**
+ * A bearer of the dropped `pvt_*` shape (vault#282 Stage 2 — vault no longer
+ * mints or validates the per-vault opaque token). Detected by prefix so a
+ * caller still presenting one gets a pointed 401 instead of the generic
+ * "Invalid API key" — the prefix is the user-meaningful signal, and a real
+ * hub JWT / `pvk_` / `VAULT_AUTH_TOKEN` never starts with `pvt_`.
+ */
+function looksLikeDroppedPvtToken(key: string): boolean {
+  return key.startsWith("pvt_");
+}
+
+function droppedPvtTokenResponse(): Response {
+  return Response.json(
+    {
+      error: "Unauthorized",
+      message:
+        "pvt_* tokens are no longer supported (vault 0.6.0). Re-add this vault via your hub to get an access token.",
+    },
+    { status: 401 },
+  );
 }
 
 /**
@@ -569,5 +594,8 @@ export async function authenticateGlobalRequest(
     }
   }
 
+  if (looksLikeDroppedPvtToken(key)) {
+    return { error: droppedPvtTokenResponse() };
+  }
   return { error: Response.json({ error: "Unauthorized", message: "Invalid API key" }, { status: 401 }) };
 }
