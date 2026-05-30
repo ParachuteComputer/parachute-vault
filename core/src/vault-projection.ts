@@ -305,5 +305,25 @@ export function projectionToMarkdown(args: {
   lines.push("");
   lines.push("If schema or tags change during this session, call `vault-info` to refresh the full projection. Call `list-tags { include_schema: true }` for tag-only details.");
 
+  // Scripting pointer block: the connect-time brief used to dead-end on
+  // querying — an agent had no path to "how do I script/automate against this
+  // vault." Point at the guide rather than inlining it, to keep this brief
+  // lean (token-budget note above). Uses the concrete vault name so the mint
+  // command is copy-paste ready.
+  lines.push("");
+  lines.push("## Scripting & automation (beyond this session)");
+  lines.push("");
+  lines.push(
+    "This vault is also a plain HTTP API — reach for it when the user wants a script, cron job, or CI step rather than an interactive session:",
+  );
+  lines.push(
+    `- Mint a scoped credential: \`parachute auth mint-token --scope vault:${vaultName}:read --ephemeral\` (\`--ephemeral\` = short-lived, ideal for scripts; use \`:write\` to create/edit).`,
+  );
+  lines.push(`- Call the REST API at \`<hub-origin>/vault/${vaultName}/api/...\`.`);
+  lines.push(
+    "- Full guide — copy-paste bash/Python/JS examples, plus how to design tags vs paths vs schemas: https://parachute.computer/scripting/",
+  );
+  lines.push("- For a prompt on a schedule with no code, see Parachute Runner.");
+
   return lines.join("\n");
 }
