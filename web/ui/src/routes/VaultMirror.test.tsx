@@ -934,12 +934,24 @@ describe("VaultMirror — Import from git section", () => {
     expect(startBtn).not.toBeDisabled();
   });
 
-  it("Start import fires postMirrorImport + shows success summary on resolve", async () => {
+  it("the 'Also sync changes back' checkbox is checked by default", async () => {
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const syncCheckbox = screen.getByLabelText(
+      /Also sync changes back to this repo/i,
+    ) as HTMLInputElement;
+    expect(syncCheckbox.checked).toBe(true);
+  });
+
+  it("Start import fires postMirrorImport (enable_sync true) + shows sync-enabled confirmation", async () => {
     vi.mocked(api.postMirrorImport).mockResolvedValue({
       notes_imported: 42,
       tags_imported: 3,
       attachments_imported: 5,
       warnings: [],
+      sync_enabled: true,
     });
     renderRoute();
     await waitFor(() =>
@@ -952,23 +964,91 @@ describe("VaultMirror — Import from git section", () => {
     await waitFor(() =>
       expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
     );
+    // enable_sync defaults ON and is sent in the POST body.
     expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
       remote_url: "https://github.com/aaron/vault.git",
       mode: "merge",
       credentials: { kind: "none" },
+      enable_sync: true,
     });
     // The success summary mentions the counts.
     expect(screen.getByText(/Imported 42 notes/i)).toBeInTheDocument();
-    // Auto-wire offer surfaces.
-    expect(screen.getByText(/Set this repo as the active mirror remote/i)).toBeInTheDocument();
+    // Sync-enabled confirmation surfaces (not the old auto-wire offer).
+    expect(screen.getByText(/Sync enabled/i)).toBeInTheDocument();
   });
 
-  it("one-time PAT credential is sent on Start", async () => {
+  it("unchecking the sync checkbox sends enable_sync false", async () => {
+    vi.mocked(api.postMirrorImport).mockResolvedValue({
+      notes_imported: 4,
+      tags_imported: 0,
+      attachments_imported: 0,
+      warnings: [],
+      sync_enabled: false,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/vault.git",
+    );
+    await user.click(screen.getByLabelText(/Also sync changes back to this repo/i));
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
+        remote_url: "https://github.com/aaron/vault.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+        enable_sync: false,
+      }),
+    );
+    // No sync confirmation, no warning — opted out cleanly.
+    await waitFor(() =>
+      expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/Sync enabled/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Sync not enabled/i)).not.toBeInTheDocument();
+  });
+
+  it("renders sync_warning as an info/warning (not error) when sync wasn't enabled", async () => {
+    vi.mocked(api.postMirrorImport).mockResolvedValue({
+      notes_imported: 9,
+      tags_imported: 0,
+      attachments_imported: 0,
+      warnings: [],
+      sync_enabled: false,
+      sync_warning:
+        "Sync not enabled — pushing changes back needs write credentials (a PAT or GitHub sign-in).",
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/public.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
+    );
+    // Warning surfaces as info, not an error-banner/alert. ("Sync not
+    // enabled" appears in both the <strong> lead-in and the warning copy,
+    // so assert at-least-one match + the credential-specific phrase.)
+    expect(screen.getAllByText(/Sync not enabled/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/needs write credentials/i)).toBeInTheDocument();
+  });
+
+  it("one-time PAT credential is sent on Start (with enable_sync)", async () => {
     vi.mocked(api.postMirrorImport).mockResolvedValue({
       notes_imported: 1,
       tags_imported: 0,
       attachments_imported: 0,
       warnings: [],
+      sync_enabled: true,
     });
     renderRoute();
     await waitFor(() =>
@@ -988,6 +1068,7 @@ describe("VaultMirror — Import from git section", () => {
         remote_url: "https://github.com/aaron/private.git",
         mode: "merge",
         credentials: { kind: "pat", token: "ghp_oneshot_xyz" },
+        enable_sync: true,
       }),
     );
   });
@@ -1007,6 +1088,7 @@ describe("VaultMirror — Import from git section", () => {
       tags_imported: 1,
       attachments_imported: 0,
       warnings: [],
+      sync_enabled: true,
     });
     renderRoute();
     await waitFor(() =>
@@ -1023,6 +1105,7 @@ describe("VaultMirror — Import from git section", () => {
         remote_url: "https://github.com/aaron/saved.git",
         mode: "merge",
         credentials: null,
+        enable_sync: true,
       }),
     );
   });

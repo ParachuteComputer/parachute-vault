@@ -1664,6 +1664,9 @@ function ImportFromGitSection({
   const [mode, setMode] = useState<ImportMode>("merge");
   const [usePerCallPat, setUsePerCallPat] = useState(false);
   const [perCallPat, setPerCallPat] = useState("");
+  // vault#416 — default-on: also sync changes back to this repo. The operator
+  // can uncheck before importing.
+  const [enableSync, setEnableSync] = useState(true);
   const [phase, setPhase] = useState<ImportPhase>({ kind: "idle" });
   // Typed-name confirmation for replace mode. The operator types the
   // literal vault name to unlock the Start button.
@@ -1705,6 +1708,7 @@ function ImportFromGitSection({
         remote_url: remoteUrl.trim(),
         mode,
         credentials,
+        enable_sync: enableSync,
       });
       window.clearTimeout(stageTimer);
       setPhase({ kind: "success", result, remoteUrl: remoteUrl.trim(), mode });
@@ -1891,6 +1895,28 @@ function ImportFromGitSection({
             ) : null}
           </div>
 
+          {/*
+            vault#416 — default-on "also sync back to this repo" checkbox.
+            Reuses the access entered above (stored creds or the one-time PAT).
+            Unchecking imports as a one-time snapshot with no push-back.
+          */}
+          <div className="form-row">
+            <label>
+              <input
+                type="checkbox"
+                checked={enableSync}
+                onChange={(e) => setEnableSync(e.target.checked)}
+                disabled={phase.kind === "running"}
+                style={{ width: "auto", marginRight: "0.5rem" }}
+              />
+              Also sync changes back to this repo
+            </label>
+            <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.85em" }}>
+              Pushes future changes to this repo automatically. Uses the access
+              you provide above.
+            </p>
+          </div>
+
           {phase.kind === "error" ? (
             <div className="error-banner" role="alert">
               <code>{phase.message}</code>
@@ -1937,18 +1963,18 @@ function ImportFromGitSection({
 }
 
 /**
- * After-success panel. Shows the import counts + warnings, and offers
- * to set the imported-from repo as the active mirror remote (auto-wire).
+ * After-success panel. Shows the import counts + warnings, and reflects the
+ * sync-back outcome (vault#416).
  *
- * The auto-wire offer is the symmetric move: if the operator just
- * imported FROM a repo, they almost certainly want exports going BACK
- * to the same repo. Yes triggers select-repo (for github-OAuth case)
- * or guides the operator to the PAT save flow.
- *
- * Aaron's directive: "if there are multiple things pushing to the same
- * git repository … important to think about" — the offer is opt-in
- * precisely because mindlessly chaining import → push back risks the
- * multi-pusher footgun. Operator opts in deliberately.
+ * Sync is now enabled BY DEFAULT during the import (the checked-by-default
+ * "Also sync changes back to this repo" checkbox). This panel just reports
+ * what happened:
+ *   - `sync_enabled` → confirm push-back is on.
+ *   - `sync_warning` (and not enabled) → show it as an info/warning, NOT an
+ *     error — the import still succeeded. Covers "no push credentials" and
+ *     "a different mirror is already configured" (the multi-pusher footgun
+ *     Aaron flagged — the server refuses to clobber an existing target).
+ *   - opted out (no warning, not enabled) → nothing extra to say.
  */
 function ImportSuccessPanel({
   vaultName,
@@ -1963,7 +1989,6 @@ function ImportSuccessPanel({
   mode: ImportMode;
   onReset: () => void;
 }) {
-  const [wireOffered, setWireOffered] = useState(true);
   return (
     <>
       <div className="mint-banner" role="status" style={{ marginBottom: "0.75rem" }}>
@@ -1993,42 +2018,39 @@ function ImportSuccessPanel({
         </details>
       ) : null}
 
-      {wireOffered ? (
+      {result.sync_enabled ? (
+        <div className="mint-banner" style={{ marginBottom: "0.75rem" }} role="status">
+          <strong>Sync enabled.</strong> Changes to vault <code>{vaultName}</code>{" "}
+          now push back to <code>{remoteUrl}</code> automatically.
+        </div>
+      ) : result.sync_warning ? (
         <div className="info-banner" style={{ marginBottom: "0.75rem" }} role="status">
           <p style={{ marginTop: 0 }}>
-            <strong>Set this repo as the active mirror remote?</strong> Future
-            exports from vault <code>{vaultName}</code> would push back to{" "}
-            <code>{remoteUrl}</code>. Skip if you'd rather keep them separate —
-            see the "one vault per remote" note above.
+            <strong>Sync not enabled.</strong> {result.sync_warning}
           </p>
-          <div className="actions">
+          <p className="dim" style={{ marginBottom: 0, fontSize: "0.9em" }}>
+            You can still set up Sync from the{" "}
             <button
               type="button"
-              onClick={() => {
-                // We don't auto-wire from here today (the existing
-                // GitRemoteSection above handles credential flow + repo
-                // selection). Closing the offer + scrolling the operator
-                // to the GitRemoteSection is the right next step.
-                // Reviewer-flagged on #390: was selecting `.section h3`
-                // (the FIRST `.section` on the page — the StatusCard's
-                // heading near the top), so the scroll landed nowhere
-                // useful. Pinned to the id we added on GitRemoteSection.
-                setWireOffered(false);
+              onClick={() =>
                 document
                   .getElementById("git-remote-section")
-                  ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" })
+              }
+              style={{
+                background: "none",
+                border: "none",
+                padding: 0,
+                color: "var(--accent)",
+                textDecoration: "underline",
+                cursor: "pointer",
+                fontSize: "inherit",
               }}
             >
-              Yes — configure mirror push above
-            </button>
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => setWireOffered(false)}
-            >
-              No, keep import-only
-            </button>
-          </div>
+              Git remote section
+            </button>{" "}
+            above.
+          </p>
         </div>
       ) : null}
 

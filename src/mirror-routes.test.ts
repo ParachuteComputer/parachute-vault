@@ -11,7 +11,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { defaultMirrorConfig, type MirrorConfig } from "./mirror-config.ts";
+import {
+  defaultMirrorConfig,
+  readMirrorConfigForVault,
+  writeMirrorConfigForVault,
+  type MirrorConfig,
+} from "./mirror-config.ts";
 import {
   MirrorManager,
   type MirrorDeps,
@@ -1112,6 +1117,28 @@ const spawnCloneFail: GitSpawn = async () => ({
   timedOut: false,
 });
 
+/**
+ * vault#416 — a MirrorManager wired to the REAL per-vault config file (so
+ * `handleMirrorImport`'s `readMirrorConfigForVault` agrees with what
+ * `manager.reload()` wrote) + a no-op export. Passed to `handleMirrorImport`
+ * as the `managerOverride` so the sync-enable step has a live manager without
+ * standing up the registry factory. Bootstrap (git init of the internal
+ * mirror) runs for real; push to a fake remote fails non-fatally (we assert
+ * on persisted config + credentials, not on a landed push).
+ */
+function makeSyncManager(home: string): MirrorManager {
+  process.env.PARACHUTE_HOME = home;
+  process.env.HOME = home;
+  const deps: MirrorDeps = {
+    vaultName: "default",
+    runExport: async () => ({ notes: 0 }),
+    firstChangedNoteTitle: async () => "",
+    readMirrorConfig: () => readMirrorConfigForVault("default"),
+    writeMirrorConfig: (c) => writeMirrorConfigForVault("default", c),
+  };
+  return new MirrorManager(deps);
+}
+
 describe("handleMirrorImport", () => {
   let home: string;
   let fixture: string;
@@ -1391,6 +1418,381 @@ describe("handleMirrorImport", () => {
     const joined = observedArgv!.join(" ");
     expect(joined).toContain("ghp_per_call_only");
     expect(joined).not.toContain("ghp_stored_xyz");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#416 — auto-enable sync to the imported repo (default-on, opt-out).
+// ---------------------------------------------------------------------------
+
+describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
+  let home: string;
+  let fixture: string;
+  let manager: MirrorManager;
+
+  afterEach(async () => {
+    if (manager) await manager.stop();
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    if (fixture) fs.rmSync(fixture, { recursive: true, force: true });
+    _resetImportInFlightForTest();
+    clearVaultStoreCache();
+  });
+
+  test("enable_sync true + PAT auth → mirror configured, creds persisted, auto_push on, sync_enabled true", async () => {
+    home = tmp("import-sync-pat-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      notes_imported: number;
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    expect(body.notes_imported).toBe(2);
+    expect(body.sync_enabled).toBe(true);
+    expect(body.sync_warning).toBeUndefined();
+
+    // Mirror config persisted with auto_push + enabled.
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(true);
+    expect(cfg?.auto_push).toBe(true);
+
+    // Credentials persisted, pointing at the imported remote.
+    const creds = readCredentials("default");
+    expect(creds?.active_method).toBe("pat");
+    expect(creds?.pat?.token).toBe("ghp_import_token_abc");
+    expect(creds?.pat?.remote_url).toContain("github.com/aaron/my-vault.git");
+  });
+
+  test("enable_sync false → no mirror configured, sync_enabled false, no warning", async () => {
+    home = tmp("import-sync-optout-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: false,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    expect(body.sync_enabled).toBe(false);
+    expect(body.sync_warning).toBeUndefined();
+
+    // Nothing configured.
+    expect(readMirrorConfigForVault("default")).toBeUndefined();
+    expect(readCredentials("default")).toBeNull();
+  });
+
+  test("enable_sync true + auth none → sync_enabled false + needs-write-creds warning; no broken mirror", async () => {
+    home = tmp("import-sync-nocreds-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      notes_imported: number;
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    // Import still succeeded.
+    expect(body.notes_imported).toBe(2);
+    expect(body.sync_enabled).toBe(false);
+    expect(body.sync_warning).toContain("write credentials");
+
+    // No mirror left configured, no credentials written.
+    expect(readMirrorConfigForVault("default")).toBeUndefined();
+    expect(readCredentials("default")).toBeNull();
+  });
+
+  test("enable_sync defaults to true when omitted", async () => {
+    home = tmp("import-sync-default-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_default_on_token" },
+        // enable_sync omitted — should default ON.
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sync_enabled: boolean };
+    expect(body.sync_enabled).toBe(true);
+    expect(readMirrorConfigForVault("default")?.auto_push).toBe(true);
+  });
+
+  test("existing mirror to a DIFFERENT remote → not clobbered, sync_enabled false + conflict warning", async () => {
+    home = tmp("import-sync-conflict-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    // Pre-existing mirror config (enabled) + credential pointing elsewhere.
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      auto_push: true,
+    });
+    writeCredentials("default", {
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        token: "ghp_existing_other",
+        remote_url:
+          "https://x-access-token:ghp_existing_other@github.com/aaron/OTHER-repo.git",
+        label: "existing backup",
+      },
+    });
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    expect(body.sync_enabled).toBe(false);
+    expect(body.sync_warning).toContain("already syncs to a different repo");
+
+    // The existing credential was NOT clobbered.
+    const creds = readCredentials("default");
+    expect(creds?.pat?.token).toBe("ghp_existing_other");
+    expect(creds?.pat?.remote_url).toContain("OTHER-repo.git");
+  });
+
+  test("existing mirror to the SAME remote → no-op success (sync_enabled true)", async () => {
+    home = tmp("import-sync-same-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      auto_push: true,
+    });
+    writeCredentials("default", {
+      active_method: "pat",
+      github_oauth: null,
+      pat: {
+        token: "ghp_same_token",
+        remote_url:
+          "https://x-access-token:ghp_same_token@github.com/aaron/my-vault.git",
+        label: "existing same",
+      },
+    });
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_same_token" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    expect(body.sync_enabled).toBe(true);
+    expect(body.sync_warning).toBeUndefined();
+  });
+
+  test("existing GitHub-connected mirror → PAT import doesn't clobber it (sync_enabled false + warning)", async () => {
+    home = tmp("import-sync-oauth-conflict-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      auto_push: true,
+    });
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_existing_oauth",
+        scope: "repo",
+        authorized_at: "2026-05-28T00:00:00.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    expect(body.sync_enabled).toBe(false);
+    expect(body.sync_warning).toContain("connected GitHub account");
+
+    // The existing OAuth credential is untouched (not switched to a PAT).
+    const creds = readCredentials("default");
+    expect(creds?.active_method).toBe("github_oauth");
+    expect(creds?.pat).toBeNull();
+  });
+
+  test("sync-setup failure after a successful import → import result still returned, sync_enabled false + warning", async () => {
+    home = tmp("import-sync-setupfail-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    // Force the sync-enable step to throw by stubbing the manager's reload.
+    // The import itself has already succeeded by the time reload runs, so the
+    // request must still return a 200 with the import counts intact.
+    manager.reload = async () => {
+      throw new Error("boom: simulated reload failure");
+    };
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      notes_imported: number;
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    // Import NOT lost.
+    expect(body.notes_imported).toBe(2);
+    expect(body.sync_enabled).toBe(false);
+    expect(body.sync_warning).toContain("enabling Sync failed");
+  });
+
+  test("invalid enable_sync type → 400 validation error", async () => {
+    home = tmp("import-sync-badtype-");
+    await bootstrapVault(home);
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+        enable_sync: "yes",
+      }),
+    });
+    const res = await handleMirrorImport(req, "default");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { field: string };
+    expect(body.field).toBe("enable_sync");
   });
 });
 

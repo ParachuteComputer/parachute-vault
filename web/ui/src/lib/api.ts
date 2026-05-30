@@ -522,6 +522,12 @@ export interface MirrorImportRequest {
   remote_url: string;
   mode: "merge" | "replace";
   credentials: MirrorImportCredentials;
+  /**
+   * vault#416 — also enable sync (mirror push-back) to the imported repo,
+   * reusing the import credentials. DEFAULT TRUE on the server when omitted;
+   * the UI sends the checkbox state explicitly.
+   */
+  enable_sync?: boolean;
 }
 
 export interface MirrorImportResult {
@@ -531,6 +537,19 @@ export interface MirrorImportResult {
   /** Only set when `mode === "replace"`. */
   notes_deleted?: number;
   warnings: string[];
+  /**
+   * vault#416 — whether sync to the imported repo ended up enabled. True
+   * when push-back is now wired; false when opted out, blocked (no push
+   * credentials / a different mirror already configured), or sync-setup
+   * failed (the import still succeeded).
+   */
+  sync_enabled: boolean;
+  /**
+   * Human-readable reason sync wasn't enabled. Present only when
+   * `sync_enabled` is false and the caller asked for sync. Shown as an
+   * info/warning, NOT an error — the import succeeded regardless.
+   */
+  sync_warning?: string;
 }
 
 /**
