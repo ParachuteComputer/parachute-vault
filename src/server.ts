@@ -347,6 +347,15 @@ const server = Bun.serve({
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id",
+      // Expose response headers a BROWSER-based MCP client (e.g. claude.ai) must
+      // read cross-origin: `WWW-Authenticate` carries the RFC 9728 auth challenge
+      // (the `resource_metadata` PRM URL) the client follows to discover the auth
+      // server — without exposing it, the browser's fetch() can't see it and the
+      // OAuth flow never starts ("Couldn't register with the sign-in service").
+      // `Mcp-Session-Id` is the streamable-HTTP MCP session the client echoes
+      // back. (Claude Code is a CLI → no CORS → unaffected. The hub already
+      // exposes WWW-Authenticate; this matches it on the resource server.)
+      "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
     };
 
     if (req.method === "OPTIONS") {
