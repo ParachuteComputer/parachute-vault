@@ -28,8 +28,27 @@
 
 import { getHubOrigin } from "./hub-jwt.ts";
 
-/** OAuth scopes vault publishes through discovery; see scopes.ts for enforcement. */
-const SCOPES_SUPPORTED = ["vault:read", "vault:write", "vault:admin"];
+/**
+ * OAuth scopes vault publishes through discovery, RESOURCE-NARROWED to the
+ * specific vault instance the metadata document describes.
+ *
+ * This MUST be narrowed (`vault:<name>:<verb>`), not broad (`vault:<verb>`).
+ * Post auth-unification (vault#282/#412), vault is a pure hub resource server
+ * that REJECTS broad `vault:<verb>` tokens (`findBroadVaultScopes` → 401) and
+ * requires `vault:<name>:<verb>` scopes carrying `aud=vault.<name>`. A
+ * spec-following MCP client (e.g. Claude) reads `scopes_supported` from this
+ * PRM and requests exactly those scopes; if we advertise broad `vault:read`
+ * the client gets a token stamped `aud=vault` and the per-vault MCP endpoint
+ * rejects it ("audience mismatch: expected vault.<name>, got vault") — the
+ * "Authorization with the MCP server failed" symptom. Advertising the narrowed
+ * shape makes the client request the scope vault will actually accept. The
+ * hub's RFC 8707 resource-binding narrows too, but only when the client echoes
+ * the `resource` param — advertising narrowed scopes here is the belt that
+ * works regardless. See scopes.ts for enforcement.
+ */
+function scopesSupportedFor(vaultName: string): string[] {
+  return [`vault:${vaultName}:read`, `vault:${vaultName}:write`, `vault:${vaultName}:admin`];
+}
 
 /**
  * Public-facing base URL of the server. Honors `x-forwarded-*` headers so a
@@ -63,7 +82,7 @@ export function handleProtectedResource(req: Request, vaultName: string): Respon
   return Response.json({
     resource: `${base}${prefix}/mcp`,
     authorization_servers: [getHubOrigin()],
-    scopes_supported: SCOPES_SUPPORTED,
+    scopes_supported: scopesSupportedFor(vaultName),
     bearer_methods_supported: ["header"],
   });
 }
@@ -78,7 +97,7 @@ export function handleProtectedResource(req: Request, vaultName: string): Respon
  * land here and discover the hub's actual endpoints; conformant clients that
  * probe AS metadata directly at the vault path get the same answer.
  */
-export function handleAuthorizationServer(_req: Request, _vaultName: string): Response {
+export function handleAuthorizationServer(_req: Request, vaultName: string): Response {
   const hub = getHubOrigin();
   return Response.json({
     issuer: hub,
@@ -90,6 +109,6 @@ export function handleAuthorizationServer(_req: Request, _vaultName: string): Re
     code_challenge_methods_supported: ["S256"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
-    scopes_supported: SCOPES_SUPPORTED,
+    scopes_supported: scopesSupportedFor(vaultName),
   });
 }
