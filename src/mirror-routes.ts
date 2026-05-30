@@ -26,16 +26,20 @@
 
 import {
   defaultMirrorConfig,
+  readMirrorConfigForVault,
   validateExternalPath,
   validateMirrorConfigShape,
   type MirrorConfig,
 } from "./mirror-config.ts";
 import type { MirrorManager } from "./mirror-manager.ts";
+import { getMirrorManager } from "./mirror-registry.ts";
 import {
   applyToGitRemote,
   deleteCredentials,
   emptyCredentials,
+  githubAuthedRemoteUrl,
   readCredentials,
+  redactRemoteUrl,
   sanitizeCredentials,
   unsetGitRemote,
   writeCredentials,
@@ -1106,15 +1110,32 @@ export async function applyCredentialsToMirror(
 //     "mode": "merge" | "replace",
 //     "credentials": null
 //       | { "kind": "pat", "token": "ghp_..." }
-//       | { "kind": "none" }
+//       | { "kind": "none" },
+//     "enable_sync": true   // optional, DEFAULT TRUE
 //   }
 //
 // `credentials: null` means "use the stored mirror credentials." Passing
-// `{kind: "pat", token}` is the one-shot path — token doesn't get persisted.
+// `{kind: "pat", token}` is the one-shot path — token doesn't get persisted
+// for the CLONE, but IS persisted when sync is enabled (it's the push
+// credential for the now-configured mirror).
+//
+// `enable_sync` (vault#416) — DEFAULT TRUE when omitted. After a successful
+// import, auto-enable mirror push-back to the SAME repo, reusing the import's
+// credentials. Makes "import a repo" and "back up to that repo going forward"
+// one fluid flow. The UI ships a checked-by-default checkbox the operator can
+// uncheck. Edge cases (handled in `enableSyncToImportedRepo`, never fail the
+// whole import):
+//   - `auth: none` (public repo, no push creds) → skip + warn (can't push
+//     without a credential).
+//   - A mirror already points at a DIFFERENT remote → skip + warn (don't
+//     clobber the operator's existing backup target).
+//   - A mirror already points at the SAME remote → no-op success.
+//   - Sync setup throws → import result still returned (success);
+//     `sync_enabled: false` + a warning. Import success is never lost.
 //
 // Response:
 //   200 { notes_imported, tags_imported, attachments_imported,
-//         notes_deleted?, warnings }
+//         notes_deleted?, warnings, sync_enabled, sync_warning? }
 //   400 { error, error_type, message }  — validation / not-a-vault-export
 //   409 { error, error_type, message }  — concurrent import for this vault
 //   502 { error, message }              — clone failed (auth, network, …)
@@ -1136,17 +1157,25 @@ export async function applyCredentialsToMirror(
  * `whichOverride` is a test seam for the git-presence preflight (default
  * `Bun.which` inside `cloneAndImport`). Inject a fn returning `null` to
  * exercise the git_not_installed 503 path without uninstalling git.
+ *
+ * `managerOverride` is a test seam for the post-import sync-enable step
+ * (vault#416). Production callers omit it; the route resolves the per-vault
+ * manager via `getMirrorManager(vaultName)` (same registry the auth /
+ * run-now / push-now routes use). Tests inject a manager so they can assert
+ * on the config it ends up with without standing up the full registry.
  */
 export async function handleMirrorImport(
   req: Request,
   vaultName: string,
   spawnOverride?: GitSpawn,
   whichOverride?: (cmd: string) => string | null,
+  managerOverride?: MirrorManager,
 ): Promise<Response> {
   let body: {
     remote_url?: unknown;
     mode?: unknown;
     credentials?: unknown;
+    enable_sync?: unknown;
   };
   try {
     body = (await req.json()) as Record<string, unknown>;
@@ -1239,6 +1268,25 @@ export async function handleMirrorImport(
     );
   }
 
+  // vault#416: `enable_sync` defaults TRUE when omitted — the default-on UX.
+  // Only a literal `false` opts out; any other type is a validation error so
+  // a malformed body never silently flips the default.
+  let enableSync = true;
+  if ("enable_sync" in body && body.enable_sync !== undefined) {
+    if (typeof body.enable_sync !== "boolean") {
+      return Response.json(
+        {
+          error: "enable_sync invalid",
+          error_type: "validation",
+          field: "enable_sync",
+          message: "enable_sync must be a boolean (defaults to true when omitted).",
+        },
+        { status: 400 },
+      );
+    }
+    enableSync = body.enable_sync;
+  }
+
   // Resolve the target vault's store + assets dir. The route is gated on
   // `vault:<name>:admin`, so we trust vaultName is real by the time we
   // reach this code path; defensively re-resolve in case the vault was
@@ -1311,7 +1359,368 @@ export async function handleMirrorImport(
     );
   }
 
+  // ---- vault#416: auto-enable sync to the imported repo (default-on) -------
+  //
+  // The import SUCCEEDED above. From here on, every failure is non-fatal —
+  // we never lose a successful import to a sync-setup error. `result` already
+  // carries `sync_enabled: false` (set by importResultFromStats); we flip it
+  // true only when sync is actually wired (or already wired to this remote).
+  if (enableSync) {
+    try {
+      const manager =
+        managerOverride ?? getMirrorManager(vaultName) ?? undefined;
+      const outcome = await enableSyncToImportedRepo({
+        vaultName,
+        remoteUrl: remote_url,
+        auth,
+        manager,
+      });
+      result.sync_enabled = outcome.sync_enabled;
+      if (outcome.warning) result.sync_warning = outcome.warning;
+    } catch (err) {
+      // Defense-in-depth: enableSyncToImportedRepo is written to not throw
+      // (it catches its own write/credential/reload errors), but a future
+      // edit or an unexpected throw must NOT take down a successful import.
+      const msg = redactToken((err as Error).message ?? String(err));
+      console.warn(
+        `[mirror-import] sync-enable threw after a successful import (non-fatal): ${msg}`,
+      );
+      result.sync_enabled = false;
+      result.sync_warning =
+        "Import succeeded, but enabling Sync failed. Set up Sync separately from the Git remote section.";
+    }
+  }
+
   return Response.json(result, {
     headers: { "Access-Control-Allow-Origin": "*" },
   });
+}
+
+// ---------------------------------------------------------------------------
+// vault#416 — sync-enable after a successful import.
+// ---------------------------------------------------------------------------
+
+/**
+ * After a successful import, turn the imported-from repo into a configured,
+ * credential-backed, auto-pushing mirror — reusing the import's credentials.
+ * This is the back half of the default-on "import → also sync back" flow.
+ *
+ * Reuses the SAME machinery the manual mirror-setup flow uses:
+ *   - `writeCredentials` to persist the push credential (per-vault, vault#399).
+ *   - `MirrorConfig` + `manager.reload()` to enable `auto_push` and restart
+ *     the lifecycle — which calls `applyCredentialsToRemote` to set `origin`
+ *     from the stored credentials (exactly like handleAuthPat /
+ *     handleAuthGithubSelectRepo do).
+ *
+ * Mirror location is left `internal` (vault-managed dir under the vault's
+ * data dir) — the import didn't ask the operator to pick an external path,
+ * and `auto_push + internal + credentials` is the supported "push to a
+ * GitHub/GitLab remote" shape (see mirror-config.ts validation note). The
+ * remote lives in credentials, not the config; that's why we persist
+ * credentials AND flip auto_push.
+ *
+ * Never throws — every failure path returns `{ sync_enabled: false, warning }`.
+ * The import already succeeded by the time this runs; a sync-setup error must
+ * not be surfaced as an import failure.
+ *
+ * Edge cases (returns `sync_enabled: false` + a warning, no broken mirror
+ * left behind):
+ *   - **No push-capable credential** — `auth: none`, OR `credentialsFile`
+ *     with no stored credential that covers this remote's host. Can't push
+ *     without a credential; skip rather than configure a mirror that would
+ *     just fail every push.
+ *   - **A mirror already targets a DIFFERENT remote** — don't clobber the
+ *     operator's existing backup target. Detected by comparing the existing
+ *     stored credential's remote host/path against the import remote.
+ *   - **A mirror already targets the SAME remote** — no-op success.
+ */
+export async function enableSyncToImportedRepo(opts: {
+  vaultName: string;
+  remoteUrl: string;
+  auth: ImportAuth;
+  /**
+   * The per-vault mirror manager. Undefined only in the boot-race window
+   * where the registry factory hasn't been installed; we then skip (warn)
+   * rather than persisting a half-configured mirror with no live manager.
+   */
+  manager: MirrorManager | undefined;
+}): Promise<{ sync_enabled: boolean; warning?: string }> {
+  const { vaultName, remoteUrl, auth, manager } = opts;
+
+  if (!manager) {
+    return {
+      sync_enabled: false,
+      warning:
+        "Sync not enabled — the vault's mirror manager wasn't ready. Set up Sync from the Git remote section.",
+    };
+  }
+
+  // --- Resolve the push credential we'll persist for this remote. ----------
+  // We need a credential that can PUSH to `remoteUrl`. The clone-time auth
+  // shapes map onto push credentials as follows:
+  //   - pat            → persist the supplied PAT against this remote.
+  //   - none           → no push credential; cannot enable a working sync.
+  //   - credentialsFile → reuse the already-stored credential, but only if it
+  //                       actually covers this remote's host (a stored PAT for
+  //                       a different host can't push here).
+  let credentialToWrite: MirrorCredentials | null = null;
+
+  if (auth.kind === "none") {
+    return {
+      sync_enabled: false,
+      warning:
+        "Sync not enabled — pushing changes back needs write credentials (a PAT or GitHub sign-in). Set up Sync separately to enable it.",
+    };
+  }
+
+  if (auth.kind === "pat") {
+    // Persist the supplied PAT against this remote — the same x-access-token
+    // embedding the manual PAT route stores, so bare `git push` works.
+    const embedded = embedTokenInRemoteUrl(remoteUrl, auth.token);
+    if (!embedded) {
+      return {
+        sync_enabled: false,
+        warning:
+          "Sync not enabled — the remote URL couldn't be parsed to embed the access token. Set up Sync separately from the Git remote section.",
+      };
+    }
+    credentialToWrite = {
+      ...(readCredentials(vaultName) ?? emptyCredentials()),
+      active_method: "pat",
+      pat: {
+        token: auth.token,
+        remote_url: embedded,
+        label: "Imported-repo sync",
+      },
+    };
+  }
+
+  // For credentialsFile we DON'T overwrite — we reuse what's already stored,
+  // but must verify it covers this remote (host match). Resolve the existing
+  // credential's effective remote so the conflict check below has something
+  // to compare against.
+  const existing = readCredentials(vaultName);
+
+  // --- Conflict / idempotency check against any already-configured mirror. --
+  // The mirror's remote lives in credentials, not in MirrorConfig. Compare
+  // the existing stored credential's remote against the import remote.
+  const persistedConfig = readMirrorConfigForVault(vaultName);
+  const mirrorAlreadyConfigured = !!persistedConfig && persistedConfig.enabled;
+  const existingRemote = existing ? effectiveRemoteOf(existing) : null;
+
+  if (mirrorAlreadyConfigured && existingRemote) {
+    if (sameRemote(existingRemote, remoteUrl)) {
+      // Same remote — make sure auto_push is on, then no-op success. We don't
+      // need to rewrite credentials (credentialsFile) or can refresh the PAT
+      // (pat path) — either way the mirror already points here.
+      if (auth.kind === "pat" && credentialToWrite) {
+        try {
+          writeCredentials(vaultName, credentialToWrite);
+        } catch (err) {
+          return {
+            sync_enabled: false,
+            warning: `Import succeeded; mirror already targets this repo but the credential refresh failed: ${redactToken((err as Error).message ?? String(err))}`,
+          };
+        }
+      }
+      return await applyEnabledAutoPush(manager);
+    }
+    // Different remote — don't clobber the operator's existing backup target.
+    return {
+      sync_enabled: false,
+      warning: `Sync not enabled — this vault already syncs to a different repo (${redactRemoteUrl(existingRemote)}). Leaving your existing backup target untouched. Change it from the Git remote section if you want to switch.`,
+    };
+  }
+
+  // A mirror is already configured + enabled with an active credential, but we
+  // couldn't read its remote to compare (github_oauth stores no owner/repo at
+  // the credential level — its remote lives on the mirror dir's `origin`). To
+  // avoid clobbering an existing GitHub-connected backup target by switching
+  // `active_method` to a PAT, refuse unless the existing credential is OAuth
+  // and this is the same GitHub host (then the manual select-repo flow already
+  // points origin where it should; we treat that as "already set up — leave
+  // it"). Conservative: don't auto-switch an existing connected mirror.
+  if (
+    mirrorAlreadyConfigured &&
+    existing?.active_method === "github_oauth" &&
+    existing.github_oauth
+  ) {
+    return {
+      sync_enabled: false,
+      warning:
+        "Sync not enabled — this vault already syncs via a connected GitHub account. Leaving your existing backup target untouched. Switch it from the Git remote section if you want to point sync at this repo instead.",
+    };
+  }
+
+  // --- No conflicting mirror. Wire it up. ----------------------------------
+  if (auth.kind === "credentialsFile") {
+    // Reuse the stored credential — but only if it can push to this remote.
+    const covers = existing && existingRemote && sameRemote(existingRemote, remoteUrl);
+    const hasOauthForGithub =
+      existing?.active_method === "github_oauth" &&
+      !!existing.github_oauth &&
+      isGithubRemote(remoteUrl);
+    if (!covers && !hasOauthForGithub) {
+      return {
+        sync_enabled: false,
+        warning:
+          "Sync not enabled — no saved credential can push to this repo. Connect GitHub or paste a Personal Access Token in the Git remote section to enable Sync.",
+      };
+    }
+    if (existing?.active_method === "github_oauth" && hasOauthForGithub) {
+      // OAuth path: persist origin via the github authed URL, same as the
+      // select-repo flow. Parse owner/repo from the import remote.
+      const ownerRepo = parseGithubOwnerRepo(remoteUrl);
+      if (!ownerRepo) {
+        return {
+          sync_enabled: false,
+          warning:
+            "Sync not enabled — couldn't parse owner/repo from the GitHub URL. Pick the repo from the Git remote section to enable Sync.",
+        };
+      }
+      const status = manager.getStatus();
+      const authedUrl = githubAuthedRemoteUrl(
+        existing.github_oauth!.access_token,
+        ownerRepo.owner,
+        ownerRepo.repo,
+      );
+      if (status.mirror_path) {
+        await applyToGitRemote(status.mirror_path, authedUrl);
+      }
+      // Stash a PAT-shaped credential so a restart re-applies the right
+      // origin without needing the operator to re-pick the repo. (The OAuth
+      // token works through the same x-access-token shape.) This mirrors how
+      // applyCredentialsToRemote refreshes github origins on restart.
+      credentialToWrite = {
+        ...existing,
+        active_method: "github_oauth",
+      };
+    }
+    // covers === true → existing PAT already targets this remote; nothing to
+    // re-persist. Fall through to enabling auto_push.
+  }
+
+  if (credentialToWrite) {
+    try {
+      writeCredentials(vaultName, credentialToWrite);
+    } catch (err) {
+      return {
+        sync_enabled: false,
+        warning: `Import succeeded, but saving the sync credential failed: ${redactToken((err as Error).message ?? String(err))}. Set up Sync separately from the Git remote section.`,
+      };
+    }
+  }
+
+  return await applyEnabledAutoPush(manager);
+}
+
+/**
+ * Flip the mirror config to `enabled: true, auto_push: true` (internal
+ * location) and reload the manager — which applies the just-persisted
+ * credentials to `origin` and starts the event-driven export loop. Returns
+ * the sync outcome; reload failures are non-fatal (import already succeeded).
+ */
+async function applyEnabledAutoPush(
+  manager: MirrorManager,
+): Promise<{ sync_enabled: boolean; warning?: string }> {
+  const current = manager.getEffectiveConfig();
+  const next: MirrorConfig = {
+    ...current,
+    enabled: true,
+    // Keep the operator's existing location if they'd set external; default
+    // internal for the fresh case. Internal + credentials is the supported
+    // "push to a hosted remote" shape.
+    location: current.location,
+    auto_push: true,
+  };
+  try {
+    await manager.reload(next);
+  } catch (err) {
+    return {
+      sync_enabled: false,
+      warning: `Import succeeded, but enabling Sync failed: ${redactToken((err as Error).message ?? String(err))}. Set up Sync separately from the Git remote section.`,
+    };
+  }
+  // reload → start sets status.enabled iff bootstrap succeeded. If bootstrap
+  // failed (e.g. git-less host, though import would've 503'd earlier), surface
+  // that rather than claiming sync is on.
+  const status = manager.getStatus();
+  if (!status.enabled) {
+    return {
+      sync_enabled: false,
+      warning: status.last_error
+        ? `Import succeeded, but the mirror couldn't start: ${redactToken(status.last_error)}`
+        : "Import succeeded, but the mirror couldn't start. Check the Git remote section.",
+    };
+  }
+  return { sync_enabled: true };
+}
+
+/**
+ * Embed an x-access-token credential into an HTTPS remote URL, the same shape
+ * the manual PAT route persists. Returns null when the URL can't be parsed or
+ * isn't http(s) (SSH / local-path remotes can't carry a token in userinfo —
+ * those rely on the operator's ssh-agent, so there's no push credential for
+ * us to embed). When the URL already carries userinfo, trust it verbatim.
+ */
+function embedTokenInRemoteUrl(remoteUrl: string, token: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(remoteUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password) return remoteUrl;
+  parsed.username = "x-access-token";
+  parsed.password = token;
+  return parsed.toString();
+}
+
+/**
+ * The remote a stored credential effectively pushes to:
+ *   - pat → its `remote_url` (userinfo-embedded; comparison strips userinfo).
+ *   - github_oauth → null here (no owner/repo stored at the credential level;
+ *     the origin is set when a repo is picked). Callers treat null as "no
+ *     known remote to conflict with."
+ */
+function effectiveRemoteOf(creds: MirrorCredentials): string | null {
+  if (creds.active_method === "pat" && creds.pat) return creds.pat.remote_url;
+  return null;
+}
+
+/**
+ * Compare two remote URLs ignoring userinfo (embedded tokens) + a trailing
+ * `.git` + a trailing slash, case-insensitively on host. "Same repo" for the
+ * clobber check. Falls back to a trimmed string compare for non-URL remotes
+ * (SSH shorthand, local paths).
+ */
+function sameRemote(a: string, b: string): boolean {
+  const norm = (u: string): string => {
+    try {
+      const url = new URL(u);
+      const host = url.host.toLowerCase();
+      const path = url.pathname.replace(/\.git$/, "").replace(/\/+$/, "");
+      return `${url.protocol}//${host}${path}`;
+    } catch {
+      return u.trim().replace(/\.git$/, "").replace(/\/+$/, "");
+    }
+  };
+  return norm(a) === norm(b);
+}
+
+/** True when a remote URL is on github.com (host-exact, case-insensitive). */
+function isGithubRemote(remoteUrl: string): boolean {
+  try {
+    return new URL(remoteUrl).host.toLowerCase() === "github.com";
+  } catch {
+    return false;
+  }
+}
+
+/** Parse `owner` + `repo` out of a github.com HTTPS URL. Null when it doesn't match. */
+function parseGithubOwnerRepo(remoteUrl: string): { owner: string; repo: string } | null {
+  const match = remoteUrl.match(/github\.com[/:]([^/]+)\/([^/.]+?)(?:\.git)?(?:\/)?$/i);
+  if (!match) return null;
+  return { owner: match[1]!, repo: match[2]! };
 }

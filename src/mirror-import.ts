@@ -154,6 +154,29 @@ export interface ImportResult {
    * etc.). The HTTP handler returns these so the operator can audit.
    */
   warnings: string[];
+  /**
+   * vault#416 — whether sync (mirror push-back to the imported repo) ended
+   * up enabled as part of this import. Default-on UX: the import request
+   * carries `enable_sync` (default true), and the route turns the imported
+   * repo into a configured, credential-backed, auto-pushing mirror after a
+   * successful import. `true` when sync is now wired (or was already wired
+   * to this same remote); `false` when sync was opted out, couldn't be
+   * enabled (no push-capable credentials), was skipped to avoid clobbering
+   * a different existing mirror, or threw during setup (import already
+   * succeeded — never lost to a sync error).
+   *
+   * `cloneAndImport` itself never sets these — the field is populated by the
+   * route (`handleMirrorImport`) after a successful import. `importResultFromStats`
+   * defaults `sync_enabled` to false; the route overwrites it.
+   */
+  sync_enabled: boolean;
+  /**
+   * Human-readable reason sync wasn't enabled (no creds / conflicting
+   * existing mirror / setup error). Only set when `sync_enabled` is false
+   * AND the caller asked for sync (`enable_sync !== false`). Absent when
+   * sync succeeded or the operator opted out.
+   */
+  sync_warning?: string;
 }
 
 /**
@@ -500,6 +523,10 @@ function importResultFromStats(
     tags_imported: stats.schemas_restored,
     attachments_imported: stats.attachments_restored,
     warnings,
+    // Default false; the route flips it true after wiring sync. Keeping the
+    // default here means a caller that bypasses the route (CLI, tests of
+    // cloneAndImport directly) gets a well-typed, conservative result.
+    sync_enabled: false,
   };
   if (mode === "replace") {
     result.notes_deleted = stats.notes_wiped;

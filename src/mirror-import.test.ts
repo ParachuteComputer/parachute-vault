@@ -297,6 +297,10 @@ describe("cloneAndImport — success", () => {
     expect(result.notes_imported).toBe(2); // alpha + beta
     expect(result.notes_deleted).toBeUndefined();
     expect(result.warnings).toEqual([]);
+    // vault#416: cloneAndImport stays focused on content — sync-enabling is
+    // the route's job. The worker always returns sync_enabled: false.
+    expect(result.sync_enabled).toBe(false);
+    expect(result.sync_warning).toBeUndefined();
 
     const restored = await store.getNote("n-alpha");
     expect(restored).toBeTruthy();
