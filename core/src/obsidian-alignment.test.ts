@@ -150,6 +150,18 @@ describe("alignment: parse tier", () => {
     expect(n.frontmatter).toEqual({});
   });
 
+  it("FX-PATH-OVERRIDE-EXT — frontmatter path: override is extension-stripped", () => {
+    // Pins contract §1.8: a `path:` override ending in .md/.markdown has
+    // its extension stripped (matches the web side). A real web-side
+    // divergence here stayed green because nothing pinned the invariant.
+    const n = parseFixture("deep/orig.md", "---\npath: My/Note.md\n---\nbody");
+    expect(n.path).toBe("My/Note");
+    expect(tags(n)).toEqual([]);
+    expect(n.id).toBeUndefined();
+    expect(n.content).toBe("body");
+    expect(n.frontmatter).toEqual({});
+  });
+
   it("FX-PATH-NORMALIZE — backslash + collapse + case-preserve", () => {
     // Frontmatter path value: \Win\Path\\x\  (double-quoted in YAML).
     const n = parseFixture("X.md", '---\npath: "\\\\Win\\\\Path\\\\\\\\x\\\\"\n---\nb');
