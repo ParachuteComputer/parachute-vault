@@ -2091,11 +2091,29 @@ export function parseFrontmatter(raw: string): {
   frontmatter: Record<string, unknown>;
   content: string;
 } {
-  if (!raw.startsWith("---")) return { frontmatter: {}, content: raw };
-  const endIdx = raw.indexOf("\n---", 3);
-  if (endIdx === -1) return { frontmatter: {}, content: raw };
-  const yamlBlock = raw.slice(4, endIdx); // skip opening "---\n"
-  const content = raw.slice(endIdx + 4).replace(/^\n/, "");
+  // 1. Strip a leading UTF-8 BOM (U+FEFF) if present. Without this an
+  //    Obsidian export saved with a BOM (`﻿---\n…`) fails the open
+  //    test and the whole file — frontmatter included — falls into the
+  //    body, silently losing id/tags/timestamps (contract FX-FENCE-BOM).
+  const src = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+
+  // 2. Line-scan close-fence (CRLF-aware). The opening line must be
+  //    EXACTLY `---`; the closing fence is the FIRST subsequent line that
+  //    is EXACTLY `---` — not `----`, not `---text`, not `  ---`. An
+  //    unclosed block means the whole file is body (never swallow). This
+  //    replaces the old `indexOf("\n---")` which wrongly matched `\n----`
+  //    and `\n---more` (contract §1.1, FX-FENCE-FOURDASH-OPEN).
+  const lines = src.split(/\r?\n/);
+  if (lines[0] !== "---") return { frontmatter: {}, content: src };
+
+  let closeIdx = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i] === "---") { closeIdx = i; break; }
+  }
+  if (closeIdx === -1) return { frontmatter: {}, content: src };
+
+  const yamlBlock = lines.slice(1, closeIdx).join("\n");
+  const content = lines.slice(closeIdx + 1).join("\n");
   return { frontmatter: parseBlock(yamlBlock, 0).value, content };
 }
 
@@ -2119,11 +2137,16 @@ function parseBlock(text: string, baseIndent: number): ParseResult {
   while (i < lines.length) {
     const line = lines[i]!;
     if (line.trim() === "") { i++; continue; }
+    // Skip `#`-comment lines (contract C3 / §1.2). A comment at the
+    // block's base level is not a key line; the parser must step over it.
+    if (line.trimStart().startsWith("#")) { i++; continue; }
     const indent = countLeadingSpaces(line);
     if (indent < baseIndent) break;
     if (indent > baseIndent) { i++; continue; } // shouldn't happen at this level
 
-    const kv = line.slice(baseIndent).match(/^([\w][\w-]*):\s*(.*)$/);
+    // Key regex (contract C2 / §1.2): dots allowed in keys, optional
+    // whitespace before the colon (`created.at:` / `key :` both parse).
+    const kv = line.slice(baseIndent).match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
     if (!kv) { i++; continue; }
     const key = kv[1]!;
     const valueText = kv[2]!.trim();
@@ -2199,7 +2222,8 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
     // First content after `- `.
     const after = line.slice(indent + 2).trim();
     // Is this a scalar item (`- foo`) or an object item (`- key: value`)?
-    const objMatch = after.match(/^([\w][\w-]*):\s*(.*)$/);
+    // Key regex matches parseBlock's (contract C2): dots + optional space.
+    const objMatch = after.match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
     if (!objMatch) {
       result.push(parseScalarOrInline(after));
       i++;
@@ -2251,7 +2275,7 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
       const sibIndent = countLeadingSpaces(sib);
       if (sibIndent !== itemIndent) break;
       if (sib.slice(sibIndent).startsWith("- ")) break;
-      const sibKv = sib.slice(sibIndent).match(/^([\w][\w-]*):\s*(.*)$/);
+      const sibKv = sib.slice(sibIndent).match(/^([\w][\w.-]*)\s*:\s*(.*)$/);
       if (!sibKv) break;
       const sibKey = sibKv[1]!;
       const sibValue = sibKv[2]!.trim();
@@ -2288,6 +2312,36 @@ function parseArrayBlock(lines: string[], start: number, arrayIndent: number): {
 }
 
 /**
+ * Quote-aware split of an inline-array body on top-level commas
+ * (contract C4 / §1.2). A comma inside a single- or double-quoted string
+ * does not separate items, so `"a, b", c` → `['"a, b"', 'c']`. Quote
+ * chars are preserved in the parts; `parseScalarOrInline` strips them via
+ * `unquote`. Mirrors the web parser's `splitInlineArray`.
+ */
+function splitInlineArray(inner: string): string[] {
+  const parts: string[] = [];
+  let buf = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]!;
+    if (quote) {
+      buf += ch;
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      buf += ch;
+    } else if (ch === ",") {
+      parts.push(buf);
+      buf = "";
+    } else {
+      buf += ch;
+    }
+  }
+  parts.push(buf);
+  return parts;
+}
+
+/**
  * Parse a scalar or inline form (`[a, b]`, `{ k: v }`). Used for the
  * value portion of `key: value` lines.
  */
@@ -2295,7 +2349,10 @@ function parseScalarOrInline(s: string): unknown {
   if (s.startsWith("[") && s.endsWith("]")) {
     const inner = s.slice(1, -1).trim();
     if (inner === "") return [];
-    return inner.split(",").map((part) => parseScalarOrInline(part.trim()));
+    // Quote-aware split (contract C4 / §1.2): a comma inside a quoted
+    // string is NOT an item separator, so `["a, b", c]` → 2 items, not 3.
+    // Matches the web parser's `splitInlineArray`.
+    return splitInlineArray(inner).map((part) => parseScalarOrInline(part.trim()));
   }
   if (s.startsWith("{") && s.endsWith("}")) {
     const inner = s.slice(1, -1).trim();
@@ -2376,18 +2433,59 @@ function unquote(s: string): unknown {
 // Directory walking — shared with obsidian.ts
 // ---------------------------------------------------------------------------
 
-/** Recursively list all .md files in a directory, excluding hidden dirs
- *  (including `.parachute/` and `.obsidian/`). */
+/**
+ * Markdown-file classification (contract §1.7). Case-insensitive `.md`
+ * OR `.markdown`. `.mdx`, `.txt`, etc. are NOT markdown for the importer.
+ * Identical to the web parser's classifier.
+ */
+export function isMarkdownExtension(path: string): boolean {
+  return /\.(md|markdown)$/i.test(path);
+}
+
+/**
+ * Named intake-excluded directory/entry segments (contract §1.9). The
+ * generic `startsWith(".")` rule below subsumes the dot-prefixed ones;
+ * the named set is kept explicit for readability + to cover
+ * `__MACOSX`/`node_modules` (which do not start with ".").
+ */
+const EXCLUDED_SEGMENTS = new Set([
+  ".obsidian",
+  ".trash",
+  ".git",
+  ".parachute",
+  "__MACOSX",
+  "node_modules",
+]);
+
+/**
+ * Intake (file-selection) exclusion (contract §1.9). Excludes a source
+ * path if ANY `/`-segment is a named-excluded entry OR starts with "."
+ * (generic dotfile/dotdir). Applied identically by both parsers before
+ * parsing. The generic dot rule means legit dot-prefixed user files
+ * (`.daily-note.md`) ARE excluded — the chosen, consistent behavior.
+ */
+export function isExcludedPath(sourcePath: string): boolean {
+  for (const segment of sourcePath.split("/")) {
+    if (segment === "") continue;
+    if (EXCLUDED_SEGMENTS.has(segment)) return true;
+    if (segment.startsWith(".")) return true;
+  }
+  return false;
+}
+
+/** Recursively list all .md / .markdown files in a directory, excluding
+ *  hidden + named-internal dirs per the canonical `isExcludedPath` rule
+ *  (`.parachute/`, `.obsidian/`, `node_modules`, …). Legacy import path. */
 export function walkMarkdownFiles(dir: string): string[] {
   const results: string[] = [];
   function walk(current: string) {
     for (const entry of readdirSync(current)) {
-      if (entry.startsWith(".")) continue;
-      if (entry === "node_modules") continue;
+      // Per-segment exclusion: the named set + generic dotfile rule.
+      if (EXCLUDED_SEGMENTS.has(entry) || entry.startsWith(".")) continue;
       const full = join(current, entry);
       const stat = statSync(full);
       if (stat.isDirectory()) walk(full);
-      else if (stat.isFile() && extname(entry).toLowerCase() === ".md") results.push(full);
+      else if (stat.isFile() && isMarkdownExtension(entry)) results.push(full);
     }
   }
   walk(dir);
@@ -2417,15 +2515,43 @@ export function walkContentFiles(dir: string): string[] {
   return results.sort();
 }
 
+/**
+ * Canonical inline-tag regex (contract §1.3). `#` at line-start or after
+ * whitespace; body chars `[A-Za-z0-9_/-]` (slash for hierarchy); the tag
+ * MUST contain ≥1 non-numeric char (the middle `[A-Za-z_/-]`), so `#2024`
+ * is NOT a tag but `#v2`, `#2024-plan`, `#area/sub` are. Identical to the
+ * web parser's `INLINE_HASHTAG`.
+ */
+const INLINE_TAG_REGEX = /(?:^|\s)#([A-Za-z0-9_/-]*[A-Za-z_/-][A-Za-z0-9_/-]*)/g;
+
+/**
+ * Normalize + slug-validate a tag value (contract §1.4). Shared by inline
+ * tag extraction and frontmatter tag extraction (obsidian.ts re-exports
+ * this) so both surfaces validate identically. Returns null when the
+ * value is unusable (non-string non-scalar, empty, or fails slug rules).
+ */
+export function normalizeTagValue(v: unknown): string | null {
+  if (typeof v === "number" || typeof v === "boolean") {
+    return String(v).toLowerCase();
+  }
+  if (typeof v !== "string") return null;
+  const stripped = v.trim().replace(/^#/, "").toLowerCase();
+  if (stripped === "") return null;
+  // Slug-validate: lowercase alnum, underscore, hyphen, slash (hierarchy).
+  if (!/^[a-z0-9_/-]+$/.test(stripped)) return null;
+  return stripped;
+}
+
 /** Extract inline #tags from markdown content. Excludes tags in code blocks. */
 export function extractInlineTags(content: string): string[] {
   let stripped = content.replace(/```[\s\S]*?```/g, "");
   stripped = stripped.replace(/`[^`\n]+`/g, "");
   const tags = new Set<string>();
-  const regex = /(?:^|\s)#([\w][\w/-]*[\w]|[\w])/gm;
+  const regex = new RegExp(INLINE_TAG_REGEX.source, INLINE_TAG_REGEX.flags);
   let match: RegExpExecArray | null;
   while ((match = regex.exec(stripped)) !== null) {
-    tags.add(match[1]!.toLowerCase());
+    const tag = normalizeTagValue(match[1]!);
+    if (tag) tags.add(tag);
   }
   return [...tags];
 }

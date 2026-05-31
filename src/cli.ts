@@ -2760,34 +2760,17 @@ async function cmdImport(args: string[]) {
     return;
   }
 
-  // Import into vault — use createNoteRaw to skip per-note wikilink sync,
-  // then do a single pass after all notes are imported (much faster for large vaults).
+  // Import into vault — use the shared `importObsidianNotes` adapter
+  // (obsidian.ts). It uses createNoteRaw to skip per-note wikilink sync,
+  // id-aware upsert with a path-conflict guard, intra-batch collision
+  // dedup, per-note error isolation, and timestamp preservation. The
+  // single wikilink pass runs below, after all notes exist.
+  const { importObsidianNotes } = await import("../core/src/obsidian.ts");
   const store = getVaultStore(vaultName);
-  let imported = 0;
-  let skipped = 0;
+  const { imported, skipped } = await importObsidianNotes(store, notes);
 
-  for (const note of notes) {
-    // Skip if a note with this path already exists
-    const existing = await store.getNoteByPath(note.path);
-    if (existing) {
-      skipped++;
-      continue;
-    }
-
-    // Build metadata from frontmatter (excluding tags, already extracted)
-    const metadata = Object.keys(note.frontmatter).length > 0 ? note.frontmatter : undefined;
-
-    await store.createNoteRaw(note.content, {
-      path: note.path,
-      tags: note.tags.length > 0 ? note.tags : undefined,
-      metadata: metadata as Record<string, unknown>,
-    });
-    imported++;
-  }
-
-  // Single-pass wikilink sync after all notes exist
   console.log(`\nImported ${imported} notes into vault "${vaultName}"`);
-  if (skipped > 0) console.log(`Skipped ${skipped} notes (path already exists)`);
+  if (skipped > 0) console.log(`Skipped ${skipped} notes (path already exists or conflict)`);
 
   if (imported > 0) {
     const linkResult = await store.syncAllWikilinks();
