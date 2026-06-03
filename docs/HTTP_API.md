@@ -575,7 +575,7 @@ supports three mutually-exclusive content modes:
   },
 
   "if_updated_at": "2026-05-20T...",                 // optimistic concurrency
-  "force": true,                                     // bypass if_updated_at
+  "force": true,                                     // bypass the *requirement* for if_updated_at
   "if_missing": "create",                            // vault#309 — upsert
   "include_content": false                           // optional lean response
 }
@@ -586,6 +586,12 @@ supports three mutually-exclusive content modes:
 returns `428 Precondition Required`. Pure append/prepend updates (no
 content/metadata/path/tags/links) are exempt — concatenation is
 no-conflict-by-design.
+
+If you supply both `if_updated_at` and `force: true`, the precondition
+still applies — `if_updated_at` wins and a mismatch returns `409 conflict`.
+`force` only waives the requirement to supply `if_updated_at`; it does not
+override one you actually passed. To update unconditionally, omit
+`if_updated_at` and send `force: true` alone.
 
 **`if_missing: "create"` (vault#309 — shipped 0.4.5).** When the target
 note doesn't exist, treat the PATCH body as a create. Useful for sync
@@ -768,13 +774,41 @@ Upsert a tag's identity row. Body accepts any combination of:
 {
   "description": "string | null",
   "fields": { "<field>": { "type": "string", "enum": [...], ... } } | null,
-  "relationships": { "<name>": { "cardinality": "one|many", "target_tags": [...] } } | null,
+  "relationships": {                                 // object-of-objects, never an array; | null clears
+    "<relName>": {
+      "target_tag": "<tag>",
+      "cardinality": "one" | "optional" | "many" | "many-required",
+      "description": "<optional string>"
+    }
+  },
   "parent_names": ["parent-tag", ...] | null
 }
 ```
 
 Omitted keys are preserved; explicit `null` clears. `fields` merges into
 the existing schema (mirrors MCP `update-tag`).
+
+**`relationships` shape.** An **object-of-objects**, never an array. Each
+key is a relationship name; each value MUST carry both `target_tag` (a
+non-empty string) and `cardinality` (one of `one`, `optional`, `many`,
+`many-required`). `description` is optional. A malformed payload — an
+array, a value missing `target_tag` or `cardinality`, or a `cardinality`
+outside the vocabulary — is **rejected with `400` and
+`error_type: invalid_relationships`** (the `error` field carries the
+specific violation); it is never silently dropped or nulled. Concrete
+example:
+
+```json
+{
+  "relationships": {
+    "works-on": {
+      "target_tag": "project",
+      "cardinality": "many",
+      "description": "projects this person contributes to"
+    }
+  }
+}
+```
 
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
 Removes the tag, its identity row, and untags every note. Returns the
@@ -952,11 +986,21 @@ Multipart form upload.
 - Allowed extensions: `.wav .mp3 .m4a .ogg .webm .png .jpg .jpeg .gif
   .webp .pdf .mp4`. `.svg` and `.html` are explicitly disallowed (XSS).
 
-Returns `{path, size, mimeType}` (201).
+Returns `{path, size, mimeType}` with status `201` on success. A file
+larger than the 100MB limit is rejected with `413`.
 
 #### `GET /vault/{name}/api/storage/{date}/{filename}` — `vault:read`
 Serves the uploaded file bytes with the matching `Content-Type`. Path is
 sandboxed under the vault's assets dir; traversal attempts return `403`.
+
+With a **tag-scoped** token, the serve is additionally gated by the owning
+note's tag scope: the requested storage path is reverse-looked-up to its
+owning attachment row(s) → note(s), and the bytes are served only if at
+least one owning note is in scope. The serve returns `404` in **both**
+failure cases — when no attachment row owns the path (owner-less) and when
+an owning note exists but falls outside the token's scope. The same `404`
+either way keeps the endpoint from acting as an existence oracle. Unscoped
+tokens keep the path-only behavior.
 
 ### MCP
 
