@@ -818,10 +818,10 @@ existing typed declarations keep working:
 Only the top-level shape is validated. A payload is **rejected with `400`
 and `error_type: invalid_relationships`** (the `error` field carries the
 specific violation) when it is a top-level array, a top-level primitive,
-`null`/absent-where-an-object-is-expected, has an empty-string key, or is
-not JSON-serializable. Inner values — including ones missing `target_tag`
-or `cardinality`, or with a `cardinality` outside the old vocabulary — are
-**no longer** rejected; they persist verbatim.
+has an empty-string key, or is not JSON-serializable. Explicit `null`
+**clears** the field (it is not rejected). Inner values — including ones
+missing `target_tag` or `cardinality`, or with a `cardinality` outside the
+old vocabulary — are **no longer** rejected; they persist verbatim.
 
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
 Removes the tag, its identity row, and untags every note. Returns the

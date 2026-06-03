@@ -39,7 +39,7 @@ export interface TagFieldSchema {
  * `{ target_tag, cardinality }` declaration — but `relationships` is now an
  * opaque vocabulary map (see `TagRelationshipMap` / `validateRelationships`),
  * so this is one valid value shape among many, not a required one.
- * See patterns/tag-data-model.md §Typed relationships.
+ * See patterns/tag-data-model.md §Relationships.
  */
 export type TagRelCardinality = "one" | "optional" | "many" | "many-required";
 
