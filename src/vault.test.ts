@@ -4165,6 +4165,19 @@ describe("HTTP /tags", async () => {
     expect(body.error_type).toBe("invalid_relationships");
   });
 
+  test("PUT /tags/:name returns 400 invalid_relationships for an empty relationship key", async () => {
+    const res = await handleTags(
+      mkReq("PUT", "/tags/person", { relationships: { "": { from: "a", to: "b" } } }),
+      store,
+      "/person",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_relationships");
+    expect(typeof body.error).toBe("string");
+    expect(body.error.length).toBeGreaterThan(0);
+  });
+
   test("DELETE /tags/:name removes tag and schema", async () => {
     await store.createNote("A", { tags: ["doomed"] });
     await store.upsertTagSchema("doomed", { description: "will be deleted" });

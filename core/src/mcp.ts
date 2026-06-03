@@ -1097,7 +1097,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
     {
       name: "update-tag",
       requiredVerb: "write",
-      description: "Create or update a tag's identity row: description, indexed-field schemas, typed-link relationships, and hierarchy parents. If the tag doesn't exist, it's created. Fields are merged (new keys added, existing keys replaced); relationships and parent_names are replaced wholesale when provided. Pass null for fields/relationships/parent_names to clear that column. See parachute-patterns/patterns/tag-data-model.md.",
+      description: "Create or update a tag's identity row: description, indexed-field schemas, relationship-vocabulary map, and hierarchy parents. If the tag doesn't exist, it's created. Fields are merged (new keys added, existing keys replaced); relationships and parent_names are replaced wholesale when provided. Pass null for fields/relationships/parent_names to clear that column. See parachute-patterns/patterns/tag-data-model.md.",
       inputSchema: {
         type: "object",
         properties: {

@@ -277,7 +277,7 @@ export function validateRelationships(raw: unknown): Record<string, unknown> {
     );
   }
   for (const rel of Object.keys(raw as Record<string, unknown>)) {
-    if (!rel || typeof rel !== "string") {
+    if (!rel) {
       throw new Error("relationships: keys must be non-empty strings");
     }
   }
