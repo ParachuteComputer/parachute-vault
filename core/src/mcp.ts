@@ -178,7 +178,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             type: "object",
             description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
           },
-          order_by: { type: "string", description: "Sort by an indexed metadata field instead of `created_at`. Field must be declared `indexed: true`; errors otherwise. Direction is taken from `sort` (default 'asc'); `created_at` is appended as a stable tiebreaker." },
+          order_by: { type: "string", description: "Sort by an indexed metadata field instead of `created_at`. Field must be declared `indexed: true`; errors otherwise. The special value `link_count` sorts by link DEGREE (both-directions raw row count) — no declaration needed — matching the `include_link_count` field for every note. Direction is taken from `sort` (default 'asc'); `created_at` is appended as a stable tiebreaker." },
           date_from: { type: "string", description: "Start date (ISO, inclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', from }`." },
           date_to: { type: "string", description: "End date (ISO, exclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', to }`." },
           date_filter: {
@@ -217,6 +217,17 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             description: "Control metadata in response: true (all, default), false (none), or array of field names to include",
           },
           include_links: { type: "boolean", description: "Include inbound + outbound links per note (default: false)" },
+          include_link_count: {
+            type: "boolean",
+            description:
+              "Include the note's link DEGREE as a `linkCount` field, without hauling the link objects (default: false). Degree is a raw row count: outbound (source) + inbound (target). A self-loop counts as 2. Cheap COUNT over indexes; batched once per request. For a tag-scoped token, `linkCount` is the raw degree and MAY include edges to notes the token can't see — only the number leaks, not the neighbor.",
+          },
+          link_count_direction: {
+            type: "string",
+            enum: ["both", "outbound", "inbound"],
+            description:
+              "Which edges `include_link_count` counts: both (default), outbound only (source_id), or inbound only (target_id). order_by=link_count always uses the both-directions degree.",
+          },
           include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
           expand_links: { type: "boolean", description: "Inline [[wikilinks]] in returned content (default: false). Has no effect if content is not included (e.g., default list mode with include_content=false); wikilinks inside fenced or inline code are not expanded." },
           expand_depth: { type: "number", description: "Recursion depth for link expansion (default 1, max 3). Only meaningful in 'full' mode — 'summary' mode does not recurse." },
@@ -255,6 +266,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           }
           if (params.include_attachments) {
             result.attachments = await store.getAttachments(note.id);
+          }
+          if (params.include_link_count) {
+            const dir = normalizeLinkCountDirection(params.link_count_direction);
+            result.linkCount = linkOps.getLinkCounts(db, [note.id], dir).get(note.id) ?? 0;
           }
           return result;
         }
@@ -388,6 +403,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // --- Apply metadata filtering ---
         if (includeMetadata !== undefined && includeMetadata !== true) {
           output = output.map((n: any) => filterMetadata(n, includeMetadata));
+        }
+
+        // --- Opt-in link degree (vault feedback #4) ---
+        // ONE batch count over all result ids (NOT per-note), so the field
+        // stays O(2 index scans) per request regardless of page size.
+        // Injected on the same objects the enrichment loop copies below.
+        if (params.include_link_count) {
+          const dir = normalizeLinkCountDirection(params.link_count_direction);
+          const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), dir);
+          for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
 
         // --- Hydrate links/attachments per note if requested ---
@@ -1418,6 +1443,16 @@ function normalizeTags(tag: unknown): string[] | undefined {
   // the original `params` object untouched.
   if (Array.isArray(tag)) return [...tag];
   return [tag as string];
+}
+
+/**
+ * Coerce the `link_count_direction` MCP param to a known value, defaulting
+ * to "both" (matches the REST `parseLinkCountDirection` fallback). A typo
+ * silently degrades to the documented default rather than erroring.
+ */
+function normalizeLinkCountDirection(v: unknown): "both" | "outbound" | "inbound" {
+  if (v === "outbound" || v === "inbound") return v;
+  return "both";
 }
 
 // Re-exported for backward compat; defined in notes.ts alongside the
