@@ -3259,6 +3259,133 @@ describe("HTTP /notes", async () => {
         delete process.env.ASSETS_DIR;
       }
     });
+
+    // ---- Optimistic concurrency on the stub re-stamp (vault#435) ----------
+    // The retry endpoint does a read-transform-write on the memo note to
+    // re-arm `transcribe_stub: true`. Without an `if_updated_at` precondition,
+    // a user edit landing between the read (`resolveNote`) and this write is
+    // silently clobbered — the static-write/stale-read class of vault#208.
+    //
+    // We inject a store wrapper that fires a concurrent USER edit immediately
+    // before the route's first OC `updateNote` runs, making its precondition
+    // stale. The route must NOT clobber the user's edit; it must re-read and
+    // re-apply the metadata-only re-stamp against fresh content.
+
+    /**
+     * Wrap a store so the first `N` `updateNote` calls carrying an
+     * `if_updated_at` precondition fire `userEdit()` (a concurrent user write
+     * that bumps `updated_at`) just before delegating — forcing the precondition
+     * stale exactly `interfereTimes` times. Non-OC writes pass through.
+     *
+     * NOTE: duplicated in src/transcription-worker.test.ts (worker-layer race
+     * tests) — keep in sync.
+     */
+    function withRace(
+      base: Store,
+      interfereTimes: number,
+      userEdit: () => Promise<void>,
+    ): Store {
+      let fired = 0;
+      return new Proxy(base, {
+        get(target, prop, receiver) {
+          if (prop === "updateNote") {
+            return async (id: string, updates: any) => {
+              if (updates?.if_updated_at !== undefined && fired < interfereTimes) {
+                fired++;
+                // bun:sqlite stamps `updated_at` at ms granularity. Sleep so
+                // the concurrent user write lands at a strictly-greater
+                // timestamp than the precondition the route captured — making
+                // the conflict deterministic rather than racing inside the
+                // same millisecond.
+                await new Promise((r) => setTimeout(r, 5));
+                await userEdit();
+              }
+              return (target as any).updateNote(id, updates);
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      }) as Store;
+    }
+
+    test("OC: single race → user edit survives, stub still re-armed (no clobber)", async () => {
+      const { noteId, attachmentId } = await seedLegacyFailedMemo({ noteId: "race-1" });
+
+      // One interference: the very first OC write conflicts; the route re-reads
+      // and re-applies against the user's new content.
+      const raceStore = withRace(store, 1, async () => {
+        // User appends a line to the body while the retry is in flight.
+        await store.updateNote(noteId, { append: "\n\nMY EDIT WHILE PENDING" });
+      });
+
+      const res = await handleNotes(
+        mkReq("POST", `/notes/${noteId}/retry-transcription`),
+        raceStore,
+        `/${noteId}/retry-transcription`,
+        "default",
+      );
+      // (a) User edit NOT clobbered + (c) re-stamp succeeded on retry → 202.
+      expect(res.status).toBe(202);
+
+      const after = await store.getNote(noteId);
+      // (a) The user's concurrent edit survives.
+      expect(after!.content).toContain("MY EDIT WHILE PENDING");
+      // Original capture body also intact (re-stamp is metadata-only).
+      expect(after!.content).toContain("_Transcription unavailable._");
+      // (c) Stub re-armed despite the race.
+      expect((after!.metadata as any)?.transcribe_stub).toBe(true);
+
+      const att = await store.getAttachment(attachmentId);
+      expect(att?.metadata?.transcribe_status).toBe("pending");
+      expect(att?.metadata?.transcribe_origin).toBe("legacy");
+
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("OC: double race → 409 (user-facing request can retry)", async () => {
+      const { noteId } = await seedLegacyFailedMemo({ noteId: "race-2" });
+
+      // Interfere on BOTH the first write and the retry write → the route
+      // exhausts its single retry and surfaces 409.
+      const raceStore = withRace(store, 2, async () => {
+        await store.updateNote(noteId, { append: " x" });
+      });
+
+      const res = await handleNotes(
+        mkReq("POST", `/notes/${noteId}/retry-transcription`),
+        raceStore,
+        `/${noteId}/retry-transcription`,
+        "default",
+      );
+      // (c) Double-conflict policy for a user-facing endpoint: 409.
+      expect(res.status).toBe(409);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("conflict");
+      expect(body.note_id).toBe(noteId);
+
+      // The note was never clobbered — the user's two appends are both present.
+      const after = await store.getNote(noteId);
+      expect(after!.content).toContain(" x x");
+
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("OC: happy path unchanged when no race occurs", async () => {
+      // With zero interference the OC write lands first-try, byte-identical to
+      // the pre-#435 behavior — guards against the precondition breaking the
+      // common path.
+      const { noteId } = await seedLegacyFailedMemo({ noteId: "race-0" });
+      const res = await handleNotes(
+        mkReq("POST", `/notes/${noteId}/retry-transcription`),
+        store,
+        `/${noteId}/retry-transcription`,
+        "default",
+      );
+      expect(res.status).toBe(202);
+      const after = await store.getNote(noteId);
+      expect((after!.metadata as any)?.transcribe_stub).toBe(true);
+      delete process.env.ASSETS_DIR;
+    });
   });
 });
 
