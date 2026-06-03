@@ -774,13 +774,13 @@ Upsert a tag's identity row. Body accepts any combination of:
 {
   "description": "string | null",
   "fields": { "<field>": { "type": "string", "enum": [...], ... } } | null,
-  "relationships": {
+  "relationships": {                                 // object-of-objects, never an array; | null clears
     "<relName>": {
       "target_tag": "<tag>",
       "cardinality": "one" | "optional" | "many" | "many-required",
       "description": "<optional string>"
     }
-  } | null,
+  },
   "parent_names": ["parent-tag", ...] | null
 }
 ```
@@ -996,10 +996,11 @@ sandboxed under the vault's assets dir; traversal attempts return `403`.
 With a **tag-scoped** token, the serve is additionally gated by the owning
 note's tag scope: the requested storage path is reverse-looked-up to its
 owning attachment row(s) → note(s), and the bytes are served only if at
-least one owning note is in scope. An out-of-scope (or owner-less) path
-returns `404` — matching the note-level attachment surfaces, so the
-endpoint can't act as an existence oracle. Unscoped tokens keep the
-path-only behavior.
+least one owning note is in scope. The serve returns `404` in **both**
+failure cases — when no attachment row owns the path (owner-less) and when
+an owning note exists but falls outside the token's scope. The same `404`
+either way keeps the endpoint from acting as an existence oracle. Unscoped
+tokens keep the path-only behavior.
 
 ### MCP
 
