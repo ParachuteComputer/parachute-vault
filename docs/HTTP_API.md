@@ -1005,6 +1005,10 @@ larger than the 100MB limit is rejected with `413`.
 #### `GET /vault/{name}/api/storage/{date}/{filename}` — `vault:read`
 Serves the uploaded file bytes with the matching `Content-Type`. Path is
 sandboxed under the vault's assets dir; traversal attempts return `403`.
+The `{date}/{filename}` slash may be sent either literally or
+`%2F`-encoded — both forms resolve to the same file. (Note the contrast
+with the single-note routes, which **require** `%2F` for a slash inside an
+id/path segment.)
 
 With a **tag-scoped** token, the serve is additionally gated by the owning
 note's tag scope: the requested storage path is reverse-looked-up to its

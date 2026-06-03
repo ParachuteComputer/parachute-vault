@@ -2267,7 +2267,31 @@ export async function handleStorage(
     return json({ path: relativePath, size: buffer.length, mimeType }, 201);
   }
 
-  const fileMatch = path.match(/^\/([^/]+)\/(.+)$/);
+  // Decode percent-encoding BEFORE matching. `path` arrives from
+  // `url.pathname`, which (per WHATWG) keeps an encoded `%2F` slash literal —
+  // so a caller requesting `/api/storage/<date>%2F<file>` would never satisfy
+  // the literal-slash match below and would fall through to the 404. Decoding
+  // first accepts both the literal-slash and `%2F`-encoded forms, and yields
+  // the literal-slash path that the DB stores (`${date}/${filename}`) so the
+  // tag-scope reverse-lookup matches. This intentionally diverges from the
+  // single-note routes, which decode their *first* segment only and therefore
+  // REQUIRE `%2F` for slashes-in-an-id — a trap-grade asymmetry we accept here
+  // because storage paths are always multi-segment date/file pairs.
+  //
+  // Guard-safety (verified): the traversal guard below operates on the
+  // post-`normalize(join())` filesystem path, so a decoded `..` is still
+  // caught → 403. Decode is idempotent for today's unencoded callers
+  // (filenames are `<Date.now()>-<uuid>.<ext>` — no stray `%`). A malformed
+  // `%` (e.g. `2026%2`) throws → 404, consistent with the no-existence-oracle
+  // stance (and an improvement over the prior catch-all 500).
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(path);
+  } catch {
+    return json({ error: "Not found" }, 404);
+  }
+
+  const fileMatch = decodedPath.match(/^\/([^/]+)\/(.+)$/);
   if (req.method === "GET" && fileMatch) {
     const reqPath = `${fileMatch[1]}/${fileMatch[2]}`;
     const filePath = normalize(join(assets, reqPath));

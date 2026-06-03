@@ -215,3 +215,165 @@ describe("storage GET tag-scope enforcement", () => {
     expect(res.status).toBe(403);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET percent-encoded-slash handling (feedback finding D).
+//
+// `path` reaches handleStorage from `url.pathname`, which keeps an encoded
+// `%2F` slash LITERAL (WHATWG). The old `path.match(/^\/([^/]+)\/(.+)$/)`
+// required a literal slash, so `/api/storage/<date>%2F<file>` fell to the
+// unconditional 404 — a trap-grade asymmetry with the single-note routes,
+// which decode their first segment and therefore REQUIRE `%2F`. The fix
+// decodes `path` before matching, accepting BOTH forms; the decoded path is
+// also what the DB stores (`${date}/${filename}`), so tag-scope lookup and
+// the traversal guard keep working. These tests pin both forms + the
+// guard-safety of the decode.
+// ---------------------------------------------------------------------------
+
+describe("storage GET percent-encoded slash (finding D)", () => {
+  const VAULT = "encode-vault";
+
+  async function setup(): Promise<{
+    store: SqliteStore;
+    assets: string;
+    inScopePath: string;
+    outScopePath: string;
+  }> {
+    const store = freshStore();
+    const assets = join(testDir, "assets", VAULT, "data");
+    mkdirSync(join(assets, "2026-05-28"), { recursive: true });
+    process.env.ASSETS_DIR = assets;
+
+    const workNote = await store.createNote("work note", { tags: ["work"] });
+    const healthNote = await store.createNote("health note", { tags: ["health"] });
+
+    const inScopePath = "2026-05-28/work-asset.pdf";
+    const outScopePath = "2026-05-28/health-asset.pdf";
+    writeFileSync(join(assets, inScopePath), Buffer.from([0x25, 0x50, 0x44, 0x46])); // %PDF
+    writeFileSync(join(assets, outScopePath), Buffer.from([0x25, 0x50, 0x44, 0x46]));
+
+    await store.addAttachment(workNote.id, inScopePath, "application/pdf");
+    await store.addAttachment(healthNote.id, outScopePath, "application/pdf");
+
+    return { store, assets, inScopePath, outScopePath };
+  }
+
+  // The request URL carries the encoded form; the `path` arg mirrors what the
+  // dispatcher hands the handler (derived from url.pathname, %2F kept literal).
+  function getReqEncoded(reqPath: string): { req: Request; path: string } {
+    const encoded = reqPath.replace(/\//g, "%2F");
+    return {
+      req: new Request(`http://localhost:1940/storage/${encoded}`, { method: "GET" }),
+      path: `/${encoded}`,
+    };
+  }
+
+  test("encoded %2F path serves the same bytes as the literal form (200)", async () => {
+    const { store, inScopePath } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    const { req, path } = getReqEncoded(inScopePath);
+    const res = await handleStorage(req, path, VAULT, store, ctx);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("application/pdf");
+    expect((await res.arrayBuffer()).byteLength).toBe(4);
+  });
+
+  test("literal-slash path still serves (regression)", async () => {
+    const { store, inScopePath } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage/${inScopePath}`, { method: "GET" }),
+      `/${inScopePath}`,
+      VAULT,
+      store,
+      ctx,
+    );
+    expect(res.status).toBe(200);
+    expect((await res.arrayBuffer()).byteLength).toBe(4);
+  });
+
+  test("encoded traversal %2E%2E%2F… → 403 (decoded `..` hits the traversal guard)", async () => {
+    const { store } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    // Fully percent-encoded `/a/../../../../../../etc/passwd`. Decode yields
+    // the literal traversal, which resolves outside assetsDir → 403.
+    const evilDecoded = "/a/../../../../../../etc/passwd";
+    const evilEncoded = "/a%2F%2E%2E%2F%2E%2E%2F%2E%2E%2F%2E%2E%2F%2E%2E%2F%2E%2E%2Fetc%2Fpasswd";
+    expect(decodeURIComponent(evilEncoded)).toBe(evilDecoded);
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage${evilEncoded}`, { method: "GET" }),
+      evilEncoded,
+      VAULT,
+      store,
+      ctx,
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("tag-scoped token + out-of-scope owning note → still 404 with an encoded path", async () => {
+    const { store, outScopePath } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    const { req, path } = getReqEncoded(outScopePath);
+    const res = await handleStorage(req, path, VAULT, store, ctx);
+    expect(res.status).toBe(404);
+  });
+
+  test("malformed `%` (e.g. /api/storage/2026%2) → 404, not 500", async () => {
+    const { store } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    // `%2` is not a valid percent-escape → decodeURIComponent throws → 404.
+    const bad = "/2026%2";
+    expect(() => decodeURIComponent(bad)).toThrow();
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage${bad}`, { method: "GET" }),
+      bad,
+      VAULT,
+      store,
+      ctx,
+    );
+    expect(res.status).toBe(404);
+  });
+
+  test("double-encoded %252F → 404 (decodes ONCE to literal %2F, no slash, no second decode)", async () => {
+    const { store } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    // `%252F` → decodeURIComponent once → `%2F` (a literal `%2F`, NOT a slash).
+    // The single decode is deliberate: a second decode would turn this into a
+    // real slash and risk serving / re-looping. With one decode the path has
+    // no `/` separator, so the date/file match fails → 404.
+    const doubleEncoded = "/2026-05-28%252Ffile.bin";
+    expect(decodeURIComponent(doubleEncoded)).toBe("/2026-05-28%2Ffile.bin");
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage${doubleEncoded}`, { method: "GET" }),
+      doubleEncoded,
+      VAULT,
+      store,
+      ctx,
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST parity (finding D — decode block must not change upload behavior).
+//
+// The `POST /upload` branch returns BEFORE the decode block, so a real upload
+// is untouched. A POST to a non-`/upload` storage path with a malformed `%`
+// falls past the upload branch into the decode (the `try/catch` is not method-
+// gated), where the throw → 404 — the same status the pre-fix unconditional
+// final 404 produced for this request. Pins that the decode doesn't turn a
+// malformed-`%` POST into a 500 and keeps POST behavior at parity.
+// ---------------------------------------------------------------------------
+
+describe("storage POST parity (finding D)", () => {
+  test("POST to a malformed-`%` storage path → 404, unchanged by the GET-side decode", async () => {
+    const bad = "/2026%2";
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage${bad}`, { method: "POST" }),
+      bad,
+      "default",
+      uploadStore,
+    );
+    expect(res.status).toBe(404);
+  });
+});
