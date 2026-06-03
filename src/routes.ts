@@ -71,6 +71,22 @@ function parseQuery(url: URL, key: string): string | null {
   return url.searchParams.get(key);
 }
 
+/**
+ * Parse `link_count_direction` (vault feedback #4). Defaults to "both";
+ * anything other than the three known values falls back to "both" so a
+ * typo silently degrades to the documented default rather than erroring.
+ *
+ * Tag-scope note (symmetric with the MCP param description): `linkCount`
+ * is a raw degree that MAY include edges to notes a tag-scoped token can't
+ * see — the tag-scope filter runs post-query, over the result notes, not
+ * their neighbors. Only the number leaks, not the neighbor.
+ */
+function parseLinkCountDirection(url: URL): "both" | "outbound" | "inbound" {
+  const v = url.searchParams.get("link_count_direction");
+  if (v === "outbound" || v === "inbound") return v;
+  return "both";
+}
+
 function parseQueryList(url: URL, key: string): string[] | undefined {
   const val = url.searchParams.get(key);
   return val ? val.split(",") : undefined;
@@ -563,6 +579,11 @@ async function handleNotesInner(
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
         }
+        // linkCount injected after filterMetadata on purpose — same as
+        // links/attachments above; filterMetadata only touches `metadata`.
+        if (parseBool(parseQuery(url, "include_link_count"), false)) {
+          result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
+        }
         return json(result);
       }
 
@@ -604,6 +625,18 @@ async function handleNotesInner(
         }
         if (inclMeta !== undefined && inclMeta !== true) {
           output = output.map((n: any) => filterMetadata(n, inclMeta));
+        }
+        // Opt-in link degree (vault feedback #4) — one batch count, same as
+        // the structured-query path. Runs AFTER filterMetadata on purpose
+        // (filterMetadata only touches `metadata`, so linkCount survives —
+        // don't casually swap the order).
+        if (parseBool(parseQuery(url, "include_link_count"), false)) {
+          const counts = linkOps.getLinkCounts(
+            db,
+            output.map((n: any) => n.id),
+            parseLinkCountDirection(url),
+          );
+          for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
         return json(output);
       }
@@ -769,6 +802,7 @@ async function handleNotesInner(
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
+      const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
       let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
       const expand = parseExpandParams(url, db);
@@ -782,6 +816,24 @@ async function handleNotesInner(
       }
       if (inclMeta !== undefined && inclMeta !== true) {
         output = output.map((n: any) => filterMetadata(n, inclMeta));
+      }
+      // Opt-in link degree (vault feedback #4). ONE batch count over all
+      // result ids — NOT a per-note query — so the field stays O(2 index
+      // scans) per request regardless of page size. Mutates `output` in
+      // place; injected on the same objects the enrichment loop below
+      // touches, the same way `links`/`attachments` are surfaced.
+      // Ordering: this runs AFTER the filterMetadata pass above on purpose —
+      // filterMetadata only touches the `metadata` key, so a linkCount
+      // injected here survives. Don't casually swap the order; injecting
+      // before filterMetadata would still survive today but couples the two
+      // to filterMetadata's current narrow behavior.
+      if (includeLinkCount) {
+        const counts = linkOps.getLinkCounts(
+          db,
+          output.map((n: any) => n.id),
+          parseLinkCountDirection(url),
+        );
+        for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
       }
 
       // Graph format — reshape into { nodes, edges }
@@ -1070,6 +1122,9 @@ async function handleNotesInner(
     }
     if (parseBool(parseQuery(url, "include_attachments"), false)) {
       result.attachments = await store.getAttachments(note.id);
+    }
+    if (parseBool(parseQuery(url, "include_link_count"), false)) {
+      result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
     }
     return json(result);
   }

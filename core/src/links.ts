@@ -165,6 +165,83 @@ export function getLinksHydrated(
   }));
 }
 
+/**
+ * Batch link-degree counter (vault feedback #4).
+ *
+ * Returns the link **degree** (raw row count) for each requested note id,
+ * never materializing link rows. Degree is defined as a sum of two
+ * directional row counts:
+ *
+ *   - `outbound` = `COUNT(*) FROM links WHERE source_id = id`
+ *   - `inbound`  = `COUNT(*) FROM links WHERE target_id = id`
+ *   - `both`     = outbound + inbound   (default)
+ *
+ * It is a **row count**, matching `getVaultStats.linkCount` (notes.ts):
+ * two typed links A→B (different `relationship`) count as 2, and a
+ * **self-loop** (source_id == target_id) counts as **degree 2** under
+ * `both` — once via the outbound query, once via the inbound query.
+ *
+ * ⚠️ This directional-sum definition MUST stay identical to the
+ * `order_by=link_count` sort key in `queryNotes` (notes.ts), which uses
+ * `(SELECT COUNT(*) ... source_id=n.id) + (SELECT COUNT(*) ... target_id=n.id)`.
+ * A single `COUNT(*) ... WHERE source_id=id OR target_id=id` would count a
+ * self-loop ONCE and diverge — do NOT use that shape here.
+ *
+ * Each direction is one grouped query over an existing B-tree index
+ * (`idx_links_source` / `idx_links_target`), so the whole page costs at
+ * most two index scans regardless of page size. The IN-list is chunked to
+ * stay under SQLite's bound-variable limit on very large pages.
+ *
+ * Returns 0 for ids with no links (every requested id is present in the map).
+ */
+export function getLinkCounts(
+  db: Database,
+  noteIds: string[],
+  direction: "both" | "outbound" | "inbound" = "both",
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  if (noteIds.length === 0) return counts;
+
+  // Dedupe so a repeated id doesn't inflate the IN-list or get summed twice
+  // when the same chunk runs the outbound + inbound grouped queries.
+  const ids = [...new Set(noteIds)];
+  for (const id of ids) counts.set(id, 0);
+
+  const wantOutbound = direction === "outbound" || direction === "both";
+  const wantInbound = direction === "inbound" || direction === "both";
+
+  // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds and
+  // 32766 on newer ones; chunk well under the conservative floor so the
+  // IN-list never trips the bind limit on a large page.
+  const CHUNK = 900;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+
+    if (wantOutbound) {
+      const rows = db.prepare(
+        `SELECT source_id AS id, COUNT(*) AS c FROM links
+         WHERE source_id IN (${placeholders}) GROUP BY source_id`,
+      ).all(...chunk) as { id: string; c: number }[];
+      for (const row of rows) {
+        counts.set(row.id, (counts.get(row.id) ?? 0) + row.c);
+      }
+    }
+
+    if (wantInbound) {
+      const rows = db.prepare(
+        `SELECT target_id AS id, COUNT(*) AS c FROM links
+         WHERE target_id IN (${placeholders}) GROUP BY target_id`,
+      ).all(...chunk) as { id: string; c: number }[];
+      for (const row of rows) {
+        counts.set(row.id, (counts.get(row.id) ?? 0) + row.c);
+      }
+    }
+  }
+
+  return counts;
+}
+
 // ---- Deeper Link Queries ----
 
 export interface TraversalNode {

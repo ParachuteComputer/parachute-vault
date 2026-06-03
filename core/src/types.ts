@@ -25,6 +25,14 @@ export interface Note {
   updatedAt?: string;
   tags?: string[];
   links?: Link[];
+  /**
+   * Opt-in link degree (raw row count, both directions by default). Present
+   * only when the caller requests it via `include_link_count` (REST/MCP).
+   * Surfaced the same way `links`/`attachments` are — an extra key injected
+   * onto the response after the base shape. See `getLinkCounts` in links.ts
+   * for the exact degree semantics (self-loop = 2 under `both`).
+   */
+  linkCount?: number;
 }
 
 // ---- Link ----
@@ -115,6 +123,12 @@ export interface QueryOpts {
   // declared `indexed: true`; errors loudly otherwise. Direction is taken
   // from `sort` (default "asc") and `created_at` is appended as a stable
   // tiebreaker.
+  //
+  // The pseudo-field `link_count` is special-cased (no indexed-field
+  // declaration needed): it sorts by link DEGREE — the both-directions
+  // raw row count — using the same directional-sum definition as the
+  // `linkCount` response field, so the sort key equals the field value for
+  // every note (self-loops included). See `queryNotes`/`getLinkCounts`.
   orderBy?: string;
   limit?: number;
   offset?: number;
@@ -153,6 +167,8 @@ export interface NoteSummary {
   createdAt: string;
   updatedAt?: string;
   tags?: string[];
+  /** Opt-in link degree (see `Note.linkCount`). */
+  linkCount?: number;
 }
 
 /**
@@ -169,6 +185,8 @@ export interface NoteIndex {
   metadata?: Record<string, unknown>;
   byteSize: number;
   preview: string;
+  /** Opt-in link degree (see `Note.linkCount`). */
+  linkCount?: number;
 }
 
 /** Link with hydrated note summaries. */

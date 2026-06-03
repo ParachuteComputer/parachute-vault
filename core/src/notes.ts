@@ -736,6 +736,32 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     // be at the mercy of SQLite's row order and the next page could
     // miss or duplicate one.
     orderBy = "n.updated_at ASC, n.id ASC";
+  } else if (opts.orderBy === "link_count") {
+    // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
+    // dateFilter block above, it bypasses `requireIndexedField` (it's not a
+    // metadata column). Sort by link DEGREE using the SAME directional-sum
+    // definition as the `linkCount` response field (see `getLinkCounts` in
+    // links.ts): two correlated COUNT subqueries summed. This MUST stay a
+    // sum of two directional counts — a single
+    // `COUNT(*) ... WHERE source_id=n.id OR target_id=n.id` would count a
+    // self-loop ONCE (degree 1) and DIVERGE from the field's degree-2. Both
+    // subqueries ride the existing `idx_links_source` / `idx_links_target`
+    // B-trees. `created_at` stays the stable tiebreaker.
+    //
+    // Always the both-directions degree — inbound-only ordering is a future
+    // extension and is not built here.
+    //
+    // Perf caveat: these are correlated subqueries, evaluated once per
+    // candidate row. At small-to-moderate vault sizes (tens of thousands of
+    // notes) that's fine — each subquery is an O(log n) index probe. At very
+    // large vault sizes the per-row scan cost grows; the upgrade path is a
+    // maintained `link_count` counter column on `notes`, incremented in
+    // `createLink` and decremented in `deleteLink`, then ordered directly.
+    // NOT built now — flagged so a future contributor sees the lever.
+    orderBy =
+      `((SELECT COUNT(*) FROM links WHERE source_id = n.id) ` +
+      `+ (SELECT COUNT(*) FROM links WHERE target_id = n.id)) ${direction}, ` +
+      `n.created_at ${direction}`;
   } else if (opts.orderBy) {
     requireIndexedField(db, opts.orderBy);
     // `orderBy` came from indexed_fields (validated on declaration), so

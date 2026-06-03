@@ -3065,6 +3065,155 @@ describe("HTTP /notes", async () => {
   });
 });
 
+describe("HTTP /notes include_link_count + order_by=link_count (vault feedback #4)", async () => {
+  // Mirrors the MCP-surface tests in core/src/link-count.test.ts on the
+  // same fixtures so REST and MCP agree on the degree semantics.
+  async function seed() {
+    await store.createNote("Hub", { id: "hub", path: "hub", tags: ["t"] });
+    await store.createNote("Leaf", { id: "leaf", path: "leaf", tags: ["t"] });
+    await store.createNote("Self", { id: "self", path: "self", tags: ["t"] });
+    await store.createLink("hub", "leaf", "a"); // hub out 1, leaf in 1
+    await store.createLink("leaf", "hub", "b"); // hub in 1, leaf out 1 => both degree 2
+    await store.createLink("self", "self", "loop"); // self-loop => degree 2
+  }
+
+  test("list mode: include_link_count injects linkCount (both directions)", async () => {
+    await seed();
+    const res = await handleNotes(mkReq("GET", "/notes?include_link_count=true"), store, "");
+    const body = (await res.json()) as any[];
+    const byId = Object.fromEntries(body.map((n) => [n.id, n]));
+    expect(byId.hub.linkCount).toBe(2);
+    expect(byId.leaf.linkCount).toBe(2);
+    expect(byId.self.linkCount).toBe(2); // self-loop = 2
+  });
+
+  test("absent flag → no linkCount key (no behavior change)", async () => {
+    await seed();
+    const res = await handleNotes(mkReq("GET", "/notes"), store, "");
+    const body = (await res.json()) as any[];
+    expect(body.every((n) => !("linkCount" in n))).toBe(true);
+  });
+
+  test("note with 0 links → linkCount: 0", async () => {
+    await store.createNote("Lonely", { id: "lonely", path: "lonely" });
+    const res = await handleNotes(mkReq("GET", "/notes?include_link_count=true"), store, "");
+    const body = (await res.json()) as any[];
+    expect(body.find((n) => n.id === "lonely").linkCount).toBe(0);
+  });
+
+  test("single-note (?id=) mode: include_link_count → correct degree", async () => {
+    await seed();
+    const res = await handleNotes(mkReq("GET", "/notes?id=self&include_link_count=true"), store, "");
+    const body = (await res.json()) as any;
+    expect(body.linkCount).toBe(2);
+  });
+
+  test("single-note (/notes/:id) mode: include_link_count → correct degree", async () => {
+    await seed();
+    const res = await handleNotes(mkReq("GET", "/notes/self?include_link_count=true"), store, "/self");
+    const body = (await res.json()) as any;
+    expect(body.linkCount).toBe(2);
+  });
+
+  test("link_count_direction outbound / inbound variants", async () => {
+    await seed();
+    const out = await handleNotes(
+      mkReq("GET", "/notes?id=hub&include_link_count=true&link_count_direction=outbound"),
+      store,
+      "",
+    );
+    expect(((await out.json()) as any).linkCount).toBe(1); // hub→leaf
+    const inb = await handleNotes(
+      mkReq("GET", "/notes?id=hub&include_link_count=true&link_count_direction=inbound"),
+      store,
+      "",
+    );
+    expect(((await inb.json()) as any).linkCount).toBe(1); // leaf→hub
+  });
+
+  test("unrecognized link_count_direction falls back to both (REST parseLinkCountDirection)", async () => {
+    await seed();
+    // hub: both=2, outbound=1, inbound=1. A bogus value must degrade to
+    // `both` (2), distinct from either directional value (1).
+    const res = await handleNotes(
+      mkReq("GET", "/notes?id=hub&include_link_count=true&link_count_direction=sideways"),
+      store,
+      "",
+    );
+    expect(((await res.json()) as any).linkCount).toBe(2);
+  });
+
+  test("FTS branch: search + include_link_count → results carry linkCount", async () => {
+    // The full-text-search branch is a separate return path from the
+    // structured query; exercise the flag there explicitly.
+    await store.createNote("quokka sighting near the hub", { id: "fts-hub", path: "fts-hub" });
+    await store.createNote("a quokka friend", { id: "fts-friend", path: "fts-friend" });
+    await store.createLink("fts-hub", "fts-friend", "a"); // hub out1, friend in1
+    await store.createLink("fts-friend", "fts-hub", "b"); // hub in1 => hub degree 2
+    const res = await handleNotes(
+      mkReq("GET", "/notes?search=quokka&include_link_count=true"),
+      store,
+      "",
+    );
+    const body = (await res.json()) as any[];
+    const byId = Object.fromEntries(body.map((n) => [n.id, n]));
+    expect(byId["fts-hub"].linkCount).toBe(2);
+    expect(byId["fts-friend"].linkCount).toBe(2);
+  });
+
+  test("FTS branch: absent flag → no linkCount key", async () => {
+    await store.createNote("quokka sighting near the hub", { id: "fts-hub", path: "fts-hub" });
+    await store.createLink("fts-hub", "fts-hub", "loop");
+    const res = await handleNotes(mkReq("GET", "/notes?search=quokka"), store, "");
+    const body = (await res.json()) as any[];
+    expect(body.every((n) => !("linkCount" in n))).toBe(true);
+  });
+
+  test("order_by=link_count desc: field value == sort key for every note", async () => {
+    // Distinct degrees so the ordering is unambiguous: big=3, mid=2, small=0.
+    await store.createNote("Big", { id: "big", path: "big" });
+    await store.createNote("Mid", { id: "mid", path: "mid" });
+    await store.createNote("Small", { id: "small", path: "small" });
+    await store.createLink("big", "mid", "a"); // big out1, mid in1
+    await store.createLink("big", "small", "b"); // big out2, small in1
+    await store.createLink("mid", "big", "c"); // big in1 => big degree 3; mid out1 => mid degree 2
+    // small degree 1 (in from big). Adjust: make small degree 0 by removing
+    // — instead assert monotonic + field==sortkey, which is the real invariant.
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?order_by=link_count&sort=desc&include_link_count=true"),
+      store,
+      "",
+    );
+    const body = (await res.json()) as any[];
+    const seq = body.map((n) => n.linkCount as number);
+    // The injected field equals the sort key, so the sequence is non-increasing.
+    expect(seq).toEqual([...seq].sort((a, b) => b - a));
+    expect(body[0].id).toBe("big"); // degree 3 — the most-connected note
+    expect(body[0].linkCount).toBe(3);
+  });
+
+  test("order_by=link_count: self-loop note ranks by its degree-2 field value", async () => {
+    await store.createNote("Selfy", { id: "selfy", path: "selfy" });
+    await store.createNote("Plain", { id: "plain", path: "plain" });
+    await store.createNote("Zero", { id: "zero", path: "zero" });
+    await store.createLink("selfy", "selfy", "loop"); // degree 2
+    await store.createLink("zero", "plain", "ref"); // plain in1, zero out1
+
+    const res = await handleNotes(
+      mkReq("GET", "/notes?order_by=link_count&sort=desc&include_link_count=true"),
+      store,
+      "",
+    );
+    const body = (await res.json()) as any[];
+    expect(body[0].id).toBe("selfy"); // degree 2 outranks the degree-1 notes
+    expect(body[0].linkCount).toBe(2); // field == the sort key that put it first
+    const byId = Object.fromEntries(body.map((n) => [n.id, n]));
+    expect(byId.plain.linkCount).toBe(1);
+    expect(byId.zero.linkCount).toBe(1);
+  });
+});
+
 describe("HTTP GET /notes?format=graph", async () => {
   test("returns nodes and edges for linked notes", async () => {
     const a = await store.createNote("A", { id: "a", path: "People/Alice", tags: ["person"] });
