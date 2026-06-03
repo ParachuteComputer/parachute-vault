@@ -84,6 +84,14 @@ const TRANSCRIPT_UNAVAILABLE = "_Transcription unavailable._";
  * both means a retried success lands in the same spot a first-try success
  * would, preserving the surrounding capture body (the `![[memo]]` embed,
  * the `_Recorded …_` line, the header).
+ *
+ * Deliberately NO `/g` flag — `.replace` swaps only the FIRST match. A
+ * canonical capture body holds exactly one marker, so first-match is the
+ * correct target. `applyFailureMarker`'s includes-guard (no-op when the
+ * marker is already present) prevents markers accumulating across repeated
+ * terminal failures, so the body never carries two of the same marker. A
+ * hand-edited body that somehow contains both markers patches only the
+ * first — accepted (degenerate, operator-induced).
  */
 const TRANSCRIPT_SUCCESS_TARGET = /_Transcript pending\._|_Transcription unavailable\._/;
 
@@ -467,7 +475,13 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
           //     code full-replaced here, which destroyed both.
           let body: string;
           if (TRANSCRIPT_SUCCESS_TARGET.test(note.content)) {
-            body = note.content.replace(TRANSCRIPT_SUCCESS_TARGET, transcript);
+            // Function replacer, NOT a string — speech-to-text is arbitrary
+            // user content, and String.replace treats `$&`, `$\``, `$'`,
+            // `$1`-`$9` as special patterns in a string replacement. A
+            // transcript containing `$&` would otherwise inject the matched
+            // marker text into the body. `() => transcript` returns the text
+            // verbatim.
+            body = note.content.replace(TRANSCRIPT_SUCCESS_TARGET, () => transcript);
           } else {
             body = note.content.length > 0
               ? `${note.content}\n\n${transcript}`

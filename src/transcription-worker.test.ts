@@ -1297,4 +1297,82 @@ describe("transcription worker — legacy in-body memo content safety (finding F
       "# 🎙️ Voice memo\n\n_Recorded sometime._\n\nthe spoken words\n\n![[memos/f5.webm]]\n",
     );
   });
+
+  test("transcript containing `$&` round-trips byte-identical (no String.replace injection) — first-try success", async () => {
+    // Regression: String.replace with a STRING replacement treats `$&` etc. as
+    // special. A transcript with `$&` must land verbatim in the body, not as
+    // the matched marker text.
+    const dollarTranscript = "it matched $& exactly, and $1 too, plus $` and $'";
+    await store.createNote(captureBody("memos/f6.webm"), {
+      id: "f-dollar-1",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f6.webm");
+    await store.addAttachment("f-dollar-1", "memos/f6.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: dollarTranscript }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("f-dollar-1");
+    expect(note!.content).toBe(
+      `# 🎙️ Voice memo\n\n_Recorded sometime._\n\n${dollarTranscript}\n\n![[memos/f6.webm]]\n`,
+    );
+    // Belt-and-suspenders: the literal `$&` must be present verbatim.
+    expect(note!.content).toContain("it matched $& exactly");
+  });
+
+  test("transcript containing `$&` round-trips byte-identical on the RETRY path (marker → transcript)", async () => {
+    // Same injection guard, but exercised on the retry surgical-replace: the
+    // transcript replaces `_Transcription unavailable._` in place.
+    const dollarTranscript = "retry text with $& and $0 and $$ literal";
+    await store.createNote(captureBody("memos/f7.webm"), {
+      id: "f-dollar-2",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f7.webm");
+    await store.addAttachment("f-dollar-2", "memos/f7.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2, // one more failure → terminal at maxAttempts=3
+    });
+
+    // Phase 1: terminal failure → marker replaces placeholder.
+    const worker1 = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "down", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try { await worker1.tick(); } finally { await worker1.stop(); }
+    const failed = await store.getNote("f-dollar-2");
+    expect(failed!.content).toContain("_Transcription unavailable._");
+
+    // Re-arm stub + reset attachment (what the retry route does).
+    await store.updateNote("f-dollar-2", {
+      metadata: { ...((failed!.metadata as any) ?? {}), transcribe_stub: true },
+      skipUpdatedAt: true,
+    });
+    const [att] = await store.getAttachments("f-dollar-2");
+    await store.setAttachmentMetadata(att.id, {
+      ...(att.metadata ?? {}),
+      transcribe_status: "pending",
+    });
+
+    // Phase 2: success with a `$&`-bearing transcript → replaces the marker.
+    const worker2 = makeWorker({
+      fetchImpl: mkFetchMock([{ text: dollarTranscript }]),
+    });
+    try { await worker2.tick(); } finally { await worker2.stop(); }
+
+    const note = await store.getNote("f-dollar-2");
+    expect(note!.content).toBe(
+      `# 🎙️ Voice memo\n\n_Recorded sometime._\n\n${dollarTranscript}\n\n![[memos/f7.webm]]\n`,
+    );
+    expect(note!.content).toContain("retry text with $& and $0 and $$ literal");
+  });
 });
