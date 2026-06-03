@@ -25,8 +25,11 @@
  *    (Whisper API shape). Response is `{ text: string }`.
  * 3. On success:
  *    - If `note.metadata.transcribe_stub === true`, replace the
- *      `_Transcript pending._` placeholder with the transcript, or the
- *      whole note body if the placeholder is absent. Clear the stub marker.
+ *      `_Transcript pending._` placeholder (or a prior `_Transcription
+ *      unavailable._` failure marker, on a retry) with the transcript. If
+ *      neither marker is present (user edited the note while pending),
+ *      APPEND the transcript rather than overwriting the body. Clear the
+ *      stub marker.
  *    - Mark `attachment.metadata.transcribe_status = "done"` and record
  *      `transcript` + `transcribe_done_at`.
  *    - If the vault's `audio_retention` is `"until_transcribed"`, unlink
@@ -56,7 +59,7 @@ import { appendContextPart, fetchContextEntries, type ContextPayload } from "./c
 import type { TriggerIncludeContext } from "./config.ts";
 import { upsertTranscriptNote } from "./transcript-note.ts";
 
-/** Placeholder pattern written by Lens's voice-memo stub. */
+/** Placeholder pattern written by the voice-memo capture stub. */
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
 
 /**
@@ -65,8 +68,24 @@ const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
  * Lens's now-removed scribe client; owning it here means a failed upload
  * stops reading "Transcript pending" forever regardless of which client
  * uploaded the audio.
+ *
+ * NOTE: the notes-ui status chip (parachute-surface TranscriptionStatus.tsx)
+ * keys off this exact string, so don't change the copy without a coordinated
+ * change there. A friendlier "retry available" copy + chip affordance is a
+ * tracked parachute-surface follow-up.
  */
 const TRANSCRIPT_UNAVAILABLE = "_Transcription unavailable._";
+
+/**
+ * On a successful (re)transcription of a legacy in-body memo, the transcript
+ * replaces whichever marker is currently in the body — the original
+ * `_Transcript pending._` on a first-try success, OR `_Transcription
+ * unavailable._` if a prior attempt failed and we're now retrying. Matching
+ * both means a retried success lands in the same spot a first-try success
+ * would, preserving the surrounding capture body (the `![[memo]]` embed,
+ * the `_Recorded …_` line, the header).
+ */
+const TRANSCRIPT_SUCCESS_TARGET = /_Transcript pending\._|_Transcription unavailable\._/;
 
 /**
  * Default sweep cadence (ms). The sweep is the safety net for backoff-
@@ -217,13 +236,23 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
 
   /**
    * On a terminal failure (maxAttempts exhausted, or audio file missing),
-   * swap the stub placeholder for the "unavailable" marker — otherwise
-   * Lens's voice memo sits reading "Transcript pending" forever. Mirrors
-   * the success-path note write in shape: only touches the note when
+   * record the "unavailable" marker on the note — otherwise the voice memo
+   * sits reading "Transcript pending" forever. Only touches the note when
    * `transcribe_stub === true`, clears the stub marker, uses `skipUpdatedAt`
    * so the note's modification time still reflects user intent. Errors
    * are logged and swallowed so a note-write failure doesn't mask the
    * attachment failure we're trying to record.
+   *
+   * Body policy (finding F — never destroy content):
+   *   - Placeholder PRESENT → surgical replace of `_Transcript pending._`
+   *     with the marker. The `![[memo]]` embed + any surrounding text survive.
+   *   - Marker ALREADY PRESENT → no-op (idempotent; a double-terminal-failure
+   *     must not stack markers).
+   *   - Otherwise (placeholder absent — the user edited the note while it was
+   *     pending) → APPEND `\n\n` + marker to the existing content. The old
+   *     code full-replaced the body here, destroying the embed AND the user's
+   *     edits. We append instead so nothing is lost. If the content is empty,
+   *     the marker alone becomes the body (avoids a leading blank line).
    */
   async function applyFailureMarker(store: Store, noteId: string): Promise<void> {
     const note = await store.getNote(noteId);
@@ -231,9 +260,18 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
     if (noteMeta.transcribe_stub !== true) return;
 
-    const body = TRANSCRIPT_PLACEHOLDER.test(note.content)
-      ? note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE)
-      : TRANSCRIPT_UNAVAILABLE;
+    let body: string;
+    if (TRANSCRIPT_PLACEHOLDER.test(note.content)) {
+      body = note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE);
+    } else if (note.content.includes(TRANSCRIPT_UNAVAILABLE)) {
+      // Marker already present — nothing to do. Clear the stub (below) and
+      // return without rewriting the body so we don't stack markers.
+      body = note.content;
+    } else {
+      body = note.content.length > 0
+        ? `${note.content}\n\n${TRANSCRIPT_UNAVAILABLE}`
+        : TRANSCRIPT_UNAVAILABLE;
+    }
     const { transcribe_stub: _drop, ...restMeta } = noteMeta;
     try {
       await store.updateNote(note.id, {
@@ -411,14 +449,30 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         logger.error(`[transcribe] failed to write transcript note for attachment ${attachment.id}:`, err);
       }
     } else {
-      // Legacy stub-patching path (Lens voice memo flow).
+      // Legacy stub-patching path (voice memo flow). Only acts when the note
+      // still carries the `transcribe_stub` opt-in — a user edit clearing it
+      // before the transcript arrives opts out of the overwrite.
       const note = await store.getNote(attachment.noteId);
       if (note) {
         const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
         if (noteMeta.transcribe_stub === true) {
-          const body = TRANSCRIPT_PLACEHOLDER.test(note.content)
-            ? note.content.replace(TRANSCRIPT_PLACEHOLDER, transcript)
-            : transcript;
+          // Body policy (finding F — never destroy content):
+          //   - placeholder OR failure-marker present → surgical replace in
+          //     place (a retried success replaces the `_Transcription
+          //     unavailable._` marker, landing exactly where a first-try
+          //     success would). The embed + surrounding capture body survive.
+          //   - neither present (user edited the note while pending) → APPEND
+          //     the transcript instead of full-replacing the body, so the
+          //     user's edits + the `![[memo]]` embed are preserved. The old
+          //     code full-replaced here, which destroyed both.
+          let body: string;
+          if (TRANSCRIPT_SUCCESS_TARGET.test(note.content)) {
+            body = note.content.replace(TRANSCRIPT_SUCCESS_TARGET, transcript);
+          } else {
+            body = note.content.length > 0
+              ? `${note.content}\n\n${transcript}`
+              : transcript;
+          }
           const { transcribe_stub: _drop, ...restMeta } = noteMeta;
           try {
             await store.updateNote(note.id, {

@@ -305,8 +305,10 @@ describe("transcription worker", () => {
   });
 
   test("FIFO: oldest pending is processed first", async () => {
-    await store.createNote("s", { id: "f1", metadata: { transcribe_stub: true } });
-    await store.createNote("s", { id: "f2", metadata: { transcribe_stub: true } });
+    // Seed the placeholder body so the transcript patches in place (the real
+    // capture shape); ordering is what this test verifies.
+    await store.createNote("_Transcript pending._", { id: "f1", metadata: { transcribe_stub: true } });
+    await store.createNote("_Transcript pending._", { id: "f2", metadata: { transcribe_stub: true } });
     seedAudio("memos/first.webm");
     seedAudio("memos/second.webm");
     await store.addAttachment("f1", "memos/first.webm", "audio/webm", {
@@ -702,7 +704,8 @@ describe("transcription worker — hook-driven", () => {
   });
 
   test("attachment:created event triggers a cycle before the sweep fires", async () => {
-    await hookedStore.createNote("stub", { id: "h1", metadata: { transcribe_stub: true } });
+    // Placeholder body so the transcript patches in place (real capture shape).
+    await hookedStore.createNote("_Transcript pending._", { id: "h1", metadata: { transcribe_stub: true } });
     seedAudio("memos/h1.webm");
 
     let callCount = 0;
@@ -1115,5 +1118,183 @@ describe("transcription worker — auto-origin (vault#353)", () => {
       expect(t).not.toBeNull();
       expect((t!.metadata as any)?.transcript_status).toBe("complete");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// finding F — never destroy content on the legacy in-body memo path. These
+// fixtures carry the `![[<audio>]]` embed (the REAL production capture shape
+// from recorder.ts memoNoteContent), which the pre-existing failure tests all
+// omitted — which is why the data-loss branch went uncaught.
+// ---------------------------------------------------------------------------
+
+describe("transcription worker — legacy in-body memo content safety (finding F)", () => {
+  // Canonical capture body: header + _Recorded_ + placeholder + ![[embed]].
+  const captureBody = (audio: string) =>
+    `# 🎙️ Voice memo\n\n_Recorded sometime._\n\n_Transcript pending._\n\n![[${audio}]]\n`;
+
+  test("failure with placeholder present → marker replaces placeholder, embed intact", async () => {
+    await store.createNote(captureBody("memos/f1.webm"), {
+      id: "f-marker-1",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f1.webm");
+    await store.addAttachment("f-marker-1", "memos/f1.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "scribe down", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("f-marker-1");
+    expect(note!.content).toBe(
+      "# 🎙️ Voice memo\n\n_Recorded sometime._\n\n_Transcription unavailable._\n\n![[memos/f1.webm]]\n",
+    );
+    // Embed survives — the whole point.
+    expect(note!.content).toContain("![[memos/f1.webm]]");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+  });
+
+  test("failure with placeholder ABSENT (user-edited body + embed) → marker APPENDED, content preserved", async () => {
+    // The data-loss regression: user edited the note while pending, removing
+    // the _Transcript pending._ placeholder but keeping their text + the
+    // embed. The old code full-replaced the body with the bare marker here,
+    // destroying both. Now we append.
+    const editedBody = "# 🎙️ My trip notes\n\nWent to the coast today.\n\n![[memos/f2.webm]]\n";
+    await store.createNote(editedBody, {
+      id: "f-marker-2",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f2.webm");
+    await store.addAttachment("f-marker-2", "memos/f2.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "scribe down", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("f-marker-2");
+    // User text + embed preserved; marker appended.
+    expect(note!.content).toBe(`${editedBody}\n\n_Transcription unavailable._`);
+    expect(note!.content).toContain("Went to the coast today.");
+    expect(note!.content).toContain("![[memos/f2.webm]]");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+  });
+
+  test("double terminal failure → exactly one marker (idempotent, no stacking)", async () => {
+    // First failure writes the marker + clears the stub. Re-arm the stub and
+    // fail again — the marker must NOT stack. (Re-arming models a retry that
+    // fails again.)
+    await store.createNote(captureBody("memos/f3.webm"), {
+      id: "f-marker-3",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f3.webm");
+    await store.addAttachment("f-marker-3", "memos/f3.webm", "audio/webm", {
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker1 = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "down", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try { await worker1.tick(); } finally { await worker1.stop(); }
+
+    // Re-arm stub + reset attachment to pending (what a retry does), then fail again.
+    const note1 = await store.getNote("f-marker-3");
+    await store.updateNote("f-marker-3", {
+      metadata: { ...((note1!.metadata as any) ?? {}), transcribe_stub: true },
+      skipUpdatedAt: true,
+    });
+    const [att] = await store.getAttachments("f-marker-3");
+    await store.setAttachmentMetadata(att.id, {
+      ...(att.metadata ?? {}),
+      transcribe_status: "pending",
+      transcribe_attempts: 2,
+    });
+
+    const worker2 = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "down again", status: 500 }]),
+      maxAttempts: 3,
+    });
+    try { await worker2.tick(); } finally { await worker2.stop(); }
+
+    const note = await store.getNote("f-marker-3");
+    const occurrences = note!.content.split("_Transcription unavailable._").length - 1;
+    expect(occurrences).toBe(1);
+    expect(note!.content).toContain("![[memos/f3.webm]]");
+  });
+
+  test("success with placeholder absent (stub set) → transcript appended, content preserved", async () => {
+    // Mirror of the failure-append case, on the success path. User edited the
+    // note (cleared the placeholder) but kept the stub. The old code
+    // full-replaced the body with the bare transcript; now we append.
+    const editedBody = "# 🎙️ My trip notes\n\nWent to the coast today.\n\n![[memos/f4.webm]]\n";
+    await store.createNote(editedBody, {
+      id: "f-success-1",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f4.webm");
+    await store.addAttachment("f-success-1", "memos/f4.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "the spoken transcript" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("f-success-1");
+    expect(note!.content).toBe(`${editedBody}\n\nthe spoken transcript`);
+    expect(note!.content).toContain("Went to the coast today.");
+    expect(note!.content).toContain("![[memos/f4.webm]]");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+  });
+
+  test("first-try success with placeholder present + embed → transcript replaces placeholder in place", async () => {
+    // Pins the canonical first-try-success shape the retry round-trip must match.
+    await store.createNote(captureBody("memos/f5.webm"), {
+      id: "f-success-2",
+      metadata: { transcribe_stub: true },
+    });
+    seedAudio("memos/f5.webm");
+    await store.addAttachment("f-success-2", "memos/f5.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const worker = makeWorker({
+      fetchImpl: mkFetchMock([{ text: "the spoken words" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("f-success-2");
+    expect(note!.content).toBe(
+      "# 🎙️ Voice memo\n\n_Recorded sometime._\n\nthe spoken words\n\n![[memos/f5.webm]]\n",
+    );
   });
 });
