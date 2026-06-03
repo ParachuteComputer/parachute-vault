@@ -459,11 +459,6 @@ Query params:
     alias does compose with bracket *date* filters (`meta[created_at][gte]=…`),
     which are a separate axis.
 
-> **Percent-encode slashes in path filters.** Single-note routes and
-> path-valued params resolve a note by id-or-path; a literal `/` in the path
-> must be percent-encoded as `%2F` (e.g. `GET .../api/notes/Projects%2FFoo`,
-> `?path=Projects%2FFoo`) so it isn't parsed as a route separator.
-
 - **Full-text search**
   - `search=query` — switches to FTS mode. Returns `Note[]` (full shape),
     not `NoteIndex[]`. Optional `tag=` filters compose. `limit` defaults to
@@ -544,6 +539,12 @@ Error shapes:
 #### `GET /vault/{name}/api/notes/{idOrPath}` — `vault:read`
 Returns the full `Note` (defaults to `include_content=true` for point
 reads). `?include_content=false` returns a `NoteIndex`.
+
+> **Percent-encode slashes in `{idOrPath}`.** This route (and the `PATCH` /
+> `DELETE` siblings below) resolves a note by id-or-path; a literal `/` in a
+> path must be percent-encoded as `%2F` (e.g.
+> `GET .../api/notes/Projects%2FFoo`) so it isn't parsed as a route separator.
+> The same applies to path-valued query params like `?path=Projects%2FFoo`.
 
 Folding options:
 

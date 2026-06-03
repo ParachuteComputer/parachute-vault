@@ -2810,6 +2810,38 @@ describe("HTTP /notes", async () => {
       expect(body.code).toBe("INVALID_QUERY");
     });
 
+    test("primitive-scalar `metadata=` JSON (number / bare string) rejects with 400 INVALID_QUERY", async () => {
+      // `metadata=42` and `metadata="open"` are valid JSON but not objects —
+      // both fall through the non-object branch.
+      for (const raw of ["42", JSON.stringify("open")]) {
+        const res = await handleNotes(
+          mkReq("GET", "/notes?metadata=" + encodeURIComponent(raw)),
+          store,
+          "",
+        );
+        expect(res.status).toBe(400);
+        const body = await res.json() as any;
+        expect(body.code).toBe("INVALID_QUERY");
+      }
+    });
+
+    test("empty-object alias `metadata={}` is treated as absent and composes with a bracket filter", async () => {
+      // `{}` carries no filter intent — it must neither set a metadata filter
+      // NOR trip the both-forms 400 guard. So `metadata={}` + a bracket
+      // metadata filter is a 200 filtered by the bracket form only.
+      await declareIndexed();
+      await store.createNote("hi", { metadata: { priority: 5 } });
+      await store.createNote("lo", { metadata: { priority: 1 } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?metadata=" + encodeURIComponent("{}") + "&meta[priority][gte]=3&include_content=true"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["hi"]);
+    });
+
     test("both `metadata=` alias AND `meta[...]` bracket params present rejects with 400 INVALID_QUERY", async () => {
       await declareIndexed();
       const q = encodeURIComponent(JSON.stringify({ status: { eq: "open" } }));

@@ -370,6 +370,10 @@ function parseMetaBrackets(url: URL): {
  * that the param parses and is a non-null, non-array plain object; anything
  * else is a malformed filter the engine can't consume.
  *
+ * An empty object (`metadata={}`) carries no filter intent, so it's treated as
+ * absent: it sets no metadata filter AND doesn't trip the both-forms guard, so
+ * it composes harmlessly with bracket params.
+ *
  * Returns `{ metadata?, error? }`. When `error` is set the caller returns it
  * directly (already shaped as a 400 with `error` + `code`).
  */
@@ -392,13 +396,16 @@ function parseMetadataJsonAlias(url: URL): {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (e: any) {
-    return { error: malformed(`failed to parse: ${e?.message ?? String(e)}`) };
+  } catch (e) {
+    return { error: malformed(`failed to parse: ${e instanceof Error ? e.message : String(e)}`) };
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     const got = Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed;
     return { error: malformed(`got ${got}`) };
   }
+  // Empty object → no filter intent. Return absent so it neither sets a
+  // metadata filter nor trips the both-forms guard in the handler.
+  if (Object.keys(parsed).length === 0) return {};
   return { metadata: parsed as Record<string, unknown> };
 }
 
