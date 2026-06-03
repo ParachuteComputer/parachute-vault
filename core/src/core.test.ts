@@ -5039,43 +5039,65 @@ describe("tag record API (patterns/tag-data-model.md)", async () => {
     expect(idxZebra).toBeGreaterThan(idxAlpha);
   });
 
-  it("update-tag MCP rejects an invalid cardinality", async () => {
+  // ---- relationships is an opaque vocabulary map (vault#428) ----
+  // Vault no longer enforces the historical { target_tag, cardinality }
+  // shape. Apps (the Weaver / structural-link picker) declare a freeform
+  // vocabulary; vault stores + returns it verbatim. The old typed shape is
+  // still a valid value, so the loosening is a backwards-compatible superset.
+
+  it("update-tag MCP persists the opaque relationship-vocabulary map verbatim (vault#428)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    const vocab = {
+      "works-on": { from: "person", to: "project" },
+      "member-of": { from: "person", to: "organization" },
+      "partner-of": { from: "person", to: "person" },
+      "based-at": { from: "project", to: "place" },
+    };
+    await update.execute({ tag: "person", relationships: vocab });
+    const r = await store.getTagRecord("person");
+    expect(r?.relationships).toEqual(vocab);
+  });
+
+  it("update-tag MCP round-trips nested arbitrary relationship values verbatim", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    const vocab = {
+      rel: { from: "a", to: "b", note: "freeform", weight: 3, optional: true, tags: ["x", "y"] },
+    };
+    await update.execute({ tag: "thing", relationships: vocab });
+    const r = await store.getTagRecord("thing");
+    expect(r?.relationships).toEqual(vocab);
+  });
+
+  it("update-tag MCP still accepts the historical typed shape (backwards-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    const typed = { owned_by: { target_tag: "person", cardinality: "one", description: "DRI" } };
+    await update.execute({ tag: "project", relationships: typed });
+    const r = await store.getTagRecord("project");
+    expect(r?.relationships).toEqual(typed);
+  });
+
+  it("update-tag MCP accepts what used to be rejected (no inner-shape enforcement)", async () => {
+    const tools = generateMcpTools(store);
+    const update = tools.find((t) => t.name === "update-tag")!;
+    // Formerly rejected: non-vocabulary cardinality + missing target_tag.
+    const formerlyInvalid = {
+      a: { target_tag: "person", cardinality: "bogus" },
+      b: { cardinality: "one" },
+    };
+    await update.execute({ tag: "loose", relationships: formerlyInvalid });
+    const r = await store.getTagRecord("loose");
+    expect(r?.relationships).toEqual(formerlyInvalid);
+  });
+
+  it("update-tag MCP rejects a top-level array for relationships (must be a map)", async () => {
     const tools = generateMcpTools(store);
     const update = tools.find((t) => t.name === "update-tag")!;
     await expect(
-      update.execute({
-        tag: "project",
-        relationships: {
-          owned_by: { target_tag: "person", cardinality: "bogus" },
-        },
-      }),
-    ).rejects.toThrow(/cardinality/);
-  });
-
-  it("update-tag MCP accepts every cardinality in the named vocabulary", async () => {
-    const tools = generateMcpTools(store);
-    const update = tools.find((t) => t.name === "update-tag")!;
-    for (const card of ["one", "optional", "many", "many-required"]) {
-      await update.execute({
-        tag: `tag-${card}`,
-        relationships: {
-          rel: { target_tag: "other", cardinality: card },
-        },
-      });
-      const r = await store.getTagRecord(`tag-${card}`);
-      expect(r?.relationships?.rel?.cardinality).toBe(card);
-    }
-  });
-
-  it("update-tag MCP rejects a relationship missing target_tag", async () => {
-    const tools = generateMcpTools(store);
-    const update = tools.find((t) => t.name === "update-tag")!;
-    await expect(
-      update.execute({
-        tag: "project",
-        relationships: { owned_by: { cardinality: "one" } },
-      }),
-    ).rejects.toThrow(/target_tag/);
+      update.execute({ tag: "project", relationships: ["not", "a", "map"] as unknown as Record<string, unknown> }),
+    ).rejects.toThrow();
   });
 
   it("update-tag MCP sets parent_names and the hierarchy invalidates", async () => {

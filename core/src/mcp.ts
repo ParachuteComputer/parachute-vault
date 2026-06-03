@@ -1119,16 +1119,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           },
           relationships: {
             type: "object",
-            description: 'Typed-link declarations. Each value declares { target_tag, cardinality, description? }. Cardinality is one of: one | optional | many | many-required. Phase 1: informational, not enforced at write time. E.g., { "lives_in": { "target_tag": "place", "cardinality": "one" } }',
-            additionalProperties: {
-              type: "object",
-              properties: {
-                target_tag: { type: "string", description: "Tag the relationship points at" },
-                cardinality: { type: "string", enum: ["one", "optional", "many", "many-required"], description: "How many targets this relationship may have" },
-                description: { type: "string", description: "Why this relationship exists; surfaced to AI clients" },
-              },
-              required: ["target_tag", "cardinality"],
-            },
+            description: 'Opaque relationship-vocabulary map: keys are relationship names, values are arbitrary JSON the declaring app interprets. Vault stores and returns the values verbatim and does NOT enforce any inner shape — only that this is a JSON object (a map), not an array or primitive. Replaces any prior map wholesale when provided; pass null to clear. The historical typed shape { "lives_in": { "target_tag": "place", "cardinality": "one" } } is still a valid value, as is any app-defined shape e.g. { "works-on": { "from": "person", "to": "project" } }.',
+            additionalProperties: true,
           },
           parent_names: {
             type: "array",
@@ -1192,10 +1184,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           }
         }
 
-        // ---- relationships: replace wholesale when provided. Validate
-        // shape + cardinality vocabulary before persisting so a malformed
-        // payload can't leave the row in an inconsistent state.
-        let relationshipsPatch: Record<string, tagSchemaOps.TagRelationship> | null | undefined;
+        // ---- relationships: replace wholesale when provided. `relationships`
+        // is an opaque vocabulary map (relationship-name → arbitrary JSON the
+        // app interprets). Validate only that it's a JSON object (a map), then
+        // persist verbatim — no inner-shape enforcement.
+        let relationshipsPatch: tagSchemaOps.TagRelationshipMap | null | undefined;
         if (params.relationships === null) {
           relationshipsPatch = null;
         } else if (params.relationships !== undefined) {

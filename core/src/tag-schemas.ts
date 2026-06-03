@@ -33,10 +33,13 @@ export interface TagFieldSchema {
 }
 
 /**
- * Cardinality vocabulary for typed relationships. Names rather than
- * algebra so AI clients reading `list-tags` can reason about intent
- * directly. Phase 1 is informational — declarations are not enforced
- * at write time. See patterns/tag-data-model.md §Typed relationships.
+ * Cardinality vocabulary for the historical typed-relationship shape.
+ * Names rather than algebra so AI clients reading `list-tags` can reason
+ * about intent directly. Retained for callers that still want the typed
+ * `{ target_tag, cardinality }` declaration — but `relationships` is now an
+ * opaque vocabulary map (see `TagRelationshipMap` / `validateRelationships`),
+ * so this is one valid value shape among many, not a required one.
+ * See patterns/tag-data-model.md §Typed relationships.
  */
 export type TagRelCardinality = "one" | "optional" | "many" | "many-required";
 
@@ -47,11 +50,23 @@ export const TAG_REL_CARDINALITIES: readonly TagRelCardinality[] = [
   "many-required",
 ] as const;
 
+/**
+ * The historical typed-relationship declaration. Still a valid opaque-map
+ * value — vault no longer enforces it. New apps (the Weaver / structural-link
+ * picker) declare their own freeform vocabulary instead.
+ */
 export interface TagRelationship {
   target_tag: string;
   cardinality: TagRelCardinality;
   description?: string;
 }
+
+/**
+ * `relationships` is an opaque vocabulary map: relationship-name → arbitrary
+ * JSON value the declaring app interprets. Vault stores and returns the values
+ * verbatim and enforces only that the top-level value is a JSON object (a map).
+ */
+export type TagRelationshipMap = Record<string, unknown>;
 
 /**
  * Schema-only view of a tag — the historical shape. Backwards-compatible
@@ -67,7 +82,7 @@ export interface TagSchema {
  * Full tag record — schema + typed relationships + hierarchy parents.
  */
 export interface TagRecord extends TagSchema {
-  relationships?: Record<string, TagRelationship>;
+  relationships?: TagRelationshipMap;
   parent_names?: string[];
   created_at?: string;
   updated_at?: string;
@@ -115,7 +130,7 @@ export function upsertTagRecord(
   patch: {
     description?: string | null;
     fields?: Record<string, TagFieldSchema> | null;
-    relationships?: Record<string, TagRelationship> | null;
+    relationships?: TagRelationshipMap | null;
     parent_names?: string[] | null;
   },
 ): TagRecord {
@@ -226,56 +241,56 @@ export function deleteTagSchema(db: Database, tag: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Validation — typed relationships
+// Validation — relationships (opaque vocabulary map)
 // ---------------------------------------------------------------------------
 
 /**
- * Validate a `relationships` payload before persisting. Returns the
- * canonicalized object on success; throws Error with a user-readable
- * message on the first violation. Rules:
+ * Validate a `relationships` payload before persisting. `relationships` is
+ * an **opaque vocabulary map**: a JSON object whose keys are relationship
+ * names and whose values are arbitrary JSON the declaring app interprets
+ * (e.g. the Weaver / structural-link picker's `{ "works-on": { from, to } }`
+ * shape). Vault does not enforce any inner structure — it stores and returns
+ * the values verbatim.
  *
- *   - Each value must declare `target_tag` (non-empty string) and
- *     `cardinality` from the named vocabulary.
- *   - `description` is optional, must be a string when present.
- *   - Relationship keys must be non-empty strings.
+ * Rules (the only ones):
+ *   - The top-level value must be a plain JSON object (a map). A top-level
+ *     array or primitive is rejected — relationships is a map, not a list.
+ *   - The payload must be JSON-serializable (no circular refs / functions /
+ *     bigints), since it's persisted as a JSON column.
+ *
+ * Returns the value verbatim (round-trips through JSON.parse(JSON.stringify)
+ * to both prove serializability and strip anything non-serializable). The
+ * historical typed shape `{ target_tag, cardinality }` is a valid opaque map,
+ * so this is a backwards-compatible superset — existing typed declarations
+ * and callers keep working unchanged.
+ *
+ * Phase 1 was already informational ("declarations are not enforced at write
+ * time"); dropping the inner-shape gate is consistent with that intent.
  */
-export function validateRelationships(
-  raw: unknown,
-): Record<string, TagRelationship> {
+export function validateRelationships(raw: unknown): Record<string, unknown> {
   if (raw === null || raw === undefined) {
     throw new Error("relationships: expected an object, got null/undefined");
   }
   if (typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("relationships: expected an object mapping rel name → declaration");
+    throw new Error(
+      "relationships: expected an object mapping relationship name → value (got an array or primitive)",
+    );
   }
-  const out: Record<string, TagRelationship> = {};
-  for (const [rel, decl] of Object.entries(raw as Record<string, unknown>)) {
+  for (const rel of Object.keys(raw as Record<string, unknown>)) {
     if (!rel || typeof rel !== "string") {
       throw new Error("relationships: keys must be non-empty strings");
     }
-    if (!decl || typeof decl !== "object" || Array.isArray(decl)) {
-      throw new Error(`relationships["${rel}"]: declaration must be an object`);
-    }
-    const d = decl as Record<string, unknown>;
-    if (typeof d.target_tag !== "string" || d.target_tag.length === 0) {
-      throw new Error(`relationships["${rel}"]: target_tag must be a non-empty string`);
-    }
-    const card = d.cardinality;
-    if (typeof card !== "string" || !TAG_REL_CARDINALITIES.includes(card as TagRelCardinality)) {
-      throw new Error(
-        `relationships["${rel}"]: cardinality must be one of ${TAG_REL_CARDINALITIES.join(" | ")}; got ${JSON.stringify(card)}`,
-      );
-    }
-    if (d.description !== undefined && typeof d.description !== "string") {
-      throw new Error(`relationships["${rel}"]: description must be a string when set`);
-    }
-    out[rel] = {
-      target_tag: d.target_tag,
-      cardinality: card as TagRelCardinality,
-      ...(d.description !== undefined ? { description: d.description as string } : {}),
-    };
   }
-  return out;
+  // Round-trip through JSON to (a) confirm the payload is serializable —
+  // the column is stored as JSON — and (b) return a clean, owned copy with
+  // no non-JSON values lingering. Throws on circular refs / bigint / etc.
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(raw);
+  } catch (err) {
+    throw new Error(`relationships: value must be JSON-serializable (${(err as Error).message})`);
+  }
+  return JSON.parse(serialized) as Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +302,7 @@ function rowToRecord(row: TagRow): TagRecord {
     tag: row.name,
     description: row.description ?? undefined,
     fields: parseJson<Record<string, TagFieldSchema>>(row.fields),
-    relationships: parseJson<Record<string, TagRelationship>>(row.relationships),
+    relationships: parseJson<TagRelationshipMap>(row.relationships),
     parent_names: parseJson<string[]>(row.parent_names),
     created_at: row.created_at ?? undefined,
     updated_at: row.updated_at ?? undefined,

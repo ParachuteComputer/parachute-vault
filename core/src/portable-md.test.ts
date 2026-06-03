@@ -794,6 +794,37 @@ describe("importPortableVault", async () => {
     expect(typed!.metadata).toEqual({ source: "git://x" });
   });
 
+  it("preserves an opaque relationship-vocabulary map across export → import → re-export (vault#428)", async () => {
+    const vocab = {
+      "works-on": { from: "person", to: "project" },
+      "member-of": { from: "person", to: "organization" },
+      "partner-of": { from: "person", to: "person" },
+      "based-at": { from: "project", to: "place", note: "freeform" },
+    };
+    await store.upsertTagRecord("person", {
+      description: "a human",
+      relationships: vocab,
+    });
+    const outDir = join(tmpBase, "out");
+    await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir: outDir });
+    expect(stats.schemas_restored).toBe(1);
+
+    // Imported value matches the original verbatim.
+    const restored = await target.getTagRecord("person");
+    expect(restored?.relationships).toEqual(vocab);
+
+    // Re-export from the restored store and confirm the schema file is
+    // byte-identical to the first export (deep round-trip stability).
+    const outDir2 = join(tmpBase, "out2");
+    await exportVaultToDir(target, { outDir: outDir2, exportedAt: "2026-05-13T00:00:00.000Z" });
+    const schemaA = readFileSync(join(outDir, SIDECAR_DIR, "schemas", "person.yaml"), "utf-8");
+    const schemaB = readFileSync(join(outDir2, SIDECAR_DIR, "schemas", "person.yaml"), "utf-8");
+    expect(schemaB).toBe(schemaA);
+  });
+
   it("skips typed links whose target is missing from the import set", async () => {
     // Source note has a typed link to a target we don't include in
     // the export (synthetic — write the .md file by hand).
@@ -861,6 +892,15 @@ describe("portable-md round-trip — byte-equivalent re-export after blow-away i
     await store.upsertTagSchema("project", {
       description: "A long-running effort",
       fields: { status: { type: "string", enum: ["active", "done"] } },
+    });
+    // Opaque relationship-vocabulary map (vault#428) — exercises that the
+    // round-trip preserves an arbitrary app-defined relationships shape,
+    // not just the historical { target_tag, cardinality } one.
+    await store.upsertTagRecord("project", {
+      relationships: {
+        "works-on": { from: "person", to: "project" },
+        "based-at": { from: "project", to: "place", note: "freeform" },
+      },
     });
     const n1 = await store.createNote("alpha body", {
       id: "01HX001",

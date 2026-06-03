@@ -1663,10 +1663,12 @@ export async function handleTags(
       parent_names?: unknown;
     };
 
-    // Validate relationships shape + cardinality vocabulary up front so
-    // a bad payload returns 400, not a thrown 500.
+    // Validate the relationships payload up front so a bad payload returns
+    // 400, not a thrown 500. `relationships` is an opaque vocabulary map
+    // (relationship-name → arbitrary JSON the app interprets); we only check
+    // that it's a JSON object (a map), then persist verbatim.
     let relationshipsPatch:
-      | Record<string, tagSchemaOps.TagRelationship>
+      | tagSchemaOps.TagRelationshipMap
       | null
       | undefined;
     if (body.relationships === null) {

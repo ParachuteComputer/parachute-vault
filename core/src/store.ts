@@ -572,7 +572,7 @@ export class BunSqliteStore implements Store {
     patch: {
       description?: string | null;
       fields?: Record<string, tagSchemaOps.TagFieldSchema> | null;
-      relationships?: Record<string, tagSchemaOps.TagRelationship> | null;
+      relationships?: tagSchemaOps.TagRelationshipMap | null;
       parent_names?: string[] | null;
     },
   ) {
