@@ -53,7 +53,7 @@
 
 import { join, normalize } from "path";
 import { existsSync, readFileSync, unlinkSync } from "fs";
-import type { Store, Attachment } from "../core/src/types.ts";
+import type { Store, Attachment, Note } from "../core/src/types.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
 import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
 import type { TriggerIncludeContext } from "./config.ts";
@@ -229,6 +229,100 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
    */
   const inFlightAttachments = new Set<string>();
 
+  /**
+   * Apply a surgical note transform under optimistic concurrency (vault#435).
+   *
+   * The worker's marker/transcript writes are read-modify-write cycles
+   * (`getNote` → transform → `updateNote`). Without a precondition, a user
+   * edit landing between the read and the write is silently clobbered —
+   * the same static-write/stale-read class as vault#208.
+   *
+   * `transform(note)` returns the surgical update to apply (`content` and/or
+   * `metadata`), or `null` when the fresh state means there's nothing to do
+   * (e.g. the stub was cleared, or the marker is already present — the
+   * idempotency guards from #434 live inside the transform, so they re-run
+   * against whatever we re-read). The transform MUST be pure w.r.t. the note
+   * it's handed — it's invoked once per read, and re-invoked on the fresh
+   * read after a conflict.
+   *
+   * Policy on conflict (worker = resilient, never crash the sweep):
+   *   1. First write conflicts → re-read, re-run the transform against fresh
+   *      content, write with the fresh precondition.
+   *   2. Second write also conflicts → fall back to a precondition-less write
+   *      ONLY when `safeWithoutPrecondition(freshNote)` says the transform is
+   *      still safe against the latest content (e.g. the surgical-replace
+   *      target is still present, or an append is always-safe). Otherwise
+   *      skip + log — better to leave the note as the user last left it than
+   *      to blind-overwrite a third concurrent edit.
+   *
+   * All errors are logged + swallowed: a note-write failure must not mask the
+   * attachment-level result we already recorded, nor crash the sweep.
+   */
+  async function applyNoteTransformWithOC(
+    store: Store,
+    noteId: string,
+    op: string,
+    transform: (note: Note) => { content?: string; metadata?: Record<string, unknown> } | null,
+    safeWithoutPrecondition: (note: Note) => boolean,
+  ): Promise<void> {
+    try {
+      const note = await store.getNote(noteId);
+      if (!note) return;
+      const update = transform(note);
+      if (update === null) return;
+
+      try {
+        await store.updateNote(note.id, {
+          ...update,
+          skipUpdatedAt: true,
+          if_updated_at: note.updatedAt,
+        });
+        return;
+      } catch (err: any) {
+        if (!err || err.code !== "CONFLICT") throw err;
+      }
+
+      // Conflict — a user edit landed between read and write. Re-read,
+      // re-apply the same surgical transform against the fresh content, and
+      // write with the fresh precondition.
+      const fresh = await store.getNote(noteId);
+      if (!fresh) return;
+      const reUpdate = transform(fresh);
+      if (reUpdate === null) return;
+
+      try {
+        await store.updateNote(fresh.id, {
+          ...reUpdate,
+          skipUpdatedAt: true,
+          if_updated_at: fresh.updatedAt,
+        });
+        return;
+      } catch (err: any) {
+        if (!err || err.code !== "CONFLICT") throw err;
+      }
+
+      // Double conflict (a third edit raced the retry). Last resort: apply
+      // without a precondition ONLY if the transform is still safe against
+      // the latest content. Otherwise skip — don't clobber the user.
+      const latest = await store.getNote(noteId);
+      if (!latest) return;
+      if (!safeWithoutPrecondition(latest)) {
+        logger.error(
+          `[transcribe] ${op}: note ${noteId} kept changing under us (double conflict); skipping to avoid clobbering a concurrent edit`,
+        );
+        return;
+      }
+      const finalUpdate = transform(latest);
+      if (finalUpdate === null) return;
+      await store.updateNote(latest.id, {
+        ...finalUpdate,
+        skipUpdatedAt: true,
+      });
+    } catch (err) {
+      logger.error(`[transcribe] ${op}: failed to apply to note ${noteId}:`, err);
+    }
+  }
+
   async function processOne(vault: string, attachment: Attachment): Promise<void> {
     // Dedupe: another path (sweep vs hook kick, or a duplicate dispatch)
     // is already working this attachment. Drop — its result is durable
@@ -263,33 +357,39 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
    *     the marker alone becomes the body (avoids a leading blank line).
    */
   async function applyFailureMarker(store: Store, noteId: string): Promise<void> {
-    const note = await store.getNote(noteId);
-    if (!note) return;
-    const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
-    if (noteMeta.transcribe_stub !== true) return;
+    // OC-guarded (vault#435): the read-transform-write below is re-run against
+    // fresh content on a conflict so a concurrent user edit isn't clobbered.
+    // The transform is pure w.r.t. the note it's handed; the stub-set and
+    // marker-already-present idempotency guards re-evaluate on the re-read.
+    await applyNoteTransformWithOC(
+      store,
+      noteId,
+      "apply-failure-marker",
+      (note) => {
+        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+        if (noteMeta.transcribe_stub !== true) return null;
 
-    let body: string;
-    if (TRANSCRIPT_PLACEHOLDER.test(note.content)) {
-      body = note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE);
-    } else if (note.content.includes(TRANSCRIPT_UNAVAILABLE)) {
-      // Marker already present — nothing to do. Clear the stub (below) and
-      // return without rewriting the body so we don't stack markers.
-      body = note.content;
-    } else {
-      body = note.content.length > 0
-        ? `${note.content}\n\n${TRANSCRIPT_UNAVAILABLE}`
-        : TRANSCRIPT_UNAVAILABLE;
-    }
-    const { transcribe_stub: _drop, ...restMeta } = noteMeta;
-    try {
-      await store.updateNote(note.id, {
-        content: body,
-        metadata: restMeta,
-        skipUpdatedAt: true,
-      });
-    } catch (err) {
-      logger.error(`[transcribe] failed to apply failure marker to note ${note.id}:`, err);
-    }
+        let body: string;
+        if (TRANSCRIPT_PLACEHOLDER.test(note.content)) {
+          body = note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE);
+        } else if (note.content.includes(TRANSCRIPT_UNAVAILABLE)) {
+          // Marker already present — nothing to do. Clear the stub and
+          // return without rewriting the body so we don't stack markers.
+          body = note.content;
+        } else {
+          body = note.content.length > 0
+            ? `${note.content}\n\n${TRANSCRIPT_UNAVAILABLE}`
+            : TRANSCRIPT_UNAVAILABLE;
+        }
+        const { transcribe_stub: _drop, ...restMeta } = noteMeta;
+        return { content: body, metadata: restMeta };
+      },
+      // Last-resort (double-conflict) safety: only blind-write while the note
+      // still carries the stub opt-in. If a racing edit cleared it, the user
+      // opted out — skip rather than re-stamp the marker. The body transform
+      // itself is non-destructive (surgical replace / no-op / append).
+      (note) => ((note.metadata as Record<string, unknown> | undefined)?.transcribe_stub === true),
+    );
   }
 
   /**
@@ -459,11 +559,16 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     } else {
       // Legacy stub-patching path (voice memo flow). Only acts when the note
       // still carries the `transcribe_stub` opt-in — a user edit clearing it
-      // before the transcript arrives opts out of the overwrite.
-      const note = await store.getNote(attachment.noteId);
-      if (note) {
-        const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
-        if (noteMeta.transcribe_stub === true) {
+      // before the transcript arrives opts out of the overwrite. OC-guarded
+      // (vault#435): re-applied against fresh content on a conflict so a
+      // concurrent user edit isn't clobbered.
+      await applyNoteTransformWithOC(
+        store,
+        attachment.noteId,
+        "apply-transcript",
+        (note) => {
+          const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+          if (noteMeta.transcribe_stub !== true) return null;
           // Body policy (finding F — never destroy content):
           //   - placeholder OR failure-marker present → surgical replace in
           //     place (a retried success replaces the `_Transcription
@@ -488,17 +593,12 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
               : transcript;
           }
           const { transcribe_stub: _drop, ...restMeta } = noteMeta;
-          try {
-            await store.updateNote(note.id, {
-              content: body,
-              metadata: restMeta,
-              skipUpdatedAt: true,
-            });
-          } catch (err) {
-            logger.error(`[transcribe] failed to apply transcript to note ${note.id}:`, err);
-          }
-        }
-      }
+          return { content: body, metadata: restMeta };
+        },
+        // Last-resort (double-conflict) safety: only blind-write while the
+        // stub opt-in survives. A racing edit that cleared it opts out.
+        (note) => ((note.metadata as Record<string, unknown> | undefined)?.transcribe_stub === true),
+      );
     }
 
     // Always record the transcript on the attachment, even if the note

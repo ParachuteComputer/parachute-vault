@@ -2284,12 +2284,63 @@ async function handleRetryLegacyInBody(
   // never writes the transcript back into the body. Use skipUpdatedAt so the
   // note's modification time still reflects user intent, matching the
   // worker's own note writes.
-  const noteMeta = { ...((note.metadata as Record<string, unknown> | undefined) ?? {}) };
-  noteMeta.transcribe_stub = true;
-  await store.updateNote(note.id, {
-    metadata: noteMeta,
-    skipUpdatedAt: true,
+  //
+  // OC-guarded (vault#435): this read-transform-write would otherwise clobber
+  // a user edit landing between `resolveNote` (above) and this write. Thread
+  // `if_updated_at` and retry once on conflict — re-read, re-apply the
+  // metadata-only re-stamp against the fresh note, write with the fresh
+  // precondition. A second conflict surfaces as 409 so the user can retry.
+  // Only the `transcribe_stub` flag is stamped (never content), so re-applying
+  // against the fresh note is always the correct surgical transform.
+  const restampStub = (current: Note): Record<string, unknown> => ({
+    ...((current.metadata as Record<string, unknown> | undefined) ?? {}),
+    transcribe_stub: true,
   });
+  try {
+    try {
+      await store.updateNote(note.id, {
+        metadata: restampStub(note),
+        skipUpdatedAt: true,
+        if_updated_at: note.updatedAt,
+      });
+    } catch (err: any) {
+      if (!err || err.code !== "CONFLICT") throw err;
+      // Conflict — re-read, re-apply the stub re-stamp, retry once.
+      const fresh = await store.getNote(note.id);
+      if (!fresh) {
+        return json(
+          { error: "note_missing", message: "Target note disappeared during retry." },
+          404,
+        );
+      }
+      await store.updateNote(fresh.id, {
+        metadata: restampStub(fresh),
+        skipUpdatedAt: true,
+        if_updated_at: fresh.updatedAt,
+      });
+    }
+  } catch (err: any) {
+    if (err && err.code === "CONFLICT") {
+      // Double conflict — the note kept changing under us. It's a user-facing
+      // request; return 409 so the caller can retry against fresh state. The
+      // attachment was already reset to pending above; a successful re-stamp
+      // on the user's next retry (or the next sweep, if they re-arm the stub)
+      // will let the worker patch the transcript in.
+      return json(
+        {
+          error_type: "conflict",
+          error: "conflict",
+          note_id: note.id,
+          current_updated_at: err.current_updated_at ?? null,
+          your_updated_at: err.expected_updated_at,
+          message:
+            "Note was modified concurrently while arming the retry; re-fetch and try again.",
+        },
+        409,
+      );
+    }
+    throw err;
+  }
 
   const { getTranscriptionWorker } = await import("./transcription-registry.ts");
   const worker = getTranscriptionWorker();

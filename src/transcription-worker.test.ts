@@ -56,18 +56,56 @@ function makeWorker(opts: {
   fetchImpl: typeof fetch;
   retention?: "keep" | "until_transcribed" | "never";
   maxAttempts?: number;
+  // Override the store the worker sees (race-injection tests wrap `store`).
+  store?: Store;
+  logger?: { error: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
 }) {
+  const workerStore = opts.store ?? (store as unknown as Store);
   return startTranscriptionWorker({
     vaultList: () => ["default"],
-    getStore: () => store as unknown as Store,
+    getStore: () => workerStore,
     scribeUrl: "http://scribe.test",
     resolveAssetsDir: () => assetsRoot,
     getAudioRetention: () => opts.retention ?? "keep",
     pollIntervalMs: 10_000_000, // never auto-fire; tests drive ticks manually
     maxAttempts: opts.maxAttempts ?? 3,
     fetchImpl: opts.fetchImpl,
-    logger: silentLogger,
+    logger: opts.logger ?? silentLogger,
   });
+}
+
+/**
+ * Wrap a store so the first `interfereTimes` `updateNote` calls carrying an
+ * `if_updated_at` precondition fire `userEdit()` (a concurrent user write that
+ * bumps `updated_at`) just before delegating — forcing the precondition stale
+ * exactly that many times. Non-OC writes (and the last-resort no-precondition
+ * write) pass straight through. Drives the vault#435 worker race tests.
+ */
+function withRace(
+  base: Store,
+  interfereTimes: number,
+  userEdit: () => Promise<void>,
+): Store {
+  let fired = 0;
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === "updateNote") {
+        return async (id: string, updates: any) => {
+          if (updates?.if_updated_at !== undefined && fired < interfereTimes) {
+            fired++;
+            // bun:sqlite stamps `updated_at` at ms granularity. Sleep so the
+            // concurrent user write lands at a strictly-greater timestamp than
+            // the precondition the worker captured — making the conflict
+            // deterministic rather than racing inside the same millisecond.
+            await new Promise((r) => setTimeout(r, 5));
+            await userEdit();
+          }
+          return (target as any).updateNote(id, updates);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as Store;
 }
 
 describe("transcription worker", () => {
@@ -512,6 +550,173 @@ describe("transcription worker", () => {
     const [att] = await store.getAttachments("m1");
     expect(att.metadata?.transcribe_status).toBe("failed");
     expect(att.metadata?.transcribe_error).toContain("audio file not found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Optimistic concurrency on the worker's note writes (vault#435).
+//
+// The worker patches the memo note in two read-modify-write cycles — the
+// success path (replace the placeholder/marker with the transcript) and the
+// failure path (`applyFailureMarker`). Without an `if_updated_at` precondition
+// a user edit landing between read and write is silently clobbered (the
+// static-write/stale-read class of vault#208). These tests inject a concurrent
+// user PATCH right before the worker's OC write to assert:
+//   (a) the user's edit is NOT clobbered,
+//   (b) the worker RE-APPLIES the transcript/marker correctly on fresh content,
+//   (c) the double-conflict policy (worker = resilient): last-resort apply when
+//       still safe, safe-skip otherwise — never crash the sweep.
+// ---------------------------------------------------------------------------
+describe("transcription worker — optimistic concurrency (vault#435)", () => {
+  test("success patch: single race → re-applies transcript onto the user's fresh content", async () => {
+    // Placeholder body so the transcript would normally surgical-replace in
+    // place. The user appends a line mid-flight; the worker's first OC write
+    // conflicts, it re-reads, and the surgical replace lands on the FRESH
+    // content — preserving the user's append.
+    await store.createNote(
+      "# memo\n\n_Transcript pending._\n",
+      { id: "oc-succ-1", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/ocs1.webm");
+    await store.addAttachment("oc-succ-1", "memos/ocs1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const raceStore = withRace(store as unknown as Store, 1, async () => {
+      await store.updateNote("oc-succ-1", { append: "\n\nUSER EDIT" });
+    });
+    const worker = makeWorker({
+      store: raceStore,
+      fetchImpl: mkFetchMock([{ text: "the transcript" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("oc-succ-1");
+    // (b) transcript replaced the placeholder in place; (a) user edit survives.
+    expect(note!.content).toBe("# memo\n\nthe transcript\n\n\nUSER EDIT");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+    const [att] = await store.getAttachments("oc-succ-1");
+    expect(att.metadata?.transcribe_status).toBe("done");
+    expect(att.metadata?.transcript).toBe("the transcript");
+  });
+
+  test("failure marker: single race → re-applies marker onto the user's fresh content", async () => {
+    // maxAttempts=1 so a single scribe failure is terminal → applyFailureMarker.
+    await store.createNote(
+      "# memo\n\n_Transcript pending._\n",
+      { id: "oc-fail-1", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/ocf1.webm");
+    await store.addAttachment("oc-fail-1", "memos/ocf1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const raceStore = withRace(store as unknown as Store, 1, async () => {
+      await store.updateNote("oc-fail-1", { append: "\n\nUSER EDIT" });
+    });
+    const worker = makeWorker({
+      store: raceStore,
+      maxAttempts: 1,
+      fetchImpl: mkFetchMock([{ error: "scribe down", status: 500 }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("oc-fail-1");
+    // (b) marker replaced the placeholder in place; (a) user edit survives.
+    expect(note!.content).toBe("# memo\n\n_Transcription unavailable._\n\n\nUSER EDIT");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+    const [att] = await store.getAttachments("oc-fail-1");
+    expect(att.metadata?.transcribe_status).toBe("failed");
+  });
+
+  test("double conflict + still safe → last-resort apply (append path stays applicable)", async () => {
+    // No placeholder in the body → the transform takes the APPEND branch, which
+    // is always safe against fresh content. Interfere on BOTH the first write
+    // and the retry write → the worker falls back to the precondition-less
+    // last-resort apply (safe because the stub survives + append is safe).
+    await store.createNote(
+      "user prose with no marker",
+      { id: "oc-dbl-safe", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/ocd1.webm");
+    await store.addAttachment("oc-dbl-safe", "memos/ocd1.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    let edits = 0;
+    const raceStore = withRace(store as unknown as Store, 2, async () => {
+      edits++;
+      await store.updateNote("oc-dbl-safe", { append: ` e${edits}` });
+    });
+    const worker = makeWorker({
+      store: raceStore,
+      fetchImpl: mkFetchMock([{ text: "TRANSCRIPT" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("oc-dbl-safe");
+    // (a) both user appends survive; (c) transcript still appended (last-resort).
+    expect(note!.content).toBe("user prose with no marker e1 e2\n\nTRANSCRIPT");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+  });
+
+  test("double conflict + unsafe (user cleared the stub) → safe-skip, note untouched", async () => {
+    // The racing user edit clears `transcribe_stub` → the last-resort safety
+    // gate refuses to blind-write. The worker skips the note write entirely
+    // and the user's content is left exactly as they left it. The attachment
+    // transcript is still recorded (we never throw work away).
+    await store.createNote(
+      "# memo\n\n_Transcript pending._\n",
+      { id: "oc-dbl-skip", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/ocd2.webm");
+    await store.addAttachment("oc-dbl-skip", "memos/ocd2.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    let edit = 0;
+    const raceStore = withRace(store as unknown as Store, 2, async () => {
+      edit++;
+      // Second interference clears the stub (user opts out mid-flight).
+      if (edit >= 2) {
+        await store.updateNote("oc-dbl-skip", {
+          content: "I took this note over",
+          metadata: {},
+        });
+      } else {
+        await store.updateNote("oc-dbl-skip", { append: " edit1" });
+      }
+    });
+    const worker = makeWorker({
+      store: raceStore,
+      fetchImpl: mkFetchMock([{ text: "WOULD CLOBBER" }]),
+    });
+    try {
+      await worker.tick();
+    } finally {
+      await worker.stop();
+    }
+
+    const note = await store.getNote("oc-dbl-skip");
+    // (c) safe-skip: the worker did NOT overwrite the user's takeover content.
+    expect(note!.content).toBe("I took this note over");
+    expect(note!.content).not.toContain("WOULD CLOBBER");
+    // Transcript still durable on the attachment row.
+    const [att] = await store.getAttachments("oc-dbl-skip");
+    expect(att.metadata?.transcribe_status).toBe("done");
+    expect(att.metadata?.transcript).toBe("WOULD CLOBBER");
   });
 });
 
