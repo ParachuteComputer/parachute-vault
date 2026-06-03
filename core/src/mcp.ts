@@ -267,6 +267,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           if (params.include_attachments) {
             result.attachments = await store.getAttachments(note.id);
           }
+          // linkCount injected after filterMetadata on purpose — same as
+          // links/attachments above; filterMetadata only touches `metadata`.
           if (params.include_link_count) {
             const dir = normalizeLinkCountDirection(params.link_count_direction);
             result.linkCount = linkOps.getLinkCounts(db, [note.id], dir).get(note.id) ?? 0;
@@ -409,6 +411,9 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // ONE batch count over all result ids (NOT per-note), so the field
         // stays O(2 index scans) per request regardless of page size.
         // Injected on the same objects the enrichment loop copies below.
+        // Ordering: runs AFTER the filterMetadata pass above on purpose —
+        // filterMetadata only touches the `metadata` key, so linkCount
+        // survives. Don't casually swap the order.
         if (params.include_link_count) {
           const dir = normalizeLinkCountDirection(params.link_count_direction);
           const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), dir);

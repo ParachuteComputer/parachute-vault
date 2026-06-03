@@ -75,6 +75,11 @@ function parseQuery(url: URL, key: string): string | null {
  * Parse `link_count_direction` (vault feedback #4). Defaults to "both";
  * anything other than the three known values falls back to "both" so a
  * typo silently degrades to the documented default rather than erroring.
+ *
+ * Tag-scope note (symmetric with the MCP param description): `linkCount`
+ * is a raw degree that MAY include edges to notes a tag-scoped token can't
+ * see — the tag-scope filter runs post-query, over the result notes, not
+ * their neighbors. Only the number leaks, not the neighbor.
  */
 function parseLinkCountDirection(url: URL): "both" | "outbound" | "inbound" {
   const v = url.searchParams.get("link_count_direction");
@@ -574,6 +579,8 @@ async function handleNotesInner(
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
         }
+        // linkCount injected after filterMetadata on purpose — same as
+        // links/attachments above; filterMetadata only touches `metadata`.
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
           result.linkCount = linkOps.getLinkCounts(db, [note.id], parseLinkCountDirection(url)).get(note.id) ?? 0;
         }
@@ -620,7 +627,9 @@ async function handleNotesInner(
           output = output.map((n: any) => filterMetadata(n, inclMeta));
         }
         // Opt-in link degree (vault feedback #4) — one batch count, same as
-        // the structured-query path.
+        // the structured-query path. Runs AFTER filterMetadata on purpose
+        // (filterMetadata only touches `metadata`, so linkCount survives —
+        // don't casually swap the order).
         if (parseBool(parseQuery(url, "include_link_count"), false)) {
           const counts = linkOps.getLinkCounts(
             db,
@@ -813,6 +822,11 @@ async function handleNotesInner(
       // scans) per request regardless of page size. Mutates `output` in
       // place; injected on the same objects the enrichment loop below
       // touches, the same way `links`/`attachments` are surfaced.
+      // Ordering: this runs AFTER the filterMetadata pass above on purpose —
+      // filterMetadata only touches the `metadata` key, so a linkCount
+      // injected here survives. Don't casually swap the order; injecting
+      // before filterMetadata would still survive today but couples the two
+      // to filterMetadata's current narrow behavior.
       if (includeLinkCount) {
         const counts = linkOps.getLinkCounts(
           db,

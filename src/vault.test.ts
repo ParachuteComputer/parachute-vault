@@ -3131,6 +3131,44 @@ describe("HTTP /notes include_link_count + order_by=link_count (vault feedback #
     expect(((await inb.json()) as any).linkCount).toBe(1); // leaf→hub
   });
 
+  test("unrecognized link_count_direction falls back to both (REST parseLinkCountDirection)", async () => {
+    await seed();
+    // hub: both=2, outbound=1, inbound=1. A bogus value must degrade to
+    // `both` (2), distinct from either directional value (1).
+    const res = await handleNotes(
+      mkReq("GET", "/notes?id=hub&include_link_count=true&link_count_direction=sideways"),
+      store,
+      "",
+    );
+    expect(((await res.json()) as any).linkCount).toBe(2);
+  });
+
+  test("FTS branch: search + include_link_count → results carry linkCount", async () => {
+    // The full-text-search branch is a separate return path from the
+    // structured query; exercise the flag there explicitly.
+    await store.createNote("quokka sighting near the hub", { id: "fts-hub", path: "fts-hub" });
+    await store.createNote("a quokka friend", { id: "fts-friend", path: "fts-friend" });
+    await store.createLink("fts-hub", "fts-friend", "a"); // hub out1, friend in1
+    await store.createLink("fts-friend", "fts-hub", "b"); // hub in1 => hub degree 2
+    const res = await handleNotes(
+      mkReq("GET", "/notes?search=quokka&include_link_count=true"),
+      store,
+      "",
+    );
+    const body = (await res.json()) as any[];
+    const byId = Object.fromEntries(body.map((n) => [n.id, n]));
+    expect(byId["fts-hub"].linkCount).toBe(2);
+    expect(byId["fts-friend"].linkCount).toBe(2);
+  });
+
+  test("FTS branch: absent flag → no linkCount key", async () => {
+    await store.createNote("quokka sighting near the hub", { id: "fts-hub", path: "fts-hub" });
+    await store.createLink("fts-hub", "fts-hub", "loop");
+    const res = await handleNotes(mkReq("GET", "/notes?search=quokka"), store, "");
+    const body = (await res.json()) as any[];
+    expect(body.every((n) => !("linkCount" in n))).toBe(true);
+  });
+
   test("order_by=link_count desc: field value == sort key for every note", async () => {
     // Distinct degrees so the ordering is unambiguous: big=3, mid=2, small=0.
     await store.createNote("Big", { id: "big", path: "big" });

@@ -140,14 +140,33 @@ describe("order_by=link_count (engine)", () => {
     expect(ordered.map((n) => n.id)).toEqual(["hub", "mid", "leaf"]);
   });
 
-  it("sorts ascending too", async () => {
-    await store.createNote("Hub", { id: "hub" });
-    await store.createNote("Leaf", { id: "leaf" });
-    await store.createLink("hub", "leaf", "a");
-    const { ordered } = await assertFieldEqualsSortOrder("asc");
-    // leaf degree 1, hub degree 1 — both 1 here; just assert monotonic + the
-    // tiebreaker keeps a deterministic order (created_at asc => hub first).
-    expect(ordered.length).toBe(2);
+  it("sorts ascending with DISTINCT degrees: non-decreasing sequence, pinned IDs", async () => {
+    // Distinct degrees so ascending order is unambiguous (not just the
+    // tiebreaker case): low=0, mid=1, high=2. This genuinely pins
+    // field==sort-key for the ascending path.
+    await store.createNote("Low", { id: "low" }); // degree 0
+    await store.createNote("Mid", { id: "mid" }); // degree 1
+    await store.createNote("High", { id: "high" }); // degree 2
+    await store.createNote("Other", { id: "other" }); // link partner
+    await store.createLink("mid", "other", "a"); // mid out 1 => degree 1
+    await store.createLink("high", "other", "b"); // high out 1
+    await store.createLink("other", "high", "c"); // high in 1 => degree 2
+    // (other: out 1 + in 1 + in 1 = degree 3, sits above all — fine, we
+    // assert the low/mid/high prefix explicitly below.)
+
+    const { ordered, degrees } = await assertFieldEqualsSortOrder("asc");
+    const seq = ordered.map((n) => degrees.get(n.id) ?? 0);
+    // Non-decreasing (assertFieldEqualsSortOrder already checks this; assert
+    // explicitly here too for the distinct-degree case).
+    for (let i = 1; i < seq.length; i++) {
+      expect(seq[i]!).toBeGreaterThanOrEqual(seq[i - 1]!);
+    }
+    // Ascending: the three distinct-degree notes appear in 0,1,2 order.
+    expect(ordered.map((n) => n.id)).toEqual(["low", "mid", "high", "other"]);
+    expect(degrees.get("low")).toBe(0);
+    expect(degrees.get("mid")).toBe(1);
+    expect(degrees.get("high")).toBe(2);
+    expect(degrees.get("other")).toBe(3);
   });
 
   it("self-loop: linkCount==2 AND its order_by position matches that 2", async () => {
@@ -240,6 +259,20 @@ describe("query-notes MCP surface: include_link_count", () => {
       link_count_direction: "inbound",
     })) as any;
     expect(inb.linkCount).toBe(1); // leaf→hub only
+  });
+
+  it("unrecognized link_count_direction falls back to both (MCP normalizeLinkCountDirection)", async () => {
+    await seed();
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    // hub: both=2, outbound=1, inbound=1. A bogus value must degrade to
+    // `both` (2), distinct from either directional value (1).
+    const result = (await query.execute({
+      id: "hub",
+      include_link_count: true,
+      link_count_direction: "sideways",
+    })) as any;
+    expect(result.linkCount).toBe(2);
   });
 
   it("note with 0 links → linkCount: 0", async () => {
