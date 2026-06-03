@@ -633,9 +633,16 @@ used by the Notes voice-memo client. Server queues a transcription job:
 `note.metadata.transcribe_stub = true` is written as the opt-in to
 overwrite content when the transcript lands. On success the worker
 replaces the literal `_Transcript pending._` placeholder in the note
-body with the transcript (or the whole body if the placeholder is
-absent). A user edit clearing `transcribe_stub` before the transcript
-arrives opts out of the overwrite.
+body with the transcript (or, on a retry, the `_Transcription
+unavailable._` failure marker). If neither marker is present — the user
+edited the note while transcription was pending — the worker **appends**
+the transcript rather than overwriting the body, so the user's edits and
+the `![[<audio>]]` embed are never destroyed. A user edit clearing
+`transcribe_stub` before the transcript arrives opts out of the overwrite
+entirely. On terminal failure the worker writes `_Transcription
+unavailable._` the same way (surgical replace of the placeholder, or
+append if it's gone — never a full-body replace); a failed legacy memo can
+be retried via `/retry-transcription` (legacy in-body form) below.
 
 **Path B — auto-transcribe (vault#353, shipped 0.4.8-rc.1).** When
 `mimeType` starts with `audio/` AND `autoTranscribe.enabled === true` AND
@@ -680,9 +687,9 @@ doesn't exist or belongs to a different note. Idempotent: a second delete
 of the same id returns `404`.
 
 #### `POST /vault/{name}/api/notes/{idOrPath}/retry-transcription` — `vault:write`
-Re-enqueues the original audio attachment for a transcript note whose
-`transcript_status` is `failed`. Shipped in 0.4.8-rc.1 (vault#353,
-design Q5). Returns 202 on success:
+Re-enqueues the original audio attachment for a failed transcription. Two
+target shapes are accepted, distinguished by whether the target note carries
+`transcript_status` frontmatter. Returns 202 on success:
 
 ```json
 {
@@ -698,10 +705,14 @@ design Q5). Returns 202 on success:
 means no worker is registered this boot and the 30s sweep will pick up
 the row. Either way the row is updated.
 
-Error branches:
+**Auto-flow form (Path B, vault#353).** The target is a
+`<audio>.transcript.md` note with `transcript_status: failed` frontmatter.
+The audio is located via `transcript_attachment_id`; `transcribe_origin:
+"auto"` is preserved so a retried success overwrites the transcript note in
+place (note id preserved across retries). Shipped in 0.4.8-rc.1 (design Q5).
 
-- `400 invalid_target` — target note has no `transcript_status` frontmatter
-  (not a transcript note).
+Auto-flow error branches:
+
 - `400 not_failed` — transcript already succeeded; nothing to retry.
 - `400 missing_attachment_id` — transcript note lacks
   `transcript_attachment_id` (likely written by an older vault version).
@@ -710,8 +721,28 @@ Error branches:
 - `404 audio_missing` — original audio file no longer exists on disk
   (e.g. `audio_retention: never` already unlinked it).
 
-The same transcript note is overwritten in place; the note id is preserved
-across retries.
+**Legacy in-body form (Path A).** The target is the voice-memo note itself
+— no `transcript_status` frontmatter. The note directly owns the audio
+attachment whose transcription failed; on failure the worker had replaced
+the `_Transcript pending._` placeholder with a `_Transcription unavailable._`
+marker (leaving the `![[<audio>]]` embed intact). This form finds the note's
+own attachment with `transcribe_status: failed`, resets it to `pending`
+**preserving `transcribe_origin: "legacy"`** (forcing `"auto"` would switch
+to the sibling-transcript-note shape and orphan the in-body embed), and
+**re-stamps `transcribe_stub: true`** on the note. The stub re-arm is
+required: the worker's legacy success path only writes the transcript back
+into the body when the note carries `transcribe_stub`, and that flag was
+cleared when the failure marker was written. On a successful retry the
+transcript replaces the `_Transcription unavailable._` marker in place,
+yielding the same body a first-try success would have produced.
+
+Legacy-form error branch:
+
+- `400 no_failed_attachment` — the target note has no `transcript_status`
+  frontmatter and owns no audio attachment with a failed transcription, so
+  there's nothing to retry.
+- `404 audio_missing` — the failed attachment's audio file no longer exists
+  on disk.
 
 ### Graph queries
 

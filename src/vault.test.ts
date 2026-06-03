@@ -13,6 +13,9 @@ import { getLinksHydrated } from "../core/src/links.ts";
 import { buildVaultProjection } from "../core/src/vault-projection.ts";
 import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
+import { startTranscriptionWorker } from "./transcription-worker.ts";
+import { setTranscriptionWorker } from "./transcription-registry.ts";
+import type { Store } from "../core/src/types.ts";
 
 let db: Database;
 let store: BunStore;
@@ -2968,7 +2971,10 @@ describe("HTTP /notes", async () => {
       expect(res.status).toBe(404);
     });
 
-    test("400 invalid_target when target is not a transcript note", async () => {
+    test("400 no_failed_attachment when target is a regular note with no failed audio", async () => {
+      // A note without `transcript_status` frontmatter is treated as a
+      // possible legacy in-body memo (finding F). With no attachment carrying
+      // a failed transcription there's nothing to retry → no_failed_attachment.
       await store.createNote("regular note", { id: "regular" });
       const res = await handleNotes(
         mkReq("POST", "/notes/regular/retry-transcription"),
@@ -2978,7 +2984,7 @@ describe("HTTP /notes", async () => {
       );
       expect(res.status).toBe(400);
       const body = await res.json() as any;
-      expect(body.error).toBe("invalid_target");
+      expect(body.error).toBe("no_failed_attachment");
     });
 
     test("400 not_failed when transcript already succeeded", async () => {
@@ -3061,6 +3067,197 @@ describe("HTTP /notes", async () => {
       );
       expect(res.status).toBe(405);
       delete process.env.ASSETS_DIR;
+    });
+
+    // -----------------------------------------------------------------------
+    // Legacy in-body memo retry (finding F). The target is the memo note
+    // itself (no `transcript_status` frontmatter); it directly owns a failed
+    // audio attachment. The request must reset the attachment preserving
+    // `transcribe_origin: "legacy"` and re-arm `transcribe_stub: true` so the
+    // worker's legacy success path will write the transcript back into the
+    // body. End-to-end re-transcription is covered in
+    // transcription-worker.test.ts.
+    // -----------------------------------------------------------------------
+    async function seedLegacyFailedMemo(opts: {
+      noteId?: string;
+      audioPath?: string;
+      withFile?: boolean;
+    } = {}): Promise<{ noteId: string; attachmentId: string; audioPath: string }> {
+      const noteId = opts.noteId ?? "legacy-memo";
+      const audioPath = opts.audioPath ?? `${noteId}/voice.webm`;
+      // The capture body after a terminal failure: marker replaced the
+      // placeholder, embed intact, stub cleared by the worker.
+      const note = await store.createNote(
+        `# 🎙️ Voice memo\n\n_Recorded sometime._\n\n_Transcription unavailable._\n\n![[${audioPath}]]\n`,
+        { id: noteId },
+      );
+      const att = await store.addAttachment(note.id, audioPath, "audio/webm", {
+        transcribe_status: "failed",
+        // legacy origin is the default (undefined); leave it off to model the
+        // genuine legacy capture shape.
+        transcribe_error: "scribe down",
+        transcribe_attempts: 3,
+      });
+      const assetsRoot = join(tmpDir, "assets");
+      if (opts.withFile !== false) {
+        mkdirSync(join(assetsRoot, audioPath.split("/").slice(0, -1).join("/")), { recursive: true });
+        writeFileSync(join(assetsRoot, audioPath), Buffer.from([1, 2, 3]));
+      }
+      process.env.ASSETS_DIR = assetsRoot;
+      return { noteId, attachmentId: att.id, audioPath };
+    }
+
+    test("legacy in-body memo: 202, resets attachment (legacy origin) + re-arms stub", async () => {
+      const { noteId, attachmentId, audioPath } = await seedLegacyFailedMemo();
+      const res = await handleNotes(
+        mkReq("POST", `/notes/${noteId}/retry-transcription`),
+        store,
+        `/${noteId}/retry-transcription`,
+        "default",
+      );
+      expect(res.status).toBe(202);
+      const body = await res.json() as any;
+      expect(body.status).toBe("queued");
+      expect(body.attachment_id).toBe(attachmentId);
+      expect(body.attachment_path).toBe(audioPath);
+      expect(body.transcript_note_id).toBe(noteId);
+
+      // Attachment reset to pending, legacy origin preserved (NOT flipped to
+      // auto — that would orphan the in-body embed), failure state cleared.
+      const att = await store.getAttachment(attachmentId);
+      expect(att?.metadata?.transcribe_status).toBe("pending");
+      expect(att?.metadata?.transcribe_origin).toBe("legacy");
+      expect(att?.metadata?.transcribe_error).toBeUndefined();
+      expect(att?.metadata?.transcribe_attempts).toBeUndefined();
+
+      // Stub re-armed on the note — without this the worker's legacy success
+      // path early-returns and never writes the transcript back.
+      const updated = await store.getNote(noteId);
+      expect((updated!.metadata as any)?.transcribe_stub).toBe(true);
+      // Body untouched by the retry request itself (embed + marker intact).
+      expect(updated!.content).toContain(`![[${audioPath}]]`);
+      expect(updated!.content).toContain("_Transcription unavailable._");
+
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("legacy in-body memo: 404 audio_missing when the file is gone", async () => {
+      const { noteId } = await seedLegacyFailedMemo({
+        noteId: "legacy-gone",
+        withFile: false,
+      });
+      const res = await handleNotes(
+        mkReq("POST", `/notes/${noteId}/retry-transcription`),
+        store,
+        `/${noteId}/retry-transcription`,
+        "default",
+      );
+      expect(res.status).toBe(404);
+      const body = await res.json() as any;
+      expect(body.error).toBe("audio_missing");
+      delete process.env.ASSETS_DIR;
+    });
+
+    test("legacy in-body memo: end-to-end retry round-trip (capture → fail → retry → success)", async () => {
+      // Start from the CANONICAL capture body (recorder.ts memoNoteContent
+      // shape): header + _Recorded_ + _Transcript pending._ + ![[embed]],
+      // with transcribe_stub: true.
+      const audioPath = "e2e/voice.webm";
+      const captureBody =
+        "# 🎙️ Voice memo\n\n_Recorded sometime._\n\n_Transcript pending._\n\n![[e2e/voice.webm]]\n";
+      await store.createNote(captureBody, {
+        id: "e2e-memo",
+        metadata: { transcribe_stub: true },
+      });
+      const att = await store.addAttachment("e2e-memo", audioPath, "audio/webm", {
+        transcribe_status: "pending",
+        transcribe_attempts: 2, // one more failure flips to terminal at maxAttempts=3
+      });
+      const assetsRoot = join(tmpDir, "assets");
+      mkdirSync(join(assetsRoot, "e2e"), { recursive: true });
+      writeFileSync(join(assetsRoot, audioPath), Buffer.from([1, 2, 3]));
+      process.env.ASSETS_DIR = assetsRoot;
+
+      // What a first-try success would have produced (for the final assert).
+      const firstTrySuccessBody =
+        "# 🎙️ Voice memo\n\n_Recorded sometime._\n\nthe spoken words\n\n![[e2e/voice.webm]]\n";
+
+      // --- Phase 1: terminal failure. Worker writes the marker in place,
+      // preserving the embed, and clears the stub.
+      let fetchMode: "fail" | "succeed" = "fail";
+      const fetchImpl = (async () => {
+        if (fetchMode === "fail") {
+          return new Response("scribe down", { status: 500 });
+        }
+        return new Response(JSON.stringify({ text: "the spoken words" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+
+      const worker = startTranscriptionWorker({
+        vaultList: () => ["default"],
+        getStore: () => store as unknown as Store,
+        scribeUrl: "http://scribe.test",
+        resolveAssetsDir: () => process.env.ASSETS_DIR!,
+        pollIntervalMs: 10_000_000,
+        maxAttempts: 3,
+        fetchImpl,
+        logger: { error: () => {}, info: () => {} },
+      });
+      setTranscriptionWorker(worker);
+      try {
+        await worker.tick();
+
+        const failedNote = await store.getNote("e2e-memo");
+        // Marker replaced the placeholder in place; embed + surrounding body intact.
+        expect(failedNote!.content).toBe(
+          "# 🎙️ Voice memo\n\n_Recorded sometime._\n\n_Transcription unavailable._\n\n![[e2e/voice.webm]]\n",
+        );
+        expect((failedNote!.metadata as any)?.transcribe_stub).toBeUndefined();
+        const failedAtt = await store.getAttachment(att.id);
+        expect(failedAtt?.metadata?.transcribe_status).toBe("failed");
+
+        // --- Phase 2: retry via the legacy route form (POST on the memo note).
+        // Deregister the worker so the retry is "sweep-only" — that lets us
+        // observe the reset + stub re-arm deterministically before the worker
+        // picks the row back up (otherwise the route's fire-and-forget kick
+        // would race our assertions and complete the success in-line).
+        setTranscriptionWorker(null);
+        fetchMode = "succeed";
+        const retryRes = await handleNotes(
+          mkReq("POST", "/notes/e2e-memo/retry-transcription"),
+          store,
+          "/e2e-memo/retry-transcription",
+          "default",
+        );
+        expect(retryRes.status).toBe(202);
+        expect((await retryRes.json() as any).worker).toBe("sweep-only");
+
+        // Attachment back to pending + legacy origin; stub re-armed on the note.
+        const pendingAtt = await store.getAttachment(att.id);
+        expect(pendingAtt?.metadata?.transcribe_status).toBe("pending");
+        expect(pendingAtt?.metadata?.transcribe_origin).toBe("legacy");
+        const rearmed = await store.getNote("e2e-memo");
+        expect((rearmed!.metadata as any)?.transcribe_stub).toBe(true);
+
+        // --- Phase 3: worker succeeds on the retry (sweep tick). Transcript
+        // replaces the _Transcription unavailable._ marker IN PLACE; embed
+        // preserved; final body is byte-identical to a first-try success.
+        setTranscriptionWorker(worker);
+        await worker.tick();
+        const success = await store.getNote("e2e-memo");
+        expect(success!.content).toBe(firstTrySuccessBody);
+        expect(success!.content).toContain("![[e2e/voice.webm]]");
+        expect((success!.metadata as any)?.transcribe_stub).toBeUndefined();
+        const doneAtt = await store.getAttachment(att.id);
+        expect(doneAtt?.metadata?.transcribe_status).toBe("done");
+        expect(doneAtt?.metadata?.transcript).toBe("the spoken words");
+      } finally {
+        await worker.stop();
+        setTranscriptionWorker(null);
+        delete process.env.ASSETS_DIR;
+      }
     });
   });
 });

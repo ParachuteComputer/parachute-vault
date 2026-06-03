@@ -1073,22 +1073,26 @@ async function handleNotesInner(
     return json({ error: "Method not allowed" }, 405);
   }
 
-  // POST /notes/:idOrPath/retry-transcription — vault#353 design Q5.
+  // POST /notes/:idOrPath/retry-transcription — vault#353 design Q5 + finding F.
   //
-  // Re-runs the auto-transcribe pipeline against the original audio
-  // attachment recorded in the transcript note's `transcript_attachment_id`
-  // frontmatter. Only valid on transcript notes (the target idOrPath must
-  // be a transcript note with `transcript_status: "failed"`); calling on
-  // anything else returns 400 with a clear reason.
+  // Re-runs transcription against a failed audio attachment. Two target
+  // shapes, dispatched in handleRetryTranscription by whether the note carries
+  // `transcript_status` frontmatter:
+  //   - Auto-flow (vault#353): target is a `<audio>.transcript.md` note with
+  //     `transcript_status: "failed"`; audio located via
+  //     `transcript_attachment_id`, origin preserved as "auto".
+  //   - Legacy in-body memo (finding F): target is the memo note itself (no
+  //     `transcript_status`); finds its own failed attachment, resets it
+  //     preserving `transcribe_origin: "legacy"`, and re-arms `transcribe_stub`.
   //
   // Wire shape:
   //   POST .../notes/<idOrPath>/retry-transcription
-  //   →  202 { attachment_id, transcript_path } when re-enqueued
-  //      400 invalid_target          (not a transcript note)
-  //      400 not_failed              (transcript already succeeded; nothing to retry)
-  //      404 attachment_missing      (transcript_attachment_id row deleted)
+  //   →  202 { attachment_id, attachment_path, transcript_note_id, worker }
+  //      400 not_failed              (auto-flow: transcript already succeeded)
+  //      400 missing_attachment_id   (auto-flow: transcript_attachment_id absent)
+  //      400 no_failed_attachment    (legacy: no failed audio attachment to retry)
+  //      404 attachment_missing      (auto-flow: transcript_attachment_id row deleted)
   //      404 audio_missing           (audio file unlinked from disk)
-  //      503 scribe_unavailable      (no worker configured this boot)
   if (sub === "/retry-transcription") {
     if (method !== "POST") return json({ error: "Method not allowed" }, 405);
     if (!vault) return json({ error: "Vault context required" }, 400);
@@ -2075,21 +2079,35 @@ ${rendered}
 // ---------------------------------------------------------------------------
 
 /**
- * Re-enqueue the original audio attachment for a `transcript_status: failed`
- * transcript note. Steps:
+ * Re-enqueue the original audio attachment for a failed transcription.
  *
- *   1. Validate target is a transcript note (`transcript_status` set in
- *      metadata) AND that status is `failed`.
- *   2. Find the original audio attachment by id from
- *      `transcript_attachment_id` frontmatter. 404 if the row's gone.
- *   3. Validate the audio file still exists on disk (retention=keep is
- *      assumed by the retry contract; retention=until_transcribed unlinks
- *      only on success, retention=never unlinks on failure — that last one
- *      explicitly breaks retry, by design).
- *   4. Reset `transcribe_status = "pending"`, clear backoff + error fields.
- *      The auto-origin marker is preserved so the worker writes a transcript
- *      note (overwriting this one in place).
- *   5. Kick the worker if registered; otherwise the sweep picks it up.
+ * Two target shapes are accepted:
+ *
+ *   - **Auto-flow (vault#353):** the target is a `<audio>.transcript.md` note
+ *     carrying `transcript_status` frontmatter. Requires that status be
+ *     `failed`; locates the audio via `transcript_attachment_id`; preserves
+ *     `transcribe_origin: "auto"` so a retried success overwrites this
+ *     transcript note in place. Behavior is byte-identical to the original
+ *     vault#353 contract.
+ *
+ *   - **Legacy in-body memo (finding F):** the target is the memo note
+ *     itself — no `transcript_status` frontmatter. The original capture body
+ *     holds `![[<audio>]]` + a `_Transcription unavailable._` marker (written
+ *     by the worker on terminal failure). We find the note's own failed audio
+ *     attachment, reset it to pending **preserving `transcribe_origin:
+ *     "legacy"`** (forcing "auto" would switch to the sibling-transcript-note
+ *     shape and orphan the in-body embed), and **re-stamp `transcribe_stub:
+ *     true`** on the note. The stub re-arm is load-bearing: the legacy success
+ *     path early-returns unless `transcribe_stub === true`, so without it the
+ *     retried success would never write the transcript back into the body.
+ *     On success the worker replaces the `_Transcription unavailable._` marker
+ *     with the transcript in place, yielding the same final shape a first-try
+ *     success would.
+ *
+ * Common steps for both: validate the audio attachment row exists (404 if
+ * gone) and its file is still on disk (404 if unlinked — e.g. retention=never
+ * already dropped it), reset the transcribe_status fields, then kick the
+ * worker if registered (otherwise the sweep picks it up).
  */
 async function handleRetryTranscription(
   store: Store,
@@ -2097,15 +2115,13 @@ async function handleRetryTranscription(
   vault: string,
 ): Promise<Response> {
   const meta = (note.metadata as Record<string, unknown> | undefined) ?? {};
+
+  // Legacy in-body memo: no `transcript_status` frontmatter. The note owns
+  // the failed audio attachment directly; there's no sibling transcript note.
   if (typeof meta.transcript_status !== "string") {
-    return json(
-      {
-        error: "invalid_target",
-        message: "Target note is not a transcript note (no transcript_status frontmatter).",
-      },
-      400,
-    );
+    return handleRetryLegacyInBody(store, note, vault);
   }
+
   if (meta.transcript_status !== "failed") {
     return json(
       {
@@ -2185,6 +2201,108 @@ async function handleRetryTranscription(
       status: "queued",
       attachment_id: attachment.id,
       attachment_path: attachment.path,
+      transcript_note_id: note.id,
+      worker: worker ? "kicked" : "sweep-only",
+    },
+    202,
+  );
+}
+
+/**
+ * Retry path for a legacy in-body voice memo (finding F). The target note is
+ * the memo itself (no `transcript_status` frontmatter); it directly owns the
+ * audio attachment whose transcription failed.
+ *
+ * Steps:
+ *   1. Find the note's own audio attachment with `transcribe_status ===
+ *      "failed"`. 400 `no_failed_attachment` if none — there's nothing to
+ *      retry.
+ *   2. Validate the audio file is still on disk (404 `audio_missing`).
+ *   3. Reset the attachment to pending, **preserving `transcribe_origin:
+ *      "legacy"`** (never force "auto" — that switches to the sibling-
+ *      transcript-note shape and orphans the in-body `![[memo]]` embed).
+ *   4. **Re-stamp `transcribe_stub: true`** on the note. The legacy worker
+ *      success path early-returns unless the note carries this flag (it was
+ *      cleared when the failure marker was written), so re-arming it is what
+ *      lets the retried success replace the `_Transcription unavailable._`
+ *      marker with the transcript.
+ *   5. Kick the worker if registered; otherwise the sweep picks it up.
+ */
+async function handleRetryLegacyInBody(
+  store: Store,
+  note: Note,
+  vault: string,
+): Promise<Response> {
+  const attachments = await store.getAttachments(note.id);
+  const failed = attachments.find((a) => {
+    const m = (a.metadata as Record<string, unknown> | undefined) ?? {};
+    return m.transcribe_status === "failed";
+  });
+  if (!failed) {
+    return json(
+      {
+        error: "no_failed_attachment",
+        message:
+          "Target note is not a transcript note and has no audio attachment with a failed transcription to retry.",
+      },
+      400,
+    );
+  }
+
+  // Audio file existence + safety: defense-in-depth against a bad attachment
+  // row pointing outside the vault assets dir. Same guard as the worker.
+  const assetsRoot = assetsDir(vault);
+  const audioFilePath = normalize(join(assetsRoot, failed.path));
+  if (!audioFilePath.startsWith(normalize(assetsRoot)) || !existsSync(audioFilePath)) {
+    return json(
+      {
+        error: "audio_missing",
+        message: `Original audio file at "${failed.path}" no longer exists on disk.`,
+      },
+      404,
+    );
+  }
+
+  // Reset the attachment back to pending. Preserve `transcribe_origin:
+  // "legacy"` (a default of `undefined` is also legacy, but make it explicit
+  // so a retried row reads unambiguously) — forcing "auto" here would make
+  // the worker materialize a sibling transcript note instead of patching the
+  // in-body embed, orphaning the memo.
+  const attMeta = { ...(failed.metadata ?? {}) } as Record<string, unknown>;
+  attMeta.transcribe_status = "pending";
+  attMeta.transcribe_requested_at = new Date().toISOString();
+  attMeta.transcribe_origin = "legacy";
+  delete attMeta.transcribe_backoff_until;
+  delete attMeta.transcribe_error;
+  delete attMeta.transcribe_error_code;
+  delete attMeta.transcribe_attempts;
+  await store.setAttachmentMetadata(failed.id, attMeta);
+
+  // Re-arm the stub on the note. The worker's legacy success path gates on
+  // `transcribe_stub === true` and CLEARED it when it wrote the failure
+  // marker; without re-stamping it the retried success early-returns and
+  // never writes the transcript back into the body. Use skipUpdatedAt so the
+  // note's modification time still reflects user intent, matching the
+  // worker's own note writes.
+  const noteMeta = { ...((note.metadata as Record<string, unknown> | undefined) ?? {}) };
+  noteMeta.transcribe_stub = true;
+  await store.updateNote(note.id, {
+    metadata: noteMeta,
+    skipUpdatedAt: true,
+  });
+
+  const { getTranscriptionWorker } = await import("./transcription-registry.ts");
+  const worker = getTranscriptionWorker();
+  if (worker) {
+    const fresh = await store.getAttachment(failed.id) ?? failed;
+    void worker.kick(vault, fresh);
+  }
+
+  return json(
+    {
+      status: "queued",
+      attachment_id: failed.id,
+      attachment_path: failed.path,
       transcript_note_id: note.id,
       worker: worker ? "kicked" : "sweep-only",
     },
