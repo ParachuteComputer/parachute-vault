@@ -611,7 +611,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           },
           include_links: {
             type: "boolean",
-            description: "Echo the note's hydrated inbound + outbound links on the response (vault feedback #8). Links are *also* echoed automatically whenever the update itself mutated links (`links.add`/`links.remove`), so you rarely need to set this — its purpose is to fetch the current link set on an update that didn't touch links. Default: `false` (and absent from the response unless mutated or requested). Mirrors `query-notes`'s `include_links`. Applies per-item on batch.",
+            description: "Echo the note's hydrated inbound + outbound links on the response (vault feedback #8). Links are *also* echoed automatically whenever the update itself mutated links (`links.add`/`links.remove`), so you rarely need to set this — its purpose is to fetch the current link set on an update that didn't touch links. Default: `false` (and absent from the response unless mutated or requested). Mirrors `query-notes`'s `include_links`. This top-level flag applies to the single-note form only; for a batch, set `include_links` on each note object in `notes` (a top-level `include_links` is ignored when `notes` is present).",
           },
           // Batch
           notes: {

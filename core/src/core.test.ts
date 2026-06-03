@@ -2219,6 +2219,25 @@ describe("MCP tools", async () => {
     expect(result[1]).not.toHaveProperty("links");
   });
 
+  it("update-note if_missing=create with include_links echoes links (no link mutation)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    // The created note has no links yet and the payload declares none, so the
+    // echo is driven purely by the explicit `include_links` flag — closing the
+    // create-on-missing × flag-only matrix gap. Hydrated `links` key is present
+    // (empty array), not absent.
+    const result = await updateNote.execute({
+      id: "fresh-note",
+      content: "brand new",
+      if_missing: "create",
+      include_links: true,
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.content).toBe("brand new");
+    expect(Array.isArray(result.links)).toBe(true);
+    expect(result.links).toHaveLength(0);
+  });
+
   it("update-note removes wikilink brackets when removing wikilink-type link", async () => {
     await store.createNote("Target", { id: "target", path: "People/Alice" });
     const source = await store.createNote("See [[People/Alice]] for details", { id: "source" });

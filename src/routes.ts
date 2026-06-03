@@ -1347,7 +1347,7 @@ async function handleNotesInner(
       const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;
       const includeLinksResp = linkMutated || parseBool(parseQuery(url, "include_links"), false);
       if (includeLinksResp) {
-        validated.links = linkOps.getLinksHydrated(db, note.id);
+        validated.links = linkOps.getLinksHydrated(db, updatedNote.id);
       }
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
