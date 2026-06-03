@@ -3191,6 +3191,78 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
   });
 
+  // vault feedback #8 — the update response now echoes hydrated links when
+  // the request mutated links OR `?include_links=true` is passed, so callers
+  // no longer have to re-GET to confirm a link they just added/removed.
+  test("PATCH links.add echoes hydrated links on the response", async () => {
+    await store.createNote("a", { id: "a" });
+    await store.createNote("b", { id: "b", path: "People/Bob", tags: ["person"] });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "b", relationship: "mentions" }] }, force: true }),
+      store,
+      "/a",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(Array.isArray(body.links)).toBe(true);
+    expect(body.links).toHaveLength(1);
+    const link = body.links[0];
+    expect(link.sourceId).toBe("a");
+    expect(link.targetId).toBe("b");
+    expect(link.relationship).toBe("mentions");
+    // Hydrated shape matches GET / query-notes: targetNote summary present.
+    expect(link.targetNote.id).toBe("b");
+    expect(link.targetNote.path).toBe("People/Bob");
+    expect(link.targetNote.tags).toEqual(["person"]);
+  });
+
+  test("PATCH links.remove echoes the post-removal link set", async () => {
+    await store.createNote("a", { id: "a" });
+    await store.createNote("b", { id: "b" });
+    await store.createNote("c", { id: "c" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("a", "c", "mentions");
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true }),
+      store,
+      "/a",
+    );
+    const body = await res.json() as any;
+    expect(Array.isArray(body.links)).toBe(true);
+    expect(body.links).toHaveLength(1);
+    expect(body.links[0].targetId).toBe("c");
+  });
+
+  test("PATCH without a link mutation or flag does NOT include links", async () => {
+    await store.createNote("a", { id: "a" });
+    await store.createNote("b", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a", { content: "updated", force: true }),
+      store,
+      "/a",
+    );
+    const body = await res.json() as any;
+    expect(body.content).toBe("updated");
+    expect(body).not.toHaveProperty("links");
+  });
+
+  test("PATCH ?include_links=true echoes current links even without a mutation", async () => {
+    await store.createNote("a", { id: "a" });
+    await store.createNote("b", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/a?include_links=true", { content: "updated", force: true }),
+      store,
+      "/a",
+    );
+    const body = await res.json() as any;
+    expect(body.content).toBe("updated");
+    expect(Array.isArray(body.links)).toBe(true);
+    expect(body.links).toHaveLength(1);
+    expect(body.links[0].targetId).toBe("b");
+  });
+
   test("PATCH resolves note by path", async () => {
     await store.createNote("x", { path: "Projects/README" });
     const res = await handleNotes(

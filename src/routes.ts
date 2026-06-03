@@ -1335,7 +1335,20 @@ async function handleNotesInner(
       // `toNoteIndex` drops unknown fields).
       const updatedNote = await store.getNote(note.id);
       if (updatedNote === null) return json({ error: "Note disappeared" }, 404);
-      const validated = attachValidationStatus(store, db, updatedNote);
+      const validated: any = attachValidationStatus(store, db, updatedNote);
+      // Echo hydrated links when a link mutation was part of this request,
+      // OR the caller explicitly asked for them via `?include_links=true`
+      // (vault feedback #8). Previously the update response omitted links
+      // entirely (`getNote` populates tags but not links), forcing callers
+      // to re-GET with `?include_links=true` just to confirm a link they
+      // had just added/removed. Additive field, scoped to UPDATE: present
+      // only when mutated or requested. Mirrors the GET / query-notes
+      // hydration call form exactly (`linkOps.getLinksHydrated`).
+      const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;
+      const includeLinksResp = linkMutated || parseBool(parseQuery(url, "include_links"), false);
+      if (includeLinksResp) {
+        validated.links = linkOps.getLinksHydrated(db, note.id);
+      }
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
       // sync-loop callers using `if_missing: "create"` can distinguish
@@ -1345,6 +1358,9 @@ async function handleNotesInner(
       const lean: any = toNoteIndex(validated);
       const vs = (validated as any).validation_status;
       if (vs !== undefined) lean.validation_status = vs;
+      // Carry the link echo across the lean conversion — `toNoteIndex`
+      // drops unknown fields, same as the `validation_status` recipe above.
+      if (validated.links !== undefined) lean.links = validated.links;
       lean.created = false;
       return json(lean);
     } catch (e: any) {
