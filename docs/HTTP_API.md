@@ -445,6 +445,20 @@ Query params:
 
   Mixing shorthand and operator form on the same field is rejected.
 
+- **Metadata filters (JSON alias)**
+  - `metadata=<json>` — the JSON-object form of the same filter, e.g.
+    `metadata={"status":{"eq":"open"},"priority":{"gte":3}}`. This is
+    **symmetric with the nested `metadata` object the MCP `query-notes` tool
+    takes** — paste the same object you'd send over MCP, URL-encoded.
+    Shorthand equality works too: `metadata={"status":"open"}` lowers through
+    the `json_extract` fallback. JSON preserves real number/boolean types, so
+    `{"priority":{"gte":3}}` compares numerically.
+  - **Not both.** Pass metadata filters as *either* the JSON `metadata=` param
+    *or* the bracket `meta[field][op]=` form, not both — supplying both is a
+    `400 INVALID_QUERY` (we won't silently pick a winner). The `metadata=`
+    alias does compose with bracket *date* filters (`meta[created_at][gte]=…`),
+    which are a separate axis.
+
 - **Full-text search**
   - `search=query` — switches to FTS mode. Returns `Note[]` (full shape),
     not `NoteIndex[]`. Optional `tag=` filters compose. `limit` defaults to
@@ -473,7 +487,9 @@ Query params:
 Error shapes notable to callers:
 
 - `400 INVALID_QUERY` — non-indexed `order_by`, unknown operator, cursor +
-  incompatible param, etc.
+  incompatible param, a malformed `metadata=` JSON alias (parse failure, or a
+  non-object value), or supplying both the `metadata=` alias and bracket
+  `meta[...]` forms, etc.
 - `400 cursor_invalid` / `400 cursor_query_mismatch` — see cursor section.
 - `409 ambiguous_path` — `id=<path>` resolved to more than one note. Body
   carries `path` + `candidates: NoteIndex[]`. Re-issue with the exact id of
@@ -523,6 +539,12 @@ Error shapes:
 #### `GET /vault/{name}/api/notes/{idOrPath}` — `vault:read`
 Returns the full `Note` (defaults to `include_content=true` for point
 reads). `?include_content=false` returns a `NoteIndex`.
+
+> **Percent-encode slashes in `{idOrPath}`.** This route (and the `PATCH` /
+> `DELETE` siblings below) resolves a note by id-or-path; a literal `/` in a
+> path must be percent-encoded as `%2F` (e.g.
+> `GET .../api/notes/Projects%2FFoo`) so it isn't parsed as a route separator.
+> The same applies to path-valued query params like `?path=Projects%2FFoo`.
 
 Folding options:
 

@@ -2721,6 +2721,171 @@ describe("HTTP /notes", async () => {
       const body = await res.json() as any[];
       expect(body.map((n) => n.content)).toEqual(["new"]);
     });
+
+    // ---- JSON `metadata=<json>` alias (symmetric with the MCP nested obj) ----
+    //
+    // Before this alias, a `?metadata={...}` param was silently dropped: the
+    // bracket grammar never matched it, `queryOpts.metadata` stayed undefined,
+    // and the query returned ALL tag-matching notes — a silent wrong result.
+
+    test("alias `metadata={field:{op:value}}` filters on an indexed field", async () => {
+      await declareIndexed();
+      await store.createNote("open-1", { metadata: { status: "open" } });
+      await store.createNote("open-2", { metadata: { status: "open" } });
+      await store.createNote("closed", { metadata: { status: "closed" } });
+      const q = encodeURIComponent(JSON.stringify({ status: { eq: "open" } }));
+      const res = await handleNotes(
+        mkReq("GET", `/notes?metadata=${q}&include_content=true`),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content).sort()).toEqual(["open-1", "open-2"]);
+    });
+
+    test("alias shorthand equality `metadata={field:value}` works via json_extract fallback", async () => {
+      // No declareIndexed — shorthand routes through the engine's json_extract
+      // exact-match path, no indexed declaration required.
+      await store.createNote("matches", { metadata: { status: "open" } });
+      await store.createNote("other", { metadata: { status: "closed" } });
+      const q = encodeURIComponent(JSON.stringify({ status: "open" }));
+      const res = await handleNotes(
+        mkReq("GET", `/notes?metadata=${q}&include_content=true`),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["matches"]);
+    });
+
+    test("alias and bracket form return identical results for the same indexed-field operator query", async () => {
+      await declareIndexed();
+      for (const p of [1, 2, 3, 4, 5]) {
+        await store.createNote(`p${p}`, { metadata: { priority: p } });
+      }
+      // JSON preserves the real number type 3; bracket form passes "3" as a
+      // string. Both must coerce to the same range result against the INTEGER
+      // indexed column — this guards the type-coercion edge.
+      const aliasQ = encodeURIComponent(JSON.stringify({ priority: { gte: 3 } }));
+      const aliasRes = await handleNotes(
+        mkReq("GET", `/notes?metadata=${aliasQ}&include_content=true`),
+        store,
+        "",
+      );
+      const bracketRes = await handleNotes(
+        mkReq("GET", "/notes?meta[priority][gte]=3&include_content=true"),
+        store,
+        "",
+      );
+      const aliasBody = await aliasRes.json() as any[];
+      const bracketBody = await bracketRes.json() as any[];
+      expect(aliasBody.map((n) => n.content).sort()).toEqual(["p3", "p4", "p5"]);
+      expect(aliasBody.map((n) => n.content).sort()).toEqual(
+        bracketBody.map((n) => n.content).sort(),
+      );
+    });
+
+    test("malformed JSON in `metadata=` rejects with 400 INVALID_QUERY", async () => {
+      const res = await handleNotes(
+        mkReq("GET", "/notes?metadata=" + encodeURIComponent("{not json")),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("JSON object");
+    });
+
+    test("non-object `metadata=` JSON (array) rejects with 400 INVALID_QUERY", async () => {
+      const res = await handleNotes(
+        mkReq("GET", "/notes?metadata=" + encodeURIComponent(JSON.stringify(["status"]))),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+    });
+
+    test("primitive-scalar `metadata=` JSON (number / bare string) rejects with 400 INVALID_QUERY", async () => {
+      // `metadata=42` and `metadata="open"` are valid JSON but not objects —
+      // both fall through the non-object branch.
+      for (const raw of ["42", JSON.stringify("open")]) {
+        const res = await handleNotes(
+          mkReq("GET", "/notes?metadata=" + encodeURIComponent(raw)),
+          store,
+          "",
+        );
+        expect(res.status).toBe(400);
+        const body = await res.json() as any;
+        expect(body.code).toBe("INVALID_QUERY");
+      }
+    });
+
+    test("empty-object alias `metadata={}` is treated as absent and composes with a bracket filter", async () => {
+      // `{}` carries no filter intent — it must neither set a metadata filter
+      // NOR trip the both-forms 400 guard. So `metadata={}` + a bracket
+      // metadata filter is a 200 filtered by the bracket form only.
+      await declareIndexed();
+      await store.createNote("hi", { metadata: { priority: 5 } });
+      await store.createNote("lo", { metadata: { priority: 1 } });
+      const res = await handleNotes(
+        mkReq("GET", "/notes?metadata=" + encodeURIComponent("{}") + "&meta[priority][gte]=3&include_content=true"),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      expect(body.map((n) => n.content)).toEqual(["hi"]);
+    });
+
+    test("both `metadata=` alias AND `meta[...]` bracket params present rejects with 400 INVALID_QUERY", async () => {
+      await declareIndexed();
+      const q = encodeURIComponent(JSON.stringify({ status: { eq: "open" } }));
+      const res = await handleNotes(
+        mkReq("GET", `/notes?metadata=${q}&meta[priority][gte]=3`),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("INVALID_QUERY");
+      expect(body.error).toContain("not both");
+    });
+
+    test("regression: previously-silently-dropped `?metadata={status:{eq:pending}}` now actually filters", async () => {
+      await declareIndexed();
+      await store.createNote("pending-1", { metadata: { status: "pending" } });
+      await store.createNote("pending-2", { metadata: { status: "pending" } });
+      await store.createNote("done", { metadata: { status: "done" } });
+      const q = encodeURIComponent(JSON.stringify({ status: { eq: "pending" } }));
+      const res = await handleNotes(
+        mkReq("GET", `/notes?metadata=${q}&include_content=true`),
+        store,
+        "",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as any[];
+      // Before the fix this returned ALL three notes (filter dropped). Now it
+      // returns only the two pending ones.
+      expect(body.map((n) => n.content).sort()).toEqual(["pending-1", "pending-2"]);
+    });
+
+    test("alias with an unknown operator surfaces the engine's 400 UNKNOWN_OPERATOR", async () => {
+      await declareIndexed();
+      const q = encodeURIComponent(JSON.stringify({ priority: { bogus: 5 } }));
+      const res = await handleNotes(
+        mkReq("GET", `/notes?metadata=${q}`),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.code).toBe("UNKNOWN_OPERATOR");
+    });
   });
 
   // -------------------------------------------------------------------------
