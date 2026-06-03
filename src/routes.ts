@@ -354,6 +354,55 @@ function parseMetaBrackets(url: URL): {
 }
 
 /**
+ * Parse the `?metadata=<json>` alias on GET /api/notes — the JSON-object form
+ * of the metadata filter, symmetric with the nested `metadata` object MCP
+ * forwards verbatim (`core/src/mcp.ts`). The value is a JSON object of the form
+ * `{"field":{"op":value}}` (operator query) or `{"field":value}` (shorthand
+ * equality via the engine's json_extract fallback).
+ *
+ * This exists because the bracket grammar (`?meta[field][op]=value`) couldn't
+ * see a `metadata=` param at all — it was silently dropped, and the query
+ * returned ALL tag-matching notes (a silent wrong result, not an error).
+ *
+ * We do NOT validate operators here — the parsed object lowers straight into
+ * `queryNotes`, where `validateOperatorObject` raises a loud 400 on unknown
+ * operators (caught by the QueryError handler in handleNotes). We only enforce
+ * that the param parses and is a non-null, non-array plain object; anything
+ * else is a malformed filter the engine can't consume.
+ *
+ * Returns `{ metadata?, error? }`. When `error` is set the caller returns it
+ * directly (already shaped as a 400 with `error` + `code`).
+ */
+function parseMetadataJsonAlias(url: URL): {
+  metadata?: Record<string, unknown>;
+  error?: Response;
+} {
+  const raw = parseQuery(url, "metadata");
+  if (raw === null) return {};
+
+  const malformed = (detail: string): Response =>
+    json(
+      {
+        error: `metadata query param must be a JSON object of the form {"field":{"op":value}} — ${detail}`,
+        code: "INVALID_QUERY",
+      },
+      400,
+    );
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e: any) {
+    return { error: malformed(`failed to parse: ${e?.message ?? String(e)}`) };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const got = Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed;
+    return { error: malformed(`got ${got}`) };
+  }
+  return { metadata: parsed as Record<string, unknown> };
+}
+
+/**
  * Parse include_metadata query param.
  * - absent/null → undefined (all metadata, default)
  * - "true"/"1" → true (all metadata)
@@ -580,6 +629,27 @@ async function handleNotesInner(
       const tags = parseQueryList(url, "tag");
       const bracket = parseMetaBrackets(url);
       if (bracket.error) return bracket.error;
+      // `?metadata=<json>` alias — the JSON-object form of the metadata
+      // filter, symmetric with the nested object MCP forwards. Before this,
+      // a `metadata=` param was silently dropped (the bracket grammar never
+      // matched it), so the query returned ALL tag-matching notes.
+      const metadataAlias = parseMetadataJsonAlias(url);
+      if (metadataAlias.error) return metadataAlias.error;
+      // Reject "both forms" loudly. If a caller passes BOTH the JSON
+      // `metadata=` param AND any `meta[...]` bracket param, there's no
+      // well-defined merge and silently picking a winner is exactly the
+      // class of bug we're fixing. Symmetric with the mixed shorthand/
+      // operator rejection inside parseMetaBrackets. Guard stays narrow —
+      // only the named `metadata` param triggers it.
+      if (metadataAlias.metadata && bracket.metadata) {
+        return json(
+          {
+            error: "pass metadata filters as either the JSON `metadata=` param or bracket `meta[field][op]=` form, not both.",
+            code: "INVALID_QUERY",
+          },
+          400,
+        );
+      }
       // Opaque cursor for "since last checked" agent loops (vault#313).
       // When present, switches the response shape to {notes, next_cursor}
       // and routes through queryNotesPaged for keyset pagination. Mutually
@@ -612,7 +682,9 @@ async function handleNotesInner(
         // are present, so the filter is silently skipped on a plain
         // GET without the extension query.
         extension: parseExtensionFilter(url),
-        metadata: bracket.metadata,
+        // Bracket form and JSON-alias form are mutually exclusive (guarded
+        // above), so at most one of these is set.
+        metadata: bracket.metadata ?? metadataAlias.metadata,
         // Date-range precedence chain (highest to lowest):
         //   1. Bracket-style `meta[created_at][gte]=…` (canonical).
         //   2. Flat `date_field=…&date_from=…&date_to=…` (deprecated).
