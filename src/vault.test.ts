@@ -4088,11 +4088,86 @@ describe("HTTP /tags", async () => {
     expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).toContain("aspect_ratio");
   });
 
-  test("PUT /tags/:name returns 400 with error_type: invalid_relationships on bad shape", async () => {
+  // ---- relationships is an opaque vocabulary map (vault#428) ----
+  // PUT persists the value verbatim with no inner-shape enforcement; GET
+  // returns it byte-for-byte. Only a top-level non-map (array/primitive)
+  // or non-serializable input is rejected with invalid_relationships.
+
+  test("PUT /tags/:name persists the opaque vocabulary map; GET returns it verbatim (vault#428)", async () => {
+    const vocab = {
+      "works-on": { from: "person", to: "project" },
+      "member-of": { from: "person", to: "organization" },
+      "partner-of": { from: "person", to: "person" },
+      "based-at": { from: "project", to: "place" },
+    };
+    const put = await handleTags(
+      mkReq("PUT", "/tags/person", { relationships: vocab }),
+      store,
+      "/person",
+    );
+    expect(put.status).toBe(200);
+
+    const get = await handleTags(mkReq("GET", "/tags/person"), store, "/person");
+    expect(get.status).toBe(200);
+    const body = await get.json() as any;
+    // Byte-for-byte: serialize both sides and compare exactly.
+    expect(JSON.stringify(body.relationships)).toBe(JSON.stringify(vocab));
+    expect(body.relationships).toEqual(vocab);
+  });
+
+  test("PUT /tags/:name still accepts the historical typed relationships shape (backwards-compat)", async () => {
+    const typed = { owned_by: { target_tag: "person", cardinality: "one", description: "DRI" } };
+    const put = await handleTags(
+      mkReq("PUT", "/tags/project", { relationships: typed }),
+      store,
+      "/project",
+    );
+    expect(put.status).toBe(200);
+    const get = await handleTags(mkReq("GET", "/tags/project"), store, "/project");
+    const body = await get.json() as any;
+    expect(body.relationships).toEqual(typed);
+  });
+
+  test("PUT /tags/:name round-trips nested arbitrary relationship values verbatim", async () => {
+    const vocab = { rel: { from: "a", to: "b", note: "freeform", weight: 3, tags: ["x", "y"] } };
+    const put = await handleTags(
+      mkReq("PUT", "/tags/thing", { relationships: vocab }),
+      store,
+      "/thing",
+    );
+    expect(put.status).toBe(200);
+    const get = await handleTags(mkReq("GET", "/tags/thing"), store, "/thing");
+    const body = await get.json() as any;
+    expect(body.relationships).toEqual(vocab);
+  });
+
+  test("PUT /tags/:name returns 400 invalid_relationships for a top-level array", async () => {
     const res = await handleTags(
-      mkReq("PUT", "/tags/person", {
-        relationships: { mentions: { target_tag: "topic", cardinality: "infinite" } },
-      }),
+      mkReq("PUT", "/tags/person", { relationships: ["not", "a", "map"] }),
+      store,
+      "/person",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_relationships");
+    expect(typeof body.error).toBe("string");
+    expect(body.error.length).toBeGreaterThan(0);
+  });
+
+  test("PUT /tags/:name returns 400 invalid_relationships for a top-level primitive", async () => {
+    const res = await handleTags(
+      mkReq("PUT", "/tags/person", { relationships: "just-a-string" as unknown as Record<string, unknown> }),
+      store,
+      "/person",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_relationships");
+  });
+
+  test("PUT /tags/:name returns 400 invalid_relationships for an empty relationship key", async () => {
+    const res = await handleTags(
+      mkReq("PUT", "/tags/person", { relationships: { "": { from: "a", to: "b" } } }),
       store,
       "/person",
     );

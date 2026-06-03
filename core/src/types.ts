@@ -1,9 +1,9 @@
-import type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
 
 // ---- Re-exports ----
 
-export type { TagFieldSchema, TagRelationship, TagRecord } from "./tag-schemas.js";
+export type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 export type { PrunedField } from "./indexed-fields.js";
 
 // ---- Note ----
@@ -331,7 +331,7 @@ export interface Store {
     patch: {
       description?: string | null;
       fields?: Record<string, TagFieldSchema> | null;
-      relationships?: Record<string, TagRelationship> | null;
+      relationships?: TagRelationshipMap | null;
       parent_names?: string[] | null;
     },
   ): Promise<TagRecord>;

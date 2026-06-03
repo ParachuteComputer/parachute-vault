@@ -30,10 +30,13 @@ CREATE TABLE IF NOT EXISTS notes (
 -- description    — human-readable blurb (markdown).
 -- fields         — JSON: indexed metadata field declarations per
 --                  query-operators.md. Replaces v6-era tag_schemas.fields.
--- relationships  — JSON: typed-link declarations
---                  ({ "rel": { target_tag, cardinality, description? } }).
---                  Cardinality vocabulary: one | optional | many | many-required.
---                  Phase 1 informational — declared but not enforced at write.
+-- relationships  — JSON: opaque relationship-vocabulary map. Keys are
+--                  relationship names; values are arbitrary JSON the declaring
+--                  app interprets (e.g. the Weaver's { "works-on": { from, to } }).
+--                  Stored + returned verbatim; only the top level is validated
+--                  (must be a JSON object/map). The historical typed shape
+--                  { "rel": { target_tag, cardinality, description? } } remains a
+--                  valid value. Not enforced at write time. See vault#428.
 -- parent_names   — JSON array of parent tag names. Replaces the v6-era
 --                  _tags/NAME config-note hierarchy.
 CREATE TABLE IF NOT EXISTS tags (
