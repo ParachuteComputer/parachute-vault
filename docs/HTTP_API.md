@@ -774,12 +774,8 @@ Upsert a tag's identity row. Body accepts any combination of:
 {
   "description": "string | null",
   "fields": { "<field>": { "type": "string", "enum": [...], ... } } | null,
-  "relationships": {                                 // object-of-objects, never an array; | null clears
-    "<relName>": {
-      "target_tag": "<tag>",
-      "cardinality": "one" | "optional" | "many" | "many-required",
-      "description": "<optional string>"
-    }
+  "relationships": {                                 // opaque map (relName → arbitrary JSON); never a top-level array; | null clears
+    "<relName>": <any JSON-serializable value>
   },
   "parent_names": ["parent-tag", ...] | null
 }
@@ -788,15 +784,24 @@ Upsert a tag's identity row. Body accepts any combination of:
 Omitted keys are preserved; explicit `null` clears. `fields` merges into
 the existing schema (mirrors MCP `update-tag`).
 
-**`relationships` shape.** An **object-of-objects**, never an array. Each
-key is a relationship name; each value MUST carry both `target_tag` (a
-non-empty string) and `cardinality` (one of `one`, `optional`, `many`,
-`many-required`). `description` is optional. A malformed payload — an
-array, a value missing `target_tag` or `cardinality`, or a `cardinality`
-outside the vocabulary — is **rejected with `400` and
-`error_type: invalid_relationships`** (the `error` field carries the
-specific violation); it is never silently dropped or nulled. Concrete
-example:
+**`relationships` shape.** An **opaque vocabulary map** (vault#431): a JSON
+object whose keys are relationship names and whose values are arbitrary
+JSON the declaring app interprets. Vault does **not** enforce any inner
+structure — it stores and returns the values verbatim. Any
+JSON-serializable value is accepted, e.g. the Weaver-style structural-link
+shape:
+
+```json
+{
+  "relationships": {
+    "works-on": { "from": "person", "to": "project" }
+  }
+}
+```
+
+The older typed `{ target_tag, cardinality }` shape is a **recommended
+convention** that's still accepted (it's just a valid opaque value), so
+existing typed declarations keep working:
 
 ```json
 {
@@ -809,6 +814,14 @@ example:
   }
 }
 ```
+
+Only the top-level shape is validated. A payload is **rejected with `400`
+and `error_type: invalid_relationships`** (the `error` field carries the
+specific violation) when it is a top-level array, a top-level primitive,
+`null`/absent-where-an-object-is-expected, has an empty-string key, or is
+not JSON-serializable. Inner values — including ones missing `target_tag`
+or `cardinality`, or with a `cardinality` outside the old vocabulary — are
+**no longer** rejected; they persist verbatim.
 
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
 Removes the tag, its identity row, and untags every note. Returns the
