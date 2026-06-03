@@ -609,6 +609,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             type: "boolean",
             description: "Response shape opt-out. Default `true` (returns the full Note with content). Set `false` to receive the lean index shape (drops `content`, adds `byteSize` and a whitespace-collapsed `preview`). `validation_status` is preserved on the lean shape when present. Applies uniformly to single and batch responses.",
           },
+          include_links: {
+            type: "boolean",
+            description: "Echo the note's hydrated inbound + outbound links on the response (vault feedback #8). Links are *also* echoed automatically whenever the update itself mutated links (`links.add`/`links.remove`), so you rarely need to set this — its purpose is to fetch the current link set on an update that didn't touch links. Default: `false` (and absent from the response unless mutated or requested). Mirrors `query-notes`'s `include_links`. This top-level flag applies to the single-note form only; for a batch, set `include_links` on each note object in `notes` (a top-level `include_links` is ignored when `notes` is present).",
+          },
           // Batch
           notes: {
             type: "array",
@@ -636,6 +640,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                 if_missing: { type: "string", enum: ["fail", "create"], description: "Per-item: see top-level `if_missing` docs. Each batch item carries its own setting." },
                 tags: { type: "object" },
                 links: { type: "object" },
+                include_links: { type: "boolean", description: "Per-item: echo hydrated links on this item's response (vault feedback #8). Also implied when this item mutates links." },
               },
               required: ["id"],
             },
@@ -657,6 +662,15 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // sync-loop caller (Gitcoin Brain et al) reads this to know which
         // path fired without doing a separate query. vault#309.
         const createdIds = new Set<string>();
+        // Track which note IDs should echo hydrated links on the response.
+        // A note qualifies when this request mutated its links
+        // (`links.add`/`links.remove`) OR the caller set `include_links`.
+        // vault feedback #8 — previously the update response omitted links
+        // entirely, forcing a re-query just to confirm a link the caller had
+        // just added/removed. Per-item on batch. Note IDs (not item indices)
+        // key this so the create-on-missing branch, which assigns the id
+        // late, can register correctly.
+        const echoLinkIds = new Set<string>();
         // Wrap multi-item batches in a SQLite transaction so any mid-batch
         // failure (precondition error, content_edit miss, ConflictError, …)
         // rolls back every prior mutation in the batch — see #236.
@@ -745,6 +759,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               const fresh = noteOps.getNote(db, created.id) ?? created;
               updated.push(fresh);
               createdIds.add(fresh.id);
+              // Echo links if this create-on-missing declared `links.add`
+              // (the only link op honored on create) or asked explicitly.
+              if (linksAdd !== undefined || item.include_links === true) {
+                echoLinkIds.add(fresh.id);
+              }
               continue;
             }
             // Fallthrough: not-found + no if_missing → existing error
@@ -907,6 +926,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             }
           }
 
+          // Echo links if this update mutated them (`links.add`/`links.remove`)
+          // or the caller asked explicitly. vault feedback #8.
+          const linkMutated = (item.links as any)?.add !== undefined || (item.links as any)?.remove !== undefined;
+          if (linkMutated || item.include_links === true) {
+            echoLinkIds.add(note.id);
+          }
+
           // Re-read for final state
           updated.push(noteOps.getNote(db, note.id) ?? result);
         }
@@ -929,11 +955,23 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         const final = updated.map((n) => {
           const validated = attachValidationStatus(store, db, n);
           const created = createdIds.has(n.id);
-          if (includeContent) return { ...validated, created } as Note & { created: boolean };
+          // Echo hydrated links when this note was flagged for it (mutated
+          // its links or `include_links` was set). Additive key, present only
+          // when triggered — mirrors the GET / query-notes shape exactly via
+          // the shared `linkOps.getLinksHydrated` call. vault feedback #8.
+          const echoLinks = echoLinkIds.has(n.id);
+          if (includeContent) {
+            const full: any = { ...validated, created };
+            if (echoLinks) full.links = linkOps.getLinksHydrated(db, n.id);
+            return full as Note & { created: boolean };
+          }
           const lean: any = noteOps.toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
           lean.created = created;
+          // Carry the link echo across the lean conversion — `toNoteIndex`
+          // drops unknown fields.
+          if (echoLinks) lean.links = linkOps.getLinksHydrated(db, n.id);
           return lean;
         });
         return batch ? final : final[0];

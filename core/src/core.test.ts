@@ -2131,6 +2131,113 @@ describe("MCP tools", async () => {
     expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
   });
 
+  // vault feedback #8 — echo hydrated links on the update response when the
+  // request mutated links OR `include_links` is set, so callers don't re-query.
+  it("update-note echoes hydrated links when the update mutates links", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b", path: "beta", tags: ["t"] });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "b", relationship: "mentions" }] },
+      force: true,
+    }) as any;
+    expect(Array.isArray(result.links)).toBe(true);
+    expect(result.links).toHaveLength(1);
+    // Hydrated shape matches query-notes' include_links output.
+    const link = result.links[0];
+    expect(link.sourceId).toBe("a");
+    expect(link.targetId).toBe("b");
+    expect(link.relationship).toBe("mentions");
+    expect(link.targetNote.path).toBe("beta");
+    expect(link.targetNote.tags).toEqual(["t"]);
+  });
+
+  it("update-note echoes links on removal (post-removal set)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "mentions");
+    await store.createLink("a", "c", "mentions");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "a",
+      links: { remove: [{ target: "b", relationship: "mentions" }] },
+      force: true,
+    }) as any;
+    expect(result.links).toHaveLength(1);
+    expect(result.links[0].targetId).toBe("c");
+  });
+
+  it("update-note with include_links echoes links even without a mutation", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      id: "a",
+      content: "updated",
+      include_links: true,
+      force: true,
+    }) as any;
+    expect(result.content).toBe("updated");
+    expect(result.links).toHaveLength(1);
+    expect(result.links[0].targetId).toBe("b");
+  });
+
+  it("update-note without a link mutation or flag does NOT echo links", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createLink("a", "b", "mentions");
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({ id: "a", content: "updated", force: true }) as any;
+    expect(result.content).toBe("updated");
+    expect(result).not.toHaveProperty("links");
+  });
+
+  it("update-note batch echoes links per-item (only on the mutated/flagged item)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const result = await updateNote.execute({
+      notes: [
+        // Item 0 mutates links → echoes.
+        { id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true },
+        // Item 1 only edits content, no flag → no links key.
+        { id: "c", content: "C updated", force: true },
+      ],
+    }) as any[];
+    expect(result).toHaveLength(2);
+    expect(result[0].links).toHaveLength(1);
+    expect(result[0].links[0].targetId).toBe("b");
+    expect(result[1]).not.toHaveProperty("links");
+  });
+
+  it("update-note if_missing=create with include_links echoes links (no link mutation)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    // The created note has no links yet and the payload declares none, so the
+    // echo is driven purely by the explicit `include_links` flag — closing the
+    // create-on-missing × flag-only matrix gap. Hydrated `links` key is present
+    // (empty array), not absent.
+    const result = await updateNote.execute({
+      id: "fresh-note",
+      content: "brand new",
+      if_missing: "create",
+      include_links: true,
+    }) as any;
+    expect(result.created).toBe(true);
+    expect(result.content).toBe("brand new");
+    expect(Array.isArray(result.links)).toBe(true);
+    expect(result.links).toHaveLength(0);
+  });
+
   it("update-note removes wikilink brackets when removing wikilink-type link", async () => {
     await store.createNote("Target", { id: "target", path: "People/Alice" });
     const source = await store.createNote("See [[People/Alice]] for details", { id: "source" });
