@@ -3276,6 +3276,9 @@ describe("HTTP /notes", async () => {
      * `if_updated_at` precondition fire `userEdit()` (a concurrent user write
      * that bumps `updated_at`) just before delegating — forcing the precondition
      * stale exactly `interfereTimes` times. Non-OC writes pass through.
+     *
+     * NOTE: duplicated in src/transcription-worker.test.ts (worker-layer race
+     * tests) — keep in sync.
      */
     function withRace(
       base: Store,

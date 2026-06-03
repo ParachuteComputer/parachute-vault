@@ -80,6 +80,8 @@ function makeWorker(opts: {
  * bumps `updated_at`) just before delegating — forcing the precondition stale
  * exactly that many times. Non-OC writes (and the last-resort no-precondition
  * write) pass straight through. Drives the vault#435 worker race tests.
+ *
+ * NOTE: duplicated in src/vault.test.ts (routes-layer race tests) — keep in sync.
  */
 function withRace(
   base: Store,

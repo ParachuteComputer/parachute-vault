@@ -2333,6 +2333,10 @@ async function handleRetryLegacyInBody(
           note_id: note.id,
           current_updated_at: err.current_updated_at ?? null,
           your_updated_at: err.expected_updated_at,
+          // Mirror the standard PATCH 409 shape (see the notes-update handler
+          // above) — both `your_updated_at` and `expected_updated_at` carry the
+          // same value, kept for shape-congruence with existing callers.
+          expected_updated_at: err.expected_updated_at,
           message:
             "Note was modified concurrently while arming the retry; re-fetch and try again.",
         },
