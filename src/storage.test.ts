@@ -333,4 +333,47 @@ describe("storage GET percent-encoded slash (finding D)", () => {
     );
     expect(res.status).toBe(404);
   });
+
+  test("double-encoded %252F → 404 (decodes ONCE to literal %2F, no slash, no second decode)", async () => {
+    const { store } = await setup();
+    const ctx = await tagScopeCtx(store, ["work"]);
+    // `%252F` → decodeURIComponent once → `%2F` (a literal `%2F`, NOT a slash).
+    // The single decode is deliberate: a second decode would turn this into a
+    // real slash and risk serving / re-looping. With one decode the path has
+    // no `/` separator, so the date/file match fails → 404.
+    const doubleEncoded = "/2026-05-28%252Ffile.bin";
+    expect(decodeURIComponent(doubleEncoded)).toBe("/2026-05-28%2Ffile.bin");
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage${doubleEncoded}`, { method: "GET" }),
+      doubleEncoded,
+      VAULT,
+      store,
+      ctx,
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST parity (finding D — decode block must not change upload behavior).
+//
+// The `POST /upload` branch returns BEFORE the decode block, so a real upload
+// is untouched. A POST to a non-`/upload` storage path with a malformed `%`
+// falls past the upload branch into the decode (the `try/catch` is not method-
+// gated), where the throw → 404 — the same status the pre-fix unconditional
+// final 404 produced for this request. Pins that the decode doesn't turn a
+// malformed-`%` POST into a 500 and keeps POST behavior at parity.
+// ---------------------------------------------------------------------------
+
+describe("storage POST parity (finding D)", () => {
+  test("POST to a malformed-`%` storage path → 404, unchanged by the GET-side decode", async () => {
+    const bad = "/2026%2";
+    const res = await handleStorage(
+      new Request(`http://localhost:1940/storage${bad}`, { method: "POST" }),
+      bad,
+      "default",
+      uploadStore,
+    );
+    expect(res.status).toBe(404);
+  });
 });

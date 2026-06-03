@@ -2278,7 +2278,7 @@ export async function handleStorage(
   // REQUIRE `%2F` for slashes-in-an-id — a trap-grade asymmetry we accept here
   // because storage paths are always multi-segment date/file pairs.
   //
-  // Guard-safety (verified): the traversal guard at ~2275 operates on the
+  // Guard-safety (verified): the traversal guard below operates on the
   // post-`normalize(join())` filesystem path, so a decoded `..` is still
   // caught → 403. Decode is idempotent for today's unencoded callers
   // (filenames are `<Date.now()>-<uuid>.<ext>` — no stray `%`). A malformed
