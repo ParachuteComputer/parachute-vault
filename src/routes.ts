@@ -44,12 +44,16 @@ import {
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { vaultDir } from "./config.ts";
+import { assetsDir } from "./config.ts";
 import { shouldAutoTranscribe } from "./auto-transcribe.ts";
-// usage.ts imports `assetsDir` from this module — the cycle is function-level
-// only (invalidateUsageCache is *called* at upload time, never at module
-// eval), so ESM resolves it fine.
+// usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
+// of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
 import { invalidateUsageCache } from "./usage.ts";
+
+// Re-export `assetsDir` (now defined in config.ts) so the existing callers
+// that import it from this module — mirror-deps, mirror-routes, server,
+// triggers, cli — keep working unchanged.
+export { assetsDir };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2371,11 +2375,12 @@ async function handleRetryLegacyInBody(
 
 // ---------------------------------------------------------------------------
 // Storage (file upload/serve) — kept as-is, Daily needs it
+//
+// `assetsDir` moved to config.ts (next to the other path helpers) to break the
+// usage.ts↔routes.ts import cycle; it's re-exported from this module's top so
+// existing importers are unaffected.
 // ---------------------------------------------------------------------------
 
-export function assetsDir(vault: string): string {
-  return process.env.ASSETS_DIR ?? join(vaultDir(vault), "assets");
-}
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
 // Storage allowlist policy:

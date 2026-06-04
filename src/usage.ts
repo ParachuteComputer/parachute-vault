@@ -27,8 +27,7 @@ import {
   type Dirent,
 } from "fs";
 import { join } from "path";
-import { vaultDir } from "./config.ts";
-import { assetsDir } from "./routes.ts";
+import { vaultDir, assetsDir } from "./config.ts";
 import { readMirrorConfigForVault, resolveMirrorPath } from "./mirror-config.ts";
 import type { VaultStats } from "../core/src/types.ts";
 
@@ -41,12 +40,21 @@ import type { VaultStats } from "../core/src/types.ts";
  * lets tests count how many times the dir-walk runs (to prove the cache
  * actually skips it) and synthesize a tree without writing real files.
  *
- * `lstatSync` semantics for `statFile` are deliberate: we DON'T follow
- * symlinks when summing directory contents, so a symlink-loop or a symlink
- * pointing at a huge tree elsewhere can't inflate the count or hang the walk.
+ * Symlink safety lives in the WALK, not in `statFile`: `dirSize` never
+ * descends into or sizes a symlink entry (it filters on
+ * `Dirent.isSymbolicLink()` before ever calling `statFile`), so a symlink
+ * loop can't hang the walk and a symlink pointing at a huge tree elsewhere
+ * can't inflate the count. `statFile` is therefore only ever called on real
+ * files / the WAL trio (which are never symlinks).
  */
 export interface UsageFs {
-  /** `lstatSync`-style: returns the size of a file (or 0 / throws if absent). */
+  /**
+   * `stat` (symlink-FOLLOWING, like `statSync`): returns the size of a file
+   * (or throws if absent — callers wrap in try/catch → 0). Following symlinks
+   * is safe here because dir descent already filters symlinks via
+   * `Dirent.isSymbolicLink()`, and the WAL files (`vault.db{,-wal,-shm}`) are
+   * never symlinks.
+   */
   statFile(path: string): { size: number; isDirectory(): boolean; isSymbolicLink(): boolean };
   /** `readdirSync(path, { withFileTypes: true })`. */
   readDir(path: string): Dirent[];
@@ -257,9 +265,9 @@ export interface UsageReport {
      */
     mirror?: number;
     /**
-     * The vault's footprint: `db + assets`. Mirror is excluded on purpose
-     * (projection of the same data); content is excluded because it's the
-     * logical size already physically counted inside `db`.
+     * Physical on-disk footprint (db + assets); excludes content (inside db)
+     * and mirror (separate projection). This is the number an operator sizes a
+     * vault by.
      */
     total: number;
   };

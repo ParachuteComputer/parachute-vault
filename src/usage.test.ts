@@ -28,8 +28,7 @@ const {
   UsageCache,
   buildUsageReport,
 } = await import("./usage.ts");
-const { vaultDir } = await import("./config.ts");
-const { assetsDir } = await import("./routes.ts");
+const { vaultDir, assetsDir } = await import("./config.ts");
 
 import type { UsageFs } from "./usage.ts";
 import type { VaultStats } from "../core/src/types.ts";
