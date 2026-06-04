@@ -556,6 +556,7 @@ async function cmdInit(args: string[] = []) {
     bindHost,
     port,
     mcpUrl,
+    vaultName: defaultVault,
     noTokenGuidance: credentialGuidance,
   });
   for (const line of lines) console.log(line);

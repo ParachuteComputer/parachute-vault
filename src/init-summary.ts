@@ -13,6 +13,13 @@ export type InitSummaryInput = {
   port: number;
   mcpUrl: string;
   /**
+   * The default vault's name — used to emit the three-segment
+   * `vault:<vaultName>:read` scope in the OAuth-first mint-token suggestion
+   * (the hub mint-token model requires the named-resource form;
+   * a bare `vault:read` would mint a malformed scope). vault#442/#443.
+   */
+  vaultName: string;
+  /**
    * Guidance from the bootstrap-credential step when no token could be issued
    * (standalone install, no hub reachable — vault#282 Stage 2). Surfaced when
    * the operator wanted a token (`addMcp || addToken`) but `apiKey` is
@@ -38,7 +45,7 @@ export type InitSummaryInput = {
  *   !addMcp, !addToken          → OAuth-first: add Claude Code later
  */
 export function buildInitSummaryLines(input: InitSummaryInput): string[] {
-  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, noTokenGuidance } = input;
+  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, vaultName, noTokenGuidance } = input;
   const lines: string[] = [];
   lines.push("");
   lines.push("---");
@@ -61,7 +68,7 @@ export function buildInitSummaryLines(input: InitSummaryInput): string[] {
     lines.push("Connect your AI — no token needed, you'll sign in on first use:");
     lines.push(`  Claude Code is already wired in (~/.claude.json) — just start a session.`);
     lines.push(`  Other clients: claude mcp add --transport http parachute-vault ${mcpUrl}`);
-    lines.push(`  Need a header-auth token for a script? parachute auth mint-token --scope vault:read`);
+    lines.push(`  Need a header-auth token for a script? parachute auth mint-token --scope vault:${vaultName}:read`);
   } else if (!addMcp && addToken && apiKey) {
     lines.push("");
     lines.push(`Your API token: ${apiKey}`);

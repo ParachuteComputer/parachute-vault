@@ -13,6 +13,7 @@ const baseInput = {
   bindHost: "127.0.0.1",
   port: 1940,
   mcpUrl: "http://127.0.0.1:1940/vault/default/mcp",
+  vaultName: "default",
 };
 
 function lines(addMcp: boolean, addToken: boolean, apiKey: string | undefined) {
@@ -116,8 +117,12 @@ describe("buildInitSummaryLines", () => {
       );
     });
 
-    test("offers the scope-narrow opt-in mint for scripts (read, never admin)", () => {
-      expect(out).toContain("parachute auth mint-token --scope vault:read");
+    test("offers the scope-narrow opt-in mint for scripts (full vault:<name>:read, never admin)", () => {
+      // Must be the three-segment named-resource form the hub mint-token model
+      // requires — a bare `vault:read` would mint a malformed scope (vault#443).
+      expect(out).toContain("parachute auth mint-token --scope vault:default:read");
+      expect(out).not.toContain("--scope vault:read ");
+      expect(out).not.toMatch(/--scope vault:read$/m);
       expect(out).not.toContain("vault:admin");
     });
 
@@ -129,6 +134,19 @@ describe("buildInitSummaryLines", () => {
 
     test("does NOT surface the old no-token-issued failure copy", () => {
       expect(out).not.toContain("No token issued");
+    });
+
+    test("threads a non-default vault name into the mint-token scope", () => {
+      const out2 = buildInitSummaryLines({
+        ...baseInput,
+        vaultName: "journal",
+        mcpUrl: "http://127.0.0.1:1940/vault/journal/mcp",
+        addMcp: true,
+        addToken: false,
+        apiKey: undefined,
+      }).join("\n");
+      expect(out2).toContain("parachute auth mint-token --scope vault:journal:read");
+      expect(out2).not.toContain("vault:default:read");
     });
   });
 
