@@ -292,6 +292,29 @@ export interface GlobalConfig {
    */
   mirror?: MirrorConfigType;
   /**
+   * Server-wide DEFAULT for newly created vaults' backup posture. Decides
+   * whether `createVault` writes the History-preset internal mirror
+   * (local git backup of the markdown projection) at create time.
+   *
+   *   - `"internal"` (default) — new vaults get a local git mirror enabled
+   *     out of the box (backup-on-by-default). The History preset:
+   *     `{enabled:true, location:internal, sync_mode:events, auto_commit:true,
+   *     auto_push:false}`. GitHub off-site backup remains an opt-in upgrade.
+   *   - `"off"` — new vaults are created with no mirror config (the historical
+   *     pre-default behavior). The escape hatch for git-less / disk-constrained
+   *     boxes and cloud deploys, where doubling disk per vault is unwanted.
+   *     Cloud / container deploys SHOULD set this to `off`.
+   *
+   * Create-time ONLY — this knob does NOT retroactively enable mirrors on
+   * already-created vaults (that would ~double disk across every existing
+   * vault). Existing-vault opt-in is a separate, deliberate follow-up.
+   *
+   * The container/cloud first-boot auto-create path in `server.ts` does NOT
+   * funnel through `createVault`, so it is unaffected by this knob and stays
+   * mirror-off regardless — matching the recommended cloud posture.
+   */
+  default_mirror?: "internal" | "off";
+  /**
    * Auto-transcribe configuration for the vault↔scribe handoff (vault#353,
    * design 2026-05-21 Part 2). When `enabled: true` AND scribe is discoverable
    * (`services.json` or `SCRIBE_URL` env), audio attachments uploaded to any
@@ -1173,6 +1196,7 @@ export function readGlobalConfig(): GlobalConfig {
       const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
       const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
       const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
+      const defaultMirrorMatch = yaml.match(/^default_mirror:\s*(internal|off)/m);
       // auto_transcribe block — currently single boolean `enabled` (vault#353).
       // Parsed as a nested 2-space-indent block so future fields can grow under
       // it without breaking the regex; only `enabled` is read for v0.6.
@@ -1200,6 +1224,9 @@ export function readGlobalConfig(): GlobalConfig {
       }
       if (autostartMatch) {
         config.autostart = autostartMatch[1]! === "true";
+      }
+      if (defaultMirrorMatch) {
+        config.default_mirror = defaultMirrorMatch[1]! as "internal" | "off";
       }
       if (autoTranscribeEnabled !== undefined) {
         config.auto_transcribe = { enabled: autoTranscribeEnabled };
@@ -1270,6 +1297,7 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
   if (config.discovery) lines.push(`discovery: ${config.discovery}`);
   if (config.autostart !== undefined) lines.push(`autostart: ${config.autostart}`);
+  if (config.default_mirror) lines.push(`default_mirror: ${config.default_mirror}`);
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);
   }

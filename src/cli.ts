@@ -102,6 +102,13 @@ import { listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import { VAULT_SCOPES } from "./scopes.ts";
 import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
 import { getVaultStore } from "./vault-store.ts";
+import {
+  defaultMirrorConfig,
+  resolveMirrorPath,
+  writeMirrorConfigForVault,
+  type MirrorConfig,
+} from "./mirror-config.ts";
+import { bootstrapInternalMirror } from "./mirror-manager.ts";
 import { selfRegister } from "./self-register.ts";
 import {
   hasOwnerPassword,
@@ -814,11 +821,15 @@ async function cmdCreate(args: string[]) {
   // POST /vaults shells out to this CLI and parses stdout). Errors still go
   // to stderr as plain text and exit nonzero — callers branch on exit code.
   const jsonMode = args.includes("--json");
+  // `--no-mirror` opts THIS create out of the default internal live mirror
+  // even when the server-wide `default_mirror` knob is `internal`. Parity for
+  // operators who want one bare vault without flipping the global default.
+  const noMirror = args.includes("--no-mirror");
   // Greedy strip of any `--*` token to recover the positional vault name.
-  // Today only `--json` is recognized; any other `--foo` is silently dropped.
-  // If a future flag (e.g. `--force`, `--dry-run`) is added, the parsing
-  // here needs to whitelist it — otherwise an invalid flag becomes a silent
-  // no-op rather than a usage error.
+  // `--json` and `--no-mirror` are recognized; any other `--foo` is silently
+  // dropped. If a future flag (e.g. `--force`, `--dry-run`) is added, the
+  // parsing here needs to whitelist it — otherwise an invalid flag becomes a
+  // silent no-op rather than a usage error.
   const positional = args.filter((a) => !a.startsWith("--"));
   const name = positional[0];
   if (!name) {
@@ -852,7 +863,7 @@ async function cmdCreate(args: string[]) {
 
   ensureConfigDirSync();
   const wasFirst = listVaults().length === 0;
-  const credential = await createVault(name);
+  const credential = await createVault(name, noMirror ? { enableMirror: false } : {});
 
   // If this is the only vault now, make it the default so unscoped routes
   // (/mcp, /api/*, /oauth/*) target it. Avoids the "single vault named
@@ -3339,7 +3350,59 @@ async function mintBootstrapCredential(name: string): Promise<VaultCredential> {
  * is reachable — vault#282 Stage 2). The DB is created lazily via
  * `getVaultStore` so migrations + schema run; we no longer write any pvt_* row.
  */
-async function createVault(name: string): Promise<VaultCredential> {
+interface CreateVaultOptions {
+  /**
+   * Override the server-wide `default_mirror` knob for this one create.
+   * `--no-mirror` on `parachute-vault create` sets this to `false` so the
+   * vault is created with no mirror config even when the knob is `internal`.
+   * Unset → fall back to the `default_mirror` global config knob (default
+   * `internal`).
+   */
+  enableMirror?: boolean;
+  /**
+   * Test seam threaded straight into `bootstrapInternalMirror` (default
+   * `Bun.which`). Inject a fn returning `null` to exercise the
+   * git-not-installed best-effort path without uninstalling git from the
+   * test host.
+   */
+  which?: (cmd: string) => string | null;
+}
+
+/**
+ * The History / "Live Mirror" preset, written at create time when the
+ * `default_mirror` knob resolves to `internal`. Matches the History preset
+ * the admin SPA's VaultMirror page applies:
+ *   `{enabled:true, location:internal, sync_mode:events, auto_commit:true,
+ *    auto_push:false}`.
+ * Built on top of `defaultMirrorConfig()` so the non-preset fields
+ * (commit_template, safety_net_seconds) stay canonical.
+ */
+function historyPresetMirrorConfig(): MirrorConfig {
+  return {
+    ...defaultMirrorConfig(),
+    enabled: true,
+    location: "internal",
+    sync_mode: "events",
+    auto_commit: true,
+    auto_push: false,
+  };
+}
+
+/**
+ * Resolve whether a freshly created vault should get the internal mirror.
+ * Precedence: explicit per-create override (`--no-mirror`) → server-wide
+ * `default_mirror` knob (default `internal`).
+ */
+function shouldEnableCreateTimeMirror(opts: CreateVaultOptions): boolean {
+  if (opts.enableMirror !== undefined) return opts.enableMirror;
+  // Default to "internal" when the knob is unset — backup-on-by-default.
+  return (readGlobalConfig().default_mirror ?? "internal") === "internal";
+}
+
+async function createVault(
+  name: string,
+  opts: CreateVaultOptions = {},
+): Promise<VaultCredential> {
   const config: VaultConfig = {
     name,
     api_keys: [],
@@ -3350,6 +3413,47 @@ async function createVault(name: string): Promise<VaultCredential> {
   // Touch the store so the vault's SQLite DB + schema are created. No token
   // row is written — vault is a pure hub resource-server post-0.5.0.
   getVaultStore(name);
+
+  // Default new vaults to an internal live mirror (local git backup of the
+  // markdown projection). Backup-on-by-default; GitHub off-site backup is an
+  // opt-in upgrade layered on top later. Opt out via the `default_mirror: off`
+  // global knob (operators on git-less / disk-constrained / cloud boxes) or
+  // the `--no-mirror` flag (this one create only).
+  //
+  // BEST-EFFORT, NON-FATAL: write the mirror config first (so the operator's
+  // intent persists even if git is absent), then attempt the bootstrap. A
+  // git-less box leaves the config written but inactive + logs an actionable
+  // hint — it must NEVER fail the vault create. Create-time ONLY: existing
+  // vaults are never retroactively migrated.
+  if (shouldEnableCreateTimeMirror(opts)) {
+    const mirrorConfig = historyPresetMirrorConfig();
+    writeMirrorConfigForVault(name, mirrorConfig);
+    const mirrorPath = resolveMirrorPath(vaultDir(name), mirrorConfig);
+    if (mirrorPath) {
+      try {
+        const result = await bootstrapInternalMirror(mirrorPath, opts.which);
+        if (!result.ok) {
+          // git-not-installed (or refuse-to-clobber) — config stays written,
+          // mirror just isn't active yet. Surface an actionable line; the
+          // vault create succeeds regardless.
+          console.error(
+            `Note: local git backup configured but not yet active — ${result.error} ` +
+              `Install git to activate; the backup turns on automatically on the next vault restart.`,
+          );
+        }
+      } catch (err) {
+        // Defense-in-depth: bootstrapInternalMirror already converts the
+        // git-missing case into a non-throwing { ok:false } result, but a
+        // truly unexpected throw must still not fail the create.
+        console.error(
+          `Note: local git backup configured but bootstrap hit an unexpected error ` +
+            `(${(err as Error).message ?? err}). The vault was still created; ` +
+            `the backup will retry on the next vault restart.`,
+        );
+      }
+    }
+  }
+
   return mintBootstrapCredential(name);
 }
 
@@ -3454,7 +3558,13 @@ Setup:
   parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
-  parachute-vault create <name> [--json]   Create a new vault (--json: emit { name, token, paths, set_as_default })
+  parachute-vault create <name> [--json] [--no-mirror]
+                                           Create a new vault (--json: emit { name, token, paths, set_as_default }).
+                                           New vaults default to an internal live mirror — a local git backup of
+                                           the markdown projection (backup on by default; GitHub off-site is an
+                                           opt-in upgrade). --no-mirror creates a bare vault with no mirror config.
+                                           Operators can flip the server-wide default with 'default_mirror: off' in
+                                           config.yaml (recommended for cloud / disk-constrained boxes).
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
   parachute-vault mcp-install [--mint|--token <t>]
