@@ -304,6 +304,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         }
 
         // --- Build near-scope (graph-filtered set of allowed IDs) ---
+        //
+        // Tag-scope policy for `near[]` (output-filter, not hop-guard): core
+        // is scope-unaware, so this BFS walks the FULL graph from the anchor —
+        // including out-of-scope intermediate hops. For a tag-scoped session
+        // the server's `applyTagScopeWrappers` (mcp-tools.ts) tag-filters the
+        // RESULT list AFTER execute, so out-of-scope notes never survive into
+        // the response — no content/ids leak. This is ASYMMETRIC with
+        // `find-path`, which guards every hop (it returns the path itself, so
+        // an out-of-scope intermediary would be a leak there). The asymmetry is
+        // deliberate; tracked at vault#439.
         let nearScope: Set<string> | null = null;
         if (params.near) {
           const near = params.near as { note_id: string; depth?: number; relationship?: string };

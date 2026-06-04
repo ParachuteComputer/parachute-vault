@@ -229,6 +229,14 @@ function applyTagScopeWrappers(
   // set `include_links`) so out-of-scope NEIGHBOR summaries (id/path/tags)
   // don't leak — symmetric with the REST `include_links` fix. Mutates in
   // place and returns the note for chaining. No-op when `links` is absent.
+  //
+  // Ordering invariant: reading `allowedHolder.value` here is safe ONLY
+  // because every wrapper that calls scrubNoteLinks first does
+  // `await getAllowed()` (which populates the holder) before `orig(params)`
+  // and before this scrub runs. So by the time we read `holder.value` it is
+  // the resolved allowlist, never the initial `null`. The `?? null` fallback
+  // is the unscoped/holder-absent path; `filterHydratedLinksByTagScope` then
+  // keys off `rawTags` (non-null here) for the actual scope check.
   const scrubNoteLinks = (n: any): any => {
     if (n && Array.isArray(n.links)) {
       n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
