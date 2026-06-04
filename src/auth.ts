@@ -171,6 +171,35 @@ export function warnLegacyOnce(cacheKey: string, context: string): void {
   );
 }
 
+/**
+ * Boot-time warning for legacy GLOBAL `api_keys` in `config.yaml` (security
+ * review — multi-user hardening). Those keys are CROSS-VAULT credentials: a
+ * single key authenticates against EVERY vault on this server (see the global
+ * `api_keys` branch in `authenticate` ~L283). That predates per-vault keys +
+ * tag-scoped hub JWTs and is a confidentiality hazard once a server hosts
+ * multiple users' vaults — one user's global key reads another's vault.
+ *
+ * WARNING ONLY — never touches the keys (the operator owns them). The
+ * verification flagged 6 such keys on the live box; this surfaces them at
+ * boot so they're rotated/removed before multi-user sharing. Returns the
+ * count it warned about (0 = silent) so callers / tests can assert.
+ */
+export function warnLegacyGlobalApiKeys(
+  globalApiKeys: StoredKey[] | undefined,
+  warn: (msg: string) => void = console.warn,
+): number {
+  const count = globalApiKeys?.length ?? 0;
+  if (count === 0) return 0;
+  warn(
+    `[auth] WARNING: ${count} legacy GLOBAL api_key(s) found in config.yaml. ` +
+      "These are CROSS-VAULT credentials (each grants access to every vault on this server) " +
+      "and predate per-vault keys + tag-scoped hub JWTs. Before multi-user sharing, ROTATE or " +
+      "REMOVE them — a global key leaks one user's vault to another. They remain active (the " +
+      "operator owns them); this is a heads-up, not an automatic change.",
+  );
+  return count;
+}
+
 /** Read-only tools (the only tools allowed for "read" permission). */
 const READ_TOOLS = new Set([
   "query-notes",

@@ -45,6 +45,7 @@ import {
 } from "./mirror-config.ts";
 import { GLOBAL_CONFIG_PATH } from "./config.ts";
 import { selfRegister } from "./self-register.ts";
+import { warnLegacyGlobalApiKeys } from "./auth.ts";
 import pkg from "../package.json" with { type: "json" };
 
 // Register webhook triggers from global config. Replaces the old hardcoded
@@ -143,6 +144,12 @@ if (scribeUrl) {
 if (process.env.VAULT_AUTH_TOKEN?.trim()) {
   console.log("[auth] VAULT_AUTH_TOKEN set — server-wide operator bearer active");
 }
+
+// Legacy GLOBAL api_keys warning (security review — multi-user hardening).
+// Surfaced at boot so the operator rotates/removes cross-vault credentials
+// before multi-user sharing. Warning only — never touches the keys. The
+// logic lives in auth.ts (import-safe + unit-tested); see warnLegacyGlobalApiKeys.
+warnLegacyGlobalApiKeys(readGlobalConfig().api_keys);
 
 // Auto-init: create a default vault if none exist (first run in Docker).
 // The vault name comes from PARACHUTE_VAULT_NAME when set + valid; otherwise
