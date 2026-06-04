@@ -49,7 +49,7 @@ import {
   authenticateGlobalRequest,
   extractApiKey,
 } from "./auth.ts";
-import { hasScopeForVault, SCOPE_ADMIN, scopeForMethod, verbForMethod } from "./scopes.ts";
+import { hasScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
 import { defaultAdminSpaDistDir, isAdminSpaPath, serveAdminSpa } from "./admin-spa.ts";
@@ -87,6 +87,7 @@ import {
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
+import { buildUsageReport } from "./usage.ts";
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -460,6 +461,35 @@ export async function route(
       createdAt: vaultConfig.created_at,
       stats,
     });
+  }
+
+  // /.parachute/usage — per-vault data-footprint report ("how big is this
+  // vault"). READ-scoped, deliberately: a vault's own user must be able to
+  // see their own vault's size, and the operator (who holds broad/admin)
+  // inherits read. This mirrors the bare-root stats precedent above (also
+  // read-gated by the method) — same data-disclosure class (counts + sizes,
+  // no note content). The expensive part (two dir-walks) is TTL-cached inside
+  // usage.ts; `?fresh=1` bypasses the cache. Hub-side aggregation/UI is a
+  // separate follow-up; this endpoint is the load-bearing primitive.
+  if (subpath === "/.parachute/usage") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (!hasScopeForVault(auth.scopes, vaultName, "read")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_READ,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const fresh = new URL(req.url).searchParams.get("fresh") === "1";
+    const stats = await store.getVaultStats();
+    return Response.json(buildUsageReport(vaultName, stats, { fresh }));
   }
 
   // The per-vault `/tokens` REST surface (pvt_* mint/list/revoke) was removed

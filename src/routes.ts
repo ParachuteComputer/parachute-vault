@@ -46,6 +46,10 @@ import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { vaultDir } from "./config.ts";
 import { shouldAutoTranscribe } from "./auto-transcribe.ts";
+// usage.ts imports `assetsDir` from this module — the cycle is function-level
+// only (invalidateUsageCache is *called* at upload time, never at module
+// eval), so ESM resolves it fine.
+import { invalidateUsageCache } from "./usage.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2436,6 +2440,13 @@ export async function handleStorage(
 
     const relativePath = `${date}/${filename}`;
     const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+
+    // Invalidate the usage dir-walk cache for this vault — the new attachment
+    // changed the assets-directory footprint, so the next /.parachute/usage
+    // read must re-walk rather than report a stale (smaller) number. Without
+    // this hook the cache's 60s TTL would briefly under-report after an
+    // upload. (usage.ts:invalidateUsageCache is a no-op-cheap map delete.)
+    invalidateUsageCache(vault);
 
     return json({ path: relativePath, size: buffer.length, mimeType }, 201);
   }

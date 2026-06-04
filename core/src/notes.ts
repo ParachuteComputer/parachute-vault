@@ -1579,6 +1579,15 @@ export function getVaultStats(
   const linkCountRow = db.prepare("SELECT COUNT(*) as c FROM links").get() as { c: number };
   const linkCount = linkCountRow.c;
 
+  // Total content bytes. CAST(content AS BLOB) forces SQLite's LENGTH() to
+  // count UTF-8 BYTES rather than characters (bare LENGTH on TEXT returns a
+  // char count, which undercounts multibyte content). COALESCE because SUM
+  // over zero rows is NULL. See VaultStats.contentBytes for the rationale.
+  const contentBytesRow = db
+    .prepare("SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) as b FROM notes")
+    .get() as { b: number };
+  const contentBytes = contentBytesRow.b;
+
   return {
     totalNotes,
     earliestNote: earliestRow
@@ -1592,6 +1601,7 @@ export function getVaultStats(
     tagCount,
     attachmentCount,
     linkCount,
+    contentBytes,
   };
 }
 

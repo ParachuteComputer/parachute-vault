@@ -67,6 +67,16 @@ export interface VaultStats {
   tagCount: number;
   attachmentCount: number;
   linkCount: number;
+  /**
+   * Total bytes of all note content, computed as the sum of the UTF-8 byte
+   * length of every note's `content`. The SQL uses `LENGTH(CAST(content AS
+   * BLOB))` deliberately: SQLite's bare `LENGTH(text)` returns the number of
+   * *characters*, not bytes, so a note full of multibyte UTF-8 (emoji, CJK,
+   * accents) would undercount its true on-disk/on-wire footprint. Casting to
+   * BLOB forces `LENGTH` to count raw bytes. This is the logical content size,
+   * not the physical DB-file size (see `usage.ts:dbBytes` for the latter).
+   */
+  contentBytes: number;
 }
 
 // ---- Query Options ----
