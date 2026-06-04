@@ -96,16 +96,53 @@ describe("buildInitSummaryLines", () => {
     });
   });
 
-  describe("MCP=N + token=N (unreachable)", () => {
-    const out = lines(false, false, undefined).join("\n");
+  // vault#442: the DEFAULT init path — MCP wired, NO token minted (per-user
+  // OAuth). The summary must LEAD with the OAuth connect path, never mint, and
+  // never surface the old "no token issued" failure copy.
+  describe("MCP=Y + no token (vault#442 OAuth default)", () => {
+    const out = lines(true, false, undefined).join("\n");
 
-    test("warns the vault is unreachable", () => {
-      expect(out).toContain("your vault isn't reachable by any client");
+    test("leads with the OAuth connect message — no token needed", () => {
+      expect(out).toContain("no token needed, you'll sign in on first use");
     });
 
-    test("points to the mcp-install recovery path (hub JWT)", () => {
+    test("tells the user Claude Code is already wired in", () => {
+      expect(out).toContain("Claude Code is already wired in");
+    });
+
+    test("shows the OAuth `claude mcp add` command for other clients", () => {
+      expect(out).toContain(
+        "claude mcp add --transport http parachute-vault http://127.0.0.1:1940/vault/default/mcp",
+      );
+    });
+
+    test("offers the scope-narrow opt-in mint for scripts (read, never admin)", () => {
+      expect(out).toContain("parachute auth mint-token --scope vault:read");
+      expect(out).not.toContain("vault:admin");
+    });
+
+    test("does NOT print or imply any minted token", () => {
+      expect(out).not.toContain("Your API token:");
+      expect(out).not.toContain("Baked into ~/.claude.json");
+      expect(out).not.toContain("Authorization: Bearer");
+    });
+
+    test("does NOT surface the old no-token-issued failure copy", () => {
+      expect(out).not.toContain("No token issued");
+    });
+  });
+
+  describe("MCP=N + token=N (OAuth default, Claude Code not wired)", () => {
+    const out = lines(false, false, undefined).join("\n");
+
+    test("frames skipping the MCP entry as OAuth-first, not 'unreachable'", () => {
+      expect(out).toContain("uses per-user OAuth, no token needed");
+      expect(out).not.toContain("your vault isn't reachable by any client");
+    });
+
+    test("points to mcp-install (no token-minting framing)", () => {
       expect(out).toContain("parachute-vault mcp-install");
-      expect(out).toContain("mints a hub JWT");
+      expect(out).not.toContain("mints a hub JWT");
     });
 
     test("does not print any token", () => {
@@ -115,6 +152,23 @@ describe("buildInitSummaryLines", () => {
 
     test("omits the Bearer curl example", () => {
       expect(out).not.toContain("Authorization: Bearer");
+    });
+  });
+
+  // Explicit opt-in but no hub reachable to mint (vault#282 Stage 2 path,
+  // reached only when the operator passes --token without a hub).
+  describe("MCP=N + token=Y but no hub (opt-in mint failed)", () => {
+    const out = buildInitSummaryLines({
+      ...baseInput,
+      addMcp: false,
+      addToken: true,
+      apiKey: undefined,
+      noTokenGuidance: "No token issued — hub unreachable.",
+    }).join("\n");
+
+    test("surfaces the no-token-issued guidance + recovery", () => {
+      expect(out).toContain("No token issued");
+      expect(out).toContain("parachute-vault mcp-install");
     });
   });
 
