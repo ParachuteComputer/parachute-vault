@@ -826,8 +826,14 @@ async function cmdCreate(args: string[]) {
     process.exit(1);
   }
 
-  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
-    console.error("Vault name must contain only letters, numbers, hyphens, and underscores.");
+  // Lowercase-only (security review — multi-user hardening). An uppercase
+  // vault name flips the audience case (`vault.<Name>` vs `vault.<name>`)
+  // and drifts from hub-side / init-path lowercasing, breaking JWT
+  // audience matching. `init` already enforces lowercase via
+  // `validateVaultName`; mirror that rule here so uppercase can't enter
+  // through `create` either.
+  if (!/^[a-z0-9_-]+$/.test(name)) {
+    console.error("Vault name must be lowercase alphanumeric with hyphens or underscores (no uppercase).");
     process.exit(1);
   }
   if (name === "list") {
