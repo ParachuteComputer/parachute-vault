@@ -22,6 +22,22 @@ export interface ExpandContext {
   mode: ExpandMode;
   /** Note IDs already expanded in this query. Shared across all expansions. */
   expanded: Set<string>;
+  /**
+   * Optional visibility predicate (tag-scope confidentiality, vault security
+   * review). When set and it returns `false` for a resolved target note, the
+   * wikilink is left UNRESOLVED — byte-identical to the not-found/unresolved
+   * branch, so an out-of-scope target is indistinguishable from a missing one
+   * (we never reveal existence differently across the scope boundary).
+   *
+   * Core stays scope-unaware: the server constructs this predicate from its
+   * tag-scope machinery and injects it; core only ever *calls* it. When
+   * unset (every unscoped caller), expansion behaves exactly as before.
+   *
+   * Applied at every hop — multi-hop (`expand_depth > 1`) expansion runs the
+   * predicate on each resolved target before inlining, so a deep chain can't
+   * tunnel out-of-scope content through an in-scope intermediary.
+   */
+  isVisible?: (note: Note) => boolean;
 }
 
 /**
@@ -62,13 +78,25 @@ export function expandContent(
     const noteId = resolveWikilink(ctx.db, target);
     if (!noteId) return match; // unresolved or ambiguous — leave as-is
 
+    // Resolve the target BEFORE the dedup check so the visibility gate can run
+    // first — an out-of-scope target must never enter `expanded` (otherwise a
+    // second reference to it would render `(expanded above)` and leak its
+    // existence via a different output than a genuinely-missing target).
+    const note = noteOps.getNote(ctx.db, noteId);
+    if (!note) return match; // shouldn't happen, but be safe
+
+    // Tag-scope confidentiality (vault security review): if a visibility
+    // predicate is installed and the resolved target is out of scope, leave
+    // the wikilink UNRESOLVED — byte-identical to the not-found / unresolved
+    // branches above. The out-of-scope case must be indistinguishable from a
+    // missing target so the response can't leak the target's existence. Runs
+    // at every hop, so multi-hop expansion can't tunnel out-of-scope content.
+    if (ctx.isVisible && !ctx.isVisible(note)) return match;
+
     if (ctx.expanded.has(noteId)) {
       return `${match} (expanded above)`;
     }
     ctx.expanded.add(noteId);
-
-    const note = noteOps.getNote(ctx.db, noteId);
-    if (!note) return match; // shouldn't happen, but be safe
 
     if (ctx.mode === "summary") {
       // Summary mode doesn't recurse: depth > 1 has no additional effect.

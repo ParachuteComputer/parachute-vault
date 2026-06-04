@@ -7,6 +7,7 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
   projectionToMarkdown,
@@ -18,6 +19,7 @@ import { hasScopeForVault, parseScopes, validateMintedScopes } from "./scopes.ts
 import type { AuthResult } from "./auth.ts";
 import {
   expandTokenTagScope,
+  filterHydratedLinksByTagScope,
   noteWithinTagScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
@@ -117,11 +119,30 @@ export function generateScopedMcpTools(
   callerBearer?: string | null,
 ): McpToolDef[] {
   const store = getVaultStore(vaultName);
-  const tools = generateMcpTools(store);
+
+  // Tag-scope confidentiality (security review): when the session is
+  // tag-scoped, build an expand-visibility predicate so `query-notes`'s
+  // `expand_links` inlining can't embed out-of-scope note content. The
+  // predicate reads from a SHARED holder that `applyTagScopeWrappers`
+  // populates with the resolved allowlist before core's execute runs the
+  // (synchronous) expansion — so by the time core calls `isVisible(note)`
+  // the allowlist is ready. Core stays scope-unaware: it only receives the
+  // plain closure. Unscoped sessions pass no predicate (unchanged path).
+  const scoped = Boolean(auth?.scoped_tags && auth.scoped_tags.length > 0);
+  const allowedHolder: { value: Set<string> | null } = { value: null };
+  const rawTags = scoped ? auth!.scoped_tags : null;
+  const expandVisibility = scoped
+    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    : undefined;
+
+  const tools = generateMcpTools(
+    store,
+    expandVisibility ? { expandVisibility } : undefined,
+  );
 
   overrideVaultInfo(tools, vaultName, auth);
   applyTagDependencyGuards(tools, vaultName);
-  applyTagScopeWrappers(tools, vaultName, auth);
+  applyTagScopeWrappers(tools, vaultName, auth, allowedHolder);
 
   // manage-token is server-only (needs token-store + auth context), so it
   // lives here rather than in core. Always appended to the surface; the
@@ -181,6 +202,7 @@ function applyTagScopeWrappers(
   tools: McpToolDef[],
   vaultName: string,
   auth: AuthResult | undefined,
+  allowedHolder?: { value: Set<string> | null },
 ): void {
   if (!auth || !auth.scoped_tags || auth.scoped_tags.length === 0) return;
   const store = getVaultStore(vaultName);
@@ -188,11 +210,31 @@ function applyTagScopeWrappers(
   let allowedPromise: Promise<Set<string> | null> | null = null;
   const getAllowed = (): Promise<Set<string> | null> => {
     if (!allowedPromise) {
-      allowedPromise = expandTokenTagScope(store, auth.scoped_tags);
+      allowedPromise = expandTokenTagScope(store, auth.scoped_tags).then((a) => {
+        // Publish the resolved allowlist into the shared holder so the
+        // expand-visibility predicate (wired in generateScopedMcpTools and
+        // baked into the query-notes expand context) sees the same set.
+        // The query-notes wrapper awaits getAllowed() before calling the
+        // core execute that runs expansion, so the holder is populated in
+        // time. Security review: closes the expand_links content leak.
+        if (allowedHolder) allowedHolder.value = a;
+        return a;
+      });
     }
     return allowedPromise;
   };
   const rawTags = auth.scoped_tags;
+
+  // Scrub a returned note's hydrated `links` array (present when the caller
+  // set `include_links`) so out-of-scope NEIGHBOR summaries (id/path/tags)
+  // don't leak — symmetric with the REST `include_links` fix. Mutates in
+  // place and returns the note for chaining. No-op when `links` is absent.
+  const scrubNoteLinks = (n: any): any => {
+    if (n && Array.isArray(n.links)) {
+      n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
+    }
+    return n;
+  };
 
   wrapReadTool(tools, "query-notes", async (orig, params) => {
     const allowed = await getAllowed();
@@ -203,7 +245,9 @@ function applyTagScopeWrappers(
     //   - `{notes, next_cursor}` (cursor mode, vault#313)
     //   - `{...note}` with `id`+`tags` (single-note by id)
     if (Array.isArray(result)) {
-      return result.filter((n: any) => noteWithinTagScope(n, allowed, rawTags));
+      return result
+        .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
+        .map(scrubNoteLinks);
     }
     if (
       result &&
@@ -214,13 +258,15 @@ function applyTagScopeWrappers(
     ) {
       const r = result as { notes: any[]; next_cursor: string | null };
       return {
-        notes: r.notes.filter((n: any) => noteWithinTagScope(n, allowed, rawTags)),
+        notes: r.notes
+          .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
+          .map(scrubNoteLinks),
         next_cursor: r.next_cursor,
       };
     }
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
-        ? result
+        ? scrubNoteLinks(result)
         : { error: "Note not found", id: (result as any).id };
     }
     return result;
