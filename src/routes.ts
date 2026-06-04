@@ -13,7 +13,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { getNote, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
@@ -1932,12 +1932,32 @@ export async function handleVault(
 // Unresolved wikilinks — REST-only (admin/maintenance)
 // ---------------------------------------------------------------------------
 
-export function handleUnresolvedWikilinks(req: Request, store: Store): Response {
+export function handleUnresolvedWikilinks(
+  req: Request,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Response {
   const url = new URL(req.url);
   const limitStr = url.searchParams.get("limit");
   const limit = limitStr ? parseInt(limitStr, 10) : 50;
   const db = (store as any).db;
-  return Response.json(listUnresolvedWikilinks(db, limit));
+  const result = listUnresolvedWikilinks(db, limit);
+
+  // Unscoped token → return as-is (unchanged behavior).
+  if (tagScope.raw === null) return Response.json(result);
+
+  // Tag-scope confidentiality (security review): each unresolved row carries
+  // a `source_id` (+ `source_path`) plus the raw `target_path` wikilink
+  // string. For a tag-scoped token, surface ONLY rows whose SOURCE note is
+  // within the token's tag scope — otherwise we'd leak out-of-scope note IDs
+  // and the wikilink target strings those notes contain. Filter the page and
+  // recompute `count` from the filtered set so the aggregate total of
+  // out-of-scope rows doesn't leak either.
+  const filtered = result.unresolved.filter((row) => {
+    const note = getNote(db, row.source_id);
+    return note !== null && noteWithinTagScope(note, tagScope.allowed, tagScope.raw);
+  });
+  return Response.json({ unresolved: filtered, count: filtered.length });
 }
 
 // ---------------------------------------------------------------------------

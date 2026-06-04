@@ -738,7 +738,7 @@ export async function route(
       writeVaultConfig(vaultConfig);
     });
   }
-  if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store);
+  if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);
   if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);
   if (apiPath === "/health") return Response.json({ status: "ok", vault: vaultName });
 

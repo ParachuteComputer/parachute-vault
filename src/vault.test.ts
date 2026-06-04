@@ -11,7 +11,7 @@ import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
 import { buildVaultProjection } from "../core/src/vault-projection.ts";
-import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks } from "./routes.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import type { TagScopeCtx } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
@@ -3624,6 +3624,39 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
     const body = await res.json() as any;
     expect((body.links ?? []).length).toBe(1);
     expect(JSON.stringify(body.links)).toContain(secret.id);
+  });
+
+  test("unresolved-wikilinks surfaces only in-scope source rows", async () => {
+    // #personal source with a dangling wikilink → out-of-scope row.
+    await store.createNote("p [[NoSuchPersonal]]", { path: "P", tags: ["personal"] });
+    // #work source with a dangling wikilink → in-scope row.
+    await store.createNote("w [[NoSuchWork]]", { path: "W", tags: ["work"] });
+
+    const res = handleUnresolvedWikilinks(
+      mkReq("GET", "/unresolved-wikilinks"),
+      store,
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    const targets = (body.unresolved as any[]).map((r) => r.target_path);
+    expect(targets).toContain("NoSuchWork");
+    expect(targets).not.toContain("NoSuchPersonal");
+    expect(body.count).toBe(1);
+  });
+
+  test("UNSCOPED unresolved-wikilinks surfaces every row (regression)", async () => {
+    await store.createNote("p [[NoSuchPersonal]]", { path: "P", tags: ["personal"] });
+    await store.createNote("w [[NoSuchWork]]", { path: "W", tags: ["work"] });
+
+    const res = handleUnresolvedWikilinks(
+      mkReq("GET", "/unresolved-wikilinks"),
+      store,
+      NO_SCOPE,
+    );
+    const body = await res.json() as any;
+    const targets = (body.unresolved as any[]).map((r) => r.target_path);
+    expect(targets).toContain("NoSuchWork");
+    expect(targets).toContain("NoSuchPersonal");
   });
 
 });
