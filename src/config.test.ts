@@ -250,6 +250,22 @@ describe("config", () => {
     writeGlobalConfig({ port: 1940, autostart: false });
     expect(readGlobalConfig().autostart).toBe(false);
   });
+
+  test("round-trips default_mirror: internal|off", () => {
+    // Absent: createVault falls back to the in-code default ("internal" —
+    // backup-on-by-default). The knob is only persisted when explicitly set.
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().default_mirror).toBeUndefined();
+
+    // Explicit internal — new vaults get the History-preset local git mirror.
+    writeGlobalConfig({ port: 1940, default_mirror: "internal" });
+    expect(readGlobalConfig().default_mirror).toBe("internal");
+
+    // Explicit off — the opt-out operators set on git-less / disk-constrained
+    // / cloud boxes so new vaults are created with no mirror config.
+    writeGlobalConfig({ port: 1940, default_mirror: "off" });
+    expect(readGlobalConfig().default_mirror).toBe("off");
+  });
 });
 
 // ---------------------------------------------------------------------------
