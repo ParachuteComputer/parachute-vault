@@ -56,6 +56,7 @@ import {
   buildMcpConfigJson,
   buildMcpEntryPlan,
   chooseHubOrigin,
+  chooseMcpUrl,
   detectInstallContext,
   mintHubJwt,
   readOperatorToken,
@@ -478,11 +479,16 @@ async function cmdInit(args: string[] = []) {
     addMcp = true; // non-interactive: preserve the installable-via-pipe default
   }
 
-  // 7b. Surface an API token for other clients? (Codex, Goose, OpenCode,
-  // Cursor, Zed, Cline, scripts, curl.) Same flag/TTY precedence as MCP.
-  // Note: a token is always minted when addMcp is true (it gets baked into
-  // the ~/.claude.json entry); this prompt controls whether that token is
-  // printed prominently at the end so the user can paste it elsewhere.
+  // 7b. Mint an API token for the header-auth / script use case? (Codex,
+  // Goose, OpenCode, Cursor, Zed, Cline, scripts, curl.)
+  //
+  // vault#442: default vault auth is per-user OAuth — the Claude Code MCP entry
+  // is written WITHOUT a baked bearer, so the first connection does browser
+  // sign-in. We mint a token ONLY when the operator explicitly opts in
+  // (`--token`, or "yes" at the prompt), and then it's scope-narrow
+  // (`vault:<name>:read`), NEVER admin. `--no-token` (and the non-interactive
+  // default) skips minting entirely — no auto-mint, no noisy mint-failure on a
+  // fresh vault.
   let addToken: boolean;
   if (flagTokenOff) {
     addToken = false;
@@ -490,25 +496,22 @@ async function cmdInit(args: string[] = []) {
     addToken = true;
   } else if (process.stdin.isTTY) {
     addToken = await confirm(
-      "Generate an API token for other MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or curl?",
-      true,
+      "Also mint a header-auth API token for non-OAuth clients / scripts (Codex, Goose, curl)? (OAuth works without one)",
+      false,
     );
   } else {
-    addToken = true; // non-interactive: default-yes matches addMcp default
+    addToken = false; // non-interactive default: OAuth-first, no auto-mint
   }
 
-  // Mint a token if we need one (for the claude.json entry and/or for
-  // prominent display) and don't already have one from vault creation —
-  // e.g. a re-run of init against an existing vault. vault#282 Stage 2: vault
-  // no longer mints pvt_* tokens, so this is a hub JWT via the operator.token
-  // → hub mint-token path (`mintBootstrapCredential`). When no hub is
-  // reachable, `apiKey` stays undefined and we carry the guidance to the
-  // summary — the operator runs `mcp-install` once a hub is up, or sets
-  // VAULT_AUTH_TOKEN.
+  // Mint a scope-narrow token ONLY when explicitly opted in and we don't
+  // already have one from vault creation. vault#282 Stage 2: vault no longer
+  // mints pvt_* tokens — this is a hub JWT via the operator.token → hub
+  // mint-token path (`mintBootstrapCredential`), scoped `vault:<name>:read`.
+  // When no hub is reachable, `apiKey` stays undefined and we carry the
+  // guidance to the summary. The default (OAuth) path never reaches here.
   const defaultVault = globalConfig.default_vault || "default";
-  const needToken = addMcp || addToken;
-  if (needToken && !apiKey) {
-    const credential = await mintBootstrapCredential(defaultVault);
+  if (addToken && !apiKey) {
+    const credential = await mintBootstrapCredential(defaultVault, "read");
     apiKey = credential.token ?? undefined;
     credentialGuidance = credential.guidance;
     if (!apiKey) console.log(`  ${credential.guidance}`);
@@ -517,10 +520,9 @@ async function cmdInit(args: string[] = []) {
   if (addMcp) {
     // Goes through `buildMcpEntryPlan` for entryKey + url so this path shares
     // the writer-side invariant with `executeMcpInstall` — a future URL-shape
-    // change can't drift between init and mcp-install. The bearer is the hub
-    // JWT minted above (omitted when no hub was reachable — the entry is then
-    // written unauthenticated, and the operator re-runs `mcp-install` once a
-    // hub is up).
+    // change can't drift between init and mcp-install. By default NO bearer is
+    // baked (vault#442 — OAuth on first connect); a bearer is embedded only
+    // when the operator explicitly opted into a scope-narrow token above.
     const target = resolveInstallTarget("user");
     const { entryKey, url, source } = buildMcpEntryPlan({
       vaultName: defaultVault,
@@ -535,6 +537,9 @@ async function cmdInit(args: string[] = []) {
     });
     console.log(`MCP URL: ${url} (${source})`);
     console.log(`  MCP server added to ~/.claude.json`);
+    if (!apiKey) {
+      console.log(`  No token baked in — you'll sign in via OAuth on first connect.`);
+    }
   } else {
     console.log("  Skipped adding MCP to ~/.claude.json.");
     console.log("  Run `parachute-vault mcp-install` later if you want it.");
@@ -551,6 +556,7 @@ async function cmdInit(args: string[] = []) {
     bindHost,
     port,
     mcpUrl,
+    vaultName: defaultVault,
     noTokenGuidance: credentialGuidance,
   });
   for (const line of lines) console.log(line);
@@ -825,12 +831,53 @@ async function cmdCreate(args: string[]) {
   // even when the server-wide `default_mirror` knob is `internal`. Parity for
   // operators who want one bare vault without flipping the global default.
   const noMirror = args.includes("--no-mirror");
-  // Greedy strip of any `--*` token to recover the positional vault name.
-  // `--json` and `--no-mirror` are recognized; any other `--foo` is silently
-  // dropped. If a future flag (e.g. `--force`, `--dry-run`) is added, the
-  // parsing here needs to whitelist it — otherwise an invalid flag becomes a
-  // silent no-op rather than a usage error.
-  const positional = args.filter((a) => !a.startsWith("--"));
+
+  // --- Auth opt-in (vault#442). Default = per-user OAuth, NO token minted. ---
+  // `--mint` opts into a scope-narrow hub JWT for the header-auth / script
+  // use case; `--scope read|write` (default read) picks the verb. `:admin` is
+  // intentionally NOT accepted from the create flow. `--token <bearer>` is the
+  // paste path — use an existing bearer instead of minting. The two are
+  // mutually exclusive.
+  const wantMint = args.includes("--mint");
+  const createTokenArg = takeArgValue(args, "--token");
+  if (createTokenArg.missingValue) {
+    console.error("--token requires a value (the bearer token to embed).");
+    process.exit(1);
+  }
+  const pastedToken = createTokenArg.value;
+  if (wantMint && pastedToken !== undefined) {
+    console.error("--mint and --token are mutually exclusive.");
+    process.exit(1);
+  }
+  const createScopeArg = takeArgValue(args, "--scope");
+  if (createScopeArg.missingValue) {
+    console.error("--scope requires a value: read or write.");
+    process.exit(1);
+  }
+  const rawCreateVerb = createScopeArg.value ?? "read";
+  if (rawCreateVerb !== "read" && rawCreateVerb !== "write") {
+    console.error(
+      `--scope must be "read" or "write" for create (admin is minted out-of-band via \`mcp-install --scope vault:admin\`). Got: ${rawCreateVerb}.`,
+    );
+    process.exit(1);
+  }
+  const mintVerb: "read" | "write" | undefined = wantMint ? rawCreateVerb : undefined;
+
+  // Greedy strip of any `--*` token (and any `--flag value` pairs we consumed
+  // above) to recover the positional vault name. `--json`, `--no-mirror`,
+  // `--mint`, `--token <v>`, `--scope <v>` are recognized; any other `--foo` is
+  // silently dropped, and the value following a recognized value-flag is
+  // skipped so it can't be mistaken for the vault name.
+  const VALUE_FLAGS = new Set(["--token", "--scope"]);
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a.startsWith("--")) {
+      if (VALUE_FLAGS.has(a)) i++; // skip the flag's value
+      continue;
+    }
+    positional.push(a);
+  }
   const name = positional[0];
   if (!name) {
     console.error("Usage: parachute-vault create <name> [--json]");
@@ -863,7 +910,18 @@ async function cmdCreate(args: string[]) {
 
   ensureConfigDirSync();
   const wasFirst = listVaults().length === 0;
-  const credential = await createVault(name, noMirror ? { enableMirror: false } : {});
+  const credential = await createVault(name, {
+    ...(noMirror ? { enableMirror: false } : {}),
+    ...(mintVerb ? { mintVerb } : {}),
+  });
+
+  // `--token <bearer>` paste path: the operator supplied their own bearer
+  // instead of minting one. Surface it as the credential token so the
+  // downstream JSON / human / summary copy treats it the same as a minted one.
+  const effectiveToken = pastedToken ?? credential.token;
+  const effectiveGuidance = pastedToken
+    ? "Using the bearer you supplied via --token."
+    : credential.guidance;
 
   // If this is the only vault now, make it the default so unscoped routes
   // (/mcp, /api/*, /oauth/*) target it. Avoids the "single vault named
@@ -897,17 +955,19 @@ async function cmdCreate(args: string[]) {
     log: () => {}, // CLI create has its own status lines.
   });
 
+  const endpoint = chooseMcpUrl(name, globalConfig.port || DEFAULT_PORT).url;
+
   if (jsonMode) {
     // Contract (hub's admin-vaults.ts requires `typeof token === "string"`):
-    // emit the minted hub JWT when present. When no hub was reachable
-    // (standalone create — no operator.token / no hub origin), `token` is the
-    // empty string and `token_guidance` carries the operator's next step. Hub
-    // only shells out to `create --json` while IT is the orchestrator (a hub is
-    // running, operator.token present), so that path always mints a real JWT.
+    // emit a token string when one was minted/pasted. vault#442 default is
+    // per-user OAuth — no token is minted — so `token` is the empty string and
+    // `token_guidance` carries the OAuth-first connect path. (Hub's admin SPA
+    // already handles the empty-token case + has its own session-cookie admin
+    // mint path, so it doesn't depend on create minting a token.)
     const payload = {
       name,
-      token: credential.token ?? "",
-      token_guidance: credential.guidance,
+      token: effectiveToken ?? "",
+      token_guidance: effectiveGuidance,
       paths: {
         vault_dir: vaultDir(name),
         vault_db: vaultDbPath(name),
@@ -921,18 +981,20 @@ async function cmdCreate(args: string[]) {
 
   console.log(`Vault "${name}" created.`);
   console.log(`  Path: ${vaultDir(name)}`);
-  if (credential.token) {
-    console.log(`  API token: ${credential.token}`);
-    console.log(`  ${credential.guidance}`);
+  if (effectiveToken) {
+    console.log(`  API token: ${effectiveToken}`);
+    console.log(`  ${effectiveGuidance}`);
     console.log(`  Save this — it will not be shown again.`);
   } else {
-    console.log(`  ${credential.guidance}`);
+    console.log(`  ${effectiveGuidance}`);
   }
   if (defaultNote) {
     console.log(`  ${defaultNote}`);
   }
   console.log();
-  console.log(`To add MCP to Claude: parachute-vault mcp-install ${name}`);
+  console.log(`Connect your AI: claude mcp add --transport http parachute-${name} ${endpoint}`);
+  console.log(`  (no token needed — you'll sign in on first use)`);
+  console.log(`Need a header-auth token for a script? parachute auth mint-token --scope vault:${name}:read`);
 }
 
 function cmdList() {
@@ -3274,30 +3336,40 @@ async function firstChangedNoteTitle(
 /**
  * Outcome of bootstrapping a fresh vault's first credential (vault#282 Stage 2).
  *
- * Vault no longer mints `pvt_*` tokens. The first credential for a new vault is
- * a hub-issued JWT, minted via the same operator.token → hub mint-token path
- * `mcp-install --mint` uses (cli.ts ~`cmdMcpInstall`). When no hub is reachable
- * (standalone install, no operator.token, or no real hub origin), `token` is
- * null and `guidance` carries the operator's next step.
+ * Vault no longer mints `pvt_*` tokens. When a token IS minted (explicit opt-in
+ * only — vault#442), it's a hub-issued JWT scoped narrow (`vault:<name>:read`
+ * or `:write`, NEVER `:admin`), minted via the same operator.token → hub
+ * mint-token path `mcp-install --mint` uses (cli.ts ~`cmdMcpInstall`). When no
+ * hub is reachable (standalone install, no operator.token, or no real hub
+ * origin), `token` is null and `guidance` carries the operator's next step.
  */
 interface VaultCredential {
-  /** Hub-issued JWT scoped to `vault:<name>:admin`, or null when no hub is reachable. */
+  /** Hub-issued JWT scoped narrow (read/write), or null when not minted / no hub reachable. */
   token: string | null;
   /** Human-readable note: how the token was issued, or why it wasn't. */
   guidance: string;
 }
 
 /**
- * Mint the first credential for a freshly-created vault.
+ * Mint a scope-narrow credential for a vault (explicit opt-in — vault#442).
  *
- * Decision (vault#282 Stage 2): when a hub is reachable (operator.token present
- * AND a real hub origin resolves), mint a `vault:<name>:admin` hub JWT and
- * return it as the bootstrap credential — preserving the `create --json`
- * `token` string contract hub's admin-vaults.ts requires. When no hub is
+ * Default vault auth is per-user OAuth (browser sign-in on first MCP connect);
+ * tokens are only for the header-auth / script use case and are minted ONLY
+ * when explicitly requested. Decision (vault#442): the create/init flow NEVER
+ * auto-mints, and when a token IS requested it's scope-narrow — `verb` is
+ * `read` (default) or `write`, NEVER `admin`. (Admin tokens, when truly
+ * needed, are minted out-of-band via `mcp-install --scope vault:admin` against
+ * a hub running hub#449, or the hub admin SPA's own session-cookie path.)
+ *
+ * When a hub is reachable (operator.token present AND a real hub origin
+ * resolves), mint a `vault:<name>:<verb>` hub JWT and return it. When no hub is
  * reachable, return `token: null` plus explicit standalone guidance. There is
  * no local pvt_* fallback anymore.
  */
-async function mintBootstrapCredential(name: string): Promise<VaultCredential> {
+async function mintBootstrapCredential(
+  name: string,
+  verb: "read" | "write" = "read",
+): Promise<VaultCredential> {
   const operatorToken = readOperatorToken();
   if (!operatorToken) {
     return {
@@ -3322,7 +3394,7 @@ async function mintBootstrapCredential(name: string): Promise<VaultCredential> {
   const result = await mintHubJwt({
     hubOrigin: hub.url,
     operatorToken,
-    scope: `vault:${name}:admin`,
+    scope: `vault:${name}:${verb}`,
     subject: "parachute-vault-bootstrap",
   });
   if ("kind" in result) {
@@ -3333,7 +3405,7 @@ async function mintBootstrapCredential(name: string): Promise<VaultCredential> {
     return {
       token: null,
       guidance:
-        `No token issued — ${detail}. Verify the hub is running (hub#449 for vault:admin mint), ` +
+        `No token issued — ${detail}. Verify the hub is running, ` +
         "then run `parachute-vault mcp-install`, or set VAULT_AUTH_TOKEN.",
     };
   }
@@ -3344,13 +3416,24 @@ async function mintBootstrapCredential(name: string): Promise<VaultCredential> {
 }
 
 /**
- * Create a vault's config + DB and mint its first credential.
+ * Create a vault's config + DB.
  *
- * Returns the bootstrap credential (a hub JWT, or null + guidance when no hub
- * is reachable — vault#282 Stage 2). The DB is created lazily via
- * `getVaultStore` so migrations + schema run; we no longer write any pvt_* row.
+ * Default vault auth is per-user OAuth (vault#442) — create does NOT mint or
+ * bake in any token. Returns a `VaultCredential` whose `token` is null and
+ * whose `guidance` points at the OAuth-first connect path. A scope-narrow
+ * token is minted only when the caller passes `mintVerb` (the explicit
+ * header-auth / script opt-in: `read` default or `write`, NEVER `admin`). The
+ * DB is created lazily via `getVaultStore` so migrations + schema run; we never
+ * write any pvt_* row.
  */
 interface CreateVaultOptions {
+  /**
+   * Opt-in token mint (vault#442). Unset → no token is minted; the vault uses
+   * per-user OAuth on first MCP connect. Set to `read`/`write` → mint a
+   * scope-narrow `vault:<name>:<verb>` hub JWT for the header-auth / script
+   * use case. `admin` is intentionally NOT accepted here.
+   */
+  mintVerb?: "read" | "write";
   /**
    * Override the server-wide `default_mirror` knob for this one create.
    * `--no-mirror` on `parachute-vault create` sets this to `false` so the
@@ -3454,7 +3537,19 @@ async function createVault(
     }
   }
 
-  return mintBootstrapCredential(name);
+  // vault#442: default to per-user OAuth — do NOT auto-mint or bake in a
+  // shared token. Only mint when the caller explicitly opted in (header-auth /
+  // script use case), and then scope-narrow (read/write, never admin).
+  if (opts.mintVerb) {
+    return mintBootstrapCredential(name, opts.mintVerb);
+  }
+  return {
+    token: null,
+    guidance:
+      "No token minted — this vault uses per-user OAuth (sign in on first connect). " +
+      "Need a header-auth token for a script? Run " +
+      `\`parachute auth mint-token --scope vault:${name}:read\` (or \`:write\`).`,
+  };
 }
 
 interface InstallMcpConfigOpts {
@@ -3536,9 +3631,11 @@ Setup:
   parachute-vault init [--mcp|--no-mcp] [--token|--no-token] [--vault-name <name>]
                        [--autostart|--no-autostart]
                                            Set up everything (one command, idempotent).
-                                           --mcp/--no-mcp controls the Claude Code MCP entry;
-                                           --token/--no-token controls whether an API token is
-                                           printed for pasting into other MCP clients / scripts.
+                                           --mcp/--no-mcp controls the Claude Code MCP entry (written
+                                           for per-user OAuth by default — no baked token; sign in on
+                                           first connect). --token opts into ALSO minting a scope-narrow
+                                           header-auth token (vault:<name>:read) for non-OAuth clients /
+                                           scripts; --no-token (the default) skips minting entirely.
                                            --vault-name skips the prompt and names the vault
                                            (lowercase alphanumeric, hyphens, underscores;
                                            omit to be prompted interactively, default "default").
@@ -3558,8 +3655,13 @@ Setup:
   parachute --version                      Print the installed version (alias: -v, version)
 
 Vaults:
-  parachute-vault create <name> [--json] [--no-mirror]
+  parachute-vault create <name> [--json] [--no-mirror] [--mint [--scope read|write]] [--token <bearer>]
                                            Create a new vault (--json: emit { name, token, paths, set_as_default }).
+                                           Default auth is per-user OAuth — NO token is minted; connect with
+                                           "claude mcp add --transport http parachute-<name> <endpoint>" and sign in
+                                           on first use. --mint opts into a scope-narrow hub JWT for the header-auth /
+                                           script case (--scope read [default] | write — admin is NOT mintable from
+                                           create); --token <bearer> pastes an existing bearer instead of minting.
                                            New vaults default to an internal live mirror — a local git backup of
                                            the markdown projection (backup on by default; GitHub off-site is an
                                            opt-in upgrade). --no-mirror creates a bare vault with no mirror config.

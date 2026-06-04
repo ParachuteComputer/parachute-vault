@@ -85,13 +85,15 @@ describe("vault create --json", () => {
     expect(lines).toHaveLength(1);
     const payload = JSON.parse(lines[0]!);
     expect(payload.name).toBe("myvault");
-    // vault#282 Stage 2: vault no longer mints pvt_* tokens. The contract
-    // hub's admin-vaults.ts requires still holds (`token` is a string). In
-    // this sandbox there's no hub/operator.token, so no token is issued: the
-    // token field is the empty string and `token_guidance` explains why.
+    // vault#442: default auth is per-user OAuth — `create` does NOT mint a
+    // token. The contract hub's admin-vaults.ts requires still holds (`token`
+    // is a string); it's the empty string and `token_guidance` carries the
+    // OAuth-first connect path (the hub SPA handles the empty-token case and
+    // mints admin via its own session-cookie path).
     expect(typeof payload.token).toBe("string");
     expect(payload.token).toBe("");
-    expect(payload.token_guidance).toContain("No token issued");
+    expect(payload.token_guidance).toContain("No token minted");
+    expect(payload.token_guidance).toContain("per-user OAuth");
     expect(payload.set_as_default).toBe(true);
     expect(payload.paths.vault_dir).toBe(join(home, "vault", "data", "myvault"));
     expect(payload.paths.vault_db).toBe(join(home, "vault", "data", "myvault", "vault.db"));
@@ -157,6 +159,95 @@ describe("vault create --json", () => {
     expect(exitCode).not.toBe(0);
     expect(stdout).toBe("");
     expect(stderr).toContain("already exists");
+  });
+});
+
+/**
+ * vault#442: default to per-user OAuth — `create` must NOT auto-mint or bake in
+ * a shared `vault:<name>:admin` token. Token-minting is explicit opt-in
+ * (`--mint`) and scope-narrow (read/write, NEVER admin); `--token <bearer>` is
+ * the paste path. These tests pin the behavioral contract.
+ */
+describe("vault create — OAuth-first auth (vault#442)", () => {
+  test("default create does NOT mint a token — empty token + OAuth guidance (--json)", () => {
+    const { exitCode, stdout } = runCli(["create", "oauthy", "--json"], {
+      PARACHUTE_HOME: home,
+    });
+    expect(exitCode).toBe(0);
+    const payload = JSON.parse(stdout.trim());
+    // No token baked in — OAuth on first connect.
+    expect(payload.token).toBe("");
+    expect(payload.token_guidance).toContain("No token minted");
+    expect(payload.token_guidance).toContain("per-user OAuth");
+    // Never the admin-mint failure copy.
+    expect(payload.token_guidance).not.toContain("No token issued");
+    expect(payload.token_guidance).not.toContain("admin");
+  });
+
+  test("default create leads the human summary with the OAuth connect command", () => {
+    const { exitCode, stdout } = runCli(["create", "connectme"], {
+      PARACHUTE_HOME: home,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(
+      "Connect your AI: claude mcp add --transport http parachute-connectme",
+    );
+    expect(stdout).toContain("no token needed");
+    // Scope-narrow opt-in pointer, never admin.
+    expect(stdout).toContain("parachute auth mint-token --scope vault:connectme:read");
+    expect(stdout).not.toContain("vault:connectme:admin");
+  });
+
+  test("--scope admin is rejected from the create flow (admin never mintable here)", () => {
+    const { exitCode, stdout, stderr } = runCli(
+      ["create", "noadmin", "--mint", "--scope", "admin", "--json"],
+      { PARACHUTE_HOME: home },
+    );
+    expect(exitCode).not.toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toContain('--scope must be "read" or "write"');
+    // The vault must not have been created (rejected before createVault).
+    expect(existsSync(join(home, "vault", "data", "noadmin", "vault.db"))).toBe(false);
+  });
+
+  test("--mint and --token are mutually exclusive", () => {
+    const { exitCode, stderr } = runCli(
+      ["create", "conflict", "--mint", "--token", "abc.def.ghi", "--json"],
+      { PARACHUTE_HOME: home },
+    );
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("mutually exclusive");
+  });
+
+  test("--token <bearer> paste path surfaces the supplied bearer (no mint attempted)", () => {
+    const { exitCode, stdout } = runCli(
+      ["create", "pasted", "--token", "header.auth.bearer", "--json"],
+      { PARACHUTE_HOME: home },
+    );
+    expect(exitCode).toBe(0);
+    const payload = JSON.parse(stdout.trim());
+    // The pasted bearer is surfaced verbatim — vault never minted one.
+    expect(payload.token).toBe("header.auth.bearer");
+    expect(payload.token_guidance).toContain("--token");
+    // No admin scope, no mint-failure copy.
+    expect(payload.token_guidance).not.toContain("No token issued");
+  });
+
+  test("--mint (no hub reachable) opts in but mints scope-narrow read, never admin", () => {
+    // In this sandbox there's no hub/operator.token, so the mint can't complete
+    // — but the request is scope-narrow read by default and must NEVER ask for
+    // admin. We assert the create still succeeds and the guidance points at the
+    // mint-token recovery (the scope requested is read, per mintBootstrapCredential).
+    const { exitCode, stdout } = runCli(
+      ["create", "wantmint", "--mint", "--json"],
+      { PARACHUTE_HOME: home },
+    );
+    expect(exitCode).toBe(0);
+    const payload = JSON.parse(stdout.trim());
+    // No hub here → no token, but the guidance is the standalone mint path, not
+    // an admin grant.
+    expect(payload.token).toBe("");
+    expect(payload.token_guidance).not.toContain("admin");
   });
 });
 
@@ -229,10 +320,14 @@ describe("vault create (human mode)", () => {
     );
     expect(exitCode).toBe(0);
     expect(stdout).toContain('Vault "human" created.');
-    // vault#282 Stage 2: with no hub reachable in this sandbox, no token is
-    // issued — the human output prints the guidance instead of "API token:".
-    expect(stdout).toContain("No token issued");
-    expect(stdout).toContain("Install the hub");
+    // vault#442: default auth is per-user OAuth — NO token is minted, even when
+    // a hub would have been reachable. The human output leads with the OAuth
+    // connect command and never prints an "API token:" line.
+    expect(stdout).toContain("No token minted");
+    expect(stdout).toContain("Connect your AI: claude mcp add --transport http parachute-human");
+    expect(stdout).not.toContain("API token:");
+    // The old admin auto-mint failure copy must NOT fire on a default create.
+    expect(stdout).not.toContain("No token issued");
     // Human output should NOT be valid JSON.
     expect(() => JSON.parse(stdout.trim())).toThrow();
   });

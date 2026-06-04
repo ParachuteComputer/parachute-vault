@@ -13,6 +13,13 @@ export type InitSummaryInput = {
   port: number;
   mcpUrl: string;
   /**
+   * The default vault's name — used to emit the three-segment
+   * `vault:<vaultName>:read` scope in the OAuth-first mint-token suggestion
+   * (the hub mint-token model requires the named-resource form;
+   * a bare `vault:read` would mint a malformed scope). vault#442/#443.
+   */
+  vaultName: string;
+  /**
    * Guidance from the bootstrap-credential step when no token could be issued
    * (standalone install, no hub reachable — vault#282 Stage 2). Surfaced when
    * the operator wanted a token (`addMcp || addToken`) but `apiKey` is
@@ -23,44 +30,54 @@ export type InitSummaryInput = {
 
 /**
  * Build the post-install summary lines for `vault init`, branched on the
- * (addMcp, addToken, apiKey) decision matrix. Post-0.5.0 the token is a
- * hub-issued JWT minted via operator.token; when no hub is reachable `apiKey`
- * is undefined even though the operator opted in (`addToken`/`addMcp`):
+ * (addMcp, addToken, apiKey) decision matrix.
  *
- *   addMcp,  addToken,  apiKey → token baked into claude.json + printed
- *   addMcp,  !addToken, apiKey → token baked into claude.json, hint
- *   !addMcp, addToken,  apiKey → token printed prominently
- *   wanted-token-but-no-hub    → guidance: no token issued, recovery paths
- *   !addMcp, !addToken         → warning: vault unreachable; recovery paths
+ * vault#442: the DEFAULT is per-user OAuth — no token is minted, and the
+ * Claude Code MCP entry is written without a baked bearer (browser sign-in on
+ * first connect). A token is minted only on explicit opt-in (`addToken`), and
+ * then scope-narrow. Branches:
+ *
+ *   addMcp,  !apiKey            → OAuth-first: connect, sign in on first use
+ *   addMcp,  addToken,  apiKey  → token baked into claude.json + printed
+ *   addMcp,  !addToken, apiKey  → token baked into claude.json, hint
+ *   !addMcp, addToken,  apiKey  → token printed prominently
+ *   !addMcp, addToken,  !apiKey → opted into a token but no hub reachable
+ *   !addMcp, !addToken          → OAuth-first: add Claude Code later
  */
 export function buildInitSummaryLines(input: InitSummaryInput): string[] {
-  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, noTokenGuidance } = input;
+  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, vaultName, noTokenGuidance } = input;
   const lines: string[] = [];
   lines.push("");
   lines.push("---");
 
-  const wantedToken = addMcp || addToken;
-
-  if (addMcp && addToken && apiKey) {
+  if (addMcp && apiKey && addToken) {
     lines.push("");
     lines.push(`Your API token: ${apiKey}`);
     lines.push(`  - Baked into ~/.claude.json for Claude Code ✓`);
     lines.push(`  - Paste into your other MCP client's config, or use as Authorization: Bearer <token>`);
     lines.push(`  - Won't be shown again — save it now.`);
-  } else if (addMcp && !addToken && apiKey) {
+  } else if (addMcp && apiKey && !addToken) {
     lines.push("");
     lines.push(
       "Token in ~/.claude.json; run `parachute-vault mcp-install` later if you need one for other clients.",
     );
+  } else if (addMcp && !apiKey) {
+    // vault#442 default: OAuth-first. The MCP entry is wired without a bearer —
+    // Claude Code signs in via browser OAuth on first connect. No token needed.
+    lines.push("");
+    lines.push("Connect your AI — no token needed, you'll sign in on first use:");
+    lines.push(`  Claude Code is already wired in (~/.claude.json) — just start a session.`);
+    lines.push(`  Other clients: claude mcp add --transport http parachute-vault ${mcpUrl}`);
+    lines.push(`  Need a header-auth token for a script? parachute auth mint-token --scope vault:${vaultName}:read`);
   } else if (!addMcp && addToken && apiKey) {
     lines.push("");
     lines.push(`Your API token: ${apiKey}`);
     lines.push(`  - Paste into your other MCP client's config, or use as Authorization: Bearer <token>`);
     lines.push(`  - Won't be shown again — save it now.`);
-  } else if (wantedToken && !apiKey) {
-    // Opted into a token but no hub was reachable to mint one (vault#282
-    // Stage 2 — vault no longer mints local pvt_* tokens). Surface why and
-    // the recovery paths.
+  } else if (!addMcp && addToken && !apiKey) {
+    // Explicitly opted into a token but no hub was reachable to mint one
+    // (vault#282 Stage 2 — vault no longer mints local pvt_* tokens). Surface
+    // why and the recovery paths.
     lines.push("");
     lines.push(
       noTokenGuidance ??
@@ -73,12 +90,13 @@ export function buildInitSummaryLines(input: InitSummaryInput): string[] {
       "  or set VAULT_AUTH_TOKEN for an operator-channel bearer.",
     );
   } else if (!addMcp && !addToken) {
+    // OAuth-first, but the operator skipped wiring Claude Code too.
     lines.push("");
     lines.push(
-      "You've skipped both MCP install and token generation — your vault isn't reachable by any client.",
+      "Skipped the Claude Code MCP entry. Add it anytime — it uses per-user OAuth, no token needed:",
     );
     lines.push(
-      "  Add Claude Code later with `parachute-vault mcp-install`, which mints a hub JWT (needs a hub running).",
+      "  parachute-vault mcp-install",
     );
   }
 
