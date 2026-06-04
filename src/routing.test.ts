@@ -44,6 +44,7 @@ const {
 const { clearVaultStoreCache, getVaultStore } = await import("./vault-store.ts");
 const { vaultDbPath } = await import("./config.ts");
 const { resetJwksCache, resetRevocationCache } = await import("./hub-jwt.ts");
+const { invalidateUsageCache } = await import("./usage.ts");
 
 // ---------------------------------------------------------------------------
 // Hub-JWT mint fixture (vault#282 Stage 2 — vault is a pure hub
@@ -135,6 +136,12 @@ function seedTagScopedRow(vaultName: string, scopedTags: string[], label = "test
 
 function reset(): void {
   clearVaultStoreCache();
+  // The usage dir-walk cache is module-level (process-wide) and survives the
+  // testDir wipe; its 60s TTL would otherwise leak a prior test's `journal`
+  // entry into the next test and flip a "first read" to cached:true. Clear
+  // the vault names these tests reuse so each test starts cache-cold.
+  invalidateUsageCache("journal");
+  invalidateUsageCache("other");
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
   mkdirSync(testDir, { recursive: true });
   mkdirSync(join(testDir, "vault", "data"), { recursive: true });
@@ -1978,5 +1985,183 @@ describe("/vault/<name>/.parachute/mirror/run-now — auth + dispatch", () => {
     );
     // 503 short-circuits the method check when no manager is wired.
     expect([405, 503]).toContain(res.status);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /vault/<name>/.parachute/usage — per-vault data-footprint endpoint.
+//
+// READ-scoped (a vault's own user must see their own vault's size; the
+// operator inherits read via broad/admin). Reports counts + byte sizes; the
+// two dir-walks (assets, mirror) are TTL-cached, `?fresh=1` bypasses, and an
+// attachment upload invalidates the cache. These tests exercise the auth
+// gate, the response shape, the cache hit/bypass, and upload-invalidation
+// end-to-end through `route()` against the real (tmp) filesystem.
+// ---------------------------------------------------------------------------
+
+describe("/vault/<name>/.parachute/usage — data-footprint endpoint", () => {
+  const USAGE_PATH = "/vault/journal/.parachute/usage";
+
+  function authedGet(token: string, path = USAGE_PATH): Request {
+    return new Request(`http://localhost:1940${path}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+  }
+
+  /** Upload an attachment through the real storage route (write-scoped). */
+  async function uploadAttachment(token: string, bytes: number): Promise<Response> {
+    const form = new FormData();
+    const file = new File([new Uint8Array(bytes).fill(7)], "photo.png", { type: "image/png" });
+    form.set("file", file);
+    const p = "/vault/journal/api/storage/upload";
+    return route(
+      new Request(`http://localhost:1940${p}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        body: form,
+      }),
+      p,
+    );
+  }
+
+  test("unauthenticated → 401", async () => {
+    createVault("journal");
+    const res = await route(new Request(`http://localhost:1940${USAGE_PATH}`), USAGE_PATH);
+    expect(res.status).toBe(401);
+  });
+
+  test("read-scoped token → 200 with the full shape (owner sees own vault)", async () => {
+    createVault("journal");
+    // Seed two notes so counts + contentBytes are non-trivial.
+    const store = getVaultStore("journal");
+    await store.createNote("hello");
+    await store.createNote("world!");
+
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const res = await route(authedGet(token), USAGE_PATH);
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as {
+      counts: { notes: number; attachments: number; links: number; tags: number };
+      bytes: { content: number; db: number; assets: number; total: number; mirror?: number };
+      computedAt: string;
+      cached: boolean;
+    };
+
+    // counts match getVaultStats
+    const stats = await store.getVaultStats();
+    expect(body.counts.notes).toBe(stats.totalNotes);
+    expect(body.counts.notes).toBe(2);
+    expect(body.counts.attachments).toBe(stats.attachmentCount);
+    expect(body.counts.links).toBe(stats.linkCount);
+    expect(body.counts.tags).toBe(stats.tagCount);
+
+    // bytes shape
+    expect(body.bytes.content).toBe(stats.contentBytes);
+    expect(body.bytes.content).toBe(11); // "hello"(5) + "world!"(6)
+    expect(body.bytes.db).toBeGreaterThan(0); // a real SQLite file exists
+    expect(body.bytes.assets).toBe(0); // no uploads yet
+    // total = db + assets (NOT content, NOT mirror)
+    expect(body.bytes.total).toBe(body.bytes.db + body.bytes.assets);
+    // no mirror configured → omitted
+    expect(body.bytes).not.toHaveProperty("mirror");
+
+    expect(typeof body.computedAt).toBe("string");
+    expect(typeof body.cached).toBe("boolean");
+  });
+
+  test("insufficient scope is impossible at read — but no vault: scope at all → 403", async () => {
+    createVault("journal");
+    // A token carrying only a non-vault scope satisfies neither read nor any
+    // vault verb → 403 insufficient_scope.
+    const token = await mintJwt({ vaultName: "journal", scopes: ["openid"] });
+    const res = await route(authedGet(token), USAGE_PATH);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:read");
+  });
+
+  test("wrong-vault scope is denied (narrowed scope names a different vault)", async () => {
+    createVault("journal");
+    createVault("other");
+    // Token scoped to `other`, used against `journal` → denied.
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:other:read"] });
+    const res = await route(authedGet(token), USAGE_PATH);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+  });
+
+  test("write/admin scope inherits read → 200", async () => {
+    createVault("journal");
+    const token = await createAdminToken("journal");
+    const res = await route(authedGet(token), USAGE_PATH);
+    expect(res.status).toBe(200);
+  });
+
+  test("non-GET method → 405", async () => {
+    createVault("journal");
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const res = await route(
+      new Request(`http://localhost:1940${USAGE_PATH}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      USAGE_PATH,
+    );
+    expect(res.status).toBe(405);
+  });
+
+  test("second read within TTL is served from cache (cached:true)", async () => {
+    createVault("journal");
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+
+    const first = (await (await route(authedGet(token), USAGE_PATH)).json()) as { cached: boolean };
+    expect(first.cached).toBe(false);
+
+    const second = (await (await route(authedGet(token), USAGE_PATH)).json()) as { cached: boolean };
+    expect(second.cached).toBe(true);
+  });
+
+  test("?fresh=1 bypasses the cache (cached:false even on a warm cache)", async () => {
+    createVault("journal");
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+
+    // Prime the cache.
+    await route(authedGet(token), USAGE_PATH);
+
+    // ?fresh=1 must recompute regardless. The server passes `url.pathname`
+    // (query stripped) as the `path` arg while the Request URL retains the
+    // query — the route reads `fresh` from `req.url`, not `path`. Mirror that.
+    const reqWithQuery = new Request(`http://localhost:1940${USAGE_PATH}?fresh=1`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const res = await route(reqWithQuery, USAGE_PATH);
+    const body = (await res.json()) as { cached: boolean };
+    expect(body.cached).toBe(false);
+  });
+
+  test("attachment upload invalidates the cache → assets bytes update", async () => {
+    createVault("journal");
+    const writeToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:write"] });
+
+    // Prime: assets empty.
+    const before = (await (await route(authedGet(writeToken), USAGE_PATH)).json()) as {
+      bytes: { assets: number };
+    };
+    expect(before.bytes.assets).toBe(0);
+
+    // Upload a 4096-byte attachment (write-scoped) — this invalidates usage.
+    const up = await uploadAttachment(writeToken, 4096);
+    expect(up.status).toBe(201);
+
+    // Next read must re-walk (cache was invalidated) and reflect the new file.
+    const after = (await (await route(authedGet(writeToken), USAGE_PATH)).json()) as {
+      bytes: { assets: number };
+      cached: boolean;
+    };
+    expect(after.cached).toBe(false); // invalidated → recomputed
+    expect(after.bytes.assets).toBeGreaterThanOrEqual(4096);
   });
 });

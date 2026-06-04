@@ -44,8 +44,16 @@ import {
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { vaultDir } from "./config.ts";
+import { assetsDir } from "./config.ts";
 import { shouldAutoTranscribe } from "./auto-transcribe.ts";
+// usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
+// of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
+import { invalidateUsageCache } from "./usage.ts";
+
+// Re-export `assetsDir` (now defined in config.ts) so the existing callers
+// that import it from this module — mirror-deps, mirror-routes, server,
+// triggers, cli — keep working unchanged.
+export { assetsDir };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2367,11 +2375,12 @@ async function handleRetryLegacyInBody(
 
 // ---------------------------------------------------------------------------
 // Storage (file upload/serve) — kept as-is, Daily needs it
+//
+// `assetsDir` moved to config.ts (next to the other path helpers) to break the
+// usage.ts↔routes.ts import cycle; it's re-exported from this module's top so
+// existing importers are unaffected.
 // ---------------------------------------------------------------------------
 
-export function assetsDir(vault: string): string {
-  return process.env.ASSETS_DIR ?? join(vaultDir(vault), "assets");
-}
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
 // Storage allowlist policy:
@@ -2436,6 +2445,13 @@ export async function handleStorage(
 
     const relativePath = `${date}/${filename}`;
     const mimeType = MIME_TYPES[ext] ?? "application/octet-stream";
+
+    // Invalidate the usage dir-walk cache for this vault — the new attachment
+    // changed the assets-directory footprint, so the next /.parachute/usage
+    // read must re-walk rather than report a stale (smaller) number. Without
+    // this hook the cache's 60s TTL would briefly under-report after an
+    // upload. (usage.ts:invalidateUsageCache is a no-op-cheap map delete.)
+    invalidateUsageCache(vault);
 
     return json({ path: relativePath, size: buffer.length, mimeType }, 201);
   }

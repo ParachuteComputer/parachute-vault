@@ -972,6 +972,33 @@ describe("vault stats", async () => {
     expect(stats.topTags).toEqual([]);
     expect(stats.tagCount).toBe(0);
     expect(stats.linkCount).toBe(0);
+    expect(stats.contentBytes).toBe(0);
+  });
+
+  it("contentBytes sums ASCII content as raw byte length", async () => {
+    // "hello" = 5 bytes, "world!" = 6 bytes — for pure ASCII, bytes == chars.
+    await store.createNote("hello");
+    await store.createNote("world!");
+    const stats = await store.getVaultStats();
+    expect(stats.contentBytes).toBe(11);
+  });
+
+  it("contentBytes counts UTF-8 BYTES, not characters (multibyte)", async () => {
+    // The whole point of CAST(content AS BLOB): SQLite's bare LENGTH() would
+    // return the CHARACTER count, undercounting multibyte content.
+    //   - "é"  is U+00E9 → 2 bytes in UTF-8 (1 char)
+    //   - "你好" is 2 CJK chars → 6 bytes (3 bytes each)
+    //   - "😀" is 1 grapheme / 2 UTF-16 code units → 4 bytes in UTF-8
+    const content = "é你好😀";
+    const expectedBytes = Buffer.byteLength(content, "utf8"); // 2 + 6 + 4 = 12
+    expect(expectedBytes).toBe(12);
+    // And it's strictly MORE than the JS character count — proves we're not
+    // accidentally counting chars.
+    expect(expectedBytes).toBeGreaterThan([...content].length);
+
+    await store.createNote(content);
+    const stats = await store.getVaultStats();
+    expect(stats.contentBytes).toBe(expectedBytes);
   });
 
   it("counts total notes and tagCount", async () => {
@@ -1041,6 +1068,7 @@ describe("vault stats", async () => {
     expect(stats).toHaveProperty("topTags");
     expect(stats).toHaveProperty("tagCount");
     expect(stats).toHaveProperty("linkCount");
+    expect(stats).toHaveProperty("contentBytes");
   });
 
   it("counts resolved wikilinks in linkCount", async () => {

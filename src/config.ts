@@ -115,6 +115,17 @@ export function vaultConfigPath(name: string): string {
   return join(vaultDir(name), "vault.yaml");
 }
 
+/**
+ * Per-vault attachments directory: `<vaultDir>/assets`, or the `ASSETS_DIR`
+ * env override when set (single-assets-root deployments). Lives here next to
+ * the other path helpers — neutral ground that both `routes.ts` (upload/serve)
+ * and `usage.ts` (footprint dir-walk) import without a cycle. `routes.ts`
+ * re-exports it for the existing callers (mirror-deps, server, triggers, …).
+ */
+export function assetsDir(name: string): string {
+  return process.env.ASSETS_DIR ?? join(vaultDir(name), "assets");
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
