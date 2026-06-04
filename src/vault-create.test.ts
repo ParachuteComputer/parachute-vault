@@ -107,7 +107,20 @@ describe("vault create --json", () => {
     );
     expect(exitCode).not.toBe(0);
     expect(stdout).toBe("");
-    expect(stderr).toContain("letters, numbers");
+    expect(stderr).toContain("lowercase alphanumeric");
+  });
+
+  test("UPPERCASE vault name is rejected (security review — audience case-drift)", () => {
+    // An uppercase name would flip the JWT audience case (vault.<Name> vs
+    // vault.<name>) and drift from hub/init lowercasing. cmdCreate must
+    // reject it the same way `init` does.
+    const { exitCode, stdout, stderr } = runCli(
+      ["create", "MyVault", "--json"],
+      { PARACHUTE_HOME: home },
+    );
+    expect(exitCode).not.toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("lowercase");
   });
 
   test("duplicate name in --json mode errors on stderr and exits non-zero", () => {

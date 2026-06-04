@@ -100,12 +100,30 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Options for {@link generateMcpTools}.
+ *
+ * `expandVisibility` (vault security review) is an OPTIONAL per-note
+ * visibility predicate threaded into the wikilink-expansion context for
+ * `query-notes`. When provided, `expand_links` inlining leaves any wikilink
+ * whose target fails the predicate UNRESOLVED — so a tag-scoped MCP session
+ * can't inline out-of-scope note content during expansion (the filtering
+ * happens DURING expansion, not after). Core stays scope-unaware: it
+ * receives a plain `(note) => boolean` closure and never imports the
+ * server's tag-scope module. Omitted (every internal / unscoped caller) →
+ * expansion behaves exactly as before.
+ */
+export interface GenerateMcpToolsOpts {
+  expandVisibility?: (note: Note) => boolean;
+}
+
+/**
  * Generate the consolidated MCP tools for a vault. Surface (10):
  * query-notes, create-note, update-note, delete-note, list-tags, update-tag,
  * delete-tag, find-path, vault-info, prune-schema (admin).
  */
-export function generateMcpTools(store: Store): McpToolDef[] {
+export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): McpToolDef[] {
   const db: Database = (store as any).db;
+  const expandVisibility = opts?.expandVisibility;
 
   return [
 
@@ -246,7 +264,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           ),
         );
         const expandCtx: ExpandContext | null = expandLinks
-          ? { db, mode: expandMode, expanded: new Set() }
+          ? {
+              db,
+              mode: expandMode,
+              expanded: new Set(),
+              // Tag-scope confidentiality (security review): when a visibility
+              // predicate was injected, wikilinks to out-of-scope notes are
+              // left unresolved DURING inlining — never embedded. Unscoped
+              // callers pass no predicate and inlining is unchanged.
+              ...(expandVisibility ? { isVisible: expandVisibility } : {}),
+            }
           : null;
 
         // --- Single note by ID/path ---
@@ -277,6 +304,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         }
 
         // --- Build near-scope (graph-filtered set of allowed IDs) ---
+        //
+        // Tag-scope policy for `near[]` (output-filter, not hop-guard): core
+        // is scope-unaware, so this BFS walks the FULL graph from the anchor —
+        // including out-of-scope intermediate hops. For a tag-scoped session
+        // the server's `applyTagScopeWrappers` (mcp-tools.ts) tag-filters the
+        // RESULT list AFTER execute, so out-of-scope notes never survive into
+        // the response — no content/ids leak. This is ASYMMETRIC with
+        // `find-path`, which guards every hop (it returns the path itself, so
+        // an out-of-scope intermediary would be a leak there). The asymmetry is
+        // deliberate; tracked at vault#439.
         let nearScope: Set<string> | null = null;
         if (params.near) {
           const near = params.near as { note_id: string; depth?: number; relationship?: string };

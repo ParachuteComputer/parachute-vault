@@ -19,7 +19,7 @@
  * `rootOf` walk is needed at the boundary.
  */
 
-import type { Store, Note } from "../core/src/types.ts";
+import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
 
 /**
  * Build the effective tag-allowlist for a token: union of `{root} ∪
@@ -98,6 +98,73 @@ export function tagsWithinScope(
     if (root && rawRoots.includes(root)) return true;
   }
   return false;
+}
+
+/**
+ * Build a per-note visibility predicate for wikilink expansion
+ * (`ExpandContext.isVisible` in core/src/expand.ts). When the token is
+ * unscoped (`rawRoots === null`) this returns `undefined` so the expander
+ * keeps its original scope-unaware behavior (no predicate installed). When
+ * scoped, it returns a closure over the SAME `noteWithinTagScope` allowlist
+ * logic every other read path uses — so a wikilink whose target is outside
+ * the token's tag scope is left unresolved during inlining, never embedded.
+ *
+ * This is the seam that keeps core scope-unaware: the predicate is built
+ * server-side from the tag-scope machinery and injected into the context;
+ * core only calls it.
+ */
+export function buildExpandVisibility(
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): ((note: Note) => boolean) | undefined {
+  if (rawRoots === null) return undefined;
+  return (note: Note) => noteWithinTagScope(note, allowed, rawRoots);
+}
+
+/**
+ * Treat a hydrated link's endpoint summary as a scope-checkable note. The
+ * summary carries `id` + `tags`, which is all `noteWithinTagScope` needs.
+ * A summary with no tags is out of scope under a tag-scoped token (same as
+ * a real note with no tags).
+ */
+function summaryWithinTagScope(
+  summary: NoteSummary | undefined,
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): boolean {
+  if (!summary) return true; // no summary → no out-of-scope info to leak (dangling/deleted)
+  return noteWithinTagScope({ id: summary.id, tags: summary.tags ?? [] } as Note, allowed, rawRoots);
+}
+
+/**
+ * Filter hydrated links for a tag-scoped token so no out-of-scope NEIGHBOR
+ * metadata leaks (security review — MINOR). A `query-notes`/REST response
+ * with `include_links=true` returns `sourceNote`/`targetNote` summaries
+ * ({id, path, tags, metadata, …}) for every link touching the returned
+ * note — INCLUDING links to notes the token can't otherwise see. Those
+ * summaries leak the out-of-scope neighbor's id, path, and tags.
+ *
+ * Policy: drop any link whose source OR target endpoint summary is outside
+ * the token's tag scope. The queried note itself is always in-scope (it had
+ * to be visible to be returned), so dropping out-of-scope-neighbor links
+ * removes exactly the leak while keeping every link between in-scope notes
+ * fully hydrated. Dropping the whole row (vs. just nulling the summary) is
+ * required because the raw row still carries the neighbor's note id.
+ *
+ * No-op when the token is unscoped (`rawRoots === null`) — identical to the
+ * pre-fix behavior.
+ */
+export function filterHydratedLinksByTagScope(
+  links: HydratedLink[],
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): HydratedLink[] {
+  if (rawRoots === null) return links;
+  return links.filter(
+    (link) =>
+      summaryWithinTagScope(link.sourceNote, allowed, rawRoots) &&
+      summaryWithinTagScope(link.targetNote, allowed, rawRoots),
+  );
 }
 
 /**

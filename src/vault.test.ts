@@ -11,7 +11,9 @@ import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
 import { buildVaultProjection } from "../core/src/vault-projection.ts";
-import { handleNotes, handleTags, handleFindPath, handleVault } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks } from "./routes.ts";
+import { expandTokenTagScope } from "./tag-scope.ts";
+import type { TagScopeCtx } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
 import { startTranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
@@ -1464,6 +1466,143 @@ describe("scoped MCP wrapper", async () => {
     expect(after.metadata.name).toBe("");
 
     close();
+  });
+
+  // -- tag-scope confidentiality: expand_links + include_links (security
+  //    review) -----------------------------------------------------------
+  //
+  // These pin the MCP side of the expand_links / include_links leaks. A
+  // tag-scoped session must NOT inline out-of-scope note content via
+  // expand_links, and must NOT hydrate out-of-scope neighbor summaries via
+  // include_links. The unscoped path must remain fully functional. They
+  // MUST fail if the predicate / link-scrub is removed.
+
+  test("MCP expand_links does NOT inline out-of-scope wikilinked content", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-expand-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    // Out-of-scope #personal note holds the secret; in-scope #work note links it.
+    await store.createNote("SECRET PERSONAL BODY", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("intro [[Secret]]", { path: "Work", tags: ["work"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: work.id,
+      include_content: true,
+      expand_links: true,
+    }) as any;
+
+    expect(result.content).not.toContain("SECRET PERSONAL BODY");
+    // Wikilink stays literal — indistinguishable from not-found.
+    expect(result.content).toContain("[[Secret]]");
+
+    closeAllStores();
+  });
+
+  test("MCP expand_links multi-hop (depth>1) does not leak out-of-scope content", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-expand-deep-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("DEEP PERSONAL SECRET", { path: "Deep", tags: ["personal"] });
+    await store.createNote("mid [[Deep]]", { path: "Mid", tags: ["work"] });
+    const top = await store.createNote("top [[Mid]]", { path: "Top", tags: ["work"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: top.id,
+      include_content: true,
+      expand_links: true,
+      expand_depth: 3,
+    }) as any;
+
+    // In-scope Mid inlines; out-of-scope Deep never does, at any depth.
+    expect(result.content).toContain("mid");
+    expect(result.content).not.toContain("DEEP PERSONAL SECRET");
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED MCP expand_links still inlines wikilinked content (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-expand-unscoped-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("PERSONAL BODY", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("intro [[Secret]]", { path: "Work", tags: ["work"] });
+
+    // No auth → unscoped session. Expansion must behave exactly as before.
+    const tools = generateScopedMcpTools(vaultName);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({
+      id: work.id,
+      include_content: true,
+      expand_links: true,
+    }) as any;
+
+    expect(result.content).toContain("PERSONAL BODY");
+
+    closeAllStores();
+  });
+
+  test("MCP include_links strips out-of-scope NEIGHBOR summaries", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-incl-links-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const secret = await store.createNote("secret", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("work", { path: "Work", tags: ["work"] });
+    await store.createLink(work.id, secret.id, "references");
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: work.id, include_links: true }) as any;
+
+    const links = (result.links ?? []) as any[];
+    // No surviving link may reference the out-of-scope note's id/path.
+    const serialized = JSON.stringify(links);
+    expect(serialized).not.toContain(secret.id);
+    expect(serialized).not.toContain("Secret");
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED MCP include_links still hydrates the full neighbor (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-incl-links-unscoped-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const secret = await store.createNote("secret", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("work", { path: "Work", tags: ["work"] });
+    await store.createLink(work.id, secret.id, "references");
+
+    const tools = generateScopedMcpTools(vaultName);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: work.id, include_links: true }) as any;
+
+    const links = (result.links ?? []) as any[];
+    expect(links.length).toBe(1);
+    expect(JSON.stringify(links)).toContain(secret.id);
+
+    closeAllStores();
   });
 });
 
@@ -3387,6 +3526,139 @@ describe("HTTP /notes", async () => {
       delete process.env.ASSETS_DIR;
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// REST tag-scope confidentiality (security review). expand_links must not
+// inline out-of-scope wikilinked content; include_links must not hydrate
+// out-of-scope neighbor summaries; unresolved-wikilinks must not surface
+// out-of-scope source rows. Unscoped path stays fully functional. Each
+// security assertion MUST fail without the fix.
+// ---------------------------------------------------------------------------
+describe("HTTP tag-scope confidentiality (security review)", async () => {
+  // Build a TagScopeCtx the same way routing.ts does, so handlers see the
+  // exact shape a real tag-scoped request produces.
+  async function scopeCtx(roots: string[]): Promise<TagScopeCtx> {
+    return { allowed: await expandTokenTagScope(store, roots), raw: roots };
+  }
+  const NO_SCOPE: TagScopeCtx = { allowed: null, raw: null };
+
+  test("expand_links does NOT inline out-of-scope wikilinked content", async () => {
+    await store.createNote("SECRET PERSONAL BODY", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("intro [[Secret]]", { path: "Work", tags: ["work"] });
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${work.id}&include_content=true&expand_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    expect(body.content).not.toContain("SECRET PERSONAL BODY");
+    expect(body.content).toContain("[[Secret]]"); // literal — like not-found
+  });
+
+  test("UNSCOPED expand_links still inlines content (regression)", async () => {
+    await store.createNote("PERSONAL BODY", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("intro [[Secret]]", { path: "Work", tags: ["work"] });
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${work.id}&include_content=true&expand_links=true`),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    const body = await res.json() as any;
+    expect(body.content).toContain("PERSONAL BODY");
+  });
+
+  test("expand_links multi-hop (depth>1) does not leak out-of-scope content", async () => {
+    await store.createNote("DEEP PERSONAL SECRET", { path: "Deep", tags: ["personal"] });
+    await store.createNote("mid [[Deep]]", { path: "Mid", tags: ["work"] });
+    const top = await store.createNote("top [[Mid]]", { path: "Top", tags: ["work"] });
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${top.id}&include_content=true&expand_links=true&expand_depth=3`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    expect(body.content).toContain("mid");
+    expect(body.content).not.toContain("DEEP PERSONAL SECRET");
+  });
+
+  test("include_links strips out-of-scope NEIGHBOR summaries", async () => {
+    const secret = await store.createNote("secret", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("work", { path: "Work", tags: ["work"] });
+    await store.createLink(work.id, secret.id, "references");
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${work.id}&include_links=true`),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    const serialized = JSON.stringify(body.links ?? []);
+    expect(serialized).not.toContain(secret.id);
+    expect(serialized).not.toContain("Secret");
+  });
+
+  test("UNSCOPED include_links hydrates the full neighbor (regression)", async () => {
+    const secret = await store.createNote("secret", { path: "Secret", tags: ["personal"] });
+    const work = await store.createNote("work", { path: "Work", tags: ["work"] });
+    await store.createLink(work.id, secret.id, "references");
+
+    const res = await handleNotes(
+      mkReq("GET", `/notes?id=${work.id}&include_links=true`),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    const body = await res.json() as any;
+    expect((body.links ?? []).length).toBe(1);
+    expect(JSON.stringify(body.links)).toContain(secret.id);
+  });
+
+  test("unresolved-wikilinks surfaces only in-scope source rows", async () => {
+    // #personal source with a dangling wikilink → out-of-scope row.
+    await store.createNote("p [[NoSuchPersonal]]", { path: "P", tags: ["personal"] });
+    // #work source with a dangling wikilink → in-scope row.
+    await store.createNote("w [[NoSuchWork]]", { path: "W", tags: ["work"] });
+
+    const res = handleUnresolvedWikilinks(
+      mkReq("GET", "/unresolved-wikilinks"),
+      store,
+      await scopeCtx(["work"]),
+    );
+    const body = await res.json() as any;
+    const targets = (body.unresolved as any[]).map((r) => r.target_path);
+    expect(targets).toContain("NoSuchWork");
+    expect(targets).not.toContain("NoSuchPersonal");
+    expect(body.count).toBe(1);
+  });
+
+  test("UNSCOPED unresolved-wikilinks surfaces every row (regression)", async () => {
+    await store.createNote("p [[NoSuchPersonal]]", { path: "P", tags: ["personal"] });
+    await store.createNote("w [[NoSuchWork]]", { path: "W", tags: ["work"] });
+
+    const res = handleUnresolvedWikilinks(
+      mkReq("GET", "/unresolved-wikilinks"),
+      store,
+      NO_SCOPE,
+    );
+    const body = await res.json() as any;
+    const targets = (body.unresolved as any[]).map((r) => r.target_path);
+    expect(targets).toContain("NoSuchWork");
+    expect(targets).toContain("NoSuchPersonal");
+  });
+
 });
 
 describe("HTTP /notes include_link_count + order_by=link_count (vault feedback #4)", async () => {

@@ -13,11 +13,13 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { getNote, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import {
+  buildExpandVisibility,
+  filterHydratedLinksByTagScope,
   filterNotesByTagScope,
   noteWithinTagScope,
   tagScopeForbidden,
@@ -453,10 +455,20 @@ function parseIncludeMetadata(url: URL): boolean | string[] | undefined {
 /**
  * Parse expand_links/expand_depth/expand_mode from query params, returning
  * an (ExpandContext, depth) pair if expansion is requested, else null.
+ *
+ * `tagScope` (security review): when the caller is tag-scoped, an `isVisible`
+ * predicate is built from the SAME tag-scope allowlist the rest of the
+ * handler uses and injected into the expand context. The expander then
+ * leaves any `[[wikilink]]` whose target is out of scope UNRESOLVED — so
+ * `expand_links=true` can never inline out-of-scope note content (and the
+ * out-of-scope case is byte-indistinguishable from a missing target). For
+ * an unscoped token the predicate is `undefined` and expansion behaves
+ * exactly as before.
  */
 function parseExpandParams(
   url: URL,
   db: any,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): { ctx: ExpandContext; depth: number } | null {
   if (!parseBool(parseQuery(url, "expand_links"), false)) return null;
   const modeRaw = parseQuery(url, "expand_mode");
@@ -468,7 +480,8 @@ function parseExpandParams(
       MAX_EXPAND_DEPTH,
     ),
   );
-  return { ctx: { db, mode, expanded: new Set() }, depth };
+  const isVisible = buildExpandVisibility(tagScope.allowed, tagScope.raw);
+  return { ctx: { db, mode, expanded: new Set(), ...(isVisible ? { isVisible } : {}) }, depth };
 }
 
 
@@ -575,14 +588,21 @@ async function handleNotesInner(
         }
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
         let result: any = includeContent ? { ...note } : toNoteIndex(note);
-        const expand = parseExpandParams(url, db);
+        const expand = parseExpandParams(url, db, tagScope);
         if (expand && includeContent && typeof result.content === "string") {
           expand.ctx.expanded.add(note.id);
           result.content = expandContent(result.content, expand.ctx, expand.depth);
         }
         result = filterMetadata(result, parseIncludeMetadata(url));
         if (parseBool(parseQuery(url, "include_links"), false)) {
-          result.links = linkOps.getLinksHydrated(db, note.id);
+          // Tag-scope: drop links whose neighbor is out of scope so the
+          // hydrated sourceNote/targetNote summaries can't leak out-of-scope
+          // ids/paths/tags. No-op for unscoped tokens.
+          result.links = filterHydratedLinksByTagScope(
+            linkOps.getLinksHydrated(db, note.id),
+            tagScope.allowed,
+            tagScope.raw,
+          );
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
@@ -622,7 +642,7 @@ async function handleNotesInner(
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
         const inclMeta = parseIncludeMetadata(url);
         let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
-        const expand = parseExpandParams(url, db);
+        const expand = parseExpandParams(url, db, tagScope);
         if (expand && includeContent) {
           for (const n of output) expand.ctx.expanded.add(n.id);
           for (const n of output) {
@@ -797,6 +817,15 @@ async function handleNotesInner(
         }
         const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
         const relationship = parseQuery(url, "near[relationship]") ?? undefined;
+        // Tag-scope policy for `near[]` (output-filter, not hop-guard): the
+        // BFS walks the FULL graph from the anchor, including out-of-scope
+        // intermediate hops, then the RESULT set is tag-scope-filtered below
+        // (`filterNotesByTagScope`). No out-of-scope content or ids leak —
+        // out-of-scope notes never survive into the response. This is
+        // ASYMMETRIC with `find-path`, which guards every hop (it returns the
+        // path itself, so an out-of-scope intermediary would be a leak there).
+        // The asymmetry is deliberate; tracked at vault#439 should we ever want
+        // `near[]` to also constrain traversal hops.
         const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship });
         const nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
         results = results.filter((n) => nearScope.has(n.id));
@@ -813,7 +842,7 @@ async function handleNotesInner(
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
       let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
-      const expand = parseExpandParams(url, db);
+      const expand = parseExpandParams(url, db, tagScope);
       if (expand && includeContent) {
         for (const n of output) expand.ctx.expanded.add(n.id);
         for (const n of output) {
@@ -866,7 +895,14 @@ async function handleNotesInner(
         const enrichedOut: any[] = [];
         for (const n of output) {
           const enriched: any = { ...n };
-          if (includeLinks) enriched.links = linkOps.getLinksHydrated(db, n.id);
+          if (includeLinks) {
+            // Tag-scope: strip out-of-scope-neighbor links (no-op unscoped).
+            enriched.links = filterHydratedLinksByTagScope(
+              linkOps.getLinksHydrated(db, n.id),
+              tagScope.allowed,
+              tagScope.raw,
+            );
+          }
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
@@ -1123,14 +1159,19 @@ async function handleNotesInner(
     }
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
-    const expand = parseExpandParams(url, db);
+    const expand = parseExpandParams(url, db, tagScope);
     if (expand && includeContent && typeof result.content === "string") {
       expand.ctx.expanded.add(note.id);
       result.content = expandContent(result.content, expand.ctx, expand.depth);
     }
     result = filterMetadata(result, parseIncludeMetadata(url));
     if (parseBool(parseQuery(url, "include_links"), false)) {
-      result.links = linkOps.getLinksHydrated(db, note.id);
+      // Tag-scope: drop out-of-scope-neighbor links (no-op unscoped).
+      result.links = filterHydratedLinksByTagScope(
+        linkOps.getLinksHydrated(db, note.id),
+        tagScope.allowed,
+        tagScope.raw,
+      );
     }
     if (parseBool(parseQuery(url, "include_attachments"), false)) {
       result.attachments = await store.getAttachments(note.id);
@@ -1414,7 +1455,14 @@ async function handleNotesInner(
       const linkMutated = body.links?.add !== undefined || body.links?.remove !== undefined;
       const includeLinksResp = linkMutated || parseBool(parseQuery(url, "include_links"), false);
       if (includeLinksResp) {
-        validated.links = linkOps.getLinksHydrated(db, updatedNote.id);
+        // Tag-scope: strip out-of-scope-neighbor links from the echoed set
+        // (no-op unscoped). A write token tag-scoped to #work mustn't learn
+        // about a #personal note it happened to link to.
+        validated.links = filterHydratedLinksByTagScope(
+          linkOps.getLinksHydrated(db, updatedNote.id),
+          tagScope.allowed,
+          tagScope.raw,
+        );
       }
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
@@ -1893,12 +1941,32 @@ export async function handleVault(
 // Unresolved wikilinks — REST-only (admin/maintenance)
 // ---------------------------------------------------------------------------
 
-export function handleUnresolvedWikilinks(req: Request, store: Store): Response {
+export function handleUnresolvedWikilinks(
+  req: Request,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Response {
   const url = new URL(req.url);
   const limitStr = url.searchParams.get("limit");
   const limit = limitStr ? parseInt(limitStr, 10) : 50;
   const db = (store as any).db;
-  return Response.json(listUnresolvedWikilinks(db, limit));
+  const result = listUnresolvedWikilinks(db, limit);
+
+  // Unscoped token → return as-is (unchanged behavior).
+  if (tagScope.raw === null) return Response.json(result);
+
+  // Tag-scope confidentiality (security review): each unresolved row carries
+  // a `source_id` (+ `source_path`) plus the raw `target_path` wikilink
+  // string. For a tag-scoped token, surface ONLY rows whose SOURCE note is
+  // within the token's tag scope — otherwise we'd leak out-of-scope note IDs
+  // and the wikilink target strings those notes contain. Filter the page and
+  // recompute `count` from the filtered set so the aggregate total of
+  // out-of-scope rows doesn't leak either.
+  const filtered = result.unresolved.filter((row) => {
+    const note = getNote(db, row.source_id);
+    return note !== null && noteWithinTagScope(note, tagScope.allowed, tagScope.raw);
+  });
+  return Response.json({ unresolved: filtered, count: filtered.length });
 }
 
 // ---------------------------------------------------------------------------

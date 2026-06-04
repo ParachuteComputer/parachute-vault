@@ -26,7 +26,8 @@ import {
   hashKey,
 } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
-import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
+import { authenticateVaultRequest, authenticateGlobalRequest, warnLegacyGlobalApiKeys } from "./auth.ts";
+import type { StoredKey } from "./config.ts";
 
 let tmpHome: string;
 let prevHome: string | undefined;
@@ -440,5 +441,40 @@ describe("auth — VAULT_AUTH_TOKEN server-wide operator bearer", () => {
 
     const result = await authenticateVaultRequest(bearer(nearMiss), journalConfig);
     expect("error" in result).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Legacy GLOBAL api_keys boot warning (security review — multi-user
+// hardening). Cross-vault credentials in config.yaml must be surfaced loudly
+// at boot, but never altered. Pure-function unit tests (no server boot).
+// ---------------------------------------------------------------------------
+describe("warnLegacyGlobalApiKeys (legacy cross-vault key boot warning)", () => {
+  function key(id: string): StoredKey {
+    return {
+      id,
+      label: id,
+      key_hash: `sha256:${id}`,
+      scope: "full",
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  test("warns when global api_keys are present", () => {
+    const msgs: string[] = [];
+    const count = warnLegacyGlobalApiKeys([key("a"), key("b")], (m) => msgs.push(m));
+    expect(count).toBe(2);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toContain("legacy GLOBAL api_key");
+    expect(msgs[0]).toContain("CROSS-VAULT");
+    // Heads-up only — must signal it does NOT alter the keys.
+    expect(msgs[0]).toContain("remain active");
+  });
+
+  test("silent when there are no global api_keys", () => {
+    const msgs: string[] = [];
+    expect(warnLegacyGlobalApiKeys([], (m) => msgs.push(m))).toBe(0);
+    expect(warnLegacyGlobalApiKeys(undefined, (m) => msgs.push(m))).toBe(0);
+    expect(msgs).toHaveLength(0);
   });
 });
