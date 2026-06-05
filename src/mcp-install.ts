@@ -271,6 +271,8 @@ export async function detectHubPresence(opts: {
   //    signal — no need to probe. We pass `hubPort` purely as the loopback
   //    fallback arg; its only role here is the source discriminator.
   const configured = chooseHubOrigin(hubPort, env);
+  // A stale expose-state can false-positive here — acceptable: this only
+  // selects guidance copy, never gates behavior.
   if (configured.source !== "loopback") return true;
 
   // 2. Live health probe against the hub's fixed loopback port.
