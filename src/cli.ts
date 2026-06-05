@@ -440,6 +440,12 @@ async function cmdInit(args: string[] = []) {
   // It targets the hub's fixed loopback port (1939 / $PARACHUTE_HUB_PORT) and
   // never throws (see detectHubPresence). We skip it when a flag/persisted
   // value already decides, to avoid an 800ms wait on a flagged run.
+  //
+  // False-positive risk: a stale expose-state / leftover PARACHUTE_HUB_ORIGIN
+  // makes detectHubPresence return true on a genuinely hubless box, so init
+  // silently skips registering a daemon. Narrow + accepted — recover with
+  // `parachute-vault init --autostart`. The pre-decided guard below means any
+  // explicit flag or persisted value never even reaches the probe.
   const autostartPreDecided =
     flagAutostartOff || flagAutostartOn || typeof globalConfig.autostart === "boolean";
   const hubPresentForAutostart = autostartPreDecided ? false : await detectHubPresence();
@@ -3702,6 +3708,10 @@ Setup:
                                            standalone, but skip when a hub is detected (the hub
                                            supervisor owns vault's lifecycle). An explicit flag
                                            persists in config.yaml as 'autostart: true|false'.
+                                           Upgrade note: a box with a persisted 'autostart: true'
+                                           (from an earlier explicit --autostart) keeps registering
+                                           even under a hub — run init --no-autostart once to clear
+                                           it and let the hub manage vault.
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,

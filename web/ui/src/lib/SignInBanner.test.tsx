@@ -75,6 +75,12 @@ describe("SignInBanner — recovery poll", () => {
     expect(auth.ensureToken).toHaveBeenCalledWith("default");
   });
 
+  it("404: still polls — sign-in can recover a not-yet-reachable vault", async () => {
+    render(<SignInBanner vaultName="ghost" status={404} onRecovered={() => {}} />);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(auth.ensureToken).toHaveBeenCalledWith("ghost");
+  });
+
   it("403: never polls — it can't recover for a non-admin (vault#451)", async () => {
     render(<SignInBanner vaultName="default" status={403} onRecovered={() => {}} />);
     await vi.advanceTimersByTimeAsync(15000);
