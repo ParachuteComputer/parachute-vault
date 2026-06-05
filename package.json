@@ -22,7 +22,6 @@
     "test:core": "cd core && node --experimental-vm-modules node_modules/vitest/dist/cli.js run",
     "typecheck": "tsc --noEmit",
     "build:spa": "cd web/ui && bun install --frozen-lockfile && bun run build",
-    "postinstall": "if [ -d web/ui ]; then bun run build:spa; fi",
     "prepack": "bun run build:spa"
   },
   "dependencies": {
