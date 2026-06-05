@@ -123,6 +123,23 @@ function renderRoute() {
   );
 }
 
+/**
+ * The page now leads with a plain-language backup status banner + the
+ * "Back up to GitHub" upgrade. The preset soup, raw config fields, the
+ * Status card (run-now / push-now), and import-from-git all live behind
+ * a single page-level "Advanced settings" disclosure — a normal owner
+ * never opens it. Tests that exercise those operator surfaces open it
+ * first via this helper.
+ */
+async function openAdvanced(user: ReturnType<typeof userEvent.setup>) {
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: /Advanced settings/i }),
+    ).toBeInTheDocument(),
+  );
+  await user.click(screen.getByRole("button", { name: /Advanced settings/i }));
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -152,6 +169,8 @@ describe("VaultMirror — admin scope", () => {
 
     renderRoute();
     expect(screen.getByText(/loading/i)).toBeInTheDocument();
+    const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Status/i })).toBeInTheDocument(),
@@ -172,6 +191,8 @@ describe("VaultMirror — admin scope", () => {
       }),
     );
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByText(/external path went missing/i)).toBeInTheDocument(),
     );
@@ -181,6 +202,7 @@ describe("VaultMirror — admin scope", () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -209,6 +231,7 @@ describe("VaultMirror — admin scope", () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -228,6 +251,8 @@ describe("VaultMirror — admin scope", () => {
   it("sync_mode events shows the safety-net hint", async () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture({ enabled: true, sync_mode: "events" }));
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -238,17 +263,18 @@ describe("VaultMirror — admin scope", () => {
     expect(screen.getByText(/safety check runs hourly/i)).toBeInTheDocument();
   });
 
-  it("clicking Live Mirror preset switches to external location + reveals path field", async () => {
+  it("clicking External folder mirror preset switches to external location + reveals path field", async () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
     );
 
     await user.click(
-      screen.getByRole("button", { name: /Apply Live Mirror preset/i }),
+      screen.getByRole("button", { name: /Apply External folder mirror preset/i }),
     );
 
     // External-path input now visible
@@ -270,6 +296,7 @@ describe("VaultMirror — admin scope", () => {
     });
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -278,9 +305,9 @@ describe("VaultMirror — admin scope", () => {
     // Default fixture is location=internal + no creds — Push checkbox absent.
     expect(screen.queryByLabelText(/Push after each commit/i)).not.toBeInTheDocument();
 
-    // Flip to external via the Live Mirror preset — the checkbox appears
-    // even with no creds (operator may have wired a remote manually).
-    await user.click(screen.getByRole("button", { name: /Apply Live Mirror preset/i }));
+    // Flip to external via the External folder mirror preset — the checkbox
+    // appears even with no creds (operator may have wired a remote manually).
+    await user.click(screen.getByRole("button", { name: /Apply External folder mirror preset/i }));
     expect(screen.getByLabelText(/Push after each commit/i)).toBeInTheDocument();
   });
 
@@ -300,6 +327,8 @@ describe("VaultMirror — admin scope", () => {
       },
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     // Wait for both the mirror snapshot AND the credential status to
     // resolve — the checkbox visibility depends on `creds.active_method`,
     // which lives in a separate fetch from the mirror snapshot.
@@ -322,6 +351,7 @@ describe("VaultMirror — admin scope", () => {
     vi.mocked(api.getMirror).mockResolvedValue(snapshotFixture());
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -342,6 +372,7 @@ describe("VaultMirror — admin scope", () => {
 
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -374,6 +405,7 @@ describe("VaultMirror — admin scope", () => {
 
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(
@@ -401,6 +433,8 @@ describe("VaultMirror — admin scope", () => {
     );
 
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(
         screen.getByRole("button", { name: /Run export now/i }),
@@ -424,6 +458,8 @@ describe("VaultMirror — admin scope", () => {
       }),
     );
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Status/i })).toBeInTheDocument(),
     );
@@ -440,6 +476,8 @@ describe("VaultMirror — admin scope", () => {
       }),
     );
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByText(/Last push failed/i)).toBeInTheDocument(),
     );
@@ -454,6 +492,8 @@ describe("VaultMirror — admin scope", () => {
       }),
     );
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByText(/3 commits ready to push/i)).toBeInTheDocument(),
     );
@@ -491,6 +531,8 @@ describe("VaultMirror — admin scope", () => {
       push: { fired: true, pushed: true, sha: "feedface1234567890abc" },
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     // The "Push now" button renders once `getMirror` resolves, but its
     // ENABLED state depends on `getMirrorAuth` (active_method: "pat")
     // resolving too. Wait for not-disabled rather than asserting it
@@ -500,7 +542,6 @@ describe("VaultMirror — admin scope", () => {
       expect(screen.getByRole("button", { name: /Push now/i })).not.toBeDisabled(),
     );
     const pushBtn = screen.getByRole("button", { name: /Push now/i });
-    const user = userEvent.setup();
     await user.click(pushBtn);
     await waitFor(() => {
       expect(api.pushMirrorNow).toHaveBeenCalledWith("work");
@@ -524,6 +565,8 @@ describe("VaultMirror — admin scope", () => {
       pat: null,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /Push now/i })).toBeInTheDocument(),
     );
@@ -541,6 +584,7 @@ describe("VaultMirror — admin scope", () => {
 
     renderRoute();
     const user = userEvent.setup();
+    await openAdvanced(user);
 
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
@@ -549,6 +593,100 @@ describe("VaultMirror — admin scope", () => {
 
     await waitFor(() =>
       expect(screen.getByText(/external_path/)).toBeInTheDocument(),
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Backup status banner (the restructured hero) + Advanced disclosure.
+  // -------------------------------------------------------------------------
+
+  it("leads with the plain 'version history on' status and keeps presets/raw fields hidden until Advanced", async () => {
+    // Default-shipped vault: enabled + internal. The owner should see the
+    // plain-language reassurance, NOT the preset soup or raw config fields.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    renderRoute();
+
+    await waitFor(() =>
+      expect(screen.getByText(/Version history — on/i)).toBeInTheDocument(),
+    );
+
+    // Preset soup + raw config are NOT visible on load.
+    expect(
+      screen.queryByRole("heading", { name: /Configuration/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Apply History preset/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Sync mode/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Run export now/i }),
+    ).not.toBeInTheDocument();
+
+    // Opening Advanced reveals them.
+    const user = userEvent.setup();
+    await openAdvanced(user);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("button", { name: /Apply History preset/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("presents 'Back up to GitHub' as the primary upgrade above Advanced", async () => {
+    // enabled + internal, no remote wired → the upgrade CTA is the
+    // GitRemoteSection, rendered OUTSIDE the Advanced disclosure.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    // The "Back up to GitHub" section is present without opening Advanced.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: /Back up to GitHub/i }),
+      ).toBeInTheDocument(),
+    );
+    // Banner nudges toward it.
+    expect(screen.getByText(/Want an off-machine copy too/i)).toBeInTheDocument();
+  });
+
+  it("status banner reports backed-up state when auto_push + credentials are wired", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal", auto_push: true }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: "github_oauth",
+      github_oauth: {
+        user_login: "aaron",
+        user_id: 1,
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        token_preview: "gho_…7890",
+      },
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/backed up off this machine/i)).toBeInTheDocument(),
+    );
+    // The connected GitHub login appears in the banner.
+    expect(screen.getAllByText(/@aaron/).length).toBeGreaterThan(0);
+  });
+
+  it("status banner reports OFF when the mirror is disabled", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: false }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Version history is off/i)).toBeInTheDocument(),
     );
   });
 });
@@ -588,24 +726,31 @@ describe("VaultMirror — read scope", () => {
     );
 
     renderRoute();
+    // Read-only banner is visible without opening Advanced.
+    await waitFor(() =>
+      expect(screen.getByText(/read-only token/i)).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
     );
 
-    expect(screen.getByText(/read-only token/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Save$/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /Run export now/i })).toBeDisabled();
   });
 
-  it("hides the Git remote section for read-only sessions (admin scope gates it)", async () => {
+  it("hides the Back-up-to-GitHub section for read-only sessions (admin scope gates it)", async () => {
     vi.mocked(api.getMirror).mockResolvedValue(
       snapshotFixture({ enabled: true, location: "external", external_path: "/tmp/x" }),
     );
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Configuration/i })).toBeInTheDocument(),
+      expect(screen.getByText(/read-only token/i)).toBeInTheDocument(),
     );
-    expect(screen.queryByRole("heading", { name: /Git remote/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: /Back up to GitHub/i }),
+    ).not.toBeInTheDocument();
   });
 });
 
@@ -629,7 +774,7 @@ describe("VaultMirror — Git remote credentials", () => {
     });
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+      expect(screen.getByRole("heading", { name: /Back up to GitHub/i })).toBeInTheDocument(),
     );
     expect(screen.getByText(/Not connected/i)).toBeInTheDocument();
     expect(
@@ -657,7 +802,7 @@ describe("VaultMirror — Git remote credentials", () => {
     });
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+      expect(screen.getByRole("heading", { name: /Back up to GitHub/i })).toBeInTheDocument(),
     );
     const patBtn = screen.getByRole("button", { name: /Use Personal Access Token/i });
     const ghBtn = screen.getByRole("button", { name: /Connect GitHub/i });
@@ -704,6 +849,8 @@ describe("VaultMirror — Git remote credentials", () => {
       pat: null,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByText(/Auto-push needs git credentials/i)).toBeInTheDocument(),
     );
@@ -730,6 +877,8 @@ describe("VaultMirror — Git remote credentials", () => {
       pat: null,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByText(/Will push to/i)).toBeInTheDocument(),
     );
@@ -759,7 +908,7 @@ describe("VaultMirror — Git remote credentials", () => {
 
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+      expect(screen.getByRole("heading", { name: /Back up to GitHub/i })).toBeInTheDocument(),
     );
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /Connect GitHub/i }));
@@ -802,7 +951,7 @@ describe("VaultMirror — Git remote credentials", () => {
     });
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+      expect(screen.getByRole("heading", { name: /Back up to GitHub/i })).toBeInTheDocument(),
     );
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /Use Personal Access Token/i }));
@@ -841,7 +990,7 @@ describe("VaultMirror — Git remote credentials", () => {
     });
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Git remote/i })).toBeInTheDocument(),
+      expect(screen.getByRole("heading", { name: /Back up to GitHub/i })).toBeInTheDocument(),
     );
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /Use Personal Access Token/i }));
@@ -882,6 +1031,8 @@ describe("VaultMirror — Import from git section", () => {
 
   it("renders the import section heading + multi-pusher caveat", async () => {
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(
         screen.getByRole("heading", { name: /Import from a git repo/i }),
@@ -897,7 +1048,7 @@ describe("VaultMirror — Import from git section", () => {
     vi.mocked(scope.hasAdminScope).mockReturnValue(false);
     renderRoute();
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: /Git backup for/i })).toBeInTheDocument(),
+      expect(screen.getByRole("heading", { name: /Backup for/i })).toBeInTheDocument(),
     );
     expect(
       screen.queryByRole("heading", { name: /Import from a git repo/i }),
@@ -906,11 +1057,12 @@ describe("VaultMirror — Import from git section", () => {
 
   it("toggling Replace requires typing the vault name to enable Start", async () => {
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
 
-    const user = userEvent.setup();
     // Type a URL into the import section's Remote URL field (the one
     // INSIDE the import section, not the PAT modal which isn't open).
     const importUrlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
@@ -936,6 +1088,8 @@ describe("VaultMirror — Import from git section", () => {
 
   it("the 'Also sync changes back' checkbox is checked by default", async () => {
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
@@ -954,10 +1108,11 @@ describe("VaultMirror — Import from git section", () => {
       sync_enabled: true,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
-    const user = userEvent.setup();
     const importUrlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
     await user.type(importUrlInput, "https://github.com/aaron/vault.git");
     await user.click(screen.getByRole("button", { name: /Start import/i }));
@@ -986,10 +1141,11 @@ describe("VaultMirror — Import from git section", () => {
       sync_enabled: false,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
-    const user = userEvent.setup();
     await user.type(
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/aaron/vault.git",
@@ -1023,10 +1179,11 @@ describe("VaultMirror — Import from git section", () => {
         "Sync not enabled — pushing changes back needs write credentials (a PAT or GitHub sign-in).",
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
-    const user = userEvent.setup();
     await user.type(
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/aaron/public.git",
@@ -1051,10 +1208,11 @@ describe("VaultMirror — Import from git section", () => {
       sync_enabled: true,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
-    const user = userEvent.setup();
     await user.type(
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/aaron/private.git",
@@ -1091,10 +1249,11 @@ describe("VaultMirror — Import from git section", () => {
       sync_enabled: true,
     });
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
-    const user = userEvent.setup();
     await user.type(
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/aaron/saved.git",
@@ -1115,10 +1274,11 @@ describe("VaultMirror — Import from git section", () => {
       new api.HttpError(502, "git clone failed for https://***@github.com/missing/repo.git: fatal: not found"),
     );
     renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
-    const user = userEvent.setup();
     await user.type(
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/missing/repo.git",
