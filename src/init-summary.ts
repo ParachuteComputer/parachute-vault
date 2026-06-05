@@ -26,6 +26,15 @@ export type InitSummaryInput = {
    * undefined, so they know why and how to make the vault reachable.
    */
   noTokenGuidance?: string | undefined;
+  /**
+   * Whether a hub is present on this host (live `/health` probe or a
+   * configured hub origin — see `detectHubPresence`). Branches the
+   * opted-into-a-token-but-none-minted copy: under a hub the vault is reachable
+   * via the hub's browser OAuth flow even with no header-auth token, so the
+   * old "your vault isn't reachable by any client" framing is false. #445.
+   * Undefined → treat as the conservative standalone case.
+   */
+  hubPresent?: boolean | undefined;
 };
 
 /**
@@ -45,7 +54,7 @@ export type InitSummaryInput = {
  *   !addMcp, !addToken          → OAuth-first: add Claude Code later
  */
 export function buildInitSummaryLines(input: InitSummaryInput): string[] {
-  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, vaultName, noTokenGuidance } = input;
+  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, vaultName, noTokenGuidance, hubPresent } = input;
   const lines: string[] = [];
   lines.push("");
   lines.push("---");
@@ -75,20 +84,35 @@ export function buildInitSummaryLines(input: InitSummaryInput): string[] {
     lines.push(`  - Paste into your other MCP client's config, or use as Authorization: Bearer <token>`);
     lines.push(`  - Won't be shown again — save it now.`);
   } else if (!addMcp && addToken && !apiKey) {
-    // Explicitly opted into a token but no hub was reachable to mint one
-    // (vault#282 Stage 2 — vault no longer mints local pvt_* tokens). Surface
-    // why and the recovery paths.
+    // Explicitly opted into a token but none was minted (vault#282 Stage 2 —
+    // vault no longer mints local pvt_* tokens). Surface why + recovery.
     lines.push("");
     lines.push(
       noTokenGuidance ??
         "No token issued — no hub was reachable to mint a hub JWT.",
     );
-    lines.push(
-      "  Once a hub is running, run `parachute-vault mcp-install` to mint + wire a token,",
-    );
-    lines.push(
-      "  or set VAULT_AUTH_TOKEN for an operator-channel bearer.",
-    );
+    if (hubPresent) {
+      // A hub IS present — the vault is already reachable via the hub's
+      // browser OAuth flow / web UI. A header-auth token is optional, only for
+      // non-OAuth clients + scripts. The "isn't reachable" framing is false
+      // here (#445).
+      lines.push(
+        "  Your vault is still reachable — clients connect through the hub's browser",
+      );
+      lines.push(
+        "  sign-in (OAuth); a header-auth token is only needed for scripts / non-OAuth",
+      );
+      lines.push(
+        "  clients. Run `parachute-vault mcp-install` to mint + wire one when you want it.",
+      );
+    } else {
+      lines.push(
+        "  Once a hub is running, run `parachute-vault mcp-install` to mint + wire a token,",
+      );
+      lines.push(
+        "  or set VAULT_AUTH_TOKEN for an operator-channel bearer.",
+      );
+    }
   } else if (!addMcp && !addToken) {
     // OAuth-first, but the operator skipped wiring Claude Code too.
     lines.push("");

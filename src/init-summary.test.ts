@@ -175,18 +175,61 @@ describe("buildInitSummaryLines", () => {
 
   // Explicit opt-in but no hub reachable to mint (vault#282 Stage 2 path,
   // reached only when the operator passes --token without a hub).
-  describe("MCP=N + token=Y but no hub (opt-in mint failed)", () => {
+  describe("MCP=N + token=Y but no hub (opt-in mint failed, standalone)", () => {
     const out = buildInitSummaryLines({
       ...baseInput,
       addMcp: false,
       addToken: true,
       apiKey: undefined,
       noTokenGuidance: "No token issued — hub unreachable.",
+      hubPresent: false,
     }).join("\n");
 
     test("surfaces the no-token-issued guidance + recovery", () => {
       expect(out).toContain("No token issued");
       expect(out).toContain("parachute-vault mcp-install");
+    });
+
+    test("standalone framing — points at bringing a hub up / VAULT_AUTH_TOKEN", () => {
+      expect(out).toContain("Once a hub is running");
+      expect(out).toContain("VAULT_AUTH_TOKEN");
+    });
+
+    test("does NOT claim the vault is reachable (no hub present)", () => {
+      expect(out).not.toContain("Your vault is still reachable");
+    });
+  });
+
+  // #445: opted into a token, none minted, but a HUB IS PRESENT. The vault is
+  // reachable via the hub's browser OAuth flow even with no header-auth token,
+  // so the standalone "isn't reachable" framing would be false here.
+  describe("MCP=N + token=Y, no token minted, but hub present (#445)", () => {
+    const out = buildInitSummaryLines({
+      ...baseInput,
+      addMcp: false,
+      addToken: true,
+      apiKey: undefined,
+      noTokenGuidance: "No token yet — the hub's admin wizard mints it.",
+      hubPresent: true,
+    }).join("\n");
+
+    test("affirms the vault is still reachable via the hub's OAuth flow", () => {
+      expect(out).toContain("Your vault is still reachable");
+      expect(out).toContain("sign-in (OAuth)");
+    });
+
+    test("frames a header-auth token as optional (scripts / non-OAuth clients)", () => {
+      expect(out).toContain("only needed for scripts");
+      expect(out).toContain("parachute-vault mcp-install");
+    });
+
+    test("does NOT print the standalone 'Once a hub is running' / VAULT_AUTH_TOKEN copy", () => {
+      expect(out).not.toContain("Once a hub is running");
+      expect(out).not.toContain("VAULT_AUTH_TOKEN");
+    });
+
+    test("never claims the vault isn't reachable by any client", () => {
+      expect(out).not.toContain("isn't reachable by any client");
     });
   });
 

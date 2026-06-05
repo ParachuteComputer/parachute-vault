@@ -236,16 +236,23 @@ describe("vault create — OAuth-first auth (vault#442)", () => {
   test("--mint (no hub reachable) opts in but mints scope-narrow read, never admin", () => {
     // In this sandbox there's no hub/operator.token, so the mint can't complete
     // — but the request is scope-narrow read by default and must NEVER ask for
-    // admin. We assert the create still succeeds and the guidance points at the
-    // mint-token recovery (the scope requested is read, per mintBootstrapCredential).
+    // an admin grant. We assert the create still succeeds and the guidance is
+    // the standalone path (the scope requested is read, per
+    // mintBootstrapCredential).
+    //
+    // Point the hub-presence probe at a guaranteed-closed port so the test is
+    // deterministic regardless of whether a real hub happens to be running on
+    // the dev box's 1939 (#445 added a live `/health` probe to branch the
+    // no-operator-token copy).
     const { exitCode, stdout } = runCli(
       ["create", "wantmint", "--mint", "--json"],
-      { PARACHUTE_HOME: home },
+      { PARACHUTE_HOME: home, PARACHUTE_HUB_PORT: "59399" },
     );
     expect(exitCode).toBe(0);
     const payload = JSON.parse(stdout.trim());
-    // No hub here → no token, but the guidance is the standalone mint path, not
-    // an admin grant.
+    // No hub here → no token, and the standalone guidance asks for NO admin
+    // grant (the #445 hub-present "admin wizard" copy is gated out by the dead
+    // probe port above).
     expect(payload.token).toBe("");
     expect(payload.token_guidance).not.toContain("admin");
   });
