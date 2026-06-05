@@ -9,12 +9,24 @@
  * vault up to a git repository — one of the launch-era asks — has a
  * home that doesn't require curl + YAML editing.
  *
- * Layout: status card → manual-trigger button → preset cards → detailed
- * config form. The presets pre-fill the form (matching the three the
- * design doc names — "History" / "Live Mirror" / "Manual Export") so
- * an operator who knows what shape they want gets there in one click.
- * The detailed fields below the presets let custom shapes through
- * without bypassing the form's validation.
+ * Layout (restructured for non-technical owners — Aaron's "the settings
+ * are very confusing for people, we want clearer defaults"):
+ *   1. BackupStatusBanner — plain-language status. Every new vault ships
+ *      with an internal live git history, so the default read is
+ *      "✓ Version history — on." When credentials are wired + auto_push is
+ *      on it upgrades to "✓ Version history + backed up off this machine."
+ *   2. "Back up to GitHub" (GitRemoteSection) — the one upgrade an owner
+ *      cares about, promoted above the fold (GitHub Device Flow / PAT).
+ *   3. A single "Advanced settings" disclosure holding everything else —
+ *      the preset shortcuts (History / External folder mirror / Manual
+ *      Export), the raw config form (location / external_path / sync_mode /
+ *      auto_commit / auto_push), the Status card with run-now / push-now,
+ *      and import-from-git. A normal owner never opens it.
+ *
+ * The presets pre-fill the raw form so an operator who knows the shape
+ * they want gets there in one click; the detailed fields below let custom
+ * shapes through without bypassing the form's validation. The export
+ * "Mirror" is the internal vocabulary; owner-facing copy says "Backup".
  *
  * Post-event-driven shift (vault#382): the granular schedule picker
  * (Live/Minute/10min/Hourly/Daily/Manual) has been replaced by a binary
@@ -112,7 +124,7 @@ const PRESETS: ReadonlyArray<Preset> = [
   },
   {
     id: "live",
-    label: "Live Mirror",
+    label: "External folder mirror",
     subtext:
       "Visible folder. Open in Obsidian, push to GitHub. Events-driven.",
     apply: (current) => ({
@@ -191,7 +203,7 @@ export function VaultMirror({ vaultName }: { vaultName?: string } = {}) {
     <div>
       <div className="list-header">
         <h2>
-          Git backup for <code>{name}</code>
+          Backup for <code>{name}</code>
         </h2>
         <Link to={detailHref} className="muted">
           ← Vault detail
@@ -258,16 +270,18 @@ function MirrorScreen({
     };
   }, [vaultName, isAdmin]);
 
+  // Single "Advanced" disclosure for the whole page. A normal owner never
+  // needs to open it: the backup status banner + "Back up to GitHub"
+  // upgrade above carry the entire common path. Everything an operator
+  // wants — the raw config (location / sync_mode / auto_commit / auto_push
+  // / external folder), the preset shortcuts, the manual run-now / push-now
+  // buttons, the manual export, and import-from-git — lives inside.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
   return (
     <>
-      <StatusCard
-        status={snapshot.status}
-        config={snapshot.config}
-        creds={creds}
-        canRun={isAdmin && snapshot.status.enabled}
-        vaultName={vaultName}
-        onSnapshot={onSnapshot}
-      />
+      <BackupStatusBanner status={snapshot.status} config={snapshot.config} creds={creds} />
+
       {!isAdmin ? (
         <div className="warn-banner">
           You're viewing this page with a read-only token. Saving config + manual run
@@ -275,16 +289,10 @@ function MirrorScreen({
           "Manage" link with an admin-scoped session to make changes.
         </div>
       ) : null}
-      <ConfigForm
-        vaultName={vaultName}
-        initial={snapshot.config}
-        readOnly={!isAdmin}
-        creds={creds}
-        onSaved={(snap) => {
-          onSnapshot(snap);
-          onRefresh();
-        }}
-      />
+
+      {/* The one upgrade an owner cares about: back up off-machine to GitHub
+          (or any HTTPS git host). Promoted out of "advanced" — it's the
+          primary call to action on this page. */}
       {isAdmin ? (
         <GitRemoteSection
           vaultName={vaultName}
@@ -300,13 +308,134 @@ function MirrorScreen({
           locationIsExternal={snapshot.config.location === "external"}
         />
       ) : null}
-      {isAdmin ? (
-        <ImportFromGitSection
-          vaultName={vaultName}
-          creds={creds}
-        />
+
+      <div className="section">
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => setAdvancedOpen((s) => !s)}
+          aria-expanded={advancedOpen}
+        >
+          {advancedOpen ? "Hide advanced settings" : "Advanced settings"}
+        </button>
+        {!advancedOpen ? (
+          <p className="dim" style={{ margin: "0.6rem 0 0" }}>
+            Manual exports, run-now, an external (Obsidian-visible) mirror folder,
+            commit settings, and import-from-a-repo. Most owners never need these.
+          </p>
+        ) : null}
+      </div>
+
+      {advancedOpen ? (
+        <>
+          <StatusCard
+            status={snapshot.status}
+            config={snapshot.config}
+            creds={creds}
+            canRun={isAdmin && snapshot.status.enabled}
+            vaultName={vaultName}
+            onSnapshot={onSnapshot}
+          />
+          <ConfigForm
+            vaultName={vaultName}
+            initial={snapshot.config}
+            readOnly={!isAdmin}
+            creds={creds}
+            onSaved={(snap) => {
+              onSnapshot(snap);
+              onRefresh();
+            }}
+          />
+          {isAdmin ? (
+            <ImportFromGitSection
+              vaultName={vaultName}
+              creds={creds}
+            />
+          ) : null}
+        </>
       ) : null}
     </>
+  );
+}
+
+/**
+ * Plain-language backup status — the hero of the page. A non-technical
+ * owner should read one line and know their vault is safe. Derived
+ * entirely from the snapshot + credential status (no new API):
+ *
+ *  - enabled + internal location → "Version history — on." (the default
+ *    every new vault ships with: a full local git history of every change).
+ *  - + credentials ACTUALLY wired AND auto_push on → "Version history +
+ *    backed up off this machine." We require real credentials, not just
+ *    the auto_push flag: never tell an owner their data is backed up when
+ *    no working remote exists (or while creds are still loading).
+ *  - disabled → an honest "off" state with a nudge to the advanced toggle.
+ *
+ * "Mirror" is the internal vocabulary; the owner-facing copy is "Backup"
+ * / "version history" throughout.
+ */
+function BackupStatusBanner({
+  status,
+  config,
+  creds,
+}: {
+  status: MirrorStatus;
+  config: MirrorConfig;
+  creds: MirrorCredentialStatus | null;
+}) {
+  if (!config.enabled) {
+    return (
+      <div className="warn-banner" role="status">
+        <strong>Version history is off.</strong> This vault isn't saving a
+        local history of changes right now. Open <strong>Advanced settings</strong>{" "}
+        below to turn it back on.
+      </div>
+    );
+  }
+
+  // Only claim "backed up off this machine" when credentials are ACTUALLY
+  // wired (a real remote exists) AND auto_push is on. `auto_push` alone is
+  // not enough: a vault can carry the flag with no working remote, and
+  // while creds are still loading `creds === null` — telling the owner
+  // their data is backed up when it isn't is a trust violation. Gate on
+  // `creds?.active_method` being truthy, never on auto_push alone.
+  const hasRemote = !!creds?.active_method;
+  const pushingToRemote = config.auto_push && hasRemote;
+
+  const githubLogin =
+    creds?.active_method === "github_oauth" ? creds.github_oauth?.user_login : undefined;
+
+  return (
+    <div className="mint-banner" role="status" style={{ marginBottom: "1rem" }}>
+      {pushingToRemote ? (
+        <>
+          <strong>✓ Version history + backed up off this machine.</strong>{" "}
+          {githubLogin ? (
+            <>
+              Every change is saved locally and pushed to GitHub as{" "}
+              <code>@{githubLogin}</code>.
+            </>
+          ) : (
+            <>
+              Every change is saved locally and pushed to your git remote
+              automatically.
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          <strong>✓ Version history — on.</strong> Your vault automatically
+          saves a full local history of every change. Want an off-machine copy
+          too? Use <strong>Back up to GitHub</strong> below.
+        </>
+      )}
+      {status.last_error ? (
+        <p className="dim" style={{ margin: "0.5rem 0 0" }}>
+          Heads up — the last backup pass reported an error. See{" "}
+          <strong>Advanced settings</strong> below for details.
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -585,11 +714,11 @@ function ConfigForm({
       <div className="form-row">
         <label>Presets</label>
         <p className="dim" style={{ marginTop: 0, marginBottom: "0.5rem", fontSize: "0.9em" }}>
-          <strong>History</strong> is the easiest start — vault manages the
-          mirror folder under its own data dir, no path to pick, no remote
-          to configure. <strong>Live Mirror</strong> + <strong>Manual
-          Export</strong> are for operators who want to point at a visible
-          folder (Obsidian, GitHub).
+          <strong>History</strong> is the default every vault ships with —
+          vault manages the history folder under its own data dir, no path to
+          pick, no remote to configure. <strong>External folder mirror</strong> +{" "}
+          <strong>Manual Export</strong> are for operators who want to point at a
+          visible folder (Obsidian, GitHub).
         </p>
         <div className="preset-grid">
           {PRESETS.map((preset) => (
@@ -766,8 +895,9 @@ function ConfigForm({
             ) : (
               <div className="warn-banner" style={{ marginTop: "0.5rem" }} role="alert">
                 Auto-push needs git credentials. Either connect GitHub in the{" "}
-                <strong>Git remote</strong> section below, or paste a Personal Access
-                Token + remote URL. Failed pushes are logged but won't crash the export.
+                <strong>Back up to GitHub</strong> section above, or paste a Personal
+                Access Token + remote URL there. Failed pushes are logged but won't crash
+                the export.
               </div>
             )
           ) : null}
@@ -913,11 +1043,22 @@ function GitRemoteSection({
   return (
     <div className="section" id="git-remote-section">
       <h3 style={{ margin: "0 0 0.85rem", fontSize: "1rem", fontWeight: 500 }}>
-        Git remote
+        {connected ? "Backed up to a git remote" : "Back up to GitHub"}
       </h3>
       <p className="dim" style={{ marginTop: 0 }}>
-        Credentials for <code>auto-push</code>. Stored on this server with{" "}
-        <code>0600</code> file permissions. Never sent to GitHub or any third party.
+        {connected ? (
+          <>
+            Your vault pushes its history to an off-machine git remote.
+            Credentials are stored on this server with <code>0600</code> file
+            permissions — never sent to GitHub or any third party.
+          </>
+        ) : (
+          <>
+            Keep an off-machine copy: push your vault's history to GitHub (or any
+            HTTPS git host). Credentials are stored on this server with{" "}
+            <code>0600</code> file permissions, never sent to a third party.
+          </>
+        )}
       </p>
 
       {/*
@@ -1031,7 +1172,7 @@ function GitRemoteSection({
                 return (
                   <>
                     Auto-push was already on; the push attempt failed —
-                    see the Status card above for details.
+                    see Advanced settings → Status for details.
                   </>
                 );
               }
@@ -1051,7 +1192,7 @@ function GitRemoteSection({
                 return (
                   <>
                     Auto-push enabled. The initial push attempt failed — see
-                    the Status card above for the error.
+                    Advanced settings → Status for the error.
                   </>
                 );
               }
@@ -1060,7 +1201,7 @@ function GitRemoteSection({
               );
             }
             return <>Credentials wired. Auto-push remains off; flip it on in
-              Configuration above to push commits automatically.</>;
+              Advanced settings → Configuration to push commits automatically.</>;
           })()}{" "}
           <button
             type="button"
