@@ -9,12 +9,24 @@
  * vault up to a git repository — one of the launch-era asks — has a
  * home that doesn't require curl + YAML editing.
  *
- * Layout: status card → manual-trigger button → preset cards → detailed
- * config form. The presets pre-fill the form (matching the three the
- * design doc names — "History" / "Live Mirror" / "Manual Export") so
- * an operator who knows what shape they want gets there in one click.
- * The detailed fields below the presets let custom shapes through
- * without bypassing the form's validation.
+ * Layout (restructured for non-technical owners — Aaron's "the settings
+ * are very confusing for people, we want clearer defaults"):
+ *   1. BackupStatusBanner — plain-language status. Every new vault ships
+ *      with an internal live git history, so the default read is
+ *      "✓ Version history — on." When credentials are wired + auto_push is
+ *      on it upgrades to "✓ Version history + backed up off this machine."
+ *   2. "Back up to GitHub" (GitRemoteSection) — the one upgrade an owner
+ *      cares about, promoted above the fold (GitHub Device Flow / PAT).
+ *   3. A single "Advanced settings" disclosure holding everything else —
+ *      the preset shortcuts (History / External folder mirror / Manual
+ *      Export), the raw config form (location / external_path / sync_mode /
+ *      auto_commit / auto_push), the Status card with run-now / push-now,
+ *      and import-from-git. A normal owner never opens it.
+ *
+ * The presets pre-fill the raw form so an operator who knows the shape
+ * they want gets there in one click; the detailed fields below let custom
+ * shapes through without bypassing the form's validation. The export
+ * "Mirror" is the internal vocabulary; owner-facing copy says "Backup".
  *
  * Post-event-driven shift (vault#382): the granular schedule picker
  * (Live/Minute/10min/Hourly/Daily/Manual) has been replaced by a binary
@@ -353,8 +365,10 @@ function MirrorScreen({
  *
  *  - enabled + internal location → "Version history — on." (the default
  *    every new vault ships with: a full local git history of every change).
- *  - + a wired remote that's pushing (auto_push or saved credentials) →
- *    "Version history + backed up to GitHub / your git remote."
+ *  - + credentials ACTUALLY wired AND auto_push on → "Version history +
+ *    backed up off this machine." We require real credentials, not just
+ *    the auto_push flag: never tell an owner their data is backed up when
+ *    no working remote exists (or while creds are still loading).
  *  - disabled → an honest "off" state with a nudge to the advanced toggle.
  *
  * "Mirror" is the internal vocabulary; the owner-facing copy is "Backup"
@@ -379,16 +393,17 @@ function BackupStatusBanner({
     );
   }
 
-  // Is it backed up to a remote? Either credentials are wired (a remote
-  // exists) and auto_push is on, or auto_push is on with a pushed commit
-  // on record. We treat "auto_push on + a remote" as the backed-up state.
-  const hasRemote = !!creds?.active_method || config.auto_push;
+  // Only claim "backed up off this machine" when credentials are ACTUALLY
+  // wired (a real remote exists) AND auto_push is on. `auto_push` alone is
+  // not enough: a vault can carry the flag with no working remote, and
+  // while creds are still loading `creds === null` — telling the owner
+  // their data is backed up when it isn't is a trust violation. Gate on
+  // `creds?.active_method` being truthy, never on auto_push alone.
+  const hasRemote = !!creds?.active_method;
   const pushingToRemote = config.auto_push && hasRemote;
 
   const githubLogin =
     creds?.active_method === "github_oauth" ? creds.github_oauth?.user_login : undefined;
-  const patRemote =
-    creds?.active_method === "pat" ? creds.pat?.remote_url : undefined;
 
   return (
     <div className="mint-banner" role="status" style={{ marginBottom: "1rem" }}>
@@ -399,10 +414,6 @@ function BackupStatusBanner({
             <>
               Every change is saved locally and pushed to GitHub as{" "}
               <code>@{githubLogin}</code>.
-            </>
-          ) : patRemote ? (
-            <>
-              Every change is saved locally and pushed to your git remote.
             </>
           ) : (
             <>
@@ -884,8 +895,9 @@ function ConfigForm({
             ) : (
               <div className="warn-banner" style={{ marginTop: "0.5rem" }} role="alert">
                 Auto-push needs git credentials. Either connect GitHub in the{" "}
-                <strong>Git remote</strong> section below, or paste a Personal Access
-                Token + remote URL. Failed pushes are logged but won't crash the export.
+                <strong>Back up to GitHub</strong> section above, or paste a Personal
+                Access Token + remote URL there. Failed pushes are logged but won't crash
+                the export.
               </div>
             )
           ) : null}
@@ -1160,7 +1172,7 @@ function GitRemoteSection({
                 return (
                   <>
                     Auto-push was already on; the push attempt failed —
-                    see the Status card above for details.
+                    see Advanced settings → Status for details.
                   </>
                 );
               }
@@ -1180,7 +1192,7 @@ function GitRemoteSection({
                 return (
                   <>
                     Auto-push enabled. The initial push attempt failed — see
-                    the Status card above for the error.
+                    Advanced settings → Status for the error.
                   </>
                 );
               }
@@ -1189,7 +1201,7 @@ function GitRemoteSection({
               );
             }
             return <>Credentials wired. Auto-push remains off; flip it on in
-              Configuration above to push commits automatically.</>;
+              Advanced settings → Configuration to push commits automatically.</>;
           })()}{" "}
           <button
             type="button"

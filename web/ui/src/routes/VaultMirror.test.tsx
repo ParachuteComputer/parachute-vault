@@ -689,6 +689,31 @@ describe("VaultMirror — admin scope", () => {
       expect(screen.getByText(/Version history is off/i)).toBeInTheDocument(),
     );
   });
+
+  it("does NOT claim backed-up when auto_push=true but NO credentials are wired (trust guard)", async () => {
+    // A vault can carry auto_push=true with no working remote. The banner
+    // must NOT tell the owner their data is backed up off-machine — that's
+    // a trust violation. It stays on the "version history on" + upgrade
+    // nudge until credentials actually exist.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal", auto_push: true }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Version history — on/i)).toBeInTheDocument(),
+    );
+    // The off-machine claim is absent.
+    expect(
+      screen.queryByText(/backed up off this machine/i),
+    ).not.toBeInTheDocument();
+    // Still nudges toward the upgrade.
+    expect(screen.getByText(/Want an off-machine copy too/i)).toBeInTheDocument();
+  });
 });
 
 describe("VaultMirror — auth-required path", () => {
