@@ -57,8 +57,10 @@ import {
   buildMcpEntryPlan,
   chooseHubOrigin,
   chooseMcpUrl,
+  detectHubPresence,
   detectInstallContext,
   mintHubJwt,
+  noOperatorTokenGuidance,
   readOperatorToken,
   removeMcpConfig,
   resolveInstallTarget,
@@ -548,6 +550,11 @@ async function cmdInit(args: string[] = []) {
   // 8. Summary
   const port = globalConfig.port || DEFAULT_PORT;
   const mcpUrl = `http://127.0.0.1:${port}/vault/${defaultVault}/mcp`;
+  // Probe whether a hub is present so the summary's "opted into a token but
+  // none minted" copy reflects reality: under a hub the vault is reachable via
+  // browser OAuth even with no header-auth token (#445). Only matters for the
+  // !apiKey branches; cheap + best-effort (never throws).
+  const hubPresent = !apiKey ? await detectHubPresence() : true;
   const lines = buildInitSummaryLines({
     addMcp,
     addToken,
@@ -558,6 +565,7 @@ async function cmdInit(args: string[] = []) {
     mcpUrl,
     vaultName: defaultVault,
     noTokenGuidance: credentialGuidance,
+    hubPresent,
   });
   for (const line of lines) console.log(line);
 }
@@ -3369,15 +3377,25 @@ interface VaultCredential {
 async function mintBootstrapCredential(
   name: string,
   verb: "read" | "write" = "read",
+  /**
+   * Test seam — injectable hub-presence probe. Defaults to the live
+   * `detectHubPresence` (loopback `/health` + configured-origin check). Lets
+   * tests drive both branches of the no-operator-token copy without a real hub.
+   */
+  detectHub: typeof detectHubPresence = detectHubPresence,
 ): Promise<VaultCredential> {
   const operatorToken = readOperatorToken();
   if (!operatorToken) {
+    // No operator.token. Two very different worlds, identical symptom:
+    //   (a) Hub running on a fresh box — the token isn't minted until the
+    //       admin wizard creates the first admin user (hub init Step 1.5 is a
+    //       no-op until then). NOTHING to do here; the old "install the hub …"
+    //       copy is circular (this very flow was spawned *by* the hub). #445.
+    //   (b) Genuinely standalone — no hub at all. The original guidance holds.
+    const hubPresent = await detectHub();
     return {
       token: null,
-      guidance:
-        "No token issued — no hub operator token at ~/.parachute/operator.token. " +
-        "Install the hub (`bun add -g @openparachute/hub` + `parachute init`) and re-run, " +
-        "or set VAULT_AUTH_TOKEN for an operator-channel bearer.",
+      guidance: noOperatorTokenGuidance(hubPresent),
     };
   }
   const port = readGlobalConfig().port || DEFAULT_PORT;

@@ -217,6 +217,103 @@ export function readOperatorToken(env: NodeJS.ProcessEnv = process.env): string 
 }
 
 // ---------------------------------------------------------------------------
+// Hub-presence probe
+// ---------------------------------------------------------------------------
+
+/**
+ * Default loopback port the hub binds. Mirrors `hub-jwt.ts`'s
+ * `DEFAULT_HUB_LOOPBACK` (`http://127.0.0.1:1939`). When no hub origin is
+ * configured (the common fresh-box case), this is where a co-located hub
+ * answers.
+ */
+export const DEFAULT_HUB_LOOPBACK_PORT = 1939;
+
+/**
+ * Best-effort: is a hub actually present on this host *right now*?
+ *
+ * This is distinct from {@link InstallContext.hubReachable}, which only asks
+ * "is a non-loopback hub *origin* configured?" (env / expose-state). On a fresh
+ * box the hub is installed and running on loopback, but no origin is configured
+ * and the operator token isn't minted yet (hub mints it only when the first
+ * admin user is created in the web wizard). The stale standalone-era copy
+ * ("install the hub …") fires off `operatorTokenPresent === false` and so
+ * misreads that fresh-box state as "no hub". This probe lets the copy branch on
+ * whether a hub is genuinely absent vs. merely not-yet-bootstrapped.
+ *
+ * Signals, cheapest-first:
+ *   1. A configured non-loopback hub origin (`PARACHUTE_HUB_ORIGIN` /
+ *      expose-state) → a hub origin exists, treat as present without a probe.
+ *   2. A live `GET http://127.0.0.1:<hubPort>/health` returning a 2xx. The
+ *      hub binds its own fixed loopback port (1939 by default), independent of
+ *      the vault's listen port — so the probe always targets the hub port, not
+ *      `chooseHubOrigin`'s vault-loopback fallback. Short timeout; any error →
+ *      not present.
+ *
+ * `port` is the hub's loopback port (defaults to `$PARACHUTE_HUB_PORT`, else
+ * 1939). `fetchImpl` is an injectable test seam; `timeoutMs` keeps a dead port
+ * from stalling init. Never throws — returns `false` on any failure.
+ */
+export async function detectHubPresence(opts: {
+  port?: number;
+  env?: { PARACHUTE_HUB_ORIGIN?: string | undefined; PARACHUTE_HUB_PORT?: string | undefined };
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+} = {}): Promise<boolean> {
+  const env =
+    opts.env ?? (process.env as { PARACHUTE_HUB_ORIGIN?: string; PARACHUTE_HUB_PORT?: string });
+  // Port precedence: explicit arg → `$PARACHUTE_HUB_PORT` → 1939. The env
+  // override keeps the probe deterministic for tests + non-default-port hubs,
+  // so it never accidentally hits an unrelated hub on the host's 1939.
+  const envPort = env.PARACHUTE_HUB_PORT ? Number(env.PARACHUTE_HUB_PORT) : undefined;
+  const hubPort =
+    opts.port ?? (envPort !== undefined && Number.isFinite(envPort) ? envPort : DEFAULT_HUB_LOOPBACK_PORT);
+  // 1. A configured hub origin (env / expose-state) is itself a present-hub
+  //    signal — no need to probe. We pass `hubPort` purely as the loopback
+  //    fallback arg; its only role here is the source discriminator.
+  const configured = chooseHubOrigin(hubPort, env);
+  if (configured.source !== "loopback") return true;
+
+  // 2. Live health probe against the hub's fixed loopback port.
+  const origin = `http://127.0.0.1:${hubPort}`;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.timeoutMs ?? 800;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${origin}/health`, { signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Pick the operator-facing guidance for the "no operator.token present" case,
+ * branched on whether a hub is genuinely absent vs. merely not-yet-bootstrapped
+ * (#445). Extracted as a pure function so the copy is unit-testable without
+ * importing cli.ts (which dispatches on import).
+ *
+ *   hubPresent === true  → a hub is running; the operator token just hasn't
+ *                          been minted yet (it's minted when the first admin
+ *                          user is created in the hub's web wizard). The old
+ *                          "install the hub …" advice is circular here — this
+ *                          flow was spawned *by* the hub. Tell them there's
+ *                          nothing to do and to finish in the wizard.
+ *   hubPresent === false → genuinely standalone. Keep the original advice.
+ */
+export function noOperatorTokenGuidance(hubPresent: boolean): string {
+  return hubPresent
+    ? "No token yet — the hub's admin wizard mints the operator token when you " +
+        "create the first admin user. Nothing to do here; finish setup in the wizard, " +
+        "then run `parachute-vault mcp-install` if you want a header-auth token for scripts."
+    : "No token issued — no hub operator token at ~/.parachute/operator.token. " +
+        "Install the hub (`bun add -g @openparachute/hub` + `parachute init`) and re-run, " +
+        "or set VAULT_AUTH_TOKEN for an operator-channel bearer.";
+}
+
+// ---------------------------------------------------------------------------
 // Hub mint-token client
 // ---------------------------------------------------------------------------
 
