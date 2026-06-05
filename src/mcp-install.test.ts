@@ -23,7 +23,9 @@ import {
   buildMcpEntryPlan,
   chooseHubOrigin,
   chooseMcpUrl,
+  detectHubPresence,
   mintHubJwt,
+  noOperatorTokenGuidance,
   readOperatorToken,
   removeMcpConfig,
   resolveInstallTarget,
@@ -312,6 +314,97 @@ describe("readOperatorToken", () => {
   test("returns null for an empty operator.token", () => {
     fs.writeFileSync(path.join(tmpHome, "operator.token"), "   \n");
     expect(readOperatorToken({ PARACHUTE_HOME: tmpHome })).toBeNull();
+  });
+});
+
+describe("detectHubPresence", () => {
+  let origHome: string | undefined;
+  let tmpHome: string;
+
+  beforeEach(() => {
+    origHome = process.env.PARACHUTE_HOME;
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "vault-hub-presence-"));
+    process.env.PARACHUTE_HOME = tmpHome;
+  });
+
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.PARACHUTE_HOME;
+    else process.env.PARACHUTE_HOME = origHome;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  test("a configured non-loopback hub origin counts as present (no probe)", async () => {
+    let probed = false;
+    const mockFetch: typeof fetch = async () => {
+      probed = true;
+      return new Response(null, { status: 500 });
+    };
+    const present = await detectHubPresence({
+      env: { PARACHUTE_HUB_ORIGIN: "https://hub.example" },
+      fetchImpl: mockFetch,
+    });
+    expect(present).toBe(true);
+    expect(probed).toBe(false); // configured origin short-circuits the probe
+  });
+
+  test("loopback + healthy hub (2xx /health) → present", async () => {
+    const calls: string[] = [];
+    const mockFetch: typeof fetch = async (url) => {
+      calls.push(String(url));
+      return new Response("ok", { status: 200 });
+    };
+    const present = await detectHubPresence({ env: {}, fetchImpl: mockFetch });
+    expect(present).toBe(true);
+    expect(calls).toHaveLength(1);
+    // Probes the hub's fixed loopback port (1939), not vault's listen port.
+    expect(calls[0]).toBe("http://127.0.0.1:1939/health");
+  });
+
+  test("loopback + no hub answering (fetch throws) → absent", async () => {
+    const mockFetch: typeof fetch = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const present = await detectHubPresence({ env: {}, fetchImpl: mockFetch });
+    expect(present).toBe(false);
+  });
+
+  test("loopback + hub answers non-2xx → absent", async () => {
+    const mockFetch: typeof fetch = async () => new Response("nope", { status: 503 });
+    const present = await detectHubPresence({ env: {}, fetchImpl: mockFetch });
+    expect(present).toBe(false);
+  });
+
+  test("$PARACHUTE_HUB_PORT overrides the probed port (deterministic for tests)", async () => {
+    const calls: string[] = [];
+    const mockFetch: typeof fetch = async (url) => {
+      calls.push(String(url));
+      return new Response("ok", { status: 200 });
+    };
+    const present = await detectHubPresence({
+      env: { PARACHUTE_HUB_PORT: "59399" },
+      fetchImpl: mockFetch,
+    });
+    expect(present).toBe(true);
+    expect(calls[0]).toBe("http://127.0.0.1:59399/health");
+  });
+});
+
+describe("noOperatorTokenGuidance (#445)", () => {
+  test("hub present → non-circular 'finish in the wizard' copy", () => {
+    const msg = noOperatorTokenGuidance(true);
+    // Does NOT tell the operator to install the hub (circular — this flow ran
+    // *under* the hub).
+    expect(msg).not.toContain("Install the hub");
+    expect(msg).not.toContain("bun add -g @openparachute/hub");
+    expect(msg).toContain("admin wizard mints");
+    expect(msg).toContain("Nothing to do here");
+  });
+
+  test("hub absent → keeps the standalone install-the-hub advice", () => {
+    const msg = noOperatorTokenGuidance(false);
+    expect(msg).toContain("Install the hub");
+    expect(msg).toContain("bun add -g @openparachute/hub");
+    expect(msg).toContain("VAULT_AUTH_TOKEN");
   });
 });
 
