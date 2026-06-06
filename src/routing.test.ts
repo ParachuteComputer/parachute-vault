@@ -1720,6 +1720,67 @@ describe("scope enforcement on /api/*", () => {
     expect(ids).toContain(b.id);
   });
 
+  // ----- vault#404: REST-path hub-JWT tag-scoping enforcement (C0) --------
+  // The MCP path's tag-scope enforcement is covered end-to-end; pin that a
+  // tag-scoped HUB JWT (allowlist carried in the `permissions.scoped_tags`
+  // claim, NOT a vestigial DB row) hitting the REST surface enforces the
+  // same allowlist on both read and write. `mintTagScopedToken` mints a real
+  // hub JWT, so these tests exercise the hub-JWT-sourced `scoped_tags` path.
+
+  test("vault#404: hub-JWT tag-scoped READ via REST enforces the allowlist (list + single)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const inScope = await store.createNote("h", { tags: ["health"] });
+    const outOfScope = await store.createNote("w", { tags: ["work"] });
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["health"]);
+
+    // List: only in-scope notes.
+    const listPath = "/vault/journal/api/notes";
+    const listRes = await route(authed(token, "GET", listPath), listPath);
+    expect(listRes.status).toBe(200);
+    const listBody = (await listRes.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(listBody) ? listBody : (listBody.notes ?? []);
+    const ids = list.map((n) => n.id);
+    expect(ids).toContain(inScope.id);
+    expect(ids).not.toContain(outOfScope.id);
+
+    // Single in-scope → 200; single out-of-scope → 404 (no existence leak).
+    const okPath = `/vault/journal/api/notes/${inScope.id}`;
+    expect((await route(authed(token, "GET", okPath), okPath)).status).toBe(200);
+    const denyPath = `/vault/journal/api/notes/${outOfScope.id}`;
+    expect((await route(authed(token, "GET", denyPath), denyPath)).status).toBe(404);
+  });
+
+  test("vault#404: hub-JWT tag-scoped WRITE via REST enforces the allowlist", async () => {
+    createVault("journal");
+    const token = await mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+
+    // In-scope write → 201.
+    const path = "/vault/journal/api/notes";
+    const okRes = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "ok", tags: ["health"] }),
+      }),
+      path,
+    );
+    expect(okRes.status).toBe(201);
+
+    // Out-of-scope write → 403 tag_scope_violation.
+    const denyRes = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "denied", tags: ["work"] }),
+      }),
+      path,
+    );
+    expect(denyRes.status).toBe(403);
+    const denyBody = (await denyRes.json()) as { error_type?: string };
+    expect(denyBody.error_type).toBe("tag_scope_violation");
+  });
+
   // ----- Q5: tag-delete dependency check ---------------------------------
   // Deleting a tag referenced by any token's scoped_tags would silently
   // orphan the token's allowlist; fail closed with 409 + referenced_by.
