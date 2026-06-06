@@ -83,7 +83,7 @@ export function createNote(
 }
 
 export function getNote(db: Database, id: string): Note | null {
-  const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | undefined;
+  const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | null;
   if (!row) return null;
 
   const note = rowToNote(row);
@@ -111,7 +111,7 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
   if (extension !== undefined) {
     const row = db.prepare(
       "SELECT * FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ?",
-    ).get(path, extension.toLowerCase()) as NoteRow | undefined;
+    ).get(path, extension.toLowerCase()) as NoteRow | null;
     if (!row) return null;
     const note = rowToNote(row);
     note.tags = getNoteTags(db, note.id);
@@ -459,7 +459,7 @@ export function updateNote(
     if (isPathUniqueError(err)) {
       const conflictPath = updates.path !== undefined
         ? (normalizePath(updates.path) ?? updates.path)
-        : ((db.prepare("SELECT path FROM notes WHERE id = ?").get(id) as { path: string | null } | undefined)?.path ?? "<unknown>");
+        : ((db.prepare("SELECT path FROM notes WHERE id = ?").get(id) as { path: string | null } | null)?.path ?? "<unknown>");
       throw new PathConflictError(conflictPath);
     }
     throw err;
@@ -475,7 +475,7 @@ export function updateNote(
 function throwConflictOrMissing(db: Database, id: string, expected: string): never {
   const row = db.prepare("SELECT updated_at, path FROM notes WHERE id = ?").get(id) as
     | { updated_at: string | null; path: string | null }
-    | undefined;
+    | null;
   if (!row) {
     throw new Error(`Note not found: "${id}"`);
   }
@@ -972,7 +972,7 @@ export function listTags(db: Database): { name: string; count: number }[] {
 export function deleteTag(db: Database, name: string): { deleted: boolean; notes_untagged: number } {
   const row = db.prepare("SELECT fields FROM tags WHERE name = ?").get(name) as
     | { fields: string | null }
-    | undefined;
+    | null;
   if (!row) return { deleted: false, notes_untagged: 0 };
 
   const countRow = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?").get(name) as { c: number };
@@ -1133,7 +1133,7 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     for (const { from, to } of renames) {
       const old = readStmt.get(from) as
         | { description: string | null; fields: string | null; relationships: string | null; parent_names: string | null; created_at: string | null }
-        | undefined;
+        | null;
       insertStmt.run(
         to,
         old?.description ?? null,
@@ -1548,11 +1548,11 @@ export function getVaultStats(
 
   const earliestRow = db.prepare(
     "SELECT id, created_at FROM notes ORDER BY created_at ASC, id ASC LIMIT 1",
-  ).get() as { id: string; created_at: string } | undefined;
+  ).get() as { id: string; created_at: string } | null;
 
   const latestRow = db.prepare(
     "SELECT id, created_at FROM notes ORDER BY created_at DESC, id DESC LIMIT 1",
-  ).get() as { id: string; created_at: string } | undefined;
+  ).get() as { id: string; created_at: string } | null;
 
   const monthRows = db.prepare(`
     SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS count

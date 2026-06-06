@@ -106,7 +106,7 @@ function parseMetadata(raw: string | null): Record<string, unknown> | undefined 
 function getNoteSummary(db: Database, noteId: string): NoteSummary | undefined {
   const row = db.prepare(
     "SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id = ?",
-  ).get(noteId) as SummaryRow | undefined;
+  ).get(noteId) as SummaryRow | null;
   if (!row) return undefined;
   return {
     id: row.id,

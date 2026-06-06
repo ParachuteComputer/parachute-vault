@@ -137,7 +137,7 @@ export function resolveWikilink(db: Database, target: string): string | null {
     const extPart = extMatch[2]!.toLowerCase();
     const explicit = db.prepare(
       "SELECT id FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ?",
-    ).get(pathPart, extPart) as { id: string } | undefined;
+    ).get(pathPart, extPart) as { id: string } | null;
     if (explicit) return explicit.id;
     // No match for explicit (path, ext) — fall through to the looser
     // rules so a literal note named `Recipe.v2` (where `v2` isn't an
@@ -199,7 +199,7 @@ export function resolveWikilinkDetailed(db: Database, target: string): WikilinkR
     const extPart = extMatch[2]!.toLowerCase();
     const explicit = db.prepare(
       "SELECT id, path FROM notes WHERE path = ? COLLATE NOCASE AND LOWER(extension) = ?",
-    ).get(pathPart, extPart) as { id: string; path: string } | undefined;
+    ).get(pathPart, extPart) as { id: string; path: string } | null;
     if (explicit) {
       return { resolved: true, note_id: explicit.id, path: explicit.path, candidates: [] };
     }

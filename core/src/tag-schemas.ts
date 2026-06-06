@@ -115,7 +115,7 @@ export function listTagRecords(db: Database): TagRecord[] {
 export function getTagRecord(db: Database, tag: string): TagRecord | null {
   const row = db.prepare(
     "SELECT name, description, fields, relationships, parent_names, created_at, updated_at FROM tags WHERE name = ?",
-  ).get(tag) as TagRow | undefined;
+  ).get(tag) as TagRow | null;
   return row ? rowToRecord(row) : null;
 }
 
@@ -189,7 +189,7 @@ export function listTagSchemas(db: Database): TagSchema[] {
 export function getTagSchema(db: Database, tag: string): TagSchema | null {
   const row = db.prepare(
     "SELECT name, description, fields FROM tags WHERE name = ?",
-  ).get(tag) as { name: string; description: string | null; fields: string | null } | undefined;
+  ).get(tag) as { name: string; description: string | null; fields: string | null } | null;
   if (!row) return null;
   if (row.description === null && row.fields === null) return null;
   return {

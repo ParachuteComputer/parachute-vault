@@ -101,7 +101,7 @@ export function listIndexedFields(db: Database): IndexedField[] {
 export function getIndexedField(db: Database, field: string): IndexedField | null {
   const row = db
     .prepare("SELECT field, sqlite_type, declarer_tags FROM indexed_fields WHERE field = ?")
-    .get(field) as IndexedFieldRow | undefined;
+    .get(field) as IndexedFieldRow | null;
   return row ? rowToField(row) : null;
 }
 
