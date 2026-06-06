@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
 
@@ -208,6 +209,15 @@ export interface HydratedLink extends Link {
 // ---- Store Interface ----
 
 export interface Store {
+  /**
+   * The underlying `bun:sqlite` handle. Exposed (read-only) so callers that
+   * need to run a raw query the Store interface doesn't surface — e.g. the
+   * token-table reverse-lookups in routes.ts and MCP tool generation in
+   * mcp.ts — can reach it without an `(store as any).db` cast. The concrete
+   * `Store` class declares this as `public readonly db: Database`. See vault#242.
+   */
+  readonly db: Database;
+
   // Notes
   createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;

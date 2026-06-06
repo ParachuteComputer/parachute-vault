@@ -567,7 +567,7 @@ async function handleNotesInner(
 ): Promise<Response> {
   const url = new URL(req.url);
   const method = req.method;
-  const db = (store as any).db;
+  const db = store.db;
 
   // ---- Collection routes (no ID in path) ----
   if (subpath === "") {
@@ -1636,7 +1636,7 @@ export async function handleTags(
     // that token's allowlist. Aggregate matches across sources for a single
     // 409 envelope.
     const referenced: { source: string; tokens: { id: string; label: string }[] }[] = [];
-    const db = (store as any).db;
+    const db = store.db;
     for (const src of sources) {
       const tokens = findTokensReferencingTag(db, src as string);
       if (tokens.length > 0) referenced.push({ source: src as string, tokens });
@@ -1800,7 +1800,7 @@ export async function handleTags(
     // tag would silently orphan the token's allowlist. Fail closed (409)
     // and name the offending tokens so the operator can revoke or re-mint
     // before retrying. patterns/tag-scoped-tokens.md §Dependencies.
-    const referenced_by = findTokensReferencingTag((store as any).db, tagName);
+    const referenced_by = findTokensReferencingTag(store.db, tagName);
     if (referenced_by.length > 0) {
       return json(
         {
@@ -1835,7 +1835,7 @@ export async function handleFindPath(
   const target = parseQuery(url, "target");
   if (!source || !target) return json({ error: "source and target parameters are required" }, 400);
 
-  const db = (store as any).db;
+  const db = store.db;
   try {
     const sourceNote = await resolveNote(store, source);
     if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
@@ -1957,7 +1957,7 @@ export function handleUnresolvedWikilinks(
   const url = new URL(req.url);
   const limitStr = url.searchParams.get("limit");
   const limit = limitStr ? parseInt(limitStr, 10) : 50;
-  const db = (store as any).db;
+  const db = store.db;
   const result = listUnresolvedWikilinks(db, limit);
 
   // Unscoped token → return as-is (unchanged behavior).

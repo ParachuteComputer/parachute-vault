@@ -131,7 +131,7 @@ export interface GenerateMcpToolsOpts {
  * delete-tag, find-path, vault-info, prune-schema (admin).
  */
 export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): McpToolDef[] {
-  const db: Database = (store as any).db;
+  const db: Database = store.db;
   const expandVisibility = opts?.expandVisibility;
   const nearTraversable = opts?.nearTraversable;
 
