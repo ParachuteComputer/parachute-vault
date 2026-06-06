@@ -1640,6 +1640,86 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(201);
   });
 
+  // ----- vault#439: near[] BFS is a WALL, not a sieve --------------------
+  // For a tag-scoped token the graph traversal must refuse to walk THROUGH
+  // an out-of-scope note. So an in-scope note reachable ONLY via an
+  // out-of-scope intermediary is unreachable — symmetric with find-path.
+  // Topology: A(#work) --link--> P(#personal) --link--> B(#work).
+  // A token scoped to ["work"] anchored at A, depth 2:
+  //   - sieve (old): B survives (reached via P, then output-filtered to keep B)
+  //   - wall (new):  P is the wall; B is never reached.
+
+  test("vault#439: tag-scoped near[] cannot reach an in-scope note through an out-of-scope hop", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const a = await store.createNote("anchor-work", { tags: ["work"] });
+    const p = await store.createNote("bridge-personal", { tags: ["personal"] });
+    const b = await store.createNote("far-work", { tags: ["work"] });
+    await store.createLink(a.id, p.id, "relates");
+    await store.createLink(p.id, b.id, "relates");
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["work"]);
+
+    // `route`'s second arg is the pathname only; the query rides on req.url.
+    const pathname = "/vault/journal/api/notes";
+    const full = `${pathname}?near[note_id]=${a.id}&near[depth]=2`;
+    const res = await route(authed(token, "GET", full), pathname);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    const ids = list.map((n) => n.id);
+    // B is in-scope (#work) but only reachable via the out-of-scope #personal
+    // bridge — the wall makes it unreachable.
+    expect(ids).not.toContain(b.id);
+    // P itself never leaks (it's out of scope).
+    expect(ids).not.toContain(p.id);
+  });
+
+  test("vault#439: tag-scoped near[] still reaches in-scope notes via in-scope hops", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const a = await store.createNote("anchor-work", { tags: ["work"] });
+    const mid = await store.createNote("mid-work", { tags: ["work"] });
+    const far = await store.createNote("far-work", { tags: ["work"] });
+    await store.createLink(a.id, mid.id, "relates");
+    await store.createLink(mid.id, far.id, "relates");
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["work"]);
+
+    const pathname = "/vault/journal/api/notes";
+    const full = `${pathname}?near[note_id]=${a.id}&near[depth]=2`;
+    const res = await route(authed(token, "GET", full), pathname);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    const ids = list.map((n) => n.id);
+    // All-in-scope path: both mid (depth 1) and far (depth 2) are reachable.
+    expect(ids).toContain(mid.id);
+    expect(ids).toContain(far.id);
+  });
+
+  test("vault#439: UNSCOPED token near[] still walks the full graph (behavior unchanged)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const a = await store.createNote("anchor-work", { tags: ["work"] });
+    const p = await store.createNote("bridge-personal", { tags: ["personal"] });
+    const b = await store.createNote("far-work", { tags: ["work"] });
+    await store.createLink(a.id, p.id, "relates");
+    await store.createLink(p.id, b.id, "relates");
+    // No scopedTags → unscoped admin token; no wall installed.
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:admin"] });
+
+    const pathname = "/vault/journal/api/notes";
+    const full = `${pathname}?near[note_id]=${a.id}&near[depth]=2`;
+    const res = await route(authed(token, "GET", full), pathname);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    const ids = list.map((n) => n.id);
+    // Unscoped: the full neighborhood is visible, including the #personal
+    // bridge and the note beyond it.
+    expect(ids).toContain(p.id);
+    expect(ids).toContain(b.id);
+  });
+
   // ----- Q5: tag-delete dependency check ---------------------------------
   // Deleting a tag referenced by any token's scoped_tags would silently
   // orphan the token's allowlist; fail closed with 409 + referenced_by.

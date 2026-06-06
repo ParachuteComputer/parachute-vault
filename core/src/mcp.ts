@@ -114,6 +114,15 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
  */
 export interface GenerateMcpToolsOpts {
   expandVisibility?: (note: Note) => boolean;
+  /**
+   * `nearTraversable` (vault#439) is an OPTIONAL per-note predicate threaded
+   * into the `near[]` graph BFS. When provided, the traversal refuses to walk
+   * THROUGH any note that fails the predicate — making a tag-scoped `near[]`
+   * query symmetric with `find-path` (scope is a wall, not a sieve). Core
+   * stays scope-unaware: it receives a plain `(noteId) => boolean` closure.
+   * Omitted (unscoped / internal callers) → the full graph is walked.
+   */
+  nearTraversable?: (noteId: string) => boolean;
 }
 
 /**
@@ -124,6 +133,7 @@ export interface GenerateMcpToolsOpts {
 export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): McpToolDef[] {
   const db: Database = (store as any).db;
   const expandVisibility = opts?.expandVisibility;
+  const nearTraversable = opts?.nearTraversable;
 
   return [
 
@@ -305,15 +315,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
         // --- Build near-scope (graph-filtered set of allowed IDs) ---
         //
-        // Tag-scope policy for `near[]` (output-filter, not hop-guard): core
-        // is scope-unaware, so this BFS walks the FULL graph from the anchor —
-        // including out-of-scope intermediate hops. For a tag-scoped session
-        // the server's `applyTagScopeWrappers` (mcp-tools.ts) tag-filters the
-        // RESULT list AFTER execute, so out-of-scope notes never survive into
-        // the response — no content/ids leak. This is ASYMMETRIC with
-        // `find-path`, which guards every hop (it returns the path itself, so
-        // an out-of-scope intermediary would be a leak there). The asymmetry is
-        // deliberate; tracked at vault#439.
+        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
+        // find-path): when the session is tag-scoped the server injects a
+        // `nearTraversable` predicate (mcp-tools.ts), and the BFS refuses to
+        // walk THROUGH out-of-scope notes — scope is a wall, not a sieve. So a
+        // token scoped to ["work"] can't reach an in-scope note at depth 2 via
+        // a #personal intermediary at depth 1. Core stays scope-unaware: it
+        // only invokes the injected closure. Unscoped sessions pass no
+        // predicate → the FULL graph is walked exactly as before. The
+        // `applyTagScopeWrappers` result-filter still runs afterward (defense
+        // in depth), but the wall makes it redundant for `near[]`.
         let nearScope: Set<string> | null = null;
         if (params.near) {
           const near = params.near as { note_id: string; depth?: number; relationship?: string };
@@ -323,6 +334,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           const traversed = linkOps.traverseLinks(db, anchor.id, {
             max_depth: depth,
             relationship: near.relationship,
+            isTraversable: nearTraversable,
           });
           nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
         }

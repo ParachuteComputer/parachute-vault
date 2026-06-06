@@ -13,7 +13,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { getNote, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { getNote, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
@@ -817,16 +817,24 @@ async function handleNotesInner(
         }
         const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
         const relationship = parseQuery(url, "near[relationship]") ?? undefined;
-        // Tag-scope policy for `near[]` (output-filter, not hop-guard): the
-        // BFS walks the FULL graph from the anchor, including out-of-scope
-        // intermediate hops, then the RESULT set is tag-scope-filtered below
-        // (`filterNotesByTagScope`). No out-of-scope content or ids leak —
-        // out-of-scope notes never survive into the response. This is
-        // ASYMMETRIC with `find-path`, which guards every hop (it returns the
-        // path itself, so an out-of-scope intermediary would be a leak there).
-        // The asymmetry is deliberate; tracked at vault#439 should we ever want
-        // `near[]` to also constrain traversal hops.
-        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship });
+        // Tag-scope policy for `near[]` (vault#439 — hop-guard, symmetric with
+        // find-path): for a tag-scoped token the BFS refuses to traverse
+        // THROUGH out-of-scope notes — scope is a wall, not a sieve. So a token
+        // scoped to ["work"] can't reach an in-scope note at depth 2 via a
+        // #personal intermediary at depth 1; that note is simply unreachable.
+        // The `filterNotesByTagScope` pass below still runs (defense in depth),
+        // but the wall makes it redundant for the `near[]` result set.
+        // Unscoped tokens (`tagScope.raw === null`) install no predicate → the
+        // FULL graph is walked exactly as before, behavior unchanged.
+        const isTraversable = tagScope.raw
+          ? (id: string) =>
+              noteWithinTagScope(
+                { id, tags: getNoteTags(db, id) } as any,
+                tagScope.allowed,
+                tagScope.raw,
+              )
+          : undefined;
+        const traversed = linkOps.traverseLinks(db, anchor.id, { max_depth: depth, relationship, isTraversable });
         const nearScope = new Set([anchor.id, ...traversed.map((t) => t.noteId)]);
         results = results.filter((n) => nearScope.has(n.id));
       }

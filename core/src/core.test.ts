@@ -4,6 +4,7 @@ import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
 import { initSchema } from "./schema.js";
 import { decodeCursor } from "./cursor.js";
+import { traverseLinks } from "./links.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -1893,6 +1894,59 @@ describe("links", async () => {
     await store.createLink("a", "b", "mentions"); // duplicate
     const links = await store.getLinks("a");
     expect(links.filter((l) => l.relationship === "mentions")).toHaveLength(1);
+  });
+
+  // vault#439 — traverseLinks isTraversable predicate (wall, not sieve).
+  // Topology: a -> b(blocked) -> c. A predicate that blocks `b` must make
+  // `c` unreachable (the BFS can't walk THROUGH b), not merely filtered out.
+  it("traverseLinks: isTraversable predicate is a wall (can't reach past a blocked hop)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "relates");
+    await store.createLink("b", "c", "relates");
+
+    const blocked = traverseLinks(db, "a", {
+      max_depth: 5,
+      isTraversable: (id) => id !== "b",
+    });
+    const ids = blocked.map((t) => t.noteId);
+    expect(ids).not.toContain("b"); // blocked hop is excluded from results
+    expect(ids).not.toContain("c"); // and unreachable beyond it
+  });
+
+  it("traverseLinks: no predicate walks the full graph (unchanged)", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createLink("a", "b", "relates");
+    await store.createLink("b", "c", "relates");
+
+    const all = traverseLinks(db, "a", { max_depth: 5 });
+    const ids = all.map((t) => t.noteId);
+    expect(ids).toContain("b");
+    expect(ids).toContain("c");
+  });
+
+  it("traverseLinks: an allowed alternate path still reaches the far node", async () => {
+    // a -> b(blocked) -> d ; a -> c(allowed) -> d. d reachable via c.
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    await store.createNote("C", { id: "c" });
+    await store.createNote("D", { id: "d" });
+    await store.createLink("a", "b", "relates");
+    await store.createLink("b", "d", "relates");
+    await store.createLink("a", "c", "relates");
+    await store.createLink("c", "d", "relates");
+
+    const res = traverseLinks(db, "a", {
+      max_depth: 5,
+      isTraversable: (id) => id !== "b",
+    });
+    const ids = res.map((t) => t.noteId);
+    expect(ids).not.toContain("b");
+    expect(ids).toContain("c");
+    expect(ids).toContain("d"); // reachable via the allowed c-path
   });
 });
 
