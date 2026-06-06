@@ -30,7 +30,7 @@ const testDir = join(
 process.env.PARACHUTE_HOME = testDir;
 
 // Dynamic import after env override so modules pick up the tmp dir.
-const { route } = await import("./routing.ts");
+const { route, filterVaultListForBinding } = await import("./routing.ts");
 const {
   readGlobalConfig,
   writeGlobalConfig,
@@ -315,6 +315,56 @@ describe("GET /vaults/list (public discovery)", () => {
     const req = new Request("http://localhost:1940/vaults");
     const res = await route(req, "/vaults");
     expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /vaults — authenticated metadata listing, filtered by vault binding
+// (vault#259). Operator / admin-channel callers (vault_name === null) see the
+// full list; a vault-bound caller sees only its own vault.
+// ---------------------------------------------------------------------------
+
+describe("GET /vaults (binding filter — vault#259)", () => {
+  // Pure policy helper — drives the filtering decision independent of the
+  // auth path (no current credential yields a non-null vault_name HERE, since
+  // authenticateGlobalRequest 401s hub JWTs; the helper pins the correct
+  // shape for any future vault-bound credential on this surface).
+  test("filterVaultListForBinding: null binding (operator) keeps the full list", () => {
+    const names = ["work", "boulder", "default"];
+    expect(filterVaultListForBinding(names, null)).toEqual(names);
+  });
+
+  test("filterVaultListForBinding: a vault-bound caller sees only its own vault", () => {
+    const names = ["work", "boulder", "default"];
+    expect(filterVaultListForBinding(names, "work")).toEqual(["work"]);
+    // No cross-vault info-leak: boulder/default are not disclosed.
+    expect(filterVaultListForBinding(names, "work")).not.toContain("boulder");
+    expect(filterVaultListForBinding(names, "work")).not.toContain("default");
+  });
+
+  test("filterVaultListForBinding: binding to a vault absent from the list yields empty", () => {
+    expect(filterVaultListForBinding(["work", "default"], "ghost")).toEqual([]);
+  });
+
+  test("operator token (VAULT_AUTH_TOKEN) gets the UNFILTERED full listing", async () => {
+    createVault("work");
+    createVault("boulder");
+    createVault("default");
+    const prev = process.env.VAULT_AUTH_TOKEN;
+    process.env.VAULT_AUTH_TOKEN = "op-secret-token-259";
+    try {
+      const req = new Request("http://localhost:1940/vaults", {
+        headers: { authorization: "Bearer op-secret-token-259" },
+      });
+      const res = await route(req, "/vaults");
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { vaults: { name: string }[] };
+      const names = body.vaults.map((v) => v.name);
+      expect(new Set(names)).toEqual(new Set(["work", "boulder", "default"]));
+    } finally {
+      if (prev === undefined) delete process.env.VAULT_AUTH_TOKEN;
+      else process.env.VAULT_AUTH_TOKEN = prev;
+    }
   });
 });
 
