@@ -797,7 +797,7 @@ function migrateToV15(db: Database): void {
     // 2. Copy `_schema_defaults` note → schema_mappings.
     const mappingNote = db.prepare(
       "SELECT metadata FROM notes WHERE path = '_schema_defaults'",
-    ).get() as { metadata: string | null } | undefined;
+    ).get() as { metadata: string | null } | null;
     if (mappingNote?.metadata) {
       const insertMapping = db.prepare(
         "INSERT OR IGNORE INTO schema_mappings (schema_name, match_kind, match_value) VALUES (?, ?, ?)",

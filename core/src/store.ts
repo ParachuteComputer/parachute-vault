@@ -730,7 +730,7 @@ export class BunSqliteStore implements Store {
     // Scope by noteId so a token authorized for note A can't delete note B's attachments.
     const row = this.db.prepare(
       "SELECT path FROM attachments WHERE id = ? AND note_id = ?",
-    ).get(attachmentId, noteId) as { path: string } | undefined;
+    ).get(attachmentId, noteId) as { path: string } | null;
     if (!row) return { deleted: false, path: null, orphaned: false };
 
     this.db.prepare("DELETE FROM attachments WHERE id = ? AND note_id = ?").run(attachmentId, noteId);
@@ -756,7 +756,7 @@ export class BunSqliteStore implements Store {
   async getAttachment(attachmentId: string): Promise<Attachment | null> {
     const row = this.db.prepare(
       "SELECT * FROM attachments WHERE id = ?",
-    ).get(attachmentId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string } | undefined;
+    ).get(attachmentId) as { id: string; note_id: string; path: string; mime_type: string; metadata: string | null; created_at: string } | null;
     if (!row) return null;
     let metadata: Record<string, unknown> | undefined;
     if (row.metadata && row.metadata !== "{}") {
