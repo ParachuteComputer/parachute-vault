@@ -591,17 +591,22 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           throw e;
         }
 
-        // Apply tag schema effects
+        // Apply tag schema effects, then re-read so the response reflects the
+        // final on-disk state (the `created` entries were read before
+        // `applySchemaDefaults` ran, so any default-filled metadata isn't on
+        // them yet). This mirrors the update-note path, which already re-reads
+        // post-defaults. The extra `getNote` is one read per note and only
+        // matters when a tag schema actually declared defaults.
         for (const note of created) {
           if (note.tags && note.tags.length > 0) {
             await applySchemaDefaults(store, db, [note.id], note.tags);
           }
         }
+        const refreshed = created.map((n) => noteOps.getNote(db, n.id) ?? n);
 
-        // Re-read after schema-default population so the response reflects the
-        // final on-disk state, then attach `validation_status` from any
-        // tag's `fields` declaration that applies to this note.
-        const final = created.map((n) => attachValidationStatus(store, db, n));
+        // Attach `validation_status` from any tag's `fields` declaration that
+        // applies to this note, against the post-defaults state.
+        const final = refreshed.map((n) => attachValidationStatus(store, db, n));
         return batch ? final : final[0];
       },
     },

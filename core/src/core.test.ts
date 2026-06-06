@@ -2067,6 +2067,41 @@ describe("MCP tools", async () => {
     expect(result[1].tags).toContain("doc");
   });
 
+  // vault#316 — the create-note tool re-reads each note AFTER
+  // `applySchemaDefaults` runs, so the response reflects the post-defaults
+  // on-disk state (matching the update-note path). Before the fix the
+  // response mapped over the pre-defaults in-memory objects, so a
+  // schema-default-filled field was missing from the returned note even
+  // though it had just been written to disk.
+  it("create-note response reflects post-applySchemaDefaults state (vault#316)", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+
+    // Single: default lands in the returned metadata.
+    const single = await createNote.execute({
+      content: "do the thing",
+      path: "Inbox/task-1",
+      tags: ["task"],
+    }) as any;
+    expect(single.metadata?.priority).toBe("high"); // first enum value
+    // Disk and response agree.
+    const onDisk = await store.getNoteByPath("Inbox/task-1");
+    expect((onDisk!.metadata as any)?.priority).toBe("high");
+
+    // Batch: each entry is re-read post-defaults too.
+    const batch = await createNote.execute({
+      notes: [
+        { content: "a", path: "Inbox/task-2", tags: ["task"] },
+        { content: "b", path: "Inbox/task-3", tags: ["task"] },
+      ],
+    }) as any[];
+    expect(batch[0].metadata?.priority).toBe("high");
+    expect(batch[1].metadata?.priority).toBe("high");
+  });
+
   it("create-note accepts extension field (vault#328)", async () => {
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
