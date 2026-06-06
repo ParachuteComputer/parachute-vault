@@ -271,8 +271,15 @@ export async function detectHubPresence(opts: {
   //    signal — no need to probe. We pass `hubPort` purely as the loopback
   //    fallback arg; its only role here is the source discriminator.
   const configured = chooseHubOrigin(hubPort, env);
-  // A stale expose-state can false-positive here — acceptable: this only
-  // selects guidance copy, never gates behavior.
+  // A stale expose-state (or a leftover PARACHUTE_HUB_ORIGIN) can
+  // false-positive here. Originally this only selected guidance copy, but as
+  // of hub#580 it ALSO gates `vault init`'s daemon registration default
+  // (hub present → skip autostart). The false-positive failure mode is
+  // therefore: a genuinely hubless box with stale hub-origin state runs init
+  // without a flag and silently skips registering a daemon. Narrow + accepted
+  // — the operator can re-run with `--autostart`, and any explicit flag or a
+  // persisted `config.autostart` short-circuits the probe entirely. See the
+  // call site in cli.ts for the persisted-value guard.
   if (configured.source !== "loopback") return true;
 
   // 2. Live health probe against the hub's fixed loopback port.

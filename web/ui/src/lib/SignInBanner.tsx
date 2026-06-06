@@ -9,21 +9,31 @@
  *      `/admin/vault-admin-token/<name>` returns 401.
  *   2. The session cookie expired or was revoked. Same 401 from hub.
  *   3. Operator is signed in but isn't the first admin (the multi-user
- *      Phase 1 gate). Hub returns 403.
+ *      Phase 1 gate). Hub returns 403 (`not_admin`).
  *   4. The vault name isn't installed on this hub. Hub returns 404.
  *
  * For cases 1+2 the operator needs to sign in at hub's `/login`. We
  * surface a direct link with a `?next=` continuation back to the current
- * URL so they land back on the admin page once authenticated. Cases 3+4
- * also show the link — there isn't a better unblock from the SPA's side
- * (a "sign out, sign in as someone else" is rare in single-operator
- * deploys; a 404 means the vault isn't reachable through this hub at
- * all, which is operationally distinct but rendering-equivalent).
+ * URL so they land back on the admin page once authenticated.
  *
- * To make the recovery loop genuinely hands-off, the banner polls
- * `ensureToken` every 5s. The instant the operator signs into the hub
- * in another tab, the next poll succeeds and `onRecovered()` fires so
- * the parent route re-attempts its data load. No manual refresh needed.
+ * Case 3 (403) is different: the operator IS signed in — they just aren't
+ * the hub admin, and vault management is admin-only (multi-user Phase 1).
+ * Sending them to `/login` loops them forever: they sign in again as the
+ * same non-admin, get the same 403, repeat (vault#451). So we branch the
+ * 403 to "you're signed in, but this is admin-only" copy with a link to
+ * `/account/` (their actual home on the hub) instead of the sign-in CTA.
+ * The recovery poll is also stopped for 403 — re-minting can never succeed
+ * for a non-admin session, so polling would burn requests with no payoff.
+ *
+ * Case 4 (404) shows distinct "no such vault" copy but keeps the sign-in
+ * CTA + poll (rendering-equivalent to the 401 path — there's no better
+ * SPA-side unblock for a vault that isn't reachable through this hub).
+ *
+ * To make the recovery loop genuinely hands-off for the recoverable cases
+ * (401/404/null), the banner polls `ensureToken` every 5s. The instant the
+ * operator signs into the hub in another tab, the next poll succeeds and
+ * `onRecovered()` fires so the parent route re-attempts its data load. No
+ * manual refresh needed.
  *
  * The poll is gated on `document.visibilityState === "visible"` so a
  * background tab doesn't spam the hub once a minute for a session that
@@ -39,13 +49,14 @@ export interface SignInBannerProps {
    *  `?next=` parameter on the hub `/login` link. */
   vaultName: string;
   /**
-   * Status code from the most recent attempt. Lets us tweak the copy a
-   * little — 404 means "this hub doesn't host that vault" rather than
-   * "sign in" — though all four (401/403/404 + null) surface the same
-   * sign-in CTA since hub login is the only safe unblock from the SPA's
-   * side. `null` = first attempt failed before we got a status (e.g.
-   * `getToken()` returned null at bootstrap and we never even tried the
-   * mint endpoint).
+   * Status code from the most recent attempt. Drives the copy + CTA:
+   *   - 401 / null → "you're not signed in" + sign-in CTA (the recoverable
+   *     default; `null` = first attempt failed before a status, e.g.
+   *     `getToken()` returned null at bootstrap and we never hit the mint
+   *     endpoint).
+   *   - 403 → "you're signed in, but management is admin-only" + a link to
+   *     `/account/` (vault#451 — sign-in would loop a non-admin forever).
+   *   - 404 → "this hub doesn't host that vault" + sign-in CTA.
    */
   status?: number | null;
   /** Called when the poll succeeds. Parent re-fires its data load. */
@@ -53,7 +64,13 @@ export interface SignInBannerProps {
 }
 
 export function SignInBanner({ vaultName, status, onRecovered }: SignInBannerProps) {
+  // A 403 (`not_admin`) can never recover for this session — the operator is
+  // signed in but isn't the hub admin. Polling would re-mint forever with no
+  // payoff, so we don't start the poll at all. See vault#451.
+  const isForbidden = status === 403;
+
   useEffect(() => {
+    if (isForbidden) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -101,7 +118,24 @@ export function SignInBanner({ vaultName, status, onRecovered }: SignInBannerPro
         document.removeEventListener("visibilitychange", onVisibility);
       }
     };
-  }, [vaultName, onRecovered]);
+  }, [vaultName, onRecovered, isForbidden]);
+
+  // 403: signed in but not the hub admin. Don't offer sign-in (it loops);
+  // point them at their account home instead. No auto-refresh — this state
+  // can't recover for a non-admin session.
+  if (isForbidden) {
+    return (
+      <div className="warn-banner" role="status">
+        <p style={{ margin: "0 0 0.5rem" }}>
+          You're signed in, but vault management is restricted to the hub admin.{" "}
+          <a href="/account/">Go to your account →</a>
+        </p>
+        <p className="dim" style={{ margin: 0, fontSize: "0.85rem" }}>
+          Ask the hub admin if you need access to manage this vault.
+        </p>
+      </div>
+    );
+  }
 
   const next = composeNext();
   const loginHref = `/login?next=${encodeURIComponent(next)}`;

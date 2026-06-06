@@ -104,6 +104,7 @@ import { resolveBindHostname } from "./bind.ts";
 import { listTokens, revokeToken, migrateVaultKeys } from "./token-store.ts";
 import { VAULT_SCOPES } from "./scopes.ts";
 import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
+import { decideAutostart } from "./autostart.ts";
 import { getVaultStore } from "./vault-store.ts";
 import {
   defaultMirrorConfig,
@@ -275,12 +276,16 @@ async function cmdInit(args: string[] = []) {
   const flagMcpOff = args.includes("--no-mcp");
   const flagTokenOn = args.includes("--token");
   const flagTokenOff = args.includes("--no-token");
-  // --autostart / --no-autostart toggle daemon registration. Default is on
-  // (preserves historical behavior). When --no-autostart is passed, init
-  // skips registering with launchd / systemd AND removes any prior
-  // registration — for CI, dev sandboxes, Docker, or any environment where
-  // another supervisor manages the process. --no-autostart wins over
-  // --autostart on the same command line (safer-default precedence).
+  // --autostart / --no-autostart toggle daemon registration. The default is
+  // context-aware (resolved by decideAutostart below): ON for standalone
+  // deploys, but OFF when a hub supervisor is detected, since the hub owns
+  // vault's lifecycle and a launchd/systemd unit would race it for :1940
+  // (ParachuteComputer/parachute-hub#580). --no-autostart always skips
+  // registering AND removes any prior registration — for CI, dev sandboxes,
+  // Docker, or any environment where another supervisor manages the process.
+  // --autostart forces registration even under a hub (logged with a warning).
+  // --no-autostart wins over --autostart on the same command line
+  // (safer-default precedence).
   const flagAutostartOn = args.includes("--autostart");
   const flagAutostartOff = args.includes("--no-autostart");
 
@@ -417,37 +422,73 @@ async function cmdInit(args: string[] = []) {
   // a folder move; this refreshes ~/.parachute/server-path and bounces the
   // daemon so the new location takes effect immediately.
   //
-  // Autostart precedence (resolved here so the user's prior config is
-  // honored on re-runs that don't pass a flag):
-  //   1. --no-autostart on this run → false (and persisted)
-  //   2. --autostart on this run    → true  (and persisted)
-  //   3. Existing config.autostart  → that value
-  //   4. Default                    → true (historical behavior)
+  // Autostart precedence is resolved by `decideAutostart` (pure, unit-tested):
+  //   1. --no-autostart on this run             → false (and persisted)
+  //   2. --autostart on this run                → true  (and persisted; warns
+  //                                                if a supervised hub was seen)
+  //   3. Existing config.autostart              → that value
+  //   4. Hub present, no flag, no persisted val → false (the hub supervisor
+  //                                                owns the lifecycle — #580)
+  //   5. Default                                → true  (standalone deploys
+  //                                                genuinely need a daemon)
   // When false: skip register AND uninstall any prior registration so the
-  // flag's intent ("don't auto-start / don't auto-restart") matches reality
+  // decision's intent ("don't auto-start / don't auto-restart") matches reality
   // even if a previous run had registered a daemon.
-  let autostartEnabled: boolean;
-  if (flagAutostartOff) autostartEnabled = false;
-  else if (flagAutostartOn) autostartEnabled = true;
-  else if (typeof globalConfig.autostart === "boolean") autostartEnabled = globalConfig.autostart;
-  else autostartEnabled = true;
+  //
+  // The hub probe runs only when neither flag was passed AND no value is
+  // persisted — i.e. only when the hub signal can actually change the outcome.
+  // It targets the hub's fixed loopback port (1939 / $PARACHUTE_HUB_PORT) and
+  // never throws (see detectHubPresence). We skip it when a flag/persisted
+  // value already decides, to avoid an 800ms wait on a flagged run.
+  //
+  // False-positive risk: a stale expose-state / leftover PARACHUTE_HUB_ORIGIN
+  // makes detectHubPresence return true on a genuinely hubless box, so init
+  // silently skips registering a daemon. Narrow + accepted — recover with
+  // `parachute-vault init --autostart`. The pre-decided guard below means any
+  // explicit flag or persisted value never even reaches the probe.
+  const autostartPreDecided =
+    flagAutostartOff || flagAutostartOn || typeof globalConfig.autostart === "boolean";
+  const hubPresentForAutostart = autostartPreDecided ? false : await detectHubPresence();
+  const autostartDecision = decideAutostart({
+    flagOn: flagAutostartOn,
+    flagOff: flagAutostartOff,
+    persisted: globalConfig.autostart,
+    hubPresent: hubPresentForAutostart,
+  });
+  const autostartEnabled = autostartDecision.enabled;
 
-  if (flagAutostartOff || flagAutostartOn) {
+  if (autostartDecision.persist) {
     globalConfig.autostart = autostartEnabled;
     writeGlobalConfig(globalConfig);
   }
 
   let serverPath: string | null = null;
   if (!autostartEnabled) {
-    console.log("Autostart disabled — skipping daemon registration.");
+    if (autostartDecision.reason === "hub-default-off") {
+      console.log(
+        "Hub supervisor detected — not registering a separate daemon. The hub manages vault's lifecycle.",
+      );
+      console.log("  To force a standalone daemon anyway: parachute-vault init --autostart");
+    } else {
+      console.log("Autostart disabled — skipping daemon registration.");
+    }
     if (isMac) {
       await uninstallAgent();
     } else if (isLinux && isSystemdAvailable()) {
       await uninstallSystemdService();
     }
     console.log("  To run vault: parachute-vault serve   (or use your own supervisor)");
-    console.log("  To re-enable: parachute-vault init --autostart");
+    if (autostartDecision.reason !== "hub-default-off") {
+      console.log("  To re-enable: parachute-vault init --autostart");
+    }
   } else {
+    if (autostartDecision.overrodeHub) {
+      console.log(
+        "Warning: a supervised hub was detected, but --autostart was passed — registering a "
+          + "standalone daemon anyway. This can race the hub supervisor for the vault port; "
+          + "prefer letting the hub manage vault unless you know you need both.",
+      );
+    }
     console.log("Installing daemon...");
     if (isMac) {
       ({ serverPath } = await installAgent());
@@ -3657,13 +3698,20 @@ Setup:
                                            --vault-name skips the prompt and names the vault
                                            (lowercase alphanumeric, hyphens, underscores;
                                            omit to be prompted interactively, default "default").
-                                           --autostart (default) registers vault with launchd /
-                                           systemd so it starts on boot AND auto-restarts on
-                                           crash. --no-autostart skips daemon registration AND
-                                           uninstalls any prior registration — for CI, dev
-                                           sandboxes, Docker, or environments where another
-                                           supervisor manages the process. Persists in
-                                           config.yaml as 'autostart: true|false'.
+                                           --autostart registers vault with launchd / systemd so
+                                           it starts on boot AND auto-restarts on crash; it forces
+                                           registration even when a hub supervisor is detected
+                                           (logged with a warning). --no-autostart skips daemon
+                                           registration AND uninstalls any prior registration — for
+                                           CI, dev sandboxes, Docker, or environments where another
+                                           supervisor manages the process. Default: register when
+                                           standalone, but skip when a hub is detected (the hub
+                                           supervisor owns vault's lifecycle). An explicit flag
+                                           persists in config.yaml as 'autostart: true|false'.
+                                           Upgrade note: a box with a persisted 'autostart: true'
+                                           (from an earlier explicit --autostart) keeps registering
+                                           even under a hub — run init --no-autostart once to clear
+                                           it and let the hub manage vault.
   parachute-vault doctor                   Diagnose install/config issues
   parachute-vault uninstall [--wipe] [--yes]
                                            Remove daemon + MCP entry; --wipe also removes vaults, .env,
