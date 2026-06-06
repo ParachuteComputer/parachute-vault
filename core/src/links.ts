@@ -255,14 +255,26 @@ export interface TraversalNode {
 /**
  * Traverse the link graph from a starting note up to `maxDepth` hops.
  * Returns all reachable notes with their depth and how they were reached.
+ *
+ * `isTraversable` (vault#439) is an OPTIONAL per-note predicate. When
+ * provided, a neighbor that fails the predicate is treated as a WALL: it is
+ * neither added to the results nor pushed onto the frontier, so the BFS
+ * cannot reach further notes THROUGH it. This makes a tag-scoped traversal
+ * symmetric with `find-path` (which guards every hop) — scope acts as a wall,
+ * not a sieve. Omitted (every unscoped / internal caller) → the full graph is
+ * walked exactly as before. Core stays scope-unaware: it receives a plain
+ * `(noteId) => boolean` closure and never imports the server's tag-scope
+ * module. The anchor `noteId` is never passed through the predicate — the
+ * caller is responsible for confirming the anchor is in scope before calling.
  */
 export function traverseLinks(
   db: Database,
   noteId: string,
-  opts?: { max_depth?: number; relationship?: string },
+  opts?: { max_depth?: number; relationship?: string; isTraversable?: (noteId: string) => boolean },
 ): TraversalNode[] {
   const maxDepth = opts?.max_depth ?? 2;
   const relFilter = opts?.relationship;
+  const isTraversable = opts?.isTraversable;
   const visited = new Set<string>([noteId]);
   const results: TraversalNode[] = [];
   let frontier = [noteId];
@@ -286,6 +298,10 @@ export function traverseLinks(
       for (const row of outbound) {
         if (!visited.has(row.target_id)) {
           visited.add(row.target_id);
+          // Wall (vault#439): an out-of-scope neighbor is marked visited (so
+          // it isn't re-evaluated) but is NOT added to the frontier or the
+          // results — the BFS can't traverse THROUGH it to reach notes beyond.
+          if (isTraversable && !isTraversable(row.target_id)) continue;
           nextFrontier.push(row.target_id);
           results.push({
             noteId: row.target_id,
@@ -311,6 +327,8 @@ export function traverseLinks(
       for (const row of inbound) {
         if (!visited.has(row.source_id)) {
           visited.add(row.source_id);
+          // Wall (vault#439): see the outbound branch above.
+          if (isTraversable && !isTraversable(row.source_id)) continue;
           nextFrontier.push(row.source_id);
           results.push({
             noteId: row.source_id,

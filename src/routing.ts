@@ -180,6 +180,23 @@ function handleParachuteIcon(): Response {
   });
 }
 
+/**
+ * Filter a server-wide vault-name list for a caller's per-vault binding
+ * (vault#259). `vaultName === null` is the operator / admin-channel caller
+ * (server-wide VAULT_AUTH_TOKEN or legacy cross-vault config.yaml key) — they
+ * keep the FULL list. A non-null binding reduces the list to just that vault
+ * (empty if the bound vault isn't in the listing). Pure + exported so the
+ * policy is unit-testable independent of the auth path. See the `/vaults`
+ * handler for the full rationale.
+ */
+export function filterVaultListForBinding(
+  names: string[],
+  vaultName: string | null,
+): string[] {
+  if (vaultName === null) return names;
+  return names.filter((name) => name === vaultName);
+}
+
 export async function route(
   req: Request,
   path: string,
@@ -286,10 +303,24 @@ export async function route(
   }
 
   // Authenticated vault metadata list.
+  //
+  // Vault-binding filter (vault#259, info-leak follow-up): `/vaults` is a
+  // cross-vault DISCOVERY endpoint, not a single-vault operational one (unlike
+  // /mcp, which legitimately routes a vault-bound token back into its own
+  // vault). A caller bound to one vault shouldn't learn that OTHER vaults exist
+  // on this server. So when the authenticated caller carries a per-vault
+  // binding (`auth.vault_name !== null`), the listing is reduced to just that
+  // vault. Operator / admin-channel callers — the server-wide VAULT_AUTH_TOKEN
+  // and legacy cross-vault config.yaml keys — have `vault_name === null` and
+  // keep the full listing (they're explicitly the cross-vault management
+  // channel). `authenticateGlobalRequest` already 401s hub JWTs here, so the
+  // only callers that reach this point today are operator-channel
+  // (`vault_name === null`); this filter is the security-correct shape for any
+  // future vault-bound credential that becomes accepted on this surface.
   if (path === "/vaults" && req.method === "GET") {
     const auth = await authenticateGlobalRequest(req);
     if ("error" in auth) return auth.error;
-    const names = listVaults();
+    const names = filterVaultListForBinding(listVaults(), auth.vault_name);
     const vaults = names.map((name) => {
       const config = readVaultConfig(name);
       return {

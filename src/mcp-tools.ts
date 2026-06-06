@@ -7,6 +7,7 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef } from "../core/src/mcp.ts";
+import { getNoteTags } from "../core/src/notes.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -135,9 +136,27 @@ export function generateScopedMcpTools(
     ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
     : undefined;
 
+  // Tag-scope hop-guard for `near[]` (vault#439): a per-note predicate the
+  // core BFS consults so it refuses to traverse THROUGH out-of-scope notes —
+  // symmetric with find-path. Reads from the SAME shared `allowedHolder` the
+  // result-filter populates; the query-notes wrapper `await getAllowed()`s
+  // (which fills the holder) before core's execute runs the BFS, so the
+  // allowlist is ready by the time this fires. Looks up each candidate note's
+  // tags by id (sync, core-native). Unscoped sessions install no predicate.
+  const nearTraversable = scoped
+    ? (noteId: string) =>
+        noteWithinTagScope(
+          { id: noteId, tags: getNoteTags(store.db, noteId) } as Note,
+          allowedHolder.value,
+          rawTags,
+        )
+    : undefined;
+
   const tools = generateMcpTools(
     store,
-    expandVisibility ? { expandVisibility } : undefined,
+    expandVisibility || nearTraversable
+      ? { ...(expandVisibility ? { expandVisibility } : {}), ...(nearTraversable ? { nearTraversable } : {}) }
+      : undefined,
   );
 
   overrideVaultInfo(tools, vaultName, auth);

@@ -30,7 +30,7 @@ const testDir = join(
 process.env.PARACHUTE_HOME = testDir;
 
 // Dynamic import after env override so modules pick up the tmp dir.
-const { route } = await import("./routing.ts");
+const { route, filterVaultListForBinding } = await import("./routing.ts");
 const {
   readGlobalConfig,
   writeGlobalConfig,
@@ -315,6 +315,56 @@ describe("GET /vaults/list (public discovery)", () => {
     const req = new Request("http://localhost:1940/vaults");
     const res = await route(req, "/vaults");
     expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /vaults — authenticated metadata listing, filtered by vault binding
+// (vault#259). Operator / admin-channel callers (vault_name === null) see the
+// full list; a vault-bound caller sees only its own vault.
+// ---------------------------------------------------------------------------
+
+describe("GET /vaults (binding filter — vault#259)", () => {
+  // Pure policy helper — drives the filtering decision independent of the
+  // auth path (no current credential yields a non-null vault_name HERE, since
+  // authenticateGlobalRequest 401s hub JWTs; the helper pins the correct
+  // shape for any future vault-bound credential on this surface).
+  test("filterVaultListForBinding: null binding (operator) keeps the full list", () => {
+    const names = ["work", "boulder", "default"];
+    expect(filterVaultListForBinding(names, null)).toEqual(names);
+  });
+
+  test("filterVaultListForBinding: a vault-bound caller sees only its own vault", () => {
+    const names = ["work", "boulder", "default"];
+    expect(filterVaultListForBinding(names, "work")).toEqual(["work"]);
+    // No cross-vault info-leak: boulder/default are not disclosed.
+    expect(filterVaultListForBinding(names, "work")).not.toContain("boulder");
+    expect(filterVaultListForBinding(names, "work")).not.toContain("default");
+  });
+
+  test("filterVaultListForBinding: binding to a vault absent from the list yields empty", () => {
+    expect(filterVaultListForBinding(["work", "default"], "ghost")).toEqual([]);
+  });
+
+  test("operator token (VAULT_AUTH_TOKEN) gets the UNFILTERED full listing", async () => {
+    createVault("work");
+    createVault("boulder");
+    createVault("default");
+    const prev = process.env.VAULT_AUTH_TOKEN;
+    process.env.VAULT_AUTH_TOKEN = "op-secret-token-259";
+    try {
+      const req = new Request("http://localhost:1940/vaults", {
+        headers: { authorization: "Bearer op-secret-token-259" },
+      });
+      const res = await route(req, "/vaults");
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { vaults: { name: string }[] };
+      const names = body.vaults.map((v) => v.name);
+      expect(new Set(names)).toEqual(new Set(["work", "boulder", "default"]));
+    } finally {
+      if (prev === undefined) delete process.env.VAULT_AUTH_TOKEN;
+      else process.env.VAULT_AUTH_TOKEN = prev;
+    }
   });
 });
 
@@ -1638,6 +1688,147 @@ describe("scope enforcement on /api/*", () => {
       path,
     );
     expect(res.status).toBe(201);
+  });
+
+  // ----- vault#439: near[] BFS is a WALL, not a sieve --------------------
+  // For a tag-scoped token the graph traversal must refuse to walk THROUGH
+  // an out-of-scope note. So an in-scope note reachable ONLY via an
+  // out-of-scope intermediary is unreachable — symmetric with find-path.
+  // Topology: A(#work) --link--> P(#personal) --link--> B(#work).
+  // A token scoped to ["work"] anchored at A, depth 2:
+  //   - sieve (old): B survives (reached via P, then output-filtered to keep B)
+  //   - wall (new):  P is the wall; B is never reached.
+
+  test("vault#439: tag-scoped near[] cannot reach an in-scope note through an out-of-scope hop", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const a = await store.createNote("anchor-work", { tags: ["work"] });
+    const p = await store.createNote("bridge-personal", { tags: ["personal"] });
+    const b = await store.createNote("far-work", { tags: ["work"] });
+    await store.createLink(a.id, p.id, "relates");
+    await store.createLink(p.id, b.id, "relates");
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["work"]);
+
+    // `route`'s second arg is the pathname only; the query rides on req.url.
+    const pathname = "/vault/journal/api/notes";
+    const full = `${pathname}?near[note_id]=${a.id}&near[depth]=2`;
+    const res = await route(authed(token, "GET", full), pathname);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    const ids = list.map((n) => n.id);
+    // B is in-scope (#work) but only reachable via the out-of-scope #personal
+    // bridge — the wall makes it unreachable.
+    expect(ids).not.toContain(b.id);
+    // P itself never leaks (it's out of scope).
+    expect(ids).not.toContain(p.id);
+  });
+
+  test("vault#439: tag-scoped near[] still reaches in-scope notes via in-scope hops", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const a = await store.createNote("anchor-work", { tags: ["work"] });
+    const mid = await store.createNote("mid-work", { tags: ["work"] });
+    const far = await store.createNote("far-work", { tags: ["work"] });
+    await store.createLink(a.id, mid.id, "relates");
+    await store.createLink(mid.id, far.id, "relates");
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["work"]);
+
+    const pathname = "/vault/journal/api/notes";
+    const full = `${pathname}?near[note_id]=${a.id}&near[depth]=2`;
+    const res = await route(authed(token, "GET", full), pathname);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    const ids = list.map((n) => n.id);
+    // All-in-scope path: both mid (depth 1) and far (depth 2) are reachable.
+    expect(ids).toContain(mid.id);
+    expect(ids).toContain(far.id);
+  });
+
+  test("vault#439: UNSCOPED token near[] still walks the full graph (behavior unchanged)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const a = await store.createNote("anchor-work", { tags: ["work"] });
+    const p = await store.createNote("bridge-personal", { tags: ["personal"] });
+    const b = await store.createNote("far-work", { tags: ["work"] });
+    await store.createLink(a.id, p.id, "relates");
+    await store.createLink(p.id, b.id, "relates");
+    // No scopedTags → unscoped admin token; no wall installed.
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:admin"] });
+
+    const pathname = "/vault/journal/api/notes";
+    const full = `${pathname}?near[note_id]=${a.id}&near[depth]=2`;
+    const res = await route(authed(token, "GET", full), pathname);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(body) ? body : (body.notes ?? []);
+    const ids = list.map((n) => n.id);
+    // Unscoped: the full neighborhood is visible, including the #personal
+    // bridge and the note beyond it.
+    expect(ids).toContain(p.id);
+    expect(ids).toContain(b.id);
+  });
+
+  // ----- vault#404: REST-path hub-JWT tag-scoping enforcement (C0) --------
+  // The MCP path's tag-scope enforcement is covered end-to-end; pin that a
+  // tag-scoped HUB JWT (allowlist carried in the `permissions.scoped_tags`
+  // claim, NOT a vestigial DB row) hitting the REST surface enforces the
+  // same allowlist on both read and write. `mintTagScopedToken` mints a real
+  // hub JWT, so these tests exercise the hub-JWT-sourced `scoped_tags` path.
+
+  test("vault#404: hub-JWT tag-scoped READ via REST enforces the allowlist (list + single)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    const inScope = await store.createNote("h", { tags: ["health"] });
+    const outOfScope = await store.createNote("w", { tags: ["work"] });
+    const token = await mintTagScopedToken("journal", ["vault:read"], ["health"]);
+
+    // List: only in-scope notes.
+    const listPath = "/vault/journal/api/notes";
+    const listRes = await route(authed(token, "GET", listPath), listPath);
+    expect(listRes.status).toBe(200);
+    const listBody = (await listRes.json()) as { notes?: { id: string }[] } | { id: string }[];
+    const list = Array.isArray(listBody) ? listBody : (listBody.notes ?? []);
+    const ids = list.map((n) => n.id);
+    expect(ids).toContain(inScope.id);
+    expect(ids).not.toContain(outOfScope.id);
+
+    // Single in-scope → 200; single out-of-scope → 404 (no existence leak).
+    const okPath = `/vault/journal/api/notes/${inScope.id}`;
+    expect((await route(authed(token, "GET", okPath), okPath)).status).toBe(200);
+    const denyPath = `/vault/journal/api/notes/${outOfScope.id}`;
+    expect((await route(authed(token, "GET", denyPath), denyPath)).status).toBe(404);
+  });
+
+  test("vault#404: hub-JWT tag-scoped WRITE via REST enforces the allowlist", async () => {
+    createVault("journal");
+    const token = await mintTagScopedToken("journal", ["vault:read", "vault:write"], ["health"]);
+
+    // In-scope write → 201.
+    const path = "/vault/journal/api/notes";
+    const okRes = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "ok", tags: ["health"] }),
+      }),
+      path,
+    );
+    expect(okRes.status).toBe(201);
+
+    // Out-of-scope write → 403 tag_scope_violation.
+    const denyRes = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "denied", tags: ["work"] }),
+      }),
+      path,
+    );
+    expect(denyRes.status).toBe(403);
+    const denyBody = (await denyRes.json()) as { error_type?: string };
+    expect(denyBody.error_type).toBe("tag_scope_violation");
   });
 
   // ----- Q5: tag-delete dependency check ---------------------------------
