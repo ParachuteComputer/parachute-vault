@@ -13,7 +13,7 @@
 
 import type { Store, Note } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { getNote, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
@@ -1013,19 +1013,33 @@ async function handleNotesInner(
         throw e;
       }
 
-      // Apply tag schema defaults
+      // Apply tag schema defaults, then re-read the notes whose metadata was
+      // actually default-filled so the response reflects the final on-disk
+      // state (the `created` entries were read before `applySchemaDefaults`
+      // ran). Mirrors the MCP create-note path (vault#316). Batched re-read
+      // (`getNotes` = one `WHERE id IN (...)`), skipped when no defaults
+      // applied so the common no-defaults path adds zero extra reads.
+      const mutatedIds = new Set<string>();
       for (const note of created) {
         if (note.tags?.length) {
-          await applySchemaDefaults(store, db, [note.id], note.tags);
+          for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
+            mutatedIds.add(id);
+          }
         }
       }
+      const refreshed =
+        mutatedIds.size === 0
+          ? created
+          : (() => {
+              const byId = new Map(getNotes(db, [...mutatedIds]).map((n) => [n.id, n]));
+              return created.map((n) => byId.get(n.id) ?? n);
+            })();
 
       // Attach `validation_status` so HTTP create-note matches the MCP
-      // surface (vault#287). Mirrors the MCP create-note attach site at
-      // `core/src/mcp.ts:451`. `attachValidationStatus` returns the note
+      // surface (vault#287). `attachValidationStatus` returns the note
       // unchanged when no tag declares fields, so vaults without any tag
       // schemas see no behavior change.
-      const final = created.map((n) => attachValidationStatus(store, db, n));
+      const final = refreshed.map((n) => attachValidationStatus(store, db, n));
       return json(body.notes ? final : final[0], 201);
     }
 
@@ -2619,9 +2633,12 @@ export async function handleStorage(
 // Tag schema defaults — same logic as core/src/mcp.ts applySchemaDefaults
 // ---------------------------------------------------------------------------
 
-async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tags: string[]): Promise<void> {
+// Returns the IDs of notes whose metadata was actually default-filled, so
+// the caller can re-read ONLY the mutated notes (and skip the re-read when
+// nothing changed). Mirrors the core/src/mcp.ts contract.
+async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tags: string[]): Promise<string[]> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
-  if (Object.keys(schemas).length === 0) return;
+  if (Object.keys(schemas).length === 0) return [];
 
   const defaults: Record<string, unknown> = {};
   for (const tag of tags) {
@@ -2633,8 +2650,9 @@ async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tag
       }
     }
   }
-  if (Object.keys(defaults).length === 0) return;
+  if (Object.keys(defaults).length === 0) return [];
 
+  const mutated: string[] = [];
   for (const noteId of noteIds) {
     const note = await store.getNote(noteId);
     if (!note) continue;
@@ -2648,7 +2666,9 @@ async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tag
       metadata: { ...existing, ...missing },
       skipUpdatedAt: true,
     });
+    mutated.push(noteId);
   }
+  return mutated;
 }
 
 function defaultForField(field: { type: string; enum?: string[] }): unknown {

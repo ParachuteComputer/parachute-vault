@@ -591,18 +591,31 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           throw e;
         }
 
-        // Apply tag schema effects, then re-read so the response reflects the
-        // final on-disk state (the `created` entries were read before
-        // `applySchemaDefaults` ran, so any default-filled metadata isn't on
-        // them yet). This mirrors the update-note path, which already re-reads
-        // post-defaults. The extra `getNote` is one read per note and only
-        // matters when a tag schema actually declared defaults.
+        // Apply tag schema effects, then re-read the notes whose metadata was
+        // actually default-filled so the response reflects the final on-disk
+        // state (the `created` entries were read before `applySchemaDefaults`
+        // ran, so default-filled metadata isn't on them yet). This mirrors the
+        // update-note path, which already re-reads post-defaults. The re-read
+        // is batched (`getNotes` = one `WHERE id IN (...)`) and skipped
+        // entirely when no defaults were applied, so the common no-defaults
+        // path adds zero extra reads.
+        const mutatedIds = new Set<string>();
         for (const note of created) {
           if (note.tags && note.tags.length > 0) {
-            await applySchemaDefaults(store, db, [note.id], note.tags);
+            for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
+              mutatedIds.add(id);
+            }
           }
         }
-        const refreshed = created.map((n) => noteOps.getNote(db, n.id) ?? n);
+        const refreshed =
+          mutatedIds.size === 0
+            ? created
+            : (() => {
+                const byId = new Map(
+                  noteOps.getNotes(db, [...mutatedIds]).map((n) => [n.id, n]),
+                );
+                return created.map((n) => byId.get(n.id) ?? n);
+              })();
 
         // Attach `validation_status` from any tag's `fields` declaration that
         // applies to this note, against the post-defaults state.
@@ -1411,9 +1424,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 // Tag schema effects — auto-populate defaults when tags are applied
 // ---------------------------------------------------------------------------
 
-async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<void> {
+/**
+ * Fill schema-declared default values into the metadata of the given notes
+ * for any field they omitted. Returns the IDs of the notes whose metadata was
+ * actually written — callers use this to re-read ONLY the mutated notes (and
+ * to skip the re-read entirely when nothing changed). The common no-schema /
+ * no-defaults path returns an empty array.
+ */
+async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<string[]> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
-  if (Object.keys(schemas).length === 0) return;
+  if (Object.keys(schemas).length === 0) return [];
 
   const defaults: Record<string, unknown> = {};
   for (const tag of tags) {
@@ -1425,8 +1445,9 @@ async function applySchemaDefaults(store: Store, db: Database, noteIds: string[]
       }
     }
   }
-  if (Object.keys(defaults).length === 0) return;
+  if (Object.keys(defaults).length === 0) return [];
 
+  const mutated: string[] = [];
   for (const noteId of noteIds) {
     const note = noteOps.getNote(db, noteId);
     if (!note) continue;
@@ -1442,7 +1463,9 @@ async function applySchemaDefaults(store: Store, db: Database, noteIds: string[]
       metadata: { ...existing, ...missing },
       skipUpdatedAt: true,
     });
+    mutated.push(noteId);
   }
+  return mutated;
 }
 
 function defaultForField(field: { type: string; enum?: string[] }): unknown {
