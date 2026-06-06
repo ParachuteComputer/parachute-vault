@@ -829,7 +829,7 @@ async function handleNotesInner(
         const isTraversable = tagScope.raw
           ? (id: string) =>
               noteWithinTagScope(
-                { id, tags: getNoteTags(db, id) } as any,
+                { id, tags: getNoteTags(db, id) } as Note,
                 tagScope.allowed,
                 tagScope.raw,
               )
