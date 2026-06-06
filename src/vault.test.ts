@@ -2023,6 +2023,46 @@ describe("HTTP /notes", async () => {
     expect(body.createdAt).toBe("2025-01-01T00:00:00.000Z");
   });
 
+  // vault#316 — the HTTP POST path re-reads each note AFTER
+  // `applySchemaDefaults`, so the response metadata carries the just-written
+  // defaults (mirrors the MCP create-note path). Before the fix the response
+  // mapped over the pre-defaults in-memory objects, so default-filled
+  // metadata was missing from `POST /api/notes` responses.
+  test("POST /notes response reflects post-applySchemaDefaults state (vault#316)", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+
+    // Single: default lands in the returned metadata and agrees with disk.
+    const single = await handleNotes(
+      mkReq("POST", "/notes", { content: "do the thing", path: "Inbox/task-1", tags: ["task"] }),
+      store,
+      "",
+    );
+    expect(single.status).toBe(201);
+    const singleBody = await single.json() as any;
+    expect(singleBody.metadata?.priority).toBe("high"); // first enum value
+    const onDisk = await store.getNoteByPath("Inbox/task-1");
+    expect((onDisk!.metadata as any)?.priority).toBe("high");
+
+    // Batch: each entry is re-read post-defaults too, in input order.
+    const batch = await handleNotes(
+      mkReq("POST", "/notes", {
+        notes: [
+          { content: "a", path: "Inbox/task-2", tags: ["task"] },
+          { content: "b", path: "Inbox/task-3", tags: ["task"] },
+        ],
+      }),
+      store,
+      "",
+    );
+    expect(batch.status).toBe(201);
+    const batchBody = await batch.json() as any[];
+    expect(batchBody.map((n) => n.path)).toEqual(["Inbox/task-2", "Inbox/task-3"]);
+    expect(batchBody[0].metadata?.priority).toBe("high");
+    expect(batchBody[1].metadata?.priority).toBe("high");
+  });
+
   // ---- Extension field (vault#328) ----
 
   test("POST /notes accepts extension and persists it", async () => {

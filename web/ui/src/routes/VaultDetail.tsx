@@ -189,7 +189,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
         <ul className="manage-list">
           <li>
             <Link to={tokensHref}>Tokens →</Link>
-            <span className="dim"> mint, list, and revoke <code>pvt_*</code> tokens</span>
+            <span className="dim"> mint, list, and revoke hub access tokens (JWTs)</span>
           </li>
           <li>
             <Link to={mirrorHref}>Git backup →</Link>
@@ -208,9 +208,9 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
  * don't need a runtime-config endpoint or hub coordination — the data's
  * already in hand from the same token that authenticated the page.
  *
- * The destination (hub#162 — `GET /hub/permissions?vault=<name>`) doesn't
- * exist yet; clicks 404 until hub catches up. The copy says so explicitly
- * so an operator who clicks isn't confused by the empty page.
+ * The destination (`GET /hub/permissions?vault=<name>`) is live: hub
+ * 301-redirects `/hub/permissions → /admin/permissions` (honoring the
+ * `?vault=` query), so the link resolves to hub's permissions UI.
  *
  * Without an `iss` claim (no token, malformed token), we render an
  * informational line instead of a broken link — same content, no false
