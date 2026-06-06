@@ -34,6 +34,104 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.5.2] - 2026-06-06
+
+The `0.5.2-rc.1` through `rc.5` chain promoted to stable. This entry was
+backfilled retroactively from the [GitHub Release notes](https://github.com/ParachuteComputer/parachute-vault/releases/tag/v0.5.2);
+per-rc detail lives in GitHub Releases / git history.
+
+### Changed (lifecycle & init — the hub-as-supervisor alignment)
+
+- **Hub-aware init.** `parachute-vault init` guidance branches on hub
+  presence — no more circular "install the hub and re-run" advice when the
+  hub itself spawned the init, and accurate connectivity copy under
+  hub-as-issuer (#445).
+- **Autostart defaults off under a hub supervisor.** Init no longer
+  registers a competing launchd/systemd daemon when a hub manages the
+  lifecycle — closing the port-1940 race behind `EADDRINUSE` crash-loops and
+  `unexpected "iss"` token rejections ([parachute-hub#580](https://github.com/ParachuteComputer/parachute-hub/issues/580)).
+  Standalone installs still register a daemon; explicit
+  `--autostart` / `--no-autostart` always win.
+- **Honest admin banner.** Signed-in non-admin users see "vault management is
+  restricted to the hub admin" with a link to their account home, instead of
+  a misleading "you're not signed in" loop (#451, PR #452).
+- The "Blocked 1 postinstall" warning on `bun add -g` is gone
+  ([parachute-hub#568](https://github.com/ParachuteComputer/parachute-hub/issues/568)).
+
+### Fixed (security & data)
+
+- **Tag-scope confidentiality.** Closed `expand_links` / wikilink content +
+  metadata leaks across tag-scope boundaries (#438).
+- **OAuth-first create.** `vault create` no longer auto-mints a shared
+  `vault:admin` token (#442/#443).
+- Per-vault **usage endpoint** for data-footprint monitoring (#437).
+- New vaults default to an **internal live mirror** (version history on from
+  day one; opt-out via `default_mirror`) (#440).
+- Transcription safety: memo content is never destroyed and legacy in-body
+  memos are retried (#434); optimistic concurrency on memo re-stamps (#436).
+
+### Added / Changed (API)
+
+- `GET /api/notes` accepts a `?metadata=<json>` filter alias (previously
+  silently dropped) (#426).
+- Updates echo hydrated links on the response (REST + MCP) (#429).
+- Opt-in `link_count` field + `order_by=link_count` (#430).
+- Tag `relationships` is an opaque vocabulary map (#428/#431).
+- Storage GET accepts `%2F`-encoded slashes in serve paths (#433).
+
+### Changed (UI)
+
+- Backup UI leads with version-history-on + "Back up to GitHub"; presets and
+  raw fields tucked under Advanced (#447).
+
+### Upgrading from ≤0.5.1
+
+If vault previously ran as its own daemon, remove the old unit once (see the
+[hub 0.6.4 release notes](https://github.com/ParachuteComputer/parachute-hub/releases/tag/v0.6.4)
+for the exact commands) and let the hub supervisor own the lifecycle.
+
+## [0.5.1] - 2026-05-31
+
+The `rc.1` / `rc.2` chain, plus one post-rc.2 fix (#424), promoted to stable.
+Backfilled retroactively; per-rc detail in GitHub Releases / git history.
+
+### Fixed
+
+- **Obsidian import alignment.** Aligned the CLI Obsidian parser's behavior
+  with the Notes-UI web importer so the two import paths agree on a shared
+  behavior contract (#424).
+- **Browser MCP CORS.** Expose `WWW-Authenticate` (and `Mcp-Session-Id`) via
+  CORS so browser-based MCP clients can read the auth-challenge headers (#421).
+
+### Changed
+
+- The MCP connect-time brief now points at the public scripting guide so
+  agents are oriented toward the HTTP API / scripting path (#422).
+
+## [0.5.0] - 2026-05-29
+
+The `0.5.0-rc.1` through `rc.5` chain promoted to stable. The BREAKING `pvt_*`
+removal is documented in the `0.5.0-rc.1` entry below; this entry completes the
+chain (rc.2–rc.5). Backfilled retroactively; per-rc detail in GitHub Releases /
+git history.
+
+### Fixed
+
+- **CORS `PUT` allowed.** Added `PUT` to `Access-Control-Allow-Methods` so the
+  Notes tag/schema setup flow works from the browser (#419).
+- **Per-vault OAuth discovery advertises resource-narrowed scopes** —
+  follow-on to the vault#282 resource-server work (#417).
+- **Friendly git-not-installed error** for import + sync, instead of a raw
+  failure, when `git` is missing (#415).
+
+### Added
+
+- **Auto-enable sync to the imported repo.** Importing from a git repo now
+  enables sync to that repo by default (opt-out) (#416).
+
+See the `0.5.0-rc.1` entry below for the BREAKING `pvt_*` token removal that
+headlines this release.
+
 ## [0.5.0-rc.1] - 2026-05-28
 
 ### Removed (BREAKING — vault#282 Stage 2)
