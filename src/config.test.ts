@@ -213,6 +213,72 @@ describe("config", () => {
     expect(reloaded.api_keys?.find((k) => k.id === "k_legacy")?.scope).toBe("write");
   });
 
+  // ----- vault#234: anchored api_keys field regexes ----------------------
+  // The api_keys field regexes (label/scope/key_hash/created_at/last_used_at)
+  // used to be unanchored, so a COMMENTED `# scope: read` line matched, and a
+  // value-less `scope: ` (trailing space) captured the NEXT field's token
+  // (`key_hash`). The writer never emits either shape — only hand-editing
+  // reaches these branches — but a malformed scope could silently mis-scope a
+  // key. The regexes are now line-anchored + horizontal-whitespace-bounded.
+
+  test("vault#234: commented `# scope:` line is ignored, scope falls back to default", () => {
+    const fs = require("fs");
+    const path = join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234", "vault.yaml");
+    fs.mkdirSync(join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234"), { recursive: true });
+    // The only `scope:` line is commented out; the parser must NOT pick it up.
+    fs.writeFileSync(
+      path,
+      `name: mv234\ncreated_at: "2026-01-01T00:00:00.000Z"\napi_keys:\n  - id: k_cmt\n    label: commented\n    # scope: read\n    key_hash: sha256:cmt\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    const loaded = readVaultConfig("mv234");
+    const key = loaded!.api_keys.find((k) => k.id === "k_cmt");
+    expect(key).toBeDefined();
+    // Commented scope ignored → default "write", NOT "read".
+    expect(key!.scope).toBe("write");
+    expect(key!.key_hash).toBe("sha256:cmt");
+  });
+
+  test("vault#234: value-less `scope: ` (trailing space) does NOT capture the next field", () => {
+    const fs = require("fs");
+    const path = join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234b", "vault.yaml");
+    fs.mkdirSync(join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234b"), { recursive: true });
+    // `scope: ` has a trailing space and no value; the OLD regex skipped the
+    // newline and captured `sha256:trailing` (the key_hash) as the scope.
+    fs.writeFileSync(
+      path,
+      `name: mv234b\ncreated_at: "2026-01-01T00:00:00.000Z"\napi_keys:\n  - id: k_trail\n    label: trailing\n    scope: \n    key_hash: sha256:trailing\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    const loaded = readVaultConfig("mv234b");
+    const key = loaded!.api_keys.find((k) => k.id === "k_trail");
+    expect(key).toBeDefined();
+    // The hash must NOT have been borrowed as the scope.
+    expect(key!.scope).not.toBe("sha256:trailing");
+    expect(key!.scope).toBe("write"); // default
+    // And the real key_hash is still parsed correctly.
+    expect(key!.key_hash).toBe("sha256:trailing");
+  });
+
+  test("vault#234: a valid `scope: read` still parses (positive control, both parsers)", () => {
+    const fs = require("fs");
+    // Vault-level parser.
+    const vpath = join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234c", "vault.yaml");
+    fs.mkdirSync(join(process.env.PARACHUTE_HOME!, "vault", "data", "mv234c"), { recursive: true });
+    fs.writeFileSync(
+      vpath,
+      `name: mv234c\ncreated_at: "2026-01-01T00:00:00.000Z"\napi_keys:\n  - id: k_v\n    label: reader\n    scope: read\n    key_hash: sha256:v\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    expect(readVaultConfig("mv234c")!.api_keys.find((k) => k.id === "k_v")?.scope).toBe("read");
+
+    // Global parser, same grammar.
+    const gpath = join(process.env.PARACHUTE_HOME!, "vault", "config.yaml");
+    fs.writeFileSync(
+      gpath,
+      `port: 1940\napi_keys:\n  - id: k_g\n    label: reader\n    # scope: write\n    scope: read\n    key_hash: sha256:g\n    created_at: "2026-01-01T00:00:00.000Z"\n`,
+    );
+    // The commented `# scope: write` is skipped; the real `scope: read` wins.
+    expect(readGlobalConfig().api_keys?.find((k) => k.id === "k_g")?.scope).toBe("read");
+  });
+
   test("writeEnvFile writes .env at 0600 (SCRIBE_AUTH_TOKEN secrecy)", () => {
     // Regression for vault#354 reviewer finding: the .env holds
     // SCRIBE_AUTH_TOKEN (the vault↔scribe loopback bearer). On a

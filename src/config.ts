@@ -518,14 +518,32 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   }
 
   // Parse api_keys
+  //
+  // Accepted grammar (vault#234): each `id:` block is the writer's output —
+  // one field per line, indented two spaces under the `- id:` list item:
+  //
+  //     - id: <id>
+  //       label: <label>            # free text to end of line
+  //       scope: <scope>            # single token (read|write|admin|…)
+  //       key_hash: <hash>          # single token
+  //       created_at: "<iso>"       # quoted or bare, no embedded newline
+  //       last_used_at: "<iso>"
+  //
+  // Each field regex is line-anchored (`^...`, `m` flag) so a COMMENTED line
+  // (`# scope: read`) never matches — the line must begin with optional
+  // leading whitespace then the bare key. The value matcher uses horizontal
+  // whitespace only (`[^\S\r\n]*`, never `\s*`) after the colon so a
+  // value-less field (`scope: ` with a trailing space) can't skip the newline
+  // and capture the NEXT field's value. A missing optional field falls back to
+  // its default rather than borrowing a neighbor's token.
   const keyBlocks = yaml.split(/\n\s+-\s+id:\s+/).slice(1);
   for (const block of keyBlocks) {
     const idMatch = block.match(/^(\S+)/);
-    const labelMatch = block.match(/label:\s*(.+)/);
-    const scopeMatch = block.match(/scope:\s*(\S+)/);
-    const hashMatch = block.match(/key_hash:\s*(\S+)/);
-    const createdAtMatch = block.match(/created_at:\s*"?([^"\n]+)"?/);
-    const lastUsedMatch = block.match(/last_used_at:\s*"?([^"\n]+)"?/);
+    const labelMatch = block.match(/^[^\S\r\n]*label:[^\S\r\n]*(.+)/m);
+    const scopeMatch = block.match(/^[^\S\r\n]*scope:[^\S\r\n]*(\S+)/m);
+    const hashMatch = block.match(/^[^\S\r\n]*key_hash:[^\S\r\n]*(\S+)/m);
+    const createdAtMatch = block.match(/^[^\S\r\n]*created_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
+    const lastUsedMatch = block.match(/^[^\S\r\n]*last_used_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
 
     if (idMatch && hashMatch) {
       config.api_keys.push({
@@ -1250,16 +1268,19 @@ export function readGlobalConfig(): GlobalConfig {
       }
 
       // Parse global api_keys
+      // Same line-anchored grammar as the vault-level parser above (vault#234)
+      // — commented lines don't match; a value-less field can't capture the
+      // next field's token across the newline.
       const keyBlocks = yaml.split(/\n\s+-\s+id:\s+/).slice(1);
       if (keyBlocks.length > 0) {
         config.api_keys = [];
         for (const block of keyBlocks) {
           const idMatch = block.match(/^(\S+)/);
-          const labelMatch = block.match(/label:\s*(.+)/);
-          const scopeMatch = block.match(/scope:\s*(\S+)/);
-          const hashMatch = block.match(/key_hash:\s*(\S+)/);
-          const createdAtMatch = block.match(/created_at:\s*"?([^"\n]+)"?/);
-          const lastUsedMatch = block.match(/last_used_at:\s*"?([^"\n]+)"?/);
+          const labelMatch = block.match(/^[^\S\r\n]*label:[^\S\r\n]*(.+)/m);
+          const scopeMatch = block.match(/^[^\S\r\n]*scope:[^\S\r\n]*(\S+)/m);
+          const hashMatch = block.match(/^[^\S\r\n]*key_hash:[^\S\r\n]*(\S+)/m);
+          const createdAtMatch = block.match(/^[^\S\r\n]*created_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
+          const lastUsedMatch = block.match(/^[^\S\r\n]*last_used_at:[^\S\r\n]*"?([^"\n]+?)"?\s*$/m);
           if (idMatch && hashMatch) {
             config.api_keys.push({
               id: idMatch[1]!,
