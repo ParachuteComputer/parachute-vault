@@ -54,7 +54,7 @@ per-rc detail lives in GitHub Releases / git history.
   `--autostart` / `--no-autostart` always win.
 - **Honest admin banner.** Signed-in non-admin users see "vault management is
   restricted to the hub admin" with a link to their account home, instead of
-  a misleading "you're not signed in" loop (#451).
+  a misleading "you're not signed in" loop (#451, PR #452).
 - The "Blocked 1 postinstall" warning on `bun add -g` is gone
   ([parachute-hub#568](https://github.com/ParachuteComputer/parachute-hub/issues/568)).
 
@@ -92,8 +92,8 @@ for the exact commands) and let the hub supervisor own the lifecycle.
 
 ## [0.5.1] - 2026-05-31
 
-The `0.5.1-rc.1` / `rc.2` chain promoted to stable. Backfilled retroactively;
-per-rc detail in GitHub Releases / git history.
+The `rc.1` / `rc.2` chain, plus one post-rc.2 fix (#424), promoted to stable.
+Backfilled retroactively; per-rc detail in GitHub Releases / git history.
 
 ### Fixed
 
