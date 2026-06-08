@@ -23,13 +23,18 @@ import {
 const DEFAULT_HUB_LOOPBACK = "http://127.0.0.1:1939";
 
 /**
- * Resolve the hub origin used to fetch JWKS and validate `iss`. Strips a
+ * Resolve the hub origin used to validate the token's `iss` claim. Strips a
  * trailing slash so we get a single canonical form.
  *
  * Order: env var → loopback fallback. We deliberately don't read
  * `~/.parachute/services.json` — the hub is the dispatcher, not a registered
  * service in that file. If a deployment exposes the hub on a non-default
  * origin, the env var is the contract.
+ *
+ * `parachute expose` pins `PARACHUTE_HUB_ORIGIN` to the PUBLIC FQDN so the
+ * `iss` we validate against matches what the hub stamps on the tokens it
+ * mints — keep using this origin for iss-validation. The JWKS *fetch* origin
+ * is resolved separately by `getJwksOrigin()`; see vault#464.
  */
 export function getHubOrigin(): string {
   const env = process.env.PARACHUTE_HUB_ORIGIN?.replace(/\/$/, "");
@@ -37,12 +42,44 @@ export function getHubOrigin(): string {
   return DEFAULT_HUB_LOOPBACK;
 }
 
+/**
+ * Resolve the origin used to FETCH the hub's JWKS — kept distinct from
+ * `getHubOrigin()` (the iss-validation origin) per vault#464.
+ *
+ * Vault is co-located with its hub (the hub supervises vault on the same box,
+ * the common deploy). After `parachute expose --cloudflare`, `getHubOrigin()`
+ * is the public Cloudflare FQDN. If we fetched JWKS from that public origin we
+ * would hairpin out through the tunnel and back to the same box — a round-trip
+ * that times out (hard fail under Docker NAT-loopback, slow/flaky on a real
+ * VPS) and 401s the first MCP connect after expose. So we always read keys
+ * from the LOCAL hub on loopback instead.
+ *
+ * Order: `PARACHUTE_HUB_JWKS_ORIGIN` override → loopback default. The override
+ * exists for the rare non-co-located case — a vault running on a DIFFERENT box
+ * than its hub sets `PARACHUTE_HUB_JWKS_ORIGIN` to the hub's reachable
+ * internal address. Trailing-slash-stripped, matching `getHubOrigin()`.
+ */
+export function getJwksOrigin(): string {
+  const env = process.env.PARACHUTE_HUB_JWKS_ORIGIN?.replace(/\/$/, "");
+  if (env && env.length > 0) return env;
+  return DEFAULT_HUB_LOOPBACK;
+}
+
 // Process-wide guard. The resolver form lets tests flip
-// `PARACHUTE_HUB_ORIGIN` between cases — the lib re-resolves on every
-// `validateHubJwt` and `resetJwksCache` call so the env-var change picks up
-// without a server restart. JWKS cache (5min/30s defaults) lives inside the
-// guard, shared across requests.
-const guard = createScopeGuard({ hubOrigin: () => getHubOrigin() });
+// `PARACHUTE_HUB_ORIGIN` / `PARACHUTE_HUB_JWKS_ORIGIN` between cases — the lib
+// re-resolves on every `validateHubJwt` and `resetJwksCache` call so the
+// env-var change picks up without a server restart. JWKS cache (5min/30s
+// defaults) lives inside the guard, shared across requests.
+//
+// The iss/jwks split (vault#464): `hubOrigin` validates the token's `iss`
+// (public FQDN post-expose, via PARACHUTE_HUB_ORIGIN); `jwksOrigin` fetches
+// the keys from the local hub (loopback by default, via
+// PARACHUTE_HUB_JWKS_ORIGIN). Co-located vault never egresses to read its own
+// hub's keys, so no tunnel hairpin.
+const guard = createScopeGuard({
+  hubOrigin: () => getHubOrigin(),
+  jwksOrigin: () => getJwksOrigin(),
+});
 
 /**
  * Verify a presented JWT against the hub's JWKS. Throws `HubJwtError` on any

@@ -14,7 +14,14 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
-import { resetJwksCache, resetRevocationCache, validateHubJwt, looksLikeJwt } from "./hub-jwt.ts";
+import {
+  resetJwksCache,
+  resetRevocationCache,
+  validateHubJwt,
+  looksLikeJwt,
+  getHubOrigin,
+  getJwksOrigin,
+} from "./hub-jwt.ts";
 
 interface Keypair {
   privateKey: CryptoKey;
@@ -113,6 +120,7 @@ async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
 let fixture: JwksFixture;
 let kp: Keypair;
 let prevHubOrigin: string | undefined;
+let prevJwksOrigin: string | undefined;
 
 beforeAll(async () => {
   fixture = startJwksFixture();
@@ -124,12 +132,19 @@ afterAll(() => {
   fixture.stop();
   if (prevHubOrigin === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
   else process.env.PARACHUTE_HUB_ORIGIN = prevHubOrigin;
+  if (prevJwksOrigin === undefined) delete process.env.PARACHUTE_HUB_JWKS_ORIGIN;
+  else process.env.PARACHUTE_HUB_JWKS_ORIGIN = prevJwksOrigin;
 });
 
 beforeEach(() => {
-  // Each test sets its own origin for clarity.
+  // Each test sets its own origin for clarity. Post-vault#464 the JWKS *fetch*
+  // origin is resolved separately from the iss-validation origin, so point the
+  // JWKS fetch at the fixture too — otherwise the guard would read keys from
+  // the loopback default (no JWKS server there) and every case would fail.
   prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
+  prevJwksOrigin = process.env.PARACHUTE_HUB_JWKS_ORIGIN;
   process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
+  process.env.PARACHUTE_HUB_JWKS_ORIGIN = fixture.origin;
   fixture.setUnreachable(false);
   fixture.setKeys([kp]);
   resetJwksCache();
@@ -150,6 +165,64 @@ describe("looksLikeJwt", () => {
   test("empty / random → false", () => {
     expect(looksLikeJwt("")).toBe(false);
     expect(looksLikeJwt("hello-world")).toBe(false);
+  });
+});
+
+describe("origin resolvers — iss/jwks split (vault#464)", () => {
+  test("getHubOrigin honors PARACHUTE_HUB_ORIGIN (iss-validation origin)", () => {
+    process.env.PARACHUTE_HUB_ORIGIN = "https://vault.example.com/";
+    expect(getHubOrigin()).toBe("https://vault.example.com");
+  });
+
+  test("getHubOrigin falls back to loopback when unset", () => {
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+    expect(getHubOrigin()).toBe("http://127.0.0.1:1939");
+  });
+
+  test("getJwksOrigin defaults to loopback (no env override)", () => {
+    delete process.env.PARACHUTE_HUB_JWKS_ORIGIN;
+    expect(getJwksOrigin()).toBe("http://127.0.0.1:1939");
+  });
+
+  test("getJwksOrigin honors PARACHUTE_HUB_JWKS_ORIGIN and strips trailing slash", () => {
+    process.env.PARACHUTE_HUB_JWKS_ORIGIN = "http://10.0.0.5:1939/";
+    expect(getJwksOrigin()).toBe("http://10.0.0.5:1939");
+  });
+
+  test("jwks fetch is decoupled from the iss origin: keys served ONLY at the jwks origin still validate a token whose iss is the (separate) public origin", async () => {
+    // Mirrors the vault#464 deploy shape: iss + revocation live at the public
+    // origin (the default `fixture` here), while the JWKS is reachable only at
+    // a SEPARATE jwks origin (a second fixture standing in for loopback). The
+    // guard must fetch keys from the jwks origin, not the iss origin.
+    const jwksOnly = startJwksFixture();
+    jwksOnly.setKeys([kp]);
+    // The public iss origin (default fixture) serves revocation but NOT keys —
+    // if the guard fetched JWKS from here, verification would fail "no key".
+    fixture.setKeys([]);
+    try {
+      process.env.PARACHUTE_HUB_ORIGIN = fixture.origin; // iss + revocation
+      process.env.PARACHUTE_HUB_JWKS_ORIGIN = jwksOnly.origin; // keys only
+      resetJwksCache();
+      const token = await signJwt(kp, { iss: fixture.origin });
+      const claims = await validateHubJwt(token);
+      expect(claims.sub).toBe("user-1");
+    } finally {
+      jwksOnly.stop();
+    }
+  });
+
+  test("token whose iss does NOT match the iss origin is rejected even when keys resolve at the jwks origin", async () => {
+    const jwksOnly = startJwksFixture();
+    jwksOnly.setKeys([kp]);
+    try {
+      process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
+      process.env.PARACHUTE_HUB_JWKS_ORIGIN = jwksOnly.origin;
+      resetJwksCache();
+      const token = await signJwt(kp, { iss: "https://attacker.example" });
+      await expect(validateHubJwt(token)).rejects.toThrow(/verification failed/);
+    } finally {
+      jwksOnly.stop();
+    }
   });
 });
 

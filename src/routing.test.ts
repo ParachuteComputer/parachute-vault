@@ -149,7 +149,12 @@ function reset(): void {
   // Default every test to the fixture hub origin so the hub-JWT mint path
   // resolves JWKS + validates `iss`. Describes that assert the loopback
   // default (OAuth discovery metadata) override this in their own beforeEach.
-  if (hubFixtureOrigin) process.env.PARACHUTE_HUB_ORIGIN = hubFixtureOrigin;
+  if (hubFixtureOrigin) {
+    process.env.PARACHUTE_HUB_ORIGIN = hubFixtureOrigin;
+    // Post-vault#464 the JWKS fetch origin resolves separately (loopback by
+    // default); point it at the fixture so the mint path's JWKS fetch resolves.
+    process.env.PARACHUTE_HUB_JWKS_ORIGIN = hubFixtureOrigin;
+  }
   resetJwksCache();
   resetRevocationCache();
 }
@@ -183,6 +188,7 @@ afterAll(() => {
   clearVaultStoreCache();
   hubServer?.stop(true);
   delete process.env.PARACHUTE_HUB_ORIGIN;
+  delete process.env.PARACHUTE_HUB_JWKS_ORIGIN;
   if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
 });
 

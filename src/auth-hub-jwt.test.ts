@@ -143,6 +143,7 @@ function bearer(token: string): Request {
 let tmpHome: string;
 let prevHome: string | undefined;
 let prevHubOrigin: string | undefined;
+let prevJwksOrigin: string | undefined;
 let fixture: HubFixture;
 let kp: Keypair;
 
@@ -159,7 +160,11 @@ beforeEach(async () => {
   kp = await makeKeypair("k1");
   fixture = startHubFixture([kp]);
   prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
+  prevJwksOrigin = process.env.PARACHUTE_HUB_JWKS_ORIGIN;
   process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
+  // Post-vault#464 the JWKS fetch origin resolves separately (loopback by
+  // default); point it at the fixture so keys are reachable in-test.
+  process.env.PARACHUTE_HUB_JWKS_ORIGIN = fixture.origin;
   resetJwksCache();
   resetRevocationCache();
 });
@@ -171,6 +176,8 @@ afterEach(() => {
   else process.env.PARACHUTE_HOME = prevHome;
   if (prevHubOrigin === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
   else process.env.PARACHUTE_HUB_ORIGIN = prevHubOrigin;
+  if (prevJwksOrigin === undefined) delete process.env.PARACHUTE_HUB_JWKS_ORIGIN;
+  else process.env.PARACHUTE_HUB_JWKS_ORIGIN = prevJwksOrigin;
   if (existsSync(tmpHome)) rmSync(tmpHome, { recursive: true, force: true });
 });
 
