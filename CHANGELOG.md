@@ -34,6 +34,21 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [Unreleased]
+
+### Fixed
+
+- **JWKS hairpin through the public Cloudflare tunnel (vault#464).** Vault now
+  fetches the hub's JWKS from the **local** hub (loopback
+  `http://127.0.0.1:1939`) by default instead of from the public `iss` origin,
+  so a co-located vault no longer hairpins the keys fetch out through the
+  Cloudflare tunnel and back to the same box after `parachute expose` (which
+  timed out the first MCP-over-public auth). `iss` is still validated against
+  `PARACHUTE_HUB_ORIGIN`; a vault on a separate box from its hub overrides the
+  fetch origin with the new `PARACHUTE_HUB_JWKS_ORIGIN` env var. Bumps
+  `@openparachute/scope-guard` → `0.4.1-rc.1` for the `jwksOrigin` seam. (No
+  rc bump in this entry — the version bump lands at tag time.)
+
 ## [0.5.2] - 2026-06-06
 
 The `0.5.2-rc.1` through `rc.5` chain promoted to stable. This entry was
