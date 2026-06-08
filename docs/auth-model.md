@@ -30,6 +30,15 @@ Vault validates them via `validateHubJwt` (`src/hub-jwt.ts`):
 
 - `iss` must equal the hub origin (`PARACHUTE_HUB_ORIGIN`, defaulting to
   `http://127.0.0.1:1939`).
+- The JWKS used to verify the signature is fetched from the **local** hub
+  (loopback `http://127.0.0.1:1939` by default), **not** from the `iss`
+  origin. The two are separate concerns: `iss` validates against the public
+  origin the hub mints with, while the keys are read from the co-located hub
+  to avoid hairpinning the fetch out through the public Cloudflare tunnel and
+  back to the same box (vault#464). A vault running on a **separate box** from
+  its hub overrides the fetch origin with `PARACHUTE_HUB_JWKS_ORIGIN` (the
+  hub's reachable internal address); co-located / standalone / single-container
+  deploys need no action.
 - `aud` is strict-checked against `vault.<name>` so a token stamped for one
   vault can't reach another.
 - `scope` claim carries OAuth-standard scopes (see "API tokens" below for the

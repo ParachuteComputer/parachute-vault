@@ -4,6 +4,26 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## JWKS now fetched from the local hub (vault#464)
+
+Vault now fetches the hub's JWKS (the signing keys it uses to verify
+hub-issued JWTs) from the **local** hub on loopback (`http://127.0.0.1:1939`)
+by default, while still validating the token's `iss` against
+`PARACHUTE_HUB_ORIGIN`. This fixes the JWKS fetch hairpinning out through the
+public Cloudflare tunnel and back to the same box after `parachute expose` —
+which timed out the first MCP-over-public auth on co-located deploys.
+
+**The overwhelming common case needs no action** — co-located (hub supervises
+vault on the same box), standalone, and Render / single-container deploys all
+read keys from loopback automatically.
+
+**If you run vault on a SEPARATE box from its hub** (the rare non-co-located
+topology), set `PARACHUTE_HUB_JWKS_ORIGIN` to the hub's reachable internal
+address (e.g. `http://10.0.0.5:1939`). Without it, vault defaults the JWKS
+fetch to `http://127.0.0.1:1939` — where no hub is listening — and every
+hub-JWT validation 401s. `PARACHUTE_HUB_ORIGIN` stays the public origin for
+`iss` validation; only the JWKS-fetch origin moves.
+
 ## pvt_* token removal — REJECTED as of 0.5.0 (BREAKING)
 
 **TL;DR:** `pvt_*` tokens (the opaque `pvt_…` bearers vault used to mint into
