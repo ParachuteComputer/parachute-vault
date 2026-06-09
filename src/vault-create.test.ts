@@ -28,11 +28,18 @@ function runCli(
   args: string[],
   env: Record<string, string>,
 ): { exitCode: number; stdout: string; stderr: string } {
+  // Hermetic: don't inherit the dev/CI box's PARACHUTE_HUB_ORIGIN. A leaked
+  // origin makes `detectHubPresence`'s rule-1 (configured-origin) short-circuit
+  // to "hub present" with no probe, flipping the no-hub guidance copy to the
+  // "admin wizard" variant — a CI flake when the runner env has it set. Tests
+  // that genuinely want a hub origin pass it explicitly via `env`.
+  const baseEnv: Record<string, string | undefined> = { ...process.env };
+  delete baseEnv.PARACHUTE_HUB_ORIGIN;
   const proc = Bun.spawnSync({
     cmd: ["bun", CLI, ...args],
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ...env },
+    env: { ...baseEnv, ...env },
   });
   return {
     exitCode: proc.exitCode ?? -1,
