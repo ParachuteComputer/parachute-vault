@@ -15,10 +15,12 @@ import { pathTitle } from "./paths.js";
 import { HookRegistry } from "./hooks.js";
 import {
   loadTagHierarchy,
-  getTagDescendants,
+  getTagExpansion,
   TAG_CONFIG_PREFIX,
   DEFAULT_TAG_NAME,
+  DEFAULT_TAG_EXPAND_MODE,
   type TagHierarchy,
+  type TagExpandMode,
 } from "./tag-hierarchy.js";
 import {
   loadSchemaConfig,
@@ -278,13 +280,25 @@ export class BunSqliteStore implements Store {
    *   the other tags' notes — wrong).
    *
    * Other filters (path, metadata, dates) still apply in both cases.
+   *
+   * `expand` axis (vault tag `expand` axis): `opts.expand` selects WHICH axis
+   * each tag expands along — `"subtypes"` (default, the parent_names path
+   * documented above, with the `_default` magic), `"namespace"` (lexical
+   * `tag/*`), `"both"` (union), or `"exact"` (no expansion). The `_default`
+   * universal-parent magic is a SUBTYPES-axis concept, so it fires only when
+   * the resolved mode includes subtypes (`"subtypes"`/`"both"`); under
+   * `"namespace"`/`"exact"` a literal `_default` tag is treated like any other.
    */
   private expandQueryTags(opts: QueryOpts): QueryOpts {
     if (!opts.tags || opts.tags.length === 0) return opts;
     const hierarchy = this.getTagHierarchy();
+    const mode: TagExpandMode = opts.expand ?? DEFAULT_TAG_EXPAND_MODE;
+    const subtypeAxis = mode === "subtypes" || mode === "both";
 
     let tags = opts.tags;
-    if (hierarchy.allTags.has(DEFAULT_TAG_NAME) && tags.includes(DEFAULT_TAG_NAME)) {
+    // `_default` collapse only applies on the subtypes axis — it's the
+    // universal *parent* (an is-a relationship), not a namespace prefix.
+    if (subtypeAxis && hierarchy.allTags.has(DEFAULT_TAG_NAME) && tags.includes(DEFAULT_TAG_NAME)) {
       const match = opts.tagMatch ?? "all";
       if (match === "any") {
         const { tags: _drop, ..._rest } = opts;
@@ -298,33 +312,60 @@ export class BunSqliteStore implements Store {
       opts = { ...opts, tags };
     }
 
-    if (hierarchy.childrenOf.size === 0) return opts;
-    const expanded = tags.map((t) => Array.from(getTagDescendants(hierarchy, t)));
+    // Subtypes fast-path: with no declared hierarchy there are no descendants,
+    // so the engine's `[tag]` fallback already produces the literal-tag join —
+    // skip attaching `_tagsExpanded` to stay byte-identical to pre-axis
+    // behavior. `exact` likewise needs no expansion. Namespace/both must still
+    // run (lexical expansion is independent of `parent_names`).
+    if (mode === "exact") return opts;
+    if (mode === "subtypes" && hierarchy.childrenOf.size === 0) return opts;
+
+    const expanded = tags.map((t) => Array.from(getTagExpansion(hierarchy, t, mode)));
     return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
-  async searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]> {
-    // Same hierarchy-expansion treatment as queryNotes — searching `#manual`
-    // should match notes tagged with any descendant tag. The underlying
-    // FTS path already uses `IN (...)` for tags, so we flatten the
-    // per-input expansions into a single union (search semantics are
-    // "any tag matches"). When `_default` is among the requested tags
-    // (and a `_default` row exists), the OR collapses to "every note" —
-    // drop the tag filter entirely so the search hits the full corpus
-    // and untagged notes are reachable.
+  async searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode }): Promise<Note[]> {
+    // Same tag-expansion treatment as queryNotes, along the SAME `expand` axis
+    // (vault tag `expand` axis) — searching `#manual` should match notes
+    // tagged with any descendant under "subtypes", any `manual/*` under
+    // "namespace", etc. The underlying FTS path already uses `IN (...)` for
+    // tags, so we flatten the per-input expansions into a single union (search
+    // semantics are "any tag matches").
+    //
+    // `_default` collapse is a SUBTYPES-axis concept (the universal *parent*):
+    // when `_default` is among the requested tags and a `_default` row exists,
+    // the OR collapses to "every note" — drop the tag filter entirely so the
+    // search hits the full corpus and untagged notes are reachable. It fires
+    // only on the subtypes/both axes (mirrors `expandQueryTags`).
     if (opts?.tags && opts.tags.length > 0) {
+      const mode: TagExpandMode = opts.expand ?? DEFAULT_TAG_EXPAND_MODE;
+      const subtypeAxis = mode === "subtypes" || mode === "both";
       const hierarchy = this.getTagHierarchy();
-      if (hierarchy.allTags.has(DEFAULT_TAG_NAME) && opts.tags.includes(DEFAULT_TAG_NAME)) {
-        const { tags: _drop, ..._rest } = opts;
+      if (subtypeAxis && hierarchy.allTags.has(DEFAULT_TAG_NAME) && opts.tags.includes(DEFAULT_TAG_NAME)) {
+        const { tags: _drop, expand: _e, ..._rest } = opts;
         return noteOps.searchNotes(this.db, query, _rest);
       }
-      if (hierarchy.childrenOf.size > 0) {
+      // Subtypes fast-path: with no declared hierarchy there are no
+      // descendants, so the tags pass through unchanged (byte-identical to
+      // pre-axis behavior). `exact` likewise needs no expansion.
+      // Namespace/both must still run (lexical expansion is independent of
+      // `parent_names`).
+      const skipExpansion =
+        mode === "exact" || (mode === "subtypes" && hierarchy.childrenOf.size === 0);
+      if (!skipExpansion) {
         const expanded = new Set<string>();
         for (const t of opts.tags) {
-          for (const x of getTagDescendants(hierarchy, t)) expanded.add(x);
+          for (const x of getTagExpansion(hierarchy, t, mode)) expanded.add(x);
         }
-        return noteOps.searchNotes(this.db, query, { ...opts, tags: Array.from(expanded) });
+        const { expand: _e, ..._rest } = opts;
+        return noteOps.searchNotes(this.db, query, { ..._rest, tags: Array.from(expanded) });
       }
+    }
+    // Strip the internal `expand` before passing to noteOps (it has no field
+    // for it; harmless but keep the boundary clean).
+    if (opts && "expand" in opts) {
+      const { expand: _e, ..._rest } = opts;
+      return noteOps.searchNotes(this.db, query, _rest);
     }
     return noteOps.searchNotes(this.db, query, opts);
   }
@@ -340,11 +381,17 @@ export class BunSqliteStore implements Store {
   }
 
   async expandTagsWithDescendants(tags: string[]): Promise<Set<string>> {
+    // Thin `mode:"subtypes"` shim over the mode-aware `expandTags`, so existing
+    // callers (tag-scope auth, search) keep the exact descendant semantics.
+    return this.expandTags(tags, "subtypes");
+  }
+
+  async expandTags(tags: string[], mode: TagExpandMode = DEFAULT_TAG_EXPAND_MODE): Promise<Set<string>> {
     const expanded = new Set<string>();
     if (tags.length === 0) return expanded;
     const hierarchy = this.getTagHierarchy();
     for (const t of tags) {
-      for (const x of getTagDescendants(hierarchy, t)) expanded.add(x);
+      for (const x of getTagExpansion(hierarchy, t, mode)) expanded.add(x);
     }
     return expanded;
   }

@@ -144,6 +144,86 @@ export function getTagDescendants(h: TagHierarchy, tag: string): Set<string> {
 }
 
 /**
+ * Tag-expansion axis (vault tag `expand` axis — design
+ * `design/2026-06-09-tag-expand-axis.md`). A tag relates to others along two
+ * orthogonal axes; this selects which one (or both, or neither) a query expands
+ * along:
+ *
+ * - `"subtypes"` (DEFAULT): tag ∪ `parent_names` descendants. The semantic
+ *   is-a axis — today's always-on behavior, unchanged. `_default` universal
+ *   parent magic fires here.
+ * - `"namespace"`: tag ∪ {names lexically prefixed `tag/`}. The organizational
+ *   filing axis — purely lexical over the known tag set, no `parent_names`, no
+ *   `_default` magic.
+ * - `"both"`: union of subtypes and namespace.
+ * - `"exact"`: the literal tag only, no expansion.
+ */
+export type TagExpandMode = "subtypes" | "namespace" | "both" | "exact";
+
+export const TAG_EXPAND_MODES: readonly TagExpandMode[] = [
+  "subtypes",
+  "namespace",
+  "both",
+  "exact",
+] as const;
+
+export const DEFAULT_TAG_EXPAND_MODE: TagExpandMode = "subtypes";
+
+/**
+ * Lexical namespace expansion for a single tag: the tag itself plus every
+ * known tag name filed under it (`name === tag` OR `name` starts with
+ * `tag + "/"`). Purely a string-prefix match over `h.allTags` — namespacing is
+ * free-form (the slash in the tag *name*), declared nowhere, which is the whole
+ * point: subtyping is declared via `parent_names`, filing is not. No `_default`
+ * magic here — that's a subtypes-axis concept.
+ */
+export function getTagNamespace(h: TagHierarchy, tag: string): Set<string> {
+  // Pre-seeded with `tag` itself, so the loop only needs the strict `tag/*`
+  // prefix test (the `name === tag` case is already covered by the seed).
+  const result = new Set<string>([tag]);
+  const prefix = tag + "/";
+  for (const name of h.allTags) {
+    if (name.startsWith(prefix)) result.add(name);
+  }
+  return result;
+}
+
+/**
+ * Mode-aware single-tag expansion (vault tag `expand` axis). Returns the set of
+ * tag names a query for `tag` should match under `mode`. Always includes `tag`
+ * itself. Set semantics: a tag that is BOTH a declared subtype-child AND
+ * name-prefixed appears once.
+ *
+ * - `"subtypes"` → `getTagDescendants` (parent_names + `_default` magic).
+ * - `"namespace"` → `getTagNamespace` (lexical `tag/*`).
+ * - `"both"` → union of the two.
+ * - `"exact"` → `{tag}`.
+ */
+export function getTagExpansion(
+  h: TagHierarchy,
+  tag: string,
+  mode: TagExpandMode,
+): Set<string> {
+  switch (mode) {
+    case "exact":
+      return new Set<string>([tag]);
+    case "namespace":
+      return getTagNamespace(h, tag);
+    case "both": {
+      const union = new Set<string>(getTagDescendants(h, tag));
+      for (const name of getTagNamespace(h, tag)) union.add(name);
+      return union;
+    }
+    case "subtypes":
+    default:
+      // `default` is a defensive fallback — `TagExpandMode` already constrains
+      // the value to the four cases above; it can only be reached if an
+      // untyped caller passes a bad string.
+      return getTagDescendants(h, tag);
+  }
+}
+
+/**
  * Detect cycles in the declared hierarchy. Returns the list of tags
  * reachable from themselves via parent declarations. Used by
  * `update-tag` write paths to surface a warning to the caller without
