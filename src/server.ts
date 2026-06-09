@@ -18,7 +18,7 @@
 import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath } from "./config.ts";
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
-import { resolveFirstBootVaultName } from "./vault-name.ts";
+import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
@@ -204,6 +204,15 @@ if (listVaults().length === 0) {
 // preserving `upsertService` ensures any hub-stamped fields on the row
 // survive — see self-register.ts header for the v0.6 vs v0.7 design note.
 selfRegister({ version: pkg.version });
+
+// Loud boot warning for vaults squatting a shadowed reserved name (B2 of the
+// 2026-06-09 hub-module-boundary migration). A vault named `admin`/`new`/
+// `assets` (created before the names were reserved) has its entire
+// `/vault/<name>/*` data plane shadowed by reserved hub/daemon routes — warn
+// with the recovery procedure rather than silently serving nothing.
+for (const warning of reservedNameSquatWarnings(listVaults())) {
+  console.warn(warning);
+}
 
 // Migrate tag schemas from vault.yaml → DB for each vault.
 // Only inserts schemas that don't already exist in the DB (safe across restarts).

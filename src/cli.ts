@@ -933,21 +933,16 @@ async function cmdCreate(args: string[]) {
     process.exit(1);
   }
 
-  // Lowercase-only (security review — multi-user hardening). An uppercase
-  // vault name flips the audience case (`vault.<Name>` vs `vault.<name>`)
-  // and drifts from hub-side / init-path lowercasing, breaking JWT
-  // audience matching. `init` already enforces lowercase via
-  // `validateVaultName`; mirror that rule here so uppercase can't enter
-  // through `create` either.
-  if (!/^[a-z0-9_-]+$/.test(name)) {
-    console.error("Vault name must be lowercase alphanumeric with hyphens or underscores (no uppercase).");
-    process.exit(1);
-  }
-  if (name === "list") {
-    // Reserved — keeps the "list" vault name out of play even though per-vault
-    // routes now live under /vault/<name>/ and no longer collide with the
-    // /vaults/list discovery endpoint.
-    console.error(`"list" is a reserved vault name.`);
+  // One validator for every name-minting edge (2026-06-09 hub-module-boundary
+  // migration B2). cmdCreate used to carry its own inline charset check plus a
+  // hardcoded `"list"` reservation that had drifted from `validateVaultName`'s
+  // set — a vault named `admin`/`new`/`assets` could enter through `create`
+  // and capture a reserved route (`/vault/admin` is the daemon-level admin
+  // mount as of B3). Consuming the shared validator also picks up its 2–32
+  // length rule, aligning `create` with `init`, the env var, and hub's wizard.
+  const nameValidation = validateVaultName(name);
+  if (!nameValidation.ok) {
+    console.error(nameValidation.error);
     process.exit(1);
   }
 
