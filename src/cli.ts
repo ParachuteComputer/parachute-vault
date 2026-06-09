@@ -1570,20 +1570,52 @@ function cmdRemove(args: string[]) {
   // Keep default_vault in sync. If the removed vault was the default, either
   // promote the remaining vault (if exactly one) or clear the setting.
   const globalConfig = readGlobalConfig();
+  const remaining = listVaults();
+  let configDirty = false;
   if (globalConfig.default_vault === name) {
-    const remaining = listVaults();
     if (remaining.length === 1) {
       globalConfig.default_vault = remaining[0];
-      writeGlobalConfig(globalConfig);
       console.log(`  Default vault is now "${remaining[0]}".`);
     } else {
       delete globalConfig.default_vault;
-      writeGlobalConfig(globalConfig);
       if (remaining.length > 1) {
         console.log(`  Cleared default_vault — set one with: editor ${CONFIG_DIR}/config.yaml`);
       }
     }
+    configDirty = true;
   }
+
+  // Last-vault marker (2026-06-09 hub-module-boundary migration, B1's
+  // CLI-side improvement). Server boot auto-creates `default` when zero
+  // vaults exist — without the marker, an operator who explicitly emptied
+  // the server would find a freshly-credentialed `default` resurrected on
+  // the next restart. Fresh installs never carry the marker (no config.yaml
+  // at all), so Docker / hub-install first-run auto-create is preserved.
+  if (remaining.length === 0 && globalConfig.auto_create !== false) {
+    globalConfig.auto_create = false;
+    configDirty = true;
+    console.log(
+      `  Last vault removed — wrote auto_create: false to ${GLOBAL_CONFIG_PATH} so the` +
+        ` server won't auto-recreate "default" on next boot. Create a vault with:` +
+        ` parachute-vault create <name>`,
+    );
+  }
+  if (configDirty) writeGlobalConfig(globalConfig);
+
+  // Refresh services.json so the removed vault's /vault/<name> path drops
+  // out of the parachute-vault row immediately — the same selfRegister
+  // refresh cmdCreate does (#208). Without this, the hub's well-known
+  // fan-out kept advertising the deleted vault until the next server boot.
+  // Note: with zero vaults remaining, selfRegister falls back to the
+  // manifest's canonical paths (`/vault/default`) — the same row a
+  // subsequent boot would write — so CLI-remove and boot agree on the
+  // zero-vault registration shape. Warnings go to stderr; status lines stay
+  // ours.
+  selfRegister({
+    version: pkg.version,
+    warn: (msg) => console.error(`Warning: ${msg}`),
+    log: () => {},
+  });
 }
 
 async function cmdConfig(args: string[]) {
