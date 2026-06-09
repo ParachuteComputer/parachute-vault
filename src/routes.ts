@@ -47,7 +47,7 @@ import {
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { assetsDir } from "./config.ts";
+import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
 import { shouldAutoTranscribe } from "./auto-transcribe.ts";
 // usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
 // of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
@@ -1144,7 +1144,14 @@ async function handleNotesInner(
       // Explicit `transcribe: true` wins — if the caller asked, we honor that
       // regardless of the auto-transcribe toggle (back-compat).
       const explicitOptIn = body.transcribe === true;
-      const autoOptIn = !explicitOptIn && shouldAutoTranscribe(body.mimeType);
+      // Per-vault auto-transcribe: read THIS vault's `auto_transcribe.enabled`
+      // (vault.yaml) and pass it as the precedence-winning toggle. A vault that
+      // set its own value uses it; one that left it unset falls through to the
+      // global toggle inside `shouldAutoTranscribe` (per-vault → global → true).
+      const perVaultEnabled = vault
+        ? readVaultConfig(vault)?.auto_transcribe?.enabled
+        : undefined;
+      const autoOptIn = !explicitOptIn && shouldAutoTranscribe(body.mimeType, { perVaultEnabled });
       const attMeta = (explicitOptIn || autoOptIn)
         ? {
             transcribe_status: "pending" as const,
@@ -1960,9 +1967,26 @@ type VaultConfigLike = {
   name: string;
   description?: string;
   audio_retention?: "keep" | "until_transcribed" | "never";
+  auto_transcribe?: { enabled?: boolean };
 };
 
 const VALID_AUDIO_RETENTION = ["keep", "until_transcribed", "never"] as const;
+
+/**
+ * Resolve the effective auto-transcribe toggle for a vault's GET response, the
+ * SAME resolution `shouldAutoTranscribe` uses at the decision point:
+ * **per-vault → global → true**. A vault that set its own `auto_transcribe`
+ * shows that; one that left it unset shows the server-wide default (itself
+ * default-ON). This keeps the GET in lock-step with what the worker actually
+ * does, with no field-name drift.
+ */
+function resolveAutoTranscribeEnabled(vaultConfig: VaultConfigLike): boolean {
+  return (
+    vaultConfig.auto_transcribe?.enabled
+    ?? readGlobalConfig().auto_transcribe?.enabled
+    ?? true
+  );
+}
 
 function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
   return {
@@ -1970,6 +1994,9 @@ function vaultResponse(vaultConfig: VaultConfigLike): Record<string, unknown> {
     description: vaultConfig.description ?? null,
     config: {
       audio_retention: vaultConfig.audio_retention ?? "keep",
+      auto_transcribe: {
+        enabled: resolveAutoTranscribeEnabled(vaultConfig),
+      },
     },
   };
 }
@@ -1993,7 +2020,7 @@ export async function handleVault(
   if (req.method === "PATCH") {
     const body = await req.json() as {
       description?: string;
-      config?: { audio_retention?: string };
+      config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
     };
     let dirty = false;
 
@@ -2014,6 +2041,28 @@ export async function handleVault(
         );
       }
       vaultConfig.audio_retention = v as typeof VALID_AUDIO_RETENTION[number];
+      dirty = true;
+    }
+
+    // auto_transcribe.enabled — PER-VAULT toggle persisted to THIS vault's
+    // vault.yaml (via `persist`, the same writeVaultConfig path as
+    // description/audio_retention). Flipping it for vault X affects only X;
+    // scribe's "link to vault X" PATCHes this and never touches other vaults.
+    // The worker reads the same per-vault field (per-vault → global → true).
+    // Validate the shape: when `auto_transcribe` is present it must carry a
+    // boolean `enabled`.
+    if (body.config?.auto_transcribe !== undefined) {
+      const enabled = body.config.auto_transcribe?.enabled;
+      if (typeof enabled !== "boolean") {
+        return json(
+          {
+            error: "invalid_auto_transcribe",
+            message: "auto_transcribe.enabled must be a boolean",
+          },
+          400,
+        );
+      }
+      vaultConfig.auto_transcribe = { ...vaultConfig.auto_transcribe, enabled };
       dirty = true;
     }
 

@@ -19,11 +19,18 @@ import { getCachedScribeUrl } from "./scribe-discovery.ts";
  *
  * Returns `true` only when ALL three conditions hold:
  *   1. mime-type starts with `audio/` (case-insensitive).
- *   2. `globalConfig.auto_transcribe?.enabled` is not explicitly false.
- *      Default behavior (when unset) is ON — once an operator has scribe
- *      reachable, audio attachments transcribe automatically without a
- *      separate config step. Operators who want it OFF set
- *      `auto_transcribe.enabled: false` explicitly.
+ *   2. The resolved auto-transcribe toggle is not `false`. Resolution is
+ *      **per-vault → global → true**:
+ *        - `perVaultEnabled` (the owning vault's own `auto_transcribe.enabled`)
+ *          wins when set — this is what makes scribe's "link to vault X" affect
+ *          only X, not the whole server.
+ *        - else the server-wide `globalConfig.auto_transcribe?.enabled`.
+ *        - else `true` (default ON — once scribe is reachable, audio
+ *          transcribes without a separate config step). Operators who want it
+ *          OFF set `auto_transcribe.enabled: false` explicitly (per-vault or
+ *          globally).
+ *      `enabledOverride`, when present, hard-overrides the whole chain (used
+ *      by the explicit caller-opt-in path).
  *   3. Scribe is discoverable (services.json entry OR SCRIBE_URL env).
  *
  * The three conditions are independent guards: a single `false` is sufficient
@@ -35,7 +42,17 @@ export function shouldAutoTranscribe(
     /** Injection seam for tests — defaults to live globals. */
     readGlobalConfigImpl?: typeof readGlobalConfig;
     getCachedScribeUrlImpl?: () => string | undefined;
-    /** Allow per-call enabled override — used by the explicit-opt-in path. */
+    /**
+     * The owning vault's per-vault `auto_transcribe.enabled` (vault.yaml).
+     * Takes precedence over the global toggle when set, so enabling/disabling
+     * one vault doesn't move the rest. `undefined` (the vault left it unset)
+     * falls through to the global toggle.
+     */
+    perVaultEnabled?: boolean;
+    /**
+     * Hard override of the entire per-vault→global→true chain. Used by the
+     * explicit caller-opt-in path; not part of the normal precedence ladder.
+     */
     enabledOverride?: boolean;
   } = {},
 ): boolean {
@@ -43,6 +60,7 @@ export function shouldAutoTranscribe(
     return false;
   }
   const enabled = opts.enabledOverride
+    ?? opts.perVaultEnabled
     ?? (opts.readGlobalConfigImpl ?? readGlobalConfig)().auto_transcribe?.enabled
     ?? true;
   if (!enabled) return false;

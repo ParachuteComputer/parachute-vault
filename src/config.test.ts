@@ -169,6 +169,33 @@ describe("config", () => {
     expect(loaded!.transcription).toBeUndefined();
   });
 
+  test("round-trips per-vault auto_transcribe.enabled (true + false)", () => {
+    // The PATCH /api/vault handler persists the per-vault toggle via
+    // writeVaultConfig; confirm it survives a read-back — this is the exact
+    // field shouldAutoTranscribe reads per-vault (per-vault → global → true).
+    const base: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+
+    writeVaultConfig({ ...base, auto_transcribe: { enabled: true } });
+    expect(readVaultConfig("testvault")!.auto_transcribe?.enabled).toBe(true);
+
+    writeVaultConfig({ ...base, auto_transcribe: { enabled: false } });
+    expect(readVaultConfig("testvault")!.auto_transcribe?.enabled).toBe(false);
+  });
+
+  test("vault config without auto_transcribe loads as undefined (falls back to global)", () => {
+    const config: VaultConfig = {
+      name: "testvault",
+      api_keys: [],
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    writeVaultConfig(config);
+    expect(readVaultConfig("testvault")!.auto_transcribe).toBeUndefined();
+  });
+
   test("round-trips discovery: enabled|disabled", () => {
     // Default: absent means enabled (endpoint serves names).
     writeGlobalConfig({ port: 1940 });
