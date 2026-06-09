@@ -63,6 +63,7 @@ import {
   handleViewNote,
   type TagScopeCtx,
 } from "./routes.ts";
+import { handleSubscribe } from "./subscribe.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import {
   handleProtectedResource,
@@ -762,6 +763,10 @@ export async function route(
   };
 
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope);
+  // Live-query SSE subscription (design 2026-06-08). Snapshot + scoped live
+  // upsert/remove events over text/event-stream. Auth + tag-scope already
+  // resolved above and threaded through, mirroring the /notes branch.
+  if (apiPath === "/subscribe") return handleSubscribe(req, store, vaultName, tagScope);
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {

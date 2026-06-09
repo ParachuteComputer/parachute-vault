@@ -7,6 +7,7 @@
 
 import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
+import type { Store } from "../core/src/types.ts";
 import { openVaultDb } from "./db.ts";
 
 export { SqliteStore as BunStore };
@@ -33,9 +34,15 @@ export function getVaultStore(name: string): SqliteStore {
   return store;
 }
 
-/** Look up the vault name for a previously-opened store. */
-export function getVaultNameForStore(store: SqliteStore): string | undefined {
-  return storeToVault.get(store);
+/**
+ * Look up the vault name for a previously-opened store. Accepts the `Store`
+ * interface (not just the concrete `SqliteStore`) so hook handlers — which
+ * receive `Store` from the dispatcher — can resolve the vault. The WeakMap is
+ * keyed on the concrete instance the dispatcher passes through unchanged, so
+ * the lookup still hits.
+ */
+export function getVaultNameForStore(store: Store): string | undefined {
+  return storeToVault.get(store as SqliteStore);
 }
 
 /**
