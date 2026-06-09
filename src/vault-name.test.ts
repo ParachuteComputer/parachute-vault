@@ -7,7 +7,13 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { validateVaultName, decideInitVaultName, resolveFirstBootVaultName } from "./vault-name.ts";
+import {
+  RESERVED_VAULT_NAMES,
+  decideInitVaultName,
+  reservedNameSquatWarnings,
+  resolveFirstBootVaultName,
+  validateVaultName,
+} from "./vault-name.ts";
 
 describe("validateVaultName", () => {
   describe("accepts", () => {
@@ -69,11 +75,28 @@ describe("validateVaultName", () => {
       }
     });
 
-    test("reserved name 'list'", () => {
-      const result = validateVaultName("list");
+    // The consolidated reserved set (2026-06-09 hub-module-boundary B2):
+    // `list` (legacy), `new` + `assets` (hub SPA route collisions), `admin`
+    // (the daemon-level /vault/admin multi-vault mount). Kept in lockstep
+    // with hub's RESERVED_VAULT_NAMES.
+    test.each(["list", "new", "assets", "admin"])("reserved name '%s'", (name) => {
+      const result = validateVaultName(name);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain("reserved");
     });
+
+    test("the exported set carries exactly the four consolidated names", () => {
+      expect([...RESERVED_VAULT_NAMES].sort()).toEqual(["admin", "assets", "list", "new"]);
+    });
+
+    test.each(["adminx", "admin2", "newer", "asset", "listing"])(
+      "near-miss '%s' is NOT reserved",
+      (name) => {
+        const result = validateVaultName(name);
+        expect(result.ok).toBe(true);
+        if (result.ok) expect(result.name).toBe(name);
+      },
+    );
 
     test("single character (below 2-char min)", () => {
       const result = validateVaultName("a");
@@ -92,6 +115,41 @@ describe("validateVaultName", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain("32");
     });
+  });
+});
+
+describe("reservedNameSquatWarnings", () => {
+  test("fires for a squatted 'admin' vault, naming the shadowing + recovery", () => {
+    const warnings = reservedNameSquatWarnings(["default", "admin"]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('vault "admin"');
+    expect(warnings[0]).toContain("shadowed");
+    expect(warnings[0]).toContain("/vault/admin/*");
+    // Recovery procedure (no rename command exists): export → create →
+    // import → remove.
+    expect(warnings[0]).toContain("export");
+    expect(warnings[0]).toContain("create <newname>");
+    expect(warnings[0]).toContain("import");
+    expect(warnings[0]).toContain("remove admin --yes");
+  });
+
+  test("fires once per squatted name — admin + new + assets all warned", () => {
+    const warnings = reservedNameSquatWarnings(["admin", "new", "assets", "ok"]);
+    expect(warnings).toHaveLength(3);
+    expect(warnings.join("\n")).toContain('vault "admin"');
+    expect(warnings.join("\n")).toContain('vault "new"');
+    expect(warnings.join("\n")).toContain('vault "assets"');
+  });
+
+  test("silent for clean vault lists and near-misses", () => {
+    expect(reservedNameSquatWarnings([])).toEqual([]);
+    expect(reservedNameSquatWarnings(["default", "work", "adminx", "admin2"])).toEqual([]);
+  });
+
+  test("silent for 'list' (reserved for consistency, but not shadowed)", () => {
+    // `/vault/list/*` still routes per-vault — list is reserved at create
+    // time but a legacy squatter keeps working, so no scary boot warning.
+    expect(reservedNameSquatWarnings(["list"])).toEqual([]);
   });
 });
 

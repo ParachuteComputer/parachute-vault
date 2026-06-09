@@ -431,6 +431,70 @@ describe("/vault/<name>/admin/* SPA mount", () => {
     expect(res.status).toBe(401);
   });
 
+  // ---------------------------------------------------------------------
+  // /vault/admin[/*] — DAEMON-LEVEL multi-vault SPA mount (B3, 2026-06-09
+  // hub-module-boundary migration). `admin` is a reserved vault name (B2),
+  // and this branch dispatches BEFORE both the per-vault SPA mount and the
+  // per-vault dispatcher. Detailed serving behavior (the bare-mount 301,
+  // asset strip) is pinned in admin-spa.test.ts with a tmp dist dir.
+  // ---------------------------------------------------------------------
+
+  test("/vault/admin/ fires the SPA layer, never the per-vault 'Vault not found' JSON", async () => {
+    // No vault named "admin" exists (it can't — reserved). Without the
+    // daemon-level branch this path would fall to the per-vault dispatcher
+    // and 404 as JSON.
+    const req = new Request("http://localhost:1940/vault/admin/");
+    const res = await route(req, "/vault/admin/");
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  test("/vault/admin/admin does NOT boot per-vault mode for a vault named 'admin'", async () => {
+    // The per-vault regex would capture name="admin" here. The daemon-level
+    // branch must win — the regexes are deliberately not merged.
+    const req = new Request("http://localhost:1940/vault/admin/admin");
+    const res = await route(req, "/vault/admin/admin");
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  test("a squatted vault named 'admin' is shadowed — its data plane serves the SPA layer", async () => {
+    // A vault created before the reservation landed. The daemon mount wins
+    // over its entire /vault/admin/* surface (server boot warns with the
+    // recovery procedure — see vault-name.ts:reservedNameSquatWarnings).
+    createVault("admin");
+    const req = new Request("http://localhost:1940/vault/admin/api/notes");
+    const res = await route(req, "/vault/admin/api/notes");
+    // The per-vault API would 401 (auth wall); the SPA layer serves the
+    // static shell (200) or the unbuilt-dist 503 — never the API's JSON.
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
+  test("POST /vault/admin/ returns 405 (daemon mount is GET-only)", async () => {
+    const req = new Request("http://localhost:1940/vault/admin/", { method: "POST" });
+    const res = await route(req, "/vault/admin/");
+    expect(res.status).toBe(405);
+  });
+
+  test("/vault/adminx/* does NOT match the daemon mount — routes per-vault", async () => {
+    // Exact-segment match only: a real vault whose name merely starts with
+    // "admin" keeps its normal per-vault surface (the API auth wall 401s,
+    // proving the per-vault dispatcher handled it).
+    createVault("adminx");
+    const req = new Request("http://localhost:1940/vault/adminx/api/notes");
+    const res = await route(req, "/vault/adminx/api/notes");
+    expect(res.status).toBe(401);
+  });
+
+  test("per-vault /vault/<real>/admin/ is unaffected by the daemon mount", async () => {
+    createVault("work");
+    const req = new Request("http://localhost:1940/vault/work/admin/");
+    const res = await route(req, "/vault/work/admin/");
+    expect(res.status === 200 || res.status === 503).toBe(true);
+    expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+  });
+
   test("origin-rooted /admin (legacy mount retired) returns 404", async () => {
     // Pre-vault#252 the SPA was at /admin/*. Routing now lets that fall
     // through to the catch-all — hub's directory page should link to

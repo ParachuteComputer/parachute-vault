@@ -29,6 +29,18 @@ import { fileURLToPath } from "node:url";
 const ADMIN_SPA_MOUNT_RE = /^\/vault\/([^/]+)\/admin(?=\/|$)/;
 
 /**
+ * Regex anchoring the DAEMON-LEVEL multi-vault SPA mount at `/vault/admin`
+ * (B3 of the 2026-06-09 hub-module-boundary migration). Deliberately a
+ * SEPARATE regex from the per-vault one — merging them would let
+ * `/vault/admin/admin` boot per-vault mode with name="admin". `admin` is a
+ * reserved vault name (see `vault-name.ts:RESERVED_VAULT_NAMES`), so this
+ * mount can never collide with a real instance; routing dispatches it
+ * BEFORE the per-vault branch so a pre-reservation squatter is shadowed
+ * (and warned about at boot) rather than capturing the mount.
+ */
+const DAEMON_ADMIN_SPA_MOUNT_RE = /^\/vault\/admin(?=\/|$)/;
+
+/**
  * Resolve the default SPA bundle dir. Anchored to this file's location so
  * a `bun src/server.ts` from any cwd still finds `<repo>/web/ui/dist/`.
  * Tests / production override via the `spaDistDir` argument to
@@ -92,18 +104,24 @@ function spaContentType(pathname: string): string {
  * even before a token has been minted (so the operator can actually see
  * the empty / auth-required state we render in `VaultDetail.tsx`).
  */
-export async function serveAdminSpa(spaDistDir: string, pathname: string): Promise<Response> {
+export async function serveAdminSpa(
+  spaDistDir: string,
+  pathname: string,
+  mountRe: RegExp = ADMIN_SPA_MOUNT_RE,
+): Promise<Response> {
   if (!existsSync(spaDistDir)) {
     return new Response(
       "vault admin SPA bundle not found — run `bun run build` in web/ui/ to produce dist/",
       { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }
-  // Strip the mount prefix:
+  // Strip the mount prefix (per-vault by default; the daemon-level mount
+  // passes its own regex via `serveDaemonAdminSpa`):
   //   /vault/foo/admin       → ""
   //   /vault/foo/admin/      → "/"
   //   /vault/foo/admin/x.js  → "/x.js"
-  const sub = pathname.replace(ADMIN_SPA_MOUNT_RE, "");
+  //   /vault/admin/x.js      → "/x.js"   (daemon mount)
+  const sub = pathname.replace(mountRe, "");
 
   // Canonicalize the bare mount → trailing-slash form. Vite emits
   // *relative* asset URLs (`./assets/index-abc.js`) since `<name>` isn't
@@ -155,7 +173,34 @@ export async function serveAdminSpa(spaDistDir: string, pathname: string): Promi
  * Match `/vault/<name>/admin` or `/vault/<name>/admin/...`. Bare
  * `/vault/<name>/admin-foo` and `/vault/<name>` (the metadata endpoint)
  * must NOT trigger this — only the SPA mount root and its true subpaths.
+ *
+ * NOTE: `/vault/admin/admin` also matches this regex (name="admin") — the
+ * router dispatches `isDaemonAdminSpaPath` FIRST so that path never
+ * reaches per-vault mode. Keep that dispatch order; it's pinned in
+ * routing.test.ts.
  */
 export function isAdminSpaPath(pathname: string): boolean {
   return ADMIN_SPA_MOUNT_RE.test(pathname);
+}
+
+/**
+ * Match the daemon-level multi-vault mount: `/vault/admin` or
+ * `/vault/admin/...`. `/vault/adminx` (a real vault that begins with
+ * "admin") must NOT trigger this — only the exact segment.
+ */
+export function isDaemonAdminSpaPath(pathname: string): boolean {
+  return DAEMON_ADMIN_SPA_MOUNT_RE.test(pathname);
+}
+
+/**
+ * Serve the SPA bundle under the daemon-level `/vault/admin` mount. Same
+ * bundle as the per-vault mount — `web/ui/src/lib/mount.ts` detects which
+ * basename it booted under at runtime — with the daemon mount's own
+ * prefix-strip. The bare-mount 301 inside `serveAdminSpa` fires for
+ * `/vault/admin` too: Vite's relative asset URLs resolve against the
+ * document's DIRECTORY, so without the trailing-slash canonicalization
+ * assets would resolve to `/vault/assets/...` and 404.
+ */
+export function serveDaemonAdminSpa(spaDistDir: string, pathname: string): Promise<Response> {
+  return serveAdminSpa(spaDistDir, pathname, DAEMON_ADMIN_SPA_MOUNT_RE);
 }

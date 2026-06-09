@@ -15,10 +15,10 @@
  * The request pipeline lives in ./routing.ts (exported for unit testing).
  */
 
-import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath } from "./config.ts";
+import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig, listVaults, DEFAULT_PORT, ensureConfigDirSync, loadEnvFile, generateApiKey, hashKey, stopSignalPath, bootAutoCreateAllowed } from "./config.ts";
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
-import { resolveFirstBootVaultName } from "./vault-name.ts";
+import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
@@ -156,9 +156,20 @@ warnLegacyGlobalApiKeys(readGlobalConfig().api_keys);
 // The vault name comes from PARACHUTE_VAULT_NAME when set + valid; otherwise
 // falls back to "default". Hub's first-boot wizard (hub#267) passes through
 // an operator-chosen name via this env var.
+//
+// Gated on the `auto_create: false` marker (2026-06-09 hub-module-boundary
+// migration): `parachute-vault remove` writes it when the operator deletes
+// their LAST vault, so an explicit empty-the-server action isn't silently
+// undone by a resurrection with fresh credentials on the next boot. Fresh
+// installs have no config.yaml — no marker — so Docker first-run still
+// auto-creates.
 if (listVaults().length === 0) {
   const globalConfig = readGlobalConfig();
-  if (!globalConfig.default_vault) {
+  if (!bootAutoCreateAllowed(globalConfig)) {
+    console.log(
+      '[vault first-boot] auto-create disabled (auto_create: false in config.yaml — the last vault was removed deliberately). Create one with: parachute-vault create <name>',
+    );
+  } else if (!globalConfig.default_vault) {
     const firstBoot = resolveFirstBootVaultName(process.env.PARACHUTE_VAULT_NAME);
     if (firstBoot.source === "env") {
       console.log(`[vault first-boot] using PARACHUTE_VAULT_NAME=${firstBoot.name}`);
@@ -204,6 +215,15 @@ if (listVaults().length === 0) {
 // preserving `upsertService` ensures any hub-stamped fields on the row
 // survive — see self-register.ts header for the v0.6 vs v0.7 design note.
 selfRegister({ version: pkg.version });
+
+// Loud boot warning for vaults squatting a shadowed reserved name (B2 of the
+// 2026-06-09 hub-module-boundary migration). A vault named `admin`/`new`/
+// `assets` (created before the names were reserved) has its entire
+// `/vault/<name>/*` data plane shadowed by reserved hub/daemon routes — warn
+// with the recovery procedure rather than silently serving nothing.
+for (const warning of reservedNameSquatWarnings(listVaults())) {
+  console.warn(warning);
+}
 
 // Migrate tag schemas from vault.yaml → DB for each vault.
 // Only inserts schemas that don't already exist in the DB (safe across restarts).

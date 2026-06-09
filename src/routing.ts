@@ -15,6 +15,9 @@
  *   /vaults/list                       — public vault-name discovery (can be
  *                                        disabled globally via config)
  *   /vaults                            — authenticated vault metadata list
+ *   /vault/admin[/*]                   — daemon-level multi-vault admin SPA
+ *                                        (B3; `admin` is a reserved vault
+ *                                        name, dispatched BEFORE per-vault)
  *   /vault/<name>/.well-known/oauth-*  — discovery forwarder; metadata names
  *                                        the hub as the authorization server
  *                                        (vault is resource-server only)
@@ -52,7 +55,13 @@ import {
 import { hasScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
-import { defaultAdminSpaDistDir, isAdminSpaPath, serveAdminSpa } from "./admin-spa.ts";
+import {
+  defaultAdminSpaDistDir,
+  isAdminSpaPath,
+  isDaemonAdminSpaPath,
+  serveAdminSpa,
+  serveDaemonAdminSpa,
+} from "./admin-spa.ts";
 import {
   handleNotes,
   handleTags,
@@ -287,6 +296,26 @@ export async function route(
     return Response.json(buildAuthStatus(), {
       headers: { "Access-Control-Allow-Origin": "*" },
     });
+  }
+
+  // Daemon-level multi-vault admin SPA — `/vault/admin[/*]` (B3 of the
+  // 2026-06-09 hub-module-boundary migration). The vault MODULE's own home
+  // surface: list / create / delete vaults, deep-link into each instance's
+  // per-vault admin. Same static bundle as the per-vault mount below —
+  // `web/ui/src/lib/mount.ts` detects the basename at runtime.
+  //
+  // MUST dispatch BEFORE `isAdminSpaPath`: the per-vault regex also matches
+  // `/vault/admin/admin` (capturing name="admin"), which must NOT boot
+  // per-vault mode — `admin` is a reserved vault name (B2) and this mount is
+  // daemon-owned. Hub#637's `/vault/admin` route forwards the FULL path here
+  // (no stripPrefix on vault's services row). A pre-reservation squatter
+  // vault named "admin" is fully shadowed by this branch — server boot
+  // warns with the recovery procedure (see vault-name.ts).
+  if (isDaemonAdminSpaPath(path)) {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    return serveDaemonAdminSpa(defaultAdminSpaDistDir(), path);
   }
 
   // Admin SPA — per-vault at `/vault/<name>/admin/*` (vault#252). Static-

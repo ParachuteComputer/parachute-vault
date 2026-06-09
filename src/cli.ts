@@ -933,21 +933,16 @@ async function cmdCreate(args: string[]) {
     process.exit(1);
   }
 
-  // Lowercase-only (security review — multi-user hardening). An uppercase
-  // vault name flips the audience case (`vault.<Name>` vs `vault.<name>`)
-  // and drifts from hub-side / init-path lowercasing, breaking JWT
-  // audience matching. `init` already enforces lowercase via
-  // `validateVaultName`; mirror that rule here so uppercase can't enter
-  // through `create` either.
-  if (!/^[a-z0-9_-]+$/.test(name)) {
-    console.error("Vault name must be lowercase alphanumeric with hyphens or underscores (no uppercase).");
-    process.exit(1);
-  }
-  if (name === "list") {
-    // Reserved — keeps the "list" vault name out of play even though per-vault
-    // routes now live under /vault/<name>/ and no longer collide with the
-    // /vaults/list discovery endpoint.
-    console.error(`"list" is a reserved vault name.`);
+  // One validator for every name-minting edge (2026-06-09 hub-module-boundary
+  // migration B2). cmdCreate used to carry its own inline charset check plus a
+  // hardcoded `"list"` reservation that had drifted from `validateVaultName`'s
+  // set — a vault named `admin`/`new`/`assets` could enter through `create`
+  // and capture a reserved route (`/vault/admin` is the daemon-level admin
+  // mount as of B3). Consuming the shared validator also picks up its 2–32
+  // length rule, aligning `create` with `init`, the env var, and hub's wizard.
+  const nameValidation = validateVaultName(name);
+  if (!nameValidation.ok) {
+    console.error(nameValidation.error);
     process.exit(1);
   }
 
@@ -1575,20 +1570,52 @@ function cmdRemove(args: string[]) {
   // Keep default_vault in sync. If the removed vault was the default, either
   // promote the remaining vault (if exactly one) or clear the setting.
   const globalConfig = readGlobalConfig();
+  const remaining = listVaults();
+  let configDirty = false;
   if (globalConfig.default_vault === name) {
-    const remaining = listVaults();
     if (remaining.length === 1) {
       globalConfig.default_vault = remaining[0];
-      writeGlobalConfig(globalConfig);
       console.log(`  Default vault is now "${remaining[0]}".`);
     } else {
       delete globalConfig.default_vault;
-      writeGlobalConfig(globalConfig);
       if (remaining.length > 1) {
         console.log(`  Cleared default_vault — set one with: editor ${CONFIG_DIR}/config.yaml`);
       }
     }
+    configDirty = true;
   }
+
+  // Last-vault marker (2026-06-09 hub-module-boundary migration, B1's
+  // CLI-side improvement). Server boot auto-creates `default` when zero
+  // vaults exist — without the marker, an operator who explicitly emptied
+  // the server would find a freshly-credentialed `default` resurrected on
+  // the next restart. Fresh installs never carry the marker (no config.yaml
+  // at all), so Docker / hub-install first-run auto-create is preserved.
+  if (remaining.length === 0 && globalConfig.auto_create !== false) {
+    globalConfig.auto_create = false;
+    configDirty = true;
+    console.log(
+      `  Last vault removed — wrote auto_create: false to ${GLOBAL_CONFIG_PATH} so the` +
+        ` server won't auto-recreate "default" on next boot. Create a vault with:` +
+        ` parachute-vault create <name>`,
+    );
+  }
+  if (configDirty) writeGlobalConfig(globalConfig);
+
+  // Refresh services.json so the removed vault's /vault/<name> path drops
+  // out of the parachute-vault row immediately — the same selfRegister
+  // refresh cmdCreate does (#208). Without this, the hub's well-known
+  // fan-out kept advertising the deleted vault until the next server boot.
+  // Note: with zero vaults remaining, selfRegister falls back to the
+  // manifest's canonical paths (`/vault/default`) — the same row a
+  // subsequent boot would write — so CLI-remove and boot agree on the
+  // zero-vault registration shape. Warnings go to stderr; status lines stay
+  // ours.
+  selfRegister({
+    version: pkg.version,
+    warn: (msg) => console.error(`Warning: ${msg}`),
+    log: () => {},
+  });
 }
 
 async function cmdConfig(args: string[]) {

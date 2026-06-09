@@ -312,6 +312,19 @@ export interface GlobalConfig {
    * point their own supervisor at it.
    */
   autostart?: boolean;
+  /**
+   * Boot auto-create marker (2026-06-09 hub-module-boundary migration, the
+   * vault wave's `cmdRemove` improvement). Server boot auto-creates a
+   * `default` vault when `listVaults()` is empty — the Docker / hub-install
+   * first-run path. When the operator EXPLICITLY deletes their last vault
+   * via `parachute-vault remove`, that auto-create would silently resurrect
+   * a fresh `default` (with fresh credentials) on the next boot. `cmdRemove`
+   * writes `auto_create: false` when it removes the last vault; boot skips
+   * the auto-create while the marker is present. Fresh installs (no
+   * config.yaml at all) never carry the marker, so the Docker first-run
+   * behavior is preserved. See `bootAutoCreateAllowed`.
+   */
+  auto_create?: boolean;
   /** Backup configuration: schedule, retention, destinations. */
   backup?: BackupConfig;
   /**
@@ -1258,6 +1271,20 @@ export function migrateVaultInternalLayout(): void {
 // Global config
 // ---------------------------------------------------------------------------
 
+/**
+ * Whether server boot may auto-create the first vault when none exist.
+ *
+ * Only the explicit `auto_create: false` marker (written by `cmdRemove`
+ * when it deletes the LAST vault) blocks the auto-create. A fresh install
+ * has no config.yaml — `readGlobalConfig()` returns defaults with
+ * `auto_create` unset — so Docker / hub-install first-run still
+ * auto-creates `default`. Pure + exported so the boot gate is testable
+ * without booting a server.
+ */
+export function bootAutoCreateAllowed(config: Pick<GlobalConfig, "auto_create">): boolean {
+  return config.auto_create !== false;
+}
+
 export function readGlobalConfig(): GlobalConfig {
   try {
     const gcPath = globalConfigPath();
@@ -1269,6 +1296,7 @@ export function readGlobalConfig(): GlobalConfig {
       const totpSecretMatch = yaml.match(/^totp_secret:\s*"([^"]+)"/m);
       const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
       const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
+      const autoCreateMatch = yaml.match(/^auto_create:\s*(true|false)/m);
       const defaultMirrorMatch = yaml.match(/^default_mirror:\s*(internal|off)/m);
       // auto_transcribe block — currently single boolean `enabled` (vault#353).
       // Parsed as a nested 2-space-indent block so future fields can grow under
@@ -1297,6 +1325,9 @@ export function readGlobalConfig(): GlobalConfig {
       }
       if (autostartMatch) {
         config.autostart = autostartMatch[1]! === "true";
+      }
+      if (autoCreateMatch) {
+        config.auto_create = autoCreateMatch[1]! === "true";
       }
       if (defaultMirrorMatch) {
         config.default_mirror = defaultMirrorMatch[1]! as "internal" | "off";
@@ -1373,6 +1404,7 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   if (config.default_vault) lines.push(`default_vault: ${config.default_vault}`);
   if (config.discovery) lines.push(`discovery: ${config.discovery}`);
   if (config.autostart !== undefined) lines.push(`autostart: ${config.autostart}`);
+  if (config.auto_create !== undefined) lines.push(`auto_create: ${config.auto_create}`);
   if (config.default_mirror) lines.push(`default_mirror: ${config.default_mirror}`);
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);

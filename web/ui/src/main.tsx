@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { App } from "./App.tsx";
 import { captureTokenFromFragment, tryMintTokenFromHubSession } from "./lib/auth.ts";
-import { getBasename, getMountedVaultName } from "./lib/mount.ts";
+import { getBasename, getMountedVaultName, isMultiVaultMount } from "./lib/mount.ts";
 import "./styles.css";
 
 // Capture a hub-issued JWT from the URL fragment if present (e.g. when the
@@ -58,8 +58,15 @@ function mount(): void {
 // `.catch()` continuation; the brief delay between document-ready and
 // React mount is invisible to the operator (no static skeleton renders
 // in `#root` — it's empty until React takes it).
+//
+// Multi-vault mode (the daemon-level `/vault/admin/` home, B3) SKIPS the
+// per-vault boot mint entirely: there is no single vault to mint against,
+// and the per-vault token cache is one-vault-per-document by design. The
+// home view mints what it needs lazily — a host-admin bearer for
+// create/delete (`lib/host-admin-auth.ts`) and short-lived per-vault
+// bearers for the usage cells (`lib/multi-vault-api.ts`, uncached).
 const mountedVault = getMountedVaultName();
-if (mountedVault) {
+if (!isMultiVaultMount() && mountedVault) {
   tryMintTokenFromHubSession(mountedVault).then(mount, mount);
 } else {
   mount();

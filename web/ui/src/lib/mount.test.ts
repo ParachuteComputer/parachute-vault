@@ -5,7 +5,7 @@
  * SPA renders a blank 404 shell.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getBasename, getMountedVaultName } from "./mount.ts";
+import { getBasename, getMountedVaultName, isMultiVaultMount } from "./mount.ts";
 
 describe("mount detection", () => {
   beforeEach(() => {
@@ -54,6 +54,50 @@ describe("mount detection", () => {
       expect(getMountedVaultName()).toBeNull();
       window.history.replaceState(null, "", "/vault/boulder/admin-foo");
       expect(getMountedVaultName()).toBeNull();
+    });
+  });
+
+  describe("multi-vault mount (/vault/admin — B3)", () => {
+    it("isMultiVaultMount() detects the daemon-level mount", () => {
+      window.history.replaceState(null, "", "/vault/admin/");
+      expect(isMultiVaultMount()).toBe(true);
+      window.history.replaceState(null, "", "/vault/admin");
+      expect(isMultiVaultMount()).toBe(true);
+    });
+
+    it("isMultiVaultMount() is false for per-vault mounts and near-misses", () => {
+      window.history.replaceState(null, "", "/vault/boulder/admin/");
+      expect(isMultiVaultMount()).toBe(false);
+      window.history.replaceState(null, "", "/vault/adminx/admin/");
+      expect(isMultiVaultMount()).toBe(false);
+      window.history.replaceState(null, "", "/admin/");
+      expect(isMultiVaultMount()).toBe(false);
+    });
+
+    it("getMountedVaultName() is null under the multi-vault mount", () => {
+      window.history.replaceState(null, "", "/vault/admin/");
+      expect(getMountedVaultName()).toBeNull();
+    });
+
+    it("/vault/admin/admin does NOT mis-parse as vault 'admin' (multi wins)", () => {
+      // Without the multi-first detection order, the per-vault regex reads
+      // this path as vault "admin" — a reserved name no instance can hold.
+      window.history.replaceState(null, "", "/vault/admin/admin");
+      expect(isMultiVaultMount()).toBe(true);
+      expect(getMountedVaultName()).toBeNull();
+      expect(getBasename()).toBe("/vault/admin");
+    });
+
+    it("getBasename() returns /vault/admin under the multi-vault mount", () => {
+      window.history.replaceState(null, "", "/vault/admin/");
+      expect(getBasename()).toBe("/vault/admin");
+    });
+
+    it("a vault named adminx still resolves per-vault", () => {
+      window.history.replaceState(null, "", "/vault/adminx/admin/");
+      expect(isMultiVaultMount()).toBe(false);
+      expect(getMountedVaultName()).toBe("adminx");
+      expect(getBasename()).toBe("/vault/adminx/admin");
     });
   });
 

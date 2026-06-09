@@ -157,6 +157,33 @@ describe("vault create --json", () => {
     expect(stderr).toContain("lowercase");
   });
 
+  test("reserved names (list/new/assets/admin) are rejected at create", () => {
+    // Consolidated reserved set (2026-06-09 hub-module-boundary B2). Before
+    // the consolidation cmdCreate hardcoded only "list" — `admin` could enter
+    // through `create` and capture the daemon-level /vault/admin mount.
+    for (const reserved of ["list", "new", "assets", "admin"]) {
+      const { exitCode, stdout, stderr } = runCli(
+        ["create", reserved, "--json"],
+        { PARACHUTE_HOME: home },
+      );
+      expect(exitCode).not.toBe(0);
+      expect(stdout).toBe("");
+      expect(stderr).toContain("reserved");
+      // The vault must not have been created.
+      expect(existsSync(join(home, "vault", "data", reserved))).toBe(false);
+    }
+  });
+
+  test("near-misses of reserved names (adminx, admin2) create fine", () => {
+    for (const name of ["adminx", "admin2"]) {
+      const { exitCode, stdout } = runCli(["create", name, "--json"], {
+        PARACHUTE_HOME: home,
+      });
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout.trim()).name).toBe(name);
+    }
+  });
+
   test("duplicate name in --json mode errors on stderr and exits non-zero", () => {
     runCli(["create", "dup", "--json"], { PARACHUTE_HOME: home });
     const { exitCode, stdout, stderr } = runCli(
