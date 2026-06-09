@@ -6115,3 +6115,147 @@ describe("handleVault: audio_retention", async () => {
   });
 });
 
+describe("handleVault: auto_transcribe (per-vault)", async () => {
+  function mkVaultReq(method: string, body?: unknown): Request {
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.body = JSON.stringify(body);
+      init.headers = { "Content-Type": "application/json" };
+    }
+    return new Request(`${BASE}/vault`, init);
+  }
+
+  test("GET reflects the per-vault auto_transcribe.enabled when set", async () => {
+    const cfg = { name: "vaultA", auto_transcribe: { enabled: false } };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    // The vault's OWN value wins over global — per-vault → global → true.
+    expect(body.config.auto_transcribe.enabled).toBe(false);
+  });
+
+  test("GET reflects per-vault true override even if global is off", async () => {
+    const cfg = { name: "vaultA", auto_transcribe: { enabled: true } };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    const body = await res.json() as any;
+    expect(body.config.auto_transcribe.enabled).toBe(true);
+  });
+
+  test("PATCH writes auto_transcribe to THIS vault's config object (per-vault)", async () => {
+    const cfg: { name: string; auto_transcribe?: { enabled?: boolean } } = { name: "vaultA" };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { auto_transcribe: { enabled: true } } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.config.auto_transcribe.enabled).toBe(true);
+    // Persisted onto the per-vault config object (writeVaultConfig path),
+    // NOT a server-wide global — this is the field the worker reads per-vault.
+    expect(cfg.auto_transcribe?.enabled).toBe(true);
+    expect(persisted).toBe(1);
+
+    // GET round-trips the persisted per-vault value.
+    const getRes = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    const getBody = await getRes.json() as any;
+    expect(getBody.config.auto_transcribe.enabled).toBe(true);
+  });
+
+  test("enabling vault X does NOT affect vault Y (genuinely per-vault)", async () => {
+    const vaultX: { name: string; auto_transcribe?: { enabled?: boolean } } = { name: "vaultX" };
+    const vaultY: { name: string; auto_transcribe?: { enabled?: boolean } } = { name: "vaultY" };
+
+    // Link scribe to X only.
+    await handleVault(
+      mkVaultReq("PATCH", { config: { auto_transcribe: { enabled: true } } }),
+      store,
+      vaultX as any,
+      () => {},
+    );
+
+    expect(vaultX.auto_transcribe?.enabled).toBe(true);
+    // Y is untouched — no global toggle was flipped, so Y still has no
+    // per-vault override (the old global-write behavior would have moved Y too).
+    expect(vaultY.auto_transcribe).toBeUndefined();
+  });
+
+  test("PATCH accepts auto_transcribe.enabled=false", async () => {
+    const cfg: { name: string; auto_transcribe?: { enabled?: boolean } } = {
+      name: "vaultA",
+      auto_transcribe: { enabled: true },
+    };
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { auto_transcribe: { enabled: false } } }),
+      store,
+      cfg as any,
+      () => {},
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.config.auto_transcribe.enabled).toBe(false);
+    expect(cfg.auto_transcribe?.enabled).toBe(false);
+  });
+
+  test("PATCH rejects a non-boolean enabled with 400 and does not mutate or persist", async () => {
+    const cfg: { name: string; auto_transcribe?: { enabled?: boolean } } = {
+      name: "vaultA",
+      auto_transcribe: { enabled: true },
+    };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { auto_transcribe: { enabled: "yes" } } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error).toBe("invalid_auto_transcribe");
+    // Unchanged — the bad write never landed.
+    expect(cfg.auto_transcribe?.enabled).toBe(true);
+    expect(persisted).toBe(0);
+  });
+
+  test("PATCH rejects auto_transcribe missing enabled with 400", async () => {
+    const cfg = { name: "vaultA" } as { name: string };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", { config: { auto_transcribe: {} } }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error).toBe("invalid_auto_transcribe");
+    expect(persisted).toBe(0);
+  });
+
+  test("auto_transcribe and audio_retention can be set in one PATCH (single persist)", async () => {
+    const cfg: { name: string; audio_retention?: string; auto_transcribe?: { enabled?: boolean } } = {
+      name: "vaultA",
+    };
+    let persisted = 0;
+    const res = await handleVault(
+      mkVaultReq("PATCH", {
+        config: { audio_retention: "until_transcribed", auto_transcribe: { enabled: true } },
+      }),
+      store,
+      cfg as any,
+      () => { persisted++; },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.config.audio_retention).toBe("until_transcribed");
+    expect(body.config.auto_transcribe.enabled).toBe(true);
+    expect(cfg.audio_retention).toBe("until_transcribed");
+    expect(cfg.auto_transcribe?.enabled).toBe(true);
+    // Both fields persisted in one writeVaultConfig call.
+    expect(persisted).toBe(1);
+  });
+
+});
+

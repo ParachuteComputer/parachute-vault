@@ -118,4 +118,55 @@ describe("shouldAutoTranscribe", () => {
       enabledOverride: false,
     })).toBe(false);
   });
+
+  describe("per-vault precedence (per-vault → global → true)", () => {
+    test("per-vault true wins even when global is false", () => {
+      expect(shouldAutoTranscribe("audio/wav", {
+        readGlobalConfigImpl: readGlobalConfig(false),
+        getCachedScribeUrlImpl: scribePresent,
+        perVaultEnabled: true,
+      })).toBe(true);
+    });
+
+    test("per-vault false wins even when global is true", () => {
+      // The whole point: linking scribe to vault X (perVault true) elsewhere
+      // must not force-on a vault that set its own false.
+      expect(shouldAutoTranscribe("audio/wav", {
+        readGlobalConfigImpl: readGlobalConfig(true),
+        getCachedScribeUrlImpl: scribePresent,
+        perVaultEnabled: false,
+      })).toBe(false);
+    });
+
+    test("per-vault unset falls back to global", () => {
+      expect(shouldAutoTranscribe("audio/wav", {
+        readGlobalConfigImpl: readGlobalConfig(true),
+        getCachedScribeUrlImpl: scribePresent,
+        perVaultEnabled: undefined,
+      })).toBe(true);
+      expect(shouldAutoTranscribe("audio/wav", {
+        readGlobalConfigImpl: readGlobalConfig(false),
+        getCachedScribeUrlImpl: scribePresent,
+        perVaultEnabled: undefined,
+      })).toBe(false);
+    });
+
+    test("both per-vault and global unset falls back to true (no regression)", () => {
+      expect(shouldAutoTranscribe("audio/wav", {
+        readGlobalConfigImpl: readGlobalConfig(undefined),
+        getCachedScribeUrlImpl: scribePresent,
+        perVaultEnabled: undefined,
+      })).toBe(true);
+    });
+
+    test("enabledOverride still hard-overrides the per-vault value", () => {
+      // The explicit caller-opt-in path beats everything.
+      expect(shouldAutoTranscribe("audio/wav", {
+        readGlobalConfigImpl: readGlobalConfig(true),
+        getCachedScribeUrlImpl: scribePresent,
+        perVaultEnabled: false,
+        enabledOverride: true,
+      })).toBe(true);
+    });
+  });
 });

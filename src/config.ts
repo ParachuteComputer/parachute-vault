@@ -183,6 +183,23 @@ export interface VaultConfig {
   transcription?: {
     context?: TriggerIncludeContext[];
   };
+  /**
+   * Per-vault auto-transcribe override (vault#353 follow-up). When set, this
+   * vault's value takes precedence over the server-wide
+   * `GlobalConfig.auto_transcribe.enabled`. Resolution at the decision point
+   * (`shouldAutoTranscribe`) is **per-vault → global → true**: a vault that
+   * sets `enabled` here uses it; a vault that leaves it unset falls back to
+   * the global toggle, which itself defaults ON.
+   *
+   * This is what makes scribe's "link to vault X" genuinely per-vault —
+   * `PATCH /vault/X/api/vault {auto_transcribe:{enabled:true}}` flips only
+   * vault X, never the whole server. URL + bearer are still resolved per-
+   * process (services.json / SCRIBE_AUTH_TOKEN); only the on/off toggle is
+   * per-vault.
+   */
+  auto_transcribe?: {
+    enabled?: boolean;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +461,14 @@ function serializeVaultConfig(config: VaultConfig): string {
     lines.push(`audio_retention: ${config.audio_retention}`);
   }
 
+  // Per-vault auto-transcribe override. Serialized as a nested block so future
+  // fields can grow under it (mirrors the GlobalConfig shape). Only emitted
+  // when `enabled` is explicitly set — an unset vault falls back to global.
+  if (config.auto_transcribe?.enabled !== undefined) {
+    lines.push("auto_transcribe:");
+    lines.push(`  enabled: ${config.auto_transcribe.enabled}`);
+  }
+
   if (config.transcription?.context?.length) {
     lines.push("transcription:");
     lines.push("  context:");
@@ -578,6 +603,22 @@ function parseVaultConfig(yaml: string, name: string): VaultConfig {
   const transcriptionContext = parseTranscriptionContext(yaml);
   if (transcriptionContext) {
     config.transcription = { context: transcriptionContext };
+  }
+
+  // Parse the per-vault auto_transcribe block — currently single boolean
+  // `enabled`. Nested 2-space-indent block (mirrors the GlobalConfig parser)
+  // so future fields can grow under it without breaking the regex.
+  const autoTranscribeStart = yaml.match(/^auto_transcribe:\s*$/m);
+  if (autoTranscribeStart) {
+    const after = yaml.slice((autoTranscribeStart.index ?? 0) + autoTranscribeStart[0].length);
+    for (const line of after.split("\n")) {
+      if (line.match(/^\S/) && line.trim().length > 0) break; // next top-level key
+      const m = line.match(/^\s+enabled:\s*(true|false)/);
+      if (m) {
+        config.auto_transcribe = { enabled: m[1]! === "true" };
+        break;
+      }
+    }
   }
 
   return config;
