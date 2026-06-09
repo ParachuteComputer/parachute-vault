@@ -178,6 +178,30 @@ h2 {
   font-size: 1.2rem;
 }
 
+/* Multi-vault home (B3): rows carry action buttons plus an optional inline
+   confirm / cascade-summary block beneath them. Mirrors hub's VaultsList
+   row shapes so the operator sees one visual language across both. */
+.vault-row-group {
+  margin-bottom: 0.5rem;
+}
+.vault-row-group .vault-row {
+  margin-bottom: 0;
+}
+.vault-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.vault-usage {
+  font-size: 0.85rem;
+}
+.field-error {
+  color: #b3402a;
+  font-size: 0.85rem;
+  margin-top: 0.35rem;
+}
+
 .section {
   background: white;
   border: 1px solid var(--border);

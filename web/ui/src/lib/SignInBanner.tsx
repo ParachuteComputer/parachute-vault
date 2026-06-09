@@ -45,9 +45,17 @@ import { ensureToken } from "./auth.ts";
 const POLL_INTERVAL_MS = 5000;
 
 export interface SignInBannerProps {
-  /** Vault name. Used both for the poll-retry call and to compose the
-   *  `?next=` parameter on the hub `/login` link. */
-  vaultName: string;
+  /** Vault name for the default per-vault poll (`ensureToken(vaultName)`).
+   *  Multi-vault mode (the `/vault/admin/` home) has no single vault — it
+   *  omits this and supplies `ensure` instead. */
+  vaultName?: string;
+  /**
+   * Override the poll's mint attempt. The default is the per-vault
+   * `ensureToken(vaultName)`; the multi-vault home passes
+   * `ensureHostAdminToken` so recovery tracks the host-admin mint its
+   * create/delete actions actually need. Only `kind === "ok"` is read.
+   */
+  ensure?: () => Promise<{ kind: string }>;
   /**
    * Status code from the most recent attempt. Drives the copy + CTA:
    *   - 401 / null → "you're not signed in" + sign-in CTA (the recoverable
@@ -63,7 +71,7 @@ export interface SignInBannerProps {
   onRecovered: () => void;
 }
 
-export function SignInBanner({ vaultName, status, onRecovered }: SignInBannerProps) {
+export function SignInBanner({ vaultName, status, onRecovered, ensure }: SignInBannerProps) {
   // A 403 (`not_admin`) can never recover for this session — the operator is
   // signed in but isn't the hub admin. Polling would re-mint forever with no
   // payoff, so we don't start the poll at all. See vault#451.
@@ -85,7 +93,7 @@ export function SignInBanner({ vaultName, status, onRecovered }: SignInBannerPro
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
       }
-      const result = await ensureToken(vaultName);
+      const result = await (ensure ? ensure() : ensureToken(vaultName ?? ""));
       if (cancelled) return;
       if (result.kind === "ok") {
         onRecovered();
@@ -118,7 +126,7 @@ export function SignInBanner({ vaultName, status, onRecovered }: SignInBannerPro
         document.removeEventListener("visibilitychange", onVisibility);
       }
     };
-  }, [vaultName, onRecovered, isForbidden]);
+  }, [vaultName, onRecovered, isForbidden, ensure]);
 
   // 403: signed in but not the hub admin. Don't offer sign-in (it loops);
   // point them at their account home instead. No auto-refresh — this state

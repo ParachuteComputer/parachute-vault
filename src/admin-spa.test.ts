@@ -12,7 +12,12 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { isAdminSpaPath, serveAdminSpa } from "./admin-spa.ts";
+import {
+  isAdminSpaPath,
+  isDaemonAdminSpaPath,
+  serveAdminSpa,
+  serveDaemonAdminSpa,
+} from "./admin-spa.ts";
 
 const fixtureDir = join(tmpdir(), `vault-admin-spa-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
@@ -130,15 +135,76 @@ describe("serveAdminSpa", () => {
   });
 });
 
+describe("isDaemonAdminSpaPath", () => {
+  test("matches /vault/admin and true subpaths", () => {
+    expect(isDaemonAdminSpaPath("/vault/admin")).toBe(true);
+    expect(isDaemonAdminSpaPath("/vault/admin/")).toBe(true);
+    expect(isDaemonAdminSpaPath("/vault/admin/assets/index.js")).toBe(true);
+    // The doubled path the per-vault regex would mis-read as vault "admin".
+    expect(isDaemonAdminSpaPath("/vault/admin/admin")).toBe(true);
+  });
+
+  test("does not match vaults whose name merely starts with 'admin'", () => {
+    expect(isDaemonAdminSpaPath("/vault/adminx")).toBe(false);
+    expect(isDaemonAdminSpaPath("/vault/admin2/admin")).toBe(false);
+    expect(isDaemonAdminSpaPath("/vault/admin-foo")).toBe(false);
+  });
+
+  test("does not match per-vault mounts or unrelated paths", () => {
+    expect(isDaemonAdminSpaPath("/vault/work/admin")).toBe(false);
+    expect(isDaemonAdminSpaPath("/admin")).toBe(false);
+    expect(isDaemonAdminSpaPath("/vaults")).toBe(false);
+  });
+});
+
+describe("serveDaemonAdminSpa (the /vault/admin multi-vault mount)", () => {
+  test("bare /vault/admin redirects to trailing-slash form (301)", async () => {
+    // Same load-bearing canonicalization as the per-vault mount: Vite's
+    // relative asset URLs (./assets/...) resolve against the document's
+    // DIRECTORY, so /vault/admin (bare) would resolve assets to
+    // /vault/assets/... and 404 them.
+    const res = await serveDaemonAdminSpa(fixtureDir, "/vault/admin");
+    expect(res.status).toBe(301);
+    expect(res.headers.get("Location")).toBe("/vault/admin/");
+  });
+
+  test("/vault/admin/ returns the SPA index", async () => {
+    const res = await serveDaemonAdminSpa(fixtureDir, "/vault/admin/");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("shell");
+  });
+
+  test("daemon-mount asset path strips cleanly", async () => {
+    const res = await serveDaemonAdminSpa(fixtureDir, "/vault/admin/assets/index-abc.js");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/javascript");
+  });
+
+  test("/vault/admin/admin serves the shell (client route, not a per-vault boot)", async () => {
+    const res = await serveDaemonAdminSpa(fixtureDir, "/vault/admin/admin");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("shell");
+  });
+
+  test("path traversal (..) cannot escape dist dir on the daemon mount", async () => {
+    const res = await serveDaemonAdminSpa(fixtureDir, "/vault/admin/../../etc/passwd");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("shell");
+  });
+});
+
 describe("hub <-> vault managementUrl contract", () => {
   // Browsers drop the URL fragment when following a 301 (RFC 7231 SHOULD
   // preserve, but Chrome/Firefox/Safari are inconsistent in practice). The
   // hub-issued JWT travels in `#token=...`, so a redirected click loses the
-  // token and the SPA boots unauthenticated. Hub's resolveManagementUrl joins
-  // the per-vault module URL with module.json's `managementUrl` verbatim — if
-  // it ends with "/" the canonical click target is `/vault/<name>/admin/`
-  // (no redirect, fragment preserved). Without the trailing slash hub emits
-  // `/vault/<name>/admin`, the server 301s, and the fragment is gone.
+  // token and the SPA boots unauthenticated. Under the B4 URL-resolution
+  // semantics (hub#637) a RELATIVE managementUrl is mount-joined per
+  // instance (`/vault/<name>` + "/" + "admin/") — if it ends with "/" the
+  // canonical click target is `/vault/<name>/admin/` (no redirect, fragment
+  // preserved). Without the trailing slash hub emits `/vault/<name>/admin`,
+  // the server 301s, and the fragment is gone.
   test("module.json managementUrl ends with '/' so hub emits the no-redirect form", () => {
     const moduleJson = JSON.parse(
       readFileSync(join(import.meta.dir, "..", ".parachute", "module.json"), "utf8"),
@@ -146,15 +212,39 @@ describe("hub <-> vault managementUrl contract", () => {
     expect(moduleJson.managementUrl).toMatch(/\/$/);
   });
 
-  test("the canonical hub-emitted URL serves the SPA shell directly (no 301)", async () => {
-    // Mirror hub's resolveManagementUrl shape: per-vault module URL +
-    // managementUrl. With managementUrl="/admin/" the result is
+  test("managementUrl + uiUrl are RELATIVE (per-instance); configUiUrl is origin-absolute (daemon-level)", () => {
+    // B4 semantics (2026-06-09 hub-module-boundary): relative = mount-joined
+    // per instance; leading "/" = origin-absolute verbatim. The per-instance
+    // surfaces (manage tile, instance UI) stay per-vault; the module-level
+    // config UI points at the daemon-level multi-vault home. A leading "/"
+    // on managementUrl/uiUrl here would flip every instance tile to the
+    // module home; a relative configUiUrl would wrongly mount-join.
+    const moduleJson = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", ".parachute", "module.json"), "utf8"),
+    );
+    expect(moduleJson.managementUrl).toBe("admin/");
+    expect(moduleJson.uiUrl).toBe("admin/");
+    expect(moduleJson.configUiUrl).toBe("/vault/admin/");
+  });
+
+  test("the canonical hub-emitted per-instance URL serves the SPA shell directly (no 301)", async () => {
+    // Mirror hub's per-instance join under B4: mount + "/" + relative
+    // managementUrl. With managementUrl="admin/" the result is
     // /vault/<name>/admin/ — which serveAdminSpa returns as 200, not 301.
     const moduleJson = JSON.parse(
       readFileSync(join(import.meta.dir, "..", ".parachute", "module.json"), "utf8"),
     );
-    const canonical = `/vault/work${moduleJson.managementUrl}`;
+    const canonical = `/vault/work/${moduleJson.managementUrl}`;
     const res = await serveAdminSpa(fixtureDir, canonical);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Location")).toBeNull();
+  });
+
+  test("the canonical configUiUrl serves the daemon-level shell directly (no 301)", async () => {
+    const moduleJson = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", ".parachute", "module.json"), "utf8"),
+    );
+    const res = await serveDaemonAdminSpa(fixtureDir, moduleJson.configUiUrl);
     expect(res.status).toBe(200);
     expect(res.headers.get("Location")).toBeNull();
   });

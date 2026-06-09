@@ -11,6 +11,17 @@ hub's grants table — modular play is "vault links to hub" rather than
 `/admin/*` to `/vault/<name>/admin/*` so the SPA is reachable through
 hub's `/vault/<name>/*` proxy.
 
+The 2026-06-09 hub-module-boundary migration (B3) added a THIRD mount:
+the daemon-level **multi-vault home** at `/vault/admin/*` — the vault
+MODULE's own lifecycle surface (list / create / delete vaults, deep-link
+into each instance's per-vault admin). Same bundle; `lib/mount.ts`
+detects the mode at runtime (multi-vault checked FIRST — `/vault/admin/
+admin` must not parse as vault "admin"; `admin` is a reserved vault
+name). Create/delete drive the hub's identity-transaction endpoints
+(`POST /vaults`, `DELETE /vaults/<name>`) with a host-admin bearer
+minted from the session cookie — the hub owns the transaction, this
+surface owns the UX.
+
 ## Mount-aware contract
 
 The same bundle has to work at any per-vault mount — the vault name
@@ -41,6 +52,18 @@ regardless of mount and route through to the per-vault API surface
 either directly or via hub's proxy. `import.meta.env.BASE_URL` is no
 longer the source of truth — read `lib/mount.ts:getBasename()` instead
 since it knows about the runtime per-vault prefix.
+
+**Carve-out (deliberate, B3): per-vault deep-links from the multi-vault
+home are plain `<a href="/vault/<name>/admin/">` anchors** —
+origin-absolute, full-document navigations. Two reasons, both
+load-bearing: (1) React Router `Link` under `basename="/vault/admin"`
+would resolve the target to `/vault/admin/vault/<name>/admin/` and
+mangle it; (2) the SPA's per-vault token cache (`lib/auth.ts`) is
+one-vault-per-document by design, so each instance's admin must boot in
+its own document — a client-side route swap would smear one vault's
+bearer across another's page. The same applies in the other direction
+(any future per-vault → module-home link). Cross-MOUNT navigation =
+full-document `<a href>`; within-mount navigation = `Link`.
 
 ## Auth
 
@@ -88,16 +111,19 @@ web/ui/
 ├── scripts/verify-base.mjs # post-build regression check
 └── src/
     ├── main.tsx            # BrowserRouter w/ runtime-detected basename
-    ├── App.tsx             # nav + Routes (redirects / to /vault/<name>
-    │                       #               when mounted under a vault)
+    ├── App.tsx             # nav + THREE route trees (multi-vault home /
+    │                       #   per-vault detail / legacy stand-alone)
     ├── styles.css          # brand tokens (kept in sync with hub's)
     ├── lib/
     │   ├── auth.ts         # fragment-token capture, in-memory cache
-    │   ├── mount.ts        # runtime basename + vault-name detection
+    │   ├── host-admin-auth.ts  # host-admin mint (tokens page + multi-vault home)
+    │   ├── mount.ts        # runtime basename + mode detection (multi first)
+    │   ├── multi-vault-api.ts  # well-known list, usage fan-out, create/delete
     │   ├── scope.ts        # JWT payload decode + hasAdminScope gate
     │   ├── api.ts          # listVaultNames + getVaultDetail
     │   └── tokens-api.ts   # listTokens / mintToken / revokeToken
     ├── routes/
+    │   ├── MultiVaultHome.tsx  # /  (under the /vault/admin mount — B3)
     │   ├── VaultsList.tsx  # /  (legacy / dev mount only)
     │   ├── VaultDetail.tsx # /vault/:name
     │   └── VaultTokens.tsx # /vault/:name/tokens

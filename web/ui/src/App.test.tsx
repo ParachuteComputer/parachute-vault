@@ -19,12 +19,16 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "./lib/api.ts";
+import * as hostAdmin from "./lib/host-admin-auth.ts";
 import * as mount from "./lib/mount.ts";
+import * as mva from "./lib/multi-vault-api.ts";
 import * as scope from "./lib/scope.ts";
 import { App } from "./App.tsx";
 
 vi.mock("./lib/api.ts");
+vi.mock("./lib/host-admin-auth.ts");
 vi.mock("./lib/mount.ts");
+vi.mock("./lib/multi-vault-api.ts");
 vi.mock("./lib/scope.ts");
 
 const detailFixture = (over: Partial<api.VaultDetailResult> = {}): api.VaultDetailResult => ({
@@ -46,6 +50,7 @@ afterEach(() => {
 
 describe("App — per-vault mount", () => {
   beforeEach(() => {
+    vi.mocked(mount.isMultiVaultMount).mockReturnValue(false);
     vi.mocked(mount.getMountedVaultName).mockReturnValue("boulder");
     vi.mocked(api.getVaultDetail).mockResolvedValue(detailFixture());
   });
@@ -134,8 +139,56 @@ describe("App — per-vault mount", () => {
   });
 });
 
+describe("App — multi-vault mount (/vault/admin — B3)", () => {
+  beforeEach(() => {
+    vi.mocked(mount.isMultiVaultMount).mockReturnValue(true);
+    // Defensive: even if a stale mount reading claimed a vault name, the
+    // multi-vault mode must win the route-tree pick.
+    vi.mocked(mount.getMountedVaultName).mockReturnValue(null);
+    vi.mocked(mva.listWellKnownVaults).mockResolvedValue({
+      kind: "ok",
+      vaults: [{ name: "default", url: "https://hub.example/vault/default", version: "0.5.2" }],
+    });
+    vi.mocked(mva.fetchVaultUsage).mockResolvedValue({ notes: 1, totalBytes: 10 });
+    vi.mocked(hostAdmin.ensureHostAdminToken).mockResolvedValue({
+      kind: "ok",
+      token: "host.jwt",
+    });
+  });
+
+  it("renders the MultiVaultHome at `/` (third route tree)", async () => {
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      expect(mva.listWellKnownVaults).toHaveBeenCalled();
+    });
+    expect(await screen.findByRole("heading", { name: /Vaults \(1\)/ })).toBeInTheDocument();
+    // The per-vault deep-link is a plain anchor (full-document navigation).
+    const manage = screen
+      .getAllByRole("link")
+      .find((l) => l.getAttribute("href") === "/vault/default/admin/");
+    expect(manage).toBeDefined();
+  });
+
+  it("nav-bar shows the generic Vaults link (no single mounted vault)", async () => {
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("link", { name: "Vaults" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mva.listWellKnownVaults).toHaveBeenCalled();
+    });
+  });
+});
+
 describe("App — stand-alone mount", () => {
   beforeEach(() => {
+    vi.mocked(mount.isMultiVaultMount).mockReturnValue(false);
     vi.mocked(mount.getMountedVaultName).mockReturnValue(null);
     vi.mocked(api.listVaultNames).mockResolvedValue(["boulder", "work"]);
     vi.mocked(api.getVaultDetail).mockResolvedValue(detailFixture());

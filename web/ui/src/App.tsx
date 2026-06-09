@@ -1,12 +1,20 @@
 import { Link, Route, Routes } from "react-router-dom";
-import { getMountedVaultName } from "./lib/mount.ts";
+import { getMountedVaultName, isMultiVaultMount } from "./lib/mount.ts";
+import { MultiVaultHome } from "./routes/MultiVaultHome.tsx";
 import { VaultDetail } from "./routes/VaultDetail.tsx";
 import { VaultMirror } from "./routes/VaultMirror.tsx";
 import { VaultTokens } from "./routes/VaultTokens.tsx";
 import { VaultsList } from "./routes/VaultsList.tsx";
 
 /**
- * The SPA carries two route shapes that don't share a tree.
+ * The SPA carries THREE route shapes that don't share a tree.
+ *
+ * Under the multi-vault mount (`/vault/admin/*`, B3 of the 2026-06-09
+ * hub-module-boundary migration), `<BrowserRouter basename="/vault/admin">`
+ * serves the module-level home: list / create / delete vaults. Per-vault
+ * deep-links from that page are full-document `<a href>` navigations (the
+ * token cache is one-vault-per-document), so this tree needs no per-vault
+ * routes at all.
  *
  * Under a per-vault mount (`/vault/<name>/admin/*` post-vault#252),
  * `<BrowserRouter basename="/vault/<name>/admin">` strips the basename
@@ -25,7 +33,8 @@ import { VaultsList } from "./routes/VaultsList.tsx";
  * back to `useParams()` for `:name` in this branch.
  */
 export function App() {
-  const mountedVault = getMountedVaultName();
+  const multiVault = isMultiVaultMount();
+  const mountedVault = multiVault ? null : getMountedVaultName();
   return (
     <div className="page">
       <nav className="nav">
@@ -41,7 +50,12 @@ export function App() {
         )}
       </nav>
 
-      {mountedVault ? (
+      {multiVault ? (
+        <Routes>
+          <Route path="/" element={<MultiVaultHome />} />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      ) : mountedVault ? (
         <Routes>
           <Route path="/" element={<VaultDetail vaultName={mountedVault} />} />
           <Route path="/tokens" element={<VaultTokens vaultName={mountedVault} />} />
