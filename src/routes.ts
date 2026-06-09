@@ -12,6 +12,7 @@
  */
 
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
+import { TAG_EXPAND_MODES, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
@@ -436,6 +437,33 @@ function parseMetadataJsonAlias(url: URL): {
 }
 
 /**
+ * Parse + validate the `?expand=` tag-expansion axis (vault tag `expand` axis).
+ * Shared by `parseNotesQueryOpts` (structured + subscribe) AND the full-text
+ * search branch of `handleNotes` (which bypasses `parseNotesQueryOpts`), so the
+ * enum lives in exactly one place and `GET /notes?search=...&expand=bogus` is
+ * validated identically to the structured path.
+ *
+ * Returns `{ expand }` (undefined when absent/empty → store defaults to
+ * "subtypes") or `{ error }` (a 400 Response) on an unknown value.
+ */
+export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Response } {
+  const expandParam = parseQuery(url, "expand");
+  if (expandParam === null || expandParam === "") return {};
+  if (!(TAG_EXPAND_MODES as readonly string[]).includes(expandParam)) {
+    return {
+      error: json(
+        {
+          error: `invalid \`expand\` value "${expandParam}" — must be one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("subtypes": parent_names descendants).`,
+          code: "INVALID_QUERY",
+        },
+        400,
+      ),
+    };
+  }
+  return { expand: expandParam as TagExpandMode };
+}
+
+/**
  * Parse the shared notes-query parameters (tags / excludeTags / path /
  * pathPrefix / extension / metadata filters / date filters / sort / paging /
  * cursor) into a `QueryOpts`, plus flags for the query shapes that the live
@@ -483,9 +511,18 @@ export function parseNotesQueryOpts(url: URL): {
     };
   }
 
+  // Tag-expansion axis (vault tag `expand` axis). Optional; absent →
+  // "subtypes" (resolved at the store, kept undefined here so it stays
+  // byte-identical to pre-axis behavior). Unknown value → 400 via the shared
+  // helper (same shape the search branch uses).
+  const expandParsed = parseExpandParam(url);
+  if (expandParsed.error) return { hasSearch, hasNear, hasCursor, error: expandParsed.error };
+  const expand = expandParsed.expand;
+
   const queryOpts: QueryOpts = {
     tags,
     tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+    expand,
     excludeTags: parseQueryList(url, "exclude_tag"),
     hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
     hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
@@ -716,7 +753,17 @@ async function handleNotesInner(
       if (search) {
         const searchTags = parseQueryList(url, "tag");
         const limit = parseInt10(parseQuery(url, "limit")) ?? 50;
-        const rawResults = await store.searchNotes(search, { tags: searchTags, limit });
+        // Tag-expansion axis (vault tag `expand` axis). This branch bypasses
+        // `parseNotesQueryOpts`, so validate `?expand=` here too — otherwise
+        // `GET /notes?search=x&expand=bogus` would silently ignore the bad
+        // value. The validated mode is threaded into the search tag-narrowing.
+        const tagExpand = parseExpandParam(url);
+        if (tagExpand.error) return tagExpand.error;
+        const rawResults = await store.searchNotes(search, {
+          tags: searchTags,
+          limit,
+          expand: tagExpand.expand,
+        });
         // Tag-scope: drop any result the token isn't permitted to see. Filter
         // happens after the store query so an empty post-filter list still
         // returns 200 [] (consistent with "no matches"), not 403.

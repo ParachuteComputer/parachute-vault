@@ -1692,6 +1692,56 @@ describe("HTTP /notes", async () => {
     expect(body).toHaveLength(1);
   });
 
+  // ---- search path honors the `expand` axis (vault tag `expand` axis) ----
+  //
+  // Corpus: all three notes share the FTS term "fox". Tags separate the two
+  // axes — `person` is a declared subtype of `entity` (parent_names) but NOT
+  // name-prefixed; `entity/archived` is name-prefixed but NOT a subtype. So
+  // search(tag=entity) returns DIFFERENT sets per `expand` mode, proving the
+  // search branch threads it (regression for the "validated then dropped" bug).
+  async function seedSearchAxisCorpus() {
+    await store.upsertTagRecord("entity", { description: "entity root" });
+    await store.upsertTagRecord("person", { parent_names: ["entity"] });
+    await store.upsertTagRecord("entity/archived", {});
+    await store.createNote("fox literal", { tags: ["entity"], path: "s-entity" });
+    await store.createNote("fox subtype", { tags: ["person"], path: "s-person" });
+    await store.createNote("fox filed", { tags: ["entity/archived"], path: "s-archived" });
+  }
+
+  test("GET /notes?search=fox&tag=entity — absent expand ≡ subtypes (descendants, no namespaced sibling)", async () => {
+    await seedSearchAxisCorpus();
+    const absent = await (await handleNotes(mkReq("GET", "/notes?search=fox&tag=entity&include_content=true"), store, "")).json() as any[];
+    const sub = await (await handleNotes(mkReq("GET", "/notes?search=fox&tag=entity&expand=subtypes&include_content=true"), store, "")).json() as any[];
+    const absentSet = new Set(absent.map((n) => n.content));
+    expect(new Set(sub.map((n) => n.content))).toEqual(absentSet);
+    // entity (literal) + person (subtype); NOT entity/archived.
+    expect(absentSet).toEqual(new Set(["fox literal", "fox subtype"]));
+  });
+
+  test("GET /notes?search=fox&tag=entity&expand=namespace — lexical tag/* only, NOT subtype sibling", async () => {
+    await seedSearchAxisCorpus();
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox&tag=entity&expand=namespace&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    // entity (literal) + entity/archived (name-prefixed); NOT person (subtype).
+    expect(new Set(body.map((n) => n.content))).toEqual(new Set(["fox literal", "fox filed"]));
+  });
+
+  test("GET /notes?search=fox&tag=entity&expand=exact — literal tag only", async () => {
+    await seedSearchAxisCorpus();
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox&tag=entity&expand=exact&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.content)).toEqual(["fox literal"]);
+  });
+
+  test("GET /notes?search=...&expand=bogus → 400 INVALID_QUERY (search branch validates too)", async () => {
+    await store.createNote("fox here");
+    const res = await handleNotes(mkReq("GET", "/notes?search=fox&expand=bogus"), store, "");
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.code).toBe("INVALID_QUERY");
+    expect(body.error).toContain("expand");
+  });
+
   test("GET /notes?has_tags=false returns only untagged notes", async () => {
     await store.createNote("tagged", { tags: ["x"], path: "t" });
     await store.createNote("plain", { path: "p" });

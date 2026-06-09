@@ -203,15 +203,17 @@ function isOperatorObject(value: unknown): value is Record<string, unknown> {
 export async function buildLiveMatcher(store: Store, opts: QueryOpts): Promise<LiveMatcher> {
   const tags = opts.tags ?? [];
   const tagMatch: "all" | "any" = opts.tagMatch ?? "all";
-  // Per-input expansion: each input tag → {tag} ∪ descendants(tag). Mirrors
-  // store.expandQueryTags / queryNotes `_tagsExpanded`. expandTagsWithDescendants
-  // already includes the tag itself.
+  // Per-input expansion along the SAME axis the snapshot query uses
+  // (vault tag `expand` axis). `opts.expand` (default "subtypes") MUST be
+  // threaded through here so the live matcher and the snapshot query engine
+  // lower the IDENTICAL expansion — otherwise a subscription's snapshot and
+  // its live events would disagree on which notes match. `expandTags` already
+  // includes each input tag.
   const tagSets: string[][] = [];
   for (const t of tags) {
-    const set = await store.expandTagsWithDescendants([t]);
-    // expandTagsWithDescendants returns {} for empty input but always
-    // includes the root for a non-empty input; be defensive and ensure the
-    // root is present.
+    const set = await store.expandTags([t], opts.expand);
+    // Be defensive: ensure the root is present (expandTags always includes it
+    // for non-empty input, but the contract should not rely on it here).
     set.add(t);
     tagSets.push(Array.from(set));
   }

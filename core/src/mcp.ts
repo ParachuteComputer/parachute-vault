@@ -3,6 +3,7 @@ import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
+import { TAG_EXPAND_MODES, type TagExpandMode } from "./tag-hierarchy.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -165,6 +166,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             description: "Filter by tag(s)",
           },
           tag_match: { type: "string", enum: ["any", "all"], description: "How to match multiple tags: 'any' (OR, default) or 'all' (AND)" },
+          expand: {
+            type: "string",
+            enum: ["subtypes", "namespace", "both", "exact"],
+            description: "How each `tag` expands. 'subtypes' (DEFAULT): the tag plus its declared parent_names descendants — the semantic is-a axis (e.g. tag:entity also matches person/work). 'namespace': the tag plus everything filed under it by NAME (tag:entity also matches entity/archived) — the lexical filing axis. 'both': union of the two. 'exact': only the literal tag, no expansion. Omit for 'subtypes' (current behavior).",
+          },
           exclude_tags: {
             oneOf: [
               { type: "string" },
@@ -361,6 +367,18 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             "INVALID_QUERY",
           );
         }
+        // Tag-expansion axis (vault tag `expand` axis). Validate loudly so a
+        // typo'd value doesn't silently fall back to the default.
+        let expand: TagExpandMode | undefined;
+        if (params.expand !== undefined && params.expand !== null) {
+          if (typeof params.expand !== "string" || !(TAG_EXPAND_MODES as readonly string[]).includes(params.expand)) {
+            throw new QueryError(
+              `invalid \`expand\` value ${JSON.stringify(params.expand)} — must be one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("subtypes").`,
+              "INVALID_QUERY",
+            );
+          }
+          expand = params.expand as TagExpandMode;
+        }
 
         // --- Full-text search ---
         let results: Note[];
@@ -376,6 +394,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           results = await store.searchNotes(params.search as string, {
             tags,
             limit: (params.limit as number) ?? 50,
+            expand,
           });
         } else {
           // --- Structured query ---
@@ -395,6 +414,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           const queryOpts = {
             tags,
             tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+            expand,
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,

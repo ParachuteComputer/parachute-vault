@@ -461,6 +461,99 @@ describe("handleSubscribe — snapshot completeness (M3)", () => {
   });
 });
 
+describe("handleSubscribe — expand axis snapshot↔live consistency", () => {
+  // vault tag `expand` axis (design 2026-06-09): a subscription's snapshot
+  // (query engine) and its live matcher MUST lower the IDENTICAL tag
+  // expansion. We seed the two-axis corpus, then for each `expand` mode assert
+  // the snapshot set EQUALS the set the live matcher would accept over every
+  // note in the vault.
+  async function seedTwoAxis() {
+    await store.upsertTagRecord("entity", { description: "entity root" });
+    await store.upsertTagRecord("person", { parent_names: ["entity"] }); // subtype, not name-prefixed
+    await store.upsertTagRecord("entity/archived", {}); // name-prefixed, not subtype
+    await store.upsertTagRecord("entity/person", { parent_names: ["entity"] }); // both
+    await store.createNote("literal", { tags: ["entity"] });
+    await store.createNote("subtype", { tags: ["person"] });
+    await store.createNote("filed", { tags: ["entity/archived"] });
+    await store.createNote("both", { tags: ["entity/person"] });
+    await store.createNote("unrelated", { tags: ["work"] });
+  }
+
+  for (const mode of ["subtypes", "namespace", "both", "exact"] as const) {
+    it(`expand=${mode}: snapshot set ≡ live-matcher acceptance`, async () => {
+      await seedTwoAxis();
+      const { buildLiveMatcher } = await import("./live-match.ts");
+
+      const res = await handleSubscribe(
+        subscribeReq(`tag=entity&expand=${mode}`),
+        store,
+        VAULT,
+        unscopedScope(),
+        manager,
+      );
+      expect(res.status).toBe(200);
+      const r = sseReader(res);
+      await r.pump();
+      const snap = r.frames().find((f) => f.event === "snapshot")!;
+      const snapIds = new Set<string>(snap.data.notes.map((n: any) => n.id));
+
+      // The matcher accepts/rejects each note in the vault — compute its set.
+      const matcher = await buildLiveMatcher(store, { tags: ["entity"], expand: mode });
+      const allNotes = await store.queryNotes({ limit: Number.MAX_SAFE_INTEGER });
+      const liveIds = new Set<string>(allNotes.filter((n) => matcher.match(n)).map((n) => n.id));
+
+      expect(liveIds).toEqual(snapIds);
+      await r.close();
+    });
+  }
+
+  it("expand=namespace: a live insert filed under entity/ arrives; a subtype-only insert does NOT", async () => {
+    await seedTwoAxis();
+    // The matcher freezes its tag expansion at subscribe time (mirroring the
+    // snapshot query — design "resolved ONCE at subscribe time"). So the tags
+    // these live notes carry must already be KNOWN at subscribe time:
+    //   - entity/inbox: name-prefixed → in the frozen namespace set.
+    //   - agent: declared subtype of entity, NOT name-prefixed → excluded by
+    //     namespace mode.
+    await store.upsertTagRecord("entity/inbox", {});
+    await store.upsertTagRecord("agent", { parent_names: ["entity"] });
+
+    const res = await handleSubscribe(
+      subscribeReq("tag=entity&expand=namespace"),
+      store,
+      VAULT,
+      unscopedScope(),
+      manager,
+    );
+    const r = sseReader(res);
+    await r.pump();
+
+    await store.createNote("new filed", { tags: ["entity/inbox"] }); // name-prefixed → upsert
+    await store.createNote("new subtype", { tags: ["agent"] }); // subtype-only → no upsert
+    await settle();
+    await r.pump();
+
+    const upserts = r.frames().filter((f) => f.event === "upsert");
+    const contents = upserts.map((u) => u.data.note.content);
+    expect(contents).toContain("new filed");
+    expect(contents).not.toContain("new subtype");
+    await r.close();
+  });
+
+  it("invalid expand value → 400 INVALID_QUERY before any stream opens", async () => {
+    const res = await handleSubscribe(
+      subscribeReq("tag=entity&expand=bogus"),
+      store,
+      VAULT,
+      unscopedScope(),
+      manager,
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe("INVALID_QUERY");
+  });
+});
+
 describe("handleSubscribe — cap", () => {
   it("over-cap subscribe → 503", async () => {
     const capped = new SubscriptionManager(hooks, { maxPerVault: 1, resolveVault: () => VAULT });

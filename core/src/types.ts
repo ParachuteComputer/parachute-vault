@@ -1,11 +1,13 @@
 import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
+import type { TagExpandMode } from "./tag-hierarchy.js";
 
 // ---- Re-exports ----
 
 export type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 export type { PrunedField } from "./indexed-fields.js";
+export type { TagExpandMode } from "./tag-hierarchy.js";
 
 // ---- Note ----
 
@@ -85,6 +87,18 @@ export interface VaultStats {
 export interface QueryOpts {
   tags?: string[];
   tagMatch?: "all" | "any"; // "all" = must have ALL tags (default), "any" = must have ANY tag
+  /**
+   * Tag-expansion axis (vault tag `expand` axis — design
+   * `design/2026-06-09-tag-expand-axis.md`). Selects how each `tags` entry
+   * expands:
+   * - `"subtypes"` (DEFAULT): tag ∪ `parent_names` descendants. Today's
+   *   semantic is-a behavior, unchanged. `_default` universal magic fires here.
+   * - `"namespace"`: tag ∪ lexically name-prefixed `tag/*` (the filing axis).
+   * - `"both"`: union of subtypes + namespace.
+   * - `"exact"`: the literal tag only, no expansion.
+   * Absent → `"subtypes"` → byte-identical to pre-axis behavior.
+   */
+  expand?: TagExpandMode;
   excludeTags?: string[];
   // Presence filters. `true` → has at least one; `false` → has none.
   // When `tags` is also set, `hasTags` is ignored (the tag filter already constrains the set).
@@ -256,7 +270,7 @@ export interface Store {
    * agent loop can persist a single watermark and keep polling.
    */
   queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
-  searchNotes(query: string, opts?: { tags?: string[]; limit?: number }): Promise<Note[]>;
+  searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode }): Promise<Note[]>;
 
   // Tags
   tagNote(noteId: string, tags: string[]): Promise<void>;
@@ -268,6 +282,18 @@ export interface Store {
    * compute the effective allowlisted tag-set at auth time.
    */
   expandTagsWithDescendants(tags: string[]): Promise<Set<string>>;
+  /**
+   * Mode-aware tag expansion (vault tag `expand` axis). Expands each input tag
+   * along the selected axis and returns the union:
+   * - `"subtypes"` (default): `{tag} ∪ parent_names-descendants` — identical to
+   *   `expandTagsWithDescendants` (which is a thin shim over this).
+   * - `"namespace"`: `{tag} ∪ lexically name-prefixed tag/*`.
+   * - `"both"`: union of the two.
+   * - `"exact"`: `{tag}` only.
+   * Always includes each input tag. Used by the live-query matcher to lower the
+   * IDENTICAL expansion the snapshot query engine uses for the same `expand`.
+   */
+  expandTags(tags: string[], mode?: TagExpandMode): Promise<Set<string>>;
   listTags(): Promise<{ name: string; count: number }[]>;
   deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
   renameTag(
