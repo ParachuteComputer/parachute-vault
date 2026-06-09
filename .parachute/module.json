@@ -8,8 +8,19 @@
   "health": "/vault/default/health",
   "managementUrl": "/admin/",
   "uiUrl": "/admin/",
+  "configUiUrl": "/admin/",
+  "focus": "core",
+  "adminCapabilities": ["config", "credentials"],
   "startCmd": ["parachute-vault", "serve"],
   "scopes": {
     "defines": ["vault:read", "vault:write", "vault:admin"]
-  }
+  },
+  "events": [
+    { "key": "note.created", "title": "A note was created" },
+    { "key": "note.updated", "title": "A note was updated" },
+    { "key": "note.deleted", "title": "A note was deleted" }
+  ],
+  "actions": [
+    { "key": "note.create", "title": "Create a note", "inputSchema": {} }
+  ]
 }
