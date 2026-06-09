@@ -11,7 +11,7 @@
  * and the Request, and returns a Response.
  */
 
-import type { Store, Note } from "../core/src/types.ts";
+import type { Store, Note, QueryOpts } from "../core/src/types.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
@@ -436,6 +436,88 @@ function parseMetadataJsonAlias(url: URL): {
 }
 
 /**
+ * Parse the shared notes-query parameters (tags / excludeTags / path /
+ * pathPrefix / extension / metadata filters / date filters / sort / paging /
+ * cursor) into a `QueryOpts`, plus flags for the query shapes that the live
+ * subscription endpoint must reject (`search`, `near`, `cursor`).
+ *
+ * Factored out of `handleNotesInner`'s structured-query branch so the
+ * `/subscribe` route evaluates the SAME predicate the snapshot query does —
+ * predicate parity by construction, not copy-paste. `handleNotesInner` keeps
+ * its own inline parsing for the single-note (`id`) and full-text (`search`)
+ * branches; this helper covers the structured-query shape both endpoints share.
+ *
+ * Returns `{ error }` (a 400 Response) on a malformed metadata filter, exactly
+ * as the inline code did. `hasSearch` is surfaced from the raw `search` param
+ * (this helper does not itself build a search query — the caller routes that).
+ */
+export function parseNotesQueryOpts(url: URL): {
+  queryOpts?: QueryOpts;
+  hasSearch: boolean;
+  hasNear: boolean;
+  hasCursor: boolean;
+  error?: Response;
+} {
+  const hasSearch = parseQuery(url, "search") !== null && parseQuery(url, "search") !== "";
+  const hasNear = parseQuery(url, "near[note_id]") !== null;
+  const cursorParam = parseQuery(url, "cursor");
+  const hasCursor = cursorParam !== null && cursorParam !== "";
+
+  const tags = parseQueryList(url, "tag");
+  const bracket = parseMetaBrackets(url);
+  if (bracket.error) return { hasSearch, hasNear, hasCursor, error: bracket.error };
+  const metadataAlias = parseMetadataJsonAlias(url);
+  if (metadataAlias.error) return { hasSearch, hasNear, hasCursor, error: metadataAlias.error };
+  if (metadataAlias.metadata && bracket.metadata) {
+    return {
+      hasSearch,
+      hasNear,
+      hasCursor,
+      error: json(
+        {
+          error: "pass metadata filters as either the JSON `metadata=` param or bracket `meta[field][op]=` form, not both.",
+          code: "INVALID_QUERY",
+        },
+        400,
+      ),
+    };
+  }
+
+  const queryOpts: QueryOpts = {
+    tags,
+    tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+    excludeTags: parseQueryList(url, "exclude_tag"),
+    hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
+    hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+    path: parseQuery(url, "path") ?? undefined,
+    pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
+    extension: parseExtensionFilter(url),
+    metadata: bracket.metadata ?? metadataAlias.metadata,
+    ...(bracket.dateFilter
+      ? { dateFilter: bracket.dateFilter }
+      : parseQuery(url, "date_field")
+        ? {
+            dateFilter: {
+              field: parseQuery(url, "date_field")!,
+              from: parseQuery(url, "date_from") ?? undefined,
+              to: parseQuery(url, "date_to") ?? undefined,
+            },
+          }
+        : {
+            dateFrom: parseQuery(url, "date_from") ?? undefined,
+            dateTo: parseQuery(url, "date_to") ?? undefined,
+          }),
+    sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
+    orderBy: parseQuery(url, "order_by") ?? undefined,
+    limit: parseInt10(parseQuery(url, "limit")) ?? 50,
+    offset: parseInt10(parseQuery(url, "offset")),
+    cursor: cursorParam ?? undefined,
+  };
+
+  return { queryOpts, hasSearch, hasNear, hasCursor };
+}
+
+/**
  * Parse include_metadata query param.
  * - absent/null → undefined (all metadata, default)
  * - "true"/"1" → true (all metadata)
@@ -694,36 +776,16 @@ async function handleNotesInner(
       // Surface asymmetry: REST flattens to a query string; MCP takes a
       // nested `date_filter: { field, from, to }` object directly. Both
       // lower to the same store-level `dateFilter` shape.
-      const tags = parseQueryList(url, "tag");
-      const bracket = parseMetaBrackets(url);
-      if (bracket.error) return bracket.error;
-      // `?metadata=<json>` alias — the JSON-object form of the metadata
-      // filter, symmetric with the nested object MCP forwards. Before this,
-      // a `metadata=` param was silently dropped (the bracket grammar never
-      // matched it), so the query returned ALL tag-matching notes.
-      const metadataAlias = parseMetadataJsonAlias(url);
-      if (metadataAlias.error) return metadataAlias.error;
-      // Reject "both forms" loudly. If a caller passes BOTH the JSON
-      // `metadata=` param AND any `meta[...]` bracket param, there's no
-      // well-defined merge and silently picking a winner is exactly the
-      // class of bug we're fixing. Symmetric with the mixed shorthand/
-      // operator rejection inside parseMetaBrackets. Guard stays narrow —
-      // only the named `metadata` param triggers it.
-      if (metadataAlias.metadata && bracket.metadata) {
-        return json(
-          {
-            error: "pass metadata filters as either the JSON `metadata=` param or bracket `meta[field][op]=` form, not both.",
-            code: "INVALID_QUERY",
-          },
-          400,
-        );
-      }
-      // Opaque cursor for "since last checked" agent loops (vault#313).
-      // When present, switches the response shape to {notes, next_cursor}
-      // and routes through queryNotesPaged for keyset pagination. Mutually
-      // exclusive with the `near` graph-neighborhood scope (rebuilding the
-      // neighborhood per page isn't stable) — rejected below.
+      // Structured-query parsing is shared with the live `/subscribe` route
+      // (see `parseNotesQueryOpts`) so both endpoints lower an identical query
+      // string to the same `QueryOpts` — predicate parity by construction.
+      const parsed = parseNotesQueryOpts(url);
+      if (parsed.error) return parsed.error;
+      const queryOpts = parsed.queryOpts!;
       const cursorParam = parseQuery(url, "cursor");
+      // Opaque cursor for "since last checked" agent loops (vault#313) is
+      // mutually exclusive with the `near` graph-neighborhood scope (rebuilding
+      // the neighborhood per page isn't stable).
       const nearNoteIdEarly = parseQuery(url, "near[note_id]");
       if (cursorParam && nearNoteIdEarly) {
         return json(
@@ -736,50 +798,6 @@ async function handleNotesInner(
       }
       let results: Note[];
       let nextCursor: string | null = null;
-      const queryOpts = {
-        tags,
-        tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
-        excludeTags: parseQueryList(url, "exclude_tag"),
-        hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
-        hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
-        path: parseQuery(url, "path") ?? undefined,
-        pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
-        // Extension filter (vault#328). Accepts repeated `extension=`
-        // params for the array form: `?extension=csv&extension=yaml`.
-        // `parseQueryList` already returns undefined when no params
-        // are present, so the filter is silently skipped on a plain
-        // GET without the extension query.
-        extension: parseExtensionFilter(url),
-        // Bracket form and JSON-alias form are mutually exclusive (guarded
-        // above), so at most one of these is set.
-        metadata: bracket.metadata ?? metadataAlias.metadata,
-        // Date-range precedence chain (highest to lowest):
-        //   1. Bracket-style `meta[created_at][gte]=…` (canonical).
-        //   2. Flat `date_field=…&date_from=…&date_to=…` (deprecated).
-        //   3. Legacy `date_from=…&date_to=…` (no date_field, deprecated)
-        //      — filters on `n.created_at` by definition.
-        // The engine rejects combinations of `dateFilter` with the legacy
-        // `dateFrom`/`dateTo`, so we never set both shapes simultaneously.
-        ...(bracket.dateFilter
-          ? { dateFilter: bracket.dateFilter }
-          : parseQuery(url, "date_field")
-            ? {
-                dateFilter: {
-                  field: parseQuery(url, "date_field")!,
-                  from: parseQuery(url, "date_from") ?? undefined,
-                  to: parseQuery(url, "date_to") ?? undefined,
-                },
-              }
-            : {
-                dateFrom: parseQuery(url, "date_from") ?? undefined,
-                dateTo: parseQuery(url, "date_to") ?? undefined,
-              }),
-        sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
-        orderBy: parseQuery(url, "order_by") ?? undefined,
-        limit: parseInt10(parseQuery(url, "limit")) ?? 50,
-        offset: parseInt10(parseQuery(url, "offset")),
-        cursor: cursorParam ?? undefined,
-      };
       try {
         if (cursorParam) {
           const page = await store.queryNotesPaged(queryOpts);
