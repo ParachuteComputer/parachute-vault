@@ -22,6 +22,7 @@ import { resolveFirstBootVaultName } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
+import { loadVaultTriggers } from "./triggers-api.ts";
 import { route } from "./routing.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
@@ -241,6 +242,31 @@ for (const vaultName of listVaults()) {
     } catch (err) {
       console.error(`[tokens] migration error for vault "${vaultName}":`, err);
     }
+  }
+}
+
+// Load persisted runtime triggers for each vault and register them
+// vault-scoped on the shared hook registry (frictionless-channel-setup PR 1).
+// Runs alongside the config.yaml trigger registration above; config.yaml
+// triggers stay global, these fire only for their own vault. Survives
+// restart — the `triggers` table is the source of truth. Per-vault failure
+// is isolated so one bad vault can't block the others.
+{
+  let totalTriggers = 0;
+  for (const vaultName of listVaults()) {
+    try {
+      const store = getVaultStore(vaultName);
+      const n = loadVaultTriggers(vaultName, store);
+      totalTriggers += n;
+      if (n > 0) {
+        console.log(`[triggers] loaded ${n} runtime trigger(s) for vault "${vaultName}"`);
+      }
+    } catch (err) {
+      console.error(`[triggers] failed to load runtime triggers for vault "${vaultName}":`, err);
+    }
+  }
+  if (totalTriggers === 0) {
+    console.log("[triggers] no persisted runtime triggers");
   }
 }
 
