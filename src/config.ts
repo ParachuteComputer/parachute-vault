@@ -240,6 +240,20 @@ export interface TriggerAction {
    * top-level `context` field (send=json). send=content ignores this.
    */
   include_context?: TriggerIncludeContext[];
+  /**
+   * Optional webhook auth. When `auth.bearer` is set, the trigger sends
+   * `Authorization: Bearer <bearer>` on the webhook POST — the JWT path that
+   * retires the shared `?secret=` query param. Back-compat: a webhook URL
+   * carrying its own `?secret=` still works; `auth` is purely additive.
+   * Runtime triggers (registered via the /api/triggers REST surface) are the
+   * primary users; config.yaml triggers may also carry it.
+   */
+  auth?: TriggerAuth;
+}
+
+export interface TriggerAuth {
+  /** Bearer token (typically a hub-issued JWT) for the webhook Authorization header. */
+  bearer?: string;
 }
 
 export interface TriggerConfig {

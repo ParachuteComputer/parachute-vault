@@ -64,6 +64,7 @@ import {
   type TagScopeCtx,
 } from "./routes.ts";
 import { handleSubscribe } from "./subscribe.ts";
+import { handleTriggers } from "./triggers-api.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import {
   handleProtectedResource,
@@ -727,6 +728,18 @@ export async function route(
   const apiMatch = subpath.match(/^\/api(\/.*)?$/);
   if (!apiMatch) {
     return Response.json({ error: "Not found" }, { status: 404 });
+  }
+
+  // /api/triggers — runtime trigger-registration API. Dispatched BEFORE the
+  // generic method→verb scope gate below because it's ADMIN-scoped on EVERY
+  // method (a webhook trigger exfiltrates note data; even GET is admin). The
+  // gate lives inside `handleTriggers`. Subpath is everything after
+  // `/api/triggers`. See src/triggers-api.ts.
+  {
+    const triggersPath = apiMatch[1] ?? "";
+    if (triggersPath === "/triggers" || triggersPath.startsWith("/triggers/")) {
+      return handleTriggers(req, store, triggersPath.slice("/triggers".length), vaultName, auth);
+    }
   }
 
   // REST API — scope gate. GET/HEAD/OPTIONS → vault:read,

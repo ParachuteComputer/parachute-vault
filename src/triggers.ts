@@ -31,11 +31,24 @@ import crypto from "node:crypto";
 import type { Note, Store, Attachment } from "../core/src/types.ts";
 import type { HookRegistry, HookEvent, NoteHookPayload } from "../core/src/hooks.ts";
 import type { TriggerConfig, TriggerWhen } from "./config.ts";
+import type { StoredTrigger } from "../core/src/triggers-store.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
 import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
 
 const DEFAULT_TIMEOUT = 60_000;
+
+/**
+ * Build the optional auth headers for a trigger's webhook POST. When
+ * `action.auth.bearer` is set we send `Authorization: Bearer <bearer>` (the
+ * JWT webhook-auth path, frictionless-channel-setup PR 1). Returns an empty
+ * object otherwise — back-compat with webhook URLs carrying a `?secret=`
+ * query param, which is unaffected by this.
+ */
+function buildAuthHeaders(action: TriggerConfig["action"]): Record<string, string> {
+  const bearer = action.auth?.bearer;
+  return bearer ? { Authorization: `Bearer ${bearer}` } : {};
+}
 
 export interface WebhookResponse {
   content?: string;
@@ -163,11 +176,12 @@ async function dispatchJson(
   existingMeta: Record<string, unknown>,
   hookEvent: HookEvent | undefined,
   context: ContextPayload | null,
+  authHeaders: Record<string, string>,
   signal: AbortSignal,
 ): Promise<DispatchResult> {
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify({
       trigger: trigger.name,
       event: hookEvent ?? "updated",
@@ -207,6 +221,7 @@ async function dispatchAttachment(
   attachments: Attachment[],
   store: Store,
   context: ContextPayload | null,
+  authHeaders: Record<string, string>,
   signal: AbortSignal,
 ): Promise<DispatchResult> {
   const assetsRoot = resolveAssetsDir(store);
@@ -223,7 +238,9 @@ async function dispatchAttachment(
   form.append("file", file);
   if (context) appendContextPart(form, context);
 
-  const resp = await fetch(url, { method: "POST", body: form, signal });
+  // multipart boundary is set by fetch from the FormData body; only the auth
+  // header is added here (no Content-Type — that would clobber the boundary).
+  const resp = await fetch(url, { method: "POST", body: form, headers: authHeaders, signal });
   if (!resp.ok) {
     throw new Error(`webhook returned ${resp.status}: ${await resp.text().catch(() => "")}`);
   }
@@ -244,6 +261,7 @@ async function dispatchContent(
   url: string,
   note: Note,
   store: Store,
+  authHeaders: Record<string, string>,
   signal: AbortSignal,
 ): Promise<DispatchResult> {
   if (!note.content || !note.content.trim()) {
@@ -252,7 +270,7 @@ async function dispatchContent(
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify({ input: note.content }),
     signal,
   });
@@ -280,15 +298,40 @@ async function dispatchContent(
 // Registration
 // ---------------------------------------------------------------------------
 
+export interface RegisterTriggersOptions {
+  logger?: { error: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
+  /**
+   * When set, the registered handler early-returns unless the firing event's
+   * vault (resolved via `getVaultNameForStore(store)`) equals this value.
+   * Used by the runtime per-vault trigger system: a trigger registered for
+   * vault A never acts on a vault-B note event. `config.yaml` triggers omit
+   * this and stay global (fire for every vault). See `registerVaultTrigger`.
+   */
+  vaultName?: string;
+}
+
 /**
  * Register all triggers from config onto a HookRegistry.
  * Returns a cleanup function that unregisters all hooks.
+ *
+ * `opts.logger` defaults to console. `opts.vaultName`, when set, scopes every
+ * registered handler to that vault (early-return on mismatch) — the
+ * load-bearing isolation for runtime per-vault triggers. A plain logger object
+ * is still accepted as the third arg for back-compat with existing callers.
  */
 export function registerTriggers(
   hooks: HookRegistry,
   triggers: TriggerConfig[],
-  logger: { error: (...args: unknown[]) => void; info?: (...args: unknown[]) => void } = console,
+  optsOrLogger: RegisterTriggersOptions | { error: (...args: unknown[]) => void; info?: (...args: unknown[]) => void } = {},
 ): () => void {
+  // Back-compat: callers historically passed a bare logger as the 3rd arg.
+  // Distinguish it from the new options object by the presence of `error`.
+  const opts: RegisterTriggersOptions =
+    optsOrLogger && typeof (optsOrLogger as { error?: unknown }).error === "function"
+      ? { logger: optsOrLogger as RegisterTriggersOptions["logger"] }
+      : (optsOrLogger as RegisterTriggersOptions);
+  const logger = opts.logger ?? console;
+  const scopedVault = opts.vaultName;
   const unregisters: Array<() => void> = [];
 
   for (const trigger of triggers) {
@@ -310,6 +353,7 @@ export function registerTriggers(
     const renderedKey = `${trigger.name}_rendered_at`;
     const timeout = trigger.action.timeout ?? DEFAULT_TIMEOUT;
     const sendMode = trigger.action.send ?? "json";
+    const authHeaders = buildAuthHeaders(trigger.action);
 
     const unregister = hooks.onNote({
       name: trigger.name,
@@ -322,6 +366,16 @@ export function registerTriggers(
         return predicate(payload as Note);
       },
       handler: async (payload: NoteHookPayload, store: Store, hookEvent?: HookEvent) => {
+        // Per-vault scoping (runtime triggers): the process-wide hook registry
+        // is shared across every vault, so a trigger registered for vault A
+        // would otherwise fire on vault-B note events too. Resolve the firing
+        // store's vault and early-return on mismatch. `config.yaml` triggers
+        // leave `scopedVault` undefined and stay global. This is the
+        // load-bearing isolation check — see the per-vault firing test.
+        if (scopedVault !== undefined && getVaultNameForStore(store) !== scopedVault) {
+          return;
+        }
+
         // Same shape contract as the predicate — triggers don't
         // subscribe to deleted events, so narrow back to Note.
         const note = payload as Note;
@@ -357,16 +411,16 @@ export function registerTriggers(
           let result: DispatchResult;
           switch (sendMode) {
             case "attachment":
-              result = await dispatchAttachment(trigger.action.webhook, note, attachments, store, context, controller.signal);
+              result = await dispatchAttachment(trigger.action.webhook, note, attachments, store, context, authHeaders, controller.signal);
               break;
             case "content":
               // send=content is pure TTS (audio out); vault context makes no
               // sense here and would confuse the server contract.
-              result = await dispatchContent(trigger.action.webhook, note, store, controller.signal);
+              result = await dispatchContent(trigger.action.webhook, note, store, authHeaders, controller.signal);
               break;
             case "json":
             default:
-              result = await dispatchJson(trigger.action.webhook, trigger, note, attachments, existingMeta, hookEvent, context, controller.signal);
+              result = await dispatchJson(trigger.action.webhook, trigger, note, attachments, existingMeta, hookEvent, context, authHeaders, controller.signal);
               break;
           }
           webhookResult = result.webhookResult;
@@ -437,4 +491,36 @@ export function registerTriggers(
   }
 
   return () => unregisters.forEach((fn) => fn());
+}
+
+/**
+ * Convert a persisted `StoredTrigger` (core/src/triggers-store.ts) into the
+ * `TriggerConfig` shape `registerTriggers` consumes. The two are structurally
+ * compatible — this is a thin, explicit bridge so the type boundary between
+ * core (storage) and src (config types) stays visible.
+ */
+export function storedTriggerToConfig(t: StoredTrigger): TriggerConfig {
+  return {
+    name: t.name,
+    events: t.events,
+    when: t.when as TriggerWhen,
+    action: t.action as unknown as TriggerConfig["action"],
+  };
+}
+
+/**
+ * Register a single runtime trigger scoped to `vaultName`. The handler
+ * early-returns unless the firing store resolves to `vaultName` (see the
+ * scoping check in `registerTriggers`), so a trigger registered for vault A
+ * never acts on a vault-B event. Otherwise identical to a config.yaml trigger
+ * — same two-phase claim + webhook fire. Returns an unregister function the
+ * caller keys by (vault, name) so POST-replace and DELETE can unwind it.
+ */
+export function registerVaultTrigger(
+  hooks: HookRegistry,
+  trigger: StoredTrigger,
+  vaultName: string,
+  logger: { error: (...args: unknown[]) => void; info?: (...args: unknown[]) => void } = console,
+): () => void {
+  return registerTriggers(hooks, [storedTriggerToConfig(trigger)], { logger, vaultName });
 }

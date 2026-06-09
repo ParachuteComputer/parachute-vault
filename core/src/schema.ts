@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -184,6 +184,23 @@ CREATE TABLE IF NOT EXISTS mcp_mint_ledger (
   created_at TEXT NOT NULL,
   expires_at TEXT,
   revoked_at TEXT
+);
+
+-- Triggers (v21, vault frictionless-channel-setup PR 1): runtime, persisted,
+-- per-vault webhook triggers. Complements the static config.yaml trigger
+-- system — config.yaml triggers stay global; rows here are scoped to THIS
+-- vault's DB and fire only for events on this vault. The structured columns
+-- (events/when/action) are JSON-encoded; the action column carries the webhook
+-- URL, send mode, timeout, and an optional auth { bearer } for the JWT webhook
+-- path. Managed at runtime via the admin-scoped /api/triggers REST surface
+-- and re-registered on the live hook registry at boot. See src/triggers-api.ts.
+CREATE TABLE IF NOT EXISTS triggers (
+  name TEXT PRIMARY KEY,
+  events TEXT NOT NULL DEFAULT '[]',
+  "when" TEXT NOT NULL DEFAULT '{}',
+  action TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 -- OAuth: registered clients (Dynamic Client Registration)
@@ -451,6 +468,11 @@ export function initSchema(db: Database): void {
   // — present for symmetry with the other migration steps and to anchor the
   // version bump. See vault#403 (MGT — manage-token mints hub JWTs).
   migrateToV20(db);
+
+  // Migrate v20 → v21: ensure the `triggers` table exists (runtime per-vault
+  // webhook triggers). Created by SCHEMA_SQL's CREATE TABLE IF NOT EXISTS
+  // above, so this is a defensive confirmation hook for upgrading vaults.
+  migrateToV21(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1075,6 +1097,28 @@ function migrateToV20(db: Database): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_mcp_mint_ledger_session ON mcp_mint_ledger(parent_jti, vault_name)",
   );
+}
+
+/**
+ * Migrate v20 → v21: ensure the `triggers` table exists (runtime per-vault
+ * webhook triggers — vault frictionless-channel-setup PR 1). SCHEMA_SQL's
+ * `CREATE TABLE IF NOT EXISTS` already covers fresh AND upgrading vaults
+ * (it runs unconditionally before the migration steps), so this is a
+ * defensive no-op confirmation for vaults created before v21. The reserved
+ * keyword `when` is quoted in the column definition. Idempotent.
+ */
+function migrateToV21(db: Database): void {
+  if (hasTable(db, "triggers")) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS triggers (
+      name TEXT PRIMARY KEY,
+      events TEXT NOT NULL DEFAULT '[]',
+      "when" TEXT NOT NULL DEFAULT '{}',
+      action TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
 }
 
 function hasTable(db: Database, name: string): boolean {
