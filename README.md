@@ -233,6 +233,14 @@ parachute-vault config                     # show current configuration
 parachute-vault config set KEY value       # set an env var (e.g. PORT=1940)
 parachute-vault config unset KEY           # remove an env var
 parachute-vault restart                    # apply config changes (bounces the daemon)
+# Env vars live in ~/.parachute/vault/.env. Notable ones:
+#   PORT                          — server port (default 1940)
+#   PARACHUTE_GITHUB_CLIENT_ID +
+#   PARACHUTE_GITHUB_APP_SLUG     — bring-your-own GitHub App for the mirror
+#                                   "Back up to GitHub" flow (defaults to the
+#                                   shared Parachute app). Set BOTH or NEITHER:
+#                                   the pair must name the same app — mixing
+#                                   apps breaks the install probe.
 
 # Server
 parachute-vault serve                      # run the server in the foreground (no daemon)

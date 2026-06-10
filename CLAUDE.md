@@ -83,6 +83,14 @@ All configuration in `~/.parachute/vault/.env`:
 
 ```
 PORT=1940
+
+# Bring-your-own GitHub App for the mirror "Back up to GitHub" flow
+# (optional — defaults to the shared Parachute app). Set BOTH or NEITHER:
+# the pair must name the SAME GitHub App; mixing apps breaks the
+# install probe (the client_id mints the tokens, the slug builds the
+# install link).
+PARACHUTE_GITHUB_CLIENT_ID=Iv1.yourappclientid
+PARACHUTE_GITHUB_APP_SLUG=your-app-slug
 ```
 
 ## Naming

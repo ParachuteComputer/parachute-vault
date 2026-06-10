@@ -380,7 +380,9 @@ export async function fetchUser(
  * uninstalled app still sees all PUBLIC repos — so this list silently
  * misleads ("looks connected, shows the wrong repos"). The picker now goes
  * `listInstallations` → `listInstallationRepos`, which enumerates exactly
- * what the operator granted. Kept for non-picker callers.
+ * what the operator granted. No production callers remain — kept exported
+ * for its test coverage and as a building block for potential external /
+ * non-App callers.
  */
 export async function listRepos(
   token: string,

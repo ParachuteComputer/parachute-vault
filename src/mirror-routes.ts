@@ -868,9 +868,12 @@ export async function handleAuthDelete(manager: MirrorManager): Promise<Response
  *     install_url: string,           // github.com/apps/<slug>/installations/new
  *     installations: [{ id, account_login, account_type, repository_selection }]
  *   }
- *   401 { error, error_type: "github_not_connected", message } — no stored
+ *   400 { error, error_type: "github_not_connected", message } — no stored
  *       github_oauth credential; the device flow hasn't been run (or a PAT
- *       is active instead — install state is a GitHub-App concept).
+ *       is active instead — install state is a GitHub-App concept). 400,
+ *       not 401, matching the sibling repos handler: a 401 here would trip
+ *       the SPA's authedFetch token-refresh machinery and clear a
+ *       perfectly valid cached admin token over a non-auth condition.
  *   502 { error, message } — GitHub unreachable / API error.
  */
 export async function handleAuthGithubInstallations(
@@ -886,7 +889,7 @@ export async function handleAuthGithubInstallations(
         message:
           "No GitHub sign-in is stored for this vault. Run the device flow first (POST /.parachute/mirror/auth/github/device-code).",
       },
-      { status: 401 },
+      { status: 400 },
     );
   }
   const clientId = getGithubClientId();
@@ -994,7 +997,16 @@ export async function handleAuthGithubRepos(
   try {
     for (const installation of installations) {
       const result = await listInstallationRepos(token, installation.id, {}, fetchImpl);
-      for (const repo of result.repos) {
+      // `GET /user/installations/{id}/repositories` takes no `sort` param
+      // (unlike the old `GET /user/repos?sort=updated` picker source), so
+      // order within each account group ourselves: most-recently-updated
+      // first, so the repo the operator probably wants sits near the top.
+      // ISO-8601 timestamps compare lexicographically. Per-group (not
+      // across the union) so the SPA's account grouping stays contiguous.
+      const sorted = [...result.repos].sort((a, b) =>
+        b.updated_at.localeCompare(a.updated_at),
+      );
+      for (const repo of sorted) {
         repos.push({
           ...repo,
           account_login: installation.account.login,
@@ -1142,6 +1154,18 @@ export async function handleAuthGithubSelectRepo(
     name,
   );
 
+  // vault#483: linking implies backup intent — the choose-repo re-entry can
+  // be the FIRST credential-linked action for this vault (a credential saved
+  // before history-on-link existed, on a never-configured vault: the #483
+  // "linked but silently inert" state). Run history-on-link here too, BEFORE
+  // the Cut-3/Cut-6 steps below and mirroring handleAuthPat's ordering:
+  // history on (the reload's start() resolves mirror_path so the remote
+  // write below actually lands), then Cut 3 sees an enabled mirror and flips
+  // auto_push, then Cut 6 fires the initial push. An explicitly-disabled
+  // mirror short-circuits all of it (history stays off → maybeEnableAutoPush
+  // no-ops on disabled).
+  const history_enabled = await maybeEnableHistoryOnLink(manager);
+
   // Apply to the mirror dir if running. If the mirror isn't running (no
   // mirror_path), we still consider this a success — the credentials are
   // stored, and the URL will get applied next time the mirror starts.
@@ -1175,6 +1199,7 @@ export async function handleAuthGithubSelectRepo(
       // Echo the redacted form back so the SPA can show "pushing to <repo>".
       // No raw token in the response.
       remote: `https://github.com/${owner}/${name}.git`,
+      history_enabled,
       auto_push_was_already_enabled: autoPushChange.was_already_enabled,
       auto_push_enabled: autoPushChange.auto_push_now_enabled,
       initial_push: initialPush,

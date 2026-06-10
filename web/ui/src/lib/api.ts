@@ -407,6 +407,9 @@ export interface GitHubAppInfo {
 export interface GitHubInstallationInfo {
   id: number;
   account_login: string;
+  /** Cast from the wire without runtime narrowing — safe by degradation:
+   *  an unknown value falls through to the 'user' branch in
+   *  `installationSettingsUrl`, it isn't validated. */
   account_type: "User" | "Organization";
   /** Whether the installation grants all repos or a hand-picked subset. */
   repository_selection: "all" | "selected";
@@ -525,8 +528,9 @@ export async function postMirrorAuthPat(
  *
  * Explicitly a network probe (the server calls GitHub) — call it when
  * rendering the connect flow / repo picker, not on every status poll.
- * Throws `HttpError` with `errorType: "github_not_connected"` (401) when
- * no GitHub sign-in is stored.
+ * Throws `HttpError` with `errorType: "github_not_connected"` (400 — not
+ * 401, which would trip `authedFetch`'s token-refresh retry and clear a
+ * perfectly valid cached admin token) when no GitHub sign-in is stored.
  */
 export async function getGithubInstallations(
   vaultName: string,
@@ -587,6 +591,13 @@ export interface SelectGithubRepoResult {
   owner: string;
   name: string;
   remote: string;
+  /**
+   * vault#483 — history-on-link outcome (see `HistoryOnLink`). Select-repo
+   * runs history-on-link too: the "Choose repository…" re-entry can be the
+   * first linked action for a credential saved before history-on-link
+   * existed, on a never-configured vault.
+   */
+  history_enabled: HistoryOnLink;
   /** Cut 3/Cut 6 — auto_push side-effects from credential save. */
   auto_push_was_already_enabled: boolean;
   auto_push_enabled: boolean;

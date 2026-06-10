@@ -5,7 +5,7 @@
  * `lib/api.ts` is mocked for the wire surface; `lib/scope.ts` is mocked
  * so admin-vs-read gating is controllable per test without crafting JWTs.
  */
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1515,6 +1515,7 @@ describe("VaultMirror — GitHub App install flow (vault#480)", () => {
       owner: "parachute-org",
       name: "org-vault",
       remote: "https://github.com/parachute-org/org-vault.git",
+      history_enabled: true,
       auto_push_was_already_enabled: false,
       auto_push_enabled: true,
       initial_push: { fired: true, pushed: true, sha: "feedface123456" },
@@ -1545,6 +1546,43 @@ describe("VaultMirror — GitHub App install flow (vault#480)", () => {
       }),
     );
   });
+
+  it("open picker fetches the repo list exactly once — no per-second refetch loop (PR #484 fold)", async () => {
+    // Regression: the modal's countdown ticker re-rendered every phase each
+    // second, and RepoPicker's inline `onError`/`onNotInstalled` props sat
+    // in its fetch-effect deps — so an open picker refetched the repo list
+    // (1+N GitHub API calls server-side) every ~1s. With the fix, the
+    // ticker is gated to the polling phase and the callbacks are stable:
+    // sitting in the open picker across several ticker periods must not
+    // re-arm the fetch. Real time (not vi.useFakeTimers) — RTL's waitFor
+    // can't detect vitest fake timers and deadlocks; the sibling
+    // device-flow test waits on real ~1s ticks the same way.
+    vi.mocked(api.listGithubRepos).mockResolvedValue({
+      installed: true,
+      repos: [repoFixture()],
+      truncated: false,
+    });
+    renderRoute();
+    const user = userEvent.setup();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Choose repository/i }),
+      ).toBeInTheDocument(),
+    );
+    await user.click(screen.getByRole("button", { name: /Choose repository/i }));
+    const modal = await screen.findByRole("dialog");
+    await waitFor(() =>
+      expect(
+        within(modal).getByRole("button", { name: /a-vault/i }),
+      ).toBeInTheDocument(),
+    );
+    expect(api.listGithubRepos).toHaveBeenCalledTimes(1);
+
+    // Sit in the open picker across ~3 ticker periods. The unfixed code
+    // refires the fetch on every 1s tick (4+ calls by now).
+    await act(() => new Promise((resolve) => setTimeout(resolve, 3200)));
+    expect(api.listGithubRepos).toHaveBeenCalledTimes(1);
+  }, 15_000);
 
   it("shared app: create-repo renders the guided-manual checklist, never a dead POST", async () => {
     vi.mocked(api.listGithubRepos).mockResolvedValue({
@@ -1850,6 +1888,52 @@ describe("VaultMirror — history-on-link (vault#483)", () => {
     );
     await waitFor(() =>
       expect(within(modal).getByRole("button", { name: /a-vault/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("repo-pick re-entry (choose-repo) surfaces the history outcome like the grant path (PR #484 fold)", async () => {
+    // A credential saved BEFORE history-on-link existed, on a vault whose
+    // mirror is explicitly off: the operator re-enters via "Choose
+    // repository…" (no fresh grant, so the grant-time onHistory never
+    // fires). The select-repo response now carries history_enabled — the
+    // banner must fire off THAT, here the one-click enable offer.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: false, location: "internal" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue(githubCreds());
+    vi.mocked(api.listGithubRepos).mockResolvedValue({
+      installed: true,
+      repos: [repoFixture()],
+      truncated: false,
+    });
+    vi.mocked(api.selectGithubRepo).mockResolvedValue({
+      ok: true,
+      applied: false,
+      owner: "aaron",
+      name: "a-vault",
+      remote: "https://github.com/aaron/a-vault.git",
+      history_enabled: "left_disabled",
+      auto_push_was_already_enabled: false,
+      auto_push_enabled: false,
+      initial_push: { fired: false, reason: "auto_push_disabled" },
+    });
+
+    renderRoute();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Choose repository/i }),
+      ).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Choose repository/i }));
+    const modal = await screen.findByRole("dialog");
+    await user.click(
+      await within(modal).findByRole("button", { name: /a-vault/i }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Version history is still off for this vault/i),
+      ).toBeInTheDocument(),
     );
   });
 });

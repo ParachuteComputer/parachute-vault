@@ -848,6 +848,19 @@ describe("auth credential routes — credential-save side-effects (Cuts 3 + 6)",
       auto_commit: false,
       auto_push: false,
     });
+    // Mirror the in-memory deps config into the REAL per-vault file:
+    // select-repo now runs maybeEnableHistoryOnLink (PR #484 fold), whose
+    // never-configured branch keys off the file's existence — without it
+    // the helper would see "never configured" and clobber this test's
+    // config with defaults.
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+      sync_mode: "manual",
+      auto_commit: false,
+      auto_push: false,
+    });
     await manager.start();
     expect(manager.getConfig().auto_push).toBe(false);
 
@@ -905,6 +918,14 @@ describe("auth credential routes — credential-save side-effects (Cuts 3 + 6)",
     home = tmp("mirror-selectrepo-disabled-");
     const { manager, deps } = makeManager(home);
     deps.writeMirrorConfig({
+      ...defaultMirrorConfig(),
+      enabled: false,
+      auto_push: false,
+    });
+    // Real file too — select-repo's history-on-link (PR #484 fold) must
+    // see this as an EXPLICIT enabled:false (left_disabled), not as a
+    // never-configured vault it should enable.
+    writeMirrorConfigForVault("default", {
       ...defaultMirrorConfig(),
       enabled: false,
       auto_push: false,
@@ -1129,6 +1150,67 @@ describe("auth credential routes — github repos / create-repo", () => {
     expect(body.repos[1]!.installation_id).toBe(202);
   });
 
+  test("repos are sorted most-recently-updated first within each account group", async () => {
+    // The installation-repositories endpoint has no `sort` param (the old
+    // GET /user/repos?sort=updated source did) — the handler sorts each
+    // group itself so the repo the operator probably wants is near the top.
+    home = tmp("mirror-auth-repos-sorted-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "ghu_test1234567890",
+        scope: "",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    const repoItem = (name: string, updated_at: string) => ({
+      name,
+      full_name: `aaron/${name}`,
+      private: true,
+      html_url: `https://github.com/aaron/${name}`,
+      description: null,
+      updated_at,
+      clone_url: `https://github.com/aaron/${name}.git`,
+      owner: { login: "aaron" },
+    });
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: {
+          total_count: 1,
+          installations: [
+            {
+              id: 101,
+              app_slug: "parachute-computer",
+              account: { login: "aaron", type: "User" },
+              repository_selection: "all",
+            },
+          ],
+        },
+      },
+      {
+        match: (u) => u.includes("/user/installations/101/repositories"),
+        body: {
+          total_count: 3,
+          // Alphabetical wire order (GitHub's default) — NOT recency.
+          repositories: [
+            repoItem("alpha", "2026-01-01T00:00:00Z"),
+            repoItem("beta", "2026-06-09T00:00:00Z"),
+            repoItem("gamma", "2026-03-15T00:00:00Z"),
+          ],
+        },
+      },
+    ]);
+    const res = await handleAuthGithubRepos(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { repos: Array<{ name: string }> };
+    expect(body.repos.map((r) => r.name)).toEqual(["beta", "gamma", "alpha"]);
+  });
+
   test("repos returns the machine-readable not_installed state when authorized but not installed", async () => {
     home = tmp("mirror-auth-repos-notinstalled-");
     const { manager } = makeManager(home);
@@ -1327,11 +1409,14 @@ describe("auth credential routes — install state (GET /auth/github/installatio
     pat: null,
   });
 
-  test("401 github_not_connected when no github_oauth credential exists", async () => {
+  test("400 github_not_connected when no github_oauth credential exists", async () => {
+    // 400, not 401, matching the sibling repos handler — a 401 would trip
+    // the SPA's authedFetch token-refresh machinery (clearing a valid
+    // cached admin token) over a condition that isn't an auth failure.
     home = tmp("mirror-installstate-nocred-");
     const { manager } = makeManager(home);
     const res = await handleAuthGithubInstallations(manager);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(400);
     const body = (await res.json()) as { error_type: string; message: string };
     expect(body.error_type).toBe("github_not_connected");
     expect(body.message).toContain("device flow");
@@ -1644,6 +1729,91 @@ describe("history-on-link (vault#483)", () => {
       history_enabled: true | false | "left_disabled";
       auto_push_enabled: boolean;
     };
+    expect(body.history_enabled).toBe("left_disabled");
+    expect(body.auto_push_enabled).toBe(false);
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(false);
+    expect(cfg?.auto_push).toBe(false);
+  });
+
+  /** Seed a stored github_oauth credential — the select-repo precondition.
+   *  Models a credential saved BEFORE history-on-link existed: the operator
+   *  re-enters via "Choose repository…" without a fresh grant. */
+  function seedOauthCredential(): void {
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_selectrepo1234567890",
+        scope: "repo",
+        authorized_at: "2026-06-10T00:00:00.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+  }
+
+  test("select-repo on a never-configured vault enables history + carries history_enabled (PR #484 fold)", async () => {
+    // The #483 re-entry gap: a credential saved pre-history-on-link on a
+    // never-configured vault. The grant/PAT paths never ran for this
+    // config, so select-repo is the first linked action — it must wire
+    // history (before auto_push, which no-ops on a disabled mirror).
+    home = tmp("history-link-selectrepo-fresh-");
+    manager = makeSyncManager(home);
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+    seedOauthCredential();
+    expect(readMirrorConfigForVault("default")).toBeUndefined();
+
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "my-vault" }),
+      }),
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      history_enabled: true | false | "left_disabled";
+      auto_push_enabled: boolean;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.history_enabled).toBe(true);
+    // History first, so the full chain runs: enabled mirror → Cut 3 flips
+    // auto_push (the PAT handler's ordering, mirrored).
+    expect(body.auto_push_enabled).toBe(true);
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(true);
+    expect(cfg?.location).toBe("internal");
+    expect(cfg?.auto_push).toBe(true);
+    expect(manager.getStatus().enabled).toBe(true);
+    // No token leak.
+    expect(JSON.stringify(body)).not.toContain("gho_selectrepo1234567890");
+  }, 30_000);
+
+  test("select-repo respects an explicitly-disabled mirror (left_disabled; stays off)", async () => {
+    home = tmp("history-link-selectrepo-disabled-");
+    manager = makeSyncManager(home);
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: false,
+    });
+    seedOauthCredential();
+
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "my-vault" }),
+      }),
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      history_enabled: true | false | "left_disabled";
+      auto_push_enabled: boolean;
+    };
+    // The operator's explicit choice survives — the UI gets the one-click
+    // "Turn on history now?" offer instead of a silent flip.
     expect(body.history_enabled).toBe("left_disabled");
     expect(body.auto_push_enabled).toBe(false);
     const cfg = readMirrorConfigForVault("default");

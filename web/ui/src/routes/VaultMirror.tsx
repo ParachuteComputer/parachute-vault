@@ -1054,7 +1054,8 @@ function GitRemoteSection({
    * the section said "Connected ✓" and nothing else.
    *
    * Deliberately fetched only while a GitHub credential exists (the
-   * endpoint 401s otherwise) — `GET /auth` stays the offline status read.
+   * endpoint 400s github_not_connected otherwise) — `GET /auth` stays the
+   * offline status read.
    */
   const [install, setInstall] = useState<GithubInstallState | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
@@ -1717,11 +1718,18 @@ function GithubOAuthModal({
   const [now, setNow] = useState(Date.now());
   const pollAbortRef = useRef<boolean>(false);
 
-  // Tick clock so the countdown ticks down visibly.
+  // Tick clock so the polling-phase countdown ticks down visibly. Gated to
+  // the polling phase — `now` is only consumed by the countdown render. An
+  // unconditional ticker re-rendered the modal every second in EVERY phase,
+  // which (with the inline callback props RepoPicker's fetch effect depended
+  // on) made the open picker refetch the repo list each tick, burning the
+  // operator's GitHub rate limit (PR #484 review fold).
+  const isPolling = phase.kind === "polling";
   useEffect(() => {
+    if (!isPolling) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [isPolling]);
 
   // Abort flag for the poll loop — unmount-only. (Setting it in the
   // start effect's cleanup would fire on the starting→polling transition
@@ -1835,6 +1843,22 @@ function GithubOAuthModal({
     };
   }, [phase, vaultName]);
 
+  // Stable identities for RepoPicker's callback props — both sit in its
+  // fetch-effect dependency array, so inline arrows (recreated every render)
+  // would re-arm the effect and refetch the repo list on any modal
+  // re-render (PR #484 review fold). Functional setPhase keeps them
+  // dependency-free: onNotInstalled reads the CURRENT picker phase's user
+  // instead of closing over a stale one.
+  const handlePickerError = useCallback(
+    (message: string) => setPhase({ kind: "error", message }),
+    [],
+  );
+  const handlePickerNotInstalled = useCallback(() => {
+    setPhase((p) =>
+      p.kind === "picker" ? { kind: "probing", user: p.user } : p,
+    );
+  }, []);
+
   const copyCode = async (code: string) => {
     try {
       await navigator.clipboard.writeText(code);
@@ -1906,11 +1930,17 @@ function GithubOAuthModal({
             install={phase.install}
             onPicked={async (owner, name) => {
               const selectResult = await selectGithubRepo(vaultName, { owner, name });
+              // vault#483 — select-repo also runs history-on-link server-side
+              // (the "Choose repository…" re-entry can be the first linked
+              // action for a credential saved before history-on-link
+              // existed). Surface the outcome the same way the grant path
+              // does, before the modal closes.
+              onHistory(selectResult.history_enabled);
               const c = await getMirrorAuth(vaultName);
               onConnected(c, selectResult);
             }}
-            onError={(message) => setPhase({ kind: "error", message })}
-            onNotInstalled={() => setPhase({ kind: "probing", user: phase.user })}
+            onError={handlePickerError}
+            onNotInstalled={handlePickerNotInstalled}
           />
         ) : null}
 
