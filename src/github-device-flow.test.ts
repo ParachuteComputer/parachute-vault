@@ -15,7 +15,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createRepo,
   fetchUser,
-  GITHUB_CLIENT_ID_PLACEHOLDER,
+  GITHUB_CLIENT_ID_DEFAULT,
   getGithubClientId,
   isPlaceholderClientId,
   listRepos,
@@ -70,18 +70,25 @@ describe("client id helpers", () => {
     }
   });
 
-  test("getGithubClientId falls back to placeholder when env unset", () => {
+  test("getGithubClientId falls back to the shared-app default when env unset", () => {
     const prev = process.env.PARACHUTE_GITHUB_CLIENT_ID;
     delete process.env.PARACHUTE_GITHUB_CLIENT_ID;
     try {
-      expect(getGithubClientId()).toBe(GITHUB_CLIENT_ID_PLACEHOLDER);
+      expect(getGithubClientId()).toBe(GITHUB_CLIENT_ID_DEFAULT);
     } finally {
       if (prev !== undefined) process.env.PARACHUTE_GITHUB_CLIENT_ID = prev;
     }
   });
 
-  test("isPlaceholderClientId catches the literal + the substring", () => {
-    expect(isPlaceholderClientId(GITHUB_CLIENT_ID_PLACEHOLDER)).toBe(true);
+  test("the shipped default is the registered Parachute GitHub App id", () => {
+    // Pin the exact value — it's public by design, and a typo'd constant
+    // would otherwise still pass a shape check.
+    expect(GITHUB_CLIENT_ID_DEFAULT).toBe("Iv23livaRF4VcvPhu3uB");
+    expect(isPlaceholderClientId(GITHUB_CLIENT_ID_DEFAULT)).toBe(false);
+  });
+
+  test("isPlaceholderClientId catches placeholder-shaped env overrides", () => {
+    expect(isPlaceholderClientId("Iv1.PLACEHOLDER_REPLACE_ME_BEFORE_RELEASE")).toBe(true);
     expect(isPlaceholderClientId("PLACEHOLDER_X")).toBe(true);
     expect(isPlaceholderClientId("Iv1.realone")).toBe(false);
   });

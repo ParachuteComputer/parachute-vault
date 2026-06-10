@@ -617,10 +617,12 @@ describe("auth credential routes — device flow", () => {
     delete process.env.PARACHUTE_GITHUB_CLIENT_ID;
   });
 
-  test("device-code returns 503 with placeholder client_id (no env override)", async () => {
+  test("device-code returns 503 when the env override is placeholder-shaped", async () => {
     home = tmp("mirror-auth-placeholder-");
     makeManager(home);
-    delete process.env.PARACHUTE_GITHUB_CLIENT_ID;
+    // A real default ships in the build, so the placeholder guard is only
+    // reachable via a misconfigured PARACHUTE_GITHUB_CLIENT_ID override.
+    process.env.PARACHUTE_GITHUB_CLIENT_ID = "Iv1.PLACEHOLDER_REPLACE_ME_BEFORE_RELEASE";
     const res = await handleAuthGithubDeviceCode();
     expect(res.status).toBe(503);
     const body = (await res.json()) as { error_type: string };

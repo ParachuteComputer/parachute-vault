@@ -104,6 +104,26 @@ describe("serialize + parse round-trip", () => {
     expect(out).toEqual(creds);
   });
 
+  test("github_oauth with empty scope round-trips (GitHub App tokens)", () => {
+    // Tokens from the shared Parachute GitHub App carry scope: "" (GitHub
+    // Apps use fine-grained permissions, not scopes). The empty string must
+    // survive serialize → parse and still pass the section-validity guard.
+    const creds: MirrorCredentials = {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "ghu_abc123def456ghi789",
+        scope: "",
+        authorized_at: "2026-06-10T18:00:00.000Z",
+        user_login: "aaron",
+        user_id: 12345,
+      },
+      pat: null,
+    };
+    const out = parseCredentials(serializeCredentials(creds));
+    expect(out).toEqual(creds);
+    expect(out.github_oauth?.scope).toBe("");
+  });
+
   test("pat credentials round-trip", () => {
     const creds: MirrorCredentials = {
       active_method: "pat",
