@@ -87,6 +87,7 @@ import {
   handleAuthGet,
   handleAuthGithubCreateRepo,
   handleAuthGithubDeviceCode,
+  handleAuthGithubInstallations,
   handleAuthGithubPoll,
   handleAuthGithubRepos,
   handleAuthGithubSelectRepo,
@@ -733,6 +734,13 @@ export async function route(
     }
     if (subpath === "/.parachute/mirror/auth/github/poll") {
       if (req.method === "POST") return handleAuthGithubPoll(req, manager);
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/auth/github/installations") {
+      // Install state (vault#480) — which app, installed-anywhere?, install
+      // link, per-account installations. Explicitly-network (probes GitHub);
+      // the offline status read stays on GET /.parachute/mirror/auth.
+      if (req.method === "GET") return handleAuthGithubInstallations(manager);
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
     if (subpath === "/.parachute/mirror/auth/github/repos") {

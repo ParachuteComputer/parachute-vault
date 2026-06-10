@@ -41,7 +41,11 @@ import { SignInBanner } from "../lib/SignInBanner.tsx";
 import {
   HttpError,
   type DeviceCodeResponse,
+  type GitHubInstallationInfo,
   type GitHubRepoInfo,
+  type GitHubRepoWithInstallation,
+  type GithubInstallState,
+  type HistoryOnLink,
   type MirrorConfig,
   type MirrorCredentialSaveResult,
   type MirrorCredentialStatus,
@@ -52,6 +56,7 @@ import {
   type SelectGithubRepoResult,
   createGithubRepo,
   deleteMirrorAuth,
+  getGithubInstallations,
   getMirror,
   getMirrorAuth,
   listGithubRepos,
@@ -305,6 +310,7 @@ function MirrorScreen({
             // the SPA's view of state. Same trigger as putMirror.
             onRefresh();
           }}
+          onConfigChanged={onRefresh}
           locationIsExternal={snapshot.config.location === "external"}
         />
       ) : null}
@@ -978,10 +984,13 @@ function ConfigForm({
  * The OAuth modal works like this: operator clicks "Connect GitHub",
  * vault calls GitHub's device-code endpoint, the modal displays the
  * user_code + verification_uri, operator types the code at
- * github.com/login/device, the modal polls until granted, then surfaces a
- * repo picker (or a "Create new private repo" form). Picking a repo
- * writes the embedded-credential URL onto the mirror's `origin`, closes
- * the flow.
+ * github.com/login/device, the modal polls until granted — then (vault#480)
+ * probes `GET /user/installations`: GitHub-App authorization and
+ * installation are SEPARATE steps, so a freshly-granted token reaches no
+ * repos until the app is also installed. Not installed → the guided-install
+ * state (install link + re-check). Installed → a repo picker grouped by
+ * account (user + orgs). Picking a repo writes the embedded-credential URL
+ * onto the mirror's `origin`, closes the flow.
  *
  * The PAT modal is the fallback: two fields (token + remote URL) + a
  * "Validate & save" button. The server runs `git ls-remote` against the
@@ -993,6 +1002,7 @@ function GitRemoteSection({
   credsError,
   onCredsChanged,
   onCredsSaved,
+  onConfigChanged,
   locationIsExternal,
 }: {
   vaultName: string;
@@ -1006,9 +1016,15 @@ function GitRemoteSection({
    * auto_push + last_push_at land in the SPA's view of state.
    */
   onCredsSaved: (result: MirrorCredentialSaveResult | SelectGithubRepoResult) => void;
+  /**
+   * vault#483 — fires after the one-click "Turn on history now" enable so
+   * the parent refreshes the snapshot (the status banner flips to "on").
+   */
+  onConfigChanged: () => void;
   locationIsExternal: boolean;
 }) {
   const [oauthOpen, setOauthOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [patOpen, setPatOpen] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1021,6 +1037,55 @@ function GitRemoteSection({
   const [saveResult, setSaveResult] = useState<
     MirrorCredentialSaveResult | SelectGithubRepoResult | null
   >(null);
+  /**
+   * vault#483 — history-on-link outcome from the most recent credential
+   * save (device-flow grant or PAT). Drives the post-link history banner:
+   * "History is on ✓" / one-click enable offer / pointer at the status.
+   */
+  const [historyNote, setHistoryNote] = useState<HistoryOnLink | null>(null);
+  const [enablingHistory, setEnablingHistory] = useState(false);
+
+  /**
+   * vault#480 — GitHub App install state. Probed when a github_oauth
+   * credential is active (authorization and installation are SEPARATE
+   * GitHub-App steps — a granted token reaches no private repos until the
+   * app is also installed). This is the page-level probe that surfaces
+   * the "authorized but not installed" state Aaron hit blind: previously
+   * the section said "Connected ✓" and nothing else.
+   *
+   * Deliberately fetched only while a GitHub credential exists (the
+   * endpoint 400s github_not_connected otherwise) — `GET /auth` stays the
+   * offline status read.
+   */
+  const [install, setInstall] = useState<GithubInstallState | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [installTick, setInstallTick] = useState(0);
+
+  const githubConnected = creds?.active_method === "github_oauth" && !!creds.github_oauth;
+
+  useEffect(() => {
+    if (!githubConnected) {
+      setInstall(null);
+      setInstallError(null);
+      return;
+    }
+    let cancelled = false;
+    getGithubInstallations(vaultName)
+      .then((state) => {
+        if (cancelled) return;
+        setInstall(state);
+        setInstallError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setInstallError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultName, githubConnected, installTick]);
+
+  const recheckInstall = () => setInstallTick((n) => n + 1);
 
   const connected = creds?.active_method !== null && creds?.active_method !== undefined;
 
@@ -1033,11 +1098,48 @@ function GitRemoteSection({
     try {
       const c = await deleteMirrorAuth(vaultName);
       onCredsChanged(c);
+      setHistoryNote(null);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setDisconnecting(false);
     }
+  };
+
+  /**
+   * One-click enable for the `"left_disabled"` history outcome — the vault
+   * has an explicit `enabled: false` config the backend (rightly) refused
+   * to flip on link. Clicking is the operator's consent; PUT with
+   * enabled:true is the documented one-click path (vault#483).
+   */
+  const onEnableHistory = async () => {
+    setEnablingHistory(true);
+    setActionError(null);
+    try {
+      await putMirror(vaultName, { enabled: true });
+      setHistoryNote(true);
+      onConfigChanged();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setEnablingHistory(false);
+    }
+  };
+
+  /**
+   * The device-flow modal can close at ANY phase — including right after
+   * the grant, before a repo pick (exactly how Aaron ended up authorized-
+   * but-stuck). Re-read the (offline) credential status on close so a
+   * mid-flow grant immediately reflects on the page, where the install
+   * probe then takes over and renders the guided-install state.
+   */
+  const onOauthModalClosed = () => {
+    setOauthOpen(false);
+    getMirrorAuth(vaultName)
+      .then((c) => onCredsChanged(c))
+      .catch(() => {
+        /* page-level credsError covers persistent failures */
+      });
   };
 
   return (
@@ -1131,9 +1233,107 @@ function GitRemoteSection({
         </p>
       )}
 
+      {/*
+        vault#480 — GitHub App install state. Authorization (the device
+        flow) and installation are SEPARATE steps; this block renders the
+        page-level truth for a github_oauth credential:
+          - not installed → the guided-install state (the one Aaron hit
+            blind: "Connected ✓" used to be the whole story).
+          - installed → which accounts carry installations + the repo
+            picker re-entry + the repeatable "install on another org".
+      */}
+      {githubConnected && installError ? (
+        <div className="warn-banner" role="alert" style={{ marginBottom: "0.75rem" }}>
+          Couldn't check the GitHub App install state:{" "}
+          <code>{installError}</code>{" "}
+          <button type="button" className="secondary" onClick={recheckInstall}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+      {githubConnected && !install && !installError ? (
+        <p className="dim">Checking GitHub App installation…</p>
+      ) : null}
+      {githubConnected && install && !install.installed ? (
+        <InstallNeededPanel install={install} onRecheck={recheckInstall} />
+      ) : null}
+      {githubConnected && install && install.installed ? (
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div className="kv" style={{ marginBottom: "0.75rem" }}>
+            <div>App installed on</div>
+            <div>
+              {install.installations.map((i) => (
+                <div key={i.id}>
+                  <code>{i.account_login}</code>{" "}
+                  <span className="dim">
+                    ({i.account_type === "Organization" ? "organization" : "user"} ·{" "}
+                    {i.repository_selection === "selected"
+                      ? "Selected repos only"
+                      : "All repos"}
+                    )
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="actions">
+            <button type="button" onClick={() => setPickerOpen(true)}>
+              Choose repository…
+            </button>
+            <a
+              href={install.install_url}
+              target="_blank"
+              rel="noreferrer"
+              className="dim"
+              style={{ alignSelf: "center" }}
+            >
+              Install on another account or org →
+            </a>
+          </div>
+        </div>
+      ) : null}
+
       {actionError ? (
         <div className="error-banner" role="alert">
           <code>{actionError}</code>
+        </div>
+      ) : null}
+
+      {/*
+        vault#483 — history-on-link outcome banner. Linking implies backup
+        intent, so the backend turns history on for a never-configured
+        vault and reports what happened; the one state it refuses to flip
+        silently (an explicit enabled:false) gets the one-click offer here
+        instead of a confusing trip into Advanced settings.
+      */}
+      {historyNote === true ? (
+        <div className="mint-banner" role="status" style={{ marginBottom: "0.75rem" }}>
+          <strong>History is on ✓</strong> — this vault keeps a local git
+          history of every change, ready to push once a repository is wired.{" "}
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => setHistoryNote(null)}
+            aria-label="Dismiss history note"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+      {historyNote === "left_disabled" ? (
+        <div className="info-banner" role="status" style={{ marginBottom: "0.75rem" }}>
+          <strong>Version history is still off for this vault</strong> (it was
+          switched off earlier, so we didn't flip it behind your back). Backups
+          push the vault's history — turn it on to start recording changes.{" "}
+          <button type="button" onClick={onEnableHistory} disabled={enablingHistory}>
+            {enablingHistory ? "Turning on…" : "Turn on history now"}
+          </button>
+        </div>
+      ) : null}
+      {historyNote === false ? (
+        <div className="warn-banner" role="alert" style={{ marginBottom: "0.75rem" }}>
+          We tried to turn on version history for this vault but it didn't
+          start — see <strong>Advanced settings → Status</strong> for the error.
         </div>
       ) : null}
 
@@ -1249,10 +1449,15 @@ function GitRemoteSection({
         )}
       </div>
 
+      {/* BYO-app disclosure — first-class sovereignty surface (vault#480). */}
+      <ByoAppSection install={install} />
+
       {oauthOpen ? (
         <GithubOAuthModal
           vaultName={vaultName}
-          onClose={() => setOauthOpen(false)}
+          mode="connect"
+          onClose={onOauthModalClosed}
+          onHistory={setHistoryNote}
           onConnected={(c, selectResult) => {
             onCredsChanged(c);
             if (selectResult) {
@@ -1264,6 +1469,30 @@ function GitRemoteSection({
         />
       ) : null}
 
+      {/*
+        Repo-picker re-entry for an already-linked GitHub credential —
+        same modal, skipping the device flow (the grant already exists).
+        Covers both "installed but never picked a repo" and "switch to a
+        different repo".
+      */}
+      {pickerOpen && githubConnected ? (
+        <GithubOAuthModal
+          vaultName={vaultName}
+          mode="choose-repo"
+          initialLogin={creds?.github_oauth?.user_login ?? ""}
+          onClose={() => setPickerOpen(false)}
+          onHistory={setHistoryNote}
+          onConnected={(c, selectResult) => {
+            onCredsChanged(c);
+            if (selectResult) {
+              setSaveResult(selectResult);
+              onCredsSaved(selectResult);
+            }
+            setPickerOpen(false);
+          }}
+        />
+      ) : null}
+
       {patOpen ? (
         <PATModal
           vaultName={vaultName}
@@ -1271,6 +1500,7 @@ function GitRemoteSection({
           onSaved={(result) => {
             onCredsChanged(result);
             setSaveResult(result);
+            setHistoryNote(result.history_enabled);
             onCredsSaved(result);
             setPatOpen(false);
           }}
@@ -1280,22 +1510,188 @@ function GitRemoteSection({
   );
 }
 
+/**
+ * The "authorized but not installed" state (vault#480) — the first thing
+ * most operators hit, because GitHub's authorize screen says nothing about
+ * repos. Authorization (the device-flow grant) and installation are
+ * separate, order-independent GitHub-App steps; until the app is installed
+ * the token reaches no repos at all (every GitHub App can read public
+ * repos, which is how the old picker quietly showed the WRONG list).
+ */
+function InstallNeededPanel({
+  install,
+  onRecheck,
+}: {
+  install: GithubInstallState;
+  onRecheck: () => void;
+}) {
+  return (
+    <div className="info-banner" role="status" style={{ marginBottom: "0.75rem" }}>
+      <p style={{ marginTop: 0 }}>
+        <strong>Authorized ✓ — one step left: install the app so it can reach
+        your repos.</strong>{" "}
+        Authorizing told GitHub who you are; installing picks which
+        repositories the app may touch. Until then it can't see any of your
+        private repos.
+      </p>
+      <div className="actions" style={{ marginBottom: "0.5rem" }}>
+        <a
+          href={install.install_url}
+          target="_blank"
+          rel="noreferrer"
+          style={{ fontWeight: 600 }}
+        >
+          Install on GitHub →
+        </a>
+        <button type="button" className="secondary" onClick={onRecheck}>
+          I've installed it — check again
+        </button>
+      </div>
+      <p className="dim" style={{ marginBottom: 0, fontSize: "0.9em" }}>
+        Keeping vaults in an organization? Install the app on that org too —
+        the same install link works for every account, as many times as you
+        need.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * BYO-app surface (vault#480) — which GitHub App this vault talks to, plus
+ * the full bring-your-own-app recipe behind a disclosure. Aaron's framing:
+ * "make it easy for people to take responsibility for their own data" —
+ * the shared app is the convenient default, not a dependency you're stuck
+ * with. First-class on the page, not buried in docs.
+ *
+ * The app identity comes from the install-state probe (the server knows
+ * which client_id/slug it's configured with); before any GitHub credential
+ * exists we describe the default instead of claiming a specific app.
+ */
+function ByoAppSection({ install }: { install: GithubInstallState | null }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: "1rem" }}>
+      <p className="dim" style={{ marginBottom: "0.5rem", fontSize: "0.9em" }}>
+        {install ? (
+          install.app.is_shared_default ? (
+            <>
+              Using the shared Parachute GitHub App (
+              <code>{install.app.slug}</code>).
+            </>
+          ) : (
+            <>
+              Using your own GitHub App (<code>{install.app.slug}</code>).
+            </>
+          )
+        ) : (
+          <>
+            "Connect GitHub" uses the shared Parachute GitHub App by default.
+          </>
+        )}{" "}
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => setOpen((s) => !s)}
+          aria-expanded={open}
+        >
+          {open ? "Hide" : "Use your own GitHub App"}
+        </button>
+      </p>
+      {open ? (
+        <div className="info-banner" role="note">
+          <p style={{ marginTop: 0 }}>
+            You don't have to trust the shared app: register your own GitHub
+            App and point this vault at it. Your tokens are then minted by an
+            app only you control — your own rate-limit budget, your own blast
+            radius. Taking responsibility for your own data is the point of
+            self-hosting; this makes it one form away.
+          </p>
+          <p style={{ marginBottom: "0.35rem" }}>
+            <strong>Register the app</strong> (GitHub → Settings → Developer
+            settings → GitHub Apps → New GitHub App):
+          </p>
+          <ul style={{ marginTop: 0 }}>
+            <li>
+              Repository permissions: <strong>Contents — Read and write</strong>.
+              Nothing else.
+            </li>
+            <li>
+              <strong>Enable Device Flow</strong> (checkbox under "Identifying
+              and authorizing users").
+            </li>
+            <li>
+              <strong>Uncheck "Expire user authorization tokens"</strong> — an
+              unattended backup daemon can't babysit 8-hour tokens.
+            </li>
+            <li>Webhook: inactive. Callback URL: anything (device flow ignores it).</li>
+            <li>
+              <strong>Don't generate a private key</strong> — Parachute never
+              uses one, and an app with no key can't mint installation tokens
+              behind your back. We recommend against creating one at all.
+            </li>
+          </ul>
+          <p style={{ marginBottom: "0.35rem" }}>
+            <strong>Point this vault at it</strong> — set both env vars as a
+            pair in the vault's <code>.env</code>, then restart the vault:
+          </p>
+          <pre style={{ margin: "0 0 0.5rem" }}>
+            <code>
+              {"PARACHUTE_GITHUB_CLIENT_ID=<your app's client ID>\nPARACHUTE_GITHUB_APP_SLUG=<your app's URL slug>"}
+            </code>
+          </pre>
+          <p className="dim" style={{ marginBottom: 0, fontSize: "0.9em" }}>
+            Both together — the client ID mints the tokens, the slug builds the
+            install link; mixing apps breaks the connect flow. Then disconnect
+            and reconnect GitHub here to mint tokens from your app.
+          </p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // GitHub OAuth modal — device flow start + poll loop + repo picker.
 // ---------------------------------------------------------------------------
 
+/**
+ * The connect flow's phases (vault#480 reshaped post-grant):
+ *
+ *   starting → polling → [granted] → probing → install-needed ⇄ probing
+ *                                            ↘ picker → (select-repo, done)
+ *
+ * `probing` runs the `GET /user/installations` check after a grant —
+ * authorization alone reaches no repos; the app must ALSO be installed.
+ * `install-needed` is the guided-install state with the install link and
+ * a re-check action. In `mode: "choose-repo"` (re-entry for an already-
+ * linked credential) the device-flow phases are skipped entirely and the
+ * modal opens at `probing`.
+ */
 type OAuthPhase =
   | { kind: "starting" }
   | { kind: "polling"; code: DeviceCodeResponse; pollIntervalMs: number; startedAt: number }
-  | { kind: "granted"; user: { login: string } }
+  | { kind: "probing"; user: { login: string } }
+  | { kind: "install-needed"; user: { login: string }; install: GithubInstallState }
+  | { kind: "picker"; user: { login: string }; install: GithubInstallState }
   | { kind: "error"; message: string };
 
 function GithubOAuthModal({
   vaultName,
+  mode,
+  initialLogin,
   onClose,
   onConnected,
+  onHistory,
 }: {
   vaultName: string;
+  /**
+   * "connect" — full device flow from the top. "choose-repo" — a GitHub
+   * credential already exists; skip straight to the install probe + repo
+   * picker (the re-entry path for "linked but never picked a repo").
+   */
+  mode: "connect" | "choose-repo";
+  /** The stored credential's login — seeds the picker in choose-repo mode. */
+  initialLogin?: string;
   onClose: () => void;
   /**
    * Cut 3/6: second arg carries the select-repo result so the parent
@@ -1307,21 +1703,49 @@ function GithubOAuthModal({
     creds: MirrorCredentialStatus,
     selectResult?: SelectGithubRepoResult,
   ) => void;
+  /**
+   * vault#483 — fires the moment the grant lands (NOT at repo-pick time:
+   * the operator may close the modal mid-flow and the history outcome
+   * already happened server-side). Parent renders the history banner.
+   */
+  onHistory: (history: HistoryOnLink) => void;
 }) {
-  const [phase, setPhase] = useState<OAuthPhase>({ kind: "starting" });
+  const [phase, setPhase] = useState<OAuthPhase>(
+    mode === "choose-repo"
+      ? { kind: "probing", user: { login: initialLogin ?? "" } }
+      : { kind: "starting" },
+  );
   const [now, setNow] = useState(Date.now());
   const pollAbortRef = useRef<boolean>(false);
 
-  // Tick clock so the countdown ticks down visibly.
+  // Tick clock so the polling-phase countdown ticks down visibly. Gated to
+  // the polling phase — `now` is only consumed by the countdown render. An
+  // unconditional ticker re-rendered the modal every second in EVERY phase,
+  // which (with the inline callback props RepoPicker's fetch effect depended
+  // on) made the open picker refetch the repo list each tick, burning the
+  // operator's GitHub rate limit (PR #484 review fold).
+  const isPolling = phase.kind === "polling";
   useEffect(() => {
+    if (!isPolling) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
+  }, [isPolling]);
+
+  // Abort flag for the poll loop — unmount-only. (Setting it in the
+  // start effect's cleanup would fire on the starting→polling transition
+  // itself and strangle the first poll tick.)
+  useEffect(() => {
+    return () => {
+      pollAbortRef.current = true;
+    };
   }, []);
 
-  // Start the device flow on mount.
+  // Start the device flow when entering the "starting" phase (mount in
+  // connect mode, or "Try again" after an error). choose-repo mode never
+  // enters this phase.
   useEffect(() => {
+    if (phase.kind !== "starting") return;
     let cancelled = false;
-    pollAbortRef.current = false;
     startGithubDeviceFlow(vaultName)
       .then((code) => {
         if (cancelled) return;
@@ -1341,13 +1765,13 @@ function GithubOAuthModal({
       });
     return () => {
       cancelled = true;
-      pollAbortRef.current = true;
     };
-  }, [vaultName]);
+  }, [phase.kind, vaultName]);
 
   // Poll loop — re-armed on every phase transition while phase=polling.
   useEffect(() => {
     if (phase.kind !== "polling") return;
+    pollAbortRef.current = false;
     const code = phase.code;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1358,7 +1782,11 @@ function GithubOAuthModal({
         const result = await pollGithubDeviceFlow(vaultName, code.polling_id);
         if (cancelled) return;
         if (result.state === "granted") {
-          setPhase({ kind: "granted", user: { login: result.user.login } });
+          // Surface the history-on-link outcome NOW — it already happened
+          // server-side, and the operator may close the modal before
+          // finishing the repo pick.
+          onHistory(result.history_enabled);
+          setPhase({ kind: "probing", user: { login: result.user.login } });
           return;
         }
         if (result.state === "denied") {
@@ -1386,7 +1814,50 @@ function GithubOAuthModal({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
+  }, [phase, vaultName, onHistory]);
+
+  // Install probe — runs whenever the modal enters the "probing" phase
+  // (post-grant, choose-repo mount, or an "I've installed it" re-check).
+  useEffect(() => {
+    if (phase.kind !== "probing") return;
+    const user = phase.user;
+    let cancelled = false;
+    getGithubInstallations(vaultName)
+      .then((install) => {
+        if (cancelled) return;
+        setPhase(
+          install.installed
+            ? { kind: "picker", user, install }
+            : { kind: "install-needed", user, install },
+        );
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPhase({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [phase, vaultName]);
+
+  // Stable identities for RepoPicker's callback props — both sit in its
+  // fetch-effect dependency array, so inline arrows (recreated every render)
+  // would re-arm the effect and refetch the repo list on any modal
+  // re-render (PR #484 review fold). Functional setPhase keeps them
+  // dependency-free: onNotInstalled reads the CURRENT picker phase's user
+  // instead of closing over a stale one.
+  const handlePickerError = useCallback(
+    (message: string) => setPhase({ kind: "error", message }),
+    [],
+  );
+  const handlePickerNotInstalled = useCallback(() => {
+    setPhase((p) =>
+      p.kind === "picker" ? { kind: "probing", user: p.user } : p,
+    );
+  }, []);
 
   const copyCode = async (code: string) => {
     try {
@@ -1400,7 +1871,9 @@ function GithubOAuthModal({
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <div className="modal">
         <div className="list-header">
-          <h3 style={{ margin: 0 }}>Connect GitHub</h3>
+          <h3 style={{ margin: 0 }}>
+            {mode === "choose-repo" ? "Choose a repository" : "Connect GitHub"}
+          </h3>
           <button type="button" className="secondary" onClick={onClose}>
             Close
           </button>
@@ -1439,16 +1912,35 @@ function GithubOAuthModal({
           </>
         ) : null}
 
-        {phase.kind === "granted" ? (
+        {phase.kind === "probing" ? (
+          <p className="muted">Checking where the app is installed…</p>
+        ) : null}
+
+        {phase.kind === "install-needed" ? (
+          <InstallNeededPanel
+            install={phase.install}
+            onRecheck={() => setPhase({ kind: "probing", user: phase.user })}
+          />
+        ) : null}
+
+        {phase.kind === "picker" ? (
           <RepoPicker
             vaultName={vaultName}
             user={phase.user}
+            install={phase.install}
             onPicked={async (owner, name) => {
               const selectResult = await selectGithubRepo(vaultName, { owner, name });
+              // vault#483 — select-repo also runs history-on-link server-side
+              // (the "Choose repository…" re-entry can be the first linked
+              // action for a credential saved before history-on-link
+              // existed). Surface the outcome the same way the grant path
+              // does, before the modal closes.
+              onHistory(selectResult.history_enabled);
               const c = await getMirrorAuth(vaultName);
               onConnected(c, selectResult);
             }}
-            onError={(message) => setPhase({ kind: "error", message })}
+            onError={handlePickerError}
+            onNotInstalled={handlePickerNotInstalled}
           />
         ) : null}
 
@@ -1458,7 +1950,16 @@ function GithubOAuthModal({
               <code>{phase.message}</code>
             </div>
             <div className="actions">
-              <button type="button" onClick={() => setPhase({ kind: "starting" })}>
+              <button
+                type="button"
+                onClick={() =>
+                  setPhase(
+                    mode === "choose-repo"
+                      ? { kind: "probing", user: { login: initialLogin ?? "" } }
+                      : { kind: "starting" },
+                  )
+                }
+              >
                 Try again
               </button>
               <button type="button" className="secondary" onClick={onClose}>
@@ -1484,32 +1985,65 @@ function formatCountdown(expiresIn: number, startedAt: number, now: number): str
 // Repo picker — surfaces after a granted device-flow token.
 // ---------------------------------------------------------------------------
 
+/**
+ * Builds the GitHub "configure this installation" URL — where the operator
+ * adds a repo to the app's repo selection. Per-account: user installations
+ * live under personal settings, org installations under the org's.
+ */
+function installationSettingsUrl(installation: GitHubInstallationInfo): string {
+  return installation.account_type === "Organization"
+    ? `https://github.com/organizations/${encodeURIComponent(installation.account_login)}/settings/installations/${installation.id}`
+    : `https://github.com/settings/installations/${installation.id}`;
+}
+
 function RepoPicker({
   vaultName,
   user,
+  install,
   onPicked,
   onError,
+  onNotInstalled,
 }: {
   vaultName: string;
   user: { login: string };
+  /** Install state from the probe — drives grouping + create guidance. */
+  install: GithubInstallState;
   onPicked: (owner: string, name: string) => Promise<void>;
   onError: (message: string) => void;
+  /**
+   * The repos call can come back `installed: false` even after a positive
+   * probe (the operator uninstalled in another tab). Bounce the flow back
+   * to the install-needed state instead of rendering an empty picker.
+   */
+  onNotInstalled: () => void;
 }) {
-  const [repos, setRepos] = useState<GitHubRepoInfo[] | null>(null);
+  const [repos, setRepos] = useState<GitHubRepoWithInstallation[] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [filter, setFilter] = useState("");
   const [picking, setPicking] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
+  /**
+   * Set when create-repo came back 403 `app_lacks_admin_permission` (BYO
+   * app without Administration:write). The shared app skips the POST
+   * entirely (we KNOW it's Contents-only) and renders the guide directly.
+   */
+  const [createForbidden, setCreateForbidden] = useState(false);
+  const [refreshTick, setRefreshTick] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    setRepos(null);
     listGithubRepos(vaultName)
-      .then(({ repos, truncated }) => {
+      .then((result) => {
         if (cancelled) return;
-        setRepos(repos);
-        setTruncated(Boolean(truncated));
+        if (!result.installed) {
+          onNotInstalled();
+          return;
+        }
+        setRepos(result.repos);
+        setTruncated(Boolean(result.truncated));
       })
       .catch((err) => {
         if (!cancelled) onError(err instanceof Error ? err.message : String(err));
@@ -1517,13 +2051,33 @@ function RepoPicker({
     return () => {
       cancelled = true;
     };
-  }, [vaultName, onError]);
+  }, [vaultName, onError, onNotInstalled, refreshTick]);
 
   const filtered = (repos ?? []).filter((r) =>
     filter.length === 0
       ? true
       : r.full_name.toLowerCase().includes(filter.toLowerCase()),
   );
+
+  /**
+   * Group by the installation account (user + each org) so org repos are
+   * visibly per-account rather than one undifferentiated soup — the old
+   * picker couldn't see org repos at all (vault#480). First-seen order;
+   * the backend unions per-installation so groups arrive contiguous.
+   */
+  const groups: Array<{ login: string; repos: GitHubRepoWithInstallation[] }> = [];
+  for (const repo of filtered) {
+    const last = groups[groups.length - 1];
+    if (last && last.login === repo.account_login) {
+      last.repos.push(repo);
+    } else {
+      const existing = groups.find((g) => g.login === repo.account_login);
+      if (existing) existing.repos.push(repo);
+      else groups.push({ login: repo.account_login, repos: [repo] });
+    }
+  }
+  const installationFor = (login: string): GitHubInstallationInfo | undefined =>
+    install.installations.find((i) => i.account_login === login);
 
   const pickRepo = async (owner: string, name: string) => {
     setPicking(`${owner}/${name}`);
@@ -1547,11 +2101,25 @@ function RepoPicker({
       });
       await onPicked(repo.owner, repo.name);
     } catch (err) {
-      onError(err instanceof Error ? err.message : String(err));
+      // The shared Contents-only app can't create repos (needs
+      // Administration:write) — and a BYO app might not grant it either.
+      // Map the machine-readable 403 to the guided-manual checklist
+      // instead of an error toast; everything else stays a hard error.
+      if (err instanceof HttpError && err.errorType === "app_lacks_admin_permission") {
+        setCreateForbidden(true);
+      } else {
+        onError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setCreating(false);
     }
   };
+
+  // The shared app is KNOWN Contents-only — don't render a button that's
+  // guaranteed to 403 ("no dead buttons"); go straight to the guide. BYO
+  // apps get the live create button (they may grant Administration:write),
+  // falling back to the same guide on the 403.
+  const createIsManual = install.app.is_shared_default || createForbidden;
 
   return (
     <>
@@ -1570,9 +2138,9 @@ function RepoPicker({
 
       {truncated ? (
         <p className="muted" style={{ fontSize: "0.85em" }}>
-          Showing the first 300 repos. Use the filter above to narrow down — or
-          paste the clone URL directly via Personal Access Token below if your
-          repo isn't here.
+          Showing the first 300 repos per account. Use the filter above to
+          narrow down — or paste the clone URL directly via Personal Access
+          Token if your repo isn't here.
         </p>
       ) : null}
 
@@ -1584,25 +2152,70 @@ function RepoPicker({
             <p className="dim">No repos match "{filter}".</p>
           ) : null}
           {filtered.length === 0 && filter.length === 0 && repos.length === 0 ? (
-            <p className="dim">You don't own any repos on this account yet.</p>
+            <p className="dim">
+              The app installation doesn't include any repos yet — pick some
+              via "Change repo access on GitHub" below, then refresh.
+            </p>
           ) : null}
-          {filtered.map((r) => (
-            <button
-              type="button"
-              key={r.full_name}
-              className="repo-row"
-              onClick={() => pickRepo(r.owner, r.name)}
-              disabled={picking !== null}
-            >
-              <span>
-                <strong>{r.name}</strong>
-                {r.private ? <span className="dim"> · private</span> : null}
-              </span>
-              <span className="dim">{r.updated_at.slice(0, 10)}</span>
-            </button>
-          ))}
+          {groups.map((group) => {
+            const installation = installationFor(group.login);
+            return (
+              <div key={group.login}>
+                <p className="dim" style={{ margin: "0.5rem 0 0.25rem" }}>
+                  <strong>{group.login}</strong>
+                  {installation ? (
+                    <>
+                      {" "}
+                      ·{" "}
+                      {installation.account_type === "Organization"
+                        ? "organization"
+                        : "user"}{" "}
+                      ·{" "}
+                      {installation.repository_selection === "selected"
+                        ? "Selected repos only"
+                        : "All repos"}
+                    </>
+                  ) : null}
+                </p>
+                {group.repos.map((r) => (
+                  <button
+                    type="button"
+                    key={r.full_name}
+                    className="repo-row"
+                    onClick={() => pickRepo(r.owner, r.name)}
+                    disabled={picking !== null}
+                  >
+                    <span>
+                      <strong>{r.name}</strong>
+                      {r.private ? <span className="dim"> · private</span> : null}
+                    </span>
+                    <span className="dim">{r.updated_at.slice(0, 10)}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })}
         </div>
       ) : null}
+
+      <div className="actions" style={{ marginTop: "0.75rem" }}>
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => setRefreshTick((n) => n + 1)}
+        >
+          Refresh list
+        </button>
+        <a
+          href={install.install_url}
+          target="_blank"
+          rel="noreferrer"
+          className="dim"
+          style={{ alignSelf: "center" }}
+        >
+          Install on another account or org →
+        </a>
+      </div>
 
       {!showCreate ? (
         <div className="actions" style={{ marginTop: "0.75rem" }}>
@@ -1624,26 +2237,115 @@ function RepoPicker({
             placeholder="my-vault-backup"
             onChange={(e) => setNewName(e.target.value)}
           />
-          <div className="actions">
-            <button
-              type="button"
-              onClick={createAndPick}
-              disabled={creating || newName.trim().length === 0}
-            >
-              {creating ? "Creating…" : "Create"}
-            </button>
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => setShowCreate(false)}
-              disabled={creating}
-            >
-              Cancel
-            </button>
-          </div>
+          {createIsManual ? (
+            <CreateRepoGuide
+              install={install}
+              suggestedName={newName.trim()}
+              onRefresh={() => setRefreshTick((n) => n + 1)}
+            />
+          ) : (
+            <div className="actions">
+              <button
+                type="button"
+                onClick={createAndPick}
+                disabled={creating || newName.trim().length === 0}
+              >
+                {creating ? "Creating…" : "Create"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setShowCreate(false)}
+                disabled={creating}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Guided-manual repo creation (vault#480). The shared Parachute app is
+ * frozen at Contents-only — `POST /user/repos` needs Administration:write,
+ * so in-app creation 403s by design (least-privilege won: a backup mirror
+ * shouldn't hold repo-deletion powers). The guide walks the three manual
+ * steps with deep links instead of leaving the operator at a dead button.
+ */
+function CreateRepoGuide({
+  install,
+  suggestedName,
+  onRefresh,
+}: {
+  install: GithubInstallState;
+  suggestedName: string;
+  onRefresh: () => void;
+}) {
+  const newRepoUrl =
+    suggestedName.length > 0
+      ? `https://github.com/new?name=${encodeURIComponent(suggestedName)}`
+      : "https://github.com/new";
+  return (
+    <div className="info-banner" role="note" style={{ marginTop: "0.5rem" }}>
+      <p style={{ marginTop: 0 }}>
+        {install.app.is_shared_default ? (
+          <>
+            The Parachute app deliberately can't create repos for you (it only
+            holds the <em>Contents</em> permission — creating repos would need
+            admin powers a backup doesn't deserve). Three quick steps instead:
+          </>
+        ) : (
+          <>
+            Your GitHub App doesn't have the <em>Administration</em> permission
+            needed to create repos. Three quick steps instead:
+          </>
+        )}
+      </p>
+      <ol style={{ marginTop: 0, marginBottom: "0.5rem" }}>
+        <li>
+          <a href={newRepoUrl} target="_blank" rel="noreferrer">
+            Create a new repo on GitHub →
+          </a>{" "}
+          <span className="dim">
+            (private; leave it empty — no README or .gitignore)
+          </span>
+        </li>
+        <li>
+          Add it to the app's repo access:{" "}
+          {install.installations.length > 0 ? (
+            install.installations.map((i, idx) => (
+              <span key={i.id}>
+                {idx > 0 ? " · " : null}
+                <a
+                  href={installationSettingsUrl(i)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  configure on {i.account_login} →
+                </a>
+              </span>
+            ))
+          ) : (
+            <a href={install.install_url} target="_blank" rel="noreferrer">
+              install the app →
+            </a>
+          )}{" "}
+          <span className="dim">
+            (skip if the installation already grants "All repos")
+          </span>
+        </li>
+        <li>
+          Come back and{" "}
+          <button type="button" className="secondary" onClick={onRefresh}>
+            Refresh list
+          </button>{" "}
+          — then pick it.
+        </li>
+      </ol>
+    </div>
   );
 }
 
@@ -2220,16 +2922,25 @@ function ImportRepoPickerModal({
 }) {
   const [repos, setRepos] = useState<GitHubRepoInfo[] | null>(null);
   const [truncated, setTruncated] = useState(false);
+  /** vault#480 — authorized-but-not-installed; carries the install link. */
+  const [notInstalledUrl, setNotInstalledUrl] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     listGithubRepos(vaultName)
-      .then(({ repos, truncated }) => {
+      .then((result) => {
         if (cancelled) return;
-        setRepos(repos);
-        setTruncated(Boolean(truncated));
+        if (!result.installed) {
+          // Authorized but the app isn't installed anywhere — repos can't
+          // be listed. Surface the install link instead of an empty list.
+          setNotInstalledUrl(result.install_url);
+          setRepos([]);
+          return;
+        }
+        setRepos(result.repos);
+        setTruncated(Boolean(result.truncated));
       })
       .catch((err) => {
         if (cancelled) return;
@@ -2260,6 +2971,16 @@ function ImportRepoPickerModal({
             <code>{error}</code>
           </div>
         ) : null}
+        {notInstalledUrl ? (
+          <div className="info-banner" role="status">
+            The Parachute GitHub App isn't installed on any of your accounts
+            yet, so there are no repos to list.{" "}
+            <a href={notInstalledUrl} target="_blank" rel="noreferrer">
+              Install it on GitHub →
+            </a>{" "}
+            then reopen this picker.
+          </div>
+        ) : null}
         <div className="form-row">
           <input
             type="search"
@@ -2270,7 +2991,8 @@ function ImportRepoPickerModal({
         </div>
         {truncated ? (
           <p className="muted" style={{ fontSize: "0.85em" }}>
-            Showing the first 300 repos. Use the filter above to narrow down.
+            Showing the first 300 repos per account. Use the filter above to
+            narrow down.
           </p>
         ) : null}
         {repos === null && !error ? <p className="muted">Loading repos…</p> : null}
@@ -2279,8 +3001,8 @@ function ImportRepoPickerModal({
             {filtered.length === 0 && filter.length > 0 ? (
               <p className="dim">No repos match "{filter}".</p>
             ) : null}
-            {filtered.length === 0 && filter.length === 0 && repos.length === 0 ? (
-              <p className="dim">You don't own any repos on this account.</p>
+            {filtered.length === 0 && filter.length === 0 && repos.length === 0 && !notInstalledUrl ? (
+              <p className="dim">The app installation doesn't include any repos.</p>
             ) : null}
             {filtered.map((r) => (
               <button

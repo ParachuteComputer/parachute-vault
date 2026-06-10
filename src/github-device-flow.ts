@@ -30,6 +30,19 @@
  *     order-independent steps. A granted token reaches no repos until the
  *     operator also installs the app on their account and selects repos
  *     (github.com/apps/<app-slug>/installations/new).
+ *   - Every GitHub App can read ALL public repos — never infer "installed"
+ *     from repo visibility. `GET /user/installations` (which requires NO
+ *     permissions) is the canonical install probe: an empty array means
+ *     "authorized but not installed yet."
+ *
+ * **Bring-your-own-app (BYO)**: operators who want their own GitHub App
+ * (own rate-limit budget, full sovereignty) must override BOTH env vars as
+ * a pair — `PARACHUTE_GITHUB_CLIENT_ID` (their app's client_id, used for
+ * the device flow) AND `PARACHUTE_GITHUB_APP_SLUG` (their app's URL slug,
+ * used to build the install link). Overriding only one mixes two apps:
+ * tokens would be minted for one app while the install link points at the
+ * other, and `GET /user/installations` (which lists installations of the
+ * TOKEN's app) would never agree with the link.
  */
 
 // ---------------------------------------------------------------------------
@@ -62,6 +75,36 @@ export function getGithubClientId(): string {
  */
 export function isPlaceholderClientId(clientId: string): boolean {
   return clientId.includes("PLACEHOLDER");
+}
+
+// ---------------------------------------------------------------------------
+// App slug — the shared Parachute GitHub App's URL slug. Drives the install
+// link (github.com/apps/<slug>/installations/new), which the connect flow
+// surfaces when the operator is authorized-but-not-installed. BYO-app
+// operators override PARACHUTE_GITHUB_APP_SLUG *together with*
+// PARACHUTE_GITHUB_CLIENT_ID (see the header comment — the pair must come
+// from the same app).
+// ---------------------------------------------------------------------------
+
+export const GITHUB_APP_SLUG_DEFAULT = "parachute-computer" as const;
+
+/**
+ * The active app slug at runtime. Resolved from the env (the BYO-app path,
+ * paired with PARACHUTE_GITHUB_CLIENT_ID) or the shared-app default above.
+ */
+export function getGithubAppSlug(): string {
+  return process.env.PARACHUTE_GITHUB_APP_SLUG || GITHUB_APP_SLUG_DEFAULT;
+}
+
+/**
+ * The "install this app / pick repos" URL for an app slug. Installation is
+ * the second, separate step of the connect flow (authorization being the
+ * first); the same URL also serves "add another account/org" and "change
+ * repo selection" — GitHub routes already-installed accounts to the
+ * configure screen.
+ */
+export function installUrlForSlug(slug: string): string {
+  return `https://github.com/apps/${encodeURIComponent(slug)}/installations/new`;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +160,45 @@ export interface ListReposResult {
    *  we stopped paginating. Signals the UI to recommend the manual-URL
    *  paste or a search filter. */
   truncated: boolean;
+}
+
+/**
+ * One installation of the app, as returned by `GET /user/installations`.
+ * That endpoint lists installations OF THE TOKEN'S APP that the token's
+ * user can access — user-account installs and org installs alike — and
+ * requires NO permissions, so it works with the Contents-only shared app.
+ * An empty list means "authorized but not installed yet" (the device-flow
+ * grant alone reaches no repos).
+ */
+export interface GitHubInstallation {
+  id: number;
+  /** The app's URL slug (e.g. "parachute-computer"). Always this app's —
+   *  the endpoint is app-scoped by the token — but carried for display +
+   *  defensive checks. */
+  app_slug: string;
+  account: {
+    login: string;
+    /** "User" or "Organization". */
+    type: string;
+  };
+  /** "all" or "selected" — whether the installation covers every repo on
+   *  the account or an operator-picked subset. */
+  repository_selection: string;
+}
+
+/**
+ * Error thrown by the GitHub API helpers when GitHub returns a non-2xx
+ * response. Carries the HTTP status so route handlers can branch on
+ * specific failure classes (e.g. createRepo's 403 = the app lacks
+ * Administration:write) without string-matching the message.
+ */
+export class GitHubApiError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "GitHubApiError";
+    this.status = status;
+  }
 }
 
 /** Minimal fetch-like surface — injectable for tests. */
@@ -292,6 +374,15 @@ export async function fetchUser(
  * Truncates after `maxPages * perPage` repos (default 3 * 100 = 300) — most
  * operators have far fewer, the truncation signals the UI to prompt for a
  * search filter.
+ *
+ * **No longer the repo-picker source** (vault#480): `type=owner` excludes
+ * org-owned repos by construction, and with a GitHub-App token an
+ * uninstalled app still sees all PUBLIC repos — so this list silently
+ * misleads ("looks connected, shows the wrong repos"). The picker now goes
+ * `listInstallations` → `listInstallationRepos`, which enumerates exactly
+ * what the operator granted. No production callers remain — kept exported
+ * for its test coverage and as a building block for potential external /
+ * non-App callers.
  */
 export async function listRepos(
   token: string,
@@ -354,11 +445,171 @@ export async function listRepos(
   return { repos, truncated };
 }
 
+// ---------------------------------------------------------------------------
+// Installation APIs — the honest sources for the connect flow (vault#480).
+// ---------------------------------------------------------------------------
+
+/**
+ * List the token-user's installations of this app — `GET /user/installations`.
+ *
+ * Requires NO permissions (works with the Contents-only shared app), and is
+ * the canonical "is the app installed?" probe: an empty array means the
+ * operator authorized via device flow but hasn't installed the app on any
+ * account yet, so the token reaches no repos. Items cover both user-account
+ * and org installs, which is how org-owned mirror repos become reachable.
+ *
+ * Single page at per_page=100 — more than 100 installations of one app for
+ * one user is beyond any plausible operator; truncating there is acceptable.
+ *
+ * Throws `GitHubApiError` on a non-2xx response, plain Error on a bad shape.
+ */
+export async function listInstallations(
+  token: string,
+  fetchImpl: FetchLike = defaultFetch(),
+): Promise<GitHubInstallation[]> {
+  const res = await fetchImpl("https://api.github.com/user/installations?per_page=100", {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `token ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new GitHubApiError(
+      `GitHub /user/installations fetch failed (${res.status}): ${body.slice(0, 200)}`,
+      res.status,
+    );
+  }
+  const parsed = (await res.json()) as { installations?: unknown };
+  if (!parsed || !Array.isArray(parsed.installations)) {
+    throw new Error(
+      `GitHub /user/installations response missing installations array: ${JSON.stringify(parsed).slice(0, 200)}`,
+    );
+  }
+  const installations: GitHubInstallation[] = [];
+  for (const item of parsed.installations as Array<Record<string, unknown>>) {
+    const account = item.account as Record<string, unknown> | null | undefined;
+    if (
+      typeof item.id !== "number" ||
+      !account ||
+      typeof account.login !== "string" ||
+      typeof account.type !== "string"
+    ) {
+      throw new Error(
+        `GitHub /user/installations item missing required fields: ${JSON.stringify(item).slice(0, 200)}`,
+      );
+    }
+    installations.push({
+      id: item.id,
+      app_slug: typeof item.app_slug === "string" ? item.app_slug : "",
+      account: { login: account.login, type: account.type },
+      repository_selection:
+        typeof item.repository_selection === "string" ? item.repository_selection : "selected",
+    });
+  }
+  return installations;
+}
+
+/**
+ * Paginated list of the repos one installation grants access to —
+ * `GET /user/installations/{id}/repositories`. Metadata-read suffices (our
+ * Contents permission implies it); private repos within the installation
+ * are included, which is exactly the set the repo picker should show.
+ * Pagination + truncation semantics match `listRepos` (per_page=100,
+ * `maxPages` cap, `truncated` flag for the UI).
+ *
+ * Throws `GitHubApiError` on a non-2xx response, plain Error on a bad shape.
+ */
+export async function listInstallationRepos(
+  token: string,
+  installationId: number,
+  opts: { maxPages?: number; perPage?: number } = {},
+  fetchImpl: FetchLike = defaultFetch(),
+): Promise<ListReposResult> {
+  const perPage = opts.perPage ?? 100;
+  const maxPages = opts.maxPages ?? 3;
+  const repos: GitHubRepoInfo[] = [];
+  let truncated = false;
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await fetchImpl(
+      `https://api.github.com/user/installations/${installationId}/repositories?per_page=${perPage}&page=${page}`,
+      {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `token ${token}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
+    );
+    if (!res.ok) {
+      const body = await res.text();
+      throw new GitHubApiError(
+        `GitHub /user/installations/${installationId}/repositories fetch failed (${res.status}, page ${page}): ${body.slice(0, 200)}`,
+        res.status,
+      );
+    }
+    const parsed = (await res.json()) as { repositories?: unknown };
+    if (!parsed || !Array.isArray(parsed.repositories)) {
+      throw new Error(
+        `GitHub /user/installations/${installationId}/repositories response missing repositories array: ${JSON.stringify(parsed).slice(0, 200)}`,
+      );
+    }
+    const items = parsed.repositories as Array<{
+      name: string;
+      full_name: string;
+      private: boolean;
+      html_url: string;
+      description: string | null;
+      updated_at: string;
+      clone_url: string;
+      owner: { login: string };
+    }>;
+    for (const item of items) {
+      if (
+        typeof item.name !== "string" ||
+        typeof item.full_name !== "string" ||
+        !item.owner ||
+        typeof item.owner.login !== "string"
+      ) {
+        throw new Error(
+          `GitHub /user/installations/${installationId}/repositories item missing required fields: ${JSON.stringify(item).slice(0, 200)}`,
+        );
+      }
+      repos.push({
+        owner: item.owner.login,
+        name: item.name,
+        full_name: item.full_name,
+        private: item.private,
+        html_url: item.html_url,
+        description: item.description,
+        updated_at: item.updated_at,
+        clone_url: item.clone_url,
+      });
+    }
+    // No more pages.
+    if (items.length < perPage) {
+      return { repos, truncated: false };
+    }
+    if (page === maxPages) {
+      truncated = true;
+    }
+  }
+  return { repos, truncated };
+}
+
 /**
  * Create a new repo on the authenticated user's account. Defaults to private
  * because the operator's vault is more likely sensitive than public. The
  * repo gets initialized empty (no README) so the first `git push` from the
  * mirror lands the operator's vault as commit 1.
+ *
+ * **403 with the shared app is EXPECTED** (vault#480): `POST /user/repos`
+ * requires the Administration repository permission (write); the shared
+ * Parachute app is frozen at Contents-only, so this call only succeeds for
+ * BYO-app operators whose app grants Administration:write. Throws
+ * `GitHubApiError` carrying the status so the route can map the 403 to the
+ * guided-manual-creation error rather than a generic failure.
  */
 export async function createRepo(
   token: string,
@@ -388,8 +639,9 @@ export async function createRepo(
     } catch {
       // not JSON
     }
-    throw new Error(
+    throw new GitHubApiError(
       `GitHub /user/repos create failed (${res.status}): ${parsed.message ?? body.slice(0, 200)}`,
+      res.status,
     );
   }
   const item = (await res.json()) as {

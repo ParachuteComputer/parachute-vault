@@ -24,8 +24,11 @@
  * hand + restarting the vault.
  */
 
+import { existsSync } from "node:fs";
+
 import {
   defaultMirrorConfig,
+  mirrorConfigPath,
   readMirrorConfigForVault,
   validateExternalPath,
   validateMirrorConfigShape,
@@ -46,11 +49,17 @@ import {
   type MirrorCredentials,
 } from "./mirror-credentials.ts";
 import {
+  GITHUB_APP_SLUG_DEFAULT,
+  GITHUB_CLIENT_ID_DEFAULT,
+  GitHubApiError,
   createRepo,
   fetchUser,
+  getGithubAppSlug,
   getGithubClientId,
+  installUrlForSlug,
   isPlaceholderClientId,
-  listRepos,
+  listInstallationRepos,
+  listInstallations,
   pollForToken,
   requestDeviceCode,
   type FetchLike,
@@ -298,9 +307,10 @@ export function buildMirrorGetResponse(
 }
 
 // ---------------------------------------------------------------------------
-// Credential routes — Cut 3 of the UI-configurable push credentials work.
+// Credential routes — Cut 3 of the UI-configurable push credentials work,
+// reshaped by the GitHub-App installation semantics (vault#480).
 //
-// Six surfaces, all `vault:<name>:admin`-gated upstream:
+// Surfaces, all `vault:<name>:admin`-gated upstream:
 //
 //   POST   /.parachute/mirror/auth/github/device-code  — start GitHub Device
 //          Flow; returns { polling_id, user_code, verification_uri, expires_in,
@@ -308,19 +318,29 @@ export function buildMirrorGetResponse(
 //          by polling_id (a short opaque token) so the device_code doesn't
 //          land on the wire twice.
 //   POST   /.parachute/mirror/auth/github/poll         — poll for token, body
-//          { polling_id }. On `granted`: fetch user, save credentials, set
-//          remote URL, return { state: "granted", user }. Other states
-//          surface verbatim.
+//          { polling_id }. On `granted`: fetch user, save credentials, enable
+//          history for a never-configured vault (vault#483), return
+//          { state: "granted", user, history_enabled }. Other states surface
+//          verbatim.
 //   POST   /.parachute/mirror/auth/pat                 — validate + store a
 //          PAT (token + remote_url + label). Validates via `git ls-remote`.
+//          Same history-on-link behavior as the poll grant (vault#483).
 //   GET    /.parachute/mirror/auth                     — current connection
-//          status (NO secrets). Returns the sanitized public shape.
+//          status (NO secrets, NO network). Returns the sanitized public shape.
 //   DELETE /.parachute/mirror/auth                     — wipe credentials,
 //          unset embedded-credential remote URL.
-//   GET    /.parachute/mirror/auth/github/repos        — list operator's
-//          GitHub repos via stored OAuth token.
+//   GET    /.parachute/mirror/auth/github/installations — install state
+//          (vault#480): which app, whether it's installed anywhere, the
+//          install link, and the per-account installations. The one
+//          explicitly-network status endpoint — `GET /auth` stays offline.
+//   GET    /.parachute/mirror/auth/github/repos        — list the repos the
+//          operator's app INSTALLATIONS grant (user + org accounts), via the
+//          stored OAuth token. Returns { installed: false, install_url,
+//          repos: [] } when the app isn't installed anywhere yet.
 //   POST   /.parachute/mirror/auth/github/create-repo  — create a new private
-//          repo on behalf of the operator.
+//          repo on behalf of the operator. 403s with the shared Contents-only
+//          app (mapped to error_type "app_lacks_admin_permission" + the
+//          guided-manual path); works for BYO apps with Administration:write.
 //
 // ---------------------------------------------------------------------------
 
@@ -517,12 +537,12 @@ export async function handleAuthGithubPoll(
     }
     // Clean up the polling session.
     deviceFlowSessions.delete(body.polling_id);
-    // Apply to git remote if mirror is currently running on an external
-    // path that's a git repo. The credentials become active on next push;
-    // the operator doesn't have to restart vault. We don't have an owner/
-    // repo yet (the operator hasn't picked a repo) — that wiring happens
-    // in the create-repo or repo-picked path. So at this point we just
-    // store credentials; the URL gets set when the operator picks a repo.
+    // vault#483: linking implies backup intent — enable history for a
+    // never-configured vault (consent-respecting; see the helper). No
+    // remote URL is set here — we don't have an owner/repo yet (the
+    // operator hasn't picked a repo); that wiring happens in select-repo,
+    // which is also where auto_push flips on (Cut 3).
+    const history_enabled = await maybeEnableHistoryOnLink(manager);
     return Response.json(
       {
         state: "granted",
@@ -532,6 +552,7 @@ export async function handleAuthGithubPoll(
           name: user.name,
           avatar_url: user.avatar_url,
         },
+        history_enabled,
       },
       { headers: { "Access-Control-Allow-Origin": "*" } },
     );
@@ -565,6 +586,14 @@ export async function handleAuthGithubPoll(
 export async function handleAuthPat(
   req: Request,
   manager: MirrorManager,
+  // Test seam for the `git ls-remote` validation probe (default
+  // `probeGitLsRemote`, which spawns real git against the supplied remote).
+  // Inject a fn returning `{ok: true}` to exercise the post-validation save
+  // path (credential persist + history-on-link, vault#483) hermetically.
+  probeOverride?: (
+    url: string,
+    timeoutMs: number,
+  ) => Promise<{ ok: boolean; error?: string }>,
 ): Promise<Response> {
   let body: { token?: unknown; remote_url?: unknown; label?: unknown };
   try {
@@ -659,7 +688,7 @@ export async function handleAuthPat(
           u.password = token;
           return u.toString();
         })();
-  const probeResult = await probeGitLsRemote(authedUrl, 10_000);
+  const probeResult = await (probeOverride ?? probeGitLsRemote)(authedUrl, 10_000);
   if (!probeResult.ok) {
     return Response.json(
       {
@@ -696,6 +725,15 @@ export async function handleAuthPat(
     );
   }
 
+  // vault#483: linking implies backup intent — enable history for a
+  // never-configured vault BEFORE the Cut-3/Cut-6 steps below, so a fresh
+  // vault gets the whole intended flow in one save: history on (the reload's
+  // start() applies the just-written PAT remote to `origin`), then Cut 3
+  // sees an enabled mirror and flips auto_push on, then Cut 6 fires the
+  // initial push. An explicitly-disabled mirror short-circuits all of it
+  // (history stays off → maybeEnableAutoPush no-ops on disabled).
+  const history_enabled = await maybeEnableHistoryOnLink(manager);
+
   // Push the new URL onto the mirror's git remote if it's currently
   // resolved + on disk. Non-fatal if the mirror isn't running.
   await applyCredentialsToMirror(manager);
@@ -715,6 +753,7 @@ export async function handleAuthPat(
   return Response.json(
     {
       ...sanitizeCredentials(next),
+      history_enabled,
       auto_push_was_already_enabled: autoPushChange.was_already_enabled,
       auto_push_enabled: autoPushChange.auto_push_now_enabled,
       initial_push: initialPush,
@@ -813,8 +852,102 @@ export async function handleAuthDelete(manager: MirrorManager): Promise<Response
 }
 
 /**
- * `GET /.parachute/mirror/auth/github/repos` — list operator's repos via
- * the stored OAuth token. Requires `active_method === "github_oauth"`.
+ * `GET /.parachute/mirror/auth/github/installations` — install state for
+ * the connect flow (vault#480). Answers three UI questions in one call:
+ * which app is in play (shared default vs BYO), is it installed ANYWHERE
+ * for this operator, and which accounts (user/orgs) carry installations.
+ *
+ * Deliberately a separate, explicitly-network endpoint: `GET /auth` stays
+ * a pure local read of the stored credential. The SPA calls this when it
+ * renders the connect flow / repo picker, not on every status poll.
+ *
+ * Response:
+ *   200 {
+ *     app: { client_id, slug, is_shared_default },
+ *     installed: boolean,            // installations.length > 0
+ *     install_url: string,           // github.com/apps/<slug>/installations/new
+ *     installations: [{ id, account_login, account_type, repository_selection }]
+ *   }
+ *   400 { error, error_type: "github_not_connected", message } — no stored
+ *       github_oauth credential; the device flow hasn't been run (or a PAT
+ *       is active instead — install state is a GitHub-App concept). 400,
+ *       not 401, matching the sibling repos handler: a 401 here would trip
+ *       the SPA's authedFetch token-refresh machinery and clear a
+ *       perfectly valid cached admin token over a non-auth condition.
+ *   502 { error, message } — GitHub unreachable / API error.
+ */
+export async function handleAuthGithubInstallations(
+  manager: MirrorManager,
+  fetchImpl?: FetchLike,
+): Promise<Response> {
+  const creds = readCredentials(manager.getVaultName());
+  if (!creds || creds.active_method !== "github_oauth" || !creds.github_oauth) {
+    return Response.json(
+      {
+        error: "Not connected to GitHub",
+        error_type: "github_not_connected",
+        message:
+          "No GitHub sign-in is stored for this vault. Run the device flow first (POST /.parachute/mirror/auth/github/device-code).",
+      },
+      { status: 400 },
+    );
+  }
+  const clientId = getGithubClientId();
+  const slug = getGithubAppSlug();
+  let installations;
+  try {
+    installations = await listInstallations(creds.github_oauth.access_token, fetchImpl);
+  } catch (err) {
+    return Response.json(
+      {
+        error: "Installation check failed",
+        message: (err as Error).message ?? String(err),
+      },
+      { status: 502 },
+    );
+  }
+  return Response.json(
+    {
+      app: {
+        client_id: clientId,
+        slug,
+        is_shared_default:
+          clientId === GITHUB_CLIENT_ID_DEFAULT && slug === GITHUB_APP_SLUG_DEFAULT,
+      },
+      installed: installations.length > 0,
+      install_url: installUrlForSlug(slug),
+      installations: installations.map((i) => ({
+        id: i.id,
+        account_login: i.account.login,
+        account_type: i.account.type,
+        repository_selection: i.repository_selection,
+      })),
+    },
+    { headers: { "Access-Control-Allow-Origin": "*" } },
+  );
+}
+
+/**
+ * `GET /.parachute/mirror/auth/github/repos` — list the repos the
+ * operator's app installations grant, via the stored OAuth token. Requires
+ * `active_method === "github_oauth"`.
+ *
+ * Source (vault#480): `GET /user/installations` → per-installation
+ * `GET /user/installations/{id}/repositories`, unioned. This replaces the
+ * old `GET /user/repos?type=owner` source, which (a) excluded org-owned
+ * repos by construction and (b) showed all-public-repos when the app wasn't
+ * installed at all (every GitHub App reads public repos) — Aaron walked
+ * into exactly that "looks connected, shows the wrong repos" state live.
+ *
+ * Response:
+ *   200 installed:    { installed: true, repos: [{ ...GitHubRepoInfo,
+ *                       account_login, installation_id }], truncated }
+ *   200 not installed: { installed: false, install_url, repos: [],
+ *                       truncated: false } — machine-readable
+ *                       authorized-but-not-installed state; the UI shows
+ *                       the guided-install step, no string-matching needed.
+ *   400 { error, message } — no github_oauth credential stored.
+ *   502 { error, message } — GitHub unreachable / API error.
  */
 export async function handleAuthGithubRepos(
   manager: MirrorManager,
@@ -830,9 +963,58 @@ export async function handleAuthGithubRepos(
       { status: 400 },
     );
   }
-  let result;
+  const token = creds.github_oauth.access_token;
+  let installations;
   try {
-    result = await listRepos(creds.github_oauth.access_token, {}, fetchImpl);
+    installations = await listInstallations(token, fetchImpl);
+  } catch (err) {
+    return Response.json(
+      {
+        error: "Repo list failed",
+        message: (err as Error).message ?? String(err),
+      },
+      { status: 502 },
+    );
+  }
+
+  if (installations.length === 0) {
+    // Authorized but not installed — the device-flow grant alone reaches no
+    // repos. Distinct, machine-readable state (NOT an empty repo list that
+    // looks like "you have no repos").
+    return Response.json(
+      {
+        installed: false,
+        install_url: installUrlForSlug(getGithubAppSlug()),
+        repos: [],
+        truncated: false,
+      },
+      { headers: { "Access-Control-Allow-Origin": "*" } },
+    );
+  }
+
+  const repos: Array<GitHubRepoInfo & { account_login: string; installation_id: number }> = [];
+  let truncated = false;
+  try {
+    for (const installation of installations) {
+      const result = await listInstallationRepos(token, installation.id, {}, fetchImpl);
+      // `GET /user/installations/{id}/repositories` takes no `sort` param
+      // (unlike the old `GET /user/repos?sort=updated` picker source), so
+      // order within each account group ourselves: most-recently-updated
+      // first, so the repo the operator probably wants sits near the top.
+      // ISO-8601 timestamps compare lexicographically. Per-group (not
+      // across the union) so the SPA's account grouping stays contiguous.
+      const sorted = [...result.repos].sort((a, b) =>
+        b.updated_at.localeCompare(a.updated_at),
+      );
+      for (const repo of sorted) {
+        repos.push({
+          ...repo,
+          account_login: installation.account.login,
+          installation_id: installation.id,
+        });
+      }
+      if (result.truncated) truncated = true;
+    }
   } catch (err) {
     return Response.json(
       {
@@ -843,7 +1025,7 @@ export async function handleAuthGithubRepos(
     );
   }
   return Response.json(
-    { repos: result.repos, truncated: result.truncated },
+    { installed: true, repos, truncated },
     { headers: { "Access-Control-Allow-Origin": "*" } },
   );
 }
@@ -852,6 +1034,15 @@ export async function handleAuthGithubRepos(
  * `POST /.parachute/mirror/auth/github/create-repo` — create a new repo on
  * the operator's account, return the new RepoInfo. The SPA flows straight
  * from this into the "repo selected" state.
+ *
+ * With the shared Parachute app this 403s by design (vault#480):
+ * `POST /user/repos` needs Administration:write; the shared app is frozen
+ * at Contents-only. The 403 maps to error_type "app_lacks_admin_permission"
+ * with the guided-manual path (create at github.com/new → add it to the
+ * installation → refresh the picker). The endpoint stays functional for
+ * BYO-app operators whose app grants Administration:write — and per the
+ * install docs, app-created repos auto-join the installation, so their
+ * create→push flow works end-to-end.
  */
 export async function handleAuthGithubCreateRepo(
   req: Request,
@@ -894,6 +1085,20 @@ export async function handleAuthGithubCreateRepo(
       fetchImpl,
     );
   } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 403) {
+      // Expected with the shared Contents-only app: POST /user/repos needs
+      // Administration:write. Actionable, machine-readable mapping — the UI
+      // renders the guided-manual checklist off error_type, not a string.
+      return Response.json(
+        {
+          error: "Create not permitted for this GitHub App",
+          error_type: "app_lacks_admin_permission",
+          message:
+            "The Parachute GitHub App can't create repositories (it only has Contents permission — creating repos needs Administration). Create it manually instead: 1) create a private, uninitialized repo at github.com/new, 2) add it to the app installation (GitHub → Settings → Applications → Configure), 3) refresh the repo list here and pick it.",
+        },
+        { status: 403 },
+      );
+    }
     return Response.json(
       { error: "Create failed", message: (err as Error).message ?? String(err) },
       { status: 502 },
@@ -949,6 +1154,18 @@ export async function handleAuthGithubSelectRepo(
     name,
   );
 
+  // vault#483: linking implies backup intent — the choose-repo re-entry can
+  // be the FIRST credential-linked action for this vault (a credential saved
+  // before history-on-link existed, on a never-configured vault: the #483
+  // "linked but silently inert" state). Run history-on-link here too, BEFORE
+  // the Cut-3/Cut-6 steps below and mirroring handleAuthPat's ordering:
+  // history on (the reload's start() resolves mirror_path so the remote
+  // write below actually lands), then Cut 3 sees an enabled mirror and flips
+  // auto_push, then Cut 6 fires the initial push. An explicitly-disabled
+  // mirror short-circuits all of it (history stays off → maybeEnableAutoPush
+  // no-ops on disabled).
+  const history_enabled = await maybeEnableHistoryOnLink(manager);
+
   // Apply to the mirror dir if running. If the mirror isn't running (no
   // mirror_path), we still consider this a success — the credentials are
   // stored, and the URL will get applied next time the mirror starts.
@@ -982,12 +1199,80 @@ export async function handleAuthGithubSelectRepo(
       // Echo the redacted form back so the SPA can show "pushing to <repo>".
       // No raw token in the response.
       remote: `https://github.com/${owner}/${name}.git`,
+      history_enabled,
       auto_push_was_already_enabled: autoPushChange.was_already_enabled,
       auto_push_enabled: autoPushChange.auto_push_now_enabled,
       initial_push: initialPush,
     },
     { headers: { "Access-Control-Allow-Origin": "*" } },
   );
+}
+
+/**
+ * vault#483 fix 1 — linking implies backup intent. Outcome flag for the
+ * credential-save responses:
+ *   - `true` — history (the mirror) is on: either this link just enabled it
+ *     (never-configured vault) or it was already enabled.
+ *   - `"left_disabled"` — a mirror config exists with `enabled: false`; we
+ *     refuse to silently flip an explicit operator choice. The UI should
+ *     offer the one-click "Turn on history now?" enable.
+ *   - `false` — we tried to enable history but the mirror didn't come up
+ *     (e.g. git missing). Config intent is persisted (PUT semantics); the
+ *     mirror status carries the actionable error.
+ */
+export type HistoryOnLink = true | false | "left_disabled";
+
+/**
+ * When a GitHub credential lands (device-flow grant or PAT save), turn
+ * history on for a vault that has NEVER had a mirror configured — nobody
+ * links GitHub to a vault for any reason other than backing it up. Aaron hit
+ * this live (vault#483): pre-#440 vaults have no mirror-config file, so
+ * linking stored a credential and then... nothing, with the only path out
+ * buried in advanced settings.
+ *
+ * Consent-respecting by design:
+ *   - **No config file** (never configured) → enable the internal mirror
+ *     with the standard defaults (enabled, internal, events, auto_commit on,
+ *     auto_push off — the same shape #440 gives new vaults). Writes through
+ *     `manager.reload()` — the exact path the PUT handler uses — so persist +
+ *     lifecycle-start stay one code path.
+ *   - **Config file exists with enabled:false** → explicit operator choice;
+ *     do NOT flip it. Return `"left_disabled"` so the UI can offer one-click
+ *     enable instead.
+ *   - **Config file exists with enabled:true** → nothing to do.
+ *
+ * The file-existence check (not just the parsed read) is the load-bearing
+ * distinction: an existing-but-malformed file parses to `undefined`, same as
+ * absent — but it still represents operator-touched state, so we treat it as
+ * "exists, not known-enabled" and leave it alone.
+ */
+async function maybeEnableHistoryOnLink(
+  manager: MirrorManager,
+): Promise<HistoryOnLink> {
+  const vaultName = manager.getVaultName();
+  if (!existsSync(mirrorConfigPath(vaultName))) {
+    try {
+      const status = await manager.reload({
+        ...defaultMirrorConfig(),
+        enabled: true,
+      });
+      if (!status.enabled) {
+        console.warn(
+          `[mirror-auth] history-on-link: enabled the mirror config for vault "${vaultName}" but it didn't start: ${status.last_error ?? "unknown error"}`,
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn(
+        `[mirror-auth] history-on-link: could not enable the mirror for vault "${vaultName}" (non-fatal): ${(err as Error).message ?? err}`,
+      );
+      return false;
+    }
+  }
+  const persisted = readMirrorConfigForVault(vaultName);
+  if (persisted?.enabled) return true;
+  return "left_disabled";
 }
 
 /**
