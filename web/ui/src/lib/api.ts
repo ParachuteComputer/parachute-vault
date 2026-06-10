@@ -39,11 +39,19 @@ export interface VaultDetailResult {
   stats: VaultStats;
 }
 
-/** Status code carried alongside the message so callers can branch numerically. */
+/**
+ * Status code carried alongside the message so callers can branch
+ * numerically. `errorType` carries the server's machine-readable
+ * `error_type` discriminator when the response body includes one (e.g.
+ * `app_lacks_admin_permission` from create-repo, `github_not_connected`
+ * from the installations probe) so the UI can branch on a stable token
+ * instead of string-matching the human message.
+ */
 export class HttpError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly errorType?: string,
   ) {
     super(message);
     this.name = "HttpError";
@@ -341,6 +349,19 @@ export interface DeviceCodeResponse {
   interval: number;
 }
 
+/**
+ * vault#483 fix 1 — outcome flag carried on the credential-save responses
+ * (device-flow grant + PAT save). Linking implies backup intent, so the
+ * backend turns history on for a never-configured vault:
+ *   - `true` — history (the mirror) is on: just-enabled or already on.
+ *   - `"left_disabled"` — a config exists with `enabled: false`; the server
+ *     refuses to silently flip an explicit operator choice. The UI offers
+ *     the one-click "Turn on history now?" enable (`PUT` with enabled:true).
+ *   - `false` — enable was attempted but the mirror didn't come up; the
+ *     mirror status carries the actionable error.
+ */
+export type HistoryOnLink = true | false | "left_disabled";
+
 export type DevicePollState =
   | { state: "pending" }
   | { state: "slow_down"; interval: number }
@@ -349,6 +370,8 @@ export type DevicePollState =
   | {
       state: "granted";
       user: { login: string; id: number; name: string | null; avatar_url?: string };
+      /** vault#483 — history-on-link outcome (see `HistoryOnLink`). */
+      history_enabled: HistoryOnLink;
     };
 
 export interface GitHubRepoInfo {
@@ -361,6 +384,55 @@ export interface GitHubRepoInfo {
   updated_at: string;
   clone_url: string;
 }
+
+// ---------------------------------------------------------------------------
+// GitHub App install state — vault#480.
+//
+// GitHub-App semantics that shape the connect flow: authorization (device
+// flow) and installation are SEPARATE, order-independent steps. A granted
+// token reaches no private repos until the operator also installs the app
+// on their account (and each org) and selects repos. The installations
+// endpoint is the canonical probe; `installed: false` = authorized-but-
+// not-installed (the state Aaron walked into blind).
+// ---------------------------------------------------------------------------
+
+export interface GitHubAppInfo {
+  client_id: string;
+  /** URL slug — drives github.com/apps/<slug>/installations/new. */
+  slug: string;
+  /** True when running on the shared Parachute app; false = BYO app. */
+  is_shared_default: boolean;
+}
+
+export interface GitHubInstallationInfo {
+  id: number;
+  account_login: string;
+  account_type: "User" | "Organization";
+  /** Whether the installation grants all repos or a hand-picked subset. */
+  repository_selection: "all" | "selected";
+}
+
+export interface GithubInstallState {
+  app: GitHubAppInfo;
+  installed: boolean;
+  install_url: string;
+  installations: GitHubInstallationInfo[];
+}
+
+/** A repo annotated with which installation (account) grants it. */
+export interface GitHubRepoWithInstallation extends GitHubRepoInfo {
+  account_login: string;
+  installation_id: number;
+}
+
+/**
+ * Discriminated repo-picker payload. `installed: false` means the operator
+ * authorized the app but hasn't installed it anywhere — the UI shows the
+ * guided-install step instead of an empty "you have no repos" list.
+ */
+export type GithubReposResult =
+  | { installed: true; repos: GitHubRepoWithInstallation[]; truncated: boolean }
+  | { installed: false; install_url: string; repos: GitHubRepoWithInstallation[]; truncated: false };
 
 export async function getMirrorAuth(vaultName: string): Promise<MirrorCredentialStatus> {
   const res = await authedFetch(
@@ -420,6 +492,8 @@ export async function pollGithubDeviceFlow(
  * commit will push to <repo>" rather than a silent "saved" confirmation.
  */
 export interface MirrorCredentialSaveResult extends MirrorCredentialStatus {
+  /** vault#483 — history-on-link outcome (see `HistoryOnLink`). */
+  history_enabled: HistoryOnLink;
   auto_push_was_already_enabled: boolean;
   auto_push_enabled: boolean;
   initial_push:
@@ -444,17 +518,49 @@ export async function postMirrorAuthPat(
   return (await res.json()) as MirrorCredentialSaveResult;
 }
 
+/**
+ * Install state for the connect flow (vault#480): which GitHub App is in
+ * play (shared default vs BYO), whether it's installed ANYWHERE for this
+ * operator, the install link, and the per-account installations.
+ *
+ * Explicitly a network probe (the server calls GitHub) — call it when
+ * rendering the connect flow / repo picker, not on every status poll.
+ * Throws `HttpError` with `errorType: "github_not_connected"` (401) when
+ * no GitHub sign-in is stored.
+ */
+export async function getGithubInstallations(
+  vaultName: string,
+): Promise<GithubInstallState> {
+  const res = await authedFetch(
+    vaultName,
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/installations`,
+  );
+  if (!res.ok) {
+    const { message, errorType } = await readErrorParts(res);
+    throw new HttpError(res.status, message, errorType);
+  }
+  return (await res.json()) as GithubInstallState;
+}
+
 export async function listGithubRepos(
   vaultName: string,
-): Promise<{ repos: GitHubRepoInfo[]; truncated: boolean }> {
+): Promise<GithubReposResult> {
   const res = await authedFetch(
     vaultName,
     `/vault/${encodeURIComponent(vaultName)}/.parachute/mirror/auth/github/repos`,
   );
   if (!res.ok) throw new HttpError(res.status, await readError(res));
-  return (await res.json()) as { repos: GitHubRepoInfo[]; truncated: boolean };
+  return (await res.json()) as GithubReposResult;
 }
 
+/**
+ * Create a repo on the operator's account. With the shared Parachute app
+ * this 403s by design (`POST /user/repos` needs Administration:write; the
+ * shared app is frozen at Contents-only) — the throw carries
+ * `errorType: "app_lacks_admin_permission"` so the UI renders the
+ * guided-manual checklist instead of an error toast. BYO apps that grant
+ * Administration:write succeed.
+ */
 export async function createGithubRepo(
   vaultName: string,
   args: { name: string; description?: string; private?: boolean },
@@ -468,7 +574,10 @@ export async function createGithubRepo(
       body: JSON.stringify(args),
     },
   );
-  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  if (!res.ok) {
+    const { message, errorType } = await readErrorParts(res);
+    throw new HttpError(res.status, message, errorType);
+  }
   return (await res.json()) as GitHubRepoInfo;
 }
 
@@ -575,15 +684,32 @@ export async function postMirrorImport(
 }
 
 async function readError(res: Response): Promise<string> {
+  return (await readErrorParts(res)).message;
+}
+
+/**
+ * Like `readError` but also surfaces the machine-readable `error_type`
+ * discriminator (when present) so callers can construct an `HttpError`
+ * the UI can branch on without string-matching.
+ */
+async function readErrorParts(
+  res: Response,
+): Promise<{ message: string; errorType?: string }> {
   try {
     const text = await res.text();
-    const parsed = JSON.parse(text) as { error?: string; error_description?: string; message?: string };
-    if (parsed.error_description) return parsed.error_description;
-    if (parsed.message) return parsed.message;
-    if (parsed.error) return parsed.error;
-    if (text) return text;
+    const parsed = JSON.parse(text) as {
+      error?: string;
+      error_description?: string;
+      error_type?: string;
+      message?: string;
+    };
+    const errorType = typeof parsed.error_type === "string" ? parsed.error_type : undefined;
+    if (parsed.error_description) return { message: parsed.error_description, errorType };
+    if (parsed.message) return { message: parsed.message, errorType };
+    if (parsed.error) return { message: parsed.error, errorType };
+    if (text) return { message: text, errorType };
   } catch {
     // not JSON
   }
-  return `${res.status} ${res.statusText}`;
+  return { message: `${res.status} ${res.statusText}` };
 }

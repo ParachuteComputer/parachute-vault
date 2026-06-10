@@ -45,6 +45,28 @@ vi.mock("../lib/api.ts", async () => {
     listGithubRepos: vi.fn(),
     createGithubRepo: vi.fn(),
     selectGithubRepo: vi.fn(),
+    // Install-state probe (vault#480). Default: shared app, installed on
+    // the operator's user account with all-repos selection — the happy
+    // "ready" state, so pre-#480 tests with a github_oauth credential see
+    // a quiet probe instead of a crash. Per-test overrides via
+    // `vi.mocked(api.getGithubInstallations).mockResolvedValue(...)`.
+    getGithubInstallations: vi.fn().mockResolvedValue({
+      app: {
+        client_id: "Iv23livaRF4VcvPhu3uB",
+        slug: "parachute-computer",
+        is_shared_default: true,
+      },
+      installed: true,
+      install_url: "https://github.com/apps/parachute-computer/installations/new",
+      installations: [
+        {
+          id: 11,
+          account_login: "aaron",
+          account_type: "User",
+          repository_selection: "all",
+        },
+      ],
+    }),
     // Import from git (vault#391).
     postMirrorImport: vi.fn(),
   };
@@ -966,6 +988,7 @@ describe("VaultMirror — Git remote credentials", () => {
         remote_url: "https://x-access-token:***@github.com/a/b.git",
         token_preview: "ghp_…7890",
       },
+      history_enabled: true,
       auto_push_was_already_enabled: false,
       auto_push_enabled: true,
       initial_push: {
@@ -1311,6 +1334,522 @@ describe("VaultMirror — Import from git section", () => {
     await user.click(screen.getByRole("button", { name: /Start import/i }));
     await waitFor(() =>
       expect(screen.getByText(/git clone failed/i)).toBeInTheDocument(),
+    );
+  });
+});
+
+// ===========================================================================
+// GitHub App install flow (vault#480) + history-on-link (vault#483).
+//
+// GitHub-App semantics: authorization (device flow) and installation are
+// SEPARATE steps — a granted token reaches no private repos until the app
+// is also installed. The page probes install state whenever a github_oauth
+// credential is active and renders the guided state machine:
+//   not-linked → linked-but-not-installed → installed-no-repo → ready.
+// ===========================================================================
+
+const githubCreds = (): api.MirrorCredentialStatus => ({
+  active_method: "github_oauth",
+  github_oauth: {
+    user_login: "aaron",
+    user_id: 1,
+    scope: "",
+    authorized_at: "2026-06-10T03:14:15.000Z",
+    token_preview: "ghu_…7890",
+  },
+  pat: null,
+});
+
+const installStateFixture = (
+  over: Partial<api.GithubInstallState> = {},
+): api.GithubInstallState => ({
+  app: {
+    client_id: "Iv23livaRF4VcvPhu3uB",
+    slug: "parachute-computer",
+    is_shared_default: true,
+  },
+  installed: true,
+  install_url: "https://github.com/apps/parachute-computer/installations/new",
+  installations: [
+    { id: 11, account_login: "aaron", account_type: "User", repository_selection: "all" },
+  ],
+  ...over,
+});
+
+const repoFixture = (
+  over: Partial<api.GitHubRepoWithInstallation> = {},
+): api.GitHubRepoWithInstallation => ({
+  owner: "aaron",
+  name: "a-vault",
+  full_name: "aaron/a-vault",
+  private: true,
+  html_url: "https://github.com/aaron/a-vault",
+  description: null,
+  updated_at: "2026-06-01T00:00:00Z",
+  clone_url: "https://github.com/aaron/a-vault.git",
+  account_login: "aaron",
+  installation_id: 11,
+  ...over,
+});
+
+describe("VaultMirror — GitHub App install flow (vault#480)", () => {
+  beforeEach(() => {
+    vi.mocked(scope.hasAdminScope).mockReturnValue(true);
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    vi.mocked(api.getMirrorAuth).mockResolvedValue(githubCreds());
+    // Re-establish the persistent default per test: `vi.clearAllMocks()`
+    // clears CALLS but a sibling test's `mockResolvedValue` would
+    // otherwise leak its implementation into tests relying on the
+    // installed-on-@aaron baseline.
+    vi.mocked(api.getGithubInstallations).mockResolvedValue(installStateFixture());
+  });
+
+  it("renders the linked-but-not-installed guided state (the one Aaron hit blind)", async () => {
+    vi.mocked(api.getGithubInstallations).mockResolvedValue(
+      installStateFixture({ installed: false, installations: [] }),
+    );
+    renderRoute();
+
+    // Explainer: authorized, one step left.
+    await waitFor(() =>
+      expect(
+        screen.getByText(/one step left: install the app/i),
+      ).toBeInTheDocument(),
+    );
+    // Install link points at the API-provided install URL.
+    const installLink = screen.getByRole("link", { name: /Install on GitHub/i });
+    expect(installLink.getAttribute("href")).toBe(
+      "https://github.com/apps/parachute-computer/installations/new",
+    );
+    // Repeatable re-check action.
+    expect(
+      screen.getByRole("button", { name: /I've installed it — check again/i }),
+    ).toBeInTheDocument();
+    // Org note — installing is per-account and repeatable.
+    expect(
+      screen.getByText(/Install the app on that org too/i),
+    ).toBeInTheDocument();
+  });
+
+  it("transitions not-installed → installed via the check-again action", async () => {
+    // First probe (page load): not installed. Second (the re-check):
+    // the factory default — installed on @aaron.
+    vi.mocked(api.getGithubInstallations).mockResolvedValueOnce(
+      installStateFixture({ installed: false, installations: [] }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /I've installed it — check again/i }),
+      ).toBeInTheDocument(),
+    );
+
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", { name: /I've installed it — check again/i }),
+    );
+
+    // The installed state replaces the guided-install panel.
+    await waitFor(() =>
+      expect(screen.getByText(/App installed on/i)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("button", { name: /Choose repository/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/one step left: install the app/i),
+    ).not.toBeInTheDocument();
+    expect(api.getGithubInstallations).toHaveBeenCalledTimes(2);
+  });
+
+  it("ready state shows the active-app identity line, selection mode, and repeatable org install", async () => {
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/App installed on/i)).toBeInTheDocument(),
+    );
+    // Active-app identity (shared default).
+    expect(
+      screen.getByText(/Using the shared Parachute GitHub App/i),
+    ).toBeInTheDocument();
+    // repository_selection surfaced.
+    expect(screen.getByText(/All repos/i)).toBeInTheDocument();
+    // "Install on another account/org" stays reachable.
+    expect(
+      screen.getByRole("link", { name: /Install on another account or org/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("repo picker groups repos by account (user + org) and labels selected-only installs", async () => {
+    vi.mocked(api.getGithubInstallations).mockResolvedValue(
+      installStateFixture({
+        installations: [
+          { id: 11, account_login: "aaron", account_type: "User", repository_selection: "all" },
+          {
+            id: 22,
+            account_login: "parachute-org",
+            account_type: "Organization",
+            repository_selection: "selected",
+          },
+        ],
+      }),
+    );
+    vi.mocked(api.listGithubRepos).mockResolvedValue({
+      installed: true,
+      repos: [
+        repoFixture(),
+        repoFixture({
+          owner: "parachute-org",
+          name: "org-vault",
+          full_name: "parachute-org/org-vault",
+          account_login: "parachute-org",
+          installation_id: 22,
+        }),
+      ],
+      truncated: false,
+    });
+    vi.mocked(api.selectGithubRepo).mockResolvedValue({
+      ok: true,
+      applied: true,
+      owner: "parachute-org",
+      name: "org-vault",
+      remote: "https://github.com/parachute-org/org-vault.git",
+      auto_push_was_already_enabled: false,
+      auto_push_enabled: true,
+      initial_push: { fired: true, pushed: true, sha: "feedface123456" },
+    });
+
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Choose repository/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Choose repository/i }));
+
+    // The picker modal probes install state, then lists repos grouped by
+    // account: both group headers + the org's "Selected repos only" label.
+    const modal = await screen.findByRole("dialog");
+    await waitFor(() =>
+      expect(within(modal).getByText("parachute-org")).toBeInTheDocument(),
+    );
+    expect(within(modal).getByText("aaron")).toBeInTheDocument();
+    expect(within(modal).getByText(/Selected repos only/i)).toBeInTheDocument();
+    // Org repo is pickable — the old GET /user/repos picker couldn't see
+    // org repos at all.
+    await user.click(within(modal).getByRole("button", { name: /org-vault/i }));
+    await waitFor(() =>
+      expect(api.selectGithubRepo).toHaveBeenCalledWith("work", {
+        owner: "parachute-org",
+        name: "org-vault",
+      }),
+    );
+  });
+
+  it("shared app: create-repo renders the guided-manual checklist, never a dead POST", async () => {
+    vi.mocked(api.listGithubRepos).mockResolvedValue({
+      installed: true,
+      repos: [repoFixture()],
+      truncated: false,
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Choose repository/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Choose repository/i }));
+    const modal = await screen.findByRole("dialog");
+    await waitFor(() =>
+      expect(
+        within(modal).getByRole("button", { name: /\+ Create new private repo/i }),
+      ).toBeInTheDocument(),
+    );
+    await user.click(
+      within(modal).getByRole("button", { name: /\+ Create new private repo/i }),
+    );
+
+    // The checklist renders directly — the shared app is KNOWN
+    // Contents-only, so there's no Create button that would just 403.
+    await waitFor(() =>
+      expect(
+        within(modal).getByText(/deliberately can't create repos/i),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      within(modal).queryByRole("button", { name: /^Create$/i }),
+    ).not.toBeInTheDocument();
+
+    // Typing a name prefills the github.com/new link (best-effort).
+    await user.type(
+      within(modal).getByLabelText(/New repo name/i),
+      "my-vault-backup",
+    );
+    const newRepoLink = within(modal).getByRole("link", {
+      name: /Create a new repo on GitHub/i,
+    });
+    expect(newRepoLink.getAttribute("href")).toBe(
+      "https://github.com/new?name=my-vault-backup",
+    );
+    // Step 2 deep-links the installation's settings page.
+    const configureLink = within(modal).getByRole("link", {
+      name: /configure on aaron/i,
+    });
+    expect(configureLink.getAttribute("href")).toBe(
+      "https://github.com/settings/installations/11",
+    );
+    // Step 3 closes the loop back into the picker. ("Refresh list" also
+    // exists in the picker's own action row — expect both.)
+    expect(
+      within(modal).getAllByRole("button", { name: /Refresh list/i }).length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(api.createGithubRepo).not.toHaveBeenCalled();
+  });
+
+  it("BYO app: create-repo 403 app_lacks_admin_permission falls back to the checklist (not an error toast)", async () => {
+    vi.mocked(api.getGithubInstallations).mockResolvedValue(
+      installStateFixture({
+        app: { client_id: "Iv1.byo", slug: "my-backup-app", is_shared_default: false },
+        install_url: "https://github.com/apps/my-backup-app/installations/new",
+      }),
+    );
+    vi.mocked(api.listGithubRepos).mockResolvedValue({
+      installed: true,
+      repos: [repoFixture()],
+      truncated: false,
+    });
+    vi.mocked(api.createGithubRepo).mockRejectedValue(
+      new api.HttpError(
+        403,
+        "The Parachute GitHub App can't create repositories…",
+        "app_lacks_admin_permission",
+      ),
+    );
+
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Choose repository/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Choose repository/i }));
+    const modal = await screen.findByRole("dialog");
+    await waitFor(() =>
+      expect(
+        within(modal).getByRole("button", { name: /\+ Create new private repo/i }),
+      ).toBeInTheDocument(),
+    );
+    await user.click(
+      within(modal).getByRole("button", { name: /\+ Create new private repo/i }),
+    );
+
+    // BYO app → the live Create button renders (the app MIGHT grant
+    // Administration:write — no way to know without trying).
+    await user.type(within(modal).getByLabelText(/New repo name/i), "new-backup");
+    await user.click(within(modal).getByRole("button", { name: /^Create$/i }));
+
+    // 403 with the machine-readable error_type → guided checklist, and
+    // the modal does NOT flip to the error phase. (The word
+    // "Administration" sits in an <em>, so match the surrounding text
+    // node — getNodeText only sees an element's own text children.)
+    await waitFor(() =>
+      expect(
+        within(modal).getByText(/permission needed to create repos/i),
+      ).toBeInTheDocument(),
+    );
+    expect(within(modal).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("BYO disclosure: renders custom-app identity + the registration recipe", async () => {
+    vi.mocked(api.getGithubInstallations).mockResolvedValue(
+      installStateFixture({
+        app: { client_id: "Iv1.byo", slug: "my-backup-app", is_shared_default: false },
+      }),
+    );
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/Using your own GitHub App/i)).toBeInTheDocument(),
+    );
+    expect(screen.getByText("my-backup-app")).toBeInTheDocument();
+
+    // The collapsible recipe: env-var pair + the no-private-key stance.
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", { name: /Use your own GitHub App/i }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/PARACHUTE_GITHUB_CLIENT_ID/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/PARACHUTE_GITHUB_APP_SLUG/)).toBeInTheDocument();
+    expect(screen.getByText(/Don't generate a private key/i)).toBeInTheDocument();
+    expect(screen.getByText(/Contents — Read and write/i)).toBeInTheDocument();
+  });
+});
+
+// ===========================================================================
+// History-on-link (vault#483) — linking implies backup intent. The backend
+// reports what it did via `history_enabled`; the section renders the
+// outcome: on ✓ / one-click enable offer / pointer at the status error.
+// ===========================================================================
+
+describe("VaultMirror — history-on-link (vault#483)", () => {
+  beforeEach(() => {
+    vi.mocked(scope.hasAdminScope).mockReturnValue(true);
+    vi.mocked(api.getMirrorAuth).mockResolvedValue({
+      active_method: null,
+      github_oauth: null,
+      pat: null,
+    });
+    // See the sibling describe — guard against implementation leakage.
+    vi.mocked(api.getGithubInstallations).mockResolvedValue(installStateFixture());
+  });
+
+  /** Drives the PAT modal to a save — the shortest path to a credential-
+   *  save response carrying `history_enabled`. */
+  async function savePat(user: ReturnType<typeof userEvent.setup>) {
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Use Personal Access Token/i }),
+      ).toBeInTheDocument(),
+    );
+    await user.click(screen.getByRole("button", { name: /Use Personal Access Token/i }));
+    const modal = await screen.findByRole("dialog");
+    await user.type(within(modal).getByLabelText(/Token/i), "ghp_x");
+    await user.type(
+      within(modal).getByLabelText(/Remote URL/i),
+      "https://github.com/a/b.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Validate & save/i }));
+  }
+
+  const patSaveResult = (
+    history: api.HistoryOnLink,
+  ): api.MirrorCredentialSaveResult => ({
+    active_method: "pat",
+    github_oauth: null,
+    pat: {
+      label: "GitHub PAT",
+      remote_url: "https://x-access-token:***@github.com/a/b.git",
+      token_preview: "ghp_…7890",
+    },
+    history_enabled: history,
+    auto_push_was_already_enabled: false,
+    auto_push_enabled: true,
+    initial_push: { fired: false, reason: "nothing_to_push" },
+  });
+
+  it("history_enabled: true → 'History is on ✓' confirmation", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    vi.mocked(api.postMirrorAuthPat).mockResolvedValue(patSaveResult(true));
+    renderRoute();
+    const user = userEvent.setup();
+    await savePat(user);
+    await waitFor(() =>
+      expect(screen.getByText(/History is on/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("history_enabled: 'left_disabled' → one-click enable that PUTs enabled:true", async () => {
+    // The vault carries an explicit enabled:false the backend refused to
+    // flip — the UI offers consent-respecting one-click enable instead.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: false, location: "internal" }),
+    );
+    vi.mocked(api.postMirrorAuthPat).mockResolvedValue(
+      patSaveResult("left_disabled"),
+    );
+    vi.mocked(api.putMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    renderRoute();
+    const user = userEvent.setup();
+    await savePat(user);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Version history is still off for this vault/i),
+      ).toBeInTheDocument(),
+    );
+    await user.click(screen.getByRole("button", { name: /Turn on history now/i }));
+    await waitFor(() =>
+      expect(api.putMirror).toHaveBeenCalledWith("work", { enabled: true }),
+    );
+    // The banner flips to the confirmation.
+    await waitFor(() =>
+      expect(screen.getByText(/History is on/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("history_enabled: false → points at the mirror status error", async () => {
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: false, location: "internal" }),
+    );
+    vi.mocked(api.postMirrorAuthPat).mockResolvedValue(patSaveResult(false));
+    renderRoute();
+    const user = userEvent.setup();
+    await savePat(user);
+    await waitFor(() =>
+      expect(
+        screen.getByText(/tried to turn on version history .* didn't\s*start/i),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("device-flow grant carries history through the full connect chain (grant → probe → guided install → picker)", async () => {
+    // The end-to-end Aaron path: authorize via device flow, history-on-link
+    // fires at the grant, the probe says "not installed", the guided
+    // install renders IN the modal, the re-check lands in the picker.
+    vi.mocked(api.getMirror).mockResolvedValue(
+      snapshotFixture({ enabled: true, location: "internal" }),
+    );
+    vi.mocked(api.startGithubDeviceFlow).mockResolvedValue({
+      polling_id: "pid",
+      user_code: "WXYZ-9876",
+      verification_uri: "https://github.com/login/device",
+      expires_in: 900,
+      interval: 1, // floor — keeps the poll tick ~1s in this test
+    });
+    vi.mocked(api.pollGithubDeviceFlow).mockResolvedValue({
+      state: "granted",
+      user: { login: "aaron", id: 1, name: "Aaron" },
+      history_enabled: true,
+    });
+    vi.mocked(api.getGithubInstallations)
+      .mockResolvedValueOnce(installStateFixture({ installed: false, installations: [] }))
+      .mockResolvedValueOnce(installStateFixture());
+    vi.mocked(api.listGithubRepos).mockResolvedValue({
+      installed: true,
+      repos: [repoFixture()],
+      truncated: false,
+    });
+
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Connect GitHub/i })).toBeInTheDocument(),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Connect GitHub/i }));
+    // Device code renders, then the ~1s poll tick lands the grant and the
+    // modal probes installations → guided install.
+    await waitFor(() => expect(screen.getByText("WXYZ-9876")).toBeInTheDocument());
+    const modal = screen.getByRole("dialog");
+    await waitFor(
+      () =>
+        expect(
+          within(modal).getByText(/one step left: install the app/i),
+        ).toBeInTheDocument(),
+      { timeout: 4000 },
+    );
+    // History banner surfaced at grant time (NOT deferred to repo pick —
+    // the operator may close the modal mid-flow).
+    expect(screen.getByText(/History is on/i)).toBeInTheDocument();
+
+    // Re-check → installed → picker with the repo list.
+    await user.click(
+      within(modal).getByRole("button", { name: /I've installed it — check again/i }),
+    );
+    await waitFor(() =>
+      expect(within(modal).getByRole("button", { name: /a-vault/i })).toBeInTheDocument(),
     );
   });
 });
