@@ -363,16 +363,18 @@ export function _resetDeviceFlowSessionsForTest(): void {
 }
 
 /**
- * Errors out cleanly when the operator hasn't replaced the placeholder
- * client_id. The user-facing message explains the next step.
+ * Errors out cleanly when PARACHUTE_GITHUB_CLIENT_ID is set to a
+ * placeholder-shaped value. A real default ships in the build (the shared
+ * Parachute GitHub App — see github-device-flow.ts), so this is only
+ * reachable via a misconfigured override.
  */
 function placeholderClientIdResponse(): Response {
   return Response.json(
     {
-      error: "GitHub OAuth not configured",
+      error: "GitHub auth misconfigured",
       error_type: "placeholder_client_id",
       message:
-        "This Parachute Vault build doesn't have a registered GitHub OAuth App client_id. Set the PARACHUTE_GITHUB_CLIENT_ID environment variable (see src/github-device-flow.ts for setup steps) or use the Personal Access Token path instead.",
+        "PARACHUTE_GITHUB_CLIENT_ID is set to a placeholder value. Unset it to use the built-in shared Parachute GitHub App, set it to your own app's client_id, or use the Personal Access Token path instead.",
     },
     { status: 503 },
   );

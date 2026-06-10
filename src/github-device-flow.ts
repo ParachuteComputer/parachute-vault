@@ -1,66 +1,67 @@
 /**
- * GitHub OAuth Device Flow client + supporting API calls.
+ * GitHub Device Flow client + supporting API calls.
  *
  * Why Device Flow (not Web Flow): self-hosted vault origins are
  * unpredictable (localhost:1940, random Tailscale FQDN, custom domain). Web
- * Flow needs a pre-registered callback URL per OAuth app; Device Flow needs
- * only a public `client_id` and the operator authorizes by typing a code at
+ * Flow needs a pre-registered callback URL; Device Flow needs only a public
+ * `client_id` and the operator authorizes by typing a code at
  * github.com/login/device from any device. Same UX as `gh auth login`.
  *
- * Spec: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow
+ * Spec: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token
  *
  * All HTTP calls accept an injectable `fetch` so tests can mock the wire
  * without spawning a real GitHub round-trip. Production wiring uses the
  * platform `fetch` (Bun's native).
  *
- * **GITHUB_CLIENT_ID setup (REQUIRED before this works in production):**
+ * **The registered app (2026-06-10)**: the default client_id below belongs
+ * to the shared Parachute **GitHub App** (not a classic OAuth App) that
+ * every self-hosted install uses — the same model as `gh` CLI shipping its
+ * client_id in source. Registration decisions (rationale in vault#480):
+ * fine-grained permissions = Contents read/write ONLY (treat as frozen —
+ * permission changes prompt every installer to re-approve); device flow
+ * enabled; user-token expiration disabled (non-expiring `ghu_` tokens — an
+ * unattended mirror daemon can't babysit single-use refresh tokens);
+ * installable on any account; webhook inactive; no OAuth-on-install.
  *
- *   1. Visit https://github.com/settings/developers
- *   2. "OAuth Apps" → "New OAuth App"
- *   3. Application name: "Parachute Vault" (or operator-chosen)
- *      Homepage URL: https://parachute.computer
- *      Authorization callback URL: https://parachute.computer/oauth/github
- *      (callback URL is required by GitHub's form but unused in Device Flow)
- *   4. After creating: open the app's settings page
- *   5. Tick the "Enable Device Flow" checkbox
- *   6. Copy the Client ID (looks like `Iv1.abc123...` or `Ov23li...`)
- *   7. Set the `GITHUB_CLIENT_ID` constant below to that value
- *
- * The placeholder ships with this PR. Production builds are gated on a real
- * client_id; the PR body flags Aaron as the action owner.
+ * GitHub-App token semantics that shape the connect flow:
+ *   - The `scope` param is IGNORED. Token abilities = app permissions ∩
+ *     the user's own access ∩ the repos selected when INSTALLING the app.
+ *   - Authorization (this device flow) and installation are separate,
+ *     order-independent steps. A granted token reaches no repos until the
+ *     operator also installs the app on their account and selects repos
+ *     (github.com/apps/<app-slug>/installations/new).
  */
 
 // ---------------------------------------------------------------------------
-// Client ID — REPLACE BEFORE TAGGING A RELEASE.
+// Client ID — the shared Parachute GitHub App (public; safe to commit).
 //
-// This is the public OAuth app client_id. No secret is needed for Device
-// Flow (the operator's typed code is the proof-of-presence factor). Safe to
-// commit + ship in client builds. But: tied to ONE registered GitHub OAuth
-// App, which Aaron owns under the Parachute org / his account. Set this
-// after running the setup checklist above.
-//
-// TODO(aaron): replace with the real client_id from the registered OAuth
-// app. Until then, the device-flow endpoints return a clear-error response
-// instead of attempting GitHub's API with an invalid id (which surfaces an
-// opaque "Not Found" that's hard to debug).
+// No secret is needed for Device Flow (the operator's typed code is the
+// proof-of-presence factor), and a client_id is not a credential — GitHub
+// treats public clients as trivially spoofable by design. Operators who
+// want their own app (own rate-limit budget — the device-flow verification
+// cap is 50/hour PER APP fleet-wide — or full sovereignty) set
+// PARACHUTE_GITHUB_CLIENT_ID, which takes precedence. See vault#480.
 // ---------------------------------------------------------------------------
 
-export const GITHUB_CLIENT_ID_PLACEHOLDER =
-  "Iv1.PLACEHOLDER_REPLACE_ME_BEFORE_RELEASE" as const;
+export const GITHUB_CLIENT_ID_DEFAULT = "Iv23livaRF4VcvPhu3uB" as const;
 
 /**
- * The active client id at runtime. Resolved from the env (preferred — lets
- * operators override per-deploy) or the constant above (for tests +
- * defaults). Defaults to the placeholder; the route handlers check for the
- * placeholder and return an actionable error before hitting GitHub.
+ * The active client id at runtime. Resolved from the env (preferred — the
+ * bring-your-own-app path) or the shared-app default above.
  */
 export function getGithubClientId(): string {
-  return process.env.PARACHUTE_GITHUB_CLIENT_ID || GITHUB_CLIENT_ID_PLACEHOLDER;
+  return process.env.PARACHUTE_GITHUB_CLIENT_ID || GITHUB_CLIENT_ID_DEFAULT;
 }
 
-/** Returns true when no real client id has been configured. */
+/**
+ * Returns true when the configured client id is a placeholder rather than a
+ * real id — only reachable via a misconfigured PARACHUTE_GITHUB_CLIENT_ID
+ * override now that a real default ships. Route handlers keep the check so
+ * a junk override surfaces an actionable error instead of GitHub's opaque
+ * "Not Found".
+ */
 export function isPlaceholderClientId(clientId: string): boolean {
-  return clientId === GITHUB_CLIENT_ID_PLACEHOLDER || clientId.includes("PLACEHOLDER");
+  return clientId.includes("PLACEHOLDER");
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +140,12 @@ function defaultFetch(): FetchLike {
 
 /**
  * Start a device-flow authorization. POSTs to GitHub's `/login/device/code`
- * with the public client_id + the `repo` scope (the minimum we need to push
- * to the operator's private repos).
+ * with the public client_id.
+ *
+ * No `scope` param: GitHub Apps ignore it entirely. Token abilities come
+ * from the app's fine-grained permissions (Contents read/write) intersected
+ * with the repos the operator selects when installing the app — push access
+ * to private repos comes from that install-time selection, not a scope.
  *
  * Throws on transport or shape error — the route handler catches + returns
  * a 502. Successful return is the four-tuple GitHub spec calls for
@@ -158,11 +163,6 @@ export async function requestDeviceCode(
     },
     body: new URLSearchParams({
       client_id: clientId,
-      // `repo` is the broad-private-repo scope. Read-only push isn't a
-      // thing on GitHub; if we want to push, we need write access to repo
-      // contents, which `repo` includes. The narrower scope `public_repo`
-      // wouldn't cover private repos — most operator vaults are private.
-      scope: "repo",
     }).toString(),
   });
   if (!res.ok) {
