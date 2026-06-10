@@ -7,7 +7,10 @@
  *   - pollForToken: granted / pending / slow_down / expired / denied
  *   - fetchUser happy path
  *   - listRepos: single-page, paginated, truncated
- *   - createRepo happy path
+ *   - listInstallations: happy (user + org), empty, bad shape, API error
+ *   - listInstallationRepos: happy, paginated/truncated, bad shape
+ *   - createRepo happy path + GitHubApiError status (403 = no Administration)
+ *   - app slug helpers + install URL
  */
 
 import { describe, expect, test } from "bun:test";
@@ -15,9 +18,15 @@ import { describe, expect, test } from "bun:test";
 import {
   createRepo,
   fetchUser,
+  GITHUB_APP_SLUG_DEFAULT,
   GITHUB_CLIENT_ID_DEFAULT,
+  getGithubAppSlug,
   getGithubClientId,
+  GitHubApiError,
+  installUrlForSlug,
   isPlaceholderClientId,
+  listInstallationRepos,
+  listInstallations,
   listRepos,
   pollForToken,
   requestDeviceCode,
@@ -91,6 +100,44 @@ describe("client id helpers", () => {
     expect(isPlaceholderClientId("Iv1.PLACEHOLDER_REPLACE_ME_BEFORE_RELEASE")).toBe(true);
     expect(isPlaceholderClientId("PLACEHOLDER_X")).toBe(true);
     expect(isPlaceholderClientId("Iv1.realone")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// App slug helpers
+// ---------------------------------------------------------------------------
+
+describe("app slug helpers", () => {
+  test("getGithubAppSlug reads from env when set (BYO-app pairing)", () => {
+    const prev = process.env.PARACHUTE_GITHUB_APP_SLUG;
+    try {
+      process.env.PARACHUTE_GITHUB_APP_SLUG = "my-own-app";
+      expect(getGithubAppSlug()).toBe("my-own-app");
+    } finally {
+      if (prev === undefined) delete process.env.PARACHUTE_GITHUB_APP_SLUG;
+      else process.env.PARACHUTE_GITHUB_APP_SLUG = prev;
+    }
+  });
+
+  test("getGithubAppSlug falls back to the shared-app default when env unset", () => {
+    const prev = process.env.PARACHUTE_GITHUB_APP_SLUG;
+    delete process.env.PARACHUTE_GITHUB_APP_SLUG;
+    try {
+      expect(getGithubAppSlug()).toBe(GITHUB_APP_SLUG_DEFAULT);
+    } finally {
+      if (prev !== undefined) process.env.PARACHUTE_GITHUB_APP_SLUG = prev;
+    }
+  });
+
+  test("the shipped default slug is the registered Parachute GitHub App's", () => {
+    // Pin the exact value — a typo'd slug would build a 404 install link.
+    expect(GITHUB_APP_SLUG_DEFAULT).toBe("parachute-computer");
+  });
+
+  test("installUrlForSlug builds the installations/new URL", () => {
+    expect(installUrlForSlug("parachute-computer")).toBe(
+      "https://github.com/apps/parachute-computer/installations/new",
+    );
   });
 });
 
@@ -359,6 +406,187 @@ describe("listRepos", () => {
 });
 
 // ---------------------------------------------------------------------------
+// listInstallations
+// ---------------------------------------------------------------------------
+
+describe("listInstallations", () => {
+  test("returns user + org installations with typed fields", async () => {
+    const fetcher = mockFetch([
+      {
+        match: (u) => u.includes("/user/installations"),
+        response: {
+          ok: true,
+          status: 200,
+          body: {
+            total_count: 2,
+            installations: [
+              {
+                id: 101,
+                app_slug: "parachute-computer",
+                account: { login: "aaron", type: "User" },
+                repository_selection: "selected",
+              },
+              {
+                id: 202,
+                app_slug: "parachute-computer",
+                account: { login: "unforced-org", type: "Organization" },
+                repository_selection: "all",
+              },
+            ],
+          },
+        },
+      },
+    ]);
+    const installations = await listInstallations("ghu_test", fetcher);
+    expect(installations).toHaveLength(2);
+    expect(installations[0]!.id).toBe(101);
+    expect(installations[0]!.account.login).toBe("aaron");
+    expect(installations[0]!.account.type).toBe("User");
+    expect(installations[0]!.repository_selection).toBe("selected");
+    expect(installations[1]!.account.type).toBe("Organization");
+    expect(installations[1]!.app_slug).toBe("parachute-computer");
+  });
+
+  test("empty installations array = authorized but not installed", async () => {
+    const fetcher = mockFetch([
+      {
+        match: () => true,
+        response: { ok: true, status: 200, body: { total_count: 0, installations: [] } },
+      },
+    ]);
+    const installations = await listInstallations("ghu_test", fetcher);
+    expect(installations).toEqual([]);
+  });
+
+  test("throws on a response missing the installations array", async () => {
+    const fetcher = mockFetch([
+      {
+        match: () => true,
+        response: { ok: true, status: 200, body: { total_count: 0 } },
+      },
+    ]);
+    await expect(listInstallations("ghu_test", fetcher)).rejects.toThrow(
+      /missing installations array/,
+    );
+  });
+
+  test("throws on an item missing required fields", async () => {
+    const fetcher = mockFetch([
+      {
+        match: () => true,
+        response: {
+          ok: true,
+          status: 200,
+          body: { total_count: 1, installations: [{ id: "not-a-number", account: null }] },
+        },
+      },
+    ]);
+    await expect(listInstallations("ghu_test", fetcher)).rejects.toThrow(
+      /missing required fields/,
+    );
+  });
+
+  test("throws GitHubApiError carrying the status on non-2xx", async () => {
+    const fetcher = mockFetch([
+      {
+        match: () => true,
+        response: { ok: false, status: 401, body: { message: "Bad credentials" } },
+      },
+    ]);
+    try {
+      await listInstallations("ghu_revoked", fetcher);
+      throw new Error("expected listInstallations to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(GitHubApiError);
+      expect((err as GitHubApiError).status).toBe(401);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listInstallationRepos
+// ---------------------------------------------------------------------------
+
+function installationRepoItem(i: number, owner = "aaron"): Record<string, unknown> {
+  return {
+    name: `repo${i}`,
+    full_name: `${owner}/repo${i}`,
+    private: true,
+    html_url: `https://github.com/${owner}/repo${i}`,
+    description: null,
+    updated_at: "2026-06-10T00:00:00Z",
+    clone_url: `https://github.com/${owner}/repo${i}.git`,
+    owner: { login: owner },
+  };
+}
+
+describe("listInstallationRepos", () => {
+  test("single page returns GitHubRepoInfo shapes from the installation", async () => {
+    const fetcher = mockFetch([
+      {
+        match: (u) => u.includes("/user/installations/101/repositories") && u.includes("page=1"),
+        response: {
+          ok: true,
+          status: 200,
+          body: { total_count: 1, repositories: [installationRepoItem(0)] },
+        },
+      },
+    ]);
+    const result = await listInstallationRepos("ghu_test", 101, { perPage: 100, maxPages: 3 }, fetcher);
+    expect(result.repos).toHaveLength(1);
+    expect(result.truncated).toBe(false);
+    expect(result.repos[0]!.full_name).toBe("aaron/repo0");
+    expect(result.repos[0]!.owner).toBe("aaron");
+    expect(result.repos[0]!.private).toBe(true);
+  });
+
+  test("paginates until a short page; truncates at the maxPages cap", async () => {
+    const fullPage = { total_count: 4, repositories: [installationRepoItem(0), installationRepoItem(1)] };
+    const fetcher = mockFetch([
+      { match: (u) => u.includes("page=1"), response: { ok: true, status: 200, body: fullPage } },
+      { match: (u) => u.includes("page=2"), response: { ok: true, status: 200, body: fullPage } },
+    ]);
+    const result = await listInstallationRepos("ghu_test", 7, { perPage: 2, maxPages: 2 }, fetcher);
+    expect(result.repos).toHaveLength(4);
+    expect(result.truncated).toBe(true);
+
+    // Short-page end: page 2 has fewer than perPage → untruncated.
+    const fetcher2 = mockFetch([
+      { match: (u) => u.includes("page=1"), response: { ok: true, status: 200, body: fullPage } },
+      {
+        match: (u) => u.includes("page=2"),
+        response: { ok: true, status: 200, body: { total_count: 3, repositories: [installationRepoItem(2)] } },
+      },
+    ]);
+    const result2 = await listInstallationRepos("ghu_test", 7, { perPage: 2, maxPages: 3 }, fetcher2);
+    expect(result2.repos).toHaveLength(3);
+    expect(result2.truncated).toBe(false);
+  });
+
+  test("throws on a response missing the repositories array", async () => {
+    const fetcher = mockFetch([
+      { match: () => true, response: { ok: true, status: 200, body: { total_count: 0 } } },
+    ]);
+    await expect(
+      listInstallationRepos("ghu_test", 101, {}, fetcher),
+    ).rejects.toThrow(/missing repositories array/);
+  });
+
+  test("throws GitHubApiError carrying the status on non-2xx", async () => {
+    const fetcher = mockFetch([
+      { match: () => true, response: { ok: false, status: 404, body: { message: "Not Found" } } },
+    ]);
+    try {
+      await listInstallationRepos("ghu_test", 999, {}, fetcher);
+      throw new Error("expected listInstallationRepos to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(GitHubApiError);
+      expect((err as GitHubApiError).status).toBe(404);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // createRepo
 // ---------------------------------------------------------------------------
 
@@ -407,5 +635,29 @@ describe("createRepo", () => {
     await expect(
       createRepo("gho_test", { name: "exists" }, fetcher),
     ).rejects.toThrow(/already exists/);
+  });
+
+  test("403 (shared Contents-only app) throws GitHubApiError with status 403", async () => {
+    // POST /user/repos needs Administration:write — the shared app's
+    // expected failure. The route maps this status to the guided-manual
+    // error, so the status must survive the throw.
+    const fetcher = mockFetch([
+      {
+        match: () => true,
+        response: {
+          ok: false,
+          status: 403,
+          body: { message: "Resource not accessible by integration" },
+        },
+      },
+    ]);
+    try {
+      await createRepo("ghu_test", { name: "my-vault" }, fetcher);
+      throw new Error("expected createRepo to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(GitHubApiError);
+      expect((err as GitHubApiError).status).toBe(403);
+      expect((err as Error).message).toContain("Resource not accessible");
+    }
   });
 });

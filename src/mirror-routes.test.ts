@@ -27,6 +27,7 @@ import {
   handleAuthGet,
   handleAuthGithubCreateRepo,
   handleAuthGithubDeviceCode,
+  handleAuthGithubInstallations,
   handleAuthGithubPoll,
   handleAuthGithubRepos,
   handleAuthGithubSelectRepo,
@@ -728,6 +729,12 @@ describe("auth credential routes — device flow", () => {
     expect(saved?.active_method).toBe("github_oauth");
     expect(saved?.github_oauth?.access_token).toBe("gho_real1234567890");
     expect(saved?.github_oauth?.user_login).toBe("aaron");
+    // vault#483: the grant also carries the history-on-link outcome (the
+    // dedicated branches are covered in the "history-on-link" describe).
+    expect("history_enabled" in (grantBody as Record<string, unknown>)).toBe(true);
+    // The grant may have started the mirror lifecycle (history-on-link) —
+    // tear it down so no safety-net timer outlives the test.
+    await manager.stop();
   });
 });
 
@@ -986,14 +993,14 @@ describe("auth credential routes — github repos / create-repo", () => {
     expect(res.status).toBe(400);
   });
 
-  test("repos returns list when authed", async () => {
+  test("repos lists from the installation (vault#480) — installed:true + account annotation", async () => {
     home = tmp("mirror-auth-repos-ok-");
     const { manager } = makeManager(home);
     writeCredentials("default", {
       active_method: "github_oauth",
       github_oauth: {
-        access_token: "gho_test1234567890",
-        scope: "repo",
+        access_token: "ghu_test1234567890",
+        scope: "",
         authorized_at: "2026-05-28T03:14:15.000Z",
         user_login: "aaron",
         user_id: 1,
@@ -1002,26 +1009,219 @@ describe("auth credential routes — github repos / create-repo", () => {
     });
     const fetcher = buildMockFetch([
       {
-        match: (u) => u.includes("/user/repos"),
-        body: [
-          {
-            name: "a",
-            full_name: "aaron/a",
-            private: true,
-            html_url: "https://github.com/aaron/a",
-            description: null,
-            updated_at: "2026-05-28T00:00:00Z",
-            clone_url: "https://github.com/aaron/a.git",
-            owner: { login: "aaron" },
-          },
-        ],
+        match: (u) => u.includes("/user/installations?"),
+        body: {
+          total_count: 1,
+          installations: [
+            {
+              id: 101,
+              app_slug: "parachute-computer",
+              account: { login: "aaron", type: "User" },
+              repository_selection: "selected",
+            },
+          ],
+        },
+      },
+      {
+        match: (u) => u.includes("/user/installations/101/repositories"),
+        body: {
+          total_count: 1,
+          repositories: [
+            {
+              name: "a",
+              full_name: "aaron/a",
+              private: true,
+              html_url: "https://github.com/aaron/a",
+              description: null,
+              updated_at: "2026-05-28T00:00:00Z",
+              clone_url: "https://github.com/aaron/a.git",
+              owner: { login: "aaron" },
+            },
+          ],
+        },
       },
     ]);
     const res = await handleAuthGithubRepos(manager, fetcher);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { repos: Array<{ full_name: string }> };
+    const body = (await res.json()) as {
+      installed: boolean;
+      truncated: boolean;
+      repos: Array<{ full_name: string; account_login: string; installation_id: number }>;
+    };
+    expect(body.installed).toBe(true);
+    expect(body.truncated).toBe(false);
     expect(body.repos).toHaveLength(1);
     expect(body.repos[0]!.full_name).toBe("aaron/a");
+    expect(body.repos[0]!.account_login).toBe("aaron");
+    expect(body.repos[0]!.installation_id).toBe(101);
+  });
+
+  test("repos unions multiple installations (user + org) with per-repo annotation", async () => {
+    // The org-repos blind spot Aaron hit live: GET /user/repos?type=owner
+    // excluded org-owned repos by construction. The installations source
+    // enumerates both.
+    home = tmp("mirror-auth-repos-multi-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "ghu_test1234567890",
+        scope: "",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    const repoItem = (owner: string, name: string) => ({
+      name,
+      full_name: `${owner}/${name}`,
+      private: true,
+      html_url: `https://github.com/${owner}/${name}`,
+      description: null,
+      updated_at: "2026-06-10T00:00:00Z",
+      clone_url: `https://github.com/${owner}/${name}.git`,
+      owner: { login: owner },
+    });
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: {
+          total_count: 2,
+          installations: [
+            {
+              id: 101,
+              app_slug: "parachute-computer",
+              account: { login: "aaron", type: "User" },
+              repository_selection: "selected",
+            },
+            {
+              id: 202,
+              app_slug: "parachute-computer",
+              account: { login: "unforced-org", type: "Organization" },
+              repository_selection: "selected",
+            },
+          ],
+        },
+      },
+      {
+        match: (u) => u.includes("/user/installations/101/repositories"),
+        body: { total_count: 1, repositories: [repoItem("aaron", "personal-vault")] },
+      },
+      {
+        match: (u) => u.includes("/user/installations/202/repositories"),
+        body: { total_count: 1, repositories: [repoItem("unforced-org", "team-vault")] },
+      },
+    ]);
+    const res = await handleAuthGithubRepos(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      installed: boolean;
+      repos: Array<{ full_name: string; account_login: string; installation_id: number }>;
+    };
+    expect(body.installed).toBe(true);
+    expect(body.repos).toHaveLength(2);
+    expect(body.repos[0]!.full_name).toBe("aaron/personal-vault");
+    expect(body.repos[0]!.account_login).toBe("aaron");
+    expect(body.repos[0]!.installation_id).toBe(101);
+    expect(body.repos[1]!.full_name).toBe("unforced-org/team-vault");
+    expect(body.repos[1]!.account_login).toBe("unforced-org");
+    expect(body.repos[1]!.installation_id).toBe(202);
+  });
+
+  test("repos returns the machine-readable not_installed state when authorized but not installed", async () => {
+    home = tmp("mirror-auth-repos-notinstalled-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "ghu_test1234567890",
+        scope: "",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: { total_count: 0, installations: [] },
+      },
+    ]);
+    const res = await handleAuthGithubRepos(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      installed: boolean;
+      install_url: string;
+      repos: unknown[];
+      truncated: boolean;
+    };
+    expect(body.installed).toBe(false);
+    expect(body.install_url).toBe(
+      "https://github.com/apps/parachute-computer/installations/new",
+    );
+    expect(body.repos).toEqual([]);
+    expect(body.truncated).toBe(false);
+  });
+
+  test("repos carries truncated:true when an installation hits the page cap", async () => {
+    home = tmp("mirror-auth-repos-trunc-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "ghu_test1234567890",
+        scope: "",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    // The route calls listInstallationRepos with defaults (perPage=100,
+    // maxPages=3): serve 3 FULL pages of 100 so the cap trips.
+    const fullPage = (page: number) => ({
+      total_count: 1000,
+      repositories: Array.from({ length: 100 }, (_, i) => {
+        const n = page * 100 + i;
+        return {
+          name: `r${n}`,
+          full_name: `aaron/r${n}`,
+          private: false,
+          html_url: `https://github.com/aaron/r${n}`,
+          description: null,
+          updated_at: "2026-06-10T00:00:00Z",
+          clone_url: `https://github.com/aaron/r${n}.git`,
+          owner: { login: "aaron" },
+        };
+      }),
+    });
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: {
+          total_count: 1,
+          installations: [
+            {
+              id: 101,
+              app_slug: "parachute-computer",
+              account: { login: "aaron", type: "User" },
+              repository_selection: "all",
+            },
+          ],
+        },
+      },
+      { match: (u) => u.includes("/repositories") && u.includes("page=1"), body: fullPage(0) },
+      { match: (u) => u.includes("/repositories") && u.includes("page=2"), body: fullPage(1) },
+      { match: (u) => u.includes("/repositories") && u.includes("page=3"), body: fullPage(2) },
+    ]);
+    const res = await handleAuthGithubRepos(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { installed: boolean; truncated: boolean; repos: unknown[] };
+    expect(body.installed).toBe(true);
+    expect(body.truncated).toBe(true);
+    expect(body.repos).toHaveLength(300);
   });
 
   test("create-repo proxies through with mocked fetch", async () => {
@@ -1062,6 +1262,393 @@ describe("auth credential routes — github repos / create-repo", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { full_name: string };
     expect(body.full_name).toBe("aaron/new-vault");
+  });
+
+  test("create-repo maps GitHub's 403 to app_lacks_admin_permission + the guided-manual path (vault#480)", async () => {
+    // Expected with the shared Contents-only app: POST /user/repos needs
+    // Administration:write. The response must be actionable + machine-
+    // readable, not a generic 502.
+    home = tmp("mirror-auth-create-repo-403-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "ghu_test1234567890",
+        scope: "",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/repos"),
+        status: 403,
+        body: { message: "Resource not accessible by integration" },
+      },
+    ]);
+    const req = new Request("http://x/create", {
+      method: "POST",
+      body: JSON.stringify({ name: "new-vault" }),
+    });
+    const res = await handleAuthGithubCreateRepo(req, manager, fetcher);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type: string; message: string };
+    expect(body.error_type).toBe("app_lacks_admin_permission");
+    // Names the guided-manual path: create at github.com/new → add to the
+    // installation → refresh.
+    expect(body.message).toContain("github.com/new");
+    expect(body.message).toContain("installation");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /.parachute/mirror/auth/github/installations — install state (vault#480).
+// ---------------------------------------------------------------------------
+
+describe("auth credential routes — install state (GET /auth/github/installations)", () => {
+  let home: string;
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    delete process.env.PARACHUTE_GITHUB_CLIENT_ID;
+    delete process.env.PARACHUTE_GITHUB_APP_SLUG;
+  });
+
+  const oauthCreds = (): MirrorCredentials => ({
+    active_method: "github_oauth",
+    github_oauth: {
+      access_token: "ghu_test1234567890",
+      scope: "",
+      authorized_at: "2026-06-10T00:00:00.000Z",
+      user_login: "aaron",
+      user_id: 1,
+    },
+    pat: null,
+  });
+
+  test("401 github_not_connected when no github_oauth credential exists", async () => {
+    home = tmp("mirror-installstate-nocred-");
+    const { manager } = makeManager(home);
+    const res = await handleAuthGithubInstallations(manager);
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error_type: string; message: string };
+    expect(body.error_type).toBe("github_not_connected");
+    expect(body.message).toContain("device flow");
+  });
+
+  test("authorized but not installed → installed:false + install_url, empty installations", async () => {
+    home = tmp("mirror-installstate-notinstalled-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", oauthCreds());
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: { total_count: 0, installations: [] },
+      },
+    ]);
+    const res = await handleAuthGithubInstallations(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      app: { client_id: string; slug: string; is_shared_default: boolean };
+      installed: boolean;
+      install_url: string;
+      installations: unknown[];
+    };
+    expect(body.installed).toBe(false);
+    expect(body.installations).toEqual([]);
+    expect(body.install_url).toBe(
+      "https://github.com/apps/parachute-computer/installations/new",
+    );
+    expect(body.app.slug).toBe("parachute-computer");
+    expect(body.app.client_id).toBe("Iv23livaRF4VcvPhu3uB");
+    expect(body.app.is_shared_default).toBe(true);
+  });
+
+  test("installed on a user account AND an org → both surfaced", async () => {
+    home = tmp("mirror-installstate-installed-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", oauthCreds());
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: {
+          total_count: 2,
+          installations: [
+            {
+              id: 101,
+              app_slug: "parachute-computer",
+              account: { login: "aaron", type: "User" },
+              repository_selection: "selected",
+            },
+            {
+              id: 202,
+              app_slug: "parachute-computer",
+              account: { login: "unforced-org", type: "Organization" },
+              repository_selection: "all",
+            },
+          ],
+        },
+      },
+    ]);
+    const res = await handleAuthGithubInstallations(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      installed: boolean;
+      installations: Array<{
+        id: number;
+        account_login: string;
+        account_type: string;
+        repository_selection: string;
+      }>;
+    };
+    expect(body.installed).toBe(true);
+    expect(body.installations).toHaveLength(2);
+    expect(body.installations[0]).toEqual({
+      id: 101,
+      account_login: "aaron",
+      account_type: "User",
+      repository_selection: "selected",
+    });
+    expect(body.installations[1]).toEqual({
+      id: 202,
+      account_login: "unforced-org",
+      account_type: "Organization",
+      repository_selection: "all",
+    });
+  });
+
+  test("BYO-app env overrides are reflected in the app block (is_shared_default false)", async () => {
+    home = tmp("mirror-installstate-byo-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", oauthCreds());
+    process.env.PARACHUTE_GITHUB_CLIENT_ID = "Iv1.byoclient";
+    process.env.PARACHUTE_GITHUB_APP_SLUG = "my-own-app";
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        body: { total_count: 0, installations: [] },
+      },
+    ]);
+    const res = await handleAuthGithubInstallations(manager, fetcher);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      app: { client_id: string; slug: string; is_shared_default: boolean };
+      install_url: string;
+    };
+    expect(body.app.client_id).toBe("Iv1.byoclient");
+    expect(body.app.slug).toBe("my-own-app");
+    expect(body.app.is_shared_default).toBe(false);
+    expect(body.install_url).toBe("https://github.com/apps/my-own-app/installations/new");
+  });
+
+  test("502 when GitHub is unreachable / errors", async () => {
+    home = tmp("mirror-installstate-apierr-");
+    const { manager } = makeManager(home);
+    writeCredentials("default", oauthCreds());
+    const fetcher = buildMockFetch([
+      {
+        match: (u) => u.includes("/user/installations?"),
+        status: 401,
+        body: { message: "Bad credentials" },
+      },
+    ]);
+    const res = await handleAuthGithubInstallations(manager, fetcher);
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("Installation check failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#483 fix 1 — history-on-link (credential save enables history for a
+// never-configured vault; explicit operator choices are respected).
+//
+// Managers here are wired to the REAL per-vault mirror-config file (the
+// makeSyncManager pattern) because the never-configured branch keys off the
+// file's existence — the in-memory makeManager deps would diverge from what
+// maybeEnableHistoryOnLink reads.
+// ---------------------------------------------------------------------------
+
+describe("history-on-link (vault#483)", () => {
+  let home: string;
+  let manager: MirrorManager;
+  afterEach(async () => {
+    if (manager) await manager.stop();
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    _resetDeviceFlowSessionsForTest();
+  });
+
+  /** Run the device flow to `granted` against a mocked GitHub. */
+  async function grantDeviceFlow(mgr: MirrorManager): Promise<{
+    state: string;
+    history_enabled: true | false | "left_disabled";
+  }> {
+    const fetchCode = buildMockFetch([
+      {
+        match: (u) => u.includes("/login/device/code"),
+        body: {
+          device_code: "dev_xyz",
+          user_code: "ABCD-1234",
+          verification_uri: "https://github.com/login/device",
+          expires_in: 900,
+          interval: 5,
+        },
+      },
+    ]);
+    const codeRes = await handleAuthGithubDeviceCode(fetchCode);
+    expect(codeRes.status).toBe(200);
+    const { polling_id } = (await codeRes.json()) as { polling_id: string };
+    const fetchGranted = buildMockFetch([
+      {
+        match: (u) => u.includes("/login/oauth/access_token"),
+        body: { access_token: "ghu_granted1234567890", scope: "", token_type: "bearer" },
+      },
+      {
+        match: (u) => u.includes("/user"),
+        body: { login: "aaron", id: 12345, name: "Aaron G" },
+      },
+    ]);
+    const grantRes = await handleAuthGithubPoll(
+      new Request("http://x/poll", { method: "POST", body: JSON.stringify({ polling_id }) }),
+      mgr,
+      fetchGranted,
+    );
+    expect(grantRes.status).toBe(200);
+    return (await grantRes.json()) as {
+      state: string;
+      history_enabled: true | false | "left_disabled";
+    };
+  }
+
+  test("device-flow grant on a never-configured vault enables history with the standard defaults", async () => {
+    home = tmp("history-link-fresh-");
+    manager = makeSyncManager(home);
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+
+    const body = await grantDeviceFlow(manager);
+    expect(body.state).toBe("granted");
+    expect(body.history_enabled).toBe(true);
+
+    // Config file now exists with the standard internal-mirror defaults.
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(true);
+    expect(cfg?.location).toBe("internal");
+    expect(cfg?.sync_mode).toBe("events");
+    expect(cfg?.auto_commit).toBe(true);
+    // auto_push stays OFF at link time — no repo picked yet; select-repo's
+    // Cut 3 flips it once a remote exists.
+    expect(cfg?.auto_push).toBe(false);
+    // And the mirror actually started.
+    expect(manager.getStatus().enabled).toBe(true);
+  });
+
+  test("device-flow grant does NOT flip an explicitly-disabled mirror; flags left_disabled", async () => {
+    home = tmp("history-link-disabled-");
+    manager = makeSyncManager(home);
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: false,
+    });
+
+    const body = await grantDeviceFlow(manager);
+    expect(body.state).toBe("granted");
+    expect(body.history_enabled).toBe("left_disabled");
+
+    // The operator's explicit choice survives untouched.
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(false);
+    expect(manager.getStatus().enabled).toBe(false);
+  });
+
+  test("device-flow grant leaves an already-enabled mirror untouched (history_enabled true)", async () => {
+    home = tmp("history-link-enabled-");
+    manager = makeSyncManager(home);
+    // Non-default field values so "untouched" is distinguishable from
+    // "rewritten with defaults."
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      sync_mode: "manual",
+      auto_commit: false,
+      safety_net_seconds: 120,
+    });
+
+    const body = await grantDeviceFlow(manager);
+    expect(body.state).toBe("granted");
+    expect(body.history_enabled).toBe(true);
+
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(true);
+    expect(cfg?.sync_mode).toBe("manual");
+    expect(cfg?.auto_commit).toBe(false);
+    expect(cfg?.safety_net_seconds).toBe(120);
+  });
+
+  test("PAT save on a never-configured vault enables history, then Cut 3 flips auto_push (remote known)", async () => {
+    home = tmp("history-link-pat-fresh-");
+    manager = makeSyncManager(home);
+    fs.mkdirSync(path.join(home, "vault", "data", "default"), { recursive: true });
+
+    // probeOverride bypasses the real `git ls-remote`; 127.0.0.1:1 keeps the
+    // post-save initial push hermetic (instant connection refusal — never a
+    // real GitHub round-trip).
+    const res = await handleAuthPat(
+      new Request("http://x/pat", {
+        method: "POST",
+        body: JSON.stringify({
+          token: "ghp_link_test_token_123",
+          remote_url: "https://127.0.0.1:1/owner/repo.git",
+        }),
+      }),
+      manager,
+      async () => ({ ok: true }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      history_enabled: true | false | "left_disabled";
+      auto_push_enabled: boolean;
+    };
+    expect(body.history_enabled).toBe(true);
+    // PAT carries the remote, so the full chain runs: history on → Cut 3
+    // flips auto_push on the now-enabled mirror.
+    expect(body.auto_push_enabled).toBe(true);
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(true);
+    expect(cfg?.auto_push).toBe(true);
+    // No token leak.
+    expect(JSON.stringify(body)).not.toContain("ghp_link_test_token_123");
+  }, 30_000);
+
+  test("PAT save respects an explicitly-disabled mirror (left_disabled; auto_push untouched)", async () => {
+    home = tmp("history-link-pat-disabled-");
+    manager = makeSyncManager(home);
+    writeMirrorConfigForVault("default", {
+      ...defaultMirrorConfig(),
+      enabled: false,
+    });
+
+    const res = await handleAuthPat(
+      new Request("http://x/pat", {
+        method: "POST",
+        body: JSON.stringify({
+          token: "ghp_link_test_token_456",
+          remote_url: "https://127.0.0.1:1/owner/repo.git",
+        }),
+      }),
+      manager,
+      async () => ({ ok: true }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      history_enabled: true | false | "left_disabled";
+      auto_push_enabled: boolean;
+    };
+    expect(body.history_enabled).toBe("left_disabled");
+    expect(body.auto_push_enabled).toBe(false);
+    const cfg = readMirrorConfigForVault("default");
+    expect(cfg?.enabled).toBe(false);
+    expect(cfg?.auto_push).toBe(false);
   });
 });
 
