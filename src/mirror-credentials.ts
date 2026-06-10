@@ -209,8 +209,8 @@ export function emptyCredentials(): MirrorCredentials {
  *
  *   active_method: github_oauth
  *   github_oauth:
- *     access_token: gho_...
- *     scope: repo
+ *     access_token: ghu_...
+ *     scope: ""
  *     authorized_at: 2026-05-28T03:14:15.000Z
  *     user_login: aaron
  *     user_id: 12345
@@ -218,6 +218,10 @@ export function emptyCredentials(): MirrorCredentials {
  *     token: ghp_...
  *     remote_url: https://github.com/aaron/my-vault.git
  *     label: "GitHub PAT"
+ *
+ * `scope` is always `""` for tokens from the shared Parachute GitHub App
+ * (GitHub Apps use fine-grained permissions, not scopes). Credentials from
+ * the classic-OAuth era may still carry `scope: repo` — both parse fine.
  */
 export function serializeCredentials(creds: MirrorCredentials): string {
   const lines: string[] = [];

@@ -80,8 +80,10 @@ describe("client id helpers", () => {
     }
   });
 
-  test("the shipped default is a real GitHub App id, not a placeholder", () => {
-    expect(GITHUB_CLIENT_ID_DEFAULT.startsWith("Iv23")).toBe(true);
+  test("the shipped default is the registered Parachute GitHub App id", () => {
+    // Pin the exact value — it's public by design, and a typo'd constant
+    // would otherwise still pass a shape check.
+    expect(GITHUB_CLIENT_ID_DEFAULT).toBe("Iv23livaRF4VcvPhu3uB");
     expect(isPlaceholderClientId(GITHUB_CLIENT_ID_DEFAULT)).toBe(false);
   });
 
