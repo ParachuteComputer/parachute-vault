@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -473,6 +473,11 @@ export function initSchema(db: Database): void {
   // webhook triggers). Created by SCHEMA_SQL's CREATE TABLE IF NOT EXISTS
   // above, so this is a defensive confirmation hook for upgrading vaults.
   migrateToV21(db);
+
+  // Migrate v21 → v22: composite index notes(updated_at, id) backing cursor
+  // keyset pagination and date_filter on updated_at — both were full table
+  // scans. See the 2026-06-10 query-perf measurements.
+  migrateToV22(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1119,6 +1124,30 @@ function migrateToV21(db: Database): void {
       updated_at TEXT NOT NULL
     )
   `);
+}
+
+/**
+ * Migrate v21 → v22: composite B-tree on notes(updated_at, id).
+ *
+ * Two query shapes ride it (2026-06-10 perf measurements — both were full
+ * table scans + temp-B-tree sorts before):
+ *
+ *   1. Cursor keyset pagination (vault#313): the predicate
+ *      `updated_at > ? OR (updated_at = ? AND id > ?)` with
+ *      `ORDER BY updated_at ASC, id ASC` matches the composite key exactly,
+ *      so a "since last checked" poll seeks straight to the watermark and
+ *      streams in order — no scan, no sort.
+ *   2. `date_filter: { field: "updated_at" }` range queries (incremental
+ *      rebuild flows, vault#285 1.5).
+ *
+ * Lives here (not SCHEMA_SQL) following the idx_tokens_vault_name precedent:
+ * migrations run after every column-shape change, so the index statement
+ * never races an older table shape. Fresh vaults reach this through the
+ * same initSchema path — CREATE INDEX IF NOT EXISTS is idempotent.
+ */
+function migrateToV22(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  db.exec("CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at, id)");
 }
 
 function hasTable(db: Database, name: string): boolean {

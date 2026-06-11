@@ -491,10 +491,17 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
         // --- Hydrate links/attachments per note if requested ---
         if (params.include_links || params.include_attachments) {
+          // Links hydrate for the WHOLE page in a constant number of
+          // queries (see getLinksHydratedForNotes) — the per-note variant
+          // cost (1 link query + 1 summary query + N tag queries) × page
+          // size. 2026-06-10 perf measurements.
+          const linksByNote = params.include_links
+            ? linkOps.getLinksHydratedForNotes(db, (output as any[]).map((n: any) => n.id))
+            : null;
           const enrichedOut: any[] = [];
           for (const n of output as any[]) {
             const enriched: any = { ...n };
-            if (params.include_links) enriched.links = linkOps.getLinksHydrated(db, n.id);
+            if (linksByNote) enriched.links = linksByNote.get(n.id) ?? [];
             if (params.include_attachments) enriched.attachments = await store.getAttachments(n.id);
             enrichedOut.push(enriched);
           }

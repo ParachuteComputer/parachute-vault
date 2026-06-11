@@ -18,7 +18,7 @@ import {
   type CursorPayload,
   type QueryHashInputs,
 } from "./cursor.js";
-import { releaseField } from "./indexed-fields.js";
+import { getIndexedField, releaseField } from "./indexed-fields.js";
 
 let idCounter = 0;
 
@@ -142,11 +142,7 @@ export function getNotes(db: Database, ids: string[]): Note[] {
   const rows = db.prepare(
     `SELECT * FROM notes WHERE id IN (${placeholders}) ORDER BY created_at`,
   ).all(...ids) as NoteRow[];
-  return rows.map((row) => {
-    const note = rowToNote(row);
-    note.tags = getNoteTags(db, note.id);
-    return note;
-  });
+  return notesWithTags(db, rows);
 }
 
 /**
@@ -489,7 +485,6 @@ export function deleteNote(db: Database, id: string): void {
 export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const conditions: string[] = [];
   const params: SQLQueryBindings[] = [];
-  const joins: string[] = [];
 
   // Include tags — "all" (default): must have ALL tags; "any": must have ANY tag.
   // The `_tagsExpanded` internal field carries per-input-tag descendant sets
@@ -498,6 +493,15 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // `{manual, voice, text, ...}` per declared `_tags/*` config notes. Falls
   // back to `[opts.tags[i]]` (single-element set) when no expansion is set,
   // preserving the original semantics.
+  //
+  // Membership is expressed as a SEMIJOIN (`n.id IN (SELECT note_id ...)`),
+  // not a `JOIN note_tags`. A JOIN multiplies rows when a note carries
+  // several matching tags, which forced `SELECT DISTINCT n.*` — and that
+  // DISTINCT materialized every candidate's FULL row (content included)
+  // into a temp B-tree before LIMIT could apply, making large-tag queries
+  // cost O(candidates × row size) regardless of limit. The IN-subquery
+  // rides idx_note_tags_tag, produces each note id at most once, and lets
+  // the whole query drop DISTINCT. See the 2026-06-10 perf measurements.
   if (opts.tags && opts.tags.length > 0) {
     const tagSets: string[][] = (opts as QueryOpts & { _tagsExpanded?: string[][] })._tagsExpanded
       ?? opts.tags.map((t) => [t]);
@@ -508,17 +512,16 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
       const flat = Array.from(new Set(tagSets.flat()));
       if (flat.length > 0) {
         const placeholders = flat.map(() => "?").join(", ");
-        joins.push(`JOIN note_tags nt_or ON nt_or.note_id = n.id AND nt_or.tag_name IN (${placeholders})`);
+        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${placeholders}))`);
         params.push(...flat);
       }
     } else {
-      // "all": one JOIN per input tag, each accepting the input or any descendant.
-      for (let i = 0; i < tagSets.length; i++) {
-        const set = tagSets[i] ?? [];
-        if (set.length === 0) continue;
-        const alias = `nt${i}`;
+      // "all": one membership clause per input tag, each accepting the
+      // input or any descendant.
+      for (const set of tagSets) {
+        if (!set || set.length === 0) continue;
         const placeholders = set.map(() => "?").join(", ");
-        joins.push(`JOIN note_tags ${alias} ON ${alias}.note_id = n.id AND ${alias}.tag_name IN (${placeholders})`);
+        conditions.push(`n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${placeholders}))`);
         params.push(...set);
       }
     }
@@ -601,6 +604,20 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // Metadata filters — operator objects route through the indexed generated
   // column (fast, loud errors on non-indexed fields); primitives keep the
   // existing JSON-scan exact-match behavior for backcompat.
+  //
+  // Plain-equality fast path (2026-06-10 perf measurements): when the field
+  // happens to be indexed, a plain `{field: value}` equality used to pay the
+  // same full-table json_extract scan as a non-indexed field — 280× slower
+  // than the operator form `{field: {eq: value}}` ON THE SAME column. We now
+  // prepend an indexed-prefilter conjunct (`"meta_<field>" = ?`) so the
+  // B-tree narrows the candidates, while KEEPING the original json_extract
+  // clause as a residual predicate. The conjunction is result-identical to
+  // the scan by construction: any row the scan matches also satisfies the
+  // prefilter (the generated column is the same json_extract under the
+  // column's type affinity), and rows where the affinity-converted column
+  // matches but the raw extraction doesn't (e.g. JSON number 5 vs query
+  // string "5") are excluded by the residual — exactly as the scan excluded
+  // them. Pinned by query-plain-eq-routing.test.ts.
   if (opts.metadata) {
     for (const [key, value] of Object.entries(opts.metadata)) {
       if (isOperatorObject(value)) {
@@ -612,8 +629,17 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
         conditions.push(sql);
         params.push(...opParams);
       } else {
-        conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
-        params.push(key, typeof value === "string" ? value : JSON.stringify(value));
+        const bound = typeof value === "string" ? value : JSON.stringify(value);
+        // `getIndexedField` returning a row proves `key` was validated by
+        // FIELD_NAME_RE at declaration time, so interpolating the column
+        // name is safe — same justification as buildOperatorClause.
+        if (getIndexedField(db, key)) {
+          conditions.push(`("meta_${key}" = ? AND json_extract(n.metadata, '$.' || ?) = ?)`);
+          params.push(bound, key, bound);
+        } else {
+          conditions.push(`json_extract(n.metadata, '$.' || ?) = ?`);
+          params.push(key, bound);
+        }
       }
     }
   }
@@ -768,30 +794,89 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     // the column name is safe to interpolate. Append created_at as a
     // stable tiebreaker so two rows with the same indexed value have a
     // deterministic order.
-    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}`;
+    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}, n.id ${direction}`;
   } else {
-    orderBy = `n.created_at ${direction}`;
+    // id tiebreaker: same-millisecond inserts get deterministic relative
+    // order — load-bearing now that the two-phase page fetch makes
+    // pagination ordering the contract (#485 review nit).
+    orderBy = `n.created_at ${direction}, n.id ${direction}`;
   }
   const limit = typeof opts.limit === "number" ? opts.limit : 100;
   const offset = typeof opts.offset === "number" ? opts.offset : 0;
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
-  const sql = `
-    SELECT DISTINCT n.* FROM notes n
-    ${joins.join("\n")}
+  // Two-phase "deferred join" page fetch (2026-06-10 perf measurements).
+  //
+  // Phase 1 selects ONLY `n.id` — the ORDER BY temp B-tree (when one is
+  // needed) holds narrow id/sort-key entries instead of full note rows, so
+  // sort/materialization cost no longer scales with content size. With the
+  // tag semijoin above there is no row multiplication, so no DISTINCT.
+  //
+  // Phase 2 fetches full rows for just the page (≤ limit ids) and re-orders
+  // to the phase-1 order; tags are hydrated in ONE batched query instead of
+  // one query per returned note.
+  const idSql = `
+    SELECT n.id FROM notes n
     ${whereClause}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
   `;
   params.push(limit, offset);
 
-  const rows = db.prepare(sql).all(...params) as NoteRow[];
-  return rows.map((row) => {
-    const note = rowToNote(row);
-    note.tags = getNoteTags(db, note.id);
-    return note;
-  });
+  const idRows = db.prepare(idSql).all(...params) as { id: string }[];
+  return fetchNotesByIdsOrdered(db, idRows.map((r) => r.id));
+}
+
+/** Chunk size for IN-list queries — comfortably under SQLite's conservative
+ *  999 bound-variable floor (older builds), matching getLinkCounts. */
+const IN_CHUNK = 900;
+
+/**
+ * Fetch full note rows for `ids`, preserving the input order, with tags
+ * hydrated via ONE batched query per chunk (not one per note). Ids not
+ * found (deleted between phases) are silently dropped.
+ */
+function fetchNotesByIdsOrdered(db: Database, ids: string[]): Note[] {
+  if (ids.length === 0) return [];
+  const rowsById = new Map<string, NoteRow>();
+  for (let i = 0; i < ids.length; i += IN_CHUNK) {
+    const chunk = ids.slice(i, i + IN_CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = db.prepare(
+      `SELECT * FROM notes WHERE id IN (${placeholders})`,
+    ).all(...chunk) as NoteRow[];
+    for (const row of rows) rowsById.set(row.id, row);
+  }
+  const notes: Note[] = [];
+  for (const id of ids) {
+    const row = rowsById.get(id);
+    if (row) notes.push(rowToNote(row));
+  }
+  const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
+  for (const note of notes) note.tags = tagsById.get(note.id) ?? [];
+  return notes;
+}
+
+/**
+ * Batched tag lookup: tags for many notes in one IN-list query per chunk.
+ * Per-note arrays are sorted by tag_name — identical to `getNoteTags`.
+ * Every requested id is present in the map (empty array when untagged).
+ */
+export function getNoteTagsForNotes(db: Database, noteIds: string[]): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  if (noteIds.length === 0) return map;
+  const ids = [...new Set(noteIds)];
+  for (const id of ids) map.set(id, []);
+  for (let i = 0; i < ids.length; i += IN_CHUNK) {
+    const chunk = ids.slice(i, i + IN_CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = db.prepare(
+      `SELECT note_id, tag_name FROM note_tags WHERE note_id IN (${placeholders}) ORDER BY tag_name`,
+    ).all(...chunk) as { note_id: string; tag_name: string }[];
+    for (const row of rows) map.get(row.note_id)!.push(row.tag_name);
+  }
+  return map;
 }
 
 /**
@@ -895,20 +980,19 @@ export function searchNotes(
 
   if (opts?.tags && opts.tags.length > 0) {
     try {
+      // Tag membership as a semijoin — same rationale as queryNotes: a
+      // `JOIN note_tags` multiplies rows for multi-tagged notes and forced
+      // DISTINCT over full rows. The FTS join itself is 1:1 on rowid.
       const tagPlaceholders = opts.tags.map(() => "?").join(", ");
       const rows = db.prepare(`
-        SELECT DISTINCT n.* FROM notes n
+        SELECT n.* FROM notes n
         JOIN notes_fts fts ON fts.rowid = n.rowid
-        JOIN note_tags nt ON nt.note_id = n.id AND nt.tag_name IN (${tagPlaceholders})
         WHERE notes_fts MATCH ?
+          AND n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${tagPlaceholders}))
         ORDER BY rank
         LIMIT ?
-      `).all(...opts.tags, query, limit) as NoteRow[];
-      return rows.map((row) => {
-        const note = rowToNote(row);
-        note.tags = getNoteTags(db, note.id);
-        return note;
-      });
+      `).all(query, ...opts.tags, limit) as NoteRow[];
+      return notesWithTags(db, rows);
     } catch {
       return [];
     }
@@ -922,14 +1006,18 @@ export function searchNotes(
       ORDER BY rank
       LIMIT ?
     `).all(query, limit) as NoteRow[];
-    return rows.map((row) => {
-      const note = rowToNote(row);
-      note.tags = getNoteTags(db, note.id);
-      return note;
-    });
+    return notesWithTags(db, rows);
   } catch {
     return [];
   }
+}
+
+/** Map rows → Notes with tags hydrated in one batched query. */
+function notesWithTags(db: Database, rows: NoteRow[]): Note[] {
+  const notes = rows.map(rowToNote);
+  const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
+  for (const note of notes) note.tags = tagsById.get(note.id) ?? [];
+  return notes;
 }
 
 // ---- Tag Operations ----

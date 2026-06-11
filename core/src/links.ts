@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Link, NoteSummary, HydratedLink } from "./types.js";
-import { getNoteTags } from "./notes.js";
+import { getNoteTagsForNotes } from "./notes.js";
 
 export function createLink(
   db: Database,
@@ -103,28 +103,25 @@ function parseMetadata(raw: string | null): Record<string, unknown> | undefined 
   try { return JSON.parse(raw); } catch { return undefined; }
 }
 
-function getNoteSummary(db: Database, noteId: string): NoteSummary | undefined {
-  const row = db.prepare(
-    "SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id = ?",
-  ).get(noteId) as SummaryRow | null;
-  if (!row) return undefined;
-  return {
-    id: row.id,
-    path: row.path ?? undefined,
-    metadata: parseMetadata(row.metadata),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at ?? undefined,
-    tags: getNoteTags(db, row.id),
-  };
-}
+/** IN-list chunk size — matches getLinkCounts' conservative bound-variable floor. */
+const IN_CHUNK = 900;
 
 function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSummary> {
   const map = new Map<string, NoteSummary>();
   if (noteIds.length === 0) return map;
-  const placeholders = noteIds.map(() => "?").join(", ");
-  const rows = db.prepare(
-    `SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id IN (${placeholders})`,
-  ).all(...noteIds) as SummaryRow[];
+  const ids = [...new Set(noteIds)];
+  const rows: SummaryRow[] = [];
+  for (let i = 0; i < ids.length; i += IN_CHUNK) {
+    const chunk = ids.slice(i, i + IN_CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+    rows.push(...db.prepare(
+      `SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id IN (${placeholders})`,
+    ).all(...chunk) as SummaryRow[]);
+  }
+  // ONE batched tag lookup for every summary on the page — this used to be
+  // a per-summary query, which made hydrating a well-linked note cost
+  // O(linked notes) round-trips (2026-06-10 perf measurements).
+  const tagsById = getNoteTagsForNotes(db, rows.map((r) => r.id));
   for (const row of rows) {
     map.set(row.id, {
       id: row.id,
@@ -132,7 +129,7 @@ function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSumm
       metadata: parseMetadata(row.metadata),
       createdAt: row.created_at,
       updatedAt: row.updated_at ?? undefined,
-      tags: getNoteTags(db, row.id),
+      tags: tagsById.get(row.id) ?? [],
     });
   }
   return map;
@@ -148,8 +145,11 @@ export function getLinksHydrated(
   opts?: { direction?: "outbound" | "inbound" | "both"; include_content?: boolean },
 ): HydratedLink[] {
   const links = getLinks(db, noteId, opts);
+  return hydrateLinks(db, links);
+}
 
-  // Collect all note IDs we need to hydrate
+/** Attach source/target note summaries to a set of links (batched). */
+function hydrateLinks(db: Database, links: Link[]): HydratedLink[] {
   const noteIds = new Set<string>();
   for (const link of links) {
     noteIds.add(link.sourceId);
@@ -163,6 +163,61 @@ export function getLinksHydrated(
     sourceNote: summaries.get(link.sourceId),
     targetNote: summaries.get(link.targetId),
   }));
+}
+
+/**
+ * Batch variant of `getLinksHydrated` for the `include_links` enrichment
+ * loops (MCP query-notes list path, REST GET /api/notes): hydrates links for
+ * a whole PAGE of notes in a constant number of queries — two indexed
+ * IN-list scans over `links` per chunk, one summary fetch, one batched tag
+ * lookup — instead of (1 link query + 1 summary query + N tag queries) per
+ * note. See the 2026-06-10 perf measurements (include_links scaled
+ * per-returned-note).
+ *
+ * Returns a map keyed by every requested note id (empty array when the note
+ * has no links). Each note's list contains links touching it in either
+ * direction, ordered created_at DESC — same contract as the single-note
+ * `getLinksHydrated`. A link between two notes that are BOTH on the page
+ * appears in both notes' lists, exactly as the per-note calls produced.
+ */
+export function getLinksHydratedForNotes(
+  db: Database,
+  noteIds: string[],
+): Map<string, HydratedLink[]> {
+  const result = new Map<string, HydratedLink[]>();
+  if (noteIds.length === 0) return result;
+  const ids = [...new Set(noteIds)];
+  for (const id of ids) result.set(id, []);
+
+  // Collect every link touching any requested note, deduped on the
+  // (source, target, relationship) primary key so a link whose endpoints
+  // are both on the page is fetched once.
+  const rowsByKey = new Map<string, LinkRow>();
+  for (let i = 0; i < ids.length; i += IN_CHUNK) {
+    const chunk = ids.slice(i, i + IN_CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+    for (const column of ["source_id", "target_id"] as const) {
+      const rows = db.prepare(
+        `SELECT * FROM links WHERE ${column} IN (${placeholders})`,
+      ).all(...chunk) as LinkRow[];
+      for (const row of rows) {
+        rowsByKey.set(`${row.source_id}|${row.target_id}|${row.relationship}`, row);
+      }
+    }
+  }
+
+  // Stable sort newest-first to mirror the single-note SQL's
+  // ORDER BY created_at DESC (ISO timestamps sort lexicographically).
+  const links = [...rowsByKey.values()]
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
+    .map(rowToLink);
+
+  const hydrated = hydrateLinks(db, links);
+  for (const link of hydrated) {
+    result.get(link.sourceId)?.push(link);
+    if (link.targetId !== link.sourceId) result.get(link.targetId)?.push(link);
+  }
+  return result;
 }
 
 /**
