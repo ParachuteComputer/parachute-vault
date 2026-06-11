@@ -794,9 +794,12 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     // the column name is safe to interpolate. Append created_at as a
     // stable tiebreaker so two rows with the same indexed value have a
     // deterministic order.
-    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}`;
+    orderBy = `"meta_${opts.orderBy}" ${direction}, n.created_at ${direction}, n.id ${direction}`;
   } else {
-    orderBy = `n.created_at ${direction}`;
+    // id tiebreaker: same-millisecond inserts get deterministic relative
+    // order — load-bearing now that the two-phase page fetch makes
+    // pagination ordering the contract (#485 review nit).
+    orderBy = `n.created_at ${direction}, n.id ${direction}`;
   }
   const limit = typeof opts.limit === "number" ? opts.limit : 100;
   const offset = typeof opts.offset === "number" ? opts.offset : 0;
