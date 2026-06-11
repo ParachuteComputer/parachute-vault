@@ -952,8 +952,9 @@ async function handleNotesInner(
         const nodes = output.map((n: any) => ({ id: n.id, path: n.path ?? null, tags: n.tags ?? [] }));
         const edges: { source: string; target: string; relationship: string }[] = [];
         if (includeLinks) {
+          const linksByNote = linkOps.getLinksHydratedForNotes(db, results.map((n) => n.id));
           for (const n of results) {
-            for (const link of linkOps.getLinksHydrated(db, n.id)) {
+            for (const link of linksByNote.get(n.id) ?? []) {
               // Only include edges where source is this note and target is in the result set
               if (link.sourceId === n.id && resultIds.has(link.targetId)) {
                 edges.push({ source: link.sourceId, target: link.targetId, relationship: link.relationship });
@@ -965,13 +966,19 @@ async function handleNotesInner(
       }
 
       if (includeLinks || includeAttachments) {
+        // Whole-page link hydration in a constant number of queries — the
+        // per-note variant cost (1 link query + 1 summary query + N tag
+        // queries) × page size. 2026-06-10 perf measurements.
+        const linksByNote = includeLinks
+          ? linkOps.getLinksHydratedForNotes(db, output.map((n: any) => n.id))
+          : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
           const enriched: any = { ...n };
-          if (includeLinks) {
+          if (linksByNote) {
             // Tag-scope: strip out-of-scope-neighbor links (no-op unscoped).
             enriched.links = filterHydratedLinksByTagScope(
-              linkOps.getLinksHydrated(db, n.id),
+              linksByNote.get(n.id) ?? [],
               tagScope.allowed,
               tagScope.raw,
             );

@@ -36,6 +36,41 @@ to `@latest`.
 
 ## [Unreleased]
 
+### Performance (query path — the 2026-06-10 measurements)
+
+- **Tag/list queries no longer materialize every candidate row.**
+  `queryNotes` expressed tag membership as `JOIN note_tags` + `SELECT
+  DISTINCT n.*`, which forced every candidate's full row (content included)
+  through a temp B-tree before LIMIT applied — cost scaled with rows
+  *scanned*, not returned (limit 5 ≈ limit 80). Tag membership is now a
+  semijoin (`n.id IN (SELECT note_id FROM note_tags …)`), DISTINCT is gone,
+  and the query runs as a two-phase "deferred join": phase 1 selects only
+  the page of ids, phase 2 fetches full rows for ≤ limit ids and hydrates
+  tags in one batched query instead of one per note. 20k-member tag scan:
+  158ms → 23ms; the per-returned-note tag N+1 is gone everywhere
+  (`queryNotes`, `searchNotes`, `getNotes`).
+- **Plain `{field: value}` metadata equality rides the index when the field
+  is indexed.** Previously only the operator form (`{field: {eq: v}}`) used
+  the generated column; the plain form paid a full-table `json_extract`
+  scan on the very same field. Plain equality now prepends an indexed
+  prefilter conjunct while keeping the original `json_extract` clause as a
+  residual predicate — result-identical to the scan by construction (pinned
+  by a twin-field property test over edge values: numbers, null, nested
+  objects, numeric-looking strings). Zero-match worst case at 25k notes:
+  28.7ms → 0.04ms.
+- **`include_links` hydration is batched per page.** The MCP and REST list
+  paths called `getLinksHydrated` per note — 1 link query + 1 summary query
+  + one tag query *per linked note*, per result. New
+  `getLinksHydratedForNotes` hydrates the whole page in a constant number
+  of queries (two indexed IN-scans over `links` per chunk + one summary
+  fetch + one batched tag lookup); link-summary hydration inside
+  `traverseLinks`/`near` also drops its per-summary tag N+1.
+- **Schema v22: composite index `notes(updated_at, id)`.** Cursor keyset
+  pagination (vault#313) and `date_filter` on `updated_at` were full table
+  scans + sorts; the keyset poll now seeks straight to the watermark.
+  25k-note cursor poll: 378ms → 0.4ms. (No rc bump in this entry — the
+  version bump lands at tag time.)
+
 ### Fixed
 
 - **JWKS hairpin through the public Cloudflare tunnel (vault#464).** Vault now
