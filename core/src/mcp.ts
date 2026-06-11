@@ -15,6 +15,12 @@ import {
   type ExpandContext,
   type ExpandMode,
 } from "./expand.js";
+import {
+  parseContentRange,
+  applyContentRange,
+  contentRangeRequiresContent,
+  MIN_CONTENT_LENGTH,
+} from "./content-range.js";
 
 export interface McpToolDef {
   name: string;
@@ -153,6 +159,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
 
 Defaults: include_content=true for single note, false for lists. include_links=false. tag_match="any".
 
+Large notes: pass \`content_offset\` / \`content_length\` (UTF-8 bytes) for a bounded read of note content — the response carries the slice plus \`content_total_length\` and \`content_next_offset\` (null when complete). Loop, feeding \`content_next_offset\` back as \`content_offset\`, to read a note too large for one response.
+
 Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.`,
       inputSchema: {
         type: "object",
@@ -243,6 +251,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               "Opaque cursor for 'since last checked' agent loops (vault#313). First call: omit. The response will include `next_cursor` — pass it on the subsequent call to receive only notes created or updated since the prior page. The cursor binds to the query's filters (tag, path, metadata, etc.); changing them between calls returns a structured `cursor_query_mismatch` error. Pagination via cursor orders results by `updated_at ASC` and is mutually exclusive with `order_by` and `sort: \"desc\"`. The response shape switches to `{notes, next_cursor}` when this parameter is present.",
           },
           include_content: { type: "boolean", description: "Include note content (default: true for single, false for list)" },
+          content_offset: {
+            type: "number",
+            description:
+              "Byte offset (UTF-8) into note content to start reading from (default 0). For reading a note too large for one response: pass the previous response's `content_next_offset` here to continue. An offset landing mid-codepoint is aligned DOWN to the codepoint's leading byte (chained `content_next_offset` values are always aligned); the effective start is echoed back as `content_offset` on the response. Requires content in the response — errors when combined with include_content=false (or a list query without include_content=true).",
+          },
+          content_length: {
+            type: "number",
+            description:
+              `Maximum bytes (UTF-8) of note content to return (minimum ${MIN_CONTENT_LENGTH}). When this or content_offset is set, the returned \`content\` is the byte slice and the response gains \`content_offset\` (effective start), \`content_total_length\` (full content size in bytes), and \`content_next_offset\` (pass back as content_offset to continue; null when the slice reaches the end). Slices end on a UTF-8 codepoint boundary, so a slice may be up to 3 bytes under the budget — never over. Concatenating the slices from offset 0 through content_next_offset=null reconstructs the content byte-for-byte. On list queries the same window applies to each note's content independently. When expand_links=true the range applies to the returned (expanded) content.`,
+          },
           include_metadata: {
             oneOf: [
               { type: "boolean" },
@@ -292,17 +310,31 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             }
           : null;
 
+        // --- Content range (bounded reads for large notes) ---
+        // Validates loudly: bad values throw QueryError here, before any
+        // query work. Null when neither param is present — response shape
+        // stays byte-identical to the no-pagination behavior.
+        const contentRange = parseContentRange(params.content_offset, params.content_length);
+
         // --- Single note by ID/path ---
         if (params.id) {
           const note = resolveNote(db, params.id as string);
           if (!note) return { error: "Note not found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
+          // Range params are meaningless on a content-less shape — error
+          // rather than silently ignore (same loud-validation policy as
+          // `expand`).
+          if (contentRange && !includeContent) throw contentRangeRequiresContent();
           let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
           if (expandCtx && includeContent && typeof result.content === "string") {
             // Mark the top-level note as already expanded so it can't recursively inline itself.
             expandCtx.expanded.add(note.id);
             result.content = expandContent(result.content, expandCtx, expandDepth);
           }
+          // Range applies to the FINAL returned content — after wikilink
+          // expansion — so the window the client pages through is the same
+          // document it would have received unpaged.
+          if (contentRange && includeContent) applyContentRange(result, contentRange);
           result = filterMetadata(result, params.include_metadata as boolean | string[] | undefined);
           if (params.include_links) {
             result.links = linkOps.getLinksHydrated(db, note.id);
@@ -457,6 +489,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
         // --- Format output ---
         const includeContent = params.include_content === true; // default false for list
+        // Range params require content in the response — on lists that
+        // means an explicit include_content=true (the lean default carries
+        // no content to slice). Error rather than silently ignore.
+        if (contentRange && !includeContent) throw contentRangeRequiresContent();
         const includeMetadata = params.include_metadata as boolean | string[] | undefined;
         let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(noteOps.toNoteIndex);
 
@@ -469,6 +505,15 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               n.content = expandContent(n.content, expandCtx, expandDepth);
             }
           }
+        }
+
+        // --- Content range (per-note, post-expansion) ---
+        // The same byte window applies to EACH note's content independently
+        // — the primary use is a single large note, but list mode keeps the
+        // simple per-note semantic (every note reports its own
+        // content_total_length / content_next_offset).
+        if (contentRange && includeContent) {
+          for (const n of output) applyContentRange(n, contentRange);
         }
 
         // --- Apply metadata filtering ---

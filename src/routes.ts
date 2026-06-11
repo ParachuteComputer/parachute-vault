@@ -15,6 +15,12 @@ import type { Store, Note, QueryOpts } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import {
+  parseContentRange,
+  applyContentRange,
+  contentRangeRequiresContent,
+  type ContentRange,
+} from "../core/src/content-range.ts";
 import { attachValidationStatus } from "../core/src/mcp.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
@@ -101,6 +107,37 @@ function parseLinkCountDirection(url: URL): "both" | "outbound" | "inbound" {
 function parseQueryList(url: URL, key: string): string[] | undefined {
   const val = url.searchParams.get(key);
   return val ? val.split(",") : undefined;
+}
+
+/**
+ * Parse `?content_offset=` / `?content_length=` (content range — bounded
+ * reads for large notes; unit is UTF-8 bytes, see core/src/content-range.ts
+ * for the codepoint-boundary slicing rules). Returns `{ range: null }` when
+ * neither param is present (response byte-identical to the no-pagination
+ * shape), or `{ error }` (400 INVALID_QUERY) on invalid values or when the
+ * response shape excludes content — range params on a content-less shape
+ * error loudly rather than silently no-op, same policy as `?expand=`.
+ */
+function parseContentRangeQuery(
+  url: URL,
+  includeContent: boolean,
+): { range: ContentRange | null; error?: Response } {
+  try {
+    const range = parseContentRange(
+      parseQuery(url, "content_offset") ?? undefined,
+      parseQuery(url, "content_length") ?? undefined,
+    );
+    if (range && !includeContent) throw contentRangeRequiresContent();
+    return { range };
+  } catch (e: any) {
+    // Duck-type on `name` — core is a separate module, so `instanceof`
+    // is fragile across bundling boundaries (same note as the QueryError
+    // handling in the structured-query path below).
+    if (e && e.name === "QueryError") {
+      return { range: null, error: json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400) };
+    }
+    throw e;
+  }
 }
 
 /**
@@ -706,12 +743,18 @@ async function handleNotesInner(
           return json({ error: "Note not found", id }, 404);
         }
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
+        const contentRange = parseContentRangeQuery(url, includeContent);
+        if (contentRange.error) return contentRange.error;
         let result: any = includeContent ? { ...note } : toNoteIndex(note);
         const expand = parseExpandParams(url, db, tagScope);
         if (expand && includeContent && typeof result.content === "string") {
           expand.ctx.expanded.add(note.id);
           result.content = expandContent(result.content, expand.ctx, expand.depth);
         }
+        // Content range applies to the FINAL returned content (post-
+        // expansion) — the window the client pages through is the same
+        // document it would have received unpaged.
+        if (contentRange.range && includeContent) applyContentRange(result, contentRange.range);
         result = filterMetadata(result, parseIncludeMetadata(url));
         if (parseBool(parseQuery(url, "include_links"), false)) {
           // Tag-scope: drop links whose neighbor is out of scope so the
@@ -769,6 +812,8 @@ async function handleNotesInner(
         // returns 200 [] (consistent with "no matches"), not 403.
         const results = filterNotesByTagScope(rawResults, tagScope.allowed, tagScope.raw);
         const includeContent = parseBool(parseQuery(url, "include_content"), false);
+        const contentRange = parseContentRangeQuery(url, includeContent);
+        if (contentRange.error) return contentRange.error;
         const inclMeta = parseIncludeMetadata(url);
         let output: any[] = includeContent ? results.map((n) => ({ ...n })) : results.map(toNoteIndex);
         const expand = parseExpandParams(url, db, tagScope);
@@ -779,6 +824,10 @@ async function handleNotesInner(
               n.content = expandContent(n.content, expand.ctx, expand.depth);
             }
           }
+        }
+        // Content range — per-note, post-expansion (see core/src/content-range.ts).
+        if (contentRange.range && includeContent) {
+          for (const n of output) applyContentRange(n, contentRange.range);
         }
         if (inclMeta !== undefined && inclMeta !== true) {
           output = output.map((n: any) => filterMetadata(n, inclMeta));
@@ -910,6 +959,8 @@ async function handleNotesInner(
       results = filterNotesByTagScope(results, tagScope.allowed, tagScope.raw);
 
       const includeContent = parseBool(parseQuery(url, "include_content"), false);
+      const contentRange = parseContentRangeQuery(url, includeContent);
+      if (contentRange.error) return contentRange.error;
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
@@ -923,6 +974,10 @@ async function handleNotesInner(
             n.content = expandContent(n.content, expand.ctx, expand.depth);
           }
         }
+      }
+      // Content range — per-note, post-expansion (see core/src/content-range.ts).
+      if (contentRange.range && includeContent) {
+        for (const n of output) applyContentRange(n, contentRange.range);
       }
       if (inclMeta !== undefined && inclMeta !== true) {
         output = output.map((n: any) => filterMetadata(n, inclMeta));
@@ -1259,12 +1314,16 @@ async function handleNotesInner(
       return json({ error: "Not found" }, 404);
     }
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
+    const contentRange = parseContentRangeQuery(url, includeContent);
+    if (contentRange.error) return contentRange.error;
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
     const expand = parseExpandParams(url, db, tagScope);
     if (expand && includeContent && typeof result.content === "string") {
       expand.ctx.expanded.add(note.id);
       result.content = expandContent(result.content, expand.ctx, expand.depth);
     }
+    // Content range applies to the FINAL returned content (post-expansion).
+    if (contentRange.range && includeContent) applyContentRange(result, contentRange.range);
     result = filterMetadata(result, parseIncludeMetadata(url));
     if (parseBool(parseQuery(url, "include_links"), false)) {
       // Tag-scope: drop out-of-scope-neighbor links (no-op unscoped).

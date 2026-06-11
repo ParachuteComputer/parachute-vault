@@ -306,6 +306,57 @@ single string and keep calling without special-casing the empty case.
 cursors and date filters coexist (cursor = "since last checked", dateFilter
 = "between X and Y").
 
+## Content range — bounded reads for large notes
+
+MCP responses are size-limited: a 100KB transcript can't come back from one
+`query-notes` call, and a remote MCP client has no `curl | head -c` escape
+hatch. `content_offset` / `content_length` page through note *content* in
+byte windows (orthogonal to `cursor`, which pages through note *lists*):
+
+```
+GET /vault/{name}/api/notes/{id}?content_offset=0&content_length=65536
+→ { ..., "content": "<first ≤64KB>",
+       "content_offset": 0,            // effective start (see alignment below)
+       "content_total_length": 118034, // full size, UTF-8 bytes
+       "content_next_offset": 65530 }  // pass back as content_offset; null when done
+```
+
+Loop until `content_next_offset` is `null`; concatenating the slices
+reconstructs the content byte-for-byte (the reassembly invariant is pinned
+by a property test).
+
+**Unit + alignment.** The unit is **UTF-8 bytes** (same as `byteSize` on the
+lean `NoteIndex`). Slices always end on a codepoint boundary *within* the
+budget — never over `content_length`, but up to 3 bytes under when a
+multi-byte character straddles the cut (which is why the example above
+resumes at 65530, not 65536). An offset landing mid-codepoint (only possible
+when you compute offsets by hand — chained `content_next_offset` values are
+always aligned) is aligned **down** to the codepoint's leading byte so no
+bytes are skipped; the effective start is echoed back as `content_offset`.
+
+**Rules.**
+
+- `content_offset` ≥ 0 (default 0); `content_length` ≥ 4 (the largest UTF-8
+  codepoint, so every window makes progress). Invalid values → `400
+  INVALID_QUERY`.
+- Range params require content in the response. With
+  `include_content=false` — or a list query left on its lean default — they
+  error (`400 INVALID_QUERY`) rather than silently no-op.
+- An offset at/past the end returns `content: ""` with
+  `content_next_offset: null` (graceful loop termination, e.g. when the
+  note shrank between calls).
+- On **list** queries (with `include_content=true`) the same window applies
+  to each note's content independently — every note reports its own
+  `content_total_length` / `content_next_offset`. The primary use is a
+  single large note.
+- With `expand=true` (wikilink inlining) the range applies to the returned
+  (expanded) content.
+- Without range params, responses are byte-identical to the pre-pagination
+  shape — no new fields appear.
+
+The MCP face is identical: `query-notes` takes `content_offset` /
+`content_length` as tool params and returns the same response fields.
+
 ## Endpoints
 
 The rest of this section documents every endpoint reachable on the REST
@@ -398,6 +449,11 @@ Query params:
 - **Output shape**
   - `include_content=true|false` — return `Note[]` (full body) instead of
     the default lean `NoteIndex[]`.
+  - `content_offset=N&content_length=M` — byte window over each returned
+    note's content (requires `include_content=true` here; the lean default
+    has no content to slice). See "Content range — bounded reads for large
+    notes" above for units, alignment, and the response fields
+    (`content_total_length`, `content_next_offset`).
   - `include_links=true` — fold each note's outbound links into the result
     rows.
   - `include_attachments=true` — fold each note's attachments into the
@@ -552,6 +608,10 @@ Folding options:
 - `include_attachments=true` — append attachments as an `attachments` field.
 - `include_metadata=...` — same allowlist as the list endpoint.
 - `expand=true&depth=N` — inline `[[wikilink]]` targets.
+- `content_offset=N&content_length=M` — bounded read of a large note's
+  content in byte windows; the response gains `content_offset` /
+  `content_total_length` / `content_next_offset`. See "Content range —
+  bounded reads for large notes" above.
 
 #### `PATCH /vault/{name}/api/notes/{idOrPath}` — `vault:write`
 Update content, path, metadata, extension, tags, or links. The body
