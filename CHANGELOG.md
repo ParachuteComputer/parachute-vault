@@ -36,6 +36,29 @@ to `@latest`.
 
 ## [Unreleased]
 
+### Added
+
+- **Content range / pagination — bounded reads for large notes (Benjamin's
+  spec).** `query-notes` (MCP) and the REST `GET /notes` family (point read,
+  `?id=`, structured list, search) accept `content_offset` (default 0) +
+  `content_length` (byte budget, min 4). When either is set, the returned
+  `content` is a byte slice and the response gains `content_offset`
+  (effective start), `content_total_length`, and `content_next_offset`
+  (`null` when complete) — so MCP clients can read notes too large to
+  return in one response by looping `content_next_offset` back in as
+  `content_offset`. Unit is UTF-8 bytes; slices always end on a codepoint
+  boundary *within* the budget (never over; up to 3 bytes under when a
+  multi-byte character straddles the cut), and an offset landing
+  mid-codepoint aligns down to the codepoint's leading byte, so
+  concatenating the slices reconstructs the content byte-for-byte (pinned
+  by a property test). On list queries the same window applies to each
+  note's content independently; with `expand_links=true` the range applies
+  to the expanded content. Range params on a content-less shape
+  (`include_content=false`, or a list left on its lean default) error
+  loudly (`INVALID_QUERY` / 400) rather than silently no-op. Responses
+  without range params are byte-identical to before. (No rc bump in this
+  entry — the version bump lands at tag time.)
+
 ### Performance (query path — the 2026-06-10 measurements)
 
 - **Tag/list queries no longer materialize every candidate row.**

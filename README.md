@@ -530,6 +530,23 @@ curl -H "Authorization: Bearer $VAULT_TOKEN" \
 
 Caller-tunable preview length is a future enhancement — file an issue if 120 chars isn't enough.
 
+### Read a large note in chunks (content range)
+
+A 100KB+ transcript won't fit in one MCP response. Pass `content_offset` / `content_length` (UTF-8 bytes) for a bounded read — the response carries the slice plus `content_total_length` and `content_next_offset` (`null` when complete). Loop, feeding `content_next_offset` back in as `content_offset`; concatenating the slices reconstructs the content byte-for-byte. Slices end on a codepoint boundary within the budget (never over `content_length`, at most 3 bytes under).
+
+```bash
+curl -H "Authorization: Bearer $VAULT_TOKEN" \
+  "http://localhost:1940/vault/default/api/notes/Meetings%2F2026-06-09?content_offset=0&content_length=65536"
+# → { ..., "content": "<first ≤64KB>", "content_total_length": 118034, "content_next_offset": 65530 }
+```
+
+```jsonc
+// MCP — same params on query-notes; works per-note on lists with include_content: true
+{ "name": "query-notes", "arguments": { "id": "Meetings/2026-06-09", "content_offset": 0, "content_length": 65536 } }
+```
+
+Range params require content in the response — with `include_content=false` (or a list query left on its lean default) they error rather than silently no-op. Full semantics in [docs/HTTP_API.md](./docs/HTTP_API.md) ("Content range — bounded reads for large notes").
+
 ### Incremental rebuilds: "what changed since X"
 
 The SSG / sync pattern. Two equivalent forms — bracket-style is canonical going forward; the flat form is the same shape that ships through the REST/MCP date filter today.
