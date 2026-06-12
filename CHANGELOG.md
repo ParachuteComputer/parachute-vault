@@ -34,10 +34,20 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
-## [Unreleased]
+## [0.6.1] - 2026-06-12
 
 ### Added
 
+- **Guided GitHub App install flow for the mirror "Back up to GitHub"
+  surface (#481, #484).** The shared Parachute GitHub App's `client_id` now
+  ships as the build default (#481), and the connect flow understands
+  GitHub-App semantics — authorization and installation are separate steps
+  (#480): an install probe (`GET /user/installations`) detects
+  authorized-but-not-installed and links to the app's install page, the
+  repo picker unions installation repos so org repos appear, linking a
+  repo turns history on for pre-#440 vaults (#483), and bring-your-own-app
+  is a documented override pair (`PARACHUTE_GITHUB_CLIENT_ID` +
+  `PARACHUTE_GITHUB_APP_SLUG` — set both or neither).
 - **Content range / pagination — bounded reads for large notes (Benjamin's
   spec).** `query-notes` (MCP) and the REST `GET /notes` family (point read,
   `?id=`, structured list, search) accept `content_offset` (default 0) +
@@ -56,8 +66,7 @@ to `@latest`.
   to the expanded content. Range params on a content-less shape
   (`include_content=false`, or a list left on its lean default) error
   loudly (`INVALID_QUERY` / 400) rather than silently no-op. Responses
-  without range params are byte-identical to before. (No rc bump in this
-  entry — the version bump lands at tag time.)
+  without range params are byte-identical to before. (#486)
 
 ### Performance (query path — the 2026-06-10 measurements)
 
@@ -91,8 +100,16 @@ to `@latest`.
 - **Schema v22: composite index `notes(updated_at, id)`.** Cursor keyset
   pagination (vault#313) and `date_filter` on `updated_at` were full table
   scans + sorts; the keyset poll now seeks straight to the watermark.
-  25k-note cursor poll: 378ms → 0.4ms. (No rc bump in this entry — the
-  version bump lands at tag time.)
+  25k-note cursor poll: 378ms → 0.4ms. The v22 migration runs automatically
+  at first boot on 0.6.1. (#485)
+
+## [0.6.0] - 2026-06-09
+
+Shipped without a changelog roll — this entry is backfilled. The block
+below is what had accumulated in `Unreleased` at tag time; the release
+also carried the hub-module boundary wave (`/vault/admin` multi-vault
+home, reserved-name validators — PR #473). Per-PR detail lives in git
+history.
 
 ### Fixed
 
@@ -104,8 +121,8 @@ to `@latest`.
   timed out the first MCP-over-public auth). `iss` is still validated against
   `PARACHUTE_HUB_ORIGIN`; a vault on a separate box from its hub overrides the
   fetch origin with the new `PARACHUTE_HUB_JWKS_ORIGIN` env var. Bumps
-  `@openparachute/scope-guard` → `0.4.1-rc.1` for the `jwksOrigin` seam. (No
-  rc bump in this entry — the version bump lands at tag time.)
+  `@openparachute/scope-guard` → `0.4.1-rc.1` for the `jwksOrigin` seam.
+  (#465)
 
 ## [0.5.2] - 2026-06-06
 
