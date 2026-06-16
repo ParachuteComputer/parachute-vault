@@ -2395,6 +2395,108 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
     expect(creds?.pat?.remote_url).toContain("OTHER-repo.git");
   });
 
+  test("vault#482: import-sync to a repo a SIBLING vault already backs up → import succeeds but sync declined + conflict warning", async () => {
+    home = tmp("import-sync-cross-vault-");
+    await bootstrapVault(home); // creates vault "default"
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    // Sibling vault "family" already syncs to the repo we're importing.
+    const sibDataDir = path.join(home, "vault", "data", "family");
+    fs.mkdirSync(sibDataDir, { recursive: true });
+    fs.writeFileSync(path.join(sibDataDir, "vault.yaml"), "name: family\n");
+    writeMirrorConfigForVault("family", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+    });
+    const sibGitDir = path.join(sibDataDir, "mirror", ".git");
+    fs.mkdirSync(sibGitDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sibGitDir, "config"),
+      '[remote "origin"]\n\turl = https://github.com/aaron/my-vault.git\n',
+    );
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      notes_imported: number;
+      sync_enabled: boolean;
+      sync_warning?: string;
+    };
+    // Import itself never fails on the conflict.
+    expect(body.notes_imported).toBe(2);
+    // ...but sync is declined + the warning names the sibling vault + repo.
+    expect(body.sync_enabled).toBe(false);
+    expect(body.sync_warning).toContain("family");
+    expect(body.sync_warning).toContain("github.com/aaron/my-vault");
+
+    // No sync config / credential got persisted for "default".
+    expect(readMirrorConfigForVault("default")).toBeUndefined();
+    expect(readCredentials("default")).toBeNull();
+  });
+
+  test("vault#482: import-sync with override=true binds anyway despite a sibling on the same repo", async () => {
+    home = tmp("import-sync-cross-override-");
+    await bootstrapVault(home);
+    fixture = await buildExportFixture();
+    manager = makeSyncManager(home);
+
+    const sibDataDir = path.join(home, "vault", "data", "family");
+    fs.mkdirSync(sibDataDir, { recursive: true });
+    fs.writeFileSync(path.join(sibDataDir, "vault.yaml"), "name: family\n");
+    writeMirrorConfigForVault("family", {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal",
+    });
+    const sibGitDir = path.join(sibDataDir, "mirror", ".git");
+    fs.mkdirSync(sibGitDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sibGitDir, "config"),
+      '[remote "origin"]\n\turl = https://github.com/aaron/my-vault.git\n',
+    );
+
+    const req = new Request("http://x/import", {
+      method: "POST",
+      body: JSON.stringify({
+        remote_url: "https://github.com/aaron/my-vault.git",
+        mode: "merge",
+        credentials: { kind: "pat", token: "ghp_import_token_abc" },
+        enable_sync: true,
+        override: true,
+      }),
+    });
+    const res = await handleMirrorImport(
+      req,
+      "default",
+      spawnCloneSuccess(fixture),
+      undefined,
+      manager,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sync_enabled: boolean };
+    expect(body.sync_enabled).toBe(true);
+    // Sync config + credential persisted for "default" despite the sibling.
+    expect(readMirrorConfigForVault("default")?.auto_push).toBe(true);
+    expect(readCredentials("default")?.pat?.token).toBe("ghp_import_token_abc");
+  });
+
   test("existing mirror to the SAME remote → no-op success (sync_enabled true)", async () => {
     home = tmp("import-sync-same-");
     await bootstrapVault(home);
@@ -2552,6 +2654,217 @@ describe("handleMirrorImport — auto-enable sync (vault#416)", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { field: string };
     expect(body.field).toBe("enable_sync");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#482 — cross-vault remote-clobber guard at the ROUTE level.
+//
+// Two vaults on one server pointing their mirror at the same repo force-push
+// over each other's backups (silent data loss). The guard refuses a bind
+// (PAT save / OAuth repo pick / import-then-sync) when a SIBLING vault already
+// claims the same normalized remote, unless `override: true`. Re-binding a
+// vault to its OWN remote is always allowed (no false positive).
+// ---------------------------------------------------------------------------
+
+/**
+ * Seed a sibling vault on disk under the active PARACHUTE_HOME so
+ * `listVaults()` sees it, with an enabled internal mirror whose `origin`
+ * points at `originUrl`. No git spawn — we write `.git/config` directly,
+ * exactly what the guard reads.
+ */
+function seedSiblingVault(name: string, originUrl: string): void {
+  const home = process.env.PARACHUTE_HOME!;
+  const dataDir = path.join(home, "vault", "data", name);
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, "vault.yaml"), `name: ${name}\n`);
+  writeMirrorConfigForVault(name, {
+    ...defaultMirrorConfig(),
+    enabled: true,
+    location: "internal",
+  });
+  const mirrorGitDir = path.join(dataDir, "mirror", ".git");
+  fs.mkdirSync(mirrorGitDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(mirrorGitDir, "config"),
+    `[remote "origin"]\n\turl = ${originUrl}\n`,
+  );
+}
+
+describe("cross-vault remote-clobber guard (vault#482)", () => {
+  let home: string;
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("PAT: a second vault targeting a sibling's repo is refused with 409 + helpful error", async () => {
+    home = tmp("guard-pat-refuse-");
+    const { manager } = makeManager(home); // vault "default"
+    // Sibling vault "family" already backs up to aaron/shared.
+    seedSiblingVault("family", "https://github.com/aaron/shared.git");
+
+    const res = await handleAuthPat(
+      new Request("http://x/pat", {
+        method: "POST",
+        body: JSON.stringify({
+          token: "ghp_newtoken1234567890",
+          remote_url: "https://github.com/aaron/shared.git",
+        }),
+      }),
+      manager,
+      // Probe stub — the conflict guard runs AFTER the probe, so the probe
+      // must pass for us to reach (and assert on) the guard.
+      async () => ({ ok: true }),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error_type: string;
+      conflicting_vault: string;
+      remote: string;
+      message: string;
+    };
+    expect(body.error_type).toBe("remote_conflict");
+    expect(body.conflicting_vault).toBe("family");
+    expect(body.remote).toBe("github.com/aaron/shared");
+    // Names the vault + repo + tells the operator how to proceed.
+    expect(body.message).toContain("family");
+    expect(body.message).toContain("github.com/aaron/shared");
+    expect(body.message).toContain("override");
+    // Nothing got persisted for the refused vault.
+    expect(readCredentials("default")).toBeNull();
+  });
+
+  test("PAT: URL-normalization — sibling stored as scp-shorthand, candidate https → recognized as same repo", async () => {
+    home = tmp("guard-pat-norm-");
+    const { manager } = makeManager(home);
+    // Sibling stored its origin as SSH scp-shorthand.
+    seedSiblingVault("family", "git@github.com:aaron/shared.git");
+
+    const res = await handleAuthPat(
+      new Request("http://x/pat", {
+        method: "POST",
+        body: JSON.stringify({
+          token: "ghp_newtoken1234567890",
+          // ...candidate arrives as HTTPS without .git.
+          remote_url: "https://github.com/aaron/shared",
+        }),
+      }),
+      manager,
+      async () => ({ ok: true }),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { conflicting_vault: string };
+    expect(body.conflicting_vault).toBe("family");
+  });
+
+  test("PAT: re-pointing the SAME vault at its OWN remote is allowed (no false positive)", async () => {
+    home = tmp("guard-pat-self-");
+    const { manager } = makeManager(home); // vault "default"
+    // "default" already targets aaron/mine (its own origin) + a sibling
+    // targets a DIFFERENT repo — neither should block a self re-bind.
+    seedSiblingVault("default", "https://github.com/aaron/mine.git");
+    seedSiblingVault("family", "https://github.com/aaron/theirs.git");
+
+    const res = await handleAuthPat(
+      new Request("http://x/pat", {
+        method: "POST",
+        body: JSON.stringify({
+          token: "ghp_rotated1234567890",
+          // Same repo "default" already points at — token rotation.
+          remote_url: "https://github.com/aaron/mine.git",
+        }),
+      }),
+      manager,
+      async () => ({ ok: true }),
+    );
+    expect(res.status).toBe(200);
+    const creds = readCredentials("default");
+    expect(creds?.active_method).toBe("pat");
+    expect(creds?.pat?.remote_url).toContain("github.com/aaron/mine.git");
+  });
+
+  test("PAT: override=true bypasses the guard and saves anyway", async () => {
+    home = tmp("guard-pat-override-");
+    const { manager } = makeManager(home);
+    seedSiblingVault("family", "https://github.com/aaron/shared.git");
+
+    const res = await handleAuthPat(
+      new Request("http://x/pat", {
+        method: "POST",
+        body: JSON.stringify({
+          token: "ghp_newtoken1234567890",
+          remote_url: "https://github.com/aaron/shared.git",
+          override: true,
+        }),
+      }),
+      manager,
+      async () => ({ ok: true }),
+    );
+    expect(res.status).toBe(200);
+    expect(readCredentials("default")?.active_method).toBe("pat");
+  });
+
+  test("select-repo: picking a sibling's repo is refused with 409", async () => {
+    home = tmp("guard-selectrepo-refuse-");
+    const { manager } = makeManager(home);
+    seedSiblingVault("family", "https://github.com/aaron/shared.git");
+    // "default" has an OAuth credential (select-repo requires one).
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_fake1234567890abcd",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "shared" }),
+      }),
+      manager,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error_type: string;
+      conflicting_vault: string;
+    };
+    expect(body.error_type).toBe("remote_conflict");
+    expect(body.conflicting_vault).toBe("family");
+  });
+
+  test("select-repo: override=true bypasses the guard", async () => {
+    home = tmp("guard-selectrepo-override-");
+    const { manager } = makeManager(home);
+    seedSiblingVault("family", "https://github.com/aaron/shared.git");
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_fake1234567890abcd",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "shared", override: true }),
+      }),
+      manager,
+    );
+    // 200 (or any non-409) — the guard didn't block it. (mirror_path is
+    // unresolved since the manager never started, so it stores creds + returns
+    // ok without applying to a remote.)
+    expect(res.status).not.toBe(409);
+    const body = (await res.json()) as { ok?: boolean };
+    expect(body.ok).toBe(true);
   });
 });
 

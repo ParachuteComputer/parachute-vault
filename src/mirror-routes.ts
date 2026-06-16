@@ -75,6 +75,10 @@ import {
   type ImportResult,
 } from "./mirror-import.ts";
 import { redactToken } from "./export-watch.ts";
+import {
+  findConflictingVault,
+  remoteConflictMessage,
+} from "./mirror-remote-guard.ts";
 import { GitNotInstalledError, ensureGitAvailable } from "./git-preflight.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { assetsDir } from "./routes.ts";
@@ -595,7 +599,7 @@ export async function handleAuthPat(
     timeoutMs: number,
   ) => Promise<{ ok: boolean; error?: string }>,
 ): Promise<Response> {
-  let body: { token?: unknown; remote_url?: unknown; label?: unknown };
+  let body: { token?: unknown; remote_url?: unknown; label?: unknown; override?: unknown };
   try {
     body = (await req.json()) as Record<string, unknown>;
   } catch (err) {
@@ -604,6 +608,7 @@ export async function handleAuthPat(
       { status: 400 },
     );
   }
+  const override = body.override === true;
   const token = typeof body.token === "string" ? body.token.trim() : "";
   const remote_url = typeof body.remote_url === "string" ? body.remote_url.trim() : "";
   const label =
@@ -699,11 +704,33 @@ export async function handleAuthPat(
     );
   }
 
+  // vault#482: refuse if ANOTHER vault on this server already pushes to this
+  // repo. Two vaults sharing one remote force-push over each other's backups
+  // (silent data loss). Compare against the operator-supplied (un-authed)
+  // remote_url — the normalizer strips userinfo so the token doesn't matter.
+  // Re-pointing THIS vault at its own remote is fine (the scan excludes it).
+  // `override=true` is the explicit escape hatch.
+  const vaultName = manager.getVaultName();
+  if (!override) {
+    const conflict = findConflictingVault(vaultName, remote_url);
+    if (conflict) {
+      return Response.json(
+        {
+          error: "Remote already in use by another vault",
+          error_type: "remote_conflict",
+          conflicting_vault: conflict.conflictingVault,
+          remote: conflict.remoteIdentity,
+          message: remoteConflictMessage(conflict),
+        },
+        { status: 409 },
+      );
+    }
+  }
+
   // Save the userinfo'd URL — that's what gets embedded as `origin` so
   // bare `git push` works without needing GIT_ASKPASS etc. Per-vault
   // (vault#399): the PAT + remote_url land in this vault's own file, not a
   // server-wide one — so configuring vault B never reuses vault A's remote.
-  const vaultName = manager.getVaultName();
   const next: MirrorCredentials = {
     ...(readCredentials(vaultName) ?? emptyCredentials()),
     active_method: "pat",
@@ -1126,7 +1153,7 @@ export async function handleAuthGithubSelectRepo(
       { status: 400 },
     );
   }
-  let body: { owner?: unknown; name?: unknown };
+  let body: { owner?: unknown; name?: unknown; override?: unknown };
   try {
     body = (await req.json()) as Record<string, unknown>;
   } catch (err) {
@@ -1135,6 +1162,7 @@ export async function handleAuthGithubSelectRepo(
       { status: 400 },
     );
   }
+  const override = body.override === true;
   const owner = typeof body.owner === "string" ? body.owner.trim() : "";
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (!owner || !name) {
@@ -1146,6 +1174,32 @@ export async function handleAuthGithubSelectRepo(
       { status: 400 },
     );
   }
+
+  // vault#482: refuse if ANOTHER vault on this server already pushes to this
+  // repo. The clobber path for the OAuth flow: select-repo writes
+  // `github.com/<owner>/<name>` onto this vault's mirror `origin`; if a sibling
+  // vault already has that same origin, both force-push the same branch and the
+  // loser's backup is overwritten. Compare against the public github URL (no
+  // token — the normalizer keys off host/owner/repo). The scan excludes THIS
+  // vault, so re-picking the same repo (token rotation, re-entry) is fine.
+  // `override=true` is the explicit escape hatch.
+  if (!override) {
+    const candidate = `https://github.com/${owner}/${name}.git`;
+    const conflict = findConflictingVault(manager.getVaultName(), candidate);
+    if (conflict) {
+      return Response.json(
+        {
+          error: "Remote already in use by another vault",
+          error_type: "remote_conflict",
+          conflicting_vault: conflict.conflictingVault,
+          remote: conflict.remoteIdentity,
+          message: remoteConflictMessage(conflict),
+        },
+        { status: 409 },
+      );
+    }
+  }
+
   // Reach into mirror-credentials.ts for the authed URL builder.
   const { githubAuthedRemoteUrl } = await import("./mirror-credentials.ts");
   const authedUrl = githubAuthedRemoteUrl(
@@ -1463,6 +1517,7 @@ export async function handleMirrorImport(
     mode?: unknown;
     credentials?: unknown;
     enable_sync?: unknown;
+    override?: unknown;
   };
   try {
     body = (await req.json()) as Record<string, unknown>;
@@ -1574,6 +1629,13 @@ export async function handleMirrorImport(
     enableSync = body.enable_sync;
   }
 
+  // vault#482: cross-vault clobber override for the sync-enable step. Default
+  // off; a literal `true` lets the operator deliberately point this vault's
+  // sync at a repo a SIBLING vault already backs up to (e.g. they moved the
+  // repo between vaults). The import itself never refuses on this — only the
+  // optional sync-enable does.
+  const override = body.override === true;
+
   // Resolve the target vault's store + assets dir. The route is gated on
   // `vault:<name>:admin`, so we trust vaultName is real by the time we
   // reach this code path; defensively re-resolve in case the vault was
@@ -1661,6 +1723,7 @@ export async function handleMirrorImport(
         remoteUrl: remote_url,
         auth,
         manager,
+        override,
       });
       result.sync_enabled = outcome.sync_enabled;
       if (outcome.warning) result.sync_warning = outcome.warning;
@@ -1731,8 +1794,14 @@ export async function enableSyncToImportedRepo(opts: {
    * rather than persisting a half-configured mirror with no live manager.
    */
   manager: MirrorManager | undefined;
+  /**
+   * vault#482 escape hatch — skip the cross-vault clobber guard. Default
+   * false: refuse (warn, don't enable sync) when a SIBLING vault already
+   * backs up to this repo.
+   */
+  override?: boolean;
 }): Promise<{ sync_enabled: boolean; warning?: string }> {
-  const { vaultName, remoteUrl, auth, manager } = opts;
+  const { vaultName, remoteUrl, auth, manager, override = false } = opts;
 
   if (!manager) {
     return {
@@ -1740,6 +1809,21 @@ export async function enableSyncToImportedRepo(opts: {
       warning:
         "Sync not enabled — the vault's mirror manager wasn't ready. Set up Sync from the Git remote section.",
     };
+  }
+
+  // vault#482: don't enable sync to a repo a DIFFERENT vault on this server
+  // already backs up to — both would force-push the same branch and clobber
+  // each other. Import success is never lost; we just decline the optional
+  // sync-enable + warn. The existing same-vault "different remote" check below
+  // handles THIS vault's own prior target; this one covers SIBLING vaults.
+  if (!override) {
+    const conflict = findConflictingVault(vaultName, remoteUrl);
+    if (conflict) {
+      return {
+        sync_enabled: false,
+        warning: `Import succeeded, but Sync was not enabled — ${remoteConflictMessage(conflict)}`,
+      };
+    }
   }
 
   // --- Resolve the push credential we'll persist for this remote. ----------
