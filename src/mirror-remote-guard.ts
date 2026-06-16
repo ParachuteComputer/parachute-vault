@@ -67,30 +67,37 @@ export function normalizeRemoteIdentity(remote: string): string | null {
   const trimmed = remote.trim();
   if (trimmed.length === 0) return null;
 
+  // The whole identity is LOWER-CASED before returning. The host is
+  // case-insensitive by DNS, and GitHub (the primary mirror target) treats
+  // owner/repo case-insensitively too — `github.com/Aaron/Vault` and
+  // `github.com/aaron/vault` are the SAME repo, so a data-loss guard must treat
+  // them as equal (else two vaults with different-case configs still clobber).
+  // The theoretical false-positive on a path-case-SENSITIVE Git host is
+  // acceptable for a clobber guard — the operator can override.
+
   // SCP-style SSH shorthand: `user@host:owner/repo.git`. Doesn't parse as a
   // URL (no scheme), so detect + rewrite to the canonical `host/path` shape
   // before the URL path. Pattern: `<user>@<host>:<path>` where the char after
   // the colon isn't a slash (a `//` after colon would be a real URL).
   const scp = trimmed.match(/^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):(.+)$/);
   if (scp && !scp[2]!.startsWith("/")) {
-    const host = scp[1]!.toLowerCase();
+    const host = scp[1]!;
     const path = stripRepoSuffix(scp[2]!);
-    return `${host}/${path}`;
+    return `${host}/${path}`.toLowerCase();
   }
 
   try {
     const url = new URL(trimmed);
-    // Host already excludes userinfo. Lower-case it; the path carries the
-    // owner/repo. `URL` keeps a leading slash on pathname — drop it so the
-    // join below doesn't double up.
-    const host = url.host.toLowerCase();
+    // Host already excludes userinfo. `URL` keeps a leading slash on pathname —
+    // drop it so the join below doesn't double up.
+    const host = url.host;
     const path = stripRepoSuffix(url.pathname.replace(/^\/+/, ""));
-    if (path.length === 0) return host;
-    return `${host}/${path}`;
+    const identity = path.length === 0 ? host : `${host}/${path}`;
+    return identity.toLowerCase();
   } catch {
     // Non-URL, non-SCP (local path, etc.) — fall back to a trimmed,
     // suffix-stripped string compare so identical local paths match.
-    return stripRepoSuffix(trimmed);
+    return stripRepoSuffix(trimmed).toLowerCase();
   }
 }
 

@@ -2067,14 +2067,16 @@ function effectiveRemoteOf(creds: MirrorCredentials): string | null {
  * (SSH shorthand, local paths).
  */
 function sameRemote(a: string, b: string): boolean {
+  // Lower-cased whole identity: GitHub owner/repo is case-insensitive, so a
+  // clobber guard must treat Aaron/Repo == aaron/repo (matches normalizeRemoteIdentity).
   const norm = (u: string): string => {
     try {
       const url = new URL(u);
       const host = url.host.toLowerCase();
       const path = url.pathname.replace(/\.git$/, "").replace(/\/+$/, "");
-      return `${url.protocol}//${host}${path}`;
+      return `${url.protocol}//${host}${path}`.toLowerCase();
     } catch {
-      return u.trim().replace(/\.git$/, "").replace(/\/+$/, "");
+      return u.trim().replace(/\.git$/, "").replace(/\/+$/, "").toLowerCase();
     }
   };
   return norm(a) === norm(b);

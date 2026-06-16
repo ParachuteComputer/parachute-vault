@@ -101,6 +101,13 @@ describe("normalizeRemoteIdentity", () => {
     expect(normalizeRemoteIdentity("https://GitHub.com/x/y")).toBe("github.com/x/y");
   });
 
+  test("owner/repo is lower-cased too (GitHub is case-insensitive) — the clobber guard", () => {
+    // Aaron/Vault and aaron/vault are the SAME GitHub repo; both must normalize
+    // equal so two vaults with different-case configs are caught, not clobbered.
+    expect(normalizeRemoteIdentity("https://github.com/Aaron/Vault.git")).toBe("github.com/aaron/vault");
+    expect(normalizeRemoteIdentity("git@github.com:Aaron/Vault.git")).toBe("github.com/aaron/vault");
+  });
+
   test("embedded userinfo (token) is stripped", () => {
     expect(
       normalizeRemoteIdentity("https://x-access-token:ghp_secret@github.com/x/y.git"),
@@ -135,6 +142,12 @@ describe("sameRemoteIdentity — the equivalence the guard keys off", () => {
         expect(sameRemoteIdentity(a, b)).toBe(true);
       }
     }
+  });
+
+  test("case-insensitive owner/repo: Aaron/Vault ≡ aaron/vault (the data-loss gap)", () => {
+    expect(
+      sameRemoteIdentity("https://github.com/Aaron/Vault.git", "https://github.com/aaron/vault"),
+    ).toBe(true);
   });
 
   test("different repos are NOT equal", () => {
