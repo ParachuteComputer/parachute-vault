@@ -20,7 +20,7 @@ So when a note's metadata says "this belongs to / replies-to / triggers that not
 relationship is invisible to the graph and has zero referential integrity.
 
 ## Why this is a vault-platform feature (not per-module)
-Every module models note→note references: agents (`run --of--> definition`,
+Every module models note→note references: agents (`thread --of--> definition`,
 `message --in_reply_to--> message`, `job --triggers--> definition`), proposals→captures,
 surfaces→inquiries, person→org. A typed-reference field with target validation, edge
 materialization, and a reverse index is *the* missing relationship primitive — it belongs
@@ -40,7 +40,7 @@ from a metadata field instead of from `[[brackets]]` in the body."**
   confirm the target exists (and carries `target_tag` if declared) → **materialize a
   `links` row** with the declared `relationship` — mirroring `syncWikilinks` exactly.
   The field now participates in `near` / `find-path` / `linkCount` for free, and
-  `idx_links_target` gives the **reverse lookup** ("which runs point at this def?") with
+  `idx_links_target` gives the **reverse lookup** ("which threads point at this def?") with
   no new index.
 - **Deferred resolution** for forward-refs (an `unresolved_*` analogue of the wikilink
   path), and lifecycle via the `links` FK `ON DELETE CASCADE`.
@@ -57,10 +57,11 @@ already a UNIQUE column — rather than adding UNIQUE metadata indexes.)
 
 ## What it unlocks for consumers
 The relationship graph becomes navigable with the same tools as everything else:
-- Agents: `run --of--> definition`, `message --in_reply_to--> message`,
+- Agents: `thread --of--> definition`, `message --in_reply_to--> message`,
   `job --triggers--> definition` → "show me everything about agent X" is one `near`
-  query; "all runs of this def" is one reverse-lookup. (`channel` stays a plain string —
-  it's a routing label, not a note; don't over-model it.)
+  query; "all threads of this def" is one reverse-lookup. (`channel` stays a plain string —
+  it's a routing label, not a note; don't over-model it.) The agent module unified "run"
+  into "thread" (a run was always a thread with one turn); this doc tracks that vocabulary.
 - Generic: proposals→captures, person↔org, etc.
 
 ## Scope of the change (when we build it)
