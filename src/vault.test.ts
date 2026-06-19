@@ -4543,6 +4543,62 @@ describe("HTTP PATCH /notes/:idOrPath if_missing=create (vault#309)", async () =
     expect(body.metadata.v).toBe(2);
   });
 
+  // Cross-repo guard for the parachute-agent #agent/thread upsert seam: a single-threaded
+  // thread note lives at a SLASH path (e.g. "Threads/<channel>/<name>") and the agent
+  // module addresses it as ONE URL segment via encodeURIComponent (so `/`→`%2F`). The
+  // full round-trip it relies on — GET an existing note by the encoded-slash path
+  // (readThreadNote read-back) then PATCH-update it by the same encoded-slash path
+  // (if_missing:create upsert, turn 2) — must resolve to the decoded path, or the agent's
+  // turn_count/usage aggregates silently reset every turn. This proves the route resolves
+  // the encoded slash on GET + PATCH-update of an EXISTING note (4505 above only covers
+  // create). See parachute-agent#110.
+  test("encoded-slash path round-trips: GET read-back + PATCH-update resolve a %2F path (the #agent/thread upsert seam)", async () => {
+    const enc = encodeURIComponent("Threads/eng/eng");
+    expect(enc).toBe("Threads%2Feng%2Feng"); // no literal slash — one URL segment.
+
+    // Turn 1 — PATCH if_missing:create by the encoded-slash path → CREATES.
+    const create = await handleNotes(
+      mkReq("PATCH", `/notes/${enc}`, {
+        content: "## Summary\n\nturn 1",
+        tags: ["#agent/thread"],
+        metadata: { turn_count: "1", status: "ok" },
+        if_missing: "create",
+        force: true,
+      }),
+      store,
+      `/${enc}`,
+    );
+    expect(create.status).toBe(200);
+    expect((await create.json() as any).created).toBe(true);
+
+    // Read-back — GET by the SAME encoded-slash path resolves the created note (NOT 404).
+    const get = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    expect(get.status).toBe(200);
+    const got = await get.json() as any;
+    expect(got.path).toBe("Threads/eng/eng");
+    expect(got.metadata.turn_count).toBe("1");
+
+    // Turn 2 — PATCH if_missing:create by the SAME encoded-slash path → UPDATES in place.
+    const update = await handleNotes(
+      mkReq("PATCH", `/notes/${enc}`, {
+        content: "## Summary\n\nturn 2",
+        metadata: { turn_count: "2", status: "ok" },
+        if_missing: "create",
+        force: true,
+      }),
+      store,
+      `/${enc}`,
+    );
+    expect(update.status).toBe(200);
+    expect((await update.json() as any).created).toBe(false); // updated, NOT a second note.
+
+    // Exactly ONE note at the decoded path, updated (the upsert worked end-to-end).
+    const final = await store.getNoteByPath("Threads/eng/eng");
+    expect(final).not.toBeNull();
+    expect(String(final!.metadata.turn_count)).toBe("2");
+    expect(final!.content).toContain("turn 2");
+  });
+
   test("missing note without if_missing returns 404 (back-compat)", async () => {
     const res = await handleNotes(
       mkReq("PATCH", "/notes/m309c-nope", {
