@@ -1,8 +1,14 @@
 /**
  * Tests for `buildInitSummaryLines` — the post-install summary printed at the
- * end of `vault init`. The summary branches on the (addMcp, addToken) decision
- * matrix; these tests cover all four cells plus the token surfacing /
- * Bearer-example rules.
+ * end of `vault init`.
+ *
+ * 2026-06-23 messaging realignment: the site no longer claims "Claude Code is
+ * auto-configured," and init no longer writes ~/.claude.json by default. The
+ * summary now (1) leads with the web setup wizard hand-off and (2) always
+ * surfaces the self-serve connect info — the connector URL plus a
+ * ready-to-paste `claude mcp add` command — so a Claude Code user opts in by
+ * copy-paste rather than via a silent side effect. These tests pin that copy
+ * across the (addMcp, addToken) decision matrix.
  */
 
 import { describe, test, expect } from "bun:test";
@@ -13,6 +19,7 @@ const baseInput = {
   bindHost: "127.0.0.1",
   port: 1940,
   mcpUrl: "http://127.0.0.1:1940/vault/default/mcp",
+  wizardUrl: "http://127.0.0.1:1939/admin/setup",
   vaultName: "default",
 };
 
@@ -21,7 +28,104 @@ function lines(addMcp: boolean, addToken: boolean, apiKey: string | undefined) {
 }
 
 describe("buildInitSummaryLines", () => {
-  describe("MCP=Y + token=Y (most common)", () => {
+  // The wizard hand-off + self-serve connect info are the load-bearing pieces
+  // of the new messaging — they must appear in every branch.
+  describe("always surfaces the wizard + the copy-paste connect info", () => {
+    for (const [addMcp, addToken] of [
+      [true, true],
+      [true, false],
+      [false, true],
+      [false, false],
+    ] as const) {
+      const out = lines(addMcp, addToken, addMcp || addToken ? "pvt_k" : undefined).join("\n");
+
+      test(`(addMcp=${addMcp}, addToken=${addToken}) prints the web wizard URL prominently`, () => {
+        expect(out).toContain("Finish setup in your browser:");
+        expect(out).toContain("http://127.0.0.1:1939/admin/setup");
+      });
+
+      test(`(addMcp=${addMcp}, addToken=${addToken}) surfaces the connector URL`, () => {
+        expect(out).toContain("http://127.0.0.1:1940/vault/default/mcp");
+      });
+
+      test(`(addMcp=${addMcp}, addToken=${addToken}) always prints Config: and Server: lines`, () => {
+        expect(out).toContain("Config:   /tmp/parachute");
+        expect(out).toContain("Server:   http://127.0.0.1:1940");
+      });
+    }
+  });
+
+  // The new DEFAULT init path — no MCP write, no token minted (per-user OAuth).
+  // init pointed the operator at the wizard and surfaced the copy-paste connect
+  // info; it did NOT write ~/.claude.json.
+  describe("DEFAULT (addMcp=N, token=N) — wizard hand-off + copy-paste opt-in", () => {
+    const out = lines(false, false, undefined).join("\n");
+
+    test("does NOT claim Claude Code is already wired in", () => {
+      expect(out).not.toContain("already wired in");
+      expect(out).not.toContain("Baked into ~/.claude.json");
+    });
+
+    test("offers the ready-to-paste `claude mcp add` opt-in command", () => {
+      expect(out).toContain(
+        "claude mcp add --transport http parachute-vault http://127.0.0.1:1940/vault/default/mcp",
+      );
+    });
+
+    test("points at the guided installer as an alternative", () => {
+      expect(out).toContain("parachute-vault mcp-install");
+    });
+
+    test("frames OAuth-first connect — no token needed", () => {
+      expect(out).toContain("no token needed, you'll sign in on first use");
+    });
+
+    test("offers the scope-narrow opt-in mint for scripts (full vault:<name>:read, never admin)", () => {
+      // Must be the three-segment named-resource form the hub mint-token model
+      // requires — a bare `vault:read` would mint a malformed scope (vault#443).
+      expect(out).toContain("parachute auth mint-token --scope vault:default:read");
+      expect(out).not.toContain("vault:admin");
+    });
+
+    test("does not print any token", () => {
+      expect(out).not.toContain("Your API token:");
+      expect(out).not.toMatch(/pvt_/);
+      expect(out).not.toContain("Authorization: Bearer");
+    });
+
+    test("threads a non-default vault name into the mint-token scope + connector URL", () => {
+      const out2 = buildInitSummaryLines({
+        ...baseInput,
+        vaultName: "journal",
+        mcpUrl: "http://127.0.0.1:1940/vault/journal/mcp",
+        addMcp: false,
+        addToken: false,
+        apiKey: undefined,
+      }).join("\n");
+      expect(out2).toContain("parachute auth mint-token --scope vault:journal:read");
+      expect(out2).toContain("http://127.0.0.1:1940/vault/journal/mcp");
+    });
+  });
+
+  // Opt-in: operator passed --configure-claude-code, so init DID write the entry.
+  describe("opted into MCP write (addMcp=Y, token=N, OAuth)", () => {
+    const out = lines(true, false, undefined).join("\n");
+
+    test("tells the user Claude Code is already wired in", () => {
+      expect(out).toContain("Claude Code is already wired in");
+    });
+
+    test("still surfaces the connector URL for other clients", () => {
+      expect(out).toContain("http://127.0.0.1:1940/vault/default/mcp");
+    });
+
+    test("does NOT print or imply any minted token", () => {
+      expect(out).not.toContain("Your API token:");
+      expect(out).not.toContain("Authorization: Bearer");
+    });
+  });
+
+  describe("opted into MCP write + token minted (addMcp=Y, token=Y)", () => {
     const out = lines(true, true, "pvt_abc123").join("\n");
 
     test("prints token prominently", () => {
@@ -47,32 +151,7 @@ describe("buildInitSummaryLines", () => {
     });
   });
 
-  describe("MCP=Y + token=N (MCP wired, token not surfaced)", () => {
-    const out = lines(true, false, "pvt_secret").join("\n");
-
-    test("does not print the token prominently", () => {
-      expect(out).not.toContain("pvt_secret");
-    });
-
-    test("does not include the 'Baked into' bullet", () => {
-      expect(out).not.toContain("Baked into ~/.claude.json");
-    });
-
-    test("includes the mcp-install-later hint", () => {
-      expect(out).toContain("Token in ~/.claude.json");
-      expect(out).toContain("parachute-vault mcp-install");
-    });
-
-    test("omits the Bearer curl example", () => {
-      expect(out).not.toContain("Authorization: Bearer");
-    });
-
-    test("still shows the Claude-Code-session next step", () => {
-      expect(out).toContain("Start a new Claude Code session");
-    });
-  });
-
-  describe("MCP=N + token=Y (token only)", () => {
+  describe("token only, no MCP write (addMcp=N, token=Y, minted)", () => {
     const out = lines(false, true, "pvt_xyz").join("\n");
 
     test("prints token prominently", () => {
@@ -84,98 +163,19 @@ describe("buildInitSummaryLines", () => {
     });
 
     test("includes Bearer curl example", () => {
-      expect(out).toContain('Authorization: Bearer pvt_xyz');
+      expect(out).toContain("Authorization: Bearer pvt_xyz");
     });
 
-    test("Next steps points at any local MCP client", () => {
-      expect(out).toContain("Point any local MCP client");
+    test("surfaces the connector URL + a copy-paste Claude Code opt-in", () => {
       expect(out).toContain("http://127.0.0.1:1940/vault/default/mcp");
-    });
-
-    test("Next steps offers mcp-install as a way back", () => {
-      expect(out).toContain("parachute-vault mcp-install");
-    });
-  });
-
-  // vault#442: the DEFAULT init path — MCP wired, NO token minted (per-user
-  // OAuth). The summary must LEAD with the OAuth connect path, never mint, and
-  // never surface the old "no token issued" failure copy.
-  describe("MCP=Y + no token (vault#442 OAuth default)", () => {
-    const out = lines(true, false, undefined).join("\n");
-
-    test("leads with the OAuth connect message — no token needed", () => {
-      expect(out).toContain("no token needed, you'll sign in on first use");
-    });
-
-    test("tells the user Claude Code is already wired in", () => {
-      expect(out).toContain("Claude Code is already wired in");
-    });
-
-    test("shows the OAuth `claude mcp add` command for other clients", () => {
       expect(out).toContain(
         "claude mcp add --transport http parachute-vault http://127.0.0.1:1940/vault/default/mcp",
       );
     });
-
-    test("offers the scope-narrow opt-in mint for scripts (full vault:<name>:read, never admin)", () => {
-      // Must be the three-segment named-resource form the hub mint-token model
-      // requires — a bare `vault:read` would mint a malformed scope (vault#443).
-      expect(out).toContain("parachute auth mint-token --scope vault:default:read");
-      expect(out).not.toContain("--scope vault:read ");
-      expect(out).not.toMatch(/--scope vault:read$/m);
-      expect(out).not.toContain("vault:admin");
-    });
-
-    test("does NOT print or imply any minted token", () => {
-      expect(out).not.toContain("Your API token:");
-      expect(out).not.toContain("Baked into ~/.claude.json");
-      expect(out).not.toContain("Authorization: Bearer");
-    });
-
-    test("does NOT surface the old no-token-issued failure copy", () => {
-      expect(out).not.toContain("No token issued");
-    });
-
-    test("threads a non-default vault name into the mint-token scope", () => {
-      const out2 = buildInitSummaryLines({
-        ...baseInput,
-        vaultName: "journal",
-        mcpUrl: "http://127.0.0.1:1940/vault/journal/mcp",
-        addMcp: true,
-        addToken: false,
-        apiKey: undefined,
-      }).join("\n");
-      expect(out2).toContain("parachute auth mint-token --scope vault:journal:read");
-      expect(out2).not.toContain("vault:default:read");
-    });
   });
 
-  describe("MCP=N + token=N (OAuth default, Claude Code not wired)", () => {
-    const out = lines(false, false, undefined).join("\n");
-
-    test("frames skipping the MCP entry as OAuth-first, not 'unreachable'", () => {
-      expect(out).toContain("uses per-user OAuth, no token needed");
-      expect(out).not.toContain("your vault isn't reachable by any client");
-    });
-
-    test("points to mcp-install (no token-minting framing)", () => {
-      expect(out).toContain("parachute-vault mcp-install");
-      expect(out).not.toContain("mints a hub JWT");
-    });
-
-    test("does not print any token", () => {
-      expect(out).not.toContain("Your API token:");
-      expect(out).not.toMatch(/pvt_/);
-    });
-
-    test("omits the Bearer curl example", () => {
-      expect(out).not.toContain("Authorization: Bearer");
-    });
-  });
-
-  // Explicit opt-in but no hub reachable to mint (vault#282 Stage 2 path,
-  // reached only when the operator passes --token without a hub).
-  describe("MCP=N + token=Y but no hub (opt-in mint failed, standalone)", () => {
+  // Explicit opt-in to a token but no hub reachable to mint (vault#282 Stage 2).
+  describe("token opt-in but no hub (standalone, mint failed)", () => {
     const out = buildInitSummaryLines({
       ...baseInput,
       addMcp: false,
@@ -198,12 +198,14 @@ describe("buildInitSummaryLines", () => {
     test("does NOT claim the vault is reachable (no hub present)", () => {
       expect(out).not.toContain("Your vault is still reachable");
     });
+
+    test("still surfaces the connector URL for self-serve connect", () => {
+      expect(out).toContain("http://127.0.0.1:1940/vault/default/mcp");
+    });
   });
 
-  // #445: opted into a token, none minted, but a HUB IS PRESENT. The vault is
-  // reachable via the hub's browser OAuth flow even with no header-auth token,
-  // so the standalone "isn't reachable" framing would be false here.
-  describe("MCP=N + token=Y, no token minted, but hub present (#445)", () => {
+  // #445: opted into a token, none minted, but a HUB IS PRESENT.
+  describe("token opt-in, none minted, hub present (#445)", () => {
     const out = buildInitSummaryLines({
       ...baseInput,
       addMcp: false,
@@ -227,22 +229,20 @@ describe("buildInitSummaryLines", () => {
       expect(out).not.toContain("Once a hub is running");
       expect(out).not.toContain("VAULT_AUTH_TOKEN");
     });
-
-    test("never claims the vault isn't reachable by any client", () => {
-      expect(out).not.toContain("isn't reachable by any client");
-    });
   });
 
-  test("always prints Config: and Server: lines", () => {
-    for (const [addMcp, addToken] of [
-      [true, true],
-      [true, false],
-      [false, true],
-      [false, false],
-    ] as const) {
-      const out = lines(addMcp, addToken, addMcp || addToken ? "pvt_k" : undefined).join("\n");
-      expect(out).toContain("Config:   /tmp/parachute");
-      expect(out).toContain("Server:   http://127.0.0.1:1940");
-    }
+  // Defensive: the summary must still render coherently if no wizard URL is
+  // supplied (e.g. an older caller / a hub-origin resolution failure).
+  test("omits the wizard hand-off cleanly when wizardUrl is absent", () => {
+    const out = buildInitSummaryLines({
+      ...baseInput,
+      wizardUrl: undefined,
+      addMcp: false,
+      addToken: false,
+      apiKey: undefined,
+    }).join("\n");
+    expect(out).not.toContain("Finish setup in your browser:");
+    // The connect info is still surfaced.
+    expect(out).toContain("http://127.0.0.1:1940/vault/default/mcp");
   });
 });

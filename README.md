@@ -22,7 +22,7 @@ bun install
 bun src/cli.ts vault init
 ```
 
-`vault init` creates a vault, generates an API key, starts a background daemon (launchd on Mac, systemd on Linux), and configures Claude Code's MCP — all in one command. Start a new Claude Code session and your vault's tools show up. For other local MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline, your own agent), point them at `http://127.0.0.1:1940/vault/default/mcp` — the API key is printed once at init; save it for anything that isn't Claude Code.
+`vault init` creates a vault, starts a background daemon (launchd on Mac, systemd on Linux), and prints how to connect your AI — the web setup wizard URL, your vault's connector URL (`http://127.0.0.1:1940/vault/default/mcp`), and a ready-to-paste `claude mcp add` command. It does **not** write any client config for you by default. Pass `--configure-claude-code` if you want init to add the Claude Code MCP entry; pass `--token` if you also need a header-auth API token for non-OAuth clients (Codex, Goose, OpenCode, Cursor, Zed, Cline, scripts, `curl`). OAuth-capable clients just need the connector URL and sign in on first connect.
 
 For remote access from Claude Desktop or mobile apps, see [Deployment](#deployment) below.
 
@@ -93,11 +93,11 @@ The daemon binds `0.0.0.0:1940` (or whatever you set in `PORT`) and serves REST,
 
 ### `~/.claude.json`
 
-`vault init` adds one entry — `mcpServers["parachute-vault"]` — pointing at `http://127.0.0.1:<port>/vault/<default-vault>/mcp` with a baked-in `Authorization: Bearer <hub-jwt>` header (a hub-minted JWT — vault#282 Stage 2). Next Claude Code session picks it up; there's no further wiring. See [Connecting a client](#connecting-a-client) for rotating that token or pointing it elsewhere.
+When you opt in (`--configure-claude-code`), `vault init` adds one entry — `mcpServers["parachute-vault"]` — pointing at `http://127.0.0.1:<port>/vault/<default-vault>/mcp`. By default that entry uses OAuth (browser sign-in on first connect); add `--token` and init bakes a scope-narrow `Authorization: Bearer <hub-jwt>` header instead (a hub-minted JWT — vault#282 Stage 2). Next Claude Code session picks it up. See [Connecting a client](#connecting-a-client) for rotating that token or pointing it elsewhere.
 
 ### Your API token
 
-`vault init` asks two explicit questions: (1) install vault as an MCP server in `~/.claude.json`? (2) also surface the access token so you can paste it into other MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or `curl`? Both default yes. Pass `--mcp` / `--no-mcp` and `--token` / `--no-token` for non-interactive installs.
+`vault init` asks two explicit questions: (1) write the Claude Code MCP entry in `~/.claude.json`? (2) also mint + surface a header-auth API token so you can paste it into non-OAuth MCP clients (Codex, Goose, OpenCode, Cursor, Zed, Cline), scripts, or `curl`? **Both default no** — init's job is to get you to the web wizard and print the connector URL + a paste-ready `claude mcp add` command, not to write client config behind your back. Opt in with `--configure-claude-code` (alias `--mcp`) and/or `--token`; `--no-mcp` / `--no-token` are the explicit opt-outs for non-interactive installs.
 
 If you said yes to (2), the hub-issued JWT is printed prominently at the end — it's the same token baked into `~/.claude.json` (if you also said yes to (1)). It's not stored anywhere retrievable — save it if you need it for `curl`, cron, or any other script. Lost it? Mint a fresh one with `parachute auth mint-token --scope vault:<name>:<verb>` (or rewire an MCP client with `parachute-vault mcp-install`, or use the admin SPA Tokens page). As of vault 0.5.0 (vault#282 Stage 2) vault no longer mints its own `pvt_*` tokens — minting is the hub's job.
 
@@ -126,7 +126,7 @@ As of 0.5.0 (vault#282 Stage 2) vault is a **pure hub resource-server**: both pa
 
 ### Claude Code
 
-`vault init` fully auto-configures `~/.claude.json` — there's nothing else to do. The entry it writes bakes in a hub-minted JWT rather than running the interactive OAuth browser flow:
+`vault init` does **not** touch `~/.claude.json` by default — connecting is self-serve (paste the `claude mcp add` command init prints, or add the connector in your client). To have init write the entry for you, pass `--configure-claude-code`. The entry it writes uses OAuth by default (browser sign-in on first connect); add `--token` and it bakes a scope-narrow hub-minted JWT instead:
 
 ```json
 {
@@ -140,9 +140,9 @@ As of 0.5.0 (vault#282 Stage 2) vault is a **pure hub resource-server**: both pa
 }
 ```
 
-Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **First MCP call after `vault init` requires no browser handoff — Claude Code uses the baked-in token and the vault's tools show up in your next session.** This is intentional: for an owner connecting their own machine's vault to their own Claude Code, the token is already there and the OAuth browser handshake would add friction.
+Where `{name}` is `default` on a fresh install, or whatever vault you pointed `vault init` at. **With `--configure-claude-code --token`, the first MCP call needs no browser handoff** — Claude Code uses the baked-in token and the vault's tools show up in your next session. Without `--token`, the opted-in entry uses OAuth and Claude Code does a one-time browser sign-in on first connect. This is a deliberate trade: OAuth-first by default (no long-lived token sitting in a dotfile), with the baked-token path one flag away for an owner wiring their own machine.
 
-To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/vault/config.yaml` and re-run `parachute-vault init` — which re-mints an API token and re-writes the `~/.claude.json` entry end-to-end. To rotate the token only, run `parachute-vault mcp-install` (defaults to `--mint`, which mints a fresh scope-narrow hub JWT via `~/.parachute/operator.token` and writes it into `~/.claude.json` with an `Authorization: Bearer …` header). See the [cookbook](#install-vault-mcp-into-a-client-config) section below for the full flag surface — token paste, scope narrowing, project-level install, multi-vault.
+To re-point Claude Code at a different vault, change `default_vault` in `~/.parachute/vault/config.yaml` and re-run `parachute-vault init --configure-claude-code` (add `--token` to bake a fresh token). To rotate the token only, run `parachute-vault mcp-install` (defaults to `--mint`, which mints a fresh scope-narrow hub JWT via `~/.parachute/operator.token` and writes it into `~/.claude.json` with an `Authorization: Bearer …` header). See the [cookbook](#install-vault-mcp-into-a-client-config) section below for the full flag surface — token paste, scope narrowing, project-level install, multi-vault.
 
 ### Claude Desktop (OAuth)
 
