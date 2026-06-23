@@ -5,13 +5,32 @@
  */
 
 export type InitSummaryInput = {
+  /**
+   * Whether init WROTE the Claude Code MCP config (~/.claude.json) this run.
+   * As of 2026-06-23 this is opt-in (default false) — init's primary job is to
+   * point the operator at the web setup wizard and surface the self-serve
+   * connect info, not to write a config file as a side effect.
+   */
   addMcp: boolean;
   addToken: boolean;
   apiKey: string | undefined;
   configDir: string;
   bindHost: string;
   port: number;
+  /**
+   * The vault's MCP connector URL — `<hub-origin>/vault/<name>/mcp` (hub-origin
+   * / expose-state aware). Surfaced in the summary for self-serve copy-paste:
+   * a ready-to-run `claude mcp add ...` command is built from it so a Claude
+   * Code user can opt in by pasting one line, AND it's printed plain so any
+   * other MCP client can be pointed at it.
+   */
   mcpUrl: string;
+  /**
+   * The web setup wizard URL — `<hub-origin>/admin/setup`. init's primary job
+   * is to get the operator into this wizard, so it's printed prominently at the
+   * top of the summary.
+   */
+  wizardUrl?: string | undefined;
   /**
    * The default vault's name — used to emit the three-segment
    * `vault:<vaultName>:read` scope in the OAuth-first mint-token suggestion
@@ -22,8 +41,8 @@ export type InitSummaryInput = {
   /**
    * Guidance from the bootstrap-credential step when no token could be issued
    * (standalone install, no hub reachable — vault#282 Stage 2). Surfaced when
-   * the operator wanted a token (`addMcp || addToken`) but `apiKey` is
-   * undefined, so they know why and how to make the vault reachable.
+   * the operator wanted a token (`addToken`) but `apiKey` is undefined, so they
+   * know why and how to make the vault reachable.
    */
   noTokenGuidance?: string | undefined;
   /**
@@ -38,54 +57,66 @@ export type InitSummaryInput = {
 };
 
 /**
- * Build the post-install summary lines for `vault init`, branched on the
- * (addMcp, addToken, apiKey) decision matrix.
+ * Build the post-install summary lines for `vault init`.
  *
- * vault#442: the DEFAULT is per-user OAuth — no token is minted, and the
- * Claude Code MCP entry is written without a baked bearer (browser sign-in on
- * first connect). A token is minted only on explicit opt-in (`addToken`), and
- * then scope-narrow. Branches:
+ * 2026-06-23 messaging realignment: the site no longer claims "Claude Code is
+ * auto-configured," and init no longer writes `~/.claude.json` by default.
+ * init's job is to (1) point the operator at the web setup wizard, and
+ * (2) SURFACE the self-serve connect info — the connector URL + a ready-to-paste
+ * `claude mcp add ...` line — so a Claude Code user opts in by copy-paste rather
+ * than a silent side effect.
  *
- *   addMcp,  !apiKey            → OAuth-first: connect, sign in on first use
- *   addMcp,  addToken,  apiKey  → token baked into claude.json + printed
- *   addMcp,  !addToken, apiKey  → token baked into claude.json, hint
- *   !addMcp, addToken,  apiKey  → token printed prominently
- *   !addMcp, addToken,  !apiKey → opted into a token but no hub reachable
- *   !addMcp, !addToken          → OAuth-first: add Claude Code later
+ * The summary is built in three parts:
+ *   1. Wizard hand-off (always) — "finish setup in your browser: <wizardUrl>".
+ *   2. Connect-your-AI block — the connector URL + copy-paste `claude mcp add`,
+ *      branched on whether init wrote the MCP entry / minted a token.
+ *   3. Config / server / next-steps footer.
+ *
+ * vault#442: per-user OAuth is the default — no token is minted unless the
+ * operator opts in (`addToken`), and then it's scope-narrow.
  */
 export function buildInitSummaryLines(input: InitSummaryInput): string[] {
-  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, vaultName, noTokenGuidance, hubPresent } = input;
+  const { addMcp, addToken, apiKey, configDir, bindHost, port, mcpUrl, wizardUrl, vaultName, noTokenGuidance, hubPresent } = input;
   const lines: string[] = [];
   lines.push("");
   lines.push("---");
 
-  if (addMcp && apiKey && addToken) {
+  // 1. Wizard hand-off — the primary purpose of init is to get the operator
+  // into the web setup wizard. Lead with it.
+  if (wizardUrl) {
+    lines.push("");
+    lines.push("Finish setup in your browser:");
+    lines.push(`  ${wizardUrl}`);
+  }
+
+  // The copy-paste opt-in line for Claude Code (and any client that speaks the
+  // `claude mcp add` form). Built from the connector URL so it's the real
+  // endpoint, hub-origin aware.
+  const claudeAddCmd = `claude mcp add --transport http parachute-vault ${mcpUrl}`;
+
+  // 2. Connect-your-AI — surface the self-serve connect info every time.
+  if (addToken && apiKey) {
+    // Operator opted into a header-auth token AND it was minted. Surface it
+    // prominently (won't be shown again), plus the connector URL.
     lines.push("");
     lines.push(`Your API token: ${apiKey}`);
-    lines.push(`  - Baked into ~/.claude.json for Claude Code ✓`);
-    lines.push(`  - Paste into your other MCP client's config, or use as Authorization: Bearer <token>`);
+    if (addMcp) {
+      lines.push(`  - Baked into ~/.claude.json for Claude Code ✓`);
+    }
+    lines.push(`  - Paste into another MCP client's config, or use as Authorization: Bearer <token>`);
     lines.push(`  - Won't be shown again — save it now.`);
-  } else if (addMcp && apiKey && !addToken) {
     lines.push("");
-    lines.push(
-      "Token in ~/.claude.json; run `parachute-vault mcp-install` later if you need one for other clients.",
-    );
-  } else if (addMcp && !apiKey) {
-    // vault#442 default: OAuth-first. The MCP entry is wired without a bearer —
-    // Claude Code signs in via browser OAuth on first connect. No token needed.
-    lines.push("");
-    lines.push("Connect your AI — no token needed, you'll sign in on first use:");
-    lines.push(`  Claude Code is already wired in (~/.claude.json) — just start a session.`);
-    lines.push(`  Other clients: claude mcp add --transport http parachute-vault ${mcpUrl}`);
-    lines.push(`  Need a header-auth token for a script? parachute auth mint-token --scope vault:${vaultName}:read`);
-  } else if (!addMcp && addToken && apiKey) {
-    lines.push("");
-    lines.push(`Your API token: ${apiKey}`);
-    lines.push(`  - Paste into your other MCP client's config, or use as Authorization: Bearer <token>`);
-    lines.push(`  - Won't be shown again — save it now.`);
-  } else if (!addMcp && addToken && !apiKey) {
+    lines.push("Connector URL (point any MCP client here):");
+    lines.push(`  ${mcpUrl}`);
+    if (!addMcp) {
+      lines.push("");
+      lines.push("Add Claude Code by copy-paste:");
+      lines.push(`  ${claudeAddCmd}`);
+    }
+  } else if (addToken && !apiKey) {
     // Explicitly opted into a token but none was minted (vault#282 Stage 2 —
-    // vault no longer mints local pvt_* tokens). Surface why + recovery.
+    // vault no longer mints local pvt_* tokens). Surface why + recovery, then
+    // still print the self-serve connect info.
     lines.push("");
     lines.push(
       noTokenGuidance ??
@@ -113,15 +144,23 @@ export function buildInitSummaryLines(input: InitSummaryInput): string[] {
         "  or set VAULT_AUTH_TOKEN for an operator-channel bearer.",
       );
     }
-  } else if (!addMcp && !addToken) {
-    // OAuth-first, but the operator skipped wiring Claude Code too.
     lines.push("");
-    lines.push(
-      "Skipped the Claude Code MCP entry. Add it anytime — it uses per-user OAuth, no token needed:",
-    );
-    lines.push(
-      "  parachute-vault mcp-install",
-    );
+    lines.push("Connect your AI — no token needed, you'll sign in on first use:");
+    lines.push(`  Connector URL:  ${mcpUrl}`);
+    lines.push(`  Claude Code:    ${claudeAddCmd}`);
+  } else {
+    // Default path (no token). Per-user OAuth — sign in on first connect.
+    lines.push("");
+    lines.push("Connect your AI — no token needed, you'll sign in on first use:");
+    lines.push(`  Connector URL:  ${mcpUrl}`);
+    if (addMcp) {
+      lines.push(`  Claude Code is already wired in (~/.claude.json) — just start a session.`);
+      lines.push(`  Other clients: ${claudeAddCmd}`);
+    } else {
+      lines.push(`  Claude Code:    ${claudeAddCmd}`);
+      lines.push(`  Other clients (Codex, Goose, OpenCode, Cursor, Zed, Cline): point them at the connector URL above.`);
+    }
+    lines.push(`  Need a header-auth token for a script? parachute auth mint-token --scope vault:${vaultName}:read`);
   }
 
   lines.push("");
@@ -137,19 +176,15 @@ export function buildInitSummaryLines(input: InitSummaryInput): string[] {
 
   lines.push("");
   lines.push(`Next steps:`);
+  if (wizardUrl) {
+    lines.push(`  - Finish setup in the web wizard:  ${wizardUrl}`);
+  }
   if (addMcp) {
     lines.push(`  - Start a new Claude Code session — your Vault is already wired in. Try:`);
     lines.push(`      claude "Help me set up my parachute vault"`);
-    lines.push(`  - Or point any other local MCP client (Codex, Goose, OpenCode, Cursor,`);
-    lines.push(`    Zed, Cline, your own agent) at:`);
-    lines.push(`      ${mcpUrl}`);
-  } else if (addToken) {
-    lines.push(`  - Point any local MCP client (Codex, Goose, OpenCode, Cursor, Zed,`);
-    lines.push(`    Cline, your own agent) at:`);
-    lines.push(`      ${mcpUrl}`);
-    lines.push(`  - Or add Claude Code back anytime:  parachute-vault mcp-install`);
   } else {
-    lines.push(`  - Add Claude Code:  parachute-vault mcp-install`);
+    lines.push(`  - Wire Claude Code (copy-paste):    ${claudeAddCmd}`);
+    lines.push(`    or run the guided installer:      parachute-vault mcp-install`);
   }
   lines.push(`  - Check status:     parachute-vault status`);
   lines.push(`  - Edit config:      parachute-vault config`);

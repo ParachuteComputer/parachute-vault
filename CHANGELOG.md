@@ -34,6 +34,28 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.6.2-rc.1] - 2026-06-23
+
+### Changed
+
+- **`parachute-vault init` no longer writes the Claude Code MCP config
+  (`~/.claude.json`) by default — it's opt-in now.** This aligns the install
+  code with the updated website messaging (the site no longer claims "Claude
+  Code is auto-configured"). init's job is to get the operator to the web setup
+  wizard and SURFACE the self-serve connection info, not to silently write a
+  config file as a side effect. The post-install summary now (1) leads with the
+  web setup wizard URL (`<hub-origin>/admin/setup`), and (2) always surfaces the
+  connector URL (`<hub-origin>/vault/<name>/mcp`) plus a ready-to-paste
+  `claude mcp add --transport http parachute-vault <url>` command — so a Claude
+  Code user opts in by copy-paste. Opt into the auto-write with
+  `parachute-vault init --configure-claude-code` (aliases `--mcp-install`,
+  `--mcp`); `--no-mcp` remains the explicit "don't." Previously init prompted
+  default-yes in a TTY and defaulted to **yes** when non-interactive (piped
+  installs), so the new default is a behavior change for both paths — the
+  connect info is printed for copy-paste instead. The standalone
+  `parachute-vault mcp-install` command is unchanged and remains the canonical
+  explicit opt-in path.
+
 ## [0.6.1] - 2026-06-12
 
 ### Added

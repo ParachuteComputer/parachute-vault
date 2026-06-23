@@ -72,6 +72,134 @@ describe("vault init — --help mentions --vault-name", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("--no-autostart");
   });
+
+  test("usage text documents the opt-in --configure-claude-code flag (2026-06-23)", () => {
+    const { exitCode, stdout } = runCli(["--help"]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("--configure-claude-code");
+  });
+});
+
+/**
+ * 2026-06-23 messaging realignment: writing the Claude Code MCP config
+ * (~/.claude.json) is now OPT-IN. init's default no longer writes it — it
+ * surfaces the connector URL + a copy-paste `claude mcp add` command and points
+ * at the web wizard instead. These run init end-to-end under an isolated HOME /
+ * PARACHUTE_HOME (with --no-autostart --no-token to keep daemon + token side
+ * effects out) and assert the ~/.claude.json side effect on the default vs the
+ * opt-in path. Non-interactive (piped) is the mode these spawned subprocesses
+ * run in, which is exactly the back-compat-sensitive path.
+ */
+describe("vault init — Claude Code MCP config is opt-in (2026-06-23)", () => {
+  test("default (no --mcp flag) does NOT write ~/.claude.json, and surfaces copy-paste connect info", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "vault-init-mcp-optin-"));
+    try {
+      const parachuteHome = join(sandbox, ".parachute");
+      const claudeJson = join(sandbox, ".claude.json");
+      const { exitCode, stdout } = runCli(
+        [
+          "init",
+          "--no-autostart",
+          "--no-token",
+          "--vault-name",
+          "mcpoptin",
+        ],
+        { HOME: sandbox, PARACHUTE_HOME: parachuteHome },
+      );
+
+      expect(exitCode).toBe(0);
+      // The headline behavior: no silent ~/.claude.json write.
+      expect(existsSync(claudeJson)).toBe(false);
+      expect(stdout).not.toContain("MCP server added to ~/.claude.json");
+      // But the self-serve connect info IS surfaced for copy-paste.
+      expect(stdout).toContain("claude mcp add --transport http");
+      expect(stdout).toContain("/vault/mcpoptin/mcp");
+      // And the web wizard hand-off is present.
+      expect(stdout).toContain("Finish setup in your browser:");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("--configure-claude-code opts in and writes ~/.claude.json", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "vault-init-mcp-optin-"));
+    try {
+      const parachuteHome = join(sandbox, ".parachute");
+      const claudeJson = join(sandbox, ".claude.json");
+      const { exitCode, stdout } = runCli(
+        [
+          "init",
+          "--no-autostart",
+          "--no-token",
+          "--configure-claude-code",
+          "--vault-name",
+          "mcpoptin",
+        ],
+        { HOME: sandbox, PARACHUTE_HOME: parachuteHome },
+      );
+
+      expect(exitCode).toBe(0);
+      expect(existsSync(claudeJson)).toBe(true);
+      const claudeConfig = JSON.parse(readFileSync(claudeJson, "utf-8"));
+      // The user-scope entry is keyed `parachute-vault` under top-level mcpServers.
+      expect(claudeConfig.mcpServers?.["parachute-vault"]?.url).toContain(
+        "/vault/mcpoptin/mcp",
+      );
+      expect(stdout).toContain("MCP server added to ~/.claude.json");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  for (const alias of ["--mcp", "--mcp-install"]) {
+    test(`the ${alias} alias still opts in`, () => {
+      const sandbox = mkdtempSync(join(tmpdir(), "vault-init-mcp-optin-"));
+      try {
+        const parachuteHome = join(sandbox, ".parachute");
+        const claudeJson = join(sandbox, ".claude.json");
+        const { exitCode } = runCli(
+          [
+            "init",
+            "--no-autostart",
+            "--no-token",
+            alias,
+            "--vault-name",
+            "mcpoptin",
+          ],
+          { HOME: sandbox, PARACHUTE_HOME: parachuteHome },
+        );
+        expect(exitCode).toBe(0);
+        expect(existsSync(claudeJson)).toBe(true);
+      } finally {
+        rmSync(sandbox, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("--no-mcp wins over an opt-in alias on the same command line", () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "vault-init-mcp-optin-"));
+    try {
+      const parachuteHome = join(sandbox, ".parachute");
+      const claudeJson = join(sandbox, ".claude.json");
+      const { exitCode } = runCli(
+        [
+          "init",
+          "--no-autostart",
+          "--no-token",
+          "--configure-claude-code",
+          "--no-mcp",
+          "--vault-name",
+          "mcpoptin",
+        ],
+        { HOME: sandbox, PARACHUTE_HOME: parachuteHome },
+      );
+      expect(exitCode).toBe(0);
+      // --no-mcp is the safer default and must win — no file written.
+      expect(existsSync(claudeJson)).toBe(false);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
 });
 
 /**

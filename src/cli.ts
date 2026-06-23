@@ -57,6 +57,7 @@ import {
   buildMcpEntryPlan,
   chooseHubOrigin,
   chooseMcpUrl,
+  DEFAULT_HUB_LOOPBACK_PORT,
   detectHubPresence,
   detectInstallContext,
   mintHubJwt,
@@ -258,21 +259,60 @@ switch (command) {
 // Command implementations
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve the origin to use for the web setup wizard link (`<origin>/admin/setup`).
+ *
+ * The wizard is served by the HUB, not by vault, so the loopback fallback must
+ * target the hub's fixed loopback port (1939 / $PARACHUTE_HUB_PORT) — NOT
+ * vault's listen port. `chooseHubOrigin` returns vault's loopback as its
+ * fallback, so we only reuse it when a real (env / expose-state) hub origin is
+ * configured; otherwise we synthesize the hub's loopback URL.
+ *
+ * `vaultPort` is vault's listen port — passed only so `chooseHubOrigin`'s
+ * loopback branch is well-formed; we discard that loopback URL in favor of the
+ * hub-port one.
+ */
+function resolveHubOriginForWizard(vaultPort: number): string {
+  const { url, source } = chooseHubOrigin(vaultPort);
+  if (source === "loopback") {
+    // Guard against a non-numeric PARACHUTE_HUB_PORT producing
+    // `http://127.0.0.1:NaN` — mirror detectHubPresence's Number.isFinite guard.
+    const envPort = process.env.PARACHUTE_HUB_PORT
+      ? Number(process.env.PARACHUTE_HUB_PORT)
+      : undefined;
+    const hubPort = Number.isFinite(envPort) ? (envPort as number) : DEFAULT_HUB_LOOPBACK_PORT;
+    return `http://127.0.0.1:${hubPort}`;
+  }
+  return url;
+}
+
 async function cmdInit(args: string[] = []) {
   ensureConfigDirSync();
 
-  // Flags: --mcp installs MCP in ~/.claude.json without prompting;
-  // --no-mcp skips it without prompting. If both passed, --no-mcp wins
-  // (safer default). Neither → prompt in a TTY, default-yes in a
-  // non-TTY for back-compat with existing piped install scripts.
+  // Writing the Claude Code MCP config (~/.claude.json) is now OPT-IN
+  // (2026-06-23). init's primary job is to get the operator to the hub's
+  // web setup wizard and SURFACE the self-serve connection info (connector
+  // URL + a ready-to-paste `claude mcp add` command), NOT to silently write
+  // a config file as a side effect of setup. The site no longer claims
+  // "Claude Code is auto-configured," so the install code stops doing it by
+  // default.
   //
-  // --token / --no-token follow the same pattern for whether the API
-  // token is surfaced to the user at the end of init (for pasting into
-  // other MCP clients, scripts, or curl).
+  // Opt in with --configure-claude-code (aliases --mcp-install, --mcp) to
+  // have init write the entry for you. --no-mcp is retained as the explicit
+  // "definitely don't" form (and wins if both are passed — safer default).
+  // The standalone `parachute-vault mcp-install` command is unchanged — it
+  // remains the canonical explicit opt-in path.
+  //
+  // --token / --no-token control whether init ALSO mints + surfaces a
+  // header-auth API token (for pasting into non-OAuth MCP clients, scripts,
+  // or curl). Default stays off.
   //
   // --vault-name <name> skips the name prompt for non-interactive installs
   // (validated up front; exits non-zero on invalid input).
-  const flagMcpOn = args.includes("--mcp");
+  const flagMcpOn =
+    args.includes("--configure-claude-code") ||
+    args.includes("--mcp-install") ||
+    args.includes("--mcp");
   const flagMcpOff = args.includes("--no-mcp");
   const flagTokenOn = args.includes("--token");
   const flagTokenOff = args.includes("--no-token");
@@ -507,19 +547,28 @@ async function cmdInit(args: string[] = []) {
   const bindHost = resolveBindHostname(process.env);
   console.log(`  Listening on http://${bindHost}:${globalConfig.port || DEFAULT_PORT}`);
 
-  // 7. Install MCP for Claude Code (with token for auth) — user confirms
-  // unless --mcp / --no-mcp explicitly passed. Writing to ~/.claude.json
-  // is a side effect some users don't want; default-yes in a TTY since
-  // most users installing vault want Claude Code to see it, but ask.
+  // 7. Optionally write the Claude Code MCP config (~/.claude.json). This is
+  // OPT-IN as of 2026-06-23 (see the flag-parsing note above). init's job is
+  // to point the operator at the web wizard + surface the self-serve connect
+  // info; it does NOT write ~/.claude.json by default. Resolution:
+  //   --no-mcp                          → false (explicit "don't")
+  //   --configure-claude-code / --mcp   → true  (explicit opt-in)
+  //   TTY, no flag                      → ask (default NO — opt-in, not -out)
+  //   non-TTY, no flag                  → false (no silent side effect in
+  //                                       piped installs; the connect info is
+  //                                       printed for copy-paste instead)
   let addMcp: boolean;
   if (flagMcpOff) {
     addMcp = false;
   } else if (flagMcpOn) {
     addMcp = true;
   } else if (process.stdin.isTTY) {
-    addMcp = await confirm("Install Vault as an MCP server in Claude Code (~/.claude.json)?", true);
+    addMcp = await confirm(
+      "Also write the Claude Code MCP config now (~/.claude.json)? (you can always copy-paste the command below later)",
+      false,
+    );
   } else {
-    addMcp = true; // non-interactive: preserve the installable-via-pipe default
+    addMcp = false; // non-interactive: no silent ~/.claude.json write
   }
 
   // 7b. Mint an API token for the header-auth / script use case? (Codex,
@@ -583,14 +632,22 @@ async function cmdInit(args: string[] = []) {
     if (!apiKey) {
       console.log(`  No token baked in — you'll sign in via OAuth on first connect.`);
     }
-  } else {
-    console.log("  Skipped adding MCP to ~/.claude.json.");
-    console.log("  Run `parachute-vault mcp-install` later if you want it.");
   }
+  // No else: when the operator didn't opt in, the init summary below surfaces
+  // the connector URL + a copy-paste `claude mcp add` command instead of a
+  // "skipped" line — that's the self-serve path.
 
   // 8. Summary
   const port = globalConfig.port || DEFAULT_PORT;
-  const mcpUrl = `http://127.0.0.1:${port}/vault/${defaultVault}/mcp`;
+  // Connector URL surfaced for self-serve copy-paste. Hub-origin / expose-state
+  // aware (chooseMcpUrl), so it's the URL a remote Claude Code / other client
+  // actually reaches, not a bare loopback. The init-summary prints a
+  // ready-to-paste `claude mcp add ...` built from this.
+  const { url: connectorUrl } = chooseMcpUrl(defaultVault, port);
+  // Web setup wizard lives on the hub at <hub-origin>/admin/setup. Resolve the
+  // hub origin the same way (env / expose-state / loopback); the loopback form
+  // points at the co-located hub's fixed port (1939), not vault's listen port.
+  const wizardUrl = `${resolveHubOriginForWizard(port)}/admin/setup`;
   // Probe whether a hub is present so the summary's "opted into a token but
   // none minted" copy reflects reality: under a hub the vault is reachable via
   // browser OAuth even with no header-auth token (#445). Only matters for the
@@ -603,7 +660,8 @@ async function cmdInit(args: string[] = []) {
     configDir: CONFIG_DIR,
     bindHost,
     port,
-    mcpUrl,
+    mcpUrl: connectorUrl,
+    wizardUrl,
     vaultName: defaultVault,
     noTokenGuidance: credentialGuidance,
     hubPresent,
@@ -3714,12 +3772,19 @@ data, and debugging.
 ── Standard use ───────────────────────────────────────────────────────
 
 Setup:
-  parachute-vault init [--mcp|--no-mcp] [--token|--no-token] [--vault-name <name>]
-                       [--autostart|--no-autostart]
-                                           Set up everything (one command, idempotent).
-                                           --mcp/--no-mcp controls the Claude Code MCP entry (written
-                                           for per-user OAuth by default — no baked token; sign in on
-                                           first connect). --token opts into ALSO minting a scope-narrow
+  parachute-vault init [--configure-claude-code|--no-mcp] [--token|--no-token]
+                       [--vault-name <name>] [--autostart|--no-autostart]
+                                           Set up everything (one command, idempotent). init's
+                                           job is to get you to the web setup wizard and surface
+                                           your connector URL + a ready-to-paste \`claude mcp add\`
+                                           command — it does NOT write the Claude Code MCP config
+                                           (~/.claude.json) by default. Pass --configure-claude-code
+                                           (alias --mcp-install / --mcp) to opt in and have init
+                                           write that entry for you (per-user OAuth — no baked token;
+                                           sign in on first connect); --no-mcp is the explicit "don't".
+                                           The standalone \`parachute-vault mcp-install\` command remains
+                                           the canonical way to wire Claude Code anytime.
+                                           --token opts into ALSO minting a scope-narrow
                                            header-auth token (vault:<name>:read) for non-OAuth clients /
                                            scripts; --no-token (the default) skips minting entirely.
                                            --vault-name skips the prompt and names the vault
