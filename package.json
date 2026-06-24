@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/vault",
-  "version": "0.6.2-rc.1",
+  "version": "0.6.2",
   "description": "Agent-native knowledge graph. Notes, tags, links over MCP.",
   "module": "src/cli.ts",
   "type": "module",
@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "@openparachute/scope-guard": "^0.4.1-rc.1",
+    "@openparachute/scope-guard": "^0.4.1",
     "jose": "^6.2.2",
     "otpauth": "^9.5.0",
     "qrcode-terminal": "^0.12.0"
