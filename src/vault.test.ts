@@ -641,6 +641,16 @@ describe("scoped MCP wrapper", async () => {
     expect(Array.isArray(result.query_hints)).toBe(true);
     expect((result.query_hints as string[]).length).toBeGreaterThan(0);
 
+    // GAP 3 — coordinates block: the vault states its own NAME + REST/MCP URL
+    // templates so a surface-builder doesn't reconstruct them from the
+    // connector config. No public hub origin in this test fixture → loopback →
+    // `<hub-origin>` placeholder templates, `base_url` null.
+    const coords = result.coordinates as Record<string, unknown>;
+    expect(coords.name).toBe(vaultName);
+    expect(coords.rest_api).toBe(`<hub-origin>/vault/${vaultName}/api`);
+    expect(coords.mcp).toBe(`<hub-origin>/vault/${vaultName}/mcp`);
+    expect(coords.base_url).toBeNull();
+
     // stats omitted unless requested
     expect(result.stats).toBeUndefined();
 

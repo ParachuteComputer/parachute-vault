@@ -100,7 +100,21 @@ export async function getServerInstruction(
     vaultName,
     description: config?.description ?? null,
     projection,
+    coordinates: resolveVaultCoordinates(),
   });
+}
+
+/**
+ * Resolve this vault's own public coordinates for the projection. The vault
+ * always knows its NAME; its hub origin comes from `resolveHubOrigin()`
+ * (PARACHUTE_HUB_ORIGIN → expose-state FQDN → loopback). A loopback source
+ * means no public origin is configured — flagged via `hubOriginKnown: false`
+ * so the projection renders relative path templates rather than a loopback URL
+ * a remote surface-builder can't use.
+ */
+function resolveVaultCoordinates(): { hubOrigin: string; hubOriginKnown: boolean } {
+  const { url, source } = resolveHubOrigin();
+  return { hubOrigin: url, hubOriginKnown: source !== "loopback" };
 }
 
 /**
@@ -482,9 +496,24 @@ function overrideVaultInfo(
     const includeStats = Boolean(params.include_stats);
     const projection = buildVaultProjection(store.db, { includeStats });
 
+    // GAP 3 / vault coordinates: surface the vault's own NAME + REST/MCP URL
+    // templates so a surface-builder doesn't have to learn them from the MCP
+    // connector config. `base_url` is absolute when the vault knows its public
+    // origin (PARACHUTE_HUB_ORIGIN / expose-state); null on a loopback-only
+    // box, where `rest_api` / `mcp` carry `<hub-origin>` placeholder templates
+    // resolved against whatever origin the client connected through.
+    const coords = resolveVaultCoordinates();
+    const coordBase = coords.hubOriginKnown ? coords.hubOrigin.replace(/\/$/, "") : "<hub-origin>";
+
     const result: Record<string, unknown> = {
       name: config.name,
       description: config.description ?? null,
+      coordinates: {
+        name: config.name,
+        base_url: coords.hubOriginKnown ? `${coordBase}/vault/${config.name}` : null,
+        rest_api: `${coordBase}/vault/${config.name}/api`,
+        mcp: `${coordBase}/vault/${config.name}/mcp`,
+      },
       tags: projection.tags,
       indexed_fields: projection.indexed_fields,
       query_hints: projection.query_hints,

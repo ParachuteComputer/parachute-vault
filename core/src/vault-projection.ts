@@ -273,8 +273,19 @@ export function projectionToMarkdown(args: {
   vaultName: string;
   description?: string | null;
   projection: VaultProjection;
+  /**
+   * This vault's own public coordinates, surfaced so a surface-builder never has
+   * to guess the vault NAME or reconstruct the REST/MCP URLs from the connector
+   * config. When `hubOrigin` is a known absolute origin (configured
+   * `PARACHUTE_HUB_ORIGIN` or an active expose-state FQDN), the absolute base
+   * URLs are rendered; when it's only the loopback fallback (no public origin
+   * known to the vault), relative path templates are rendered with a note that
+   * the origin is whatever the client connected through. The NAME is always
+   * known and always surfaced. See `chooseHubOrigin` (src/mcp-install.ts).
+   */
+  coordinates?: { hubOrigin: string; hubOriginKnown: boolean };
 }): string {
-  const { vaultName, description, projection } = args;
+  const { vaultName, description, projection, coordinates } = args;
   const stats = projection.stats;
 
   const lines: string[] = [];
@@ -282,6 +293,27 @@ export function projectionToMarkdown(args: {
   if (description && description.trim().length > 0) {
     lines.push("");
     lines.push(description.trim());
+  }
+
+  // GAP 3 / vault coordinates: state the vault's own NAME + REST/MCP URLs so a
+  // surface-builder (or any scripting client) doesn't have to learn them from
+  // the MCP connector config. Absolute when the vault knows its public origin;
+  // relative templates otherwise.
+  if (coordinates) {
+    lines.push("");
+    lines.push("## This vault's coordinates");
+    lines.push("");
+    lines.push(`- Name: \`${vaultName}\``);
+    if (coordinates.hubOriginKnown) {
+      const base = coordinates.hubOrigin.replace(/\/$/, "");
+      lines.push(`- REST API base: \`${base}/vault/${vaultName}/api/...\``);
+      lines.push(`- MCP endpoint: \`${base}/vault/${vaultName}/mcp\``);
+    } else {
+      lines.push(
+        `- REST API: \`<hub-origin>/vault/${vaultName}/api/...\` — \`<hub-origin>\` is the origin you connected through (the vault has no public origin configured to render here).`,
+      );
+      lines.push(`- MCP endpoint: \`<hub-origin>/vault/${vaultName}/mcp\``);
+    }
   }
 
   // A2: surface the seeded onboarding guide so a connected AI can discover it
