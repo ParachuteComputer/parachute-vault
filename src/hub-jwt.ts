@@ -65,6 +65,37 @@ export function getJwksOrigin(): string {
   return DEFAULT_HUB_LOOPBACK;
 }
 
+/**
+ * Parse the hub's comma-separated legitimate-origin SET from
+ * `PARACHUTE_HUB_ORIGINS` into a clean string array. Mirrors the hub's own
+ * `parseHubOrigins` semantics: split on `,`, trim each, strip a trailing
+ * slash, drop empties, dedupe. We write the ~6-line helper locally rather than
+ * import from a private hub path.
+ *
+ * The multi-origin iss-set (onboarding-streamline 2026-06-25, hub#692): one box
+ * reachable on several URLs at once (loopback + `<ip>.sslip.io` + a custom
+ * domain) mints tokens whose `iss` is whichever origin the request arrived on.
+ * The signing KEY is stable and origin-independent, so a token minted under
+ * URL-A must validate when this resource is reached via URL-B on the SAME box.
+ * The hub publishes its legitimate-origin set here (out-of-band, never from an
+ * unvalidated request Host); scope-guard layers it on top of the signature
+ * verify, never as a substitute for it.
+ *
+ * BACK-COMPAT INVARIANT: when `PARACHUTE_HUB_ORIGINS` is UNSET this returns
+ * `[]`. scope-guard's `resolveAcceptedIssuers` sees an empty set and collapses
+ * to the single canonical `getHubOrigin()` — byte-identical to today. A vault
+ * that never receives the new env var behaves exactly as before.
+ */
+export function parseHubOrigins(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const origin = part.trim().replace(/\/$/, "");
+    if (origin.length > 0) seen.add(origin);
+  }
+  return Array.from(seen);
+}
+
 // Process-wide guard. The resolver form lets tests flip
 // `PARACHUTE_HUB_ORIGIN` / `PARACHUTE_HUB_JWKS_ORIGIN` between cases — the lib
 // re-resolves on every `validateHubJwt` and `resetJwksCache` call so the
@@ -79,6 +110,12 @@ export function getJwksOrigin(): string {
 const guard = createScopeGuard({
   hubOrigin: () => getHubOrigin(),
   jwksOrigin: () => getJwksOrigin(),
+  // Multi-origin iss-set (hub#692): accept the hub's full legitimate-origin set
+  // (published via PARACHUTE_HUB_ORIGINS), not just the single PARACHUTE_HUB_ORIGIN.
+  // Re-evaluated per call so an operator widening the box's origins is picked up
+  // without a vault restart. When the env var is unset → `[]` → scope-guard
+  // collapses to the single canonical hubOrigin (byte-identical to before).
+  allowedIssuers: () => parseHubOrigins(process.env.PARACHUTE_HUB_ORIGINS),
 });
 
 /**

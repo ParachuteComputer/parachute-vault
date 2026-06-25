@@ -21,6 +21,7 @@ import {
   looksLikeJwt,
   getHubOrigin,
   getJwksOrigin,
+  parseHubOrigins,
 } from "./hub-jwt.ts";
 
 interface Keypair {
@@ -121,6 +122,7 @@ let fixture: JwksFixture;
 let kp: Keypair;
 let prevHubOrigin: string | undefined;
 let prevJwksOrigin: string | undefined;
+let prevHubOrigins: string | undefined;
 
 beforeAll(async () => {
   fixture = startJwksFixture();
@@ -134,6 +136,8 @@ afterAll(() => {
   else process.env.PARACHUTE_HUB_ORIGIN = prevHubOrigin;
   if (prevJwksOrigin === undefined) delete process.env.PARACHUTE_HUB_JWKS_ORIGIN;
   else process.env.PARACHUTE_HUB_JWKS_ORIGIN = prevJwksOrigin;
+  if (prevHubOrigins === undefined) delete process.env.PARACHUTE_HUB_ORIGINS;
+  else process.env.PARACHUTE_HUB_ORIGINS = prevHubOrigins;
 });
 
 beforeEach(() => {
@@ -143,8 +147,12 @@ beforeEach(() => {
   // the loopback default (no JWKS server there) and every case would fail.
   prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
   prevJwksOrigin = process.env.PARACHUTE_HUB_JWKS_ORIGIN;
+  prevHubOrigins = process.env.PARACHUTE_HUB_ORIGINS;
   process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
   process.env.PARACHUTE_HUB_JWKS_ORIGIN = fixture.origin;
+  // Default each case to the single-origin (env-unset) world so the multi-origin
+  // iss-set is opt-in per test — unrelated cases stay byte-identical to before.
+  delete process.env.PARACHUTE_HUB_ORIGINS;
   fixture.setUnreachable(false);
   fixture.setKeys([kp]);
   resetJwksCache();
@@ -165,6 +173,28 @@ describe("looksLikeJwt", () => {
   test("empty / random → false", () => {
     expect(looksLikeJwt("")).toBe(false);
     expect(looksLikeJwt("hello-world")).toBe(false);
+  });
+});
+
+describe("parseHubOrigins — multi-origin iss-set (hub#692)", () => {
+  test("undefined → [] (back-compat: env unset collapses to single hubOrigin)", () => {
+    expect(parseHubOrigins(undefined)).toEqual([]);
+  });
+
+  test("empty string → []", () => {
+    expect(parseHubOrigins("")).toEqual([]);
+  });
+
+  test("splits, trims, strips trailing slash, drops empties, dedupes", () => {
+    // "a,b/, ,a" → [a, b]: trailing slash off b, blank entry dropped, dup a collapsed.
+    expect(parseHubOrigins("https://a.example,https://b.example/, ,https://a.example")).toEqual([
+      "https://a.example",
+      "https://b.example",
+    ]);
+  });
+
+  test("whitespace-only entries are dropped", () => {
+    expect(parseHubOrigins("  ,  ,  ")).toEqual([]);
   });
 });
 
@@ -223,6 +253,56 @@ describe("origin resolvers — iss/jwks split (vault#464)", () => {
     } finally {
       jwksOnly.stop();
     }
+  });
+});
+
+describe("validateHubJwt — multi-origin iss-set (hub#692)", () => {
+  // A second + third origin that are NOT the canonical PARACHUTE_HUB_ORIGIN.
+  // Every token here is signed by the SAME published key (`kp`), so the
+  // signature always verifies — the ONLY variable under test is whether the
+  // token's `iss` is in the accepted set. JWKS + revocation stay served by the
+  // default `fixture`, reached as both the iss origin and the jwks origin.
+  const SECOND = "https://second.example";
+  const THIRD = "https://third.example";
+
+  test("token issued by a SECOND origin validates when that origin is in PARACHUTE_HUB_ORIGINS", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = fixture.origin; // canonical (also JWKS host)
+    process.env.PARACHUTE_HUB_ORIGINS = `${fixture.origin},${SECOND}`;
+    resetJwksCache();
+    const token = await signJwt(kp, { iss: SECOND });
+    const claims = await validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+  });
+
+  test("the canonical origin still validates when PARACHUTE_HUB_ORIGINS lists a different second origin", async () => {
+    // The resolved hubOrigin is always added to the set, so a token minted under
+    // the canonical origin keeps validating even when the env names only others.
+    process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
+    process.env.PARACHUTE_HUB_ORIGINS = SECOND; // env need not include the canonical
+    resetJwksCache();
+    const token = await signJwt(kp, { iss: fixture.origin });
+    const claims = await validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+  });
+
+  test("token issued by a THIRD, unlisted origin is rejected even with PARACHUTE_HUB_ORIGINS set", async () => {
+    process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
+    process.env.PARACHUTE_HUB_ORIGINS = `${fixture.origin},${SECOND}`;
+    resetJwksCache();
+    const token = await signJwt(kp, { iss: THIRD });
+    await expect(validateHubJwt(token)).rejects.toThrow(/verification failed/);
+  });
+
+  test("back-compat: with PARACHUTE_HUB_ORIGINS UNSET only the canonical origin validates; a second origin is rejected", async () => {
+    delete process.env.PARACHUTE_HUB_ORIGINS;
+    process.env.PARACHUTE_HUB_ORIGIN = fixture.origin;
+    resetJwksCache();
+    // canonical iss → accepted
+    const ok = await signJwt(kp, { iss: fixture.origin });
+    expect((await validateHubJwt(ok)).sub).toBe("user-1");
+    // the same SECOND origin that WOULD pass when listed → rejected when unset
+    const bad = await signJwt(kp, { iss: SECOND });
+    await expect(validateHubJwt(bad)).rejects.toThrow(/verification failed/);
   });
 });
 

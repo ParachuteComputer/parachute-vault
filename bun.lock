@@ -6,7 +6,7 @@
       "name": "parachute-vault",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.12.1",
-        "@openparachute/scope-guard": "^0.4.1",
+        "@openparachute/scope-guard": "^0.5.0",
         "jose": "^6.2.2",
         "otpauth": "^9.5.0",
         "qrcode-terminal": "^0.12.0",
@@ -26,7 +26,7 @@
 
     "@noble/hashes": ["@noble/hashes@2.0.1", "", {}, "sha512-XlOlEbQcE9fmuXxrVTXCTlG2nlRXa9Rj3rr5Ue/+tX+nmkgbX720YHh0VR3hBF9xDvwnb8D2shVGOwNx+ulArw=="],
 
-    "@openparachute/scope-guard": ["@openparachute/scope-guard@0.4.1", "", { "dependencies": { "jose": "^6.2.2" }, "peerDependencies": { "typescript": "^5" } }, "sha512-qG6Eatlw184OZS0yG9Xw9MRtwIMTMmIgsNr4DnMJyjx2MZqPdcihBVzwTC5l5Lnq2Kz0daAjTAfNc+4lE9I0/Q=="],
+    "@openparachute/scope-guard": ["@openparachute/scope-guard@0.5.0", "", { "dependencies": { "jose": "^6.2.2" }, "peerDependencies": { "typescript": "^5" } }, "sha512-cnX4hutteyIWPSj1I5UvIGShBNLrQSrW1DpP2CNJfHl0ndi5DrdvQvxjXQj3S8/F/FDlhTbFyTNqmyErATuN4Q=="],
 
     "@types/bun": ["@types/bun@1.3.11", "", { "dependencies": { "bun-types": "1.3.11" } }, "sha512-5vPne5QvtpjGpsGYXiFyycfpDF2ECyPcTSsFBMa0fraoxiQyMJ3SmuQIGhzPg2WJuWxVBoxWJ2kClYTcw/4fAg=="],
 
