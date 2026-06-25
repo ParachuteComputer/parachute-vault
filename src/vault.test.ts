@@ -578,6 +578,13 @@ describe("scoped MCP wrapper", async () => {
     const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
 
+    // The GAP-3 coordinates block reads PARACHUTE_HUB_ORIGIN; another test FILE
+    // in a shared `bun test ./src` run may have left it set (cross-file env
+    // pollution — e.g. hub-jwt.test.ts). Pin loopback so the coordinates
+    // assertion below is deterministic regardless of file order; restore after.
+    const prevHubOrigin = process.env.PARACHUTE_HUB_ORIGIN;
+    delete process.env.PARACHUTE_HUB_ORIGIN;
+
     const vaultName = `proj-${Date.now()}`;
     writeVaultConfig({
       name: vaultName,
@@ -657,6 +664,8 @@ describe("scoped MCP wrapper", async () => {
     const withStats = await vaultInfo.execute({ include_stats: true }) as any;
     expect(withStats.stats).toBeTruthy();
 
+    if (prevHubOrigin === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
+    else process.env.PARACHUTE_HUB_ORIGIN = prevHubOrigin;
     closeAllStores();
   });
 
