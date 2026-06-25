@@ -9,6 +9,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { resolve } from "path";
 import {
   mkdtempSync,
@@ -347,6 +348,51 @@ describe("vault create — services.json registration (#208)", () => {
     // Regression guard: warnings from upsertService must go to stderr, not
     // stdout — otherwise the hub orchestrator's JSON.parse(stdout) breaks.
     const { stdout } = runCli(["create", "clean", "--json"], {
+      PARACHUTE_HOME: home,
+    });
+    expect(() => JSON.parse(stdout.trim())).not.toThrow();
+  });
+});
+
+/**
+ * Onboarding-guide seeding on create (demo-prep Workstream A — A1/A3).
+ *
+ * A freshly-created vault must contain the `Getting Started` + `Surface Starter`
+ * notes so a connected AI can read them and help set the vault up. Idempotent +
+ * best-effort: the seed never fails a create and never clobbers an edited note.
+ */
+describe("vault create — onboarding guide seeding (A1/A3)", () => {
+  /** Read all (path, content) rows from a created vault's SQLite DB. */
+  function readNotes(name: string): { path: string | null; content: string }[] {
+    const dbPath = join(home, "vault", "data", name, "vault.db");
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      return db
+        .query("SELECT path, content FROM notes")
+        .all() as { path: string | null; content: string }[];
+    } finally {
+      db.close();
+    }
+  }
+
+  test("create seeds Getting Started + Surface Starter notes", () => {
+    const { exitCode } = runCli(["create", "guided", "--json"], {
+      PARACHUTE_HOME: home,
+    });
+    expect(exitCode).toBe(0);
+
+    const notes = readNotes("guided");
+    const gs = notes.find((n) => n.path === "Getting Started");
+    const ss = notes.find((n) => n.path === "Surface Starter");
+    expect(gs).toBeDefined();
+    expect(ss).toBeDefined();
+    expect(gs!.content).toContain("# Getting Started");
+    expect(gs!.content).toContain("[[Surface Starter]]");
+    expect(ss!.content).toContain("@openparachute/surface-client");
+  });
+
+  test("seeding doesn't break --json stdout (notes seeded silently)", () => {
+    const { stdout } = runCli(["create", "jsonclean", "--json"], {
       PARACHUTE_HOME: home,
     });
     expect(() => JSON.parse(stdout.trim())).not.toThrow();

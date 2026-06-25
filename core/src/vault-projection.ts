@@ -33,6 +33,23 @@ import {
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
 import type { VaultStats } from "./types.ts";
+import { GETTING_STARTED_PATH } from "./onboarding.ts";
+
+/**
+ * Does a note live at the seeded onboarding path? Used to gate the "Start here"
+ * pointer so it only fires when the guide actually exists (fresh vaults seed it;
+ * pre-existing vaults that never seeded one shouldn't dangle a dead pointer).
+ */
+function hasGettingStartedNote(db: Database): boolean {
+  try {
+    const row = db
+      .query("SELECT 1 FROM notes WHERE path = ? LIMIT 1")
+      .get(GETTING_STARTED_PATH);
+    return row != null;
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,6 +93,14 @@ export interface VaultProjection {
   tags: ProjectionTag[];
   indexed_fields: ProjectionIndexedField[];
   query_hints: string[];
+  /**
+   * Path of the seeded onboarding guide, when present. A pointer (NOT the note
+   * body) so any connected AI is steered to read `Getting Started` first, every
+   * session — the AI fetches it with `query-notes { id: "<path>" }`. Omitted
+   * when no such note exists (older vaults that never seeded one). See
+   * core/src/onboarding.ts.
+   */
+  getting_started?: string;
   /** Included when the caller requests stats; omitted otherwise. */
   stats?: VaultStats;
 }
@@ -210,6 +235,12 @@ export function buildVaultProjection(
     query_hints: [...QUERY_HINTS],
   };
 
+  // A2: point any connected AI at the seeded onboarding guide (a path pointer,
+  // never the body). Only when the note actually exists.
+  if (hasGettingStartedNote(db)) {
+    projection.getting_started = GETTING_STARTED_PATH;
+  }
+
   if (opts?.includeStats) {
     projection.stats = noteOps.getVaultStats(db);
   }
@@ -251,6 +282,19 @@ export function projectionToMarkdown(args: {
   if (description && description.trim().length > 0) {
     lines.push("");
     lines.push(description.trim());
+  }
+
+  // A2: steer the AI to read the seeded onboarding guide FIRST, every session.
+  // A pointer only — the AI fetches the body on demand. Rendered prominently up
+  // top so it's the first instruction after the vault's own description.
+  if (projection.getting_started) {
+    lines.push("");
+    lines.push(
+      `## Start here\n\nRead the **${projection.getting_started}** guide before doing anything else — ` +
+        `it's your standing orientation for this vault (what it is, how to design tags vs paths vs ` +
+        `schemas, how to import existing notes, and how to keep growing it). Fetch it with ` +
+        `\`query-notes { id: "${projection.getting_started}" }\`. It's a living note — keep it current as the vault matures.`,
+    );
   }
 
   lines.push("");

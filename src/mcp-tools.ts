@@ -490,6 +490,14 @@ function overrideVaultInfo(
       query_hints: projection.query_hints,
     };
 
+    // A2: surface a pointer (path, not body) to the seeded onboarding guide so
+    // any connected AI is steered to read it first. Present only when the note
+    // exists (buildVaultProjection gates on it). Older vaults without one omit
+    // the field entirely.
+    if (projection.getting_started) {
+      result.getting_started = projection.getting_started;
+    }
+
     if (projection.stats) {
       result.stats = projection.stats;
     }

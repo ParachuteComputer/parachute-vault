@@ -20,6 +20,7 @@ import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
+import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
 import { loadVaultTriggers } from "./triggers-api.ts";
@@ -205,6 +206,10 @@ if (listVaults().length === 0) {
     }
     writeGlobalConfig(globalConfig);
     console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
+    // Seed the in-vault onboarding guide so a connected AI can self-orient and
+    // help set the vault up — same as the `create`/`init` CLI path. Idempotent
+    // + best-effort (never fails first boot). Mirrors createVault() in cli.ts.
+    await seedOnboardingNotesBestEffort(getVaultStore(vaultName));
   }
 }
 

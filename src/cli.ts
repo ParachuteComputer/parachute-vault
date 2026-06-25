@@ -107,6 +107,7 @@ import { VAULT_SCOPES } from "./scopes.ts";
 import { validateVaultName, decideInitVaultName } from "./vault-name.ts";
 import { decideAutostart } from "./autostart.ts";
 import { getVaultStore } from "./vault-store.ts";
+import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import {
   defaultMirrorConfig,
   resolveMirrorPath,
@@ -3639,7 +3640,14 @@ async function createVault(
 
   // Touch the store so the vault's SQLite DB + schema are created. No token
   // row is written — vault is a pure hub resource-server post-0.5.0.
-  getVaultStore(name);
+  const seedStore = getVaultStore(name);
+
+  // Seed the in-vault onboarding guide (Getting Started + Surface Starter) so a
+  // connected AI can read it and help the operator set the vault up. Idempotent
+  // + best-effort: only writes notes that are absent, and never fails the
+  // create. Runs BEFORE the mirror bootstrap so the seeded notes land in the
+  // initial mirror commit. See src/onboarding-seed.ts + core/src/onboarding.ts.
+  await seedOnboardingNotesBestEffort(seedStore);
 
   // Default new vaults to an internal live mirror (local git backup of the
   // markdown projection). Backup-on-by-default; GitHub off-site backup is an
