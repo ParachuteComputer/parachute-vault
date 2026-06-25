@@ -16,6 +16,7 @@ import { Link, useParams } from "react-router-dom";
 import { HttpError, type VaultDetailResult, getVaultDetail } from "../lib/api.ts";
 import { getIssuerOrigin } from "../lib/scope.ts";
 import { SignInBanner } from "../lib/SignInBanner.tsx";
+import { McpConnectCard } from "./McpConnectCard.tsx";
 
 type State =
   | { kind: "loading" }
@@ -160,6 +161,13 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
             </div>
           </>
         ) : null}
+      </div>
+
+      {/* Connect-to-AI is the obvious next step after setup. The hub origin
+          is derived from the SPA's own origin (window.location.origin — the
+          SPA is served at <hub-origin>/vault/<name>/admin) inside the card. */}
+      <div className="section">
+        <McpConnectCard vaultName={vault.name} tokensHref={tokensHref} />
       </div>
 
       <div className="section">
