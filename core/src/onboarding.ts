@@ -91,6 +91,48 @@ schemas.** Start minimal — invent tags as real notes need them, declare a
 schema only when a query demands it. Over-designing an empty vault is the
 common mistake.
 
+Declaring a schema is one \`update-tag\` call — the \`fields\` object maps each
+field name to \`{ type, enum?, indexed? }\` (\`type\` is \`"string"\`, \`"boolean"\`,
+or \`"integer"\`):
+
+\`\`\`
+update-tag {
+  tag: "meeting",
+  description: "A meeting with notes",
+  fields: {
+    held_on: { type: "string", indexed: true },              // queryable with operators
+    status:  { type: "string", enum: ["scheduled", "done"] }, // first enum value is the default
+    rating:  { type: "integer" }
+  }
+}
+\`\`\`
+
+\`fields\` is **merged** (new keys added, existing replaced); \`parent_names\` and
+\`relationships\` are replaced wholesale when passed. Only \`indexed: true\` fields
+support operator queries (\`metadata: { held_on: { gte: "..." } }\`) and
+\`order_by\`; all tags declaring the same field must agree on its \`type\` and
+\`indexed\` flag.
+
+## Write gotchas
+
+A few behaviors worth knowing before you write at scale:
+
+- **\`update-note\` requires optimistic concurrency by default.** Pass
+  \`if_updated_at\` with the \`updated_at\` you last read; a mismatch returns a
+  conflict error (re-read, reconcile, retry). For bulk/scripted writes where
+  concurrency is known-safe, pass \`force: true\` to waive the *requirement to
+  supply* it. \`append\`/\`prepend\`-only updates are exempt (no-conflict-by-design).
+- **A schema field's default is filled in on write, so it shows up even when you
+  didn't set it.** When a note gets a tag whose schema declares a field, the
+  missing field is back-filled: an \`enum\` field → its **first listed value**, an
+  \`integer\` → \`0\`, a \`boolean\` → \`false\`, a plain string → \`""\`. So a
+  \`rating: { type: "integer" }\` reads as \`0\` on notes nobody rated — that \`0\`
+  is "unset," not "rated zero." Order an \`enum\`'s values so the first is a sane
+  default, and don't read a back-filled \`0\`/\`""\`/\`false\` as a real value.
+- **Validation is advisory, never blocking.** A type/enum mismatch comes back as
+  a \`validation_status\` warning on the write response — the write still lands.
+  Read those warnings and self-correct on the next turn.
+
 (Full design guide, with copy-paste examples: https://parachute.computer/scripting/)
 
 ## Importing existing notes
@@ -146,6 +188,17 @@ single-purpose tool. This note is a living starter for building one *with the
 operator*. Update it as you settle on a stack, conventions, or a deployed
 surface for this vault.
 
+## ⚠️ Build a surface in your editor, not from this session
+
+A surface runs **in a browser**: it needs a real OAuth round-trip (a redirect to
+the hub's consent screen and back), a dev server to serve the app, and a CORS
+origin the hub trusts. **None of that exists in this MCP/chat session** — there's
+no browser, no redirect, no dev server. So **don't try to "run" a surface from
+the vault session.** Build it in **Claude Code (or your editor)** against a local
+dev server (\`vite\`/\`bun dev\`), sign in through the browser there, and iterate.
+From *this* session you design the vault structure the surface will consume and
+write the code — you can't exercise the OAuth/render loop here.
+
 ## Don't hand-roll the plumbing
 
 Two published packages do the heavy lifting — import them instead of writing
@@ -158,10 +211,67 @@ OAuth, the vault API client, or note rendering by hand:
   content (Markdown, wikilinks, embeds) the way the rest of the ecosystem does,
   so your surface looks native without re-implementing the renderer.
 
+## Minimal end-to-end (config → sign-in → query → render)
+
+A React sketch wiring all four steps. \`createVaultSurface\` is the only required
+config (its \`clientName\` is the sole required option; \`hubUrl\` defaults to the
+page origin, \`vaultName\` to \`"default"\`, \`scope\` to \`"vault:read vault:write"\`).
+\`getClient()\` returns a \`VaultClient\` (or \`null\` until signed in) whose
+\`queryNotes()\` takes the same query grammar you use over MCP. See
+[[Getting Started]] / \`vault-info\` for this vault's NAME and hub origin.
+
+\`\`\`tsx
+import { useEffect, useState } from "react";
+import { createVaultSurface, type Note } from "@openparachute/surface-client";
+import { NoteRenderer } from "@openparachute/surface-render";
+
+// One surface per (hub, vault) config. clientName shows on the consent screen.
+const surface = createVaultSurface({
+  clientName: "My Vault Surface",
+  hubUrl: "https://your-hub.example",   // omit to default to window.location.origin
+  vaultName: "default",                 // this vault's name (see vault-info)
+});
+
+export function App() {
+  const [notes, setNotes] = useState<Note[] | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      // OAuth: finish a redirect callback if we're on it, else send the browser
+      // off to sign in. handleCallback() needs BOTH code + state, so guard on
+      // both. (Real apps route /oauth/callback to its own component.)
+      const q = new URLSearchParams(location.search);
+      if (q.get("code") && q.get("state")) await surface.handleCallback();
+      const client = surface.getClient(); // VaultClient | null (null = not signed in)
+      if (!client) return void surface.login();
+      setNotes(await client.queryNotes({ tag: "note", limit: 20 }));
+    })();
+  }, []);
+
+  if (!notes) return <p>Connecting…</p>;
+  return (
+    <>
+      {notes.map((n) => (
+        // resolve maps a [[wikilink]] target → { href, exists } (or null = inert).
+        <NoteRenderer
+          key={n.id}
+          note={n}
+          resolve={(target) => ({ href: \`#/n/\${encodeURIComponent(target)}\`, exists: true })}
+        />
+      ))}
+    </>
+  );
+}
+\`\`\`
+
+That's the whole spine. \`<NoteRenderer>\` also takes \`linkComponent\` (your
+router's \`<Link>\`) and \`fetchBlob\` (\`(url) => Promise<Blob>\`, for auth'd
+image/audio embeds) when you need them — both optional.
+
 ## Build order
 
 1. **Auth + data first.** Stand up \`createVaultSurface\` pointed at this vault;
-   confirm you can sign in and \`query-notes\` round-trips before any UI polish.
+   confirm you can sign in and \`queryNotes\` round-trips before any UI polish.
 2. **Render next.** Drop in \`<NoteRenderer>\` to display note content; wire
    wikilink/embed resolution through the package, not by hand.
 3. **UX last.** Layout, navigation, and the surface's actual purpose — now that

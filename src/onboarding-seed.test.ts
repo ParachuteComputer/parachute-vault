@@ -67,6 +67,35 @@ describe("seedOnboardingNotes (A1/A3)", () => {
     expect(ss!.content).toContain("@openparachute/surface-render");
     expect(ss!.content).toContain("createVaultSurface");
     expect(ss!.content).toContain("NoteRenderer");
+
+    // GAP 2: warn that a surface can't be run/developed from this MCP session.
+    expect(ss!.content).toContain("not from this");
+    expect(ss!.content.toLowerCase()).toContain("browser");
+
+    // GAP 1: a real, copy-paste end-to-end snippet — every load-bearing symbol
+    // present, verified against the surface-client / surface-render source.
+    expect(ss!.content).toContain("clientName"); // the one required createVaultSurface option
+    expect(ss!.content).toContain("getClient");
+    expect(ss!.content).toContain("queryNotes");
+    expect(ss!.content).toContain("handleCallback");
+    expect(ss!.content).toContain("resolve="); // NoteRenderer wikilink resolver prop
+  });
+
+  test("GAP 4: Getting Started shows a concrete update-tag fields example + write gotchas", async () => {
+    await seedOnboardingNotes(store);
+    const gs = await store.getNoteByPath(GETTING_STARTED_PATH);
+
+    // (a) a literal update-tag fields object: field name → { type, enum?, indexed? }.
+    expect(gs!.content).toContain("update-tag {");
+    expect(gs!.content).toContain('{ type: "string", indexed: true }');
+    expect(gs!.content).toContain('enum: ["scheduled", "done"]');
+
+    // (b) the write-gotchas subsection — each gotcha verified against mcp.ts.
+    expect(gs!.content).toContain("## Write gotchas");
+    expect(gs!.content).toContain("if_updated_at"); // optimistic concurrency
+    expect(gs!.content).toContain("force: true");
+    // schema-default back-fill: enum→first value, integer→0.
+    expect(gs!.content).toContain("first listed value");
   });
 
   test("A3: Getting Started links to Surface Starter via a resolved wikilink", async () => {
@@ -146,5 +175,48 @@ describe("vault-info / projection pointer (A2)", () => {
       projection,
     });
     expect(md).not.toContain("## Start here");
+  });
+});
+
+describe("vault coordinates in the projection (GAP 3)", () => {
+  test("renders absolute REST + MCP URLs when the hub origin is known", () => {
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "research",
+      description: null,
+      projection,
+      coordinates: { hubOrigin: "https://hub.example.com", hubOriginKnown: true },
+    });
+
+    expect(md).toContain("## This vault's coordinates");
+    expect(md).toContain("Name: `research`");
+    expect(md).toContain("https://hub.example.com/vault/research/api/...");
+    expect(md).toContain("https://hub.example.com/vault/research/mcp");
+  });
+
+  test("renders relative templates + connected-origin note when origin is unknown", () => {
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({
+      vaultName: "research",
+      description: null,
+      projection,
+      coordinates: { hubOrigin: "http://127.0.0.1:1940", hubOriginKnown: false },
+    });
+
+    expect(md).toContain("## This vault's coordinates");
+    expect(md).toContain("Name: `research`");
+    // The loopback URL is NOT leaked; relative templates carry a placeholder.
+    expect(md).not.toContain("127.0.0.1");
+    expect(md).toContain("<hub-origin>/vault/research/api/...");
+    expect(md).toContain("<hub-origin>/vault/research/mcp");
+  });
+
+  test("no coordinates block when coordinates are omitted; name still in the opening line", () => {
+    const projection = buildVaultProjection(db, { includeStats: true });
+    const md = projectionToMarkdown({ vaultName: "research", description: null, projection });
+    // Without coordinates the dedicated block is absent; the vault NAME is still
+    // stated in the pre-existing opening line (the always-known coordinate).
+    expect(md).toContain('Parachute Vault "research"');
+    expect(md).not.toContain("## This vault's coordinates");
   });
 });
