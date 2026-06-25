@@ -242,6 +242,8 @@ export function App() {
       // both. (Real apps route /oauth/callback to its own component.)
       const q = new URLSearchParams(location.search);
       if (q.get("code") && q.get("state")) await surface.handleCallback();
+      // getClient() builds a FRESH VaultClient on each call — fine here (one-shot
+      // effect); in a real component keep it in state/ref, don't call it per render.
       const client = surface.getClient(); // VaultClient | null (null = not signed in)
       if (!client) return void surface.login();
       setNotes(await client.queryNotes({ tag: "note", limit: 20 }));
@@ -253,6 +255,9 @@ export function App() {
     <>
       {notes.map((n) => (
         // resolve maps a [[wikilink]] target → { href, exists } (or null = inert).
+        // You own this href's trust boundary — keep it a fragment (or validate the
+        // target). Don't build a raw passthrough href: a vault note could carry a
+        // javascript: target.
         <NoteRenderer
           key={n.id}
           note={n}
