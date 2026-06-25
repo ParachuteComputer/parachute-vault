@@ -104,7 +104,10 @@ describe("App — per-vault mount", () => {
         <App />
       </MemoryRouter>,
     );
-    const link = await screen.findByRole("link", { name: /Tokens/ });
+    // Target the Manage section's "Tokens →" link specifically — the
+    // McpConnectCard also renders a "Tokens page" link, so a bare /Tokens/
+    // matcher is now ambiguous.
+    const link = await screen.findByRole("link", { name: /Tokens →/ });
     // Under `basename="/vault/boulder/admin"` in production, this href is
     // joined to the basename → final URL `/vault/boulder/admin/tokens`.
     // If we emitted `/vault/boulder/tokens` here we'd get the doubled
@@ -223,7 +226,9 @@ describe("App — stand-alone mount", () => {
         <App />
       </MemoryRouter>,
     );
-    const link = await screen.findByRole("link", { name: /Tokens/ });
+    // "Tokens →" is the Manage section link; the McpConnectCard's "Tokens
+    // page" link would otherwise make a bare /Tokens/ matcher ambiguous.
+    const link = await screen.findByRole("link", { name: /Tokens →/ });
     expect(link).toHaveAttribute("href", "/vault/boulder/tokens");
   });
 
