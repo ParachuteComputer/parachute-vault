@@ -8,11 +8,11 @@
  *   - the projection/`vault-info` pointer (`core/src/vault-projection.ts`)
  * can share the canonical note paths without a cross-layer import.
  *
- * The notes are AI-legible doctrine addressed to the assistant that connects to
- * the vault. They are deliberately *living* notes — Getting Started tells the AI
- * to keep updating them as the vault matures, so onboarding doctrine and the
- * actual vault stay in step. Seeding is create-time only and idempotent (never
- * clobbers a note the operator/AI has since edited).
+ * The notes are AI-legible, practical (SKILL.md-style) guides addressed to the
+ * assistant that connects to the vault. They are a starting point, not gospel —
+ * Getting Started tells the AI it can adapt them as the vault matures. Seeding is
+ * create-time only and idempotent (never clobbers a note the operator/AI has
+ * since edited).
  *
  * See the demo-prep Workstream A (A1/A2/A3).
  */
@@ -28,21 +28,21 @@ export const SURFACE_STARTER_PATH = "Surface Starter";
 /**
  * Body of the seeded `Getting Started` note.
  *
- * Voice: addressed to the connected AI ("you"), dense, doctrine not tutorial.
+ * Voice: addressed to the connected AI ("you"), practical, SKILL.md-style.
  * Covers (a) what a Parachute vault is, (b) tags-vs-paths-vs-schemas design,
- * (c) importing existing notes, (d) that this is a LIVING note to keep growing.
+ * (c) importing existing notes, (d) that it's an adaptable starting point.
  */
 export const GETTING_STARTED_CONTENT = `# Getting Started
 
-You are an AI connected to a **Parachute vault** — a knowledge graph this person
-owns, that you and they grow together. This note is your standing orientation.
-**Read it first, every session.** It is a *living* note: as the vault matures,
-keep it current (see "Keep this note growing" at the end). It is not a one-shot
-script to run and forget.
+This is the **start-here guide** for this Parachute vault — think of it like a
+\`SKILL.md\`: practical instructions for setting up and growing the vault. Read it
+when you're **getting the vault started** or orienting yourself to it — you don't
+need to re-read it every session. It's a **starting point, not a script**, and
+it's adaptable: edit it (see "Adapt this note") as the vault takes shape.
 
 When the operator says something like *"help me set up my parachute,"* this is
 your brief: design their structure with them, import what they already have, and
-keep tending it over time.
+shape the vault around how they actually think and work.
 
 ## What a Parachute vault is
 
@@ -78,13 +78,13 @@ These three axes are the heart of vault design. Use the right one for the job:
   don't encode meaning in a path that a tag should carry. A note can have a
   path, tags, or both.
 
-- **Schemas = indexed metadata fields.** Attach a schema to a tag (via
+- **Schemas = typed metadata fields.** Attach a schema to a tag (via
   \`update-tag\`) to declare typed metadata fields — e.g. \`#meeting\` with a
-  \`held_on\` date, \`#person\` with an \`email\`. Mark a field \`indexed: true\` and
-  it becomes **queryable with operators** (\`query-notes { tag: "meeting",
-  metadata: { held_on: { gte: "2026-01-01" } } }\`). Schemas turn freeform notes
-  into something the operator can slice with precise filters. Add a schema when
-  you find yourself wanting to filter or sort on a value, not before.
+  \`held_on\` date, \`#person\` with an \`email\`. Each field can **optionally** be
+  marked \`indexed: true\` to make it **queryable with operators** (\`query-notes
+  { tag: "meeting", metadata: { held_on: { gte: "2026-01-01" } } }\`); indexing
+  is opt-in per field, not automatic. Add a schema (and index a field) when you
+  find yourself wanting to filter or sort on a value, not before.
 
 Rule of thumb: **type with tags, file with paths, make-it-queryable with
 schemas.** Start minimal — invent tags as real notes need them, declare a
@@ -111,25 +111,25 @@ After an import, orient yourself: \`vault-info\` for the new schema picture,
 \`list-tags\` to see what vocabulary arrived, \`query-notes { search: "..." }\` to
 spot-check. Then propose structure — don't impose it silently.
 
-## Build a surface
+## Later: a custom surface
 
-When the operator wants a custom UI over their vault (a dashboard, a notes app,
-a single-purpose tool), see **[[Surface Starter]]** — a living starter for
-building one with \`@openparachute/surface-client\` + \`@openparachute/surface-render\`.
+Building a custom UI over the vault (a dashboard, a notes app) is usually **not**
+the starting point — get the notes and structure right first. If and when the
+operator wants one, see **[[Surface Starter]]** (built with
+\`@openparachute/surface-client\` + \`@openparachute/surface-render\`).
 
-## Keep this note growing
+## Adapt this note
 
-This note is **yours to maintain**. As you and the operator settle on a tag
-vocabulary, establish conventions, or build surfaces, **update this note** so the
-*next* session (you, or another AI) inherits the current shape of the vault
-instead of this blank-slate default. Good things to capture here over time:
+This guide is a **default starting point, not gospel** — edit it to fit this
+vault. As you and the operator settle on a tag vocabulary, conventions, or a
+surface, you can record that here so a future session inherits the current shape
+of the vault instead of this blank-slate default. Useful things to capture:
 - the tag vocabulary you've settled on and what each tag means;
 - naming/path conventions for this vault;
 - which schemas exist and why;
-- surfaces that have been built and how to run them;
 - anything a fresh AI would need to be immediately useful.
 
-Treat onboarding as a relationship, not a one-time install.
+Treat setup as a relationship, not a one-time install.
 `;
 
 /**
@@ -175,7 +175,7 @@ matter to the operator; surface the indexed fields they filter on. If the vault
 doesn't yet have the structure a surface wants, that's a signal to design tags +
 schemas first.
 
-## Keep this note growing
+## Adapt this note
 
 When you build a surface for this vault, record it here: what it's for, the
 stack, how to run it, the queries it depends on. The next session should be able

@@ -55,9 +55,9 @@ describe("seedOnboardingNotes (A1/A3)", () => {
     // and the living-note instruction.
     expect(gs!.content).toContain("Tags = types");
     expect(gs!.content).toContain("Paths = organization");
-    expect(gs!.content).toContain("Schemas = indexed metadata fields");
+    expect(gs!.content).toContain("Schemas = typed metadata fields");
     expect(gs!.content).toContain("parachute-vault import");
-    expect(gs!.content).toContain("Keep this note growing");
+    expect(gs!.content).toContain("Adapt this note");
 
     const ss = await store.getNoteByPath(SURFACE_STARTER_PATH);
     expect(ss).not.toBeNull();
@@ -135,7 +135,7 @@ describe("vault-info / projection pointer (A2)", () => {
     // It's a POINTER, not the embedded body — the fetch command appears, the
     // note's distinctive body copy does not.
     expect(md).toContain(`query-notes { id: "${GETTING_STARTED_PATH}" }`);
-    expect(md).not.toContain("Keep this note growing");
+    expect(md).not.toContain("Adapt this note");
   });
 
   test("no Start-here block on a vault without the guide (back-compat)", async () => {

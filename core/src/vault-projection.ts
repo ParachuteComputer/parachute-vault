@@ -284,16 +284,16 @@ export function projectionToMarkdown(args: {
     lines.push(description.trim());
   }
 
-  // A2: steer the AI to read the seeded onboarding guide FIRST, every session.
-  // A pointer only — the AI fetches the body on demand. Rendered prominently up
-  // top so it's the first instruction after the vault's own description.
+  // A2: surface the seeded onboarding guide so a connected AI can discover it
+  // when setting up or orienting. A pointer only — the AI fetches the body on
+  // demand. NOT a mandate to re-read every session; it's a start-here guide.
   if (projection.getting_started) {
     lines.push("");
     lines.push(
-      `## Start here\n\nRead the **${projection.getting_started}** guide before doing anything else — ` +
-        `it's your standing orientation for this vault (what it is, how to design tags vs paths vs ` +
-        `schemas, how to import existing notes, and how to keep growing it). Fetch it with ` +
-        `\`query-notes { id: "${projection.getting_started}" }\`. It's a living note — keep it current as the vault matures.`,
+      `## Start here\n\nThis vault has a **${projection.getting_started}** guide — how to set it up ` +
+        `and grow it (what a Parachute vault is, designing tags vs paths vs schemas, importing ` +
+        `existing notes). Read it when setting up or getting oriented, or when the operator asks ` +
+        `for help setting up their parachute. Fetch it with \`query-notes { id: "${projection.getting_started}" }\`.`,
     );
   }
 
