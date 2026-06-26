@@ -1073,31 +1073,47 @@ export class MirrorManager {
         return;
       }
       // github_oauth: the active token is set, but a repo may not yet be
-      // picked. The select-repo route handler writes the URL; on a
-      // subsequent restart we can't reconstruct the URL without the
-      // owner/repo. Best-effort: if `origin` already points at a github.com
-      // URL, rewrite it with the stored token in case the token rotated.
+      // picked. The select-repo route handler writes the URL onto origin AND
+      // (vault#401) persists owner/name into the credentials struct.
       if (creds.active_method === "github_oauth" && creds.github_oauth) {
-        const current = await readCurrentOrigin(repoDir);
-        if (current && current.includes("github.com")) {
-          // Parse owner/repo out of the current URL.
-          const match = current.match(
-            /github\.com[/:]([^/]+)\/([^/.]+?)(?:\.git)?$/,
-          );
-          if (match) {
-            const [, owner, repo] = match;
-            const { githubAuthedRemoteUrl } = await import("./mirror-credentials.ts");
-            const authed = githubAuthedRemoteUrl(
-              creds.github_oauth.access_token,
-              owner!,
-              repo!,
+        // vault#401: prefer the persisted owner/name. Reconstructing the
+        // remote from credentials alone means the selection survives the
+        // origin being cleared (DELETE /auth then re-OAuth) across a restart —
+        // the bug class where regex-parsing the origin silently lost the repo.
+        const persistedOwner = creds.github_oauth.owner;
+        const persistedName = creds.github_oauth.name;
+        let owner: string | undefined;
+        let repo: string | undefined;
+        if (persistedOwner && persistedName) {
+          owner = persistedOwner;
+          repo = persistedName;
+        } else {
+          // Back-compat fallback: credentials written before #401 don't carry
+          // owner/name. Parse them out of the current github.com origin (the
+          // pre-#401 behavior) when origin is still present.
+          const current = await readCurrentOrigin(repoDir);
+          if (current && current.includes("github.com")) {
+            const match = current.match(
+              /github\.com[/:]([^/]+)\/([^/.]+?)(?:\.git)?$/,
             );
-            const result = await applyToGitRemote(repoDir, authed);
-            if (!result.ok) {
-              console.warn(
-                `[mirror] could not refresh github_oauth remote URL (non-fatal): ${result.error}`,
-              );
+            if (match) {
+              owner = match[1];
+              repo = match[2];
             }
+          }
+        }
+        if (owner && repo) {
+          const { githubAuthedRemoteUrl } = await import("./mirror-credentials.ts");
+          const authed = githubAuthedRemoteUrl(
+            creds.github_oauth.access_token,
+            owner,
+            repo,
+          );
+          const result = await applyToGitRemote(repoDir, authed);
+          if (!result.ok) {
+            console.warn(
+              `[mirror] could not refresh github_oauth remote URL (non-fatal): ${result.error}`,
+            );
           }
         }
       }

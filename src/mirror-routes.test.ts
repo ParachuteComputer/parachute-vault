@@ -912,6 +912,84 @@ describe("auth credential routes — credential-save side-effects (Cuts 3 + 6)",
     await manager.stop();
   }, 30_000);
 
+  test("vault#401: owner/name survive a cleared origin + restart (persisted in creds, not just the git remote)", async () => {
+    // The bug: pre-#401, select-repo wrote owner/name ONLY into the git
+    // origin URL. On restart, applyCredentialsToRemote regex-parsed them back
+    // out of the origin — so clearing the origin (DELETE /auth → re-OAuth
+    // without re-selecting) silently lost the repo even with a valid token.
+    // Now select-repo persists owner/name into the credentials struct, and
+    // applyCredentialsToRemote prefers the persisted values. With the origin
+    // cleared, a restart still reconstructs the github.com remote.
+    home = tmp("mirror-selectrepo-persist-");
+    const { manager, deps } = makeManager(home);
+    const cfg = {
+      ...defaultMirrorConfig(),
+      enabled: true,
+      location: "internal" as const,
+      sync_mode: "manual" as const,
+      auto_commit: false,
+      auto_push: false,
+    };
+    // The manager reads config via deps.readMirrorConfig (in-memory); the
+    // route's history-on-link keys off the real per-vault file's existence.
+    // Seed both, same as the autopush test above.
+    deps.writeMirrorConfig(cfg);
+    writeMirrorConfigForVault("default", cfg);
+    await manager.start();
+    const mirrorPath = manager.getStatus().mirror_path;
+    expect(mirrorPath).toBeTruthy();
+
+    writeCredentials("default", {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_persisttoken12345",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 1,
+      },
+      pat: null,
+    });
+
+    const res = await handleAuthGithubSelectRepo(
+      new Request("http://x/select", {
+        method: "POST",
+        body: JSON.stringify({ owner: "aaron", name: "backup-repo" }),
+      }),
+      manager,
+    );
+    expect(res.status).toBe(200);
+
+    // The fix: owner/name persisted into the credentials struct (not just origin).
+    const persisted = readCredentials("default");
+    expect(persisted?.github_oauth?.owner).toBe("aaron");
+    expect(persisted?.github_oauth?.name).toBe("backup-repo");
+
+    // Simulate the DELETE /auth + re-OAuth-without-reselect path: the OAuth
+    // token survives, but the git origin gets cleared.
+    Bun.spawnSync(["git", "remote", "remove", "origin"], { cwd: mirrorPath! });
+    const afterClear = Bun.spawnSync(["git", "remote", "get-url", "origin"], {
+      cwd: mirrorPath!,
+    });
+    expect(afterClear.exitCode).not.toBe(0); // origin is gone
+
+    // Restart — applyCredentialsToRemote runs again. Pre-#401 it would find no
+    // origin to parse and leave the remote unset; post-#401 it rebuilds from
+    // the persisted owner/name.
+    await manager.stop();
+    await manager.start();
+
+    const reapplied = Bun.spawnSync(["git", "remote", "get-url", "origin"], {
+      cwd: mirrorPath!,
+    });
+    expect(reapplied.exitCode).toBe(0);
+    const reappliedUrl = reapplied.stdout.toString().trim();
+    // The remote was reconstructed from persisted owner/name (token embedded,
+    // not asserted here). Without persistence this would be empty.
+    expect(reappliedUrl).toContain("github.com/aaron/backup-repo");
+    await manager.stop();
+  }, 30_000);
+
   test("select-repo is a no-op for auto_push when mirror is disabled", async () => {
     // Operator wiring credentials before flipping the mirror on — don't
     // mutate auto_push behind their back.
