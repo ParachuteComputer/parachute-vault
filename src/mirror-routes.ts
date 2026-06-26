@@ -1200,6 +1200,19 @@ export async function handleAuthGithubSelectRepo(
     }
   }
 
+  // vault#401: persist the selected owner/name INTO the credentials struct,
+  // not only into the git origin URL. Pre-#401 the selection lived solely in
+  // the origin URL; `applyCredentialsToRemote` regex-parsed it back out on
+  // restart, so clearing the origin (e.g. `DELETE /auth` then re-OAuth without
+  // re-selecting) silently lost the repo even with a still-valid token. Saving
+  // it here lets the restart path reconstruct the remote from credentials
+  // alone. Write before the remote-apply so the persisted selection survives
+  // even if the apply later fails.
+  writeCredentials(manager.getVaultName(), {
+    ...creds,
+    github_oauth: { ...creds.github_oauth, owner, name },
+  });
+
   // Reach into mirror-credentials.ts for the authed URL builder.
   const { githubAuthedRemoteUrl } = await import("./mirror-credentials.ts");
   const authedUrl = githubAuthedRemoteUrl(

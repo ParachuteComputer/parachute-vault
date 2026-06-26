@@ -104,6 +104,53 @@ describe("serialize + parse round-trip", () => {
     expect(out).toEqual(creds);
   });
 
+  test("github_oauth with persisted owner/name round-trips through the bytes (vault#401)", () => {
+    // owner/name are persisted at repo-select time so the selection survives a
+    // cleared git origin + restart. They must serialize and parse back
+    // byte-faithfully.
+    const creds: MirrorCredentials = {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_abc123def456ghi789",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 12345,
+        owner: "aaron",
+        name: "backup-repo",
+      },
+      pat: null,
+    };
+    const out = parseCredentials(serializeCredentials(creds));
+    expect(out).toEqual(creds);
+    expect(out.github_oauth?.owner).toBe("aaron");
+    expect(out.github_oauth?.name).toBe("backup-repo");
+  });
+
+  test("github_oauth WITHOUT owner/name stays byte-stable (back-compat)", () => {
+    // Credentials written before a repo is picked (or before vault#401) carry
+    // no owner/name. Serialize must NOT emit empty owner/name lines, and the
+    // round-trip must leave the fields absent (not "").
+    const creds: MirrorCredentials = {
+      active_method: "github_oauth",
+      github_oauth: {
+        access_token: "gho_abc123def456ghi789",
+        scope: "repo",
+        authorized_at: "2026-05-28T03:14:15.000Z",
+        user_login: "aaron",
+        user_id: 12345,
+      },
+      pat: null,
+    };
+    const serialized = serializeCredentials(creds);
+    expect(serialized).not.toContain("owner:");
+    expect(serialized).not.toContain("name:");
+    const out = parseCredentials(serialized);
+    expect(out).toEqual(creds);
+    expect(out.github_oauth?.owner).toBeUndefined();
+    expect(out.github_oauth?.name).toBeUndefined();
+  });
+
   test("github_oauth with empty scope round-trips (GitHub App tokens)", () => {
     // Tokens from the shared Parachute GitHub App carry scope: "" (GitHub
     // Apps use fine-grained permissions, not scopes). The empty string must

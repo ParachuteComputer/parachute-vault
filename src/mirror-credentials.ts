@@ -86,6 +86,18 @@ export interface GitHubOAuthCredential {
   user_login: string;
   /** GitHub numeric user id — stable across login renames. */
   user_id: number;
+  /**
+   * The selected repo's owner — persisted at repo-select time (vault#401).
+   * Optional: absent before the operator picks a repo, and absent in
+   * credentials files written before this field existed (back-compat). When
+   * present, `applyCredentialsToRemote` reconstructs the authed remote URL
+   * from `owner`/`name` directly rather than regex-parsing the current git
+   * origin — so the selection survives the origin being cleared (e.g.
+   * `DELETE /auth` then re-OAuth) and a server restart.
+   */
+  owner?: string;
+  /** The selected repo's name — persisted alongside `owner` (vault#401). */
+  name?: string;
 }
 
 /**
@@ -138,6 +150,10 @@ export interface MirrorCredentialsPublic {
     scope: string;
     authorized_at: string;
     token_preview: string;
+    /** Selected repo owner, when a repo has been picked (vault#401). */
+    owner?: string;
+    /** Selected repo name, when a repo has been picked (vault#401). */
+    name?: string;
   } | null;
   pat: {
     label: string;
@@ -233,6 +249,15 @@ export function serializeCredentials(creds: MirrorCredentials): string {
     lines.push(`  authorized_at: ${quoteIfNeeded(creds.github_oauth.authorized_at)}`);
     lines.push(`  user_login: ${quoteIfNeeded(creds.github_oauth.user_login)}`);
     lines.push(`  user_id: ${creds.github_oauth.user_id}`);
+    // owner/name persisted at repo-select time (vault#401). Emitted only when
+    // present so credentials written before a repo is picked (or before this
+    // field existed) stay byte-stable.
+    if (creds.github_oauth.owner !== undefined) {
+      lines.push(`  owner: ${quoteIfNeeded(creds.github_oauth.owner)}`);
+    }
+    if (creds.github_oauth.name !== undefined) {
+      lines.push(`  name: ${quoteIfNeeded(creds.github_oauth.name)}`);
+    }
   } else {
     lines.push("github_oauth: null");
   }
@@ -356,6 +381,8 @@ export function parseCredentials(yaml: string): MirrorCredentials {
       else if (key === "scope") oauth.scope = parseScalar(rawVal!);
       else if (key === "authorized_at") oauth.authorized_at = parseScalar(rawVal!);
       else if (key === "user_login") oauth.user_login = parseScalar(rawVal!);
+      else if (key === "owner") oauth.owner = parseScalar(rawVal!);
+      else if (key === "name") oauth.name = parseScalar(rawVal!);
       else if (key === "user_id") {
         const n = Number(parseScalar(rawVal!));
         if (Number.isFinite(n)) oauth.user_id = n;
@@ -571,6 +598,12 @@ export function sanitizeCredentials(
           scope: creds.github_oauth.scope,
           authorized_at: creds.github_oauth.authorized_at,
           token_preview: previewToken(creds.github_oauth.access_token),
+          ...(creds.github_oauth.owner !== undefined
+            ? { owner: creds.github_oauth.owner }
+            : {}),
+          ...(creds.github_oauth.name !== undefined
+            ? { name: creds.github_oauth.name }
+            : {}),
         }
       : null,
     pat: creds.pat
