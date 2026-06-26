@@ -38,9 +38,22 @@ describe("isAdminSpaPath", () => {
     expect(isAdminSpaPath("/vault/work/admin/")).toBe(true);
     expect(isAdminSpaPath("/vault/work/admin/tokens")).toBe(true);
     expect(isAdminSpaPath("/vault/boulder/admin/assets/index.js")).toBe(true);
-    // Vault names with URL-safe punctuation should still match — the regex
-    // captures up to the next "/" so dashes / dots / digits all pass.
-    expect(isAdminSpaPath("/vault/my-vault.2/admin")).toBe(true);
+    // Canonical-charset names (lowercase alphanumerics + hyphen / underscore)
+    // match; dots are NOT canonical (see the vault#253 reject test below).
+    expect(isAdminSpaPath("/vault/my-vault_2/admin")).toBe(true);
+  });
+
+  test("vault#253: names outside the canonical charset do NOT match the mount", () => {
+    // The mount used to capture `[^/]+`, so a name hub can never manage
+    // (dots, @, unicode) still served the admin SPA. Aligning the mount to
+    // hub's VAULT_NAME_CHARSET_RE (`/^[a-z0-9_-]+$/`) makes a non-canonical
+    // name 404 — the same answer hub gives. No legitimately-created vault can
+    // carry these characters (cmdCreate / init / the env var all reject them
+    // via validateVaultName), so nothing reachable regresses.
+    expect(isAdminSpaPath("/vault/my.vault/admin")).toBe(false);
+    expect(isAdminSpaPath("/vault/vault@v2/admin")).toBe(false);
+    expect(isAdminSpaPath("/vault/Work/admin")).toBe(false); // uppercase isn't canonical
+    expect(isAdminSpaPath("/vault/🦑/admin")).toBe(false);
   });
 
   test("does not match adjacent paths under the same vault", () => {
@@ -111,8 +124,8 @@ describe("serveAdminSpa", () => {
     expect(cssRes.headers.get("content-type")).toContain("text/css");
   });
 
-  test("vault names with URL-safe punctuation strip cleanly", async () => {
-    const res = await serveAdminSpa(fixtureDir, "/vault/my-vault.2/admin/assets/index-abc.js");
+  test("canonical-charset vault names strip cleanly", async () => {
+    const res = await serveAdminSpa(fixtureDir, "/vault/my-vault_2/admin/assets/index-abc.js");
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/javascript");
   });

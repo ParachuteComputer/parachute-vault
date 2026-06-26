@@ -22,11 +22,32 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * Regex anchoring the per-vault SPA mount. Matches `/vault/<name>/admin`
- * exactly and any subpath under it. The `<name>` capture is reused by the
- * prefix-strip below — keep the two in sync if this regex moves.
+ * The canonical vault-name charset, kept byte-identical with hub's
+ * `VAULT_NAME_CHARSET_RE` (`parachute-hub/src/vault-name.ts`) and vault's own
+ * `validateVaultName` (`src/vault-name.ts`): lowercase alphanumerics plus
+ * hyphen / underscore. Embedded here (not imported) because this regex is
+ * spliced into the mount-matching patterns below, and a charset class is the
+ * only piece they share.
+ *
+ * vault#253: the mount regexes used to capture `[^/]+` (anything-but-slash),
+ * so a name like `my.vault` / `vault@v2` / `🦑` matched the admin mount and
+ * served the SPA — even though hub rejects those names at every name-minting
+ * edge and can never render a "Manage Vault" link for them. A vault that can't
+ * be created (cmdCreate / init / the env var all run `validateVaultName`, which
+ * rejects out-of-charset names) shouldn't have a reachable admin mount either.
+ * Pinning the mount to THIS charset closes the boundary drift: a dotted name
+ * no longer matches → 404, the same answer hub gives.
  */
-const ADMIN_SPA_MOUNT_RE = /^\/vault\/([^/]+)\/admin(?=\/|$)/;
+const VAULT_NAME_CHARSET = "a-z0-9_-";
+
+/**
+ * Regex anchoring the per-vault SPA mount. Matches `/vault/<name>/admin`
+ * exactly and any subpath under it, where `<name>` is a canonical vault name
+ * (lowercase alphanumerics + hyphen / underscore — see `VAULT_NAME_CHARSET`).
+ * The `<name>` capture is reused by the prefix-strip below — keep the two in
+ * sync if this regex moves.
+ */
+const ADMIN_SPA_MOUNT_RE = new RegExp(`^/vault/([${VAULT_NAME_CHARSET}]+)/admin(?=/|$)`);
 
 /**
  * Regex anchoring the DAEMON-LEVEL multi-vault SPA mount at `/vault/admin`
