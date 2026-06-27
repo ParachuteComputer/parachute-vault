@@ -56,8 +56,13 @@ import { listVaults, readGlobalConfig, DEFAULT_PORT } from "./config.ts";
  *
  * Mirrors `buildVaultServicePaths` in `cli.ts` so the self-register pass
  * produces the same multi-vault path advertisement as `parachute-vault
- * init` / `vault create`. With no vaults yet, falls back to the manifest's
- * canonical `paths[0]` so early-boot registration is still well-formed.
+ * init` / `vault create`.
+ *
+ * At zero vaults, returns an empty array (`paths: []`). The row remains
+ * present in services.json (name, port, health, version, installDir intact
+ * — so the module is still detected as installed), but it advertises no
+ * `/vault/<name>` path and the hub must not resolve it to a phantom
+ * `/vault/default`. Closes #478.
  *
  * Exported for tests; not part of the public module surface.
  */
@@ -66,7 +71,7 @@ export function buildVaultServicePaths(
   vaults: readonly string[],
   fallbackFromManifest: readonly string[],
 ): string[] {
-  if (vaults.length === 0) return [...fallbackFromManifest];
+  if (vaults.length === 0) return [];
   if (defaultVault && vaults.includes(defaultVault)) {
     return [
       `/vault/${defaultVault}`,

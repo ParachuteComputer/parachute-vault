@@ -61,10 +61,8 @@ function captureLogs(): {
 }
 
 describe("self-register", () => {
-  test("buildVaultServicePaths — no vaults yet → manifest fallback", () => {
-    expect(buildVaultServicePaths(undefined, [], ["/vault/default"])).toEqual([
-      "/vault/default",
-    ]);
+  test("buildVaultServicePaths — no vaults yet → empty paths (no phantom /vault/default, #478)", () => {
+    expect(buildVaultServicePaths(undefined, [], ["/vault/default"])).toEqual([]);
   });
 
   test("buildVaultServicePaths — default vault sorts first", () => {
@@ -108,7 +106,9 @@ describe("self-register", () => {
       const row = parsed.services[0] as Record<string, unknown>;
       expect(row.name).toBe("parachute-vault");
       expect(row.port).toBe(1940);
-      expect(row.paths).toEqual(["/vault/default"]);
+      // Zero vaults → paths: [] (no phantom /vault/default, #478).
+      // Health still well-formed: paths[0] ?? "/vault/default" fallback.
+      expect(row.paths).toEqual([]);
       expect(row.health).toBe("/vault/default/health");
       expect(row.version).toBe("0.4.8-rc.3");
       expect(row.installDir).toBe("/fake/install/dir");

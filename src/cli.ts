@@ -1674,11 +1674,11 @@ function cmdRemove(args: string[]) {
   // out of the parachute-vault row immediately — the same selfRegister
   // refresh cmdCreate does (#208). Without this, the hub's well-known
   // fan-out kept advertising the deleted vault until the next server boot.
-  // Note: with zero vaults remaining, selfRegister falls back to the
-  // manifest's canonical paths (`/vault/default`) — the same row a
-  // subsequent boot would write — so CLI-remove and boot agree on the
-  // zero-vault registration shape. Warnings go to stderr; status lines stay
-  // ours.
+  // Note: with zero vaults remaining, selfRegister emits paths: [] (#478) —
+  // the row stays present (so the hub still sees the module as installed)
+  // but advertises no /vault/<name> path. The hub must tolerate empty-paths
+  // rows and skip them rather than resolving a phantom "default". Warnings
+  // go to stderr; status lines stay ours.
   selfRegister({
     version: pkg.version,
     warn: (msg) => console.error(`Warning: ${msg}`),
