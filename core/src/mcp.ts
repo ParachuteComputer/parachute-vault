@@ -1453,7 +1453,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         required: ["tag"],
       },
       execute: async (params) => {
-        // Canonical-bare-tag guard (vault#XXX): normalize the tag NAME up front
+        // Canonical-bare-tag guard (PR #516): normalize the tag NAME up front
         // so the existing-record lookup (and the field/cross-tag merge that
         // depends on it) reads the bare `foo` row, not a phantom `#foo` miss.
         // store.upsertTagRecord normalizes again (idempotent) for non-MCP

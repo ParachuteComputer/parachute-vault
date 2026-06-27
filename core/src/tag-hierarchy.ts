@@ -46,7 +46,11 @@ import { Database } from "bun:sqlite";
  * name + parent_names) so MCP, REST, and direct-core callers all converge.
  */
 export function stripTagHash(tag: string): string {
-  return tag.trim().replace(/^#+/, "");
+  // Strip any LEADING run of `#`/whitespace (handles `#tag`, `##tag`, `  #tag`,
+  // and `# tag` with a space after the hash), then trim the tail. A `#`
+  // mid-string (`c#`) is untouched; a degenerate `# #` collapses to "" (the
+  // write-path empty-tag gate drops it).
+  return tag.replace(/^[#\s]+/, "").trim();
 }
 
 export interface TagHierarchy {

@@ -4,7 +4,7 @@ import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
 import { stripTagHash } from "./tag-hierarchy.js";
 
-// Canonical-bare-tag guard (vault#XXX). A `#`-prefixed tag must never be stored
+// Canonical-bare-tag guard (PR #516). A `#`-prefixed tag must never be stored
 // or mismatched: the agent module stored `#agent/message/inbound` literally and
 // consumers querying the bare `agent/message/inbound` convention found nothing.
 // The guard strips a leading `#` (idempotently) on BOTH the write path and the
@@ -210,6 +210,29 @@ describe("rename carve-out — source name stays literal (migration escape hatch
     const tags = await store.listTags();
     expect(tags.map((t) => t.name)).not.toContain("#agent/message");
     expect(tags.map((t) => t.name)).toContain("agent/message");
+  });
+
+  it("renameTag normalizes the TARGET — renaming TO a #-name stores bare (can't re-introduce #)", async () => {
+    db.prepare("INSERT OR IGNORE INTO tags (name) VALUES ('plainsrc')").run();
+    const note = await store.createNote("x");
+    db.prepare("INSERT INTO note_tags (note_id, tag_name) VALUES (?, 'plainsrc')").run(note.id);
+
+    await store.renameTag("plainsrc", "#shiny");
+
+    // The target #-prefix is stripped — no `#shiny` row, the note carries `shiny`.
+    expect(storedTags(note.id)).toEqual(["shiny"]);
+    expect((await store.listTags()).map((t) => t.name)).not.toContain("#shiny");
+  });
+
+  it("mergeTags normalizes the TARGET — merging INTO a #-name stores bare", async () => {
+    db.prepare("INSERT OR IGNORE INTO tags (name) VALUES ('m1')").run();
+    const note = await store.createNote("y");
+    db.prepare("INSERT INTO note_tags (note_id, tag_name) VALUES (?, 'm1')").run(note.id);
+
+    await store.mergeTags(["m1"], "#dest");
+
+    expect(storedTags(note.id)).toEqual(["dest"]);
+    expect((await store.listTags()).map((t) => t.name)).not.toContain("#dest");
   });
 });
 

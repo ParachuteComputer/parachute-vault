@@ -1387,6 +1387,11 @@ export type RenameTagResult =
  * after the cascade returns.
  */
 export function renameTag(db: Database, oldName: string, newName: string): RenameTagResult {
+  // Normalize the TARGET so a rename can never create a `#`-prefixed tag. The
+  // SOURCE (`oldName`) is left LITERAL on purpose — it's the transitional escape
+  // hatch that lets the `#legacy/*` → `legacy/*` data migration find the
+  // `#`-prefixed rows. (Renaming TO a `#`-name is the thing we're preventing.)
+  newName = stripTagHash(newName);
   if (oldName === newName) {
     const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(oldName);
     return exists
@@ -1755,6 +1760,9 @@ export function mergeTags(
   sources: string[],
   target: string,
 ): { merged: Record<string, number>; target: string } {
+  // Normalize the TARGET so a merge can never create a `#`-prefixed tag. SOURCES
+  // stay LITERAL so `#legacy/*` rows can be merged away (same carve-out as rename).
+  target = stripTagHash(target);
   // Dedup + drop target-in-sources (self-merge is a no-op).
   const uniqueSources = Array.from(new Set(sources)).filter((s) => s !== target);
 
