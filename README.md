@@ -943,7 +943,7 @@ cp .env.example .env   # edit with your config
 docker compose up -d
 ```
 
-Optionally set `PARACHUTE_VAULT_NAME` to choose a name for your first vault (defaults to `default`). Lowercase alphanumeric + hyphens or underscores, 2–32 chars.
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name: lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it the server boots with zero vaults — create one explicitly via the admin wizard, `parachute init --vault-name <name>`, or `parachute-vault create <name>`.
 
 ### Cloud platforms
 
@@ -968,9 +968,11 @@ typical v0.6 self-host wants. If you're not sure, use the hub-managed
 path above. The standalone Blueprint stays in tree because some
 operators specifically want this shape (vault#341).
 
-Optionally set `PARACHUTE_VAULT_NAME` to choose a name for your first
-vault (defaults to `default`). Lowercase alphanumeric + hyphens or
-underscores, 2–32 chars.
+Set `PARACHUTE_VAULT_NAME` to auto-create a first vault on startup (name:
+lowercase alphanumeric + hyphens or underscores, 2–32 chars). Without it
+the server boots with zero vaults — create one explicitly via the admin
+wizard, `parachute init --vault-name <name>`, or `parachute-vault create
+<name>`.
 
 #### Other platforms
 

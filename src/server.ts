@@ -223,6 +223,13 @@ if (listVaults().length === 0) {
         '[vault first-boot] no vaults and PARACHUTE_VAULT_NAME unset — staying empty. Create one via the admin wizard, parachute init --vault-name <name>, or parachute-vault create <name>.',
       );
     }
+  } else {
+    // Stale config: default_vault is set but no vault DB exists on disk, so
+    // first-boot create is skipped. Without a log line the server would boot
+    // empty and silent here, which is confusing. (#478 Part 2)
+    console.warn(
+      '[vault first-boot] config.yaml has default_vault set but no vaults exist on disk — skipping first-boot create. Create one with: parachute-vault create <name>',
+    );
   }
 }
 
