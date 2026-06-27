@@ -141,13 +141,12 @@ describe("vault remove — last-vault auto_create marker", () => {
     // resurrection of a freshly-credentialed "default".
     expect(bootAutoCreateAllowed(config)).toBe(false);
 
-    // services.json was still refreshed: with zero vaults the row falls back
-    // to the manifest's canonical paths — the SAME row a subsequent boot's
-    // selfRegister writes, so CLI-remove and boot agree on the zero-vault
-    // registration shape (and the hub still sees the module as installed).
+    // services.json was still refreshed: with zero vaults the row carries
+    // paths: [] (#478) — the row stays present so the hub sees the module as
+    // installed, but advertises no /vault/<name> path (no phantom default).
     const vault = readServices(home).find((s) => s.name === "parachute-vault");
     expect(vault).toBeDefined();
-    expect(vault!.paths).toEqual(["/vault/default"]);
+    expect(vault!.paths).toEqual([]);
   });
 
   test("removing a NON-last vault does not write the marker", () => {
