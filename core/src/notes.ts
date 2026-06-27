@@ -19,6 +19,7 @@ import {
   type QueryHashInputs,
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
+import { stripTagHash } from "./tag-hierarchy.js";
 
 let idCounter = 0;
 
@@ -686,8 +687,14 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // rides idx_note_tags_tag, produces each note id at most once, and lets
   // the whole query drop DISTINCT. See the 2026-06-10 perf measurements.
   if (opts.tags && opts.tags.length > 0) {
+    // Canonical-bare-tag guard (vault#XXX) backstop for direct-core callers
+    // that bypass BunSqliteStore.normalizeQueryTags (the store normalizes +
+    // hierarchy-expands before reaching here; this protects the raw noteOps
+    // entry point and tests). `_tagsExpanded`, when present, was already built
+    // from bare names by the store, so prefer it; otherwise strip the literal
+    // tags. No-op on already-bare input.
     const tagSets: string[][] = (opts as QueryOpts & { _tagsExpanded?: string[][] })._tagsExpanded
-      ?? opts.tags.map((t) => [t]);
+      ?? opts.tags.map((t) => [stripTagHash(t)]);
     const match = opts.tagMatch ?? "all";
     if (match === "any") {
       // Flatten all expanded sets and dedupe — a note tagged with any one
@@ -710,9 +717,11 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
-  // Exclude tags
+  // Exclude tags — bare-tag guard backstop (see tags block above).
   if (opts.excludeTags && opts.excludeTags.length > 0) {
-    for (const tag of opts.excludeTags) {
+    for (const rawTag of opts.excludeTags) {
+      const tag = stripTagHash(rawTag);
+      if (tag === "") continue;
       conditions.push(`NOT EXISTS (SELECT 1 FROM note_tags ex WHERE ex.note_id = n.id AND ex.tag_name = ?)`);
       params.push(tag);
     }
@@ -1189,11 +1198,18 @@ export function searchNotes(
   const limit = typeof opts?.limit === "number" ? opts.limit : 50;
 
   if (opts?.tags && opts.tags.length > 0) {
+    // Canonical-bare-tag guard backstop (vault#XXX) for direct-core callers.
+    const searchTags = opts.tags.map(stripTagHash).filter((t) => t !== "");
+    if (searchTags.length === 0) {
+      // All tag filters collapsed to empty — fall through to the untagged
+      // search path below (no tag constraint).
+      opts = { ...opts, tags: undefined };
+    } else {
     try {
       // Tag membership as a semijoin — same rationale as queryNotes: a
       // `JOIN note_tags` multiplies rows for multi-tagged notes and forced
       // DISTINCT over full rows. The FTS join itself is 1:1 on rowid.
-      const tagPlaceholders = opts.tags.map(() => "?").join(", ");
+      const tagPlaceholders = searchTags.map(() => "?").join(", ");
       const rows = db.prepare(`
         SELECT n.* FROM notes n
         JOIN notes_fts fts ON fts.rowid = n.rowid
@@ -1201,10 +1217,11 @@ export function searchNotes(
           AND n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${tagPlaceholders}))
         ORDER BY rank
         LIMIT ?
-      `).all(query, ...opts.tags, limit) as NoteRow[];
+      `).all(query, ...searchTags, limit) as NoteRow[];
       return notesWithTags(db, rows);
     } catch {
       return [];
+    }
     }
   }
 
@@ -1236,7 +1253,15 @@ export function tagNote(db: Database, noteId: string, tags: string[]): void {
   const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
   const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
 
-  for (const tag of tags) {
+  // Canonical-bare-tag guard (vault#XXX): strip any leading `#` so the
+  // `#`-decorated form a client may pass (the agent module stored
+  // `#agent/message/inbound` verbatim) lands on the same bare row everyone
+  // else queries. This is the single write chokepoint — createNote /
+  // updateNote / batch / MCP add-tags / REST / import / transcript all funnel
+  // through store.tagNote → here.
+  for (const raw of tags) {
+    const tag = stripTagHash(raw);
+    if (tag === "") continue;
     insertTag.run(tag);
     insertNoteTag.run(noteId, tag);
   }
@@ -1244,7 +1269,10 @@ export function tagNote(db: Database, noteId: string, tags: string[]): void {
 
 export function untagNote(db: Database, noteId: string, tags: string[]): void {
   const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
-  for (const tag of tags) {
+  // Mirror tagNote's normalization so removing `#tag` deletes the bare row.
+  for (const raw of tags) {
+    const tag = stripTagHash(raw);
+    if (tag === "") continue;
     stmt.run(noteId, tag);
   }
 }
@@ -1359,6 +1387,11 @@ export type RenameTagResult =
  * after the cascade returns.
  */
 export function renameTag(db: Database, oldName: string, newName: string): RenameTagResult {
+  // Normalize the TARGET so a rename can never create a `#`-prefixed tag. The
+  // SOURCE (`oldName`) is left LITERAL on purpose — it's the transitional escape
+  // hatch that lets the `#legacy/*` → `legacy/*` data migration find the
+  // `#`-prefixed rows. (Renaming TO a `#`-name is the thing we're preventing.)
+  newName = stripTagHash(newName);
   if (oldName === newName) {
     const exists = db.prepare("SELECT 1 FROM tags WHERE name = ?").get(oldName);
     return exists
@@ -1727,6 +1760,9 @@ export function mergeTags(
   sources: string[],
   target: string,
 ): { merged: Record<string, number>; target: string } {
+  // Normalize the TARGET so a merge can never create a `#`-prefixed tag. SOURCES
+  // stay LITERAL so `#legacy/*` rows can be merged away (same carve-out as rename).
+  target = stripTagHash(target);
   // Dedup + drop target-in-sources (self-merge is a no-op).
   const uniqueSources = Array.from(new Set(sources)).filter((s) => s !== target);
 
@@ -1991,15 +2027,18 @@ export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
 export function batchTag(db: Database, noteIds: string[], tags: string[]): number {
   const insertTag = db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)");
   const insertNoteTag = db.prepare("INSERT OR IGNORE INTO note_tags (note_id, tag_name) VALUES (?, ?)");
+  // Canonical-bare-tag guard (vault#XXX) — batchTag has its own SQL (does NOT
+  // funnel through tagNote), so it strips leading `#` independently.
+  const bareTags = tags.map(stripTagHash).filter((t) => t !== "");
   let count = 0;
 
   db.exec("BEGIN");
   try {
-    for (const tag of tags) {
+    for (const tag of bareTags) {
       insertTag.run(tag);
     }
     for (const noteId of noteIds) {
-      for (const tag of tags) {
+      for (const tag of bareTags) {
         insertNoteTag.run(noteId, tag);
         count++;
       }
@@ -2015,12 +2054,15 @@ export function batchTag(db: Database, noteIds: string[], tags: string[]): numbe
 
 export function batchUntag(db: Database, noteIds: string[], tags: string[]): number {
   const stmt = db.prepare("DELETE FROM note_tags WHERE note_id = ? AND tag_name = ?");
+  // Mirror batchTag's bare-tag normalization so removing `#tag` deletes the
+  // bare row.
+  const bareTags = tags.map(stripTagHash).filter((t) => t !== "");
   let count = 0;
 
   db.exec("BEGIN");
   try {
     for (const noteId of noteIds) {
-      for (const tag of tags) {
+      for (const tag of bareTags) {
         stmt.run(noteId, tag);
         count++;
       }
