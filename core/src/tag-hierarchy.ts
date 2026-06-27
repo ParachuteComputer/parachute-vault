@@ -27,6 +27,28 @@
 
 import { Database } from "bun:sqlite";
 
+/**
+ * Canonical-bare-tag guard (vault#XXX). Strip any leading `#` (one or more)
+ * from a tag value so a `#`-prefixed tag can never be stored or queried
+ * out-of-band. Tags are stored BARE by convention (`agent/message/inbound`,
+ * not `#agent/message/inbound`); a client that passes the `#`-decorated form —
+ * as the agent module did, persisting `#agent/message/inbound` literally — must
+ * land on the same canonical row everyone else queries.
+ *
+ * Deliberately MINIMAL: this is NOT `normalizeTagValue` (portable-md.ts). It
+ * does NOT lowercase, slug-validate, or otherwise transform the value — casing
+ * and structure are preserved. The ONLY job is to remove the stray leading `#`.
+ *
+ * Idempotent: `#tag` / `##tag` / `tag` all collapse to `tag`. Only LEADING `#`
+ * is stripped — a `#` mid-string (e.g. `c#`) is left intact. Whitespace is
+ * trimmed first so a `" #tag"` from a sloppy client also normalizes. Applied at
+ * the canonical chokepoints (note-tag write, query/exclude filters, tag-schema
+ * name + parent_names) so MCP, REST, and direct-core callers all converge.
+ */
+export function stripTagHash(tag: string): string {
+  return tag.trim().replace(/^#+/, "");
+}
+
 export interface TagHierarchy {
   /** tag → set of immediate child tags (those that declared `tag` as a parent). */
   childrenOf: Map<string, Set<string>>;

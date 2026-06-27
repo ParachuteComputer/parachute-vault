@@ -16,6 +16,7 @@ import { HookRegistry } from "./hooks.js";
 import {
   loadTagHierarchy,
   getTagExpansion,
+  stripTagHash,
   TAG_CONFIG_PREFIX,
   DEFAULT_TAG_NAME,
   DEFAULT_TAG_EXPAND_MODE,
@@ -251,8 +252,30 @@ export class BunSqliteStore implements Store {
     );
   }
 
+  /**
+   * Canonical-bare-tag guard (vault#XXX) for the QUERY path. Strip any leading
+   * `#` from `tags` / `excludeTags` BEFORE hierarchy expansion so a
+   * `#agent/message`-form query matches a bare-stored `agent/message` row (and
+   * vice-versa). This is what makes the data migration non-breaking — every
+   * old `#`-decorated query keeps working, mapping onto the same bare rows.
+   * Runs before `expandQueryTags` so hierarchy resolution / `_default` collapse
+   * see the bare names. Empty-after-strip entries are dropped.
+   */
+  private normalizeQueryTags(opts: QueryOpts): QueryOpts {
+    let next = opts;
+    if (opts.tags && opts.tags.length > 0) {
+      const tags = opts.tags.map(stripTagHash).filter((t) => t !== "");
+      next = { ...next, tags };
+    }
+    if (opts.excludeTags && opts.excludeTags.length > 0) {
+      const excludeTags = opts.excludeTags.map(stripTagHash).filter((t) => t !== "");
+      next = { ...next, excludeTags };
+    }
+    return next;
+  }
+
   async queryNotes(opts: QueryOpts): Promise<Note[]> {
-    return noteOps.queryNotes(this.db, this.expandQueryTags(opts));
+    return noteOps.queryNotes(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
   }
 
   async queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage> {
@@ -262,7 +285,11 @@ export class BunSqliteStore implements Store {
     // descendant set → different rows match → caller should restart). The
     // alternative — hash the expanded set — would silently keep returning
     // stale results from a hierarchy snapshot the caller never saw.
-    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(opts));
+    //
+    // Bare-tag normalization runs first (before the hash is taken inside
+    // queryNotesPaged) so a `#tag`-form page-1 and a bare `tag`-form follow-up
+    // resolve to the same cursor query_hash.
+    return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
   }
 
   /**
@@ -332,6 +359,11 @@ export class BunSqliteStore implements Store {
   }
 
   async searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode }): Promise<Note[]> {
+    // Canonical-bare-tag guard (vault#XXX): strip leading `#` from search tag
+    // filters before expansion, so `#manual` and `manual` resolve identically.
+    if (opts?.tags && opts.tags.length > 0) {
+      opts = { ...opts, tags: opts.tags.map(stripTagHash).filter((t) => t !== "") };
+    }
     // Same tag-expansion treatment as queryNotes, along the SAME `expand` axis
     // (vault tag `expand` axis) — searching `#manual` should match notes
     // tagged with any descendant under "subtypes", any `manual/*` under
@@ -630,6 +662,18 @@ export class BunSqliteStore implements Store {
       parent_names?: string[] | null;
     },
   ) {
+    // Canonical-bare-tag guard (vault#XXX) for the SCHEMA path. Strip leading
+    // `#` from the tag NAME being upserted and from every `parent_names` entry,
+    // so the `tags` rows and the inheritance graph stay bare — matching the
+    // bare-stored note_tags. A `#foo` schema with `parent_names: ["#bar"]`
+    // becomes `foo` / `["bar"]`, so `tag:bar` still expands to `foo`.
+    tag = stripTagHash(tag);
+    if (patch.parent_names != null) {
+      patch = {
+        ...patch,
+        parent_names: patch.parent_names.map(stripTagHash).filter((p) => p !== ""),
+      };
+    }
     // Snapshot the prior indexed-field set BEFORE the write so the diff below
     // sees what this tag declared going in. Only needed when `fields` changes.
     const priorRecord =

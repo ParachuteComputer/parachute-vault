@@ -12,7 +12,7 @@
  */
 
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
-import { TAG_EXPAND_MODES, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
+import { TAG_EXPAND_MODES, stripTagHash, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import {
@@ -2086,7 +2086,15 @@ export async function handleTags(
   // of { description, fields, relationships, parent_names }; omitted keys
   // are preserved, explicit null clears. See patterns/tag-data-model.md.
   if (req.method === "PUT") {
-    if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
+    // Canonical-bare-tag guard (vault#XXX): normalize the upserted tag NAME so
+    // the existing-field merge read (store.getTagSchema below) and the upsert
+    // both target the bare row. store.upsertTagRecord re-normalizes (idempotent)
+    // for the write; this keeps the partial-merge read correct for a
+    // `#`-decorated PUT path. (GET/DELETE/rename keep their literal lookups —
+    // rename's source-name must still match a `#`-prefixed legacy row so the
+    // data migration can rename it away.)
+    const putTagName = stripTagHash(tagName);
+    if (tagScope.allowed && !tagScope.allowed.has(putTagName)) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
     const body = (await req.json()) as {
@@ -2157,7 +2165,7 @@ export async function handleTags(
         const full = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
         fieldsPatch = Object.keys(full).length > 0 ? full : null;
       } else {
-        const existing = await store.getTagSchema(tagName);
+        const existing = await store.getTagSchema(putTagName);
         const merged: Record<string, tagSchemaOps.TagFieldSchema> = {
           ...(existing?.fields ?? {}),
           ...(body.fields as Record<string, tagSchemaOps.TagFieldSchema>),
@@ -2172,7 +2180,7 @@ export async function handleTags(
     // unchanged on failure (no orphan/lying index). vault#478.
     let result;
     try {
-      result = await store.upsertTagRecord(tagName, {
+      result = await store.upsertTagRecord(putTagName, {
         ...(body.description !== undefined ? { description: body.description } : {}),
         ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
         ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),

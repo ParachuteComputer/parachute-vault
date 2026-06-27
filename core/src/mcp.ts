@@ -3,7 +3,7 @@ import type { Store, Note } from "./types.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
-import { TAG_EXPAND_MODES, type TagExpandMode } from "./tag-hierarchy.js";
+import { TAG_EXPAND_MODES, stripTagHash, type TagExpandMode } from "./tag-hierarchy.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -1453,7 +1453,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         required: ["tag"],
       },
       execute: async (params) => {
-        const tag = params.tag as string;
+        // Canonical-bare-tag guard (vault#XXX): normalize the tag NAME up front
+        // so the existing-record lookup (and the field/cross-tag merge that
+        // depends on it) reads the bare `foo` row, not a phantom `#foo` miss.
+        // store.upsertTagRecord normalizes again (idempotent) for non-MCP
+        // callers; doing it here keeps the merge correct.
+        const tag = stripTagHash(params.tag as string);
         const existing = tagSchemaOps.getTagRecord(db, tag);
 
         // ---- fields: three-way semantics, distinguishing `null` from
