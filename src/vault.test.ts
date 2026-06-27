@@ -1393,6 +1393,99 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  // -- Q6 through the MCP TRANSPORT (vault#325 Part 2) --------------------
+  //
+  // The two tests above call `tool.execute()` directly — that exercises the
+  // tag-scope WRAPPER but bypasses `handleScopedMcp`: the JSON-RPC transport,
+  // the `hasScopeForVault` tool-visibility gate, and the tools/call dispatch.
+  // The HTTP-layer twin lives in `routing.test.ts` (Q6 read-path). What was
+  // missing — and what this pins — is the orphan-sub-tag fail-open driven
+  // through the actual MCP `tools/call` path a real client hits. Same fixture
+  // as the HTTP test (`#health/food` with no `_tags/health/food` schema,
+  // token allowlisted for `health`), different transport.
+
+  test("MCP query-notes (tools/call) sees orphan sub-tag via string-form root (vault#325 Part 2)", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `mcp-orphan-query-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    // No `_tags/health/food` schema — this is the orphan case. The hierarchy
+    // is implicit, so authorization must fall back to the string-form root.
+    const orphan = await store.createNote("orphan", { tags: ["health/food"] });
+
+    const auth = {
+      permission: "read" as const,
+      scopes: ["vault:read"],
+      legacyDerived: false,
+      scoped_tags: ["health"],
+    };
+
+    // The URL is inert here — handleScopedMcp hands it to the SDK
+    // transport, which only reads the body; the `vaultName` route wiring
+    // is exercised by routing.test.ts, not this transport-level test. The
+    // `accept` header is load-bearing: `enableJsonResponse` returns JSON
+    // only when text/event-stream is also acceptable, else it streams SSE.
+    const callReq = (id: number, name: string, args: Record<string, unknown>) =>
+      new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name, arguments: args },
+        }),
+      });
+
+    // Fetch the orphan by id through the MCP transport with a token scoped
+    // to ["health"]. The orphan is tagged `health/food` (no schema) → the
+    // string-form fallback resolves the root `health` → in allowlist → the
+    // note must come back rather than 404/forbidden.
+    const res = await handleScopedMcp(callReq(1, "query-notes", { id: orphan.id }), vaultName, auth as any);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    // tools/call returns content[].text with the JSON-stringified tool result.
+    expect(body.result?.isError).toBeFalsy();
+    const text: string = body.result.content[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.id).toBe(orphan.id);
+    expect(parsed.tags).toContain("health/food");
+
+    // Control: a token scoped to a DIFFERENT root must NOT see the orphan
+    // through the same transport — proves the green result above is the
+    // fail-open fallback firing, not scoping being inert.
+    const denied = {
+      permission: "read" as const,
+      scopes: ["vault:read"],
+      legacyDerived: false,
+      scoped_tags: ["work"],
+    };
+    const resDenied = await handleScopedMcp(
+      callReq(2, "query-notes", { id: orphan.id }),
+      vaultName,
+      denied as any,
+    );
+    expect(resDenied.status).toBe(200);
+    const deniedBody = (await resDenied.json()) as any;
+    const deniedText: string = deniedBody.result.content[0].text;
+    const deniedParsed = JSON.parse(deniedText);
+    // Out-of-scope single-note fetch fails closed: the wrapper replaces the
+    // note body with `{ error: "Note not found" }` (no content/tags leak).
+    // This proves the `health`-scoped green result above is the fail-open
+    // string-form fallback firing, not the wrapper being a no-op.
+    expect(deniedParsed.error).toBe("Note not found");
+    expect(deniedParsed.content).toBeUndefined();
+    expect(deniedParsed.tags).toBeUndefined();
+
+    closeAllStores();
+  });
+
   // -- Q5: MCP delete-tag dependency check -------------------------------
 
   test("MCP delete-tag returns tag_in_use_by_tokens when a vestigial tag-scoped token row references the tag", async () => {

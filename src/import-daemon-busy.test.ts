@@ -15,30 +15,21 @@ import { resolve } from "path";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { runSubprocess } from "./test-support/spawn.ts";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
 
+// Async spawn — the daemon-busy probe inside the CLI fetches the test
+// process's stub server, so the parent event loop must keep servicing
+// requests while the child runs. `Bun.spawnSync` blocks the event loop and
+// the in-test server can't answer, which makes every probe time out into
+// the "not listening" branch (vault#324). `runSubprocess` is the shared
+// safe primitive (vault#325 Part 1) — see src/test-support/spawn.ts.
 async function runCli(
   args: string[],
   env: Record<string, string>,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  // Async spawn — the daemon-busy probe inside the CLI fetches the test
-  // process's stub server, so the parent event loop must keep servicing
-  // requests while the child runs. Bun.spawnSync blocks the event loop
-  // and the in-test server can't answer, which makes every probe time
-  // out into the "not listening" branch.
-  const proc = Bun.spawn({
-    cmd: ["bun", CLI, ...args],
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, ...env },
-  });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { exitCode: exitCode ?? -1, stdout, stderr };
+  return runSubprocess({ cmd: ["bun", CLI, ...args], env });
 }
 
 let home: string;
