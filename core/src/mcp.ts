@@ -120,6 +120,16 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
  * expansion behaves exactly as before.
  */
 export interface GenerateMcpToolsOpts {
+  /**
+   * Write-attribution context (vault#298) stamped onto every note written
+   * through these tools. `actor` is the principal (JWT `sub` / operator
+   * label); `via` is the interface the write arrived through (here, always an
+   * MCP session — the server-side wrapper derives `mcp` or a more specific
+   * `agent:<id>` / `surface:<name>` when the token's claims reveal it). The
+   * core tools pass it straight into `store.createNote` / `store.updateNote`.
+   * Omitted (internal / unattributed callers) → writes leave attribution NULL.
+   */
+  writeContext?: { actor?: string | null; via?: string | null };
   expandVisibility?: (note: Note) => boolean;
   /**
    * `nearTraversable` (vault#439) is an OPTIONAL per-note predicate threaded
@@ -141,6 +151,11 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const db: Database = store.db;
   const expandVisibility = opts?.expandVisibility;
   const nearTraversable = opts?.nearTraversable;
+  // Write-attribution (vault#298) — captured once at tool-generation time
+  // (a fresh tool set is generated per MCP request, so this is request-scoped)
+  // and folded into every create/update the tools perform.
+  const writeActor = opts?.writeContext?.actor ?? null;
+  const writeVia = opts?.writeContext?.via ?? null;
 
   return [
 
@@ -220,6 +235,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             type: "object",
             description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
           },
+          created_by: { type: "string", description: "Write-attribution filter (vault#298): only notes whose FIRST write was attributed to this principal (a JWT subject, or an operator/token label). Exact match; indexed. Legacy/unattributed notes (NULL) never match." },
+          last_updated_by: { type: "string", description: "Write-attribution filter (vault#298): only notes whose MOST RECENT write was attributed to this principal. Exact match; indexed." },
+          created_via: { type: "string", description: "Write-attribution filter (vault#298): only notes FIRST written through this interface/channel — e.g. `mcp`, `surface:<name>`, `agent:<id>`, `operator`, `api`. Exact match; indexed." },
+          last_updated_via: { type: "string", description: "Write-attribution filter (vault#298): only notes whose MOST RECENT write came through this interface/channel. Exact match; indexed." },
           order_by: { type: "string", description: "Sort by an indexed metadata field instead of `created_at`. Field must be declared `indexed: true`; errors otherwise. The special value `link_count` sorts by link DEGREE (both-directions raw row count) — no declaration needed — matching the `include_link_count` field for every note. Direction is taken from `sort` (default 'asc'); `created_at` is appended as a stable tiebreaker." },
           date_from: { type: "string", description: "Start date (ISO, inclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', from }`." },
           date_to: { type: "string", description: "End date (ISO, exclusive). Filters on `created_at` (vault ingestion time). Shorthand for `date_filter: { field: 'created_at', to }`." },
@@ -460,6 +479,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             // result whenever the neighborhood lies outside that prefix.
             ids: nearScope ? [...nearScope] : undefined,
             metadata: params.metadata as Record<string, unknown> | undefined,
+            // Write-attribution filters (vault#298): "who wrote / via what."
+            createdBy: params.created_by as string | undefined,
+            lastUpdatedBy: params.last_updated_by as string | undefined,
+            createdVia: params.created_via as string | undefined,
+            lastUpdatedVia: params.last_updated_via as string | undefined,
             dateFrom: params.date_from as string | undefined,
             dateTo: params.date_to as string | undefined,
             dateFilter: params.date_filter as
@@ -643,6 +667,10 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
               metadata: item.metadata as Record<string, unknown> | undefined,
               created_at: item.created_at as string | undefined,
               ...(extension !== undefined ? { extension } : {}),
+              // Write-attribution (vault#298) — same actor/via for every item
+              // in a batch (the whole call came from one authenticated session).
+              actor: writeActor,
+              via: writeVia,
             });
 
             // Create explicit links (not wikilinks — those are automatic)
@@ -714,7 +742,9 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 - For batch: pass a \`notes\` array, each with an \`id\` field.
 - **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`force\` only waives the *requirement to supply* \`if_updated_at\` — if you pass both, the precondition you supplied still applies and a mismatch returns a conflict error. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).
 - **Idempotent upsert via \`if_missing: "create"\`** — when the note doesn't exist, create it from this same payload (content/path/tags/metadata become the create fields; OC precondition skipped — nothing to conflict with). Response carries \`created: true\`. Useful for nightly sync loops that don't know ahead of time whether the note exists. Default \`"fail"\` (current behavior — missing note errors). See vault#309.
-- \`include_content\` (default \`true\`) — set \`false\` to receive a lean index shape (\`id\`, \`path\`, \`createdAt\`, \`updatedAt\`, \`tags\`, \`metadata\`, \`byteSize\`, \`preview\`) instead of full content. Useful for agents making frequent small edits to large notes (e.g. via \`append\` or \`content_edit\`) where re-receiving the body is the dominant cost. \`validation_status\` is preserved on the lean shape when present.`,
+- \`include_content\` (default \`true\`) — set \`false\` to receive a lean index shape (\`id\`, \`path\`, \`createdAt\`, \`updatedAt\`, \`createdBy\`, \`createdVia\`, \`lastUpdatedBy\`, \`lastUpdatedVia\`, \`tags\`, \`metadata\`, \`byteSize\`, \`preview\`) instead of full content. Useful for agents making frequent small edits to large notes (e.g. via \`append\` or \`content_edit\`) where re-receiving the body is the dominant cost. \`validation_status\` is preserved on the lean shape when present.
+
+Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\` (the principal + interface of the first write) and \`lastUpdatedBy\`/\`lastUpdatedVia\` (the most recent write). NULL on notes written before attribution existed. Filter on them with \`created_by\`/\`last_updated_by\`/\`created_via\`/\`last_updated_via\`.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -913,6 +943,12 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
                 ...(item.metadata !== undefined ? { metadata: item.metadata as Record<string, unknown> } : {}),
                 ...(item.created_at !== undefined ? { created_at: item.created_at as string } : {}),
                 ...(createExt !== undefined ? { extension: createExt } : {}),
+                // Write-attribution (vault#298) — the if_missing:"create" upsert
+                // branch is still a CREATE, so it must stamp the same actor/via
+                // as the create-note tool + the REST upsert-create path. Without
+                // this an MCP-driven upsert-create wrote NULL attribution.
+                actor: writeActor,
+                via: writeVia,
               };
               const content = (item.content as string | undefined) ?? "";
               const created = await store.createNote(content, createOpts);
@@ -1060,6 +1096,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
           let result: Note;
           if (Object.keys(updates).length > 0) {
+            // Write-attribution (vault#298): stamp the most-recent-write
+            // columns on the same UPDATE that bumps `updated_at`. Only set when
+            // there's a real change to write (the empty-updates branch below
+            // leaves attribution untouched, symmetric with not bumping
+            // updated_at on a no-op).
+            updates.actor = writeActor;
+            updates.via = writeVia;
             // store.updateNote routes through noteOps.updateNote, which runs
             // the UPDATE (with optional `AND updated_at IS ?`) atomically and
             // throws ConflictError on mismatch. No mutations have happened

@@ -100,6 +100,11 @@ function tryServerWideAuth(
     // would see no other operator mints; that's fine — env-var-bearer is
     // explicitly the operator-channel, not a user surface).
     caller_jti: null,
+    // Write-attribution (vault#298): the env-var bearer IS the operator
+    // channel. `actor: "operator"` + `via: "operator"` — a stable, honest
+    // label for cross-container hub→vault and CLI operator writes.
+    actor: "operator",
+    via: "operator",
   };
 }
 
@@ -137,14 +142,52 @@ export interface AuthResult {
    * mints. See vault#376.
    */
   caller_jti: string | null;
+  /**
+   * Write-attribution axis 1 — WHO (vault#298). The principal a write is
+   * attributed to:
+   *   - Hub JWT  → the validated `sub` claim (the human or the identity an
+   *     agent runs as).
+   *   - VAULT_AUTH_TOKEN operator bearer → `"operator"`.
+   *   - Legacy YAML api_keys → `"token:<keyhash-prefix>"` so legacy writes
+   *     still attribute to *something* stable, never crash.
+   * NULL only when no principal could be resolved (shouldn't happen on a
+   * successful auth, but kept nullable so a future credential class that
+   * lacks a subject degrades gracefully rather than throwing).
+   */
+  actor: string | null;
+  /**
+   * Write-attribution axis 2 — VIA WHAT (vault#298). The interface/channel a
+   * write arrived through, derived PRAGMATICALLY from the credential class
+   * here, then REFINED by the request path at the call site (the MCP handler
+   * stamps `mcp`; the REST router keeps the credential-class default). Values:
+   * `mcp` · `surface:<name>` · `agent:<id>` · `operator` · `api`. This is the
+   * BASE value from auth — the credential class:
+   *   - Hub JWT  → `"api"` (the generic class; refined to `mcp` etc. downstream
+   *     once the channel is known).
+   *   - operator bearer → `"operator"`.
+   *   - legacy YAML key → `"api"` (a REST credential; the `token:<id>` actor
+   *     already carries the legacy-key identity).
+   * Never blocks the `actor` work — if the channel can't be cleanly
+   * determined the class (or `api`) stands.
+   */
+  via: string | null;
 }
 
 /**
  * Convert a legacy "read" | "full" permission into scopes + the legacyDerived
  * flag. Used for legacy YAML key authentication paths and for tokens whose
  * `scopes` column is still NULL.
+ *
+ * `actorLabel` (vault#298) is the write-attribution principal for this legacy
+ * credential — `token:<keyhash-prefix>` so a legacy-YAML-keyed write still
+ * attributes to a stable identity. Defaults to `"operator"` for the rare
+ * call site without a key in hand. `via` is the generic `api` class (legacy
+ * keys are a REST credential); the MCP handler refines it to `mcp` downstream.
  */
-function legacyAuthResult(permission: TokenPermission): AuthResult {
+function legacyAuthResult(
+  permission: TokenPermission,
+  actorLabel: string = "operator",
+): AuthResult {
   return {
     permission,
     scopes: legacyPermissionToScopes(permission),
@@ -152,7 +195,21 @@ function legacyAuthResult(permission: TokenPermission): AuthResult {
     scoped_tags: null,
     vault_name: null,
     caller_jti: null,
+    actor: actorLabel,
+    via: "api",
   };
+}
+
+/**
+ * Stable short label for a legacy YAML api_key, derived from its stored hash.
+ * `token:<first-12-of-hash>` — enough to distinguish keys for attribution
+ * without putting a full secret-derived hash into note rows. The hash is
+ * already a one-way digest of the key (see config.ts `verifyKey`), so a prefix
+ * leaks nothing usable.
+ */
+function legacyKeyActorLabel(keyHash: string): string {
+  const clean = keyHash.replace(/^[^:]*:/, ""); // drop any `algo:` prefix
+  return `token:${clean.slice(0, 12)}`;
 }
 
 // One-shot deprecation warning tracker, keyed by token hash / legacy label so
@@ -303,7 +360,10 @@ export async function authenticateVaultRequest(
   if (vaultKey) {
     try { writeVaultConfig(vaultConfig); } catch {}
     warnLegacyOnce(`yaml-vault:${vaultKey.key_hash}`, "vault.yaml api_keys");
-    return legacyAuthResult(vaultKey.scope === "read" ? "read" : "full");
+    return legacyAuthResult(
+      vaultKey.scope === "read" ? "read" : "full",
+      legacyKeyActorLabel(vaultKey.key_hash),
+    );
   }
 
   // Legacy: check global keys from config.yaml
@@ -313,7 +373,10 @@ export async function authenticateVaultRequest(
     if (globalKey) {
       try { writeGlobalConfig(globalConfig); } catch {}
       warnLegacyOnce(`yaml-global:${globalKey.key_hash}`, "config.yaml api_keys");
-      return legacyAuthResult(globalKey.scope === "read" ? "read" : "full");
+      return legacyAuthResult(
+        globalKey.scope === "read" ? "read" : "full",
+        legacyKeyActorLabel(globalKey.key_hash),
+      );
     }
   }
 
@@ -515,6 +578,18 @@ async function authenticateHubJwt(
       // through verbatim — manage-token's session-pin will be null in that
       // case, and list/revoke from that session sees no mints.
       caller_jti: claims.jti ?? null,
+      // Write-attribution (vault#298). WHO = the validated JWT subject (the
+      // human, or the identity an agent runs as — note agent-grant tokens are
+      // minted with `sub = <user-on-whose-behalf>`, so today an agent's writes
+      // attribute to that human; a delegation-chain `via` is the deferred v2 in
+      // the issue). VIA = `api` here, the generic credential class; the request
+      // path refines it (the MCP handler stamps `mcp`). The JWT carries no
+      // clean surface-name / agent-definition-id claim — `clientId` is an
+      // opaque DCR id and `aud` is just `vault.<name>` — so per the issue's
+      // pragmatic constraint we DON'T manufacture a more specific class; the
+      // channel comes from the path instead.
+      actor: claims.sub && claims.sub.length > 0 ? claims.sub : null,
+      via: "api",
     };
   } catch (err) {
     if (err instanceof MalformedScopedTagsError) {
@@ -619,7 +694,10 @@ export async function authenticateGlobalRequest(
     if (matched) {
       try { writeGlobalConfig(globalConfig); } catch {}
       warnLegacyOnce(`yaml-global:${matched.key_hash}`, "config.yaml api_keys");
-      return legacyAuthResult(matched.scope === "read" ? "read" : "full");
+      return legacyAuthResult(
+        matched.scope === "read" ? "read" : "full",
+        legacyKeyActorLabel(matched.key_hash),
+      );
     }
   }
 

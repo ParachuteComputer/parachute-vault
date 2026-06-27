@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
 
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -13,6 +13,17 @@ export const SCHEMA_SQL = `
 -- column; on-disk uniqueness key is (path, extension). See
 -- core/src/portable-md.ts:supportsInlineFrontmatter for the
 -- frontmatter-vs-sidecar split.
+--
+-- Write-attribution (v23, vault#298) — two axes of provenance, both nullable:
+--   created_by / created_via        — the principal + interface of the FIRST
+--                                     write (set once at create; never rewritten).
+--   last_updated_by / last_updated_via — the principal + interface of the MOST
+--                                     RECENT write (set on every mutating update).
+-- The *_by columns are the actor (a JWT sub, or an operator/token label for
+-- non-JWT auth); the *_via columns are the channel the write arrived through
+-- (mcp, surface:NAME, agent:ID, operator/cli, api). Legacy rows stay NULL —
+-- we don't fabricate authors for writes that predate attribution. See
+-- migrateToV23.
 CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
   content TEXT DEFAULT '',
@@ -20,7 +31,11 @@ CREATE TABLE IF NOT EXISTS notes (
   metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT,
-  extension TEXT NOT NULL DEFAULT 'md'
+  extension TEXT NOT NULL DEFAULT 'md',
+  created_by TEXT,
+  created_via TEXT,
+  last_updated_by TEXT,
+  last_updated_via TEXT
 );
 
 -- Tags: first-class identity carrying schema, hierarchy, and typed-link
@@ -478,6 +493,13 @@ export function initSchema(db: Database): void {
   // keyset pagination and date_filter on updated_at — both were full table
   // scans. See the 2026-06-10 query-perf measurements.
   migrateToV22(db);
+
+  // Migrate v22 → v23: write-attribution columns on `notes`
+  // (created_by/created_via/last_updated_by/last_updated_via) + their indexes.
+  // All four nullable; existing rows backfill to NULL ("written before
+  // attribution" — we don't fabricate authors for legacy writes). See
+  // vault#298.
+  migrateToV23(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1148,6 +1170,43 @@ function migrateToV21(db: Database): void {
 function migrateToV22(db: Database): void {
   if (!hasTable(db, "notes")) return;
   db.exec("CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at, id)");
+}
+
+/**
+ * Migrate v22 → v23: per-identity + per-interface write attribution
+ * (vault#298). Adds four nullable columns to `notes` and an index on each so
+ * "what did Mathilda write" / "what came in via the meeting-ingest surface"
+ * are indexed lookups, not scans:
+ *
+ *   created_by        — principal (actor) of the first write
+ *   created_via       — interface/channel of the first write
+ *   last_updated_by   — principal of the most recent write
+ *   last_updated_via  — interface/channel of the most recent write
+ *
+ * `*_by` is the JWT `sub` (or an operator / `token:<id>` label for non-JWT
+ * auth); `*_via` is the channel (`mcp`, `surface:<name>`, `agent:<id>`,
+ * `operator`/`cli`, `api`). All four NULL on legacy rows — we deliberately do
+ * NOT backfill an author for writes that predate attribution; NULL reads as
+ * "unknown / pre-attribution," distinct from any real principal.
+ *
+ * Columns live here (not SCHEMA_SQL's index block) following the
+ * idx_tokens_vault_name / idx_notes_updated precedent: SCHEMA_SQL runs before
+ * the migration steps, so an upgrading v22 vault doesn't yet have the columns
+ * when that block evaluates. Fresh vaults get the columns from the CREATE
+ * TABLE above and the indexes from this same path. All idempotent — the
+ * column-existence guard + CREATE INDEX IF NOT EXISTS make re-runs no-ops.
+ */
+function migrateToV23(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  const cols = ["created_by", "created_via", "last_updated_by", "last_updated_via"];
+  for (const col of cols) {
+    if (!hasColumn(db, "notes", col)) {
+      db.exec(`ALTER TABLE notes ADD COLUMN ${col} TEXT`);
+    }
+  }
+  for (const col of cols) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_notes_${col} ON notes(${col})`);
+  }
 }
 
 function hasTable(db: Database, name: string): boolean {

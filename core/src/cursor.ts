@@ -160,6 +160,14 @@ export interface QueryHashInputs {
   extension?: string | string[];
   ids?: string[];
   metadata?: Record<string, unknown>;
+  // Write-attribution filters (vault#298) — part of the result-set-affecting
+  // opts, so they're bound into the cursor: changing "who/via" between polls
+  // invalidates the cursor with cursor_query_mismatch rather than silently
+  // continuing the prior filter's watermark.
+  createdBy?: string;
+  lastUpdatedBy?: string;
+  createdVia?: string;
+  lastUpdatedVia?: string;
   dateFrom?: string;
   dateTo?: string;
   dateFilter?: { field?: string; from?: string; to?: string };

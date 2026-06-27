@@ -26,6 +26,19 @@ export interface Note {
   metadata?: Record<string, unknown>;
   createdAt: string; // ISO-8601
   updatedAt?: string;
+  /**
+   * Write-attribution (vault#298) — two axes of provenance, both nullable.
+   * `*By` is the principal (a JWT `sub`, or an operator / `token:<id>` label);
+   * `*Via` is the interface the write arrived through (`mcp`, `surface:<name>`,
+   * `agent:<id>`, `operator`/`cli`, `api`). The `created*` pair is set once at
+   * create; the `lastUpdated*` pair tracks the most recent mutating write. NULL
+   * = unknown / written before attribution existed (legacy rows) or by a path
+   * that carried no context — distinct from any real principal.
+   */
+  createdBy?: string | null;
+  createdVia?: string | null;
+  lastUpdatedBy?: string | null;
+  lastUpdatedVia?: string | null;
   tags?: string[];
   links?: Link[];
   /**
@@ -125,6 +138,15 @@ export interface QueryOpts {
   // for the field. Operator queries require the field to be declared
   // `indexed: true` in a tag schema; undeclared fields error loudly.
   metadata?: Record<string, unknown>;
+  // Write-attribution filters (vault#298). Exact-match on the indexed
+  // attribution columns — "what did Mathilda write" (`createdBy`/`lastUpdatedBy`)
+  // or "what came in via the meeting-ingest surface"
+  // (`createdVia`/`lastUpdatedVia`). Each is an exact string match; multiple
+  // AND together with the rest of the filter set.
+  createdBy?: string;
+  lastUpdatedBy?: string;
+  createdVia?: string;
+  lastUpdatedVia?: string;
   // Legacy shorthand: filters on `n.created_at` (vault ingestion time).
   // Equivalent to `dateFilter: { field: "created_at", from, to }`. Kept
   // as the common path; specifying both this and `dateFilter` rejects.
@@ -206,6 +228,12 @@ export interface NoteIndex {
   extension?: string;
   createdAt: string;
   updatedAt?: string;
+  /** Write-attribution (vault#298) — carried on the lean shape too so "who
+   *  touched what" is answerable without re-fetching full content. See `Note`. */
+  createdBy?: string | null;
+  createdVia?: string | null;
+  lastUpdatedBy?: string | null;
+  lastUpdatedVia?: string | null;
   tags?: string[];
   metadata?: Record<string, unknown>;
   byteSize: number;
@@ -232,8 +260,10 @@ export interface Store {
    */
   readonly db: Database;
 
-  // Notes
-  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note>;
+  // Notes. `actor` / `via` carry write-attribution (vault#298) — the
+  // principal + interface stamped onto created_by/created_via (and mirrored
+  // into the last_updated_* pair on create). Omitted → attribution NULL.
+  createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null }): Promise<Note>;
   getNote(id: string): Promise<Note | null>;
   /**
    * Look up a note by path. Pass `extension` to disambiguate when
@@ -244,7 +274,7 @@ export interface Store {
    */
   getNoteByPath(path: string, extension?: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
-  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; if_updated_at?: string }): Promise<Note>;
+  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from
