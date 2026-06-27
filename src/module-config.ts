@@ -85,9 +85,8 @@ export function buildConfigSchema(): ModuleConfigSchema {
 }
 
 /**
- * Effective config values for ONE vault, with `writeOnly` fields stripped.
- * `scribeBearer` (and its legacy alias `scribe_token`) are declared `writeOnly`
- * and never returned, even when set in the environment.
+ * Effective config values for ONE vault. The shared scribe bearer is
+ * daemon-global and never returned (see the scope boundary below).
  *
  * Scope boundary (vault#478): the `GET /vault/<name>/.parachute/config`
  * endpoint is gated by `vault:<name>:admin` — "admin over *your* vault only".

@@ -5408,6 +5408,25 @@ describe("tag record API (patterns/tag-data-model.md)", async () => {
     expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
     expect(indexedFieldOps.getIndexedField(db, "bad-field")).toBeNull();
   });
+
+  it("upsertTagRecord with fields:null releases indexed fields (transaction commits the release path)", async () => {
+    // Declare an indexed field, then clear all fields — the release path runs
+    // inside the same transaction as the persist. It must commit cleanly:
+    // the row, generated column, and index all drop.
+    await store.upsertTagRecord("meeting", {
+      fields: { held_on: { type: "string", indexed: true } },
+    });
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+
+    await store.upsertTagRecord("meeting", { fields: null });
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "held_on")).toBeNull();
+    const cols = (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(cols).not.toContain("meta_held_on");
+  });
 });
 
 // ---------------------------------------------------------------------------
