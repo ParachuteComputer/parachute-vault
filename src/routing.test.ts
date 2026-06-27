@@ -1262,12 +1262,17 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
     expect(body.type).toBe("object");
     expect(body.properties.audio_retention?.type).toBe("string");
     expect(body.properties.audio_retention?.enum).toEqual(["keep", "until_transcribed", "never"]);
-    expect(body.properties.scribe_url?.type).toBe("string");
-    expect(body.properties.scribe_token?.writeOnly).toBe(true);
-    expect(body.properties.port?.readOnly).toBe(true);
+    expect(body.properties.autoTranscribe?.type).toBe("object");
+    // vault#478 scope boundary: daemon-GLOBAL fields are NOT described by the
+    // per-vault admin config schema. The per-vault admin surface is "admin
+    // over *your* vault only" — port / scribe URL / scribe bearer are
+    // deployment-wide and live behind the operator-only surface.
+    expect(body.properties).not.toHaveProperty("scribe_url");
+    expect(body.properties).not.toHaveProperty("scribe_token");
+    expect(body.properties).not.toHaveProperty("port");
   });
 
-  test("config returns current values with writeOnly fields excluded", async () => {
+  test("config returns ONLY per-vault values, never daemon-global ones (scope boundary, vault#478)", async () => {
     createVault("journal");
     const token = await createAdminToken("journal");
     const path = "/vault/journal/.parachute/config";
@@ -1284,13 +1289,22 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as Record<string, unknown>;
+      // Per-vault config is present.
       expect(body.audio_retention).toBe("keep"); // default when unset
-      expect(body.scribe_url).toBe("https://scribe.example/v1");
-      expect(body.port).toBe(1940);
+      expect(body).toHaveProperty("autoTranscribe");
+      // Daemon-GLOBAL values must NOT cross the per-vault admin boundary.
+      expect(body).not.toHaveProperty("port");
+      expect(body).not.toHaveProperty("scribe_url");
+      // The discovery-resolved scribe URL is daemon-global → must not leak,
+      // even nested under autoTranscribe.
+      const at = body.autoTranscribe as Record<string, unknown>;
+      expect(at).not.toHaveProperty("scribeUrl");
       // writeOnly field must not appear in GET.
       expect(body).not.toHaveProperty("scribe_token");
-      // Defense in depth: grep the raw body for the token value.
-      expect(JSON.stringify(body)).not.toContain("super-secret-should-never-appear");
+      // Defense in depth: no daemon-global value (URL or secret) anywhere.
+      const raw = JSON.stringify(body);
+      expect(raw).not.toContain("super-secret-should-never-appear");
+      expect(raw).not.toContain("https://scribe.example/v1");
     } finally {
       if (origScribeToken === undefined) delete process.env.SCRIBE_TOKEN;
       else process.env.SCRIBE_TOKEN = origScribeToken;
@@ -1318,24 +1332,27 @@ describe("/.parachute/config/schema + /.parachute/config", () => {
     expect(body.audio_retention).toBe("until_transcribed");
   });
 
-  test("config scribe_url falls back to empty string when SCRIBE_URL env is unset", async () => {
-    createVault("journal");
+  test("autoTranscribe.enabled reports the per-vault override (vault#478)", async () => {
+    // Server default ON; this vault explicitly opts OUT — the per-vault value
+    // must win, proving the field is reported per-vault (not the raw global).
+    writeGlobalConfig({ port: 1940, auto_transcribe: { enabled: true } });
+    writeVaultConfig({
+      name: "journal",
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      auto_transcribe: { enabled: false },
+    });
     const token = await createAdminToken("journal");
-    const orig = process.env.SCRIBE_URL;
-    delete process.env.SCRIBE_URL;
-    try {
-      const path = "/vault/journal/.parachute/config";
-      const res = await route(
-        new Request(`http://localhost:1940${path}`, {
-          headers: { authorization: `Bearer ${token}` },
-        }),
-        path,
-      );
-      const body = (await res.json()) as { scribe_url: string };
-      expect(body.scribe_url).toBe("");
-    } finally {
-      if (orig !== undefined) process.env.SCRIBE_URL = orig;
-    }
+    const path = "/vault/journal/.parachute/config";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      path,
+    );
+    const body = (await res.json()) as { autoTranscribe: { enabled: boolean } };
+    expect(body.autoTranscribe.enabled).toBe(false);
+    writeGlobalConfig({ port: 1940 });
   });
 
   test("unknown vault returns 404 before reaching the config handlers", async () => {
