@@ -110,11 +110,17 @@ import { getVaultStore } from "./vault-store.ts";
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import {
   defaultMirrorConfig,
+  readMirrorConfigForVault,
   resolveMirrorPath,
   writeMirrorConfigForVault,
   type MirrorConfig,
 } from "./mirror-config.ts";
-import { bootstrapInternalMirror } from "./mirror-manager.ts";
+import {
+  bootstrapInternalMirror,
+  readMirrorHistory,
+  showMirrorRevision,
+} from "./mirror-manager.ts";
+import { GitNotInstalledError, ensureGitAvailable } from "./git-preflight.ts";
 import { selfRegister } from "./self-register.ts";
 import {
   hasOwnerPassword,
@@ -233,6 +239,9 @@ switch (command) {
     break;
   case "export":
     await cmdExport(cmdArgs);
+    break;
+  case "history":
+    await cmdHistory(cmdArgs);
     break;
   case "schema":
     await cmdSchema(cmdArgs);
@@ -3331,6 +3340,163 @@ async function cmdExport(args: string[]) {
 }
 
 // ---------------------------------------------------------------------------
+// `parachute-vault history` — surface the vault's git write history (vault#300)
+// ---------------------------------------------------------------------------
+
+/**
+ * `parachute-vault history [--note <path>] [--limit N] [--vault <name>] [--json]`
+ *
+ * Surfaces the mirror's git commit log — the vault is already git-backed
+ * (one file per note), so `git log` IS a tamper-evident, diffable write
+ * history. This CLI front-door wraps the SAME `readMirrorHistory` helper the
+ * REST `/history` endpoint uses (no drift between the two surfaces).
+ *
+ * `--note <path>` scopes to a single note's history (`git log --follow --
+ * <path>.md`). `--show <sha>` (with `--note`) prints that note's content at
+ * a past revision (`git show <sha>:<path>.md`).
+ */
+async function cmdHistory(args: string[]) {
+  let vaultName = "default";
+  let notePath: string | undefined;
+  let limit: number | undefined;
+  let showSha: string | undefined;
+  let asJson = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--vault") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--vault requires a value.");
+        process.exit(1);
+      }
+      vaultName = v;
+    } else if (arg === "--note") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--note requires a note path.");
+        process.exit(1);
+      }
+      notePath = v;
+    } else if (arg === "--limit") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--limit requires a number.");
+        process.exit(1);
+      }
+      const n = Number(v);
+      if (!Number.isInteger(n) || n <= 0) {
+        console.error(`--limit: must be a positive integer (got '${v}')`);
+        process.exit(1);
+      }
+      limit = n;
+    } else if (arg === "--show") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--show requires a commit sha.");
+        process.exit(1);
+      }
+      showSha = v;
+    } else if (arg === "--json") {
+      asJson = true;
+    } else if (arg === "--help" || arg === "-h") {
+      printHistoryUsage();
+      return;
+    } else {
+      console.error(`Unknown argument: ${arg}`);
+      printHistoryUsage();
+      process.exit(1);
+    }
+  }
+
+  if (showSha && !notePath) {
+    console.error("--show <sha> requires --note <path> (which file to read at that revision).");
+    process.exit(1);
+  }
+
+  const config = readVaultConfig(vaultName);
+  if (!config) {
+    console.error(`Vault "${vaultName}" not found. Available: ${listVaults().join(", ") || "(none)"}.`);
+    process.exit(1);
+  }
+
+  // Resolve the mirror dir the same way the server does: per-vault mirror
+  // config (or defaults) → resolveMirrorPath against the vault's data dir.
+  const mirrorConfig = readMirrorConfigForVault(vaultName) ?? defaultMirrorConfig();
+  const mirrorPath = resolveMirrorPath(vaultDir(vaultName), mirrorConfig);
+  if (!mirrorPath || !existsSync(mirrorPath)) {
+    console.error(
+      `No git history for vault "${vaultName}" — the mirror isn't initialized yet.\n` +
+        `Enable history (backup) so writes are recorded, then re-run.`,
+    );
+    process.exit(1);
+  }
+
+  // Preflight git — friendly, actionable message instead of a raw spawn throw.
+  try {
+    ensureGitAvailable();
+  } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
+
+  // `--show` path: print one note's content at a past revision.
+  if (showSha && notePath) {
+    const content = await showMirrorRevision(mirrorPath, showSha, notePath);
+    if (content === null) {
+      console.error(
+        `No content for "${notePath}" at ${showSha} — the sha may be unknown, the note may not have existed at that commit, or the path is invalid.`,
+      );
+      process.exit(1);
+    }
+    process.stdout.write(content);
+    return;
+  }
+
+  const history = await readMirrorHistory(mirrorPath, { notePath, limit });
+
+  if (asJson) {
+    console.log(JSON.stringify(history, null, 2));
+    return;
+  }
+
+  if (history.length === 0) {
+    if (notePath) {
+      console.log(`No history for note "${notePath}" in vault "${vaultName}".`);
+    } else {
+      console.log(`No history yet for vault "${vaultName}".`);
+    }
+    return;
+  }
+
+  const scope = notePath ? ` for "${notePath}"` : "";
+  console.log(`Git history for vault "${vaultName}"${scope} (${history.length} commit${history.length === 1 ? "" : "s"}):\n`);
+  for (const entry of history) {
+    // Short sha + date + subject — one line per commit, the `git log --oneline`
+    // shape an operator expects.
+    console.log(`  ${entry.sha.slice(0, 8)}  ${entry.date}  ${entry.message}`);
+  }
+}
+
+function printHistoryUsage(): void {
+  console.error(
+    "Usage: parachute-vault history [--note <path>] [--limit N] [--vault <name>] [--json]\n" +
+      "                              [--note <path> --show <sha>]",
+  );
+  console.error("\nSurface the vault's git write history. The vault is already git-backed via the");
+  console.error("mirror (one file per note), so `git log` IS a tamper-evident, diffable history.");
+  console.error("\nOptions:");
+  console.error("  --vault <name>   Vault to read (default: 'default')");
+  console.error("  --note <path>    Scope to a single note's history (git log --follow)");
+  console.error("  --limit N        Cap the number of commits returned (default 100)");
+  console.error("  --show <sha>     With --note: print that note's content at the given revision");
+  console.error("  --json           Emit the history as JSON instead of the human-readable list");
+}
+
+// ---------------------------------------------------------------------------
 // Schema maintenance — `parachute-vault schema <subcommand>`
 // ---------------------------------------------------------------------------
 
@@ -4105,6 +4271,15 @@ Import/Export:
                                                        (combine with --watch for auto-history;
                                                        template via --git-message-template;
                                                        --git-push to push after commit)
+
+History:
+  parachute-vault history [--vault <name>]             Show the vault's git write history (the
+                                                       mirror is git-backed — one file per note,
+                                                       so git log IS a tamper-evident history)
+  parachute-vault history --note <path>                Scope to one note's history (git log --follow)
+  parachute-vault history --limit N                    Cap the number of commits (default 100)
+  parachute-vault history --note <path> --show <sha>   Print that note's content at a past revision
+  parachute-vault history --json                       Emit history as JSON
 
 Schema maintenance:
   parachute-vault schema prune [--vault <name>]       Drop orphaned indexed-field columns +

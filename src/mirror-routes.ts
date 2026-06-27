@@ -34,7 +34,11 @@ import {
   validateMirrorConfigShape,
   type MirrorConfig,
 } from "./mirror-config.ts";
-import type { MirrorManager } from "./mirror-manager.ts";
+import {
+  readMirrorHistory,
+  showMirrorRevision,
+  type MirrorManager,
+} from "./mirror-manager.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import {
   applyToGitRemote,
@@ -292,6 +296,183 @@ export async function handleMirrorPushNow(
       status: manager.getStatus(),
       push: result,
     },
+    { headers: { "Access-Control-Allow-Origin": "*" } },
+  );
+}
+
+/**
+ * `GET /vault/<name>/.parachute/mirror/history` — surface the mirror's git
+ * commit history (vault#300).
+ *
+ * The vault is already git-backed via the mirror (one file per note), so
+ * `git log` IS a tamper-evident, diffable write history. This endpoint
+ * SURFACES it through the admin gate — it's a read-only ops/forensics
+ * surface, not a content read path (hence admin, not read, scoped upstream).
+ *
+ * Query params:
+ *   - `?path=<note.path>` — scope the log to a single note's file
+ *     (`git log --follow -- <path>.md`). An unsafe path (traversal /
+ *     absolute) yields an empty list, never an unscoped log.
+ *   - `?limit=<n>` — cap the number of commits (default
+ *     HISTORY_DEFAULT_LIMIT, clamped to HISTORY_MAX_LIMIT).
+ *
+ * Response: 200 `{ history: [{ sha, date, message }], mirror_path,
+ * path?, limit }`. Degrades gracefully:
+ *   - mirror disabled / no path resolved → 200 with empty history + a
+ *     `note` explaining the mirror isn't initialized (not a 500).
+ *   - git not installed → 503 git_not_installed (consistent with the other
+ *     mirror routes).
+ *   - no commits yet / path with no history → 200 empty history.
+ */
+export async function handleMirrorHistory(
+  req: Request,
+  manager: MirrorManager,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const pathParam = url.searchParams.get("path") ?? undefined;
+  const limitParam = url.searchParams.get("limit");
+  let limit: number | undefined;
+  if (limitParam !== null) {
+    const n = Number(limitParam);
+    if (!Number.isInteger(n) || n <= 0) {
+      return Response.json(
+        {
+          error: "Invalid limit",
+          field: "limit",
+          message: "limit must be a positive integer.",
+        },
+        { status: 400 },
+      );
+    }
+    limit = n;
+  }
+
+  const status = manager.getStatus();
+  // No resolved mirror path means the mirror was never enabled /
+  // bootstrapped for this vault — there's no git repo to read. Return an
+  // empty history with an explanatory note rather than a 500/404; the
+  // caller (SPA / CLI) renders "no history yet, enable backup to start".
+  if (!status.mirror_path) {
+    return Response.json(
+      {
+        history: [],
+        mirror_path: null,
+        ...(pathParam ? { path: pathParam } : {}),
+        note: "Mirror is not initialized for this vault — no git history exists yet. Enable history (backup) to start recording write history.",
+      },
+      { headers: { "Access-Control-Allow-Origin": "*" } },
+    );
+  }
+
+  // Preflight git — the helper degrades a missing repo to [], but a
+  // git-less server should get the friendly, actionable 503 (same shape as
+  // the import / PUT routes) rather than a silently-empty list.
+  try {
+    ensureGitAvailable();
+  } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      return Response.json(
+        {
+          error: "git not installed",
+          error_type: "git_not_installed",
+          message: err.message,
+        },
+        { status: 503 },
+      );
+    }
+    throw err;
+  }
+
+  const history = await readMirrorHistory(status.mirror_path, {
+    notePath: pathParam,
+    limit,
+  });
+  return Response.json(
+    {
+      history,
+      mirror_path: status.mirror_path,
+      ...(pathParam ? { path: pathParam } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    },
+    { headers: { "Access-Control-Allow-Origin": "*" } },
+  );
+}
+
+/**
+ * `GET /vault/<name>/.parachute/mirror/history/show?sha=<sha>&path=<note.path>`
+ * — read a single note file at a past revision (`git show <sha>:<path>.md`).
+ * The companion to `/history`: history lists the commits, this reads what a
+ * note looked like at one of them. Admin-gated (vault#300).
+ *
+ * Query params (both required):
+ *   - `sha` — a commit sha (hex, validated in `showMirrorRevision`).
+ *   - `path` — the note path (normalized to `<path>.md`).
+ *
+ * Response:
+ *   200 `{ sha, path, content }` — the file content at that revision.
+ *   400 — missing sha/path.
+ *   404 — the sha/path pair doesn't resolve (unknown sha, note didn't
+ *         exist at that commit, or an unsafe path).
+ *   503 — git not installed.
+ */
+export async function handleMirrorHistoryShow(
+  req: Request,
+  manager: MirrorManager,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const sha = url.searchParams.get("sha")?.trim() ?? "";
+  const notePath = url.searchParams.get("path")?.trim() ?? "";
+  if (sha.length === 0 || notePath.length === 0) {
+    return Response.json(
+      {
+        error: "sha and path required",
+        message:
+          "Provide both `sha` (a commit from /history) and `path` (the note path) query params.",
+      },
+      { status: 400 },
+    );
+  }
+
+  const status = manager.getStatus();
+  if (!status.mirror_path) {
+    return Response.json(
+      {
+        error: "Mirror not initialized",
+        message:
+          "No git history exists for this vault yet — enable history (backup) first.",
+      },
+      { status: 404 },
+    );
+  }
+
+  try {
+    ensureGitAvailable();
+  } catch (err) {
+    if (err instanceof GitNotInstalledError) {
+      return Response.json(
+        {
+          error: "git not installed",
+          error_type: "git_not_installed",
+          message: err.message,
+        },
+        { status: 503 },
+      );
+    }
+    throw err;
+  }
+
+  const content = await showMirrorRevision(status.mirror_path, sha, notePath);
+  if (content === null) {
+    return Response.json(
+      {
+        error: "Revision not found",
+        message: `No content for ${notePath} at ${sha} — the sha may be unknown, the note may not have existed at that commit, or the path is invalid.`,
+      },
+      { status: 404 },
+    );
+  }
+  return Response.json(
+    { sha, path: notePath, content },
     { headers: { "Access-Control-Allow-Origin": "*" } },
   );
 }

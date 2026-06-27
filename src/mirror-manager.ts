@@ -369,6 +369,170 @@ async function readCurrentOrigin(repoDir: string): Promise<string | null> {
   return url.length > 0 ? url : null;
 }
 
+// ---------------------------------------------------------------------------
+// Git history read surface (vault#300)
+//
+// The vault is already git-backed via the mirror — one file per note, so
+// `git log` IS a tamper-evident, time-travelable, diffable write history.
+// These helpers SURFACE that history through the admin-gated REST + CLI
+// read paths. No write-path change, no schema change, no new table — the
+// history already exists on disk; we just read it.
+//
+// Same Bun.spawn-git shape as `readCommitsUnpushed` / `readCurrentOrigin`
+// above (spawn array argv, capture stdout, parse) so REST + CLI share ONE
+// implementation and there's no drift between them.
+// ---------------------------------------------------------------------------
+
+/** A single commit in the mirror's history. */
+export interface HistoryEntry {
+  /** Full commit sha. */
+  sha: string;
+  /** ISO-8601 author date (`%aI`). */
+  date: string;
+  /** Commit subject line (`%s`). */
+  message: string;
+}
+
+/** Default cap on how many commits a history read returns. */
+export const HISTORY_DEFAULT_LIMIT = 100;
+/** Hard ceiling — even an explicit `?limit=` can't exceed this. */
+export const HISTORY_MAX_LIMIT = 1000;
+
+/**
+ * Normalize + validate a note path for use as a `git log -- <path>.md`
+ * pathspec. Returns the `<path>.md` argv token, or null when the path is
+ * unsafe / empty.
+ *
+ * The path goes into an ARRAY-spawn argv (no shell), so this isn't guarding
+ * against shell injection — it's guarding against directory traversal
+ * (`..`) and absolute paths escaping the mirror dir, plus normalizing the
+ * leading-slash + trailing-`.md` shape so the pathspec matches the file the
+ * exporter actually wrote (`<note.path>.md`, see portable-md.ts).
+ */
+export function noteHistoryPathspec(notePath: string): string | null {
+  const trimmed = notePath.trim();
+  if (trimmed.length === 0) return null;
+  // Reject absolute paths and traversal — the pathspec must stay inside the
+  // mirror working tree. A `..` segment (or a leading `/`) could otherwise
+  // point `git log` at files outside the vault's note tree.
+  if (trimmed.startsWith("/")) return null;
+  const segments = trimmed.split("/");
+  if (segments.some((s) => s === "..")) return null;
+  // The exporter writes `<note.path>.md`. Accept a path the caller already
+  // suffixed with `.md` (idempotent) or bare; emit the `.md` form either way.
+  const base = trimmed.endsWith(".md") ? trimmed.slice(0, -3) : trimmed;
+  if (base.length === 0) return null;
+  return `${base}.md`;
+}
+
+/**
+ * Read the mirror's commit history via `git log`. Optionally scoped to a
+ * single note's file (`opts.notePath` → `git log --follow -- <path>.md`).
+ *
+ * Returns an ordered (newest-first) array of `{ sha, date, message }`.
+ * Tolerant of the not-yet-a-repo / no-commits-yet cases — those return an
+ * empty array rather than throwing, so a freshly-bootstrapped (or never-
+ * bootstrapped) mirror reads as "no history yet", not a 500.
+ *
+ * `git log` field separators: we use `%H` (full sha), `%aI` (ISO author
+ * date), `%s` (subject). A literal record separator (`\x1f`) joins the
+ * three fields and a literal unit separator (`\x1e`) terminates each record
+ * so a multi-line-unfriendly subject (it isn't — `%s` is the subject line
+ * only) or a commit message containing our delimiters can't desync parsing.
+ *
+ * The git binary preflight is the CALLER's responsibility (REST + CLI both
+ * call `ensureGitAvailable` before this) — but a missing-repo `git log`
+ * exits non-zero, which we map to `[]`, so even an un-preflighted call
+ * degrades to "empty" rather than a crash.
+ */
+export async function readMirrorHistory(
+  repoDir: string,
+  opts: { notePath?: string; limit?: number } = {},
+): Promise<HistoryEntry[]> {
+  const limit = Math.min(
+    Math.max(1, Math.floor(opts.limit ?? HISTORY_DEFAULT_LIMIT)),
+    HISTORY_MAX_LIMIT,
+  );
+  const FIELD_SEP = "\x1f";
+  const RECORD_SEP = "\x1e";
+  const format = `%H${FIELD_SEP}%aI${FIELD_SEP}%s${RECORD_SEP}`;
+  const args = [
+    "log",
+    `--max-count=${limit}`,
+    `--pretty=format:${format}`,
+  ];
+  if (opts.notePath) {
+    const spec = noteHistoryPathspec(opts.notePath);
+    // An unsafe / empty path yields no history rather than an unscoped log.
+    if (spec === null) return [];
+    // `--follow` traces the file across renames (the vault renames note
+    // files when a note's path changes). `--` ends the option list so the
+    // pathspec is never mistaken for a flag.
+    args.push("--follow", "--", spec);
+  }
+  const proc = Bun.spawn(["git", ...args], {
+    cwd: repoDir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const exitCode = await proc.exited;
+  // Non-zero: not a git repo, no commits yet, or a path with no history.
+  // All map to "empty history" — never a thrown error.
+  if (exitCode !== 0) return [];
+  const out = new TextDecoder().decode(
+    await new Response(proc.stdout).arrayBuffer(),
+  );
+  const entries: HistoryEntry[] = [];
+  for (const record of out.split(RECORD_SEP)) {
+    const trimmed = record.trim();
+    if (trimmed.length === 0) continue;
+    const [sha, date, ...rest] = trimmed.split(FIELD_SEP);
+    if (!sha || !date) continue;
+    entries.push({
+      sha,
+      date,
+      // `%s` never contains FIELD_SEP, but rejoin defensively so a delimiter
+      // that somehow slipped into a subject doesn't truncate the message.
+      message: redactToken(rest.join(FIELD_SEP)),
+    });
+  }
+  return entries;
+}
+
+/**
+ * Read a single past revision of a note file: `git show <sha>:<path>.md`.
+ * Returns the file content at that commit, or null when the path is unsafe,
+ * the sha/path pair doesn't resolve, or git exits non-zero.
+ *
+ * The sha + path both go into an array-spawn argv (no shell). The sha is
+ * validated to a hex-only shape (git accepts abbreviated shas + symbolic
+ * refs, but for this read surface we only allow `[0-9a-f]` so a caller can't
+ * smuggle a `..`-style ref or option-looking token). The path runs through
+ * the same `noteHistoryPathspec` normalization as the log read.
+ */
+export async function showMirrorRevision(
+  repoDir: string,
+  sha: string,
+  notePath: string,
+): Promise<string | null> {
+  const cleanSha = sha.trim();
+  // Hex-only, bounded. Covers full + abbreviated shas; rejects refs,
+  // ranges, and anything option-looking.
+  if (!/^[0-9a-f]{4,64}$/.test(cleanSha)) return null;
+  const spec = noteHistoryPathspec(notePath);
+  if (spec === null) return null;
+  const proc = Bun.spawn(["git", "show", `${cleanSha}:${spec}`], {
+    cwd: repoDir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) return null;
+  return new TextDecoder().decode(
+    await new Response(proc.stdout).arrayBuffer(),
+  );
+}
+
 /**
  * Singleton lifecycle controller. Holds the active mirror config, the
  * resolved path, hook subscriptions (when sync_mode=events), the

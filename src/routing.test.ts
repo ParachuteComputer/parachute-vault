@@ -2267,6 +2267,79 @@ describe("/vault/<name>/.parachute/mirror/run-now — auth + dispatch", () => {
 });
 
 // ---------------------------------------------------------------------------
+// /vault/<name>/.parachute/mirror/history — surface the git write history
+// (vault#300). Admin-gated (ops/forensics surface). Tests pin the auth gate
+// matches the sibling mirror routes; helper + handler shape lives in
+// mirror-history.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("/vault/<name>/.parachute/mirror/history — auth + dispatch", () => {
+  test("unauthenticated → 401", async () => {
+    createVault("journal");
+    const p = "/vault/journal/.parachute/mirror/history";
+    const res = await route(new Request(`http://localhost:1940${p}`), p);
+    expect(res.status).toBe(401);
+  });
+
+  test("vault:read token → 403 insufficient_scope (admin required)", async () => {
+    createVault("journal");
+    const fullToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const p = "/vault/journal/.parachute/mirror/history";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        headers: { authorization: `Bearer ${fullToken}` },
+      }),
+      p,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+  });
+
+  test("admin token reaches the handler (200 when wired, 503 when not)", async () => {
+    createVault("journal");
+    const token = await createAdminToken("journal");
+    const p = "/vault/journal/.parachute/mirror/history";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      p,
+    );
+    // Either way the auth gate passed — that's what this routing-level test pins.
+    expect([200, 503]).toContain(res.status);
+  });
+
+  test("/history/show admin gate matches /history", async () => {
+    createVault("journal");
+    const fullToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const p = "/vault/journal/.parachute/mirror/history/show";
+    const res = await route(
+      new Request(`http://localhost:1940${p}?sha=abc123&path=Notes/a`, {
+        headers: { authorization: `Bearer ${fullToken}` },
+      }),
+      p,
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("non-GET method → 405 (or 503 when manager not wired)", async () => {
+    createVault("journal");
+    const token = await createAdminToken("journal");
+    const p = "/vault/journal/.parachute/mirror/history";
+    const res = await route(
+      new Request(`http://localhost:1940${p}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      p,
+    );
+    expect([405, 503]).toContain(res.status);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // /vault/<name>/.parachute/usage — per-vault data-footprint endpoint.
 //
 // READ-scoped (a vault's own user must see their own vault's size; the
