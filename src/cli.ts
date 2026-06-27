@@ -1664,7 +1664,7 @@ function cmdRemove(args: string[]) {
     configDirty = true;
     console.log(
       `  Last vault removed — wrote auto_create: false to ${GLOBAL_CONFIG_PATH} so the` +
-        ` server won't auto-recreate "default" on next boot. Create a vault with:` +
+        ` server won't auto-create a first vault on next boot. Create one with:` +
         ` parachute-vault create <name>`,
     );
   }
