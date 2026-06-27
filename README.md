@@ -586,16 +586,12 @@ Range params require content in the response — with `include_content=false` (o
 
 ### Incremental rebuilds: "what changed since X"
 
-The SSG / sync pattern. Two equivalent forms — bracket-style is canonical going forward; the flat form is the same shape that ships through the REST/MCP date filter today.
+The SSG / sync pattern. Bracket-style is the query-string date filter. (The flat `date_field` / `date_from` / `date_to` params were removed in 0.6.4 — vault#288 — and are now ignored.)
 
 ```bash
-# Bracket-style (canonical)
+# Bracket-style (the query-string date filter)
 curl -H "Authorization: Bearer $VAULT_TOKEN" \
   "http://localhost:1940/vault/default/api/notes?meta[updated_at][gte]=2026-04-01T00:00:00Z"
-
-# Flat form (DEPRECATED in 0.4.3; planned removal in a later 0.x per vault#288)
-curl -H "Authorization: Bearer $VAULT_TOKEN" \
-  "http://localhost:1940/vault/default/api/notes?date_field=updated_at&date_from=2026-04-01T00:00:00Z"
 ```
 
 ```jsonc

@@ -328,7 +328,7 @@ function parseMetaBrackets(url: URL): {
         return {
           error: json(
             {
-              error: `bracket-date filter on \`${field}\` supports only \`gte\` (inclusive lower bound) and \`lt\` (exclusive upper bound). Got: \`${op}\`. The dateFilter contract uses these two ops because the equivalent flat shape (\`date_field=${field}&date_from=…&date_to=…\`) is half-open by design.`,
+              error: `bracket-date filter on \`${field}\` supports only \`gte\` (inclusive lower bound) and \`lt\` (exclusive upper bound). Got: \`${op}\`. The dateFilter contract is half-open by design.`,
               code: "INVALID_QUERY",
             },
             400,
@@ -623,20 +623,13 @@ export function parseNotesQueryOpts(url: URL): {
     lastUpdatedBy: parseQuery(url, "last_updated_by") ?? undefined,
     createdVia: parseQuery(url, "created_via") ?? undefined,
     lastUpdatedVia: parseQuery(url, "last_updated_via") ?? undefined,
-    ...(bracket.dateFilter
-      ? { dateFilter: bracket.dateFilter }
-      : parseQuery(url, "date_field")
-        ? {
-            dateFilter: {
-              field: parseQuery(url, "date_field")!,
-              from: parseQuery(url, "date_from") ?? undefined,
-              to: parseQuery(url, "date_to") ?? undefined,
-            },
-          }
-        : {
-            dateFrom: parseQuery(url, "date_from") ?? undefined,
-            dateTo: parseQuery(url, "date_to") ?? undefined,
-          }),
+    // Date-range filtering on the query string is bracket-style only:
+    // `?meta[created_at][gte]=…&meta[created_at][lt]=…` (see
+    // `parseMetaBrackets`). The flat `date_field` / `date_from` / `date_to`
+    // params were removed in 0.6.4 (vault#288, breaking) — they are now
+    // ignored. The MCP `date_from` / `date_to` shorthand is a separate,
+    // supported convenience and is unaffected.
+    ...(bracket.dateFilter ? { dateFilter: bracket.dateFilter } : {}),
     sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
     orderBy: parseQuery(url, "order_by") ?? undefined,
     limit: parseInt10(parseQuery(url, "limit")) ?? 50,
@@ -907,7 +900,7 @@ async function handleNotesInner(
 
       // Structured query
       //
-      // Two filter syntaxes coexist on this endpoint:
+      // Date-range filtering on the query string uses one syntax:
       //
       //   - **Bracket-style** (canonical, vault#285 friction point 1.3):
       //     `?meta[field][op]=value` / `?meta[created_at][gte]=…`. Exposes
@@ -915,21 +908,18 @@ async function handleNotesInner(
       //     not_in/exists) and the dateFilter bridge through one consistent
       //     shape. See `parseMetaBrackets` for the grammar.
       //
-      //   - **Flat date params** (DEPRECATED): `?date_field=created_at&
-      //     date_from=…&date_to=…` and the legacy `?date_from=…&date_to=…`.
-      //     Still functional through 0.5.x; planned removal in a later 0.x
-      //     (vault#288). New consumers should use bracket-style.
-      //
-      // Precedence on overlap: bracket-style wins. If a caller passes both
-      // `meta[created_at][gte]=X` and `date_field=created_at&date_from=Y`,
-      // the bracket form is the dateFilter the engine sees; the flat
-      // params are silently dropped. We don't error — the bracket form is
-      // documented as canonical, and rejecting the overlap would block a
-      // realistic migration path where a caller half-converted their code.
+      // The flat date params (`?date_field=created_at&date_from=…&date_to=…`
+      // and the legacy bare `?date_from=…&date_to=…`) were REMOVED in 0.6.4
+      // (vault#288, breaking change). They are now silently ignored — a
+      // request that passes only flat date params comes back unfiltered.
+      // Bracket-style is functionally complete (full operator set), so no
+      // capability was lost. Migrate `date_field=created_at&date_from=X` to
+      // `meta[created_at][gte]=X` (and `date_to=Y` to `meta[created_at][lt]=Y`).
       //
       // Surface asymmetry: REST flattens to a query string; MCP takes a
-      // nested `date_filter: { field, from, to }` object directly. Both
-      // lower to the same store-level `dateFilter` shape.
+      // nested `date_filter: { field, from, to }` object directly (plus a
+      // top-level `date_from` / `date_to` shorthand, which is unaffected by
+      // this removal). Both lower to the same store-level `dateFilter` shape.
       // Structured-query parsing is shared with the live `/subscribe` route
       // (see `parseNotesQueryOpts`) so both endpoints lower an identical query
       // string to the same `QueryOpts` — predicate parity by construction.

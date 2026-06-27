@@ -34,6 +34,23 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.6.4-rc.7] - 2026-06-27
+
+### Removed
+
+- **BREAKING: the flat HTTP date-filter query params are removed (vault#288).**
+  `?date_field=…&date_from=…&date_to=…` (targeted) and the legacy bare
+  `?date_from=…&date_to=…` (implicit `created_at`) are no longer parsed on
+  `GET /notes` (or the shared `/subscribe` route) — they are now **silently
+  ignored**. A request that passes only the flat shape comes back **unfiltered**
+  (not an error), so external callers relying on the flat params will get more
+  rows than before. Migrate to the bracket-style filter, which is functionally
+  complete (full half-open range): `date_field=created_at&date_from=X&date_to=Y`
+  → `meta[created_at][gte]=X&meta[created_at][lt]=Y`. The deprecation shipped in
+  0.4.3. **Unaffected:** the bracket-style `meta[...]` date filter and the MCP
+  `query-notes` `date_from` / `date_to` shorthand (a separate, supported MCP
+  convenience for `date_filter: { field: 'created_at', … }`).
+
 ## [0.6.2-rc.1] - 2026-06-23
 
 ### Changed

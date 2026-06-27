@@ -416,9 +416,12 @@ describe("handleSubscribe — rejected query shapes", () => {
     expect(body.error).toContain("has_links");
   });
 
-  it("date filter → 400 (M1) — legacy date_from", async () => {
+  it("date filter → 400 (M1) — bracket date_filter on created_at", async () => {
+    // The flat `date_from` param was removed in 0.6.4 (vault#288) and is now
+    // ignored, so it no longer reaches the M1 date guard. Bracket-style is the
+    // only query-string date filter; assert it's still rejected for live subs.
     const res = await handleSubscribe(
-      subscribeReq("date_from=2026-01-01"),
+      subscribeReq("meta%5Bcreated_at%5D%5Bgte%5D=2026-01-01"),
       store,
       VAULT,
       unscopedScope(),
@@ -428,6 +431,24 @@ describe("handleSubscribe — rejected query shapes", () => {
     const body = await res.json();
     expect(body.code).toBe("UNSUPPORTED_SUBSCRIPTION_QUERY");
     expect(body.error).toContain("date");
+  });
+
+  it("flat date_from is ignored → subscription created (vault#288 removal)", async () => {
+    // Documents the breaking change: the removed flat param no longer reaches
+    // the date guard, so a sub that ONLY carries it is now a valid (unfiltered)
+    // subscription rather than a 400.
+    const res = await handleSubscribe(
+      subscribeReq("date_from=2026-01-01"),
+      store,
+      VAULT,
+      unscopedScope(),
+      manager,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("text/event-stream");
+    const r = sseReader(res);
+    await r.pump();
+    await r.close();
   });
 
   it("date filter → 400 (M1) — bracket date_filter on updated_at", async () => {
