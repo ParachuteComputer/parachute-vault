@@ -153,17 +153,23 @@ if (process.env.VAULT_AUTH_TOKEN?.trim()) {
 // logic lives in auth.ts (import-safe + unit-tested); see warnLegacyGlobalApiKeys.
 warnLegacyGlobalApiKeys(readGlobalConfig().api_keys);
 
-// Auto-init: create a default vault if none exist (first run in Docker).
-// The vault name comes from PARACHUTE_VAULT_NAME when set + valid; otherwise
-// falls back to "default". Hub's first-boot wizard (hub#267) passes through
-// an operator-chosen name via this env var.
+// First-boot vault creation — ONLY when PARACHUTE_VAULT_NAME is explicitly
+// set in the environment. (#478 Part 2)
+//
+// The hub setup wizard and `parachute init --vault-name <name>` both spawn
+// the vault server with PARACHUTE_VAULT_NAME=<operator-chosen-name>; that
+// env var is the load-bearing signal that an external orchestrator has
+// decided what the first vault should be called. With the env var unset the
+// server boots with zero vaults and stays that way — no silent "default"
+// — so a fresh install without a wizard can't accidentally squash an
+// explicit later `parachute-vault create <name>` call.
 //
 // Gated on the `auto_create: false` marker (2026-06-09 hub-module-boundary
 // migration): `parachute-vault remove` writes it when the operator deletes
 // their LAST vault, so an explicit empty-the-server action isn't silently
 // undone by a resurrection with fresh credentials on the next boot. Fresh
-// installs have no config.yaml — no marker — so Docker first-run still
-// auto-creates.
+// installs have no config.yaml — no marker — so the env-var-driven path
+// still works on a clean box.
 if (listVaults().length === 0) {
   const globalConfig = readGlobalConfig();
   if (!bootAutoCreateAllowed(globalConfig)) {
@@ -173,43 +179,57 @@ if (listVaults().length === 0) {
   } else if (!globalConfig.default_vault) {
     const firstBoot = resolveFirstBootVaultName(process.env.PARACHUTE_VAULT_NAME);
     if (firstBoot.source === "env") {
-      console.log(`[vault first-boot] using PARACHUTE_VAULT_NAME=${firstBoot.name}`);
+      // PARACHUTE_VAULT_NAME explicitly set + valid — create the named vault.
+      console.log(`[vault first-boot] PARACHUTE_VAULT_NAME=${firstBoot.name} — creating vault`);
+      const vaultName = firstBoot.name;
+      const { fullKey, keyId } = generateApiKey();
+      writeVaultConfig({
+        name: vaultName,
+        api_keys: [{
+          id: keyId,
+          label: "default",
+          scope: "write",
+          key_hash: hashKey(fullKey),
+          created_at: new Date().toISOString(),
+        }],
+        created_at: new Date().toISOString(),
+      });
+      globalConfig.default_vault = vaultName;
+      if (!globalConfig.api_keys?.length) {
+        globalConfig.api_keys = [{
+          id: keyId,
+          label: "default",
+          scope: "write",
+          key_hash: hashKey(fullKey),
+          created_at: new Date().toISOString(),
+        }];
+      }
+      writeGlobalConfig(globalConfig);
+      console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
+      // Seed the in-vault onboarding guide so a connected AI can self-orient and
+      // help set the vault up — same as the `create`/`init` CLI path. Idempotent
+      // + best-effort (never fails first boot). Mirrors createVault() in cli.ts.
+      await seedOnboardingNotesBestEffort(getVaultStore(vaultName));
     } else if (firstBoot.source === "env-invalid") {
+      // PARACHUTE_VAULT_NAME was set but failed validation — do NOT silently
+      // fall back to "default". Log the problem and stay empty so the operator
+      // sees the misconfiguration instead of a phantom vault.
       console.warn(
-        `[vault first-boot] PARACHUTE_VAULT_NAME=${JSON.stringify(firstBoot.rawValue)} is invalid (${firstBoot.reason}); falling back to "default"`,
+        `[vault first-boot] PARACHUTE_VAULT_NAME=${JSON.stringify(firstBoot.rawValue)} is invalid (${firstBoot.reason}) — server starting with zero vaults. Fix the env var, or create one via the admin wizard, parachute init --vault-name <name>, or parachute-vault create <name>.`,
       );
     } else {
-      console.log("[vault first-boot] using default name (no PARACHUTE_VAULT_NAME set)");
+      // PARACHUTE_VAULT_NAME unset — stay empty. No silent "default".
+      console.log(
+        '[vault first-boot] no vaults and PARACHUTE_VAULT_NAME unset — staying empty. Create one via the admin wizard, parachute init --vault-name <name>, or parachute-vault create <name>.',
+      );
     }
-    const vaultName = firstBoot.name;
-    const { fullKey, keyId } = generateApiKey();
-    writeVaultConfig({
-      name: vaultName,
-      api_keys: [{
-        id: keyId,
-        label: "default",
-        scope: "write",
-        key_hash: hashKey(fullKey),
-        created_at: new Date().toISOString(),
-      }],
-      created_at: new Date().toISOString(),
-    });
-    globalConfig.default_vault = vaultName;
-    if (!globalConfig.api_keys?.length) {
-      globalConfig.api_keys = [{
-        id: keyId,
-        label: "default",
-        scope: "write",
-        key_hash: hashKey(fullKey),
-        created_at: new Date().toISOString(),
-      }];
-    }
-    writeGlobalConfig(globalConfig);
-    console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
-    // Seed the in-vault onboarding guide so a connected AI can self-orient and
-    // help set the vault up — same as the `create`/`init` CLI path. Idempotent
-    // + best-effort (never fails first boot). Mirrors createVault() in cli.ts.
-    await seedOnboardingNotesBestEffort(getVaultStore(vaultName));
+  } else {
+    // Stale config: default_vault is set but no vault DB exists on disk, so
+    // first-boot create is skipped. Without a log line the server would boot
+    // empty and silent here, which is confusing. (#478 Part 2)
+    console.warn(
+      '[vault first-boot] config.yaml has default_vault set but no vaults exist on disk — skipping first-boot create. Create one with: parachute-vault create <name>',
+    );
   }
 }
 
