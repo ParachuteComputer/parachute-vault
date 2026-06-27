@@ -94,6 +94,8 @@ import {
   handleAuthGithubSelectRepo,
   handleAuthPat,
   handleMirrorGet,
+  handleMirrorHistory,
+  handleMirrorHistoryShow,
   handleMirrorImport,
   handleMirrorPushNow,
   handleMirrorPut,
@@ -669,6 +671,50 @@ export async function route(
     }
     if (req.method === "POST") return handleMirrorPushNow(manager);
     return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/mirror/history — surface the mirror's git commit history
+  // (vault#300). The vault is already git-backed (one file per note), so
+  // `git log` IS a tamper-evident write history; this read path exposes it.
+  // Admin-gated (it's an ops/forensics surface, not a content read) — same
+  // gate + manager check as the sibling mirror routes. GET-only.
+  //   /history       — full mirror history (?path=<note> scopes to one note,
+  //                    ?limit=<n> caps the count)
+  //   /history/show  — `git show <sha>:<path>.md` to read a past revision
+  if (
+    subpath === "/.parachute/mirror/history" ||
+    subpath === "/.parachute/mirror/history/show"
+  ) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const manager = getMirrorManager(vaultName);
+    if (!manager) {
+      return Response.json(
+        {
+          error: "Mirror manager not initialized",
+          message:
+            "The vault server hasn't wired the mirror manager registry yet (boot hasn't finished, or it failed). Check logs for [mirror] entries.",
+        },
+        { status: 503 },
+      );
+    }
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+    if (subpath === "/.parachute/mirror/history/show") {
+      return handleMirrorHistoryShow(req, manager);
+    }
+    return handleMirrorHistory(req, manager);
   }
 
   // /.parachute/mirror/import — clone a vault export from git + import.
