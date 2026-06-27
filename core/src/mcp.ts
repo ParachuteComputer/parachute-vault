@@ -830,7 +830,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           },
           path: { type: "string", description: "New path" },
           extension: { type: "string", description: "Change the note's file extension (vault#328). Allowed but caller-owned — you're responsible for content validity if you switch a non-empty note's extension. Lowercase alphanumeric, 1–16 chars; \"parachute\" prefix reserved." },
-          metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale)" },
+          metadata: { type: "object", description: "Metadata to merge (keys are merged, not replaced wholesale). A value of `null` deletes that key (RFC 7386 merge-patch) — e.g. `{\"new_key\": \"v\", \"old_key\": null}` renames in one call. Omitting a key preserves its existing value." },
           created_at: { type: "string", description: "New created_at timestamp" },
           if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
           force: { type: "boolean", description: "Waive the *requirement to supply* `if_updated_at` and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe. Note: this does not override an `if_updated_at` you actually pass — if you supply both, the precondition still applies and a mismatch returns a conflict error." },
@@ -1194,9 +1194,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             updates.extension = validateExtension(item.extension);
           }
           if (item.metadata !== undefined) {
-            // Merge metadata (don't replace wholesale)
-            const existing = (note.metadata as Record<string, unknown>) ?? {};
-            updates.metadata = { ...existing, ...(item.metadata as Record<string, unknown>) };
+            // Merge metadata (RFC 7386: keys are merged, incoming `null`
+            // removes the key rather than persisting a literal null —
+            // vault#478/#479). Mirrors the REST PATCH path.
+            updates.metadata = noteOps.mergeMetadata(
+              note.metadata as Record<string, unknown> | null | undefined,
+              item.metadata as Record<string, unknown>,
+            );
           }
           if (item.created_at !== undefined) updates.created_at = item.created_at;
           if (item.if_updated_at !== undefined) updates.if_updated_at = item.if_updated_at as string;

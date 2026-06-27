@@ -14,7 +14,7 @@
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
-import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import {
   parseContentRange,
   applyContentRange,
@@ -1653,8 +1653,11 @@ async function handleNotesInner(
         updates.extension = validateExtension(body.extension);
       }
       if (body.metadata !== undefined) {
-        const existing = (note.metadata as Record<string, unknown>) ?? {};
-        updates.metadata = { ...existing, ...body.metadata };
+        // RFC 7386 merge: incoming `null` removes the key (vault#478/#479).
+        updates.metadata = mergeMetadata(
+          note.metadata as Record<string, unknown> | null | undefined,
+          body.metadata as Record<string, unknown>,
+        );
       }
       if (body.created_at !== undefined || body.createdAt !== undefined) {
         updates.created_at = body.created_at ?? body.createdAt;

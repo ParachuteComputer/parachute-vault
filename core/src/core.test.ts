@@ -2170,6 +2170,50 @@ describe("MCP tools", async () => {
     expect(result.extension).toBe("csv");
   });
 
+  // ---- Metadata key-deletion via null tombstone (vault#478 / #479) ---------
+
+  it("update-note deletes a metadata key when its value is null (RFC 7386)", async () => {
+    const note = await store.createNote("m", {
+      metadata: { keep: "yes", drop: "old", other: 1 },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, metadata: { drop: null }, force: true });
+
+    const fresh = await store.getNote(note.id);
+    // The deleted key is GONE — not a literal JSON null.
+    expect(fresh!.metadata).not.toHaveProperty("drop");
+    // Other keys are untouched.
+    expect(fresh!.metadata).toMatchObject({ keep: "yes", other: 1 });
+  });
+
+  it("update-note metadata key-rename in one call (new key set, old key deleted)", async () => {
+    const note = await store.createNote("m", {
+      metadata: { "old-key": "v", stable: true },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({
+      id: note.id,
+      metadata: { new_key: "v", "old-key": null },
+      force: true,
+    });
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.metadata).not.toHaveProperty("old-key");
+    expect(fresh!.metadata).toMatchObject({ new_key: "v", stable: true });
+  });
+
+  it("deleting an absent metadata key is a no-op (round-trips cleanly)", async () => {
+    const note = await store.createNote("m", { metadata: { a: 1 } });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, metadata: { ghost: null }, force: true });
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.metadata).toEqual({ a: 1 });
+    expect(fresh!.metadata).not.toHaveProperty("ghost");
+  });
+
   it("query-notes filters by extension (vault#328)", async () => {
     await store.createNote("md note", { path: "a" });
     await store.createNote("csv note", { path: "b", extension: "csv" });

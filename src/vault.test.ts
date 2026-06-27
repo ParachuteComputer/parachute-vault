@@ -4012,6 +4012,36 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.metadata).toEqual({ a: 1, b: 2 });
   });
 
+  test("PATCH metadata null DELETES the key (RFC 7386), not a literal null (vault#478/#479)", async () => {
+    await store.createNote("doc", { id: "x", metadata: { keep: "yes", drop: "old", n: 3 } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { metadata: { drop: null }, force: true }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    // Key removed entirely — must NOT survive as a literal JSON null.
+    expect(body.metadata).not.toHaveProperty("drop");
+    expect(body.metadata).toEqual({ keep: "yes", n: 3 });
+    // Persisted state matches the response (round-trips).
+    const fresh = await store.getNote("x");
+    expect(fresh!.metadata).not.toHaveProperty("drop");
+    expect(fresh!.metadata).toEqual({ keep: "yes", n: 3 });
+  });
+
+  test("PATCH metadata key-rename in one call: set new, null-delete old (vault#478)", async () => {
+    await store.createNote("doc", { id: "x", metadata: { "old-key": "v", stable: true } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { metadata: { new_key: "v", "old-key": null }, force: true }),
+      store,
+      "/x",
+    );
+    const body = await res.json() as any;
+    expect(body.metadata).not.toHaveProperty("old-key");
+    expect(body.metadata).toEqual({ new_key: "v", stable: true });
+  });
+
   test("PATCH adds/removes tags", async () => {
     await store.createNote("x", { id: "x", tags: ["old"] });
     const res = await handleNotes(
