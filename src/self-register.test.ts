@@ -62,17 +62,17 @@ function captureLogs(): {
 
 describe("self-register", () => {
   test("buildVaultServicePaths — no vaults yet → empty paths (no phantom /vault/default, #478)", () => {
-    expect(buildVaultServicePaths(undefined, [], ["/vault/default"])).toEqual([]);
+    expect(buildVaultServicePaths(undefined, [])).toEqual([]);
   });
 
   test("buildVaultServicePaths — default vault sorts first", () => {
     expect(
-      buildVaultServicePaths("default", ["alpha", "default", "beta"], ["/"]),
+      buildVaultServicePaths("default", ["alpha", "default", "beta"]),
     ).toEqual(["/vault/default", "/vault/alpha", "/vault/beta"]);
   });
 
   test("buildVaultServicePaths — no default → map by listed order", () => {
-    expect(buildVaultServicePaths(undefined, ["alpha", "beta"], ["/"])).toEqual([
+    expect(buildVaultServicePaths(undefined, ["alpha", "beta"])).toEqual([
       "/vault/alpha",
       "/vault/beta",
     ]);
@@ -80,7 +80,7 @@ describe("self-register", () => {
 
   test("buildVaultServicePaths — default points to missing vault → ignore default", () => {
     expect(
-      buildVaultServicePaths("missing", ["alpha", "beta"], ["/"]),
+      buildVaultServicePaths("missing", ["alpha", "beta"]),
     ).toEqual(["/vault/alpha", "/vault/beta"]);
   });
 

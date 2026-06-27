@@ -69,7 +69,6 @@ import { listVaults, readGlobalConfig, DEFAULT_PORT } from "./config.ts";
 export function buildVaultServicePaths(
   defaultVault: string | undefined,
   vaults: readonly string[],
-  fallbackFromManifest: readonly string[],
 ): string[] {
   if (vaults.length === 0) return [];
   if (defaultVault && vaults.includes(defaultVault)) {
@@ -165,7 +164,7 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
     return { status: "failed", reason: msg };
   }
 
-  const paths = buildVaultServicePaths(globalConfig.default_vault, vaults, manifest.paths);
+  const paths = buildVaultServicePaths(globalConfig.default_vault, vaults);
   const port = globalConfig.port ?? DEFAULT_PORT;
 
   // Derive the health path from the primary path (paths[0]) rather than
