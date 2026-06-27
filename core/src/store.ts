@@ -631,36 +631,65 @@ export class BunSqliteStore implements Store {
     const priorRecord =
       patch.fields !== undefined ? tagSchemaOps.getTagRecord(this.db, tag) : null;
 
-    const result = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
+    const indexedSet = (fields: Record<string, tagSchemaOps.TagFieldSchema> | null | undefined) =>
+      new Set(
+        Object.entries(fields ?? {})
+          .filter(([, v]) => v.indexed === true)
+          .map(([k]) => k),
+      );
+    const nextFields = patch.fields; // object | null | undefined
+    const priorIndexed = indexedSet(priorRecord?.fields);
+    const nextIndexed = indexedSet(nextFields);
 
+    // PRE-VALIDATE every newly-indexed field BEFORE any persistence. A bad
+    // field name (or unmappable type) must fail closed — the schema record
+    // must NOT be written when the backing index can't be created. Pre-checking
+    // here, before the transaction even opens, turns the failure into a clean
+    // caller error (IndexedFieldError → 400) and leaves the schema untouched.
+    // Without this, the prior code persisted the field declaration, THEN threw
+    // on declareField — a 500 plus a tag claiming an index the engine can't
+    // build (the "lying schema" loop). See vault#478.
     if (patch.fields !== undefined) {
-      const indexedSet = (fields: Record<string, tagSchemaOps.TagFieldSchema> | null | undefined) =>
-        new Set(
-          Object.entries(fields ?? {})
-            .filter(([, v]) => v.indexed === true)
-            .map(([k]) => k),
-        );
-      const nextFields = patch.fields; // object | null
-      const priorIndexed = indexedSet(priorRecord?.fields);
-      const nextIndexed = indexedSet(nextFields);
       for (const fieldName of nextIndexed) {
         const spec = nextFields![fieldName]!;
         const mapped = indexedFieldOps.mapFieldType(spec.type);
-        // Unmappable type for indexing is a caller error; surface it rather
-        // than silently skipping. MCP/REST validate up-front for a cleaner
-        // message, but this is the backstop at the chokepoint.
         if (!mapped) {
           throw new indexedFieldOps.IndexedFieldError(
             `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
           );
         }
-        indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
+        // Throws IndexedFieldError on an invalid identifier (e.g. kebab-case).
+        indexedFieldOps.validateFieldName(fieldName);
       }
-      for (const fieldName of priorIndexed) {
-        if (!nextIndexed.has(fieldName)) {
-          indexedFieldOps.releaseField(this.db, fieldName, tag);
+    }
+
+    // Persist the record + reconcile the indexed-field lifecycle atomically.
+    // If declareField throws inside the transaction (e.g. a cross-tag type
+    // mismatch only detectable once the existing declarer set is consulted),
+    // the whole write rolls back — the schema never ends up claiming an index
+    // that doesn't exist. vault#478 transactional fix.
+    let result: tagSchemaOps.TagRecord;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      result = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
+
+      if (patch.fields !== undefined) {
+        for (const fieldName of nextIndexed) {
+          const spec = nextFields![fieldName]!;
+          // Type already validated above; non-null assertion is safe here.
+          const mapped = indexedFieldOps.mapFieldType(spec.type)!;
+          indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
+        }
+        for (const fieldName of priorIndexed) {
+          if (!nextIndexed.has(fieldName)) {
+            indexedFieldOps.releaseField(this.db, fieldName, tag);
+          }
         }
       }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
     }
 
     if (patch.parent_names !== undefined) {

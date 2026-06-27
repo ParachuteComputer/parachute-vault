@@ -26,6 +26,7 @@ import type { ValidationWarning } from "../core/src/schema-defaults.ts";
 import { logStrictBypass } from "./scopes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
+import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 import {
   buildExpandVisibility,
   filterHydratedLinksByTagScope,
@@ -2093,12 +2094,27 @@ export async function handleTags(
       fieldsPatch = Object.keys(merged).length > 0 ? merged : null;
     }
 
-    const result = await store.upsertTagRecord(tagName, {
-      ...(body.description !== undefined ? { description: body.description } : {}),
-      ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
-      ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
-      ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
-    });
+    // A bad indexed-field name (or an unindexable type, or a cross-tag type
+    // mismatch) is a CLIENT error — return 400, not the catch-all 500. The
+    // store pre-validates and is transactional, so the schema is left
+    // unchanged on failure (no orphan/lying index). vault#478.
+    let result;
+    try {
+      result = await store.upsertTagRecord(tagName, {
+        ...(body.description !== undefined ? { description: body.description } : {}),
+        ...(fieldsPatch !== undefined ? { fields: fieldsPatch } : {}),
+        ...(relationshipsPatch !== undefined ? { relationships: relationshipsPatch } : {}),
+        ...(parentNamesPatch !== undefined ? { parent_names: parentNamesPatch } : {}),
+      });
+    } catch (err) {
+      if (err instanceof IndexedFieldError) {
+        return json(
+          { error: err.message, error_type: "invalid_indexed_field" },
+          400,
+        );
+      }
+      throw err;
+    }
     return json(result);
   }
 

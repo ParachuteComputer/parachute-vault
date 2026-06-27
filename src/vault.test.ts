@@ -4789,6 +4789,28 @@ describe("HTTP /tags", async () => {
       .filter((n) => n.startsWith("meta_"));
   }
 
+  test("PUT /tags/:name with a bad indexed-field name returns 400 + leaves schema unchanged (vault#478)", async () => {
+    // kebab-case indexed field violates [A-Za-z0-9_]. Pre-fix this persisted
+    // the declaration then 500'd on index creation, leaving a tag claiming an
+    // index the engine couldn't build (the "lying schema" loop).
+    const res = await handleTags(
+      mkReq("PUT", "/tags/meeting", { fields: { "meeting-type": { type: "string", indexed: true } } }),
+      store,
+      "/meeting",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_indexed_field");
+    expect(body.error).toMatch(/invalid field name/);
+
+    // Schema is untouched — no poisoned field declared.
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.["meeting-type"]).toBeUndefined();
+    // No orphan/lying index: neither the generated column nor an indexed_fields row.
+    expect(notesMetaCols()).not.toContain("meta_meeting-type");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("meeting-type");
+  });
+
   test("PUT /tags/:name {fields:null} drops the orphaned generated column", async () => {
     // Declare an indexed field via REST PUT — column materializes.
     await handleTags(
