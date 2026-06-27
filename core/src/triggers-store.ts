@@ -27,6 +27,12 @@ export interface StoredTriggerWhen {
   has_content?: boolean;
   missing_metadata?: string[];
   has_metadata?: string[];
+  /**
+   * Value-matched metadata predicate (vault#299 Part B). field →
+   * operator-object, evaluated with the shared query-operators engine. See
+   * src/config.ts:TriggerWhen.metadata.
+   */
+  metadata?: Record<string, Record<string, unknown>>;
 }
 
 /** Webhook auth — only the bearer-JWT path for now. */

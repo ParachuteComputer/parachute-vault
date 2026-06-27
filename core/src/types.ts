@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
 import type { TagExpandMode } from "./tag-hierarchy.js";
+import type { ValidationStatus } from "./schema-defaults.js";
 
 // ---- Re-exports ----
 
@@ -420,17 +421,7 @@ export interface Store {
   // `_default` is the implicit universal parent. Returns null when no
   // ancestor declares any fields. The underlying resolver is in-memory after
   // the first lazy load.
-  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): {
-    schemas: string[];
-    warnings: {
-      field: string;
-      schema: string;
-      reason: "type_mismatch" | "enum_mismatch" | "schema_conflict";
-      message: string;
-      /** Set only on `schema_conflict` — the tag whose declaration was overridden. */
-      loser_schema?: string;
-    }[];
-  } | null;
+  validateNoteAgainstSchemas(note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> }): ValidationStatus | null;
 
   // Attachments
   addAttachment(noteId: string, path: string, mimeType: string, metadata?: Record<string, unknown>): Promise<Attachment>;

@@ -28,6 +28,19 @@ export const SCOPE_READ = "vault:read" as const;
 export const SCOPE_WRITE = "vault:write" as const;
 export const SCOPE_ADMIN = "vault:admin" as const;
 
+/**
+ * Migration-bypass scope (vault#299). A SEPARATE capability axis — NOT part
+ * of the read ⊇ write ⊇ admin inheritance chain. A token holding
+ * `vault:migrate` (broad) or `vault:<name>:migrate` (narrowed) may skip
+ * `strict:true` schema enforcement so existing non-conforming notes can be
+ * migrated/backfilled. It is deliberately orthogonal: an `admin` token does
+ * NOT auto-bypass strict validation — bypass must be an explicit, audited
+ * grant. A bypass write still needs `write` to actually mutate (migrate is an
+ * ADD-ON flag, not a write grant on its own). Every bypassed write is logged
+ * (see the write path) since #300 (the audit-log table) is deferred.
+ */
+export const SCOPE_MIGRATE = "vault:migrate" as const;
+
 /** All first-class vault scopes in inheritance order (lowest → highest). */
 export const VAULT_SCOPES = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN] as const;
 export type VaultScope = (typeof VAULT_SCOPES)[number];
@@ -135,6 +148,56 @@ export function hasScopeForVault(
     if (VERB_RANK[d.verb] >= reqRank) return true;
   }
   return false;
+}
+
+/**
+ * Migration-bypass check (vault#299): does `granted` hold the `migrate`
+ * capability for `vaultName`? Accepts broad `vault:migrate` (any vault) or
+ * narrowed `vault:<name>:migrate` (this vault only). Orthogonal to the
+ * read/write/admin verbs — a plain admin token returns `false` here, by
+ * design. The migrate scope does NOT live in `decomposeVaultScope` (it isn't a
+ * read/write/admin verb), so it's matched by exact shape here.
+ */
+export function hasMigrateScopeForVault(granted: string[], vaultName: string): boolean {
+  for (const s of granted) {
+    if (s === SCOPE_MIGRATE) return true; // broad — any vault
+    if (s === `vault:${vaultName}:migrate`) return true; // narrowed — this vault
+  }
+  return false;
+}
+
+/**
+ * Structured log line for a migration-bypassed write (vault#299 settled lead
+ * #2). Records WHO bypassed (actor/via from MW1 attribution), WHAT note, and
+ * WHICH strict violations were waived — enough to reconstruct the bypass for
+ * later audit without the #300 audit-log table (deferred). One JSON line so
+ * it's grep/jq-able in the daemon log. Lives here (next to the migrate-scope
+ * check) so both write transports — REST (routes.ts) and MCP (mcp-tools.ts) —
+ * emit the identical line without importing each other.
+ */
+export function logStrictBypass(info: {
+  actor: string | null;
+  via: string | null;
+  path?: string | null;
+  tags?: string[];
+  violations: { field: string; reason: string; schema: string }[];
+}): void {
+  console.warn(
+    "[schema-bypass] " +
+      JSON.stringify({
+        event: "strict_schema_bypass",
+        actor: info.actor,
+        via: info.via,
+        path: info.path ?? null,
+        tags: info.tags ?? [],
+        violations: info.violations.map((v) => ({
+          field: v.field,
+          reason: v.reason,
+          schema: v.schema,
+        })),
+        at: new Date().toISOString(),
+      }),
+  );
 }
 
 /**

@@ -151,6 +151,11 @@ async function handleMcp(
         note_path?: string | null;
         current_updated_at?: string | null;
         expected_updated_at?: string;
+        field?: string;
+        expected_from?: unknown;
+        to?: unknown;
+        current?: unknown;
+        violations?: unknown;
       };
       if (e?.code === "CONFLICT") {
         throw new McpError(ErrorCode.InvalidRequest, message, {
@@ -159,6 +164,28 @@ async function handleMcp(
           your_updated_at: e.expected_updated_at,
           path: e.note_path ?? null,
           note_id: e.note_id,
+        });
+      }
+      // State-transition compare-and-set conflict (vault#299 Part B) — a
+      // DISTINCT vocabulary from `conflict` (settled lead #3): the value
+      // didn't match, not the updated_at token.
+      if (e?.code === "TRANSITION_CONFLICT") {
+        throw new McpError(ErrorCode.InvalidRequest, message, {
+          error_type: "transition_conflict",
+          note_id: e.note_id,
+          path: e.note_path ?? null,
+          field: e.field,
+          expected_from: e.expected_from,
+          to: e.to,
+          current: e.current ?? null,
+        });
+      }
+      // Strict-schema rejection (vault#299 Part A) — one error carrying ALL
+      // per-field violations (settled lead #1).
+      if (e?.code === "SCHEMA_VALIDATION") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: "schema_validation",
+          violations: e.violations ?? [],
         });
       }
       if (e?.code === "PRECONDITION_REQUIRED") {

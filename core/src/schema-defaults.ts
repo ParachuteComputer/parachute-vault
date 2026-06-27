@@ -60,6 +60,33 @@ export interface SchemaField {
   type?: "string" | "number" | "integer" | "boolean" | "array" | "object";
   enum?: string[];
   description?: string;
+  /**
+   * Strict enforcement opt-in (vault#299, Part A). Default `false` — when
+   * unset/false, ALL constraints on this field are advisory: violations
+   * surface as `validation_status` warnings and the write succeeds (the
+   * historical byte-identical behavior). When `true`, ALL declared
+   * constraints on this field (type + enum + required + cardinality) flip
+   * to hard write rejections, all-or-nothing per field (the Gitcoin team's
+   * call — "enum + required together, not enum alone"). Free-form fields
+   * (`notes`/`description`) on an otherwise-strict tag stay advisory by
+   * simply leaving `strict` off — strictness is per-field, not per-tag.
+   */
+  strict?: boolean;
+  /**
+   * Whether the field MUST be present (and non-null) on a note carrying this
+   * tag. Advisory under `strict:false` (a `required` violation surfaces as a
+   * `missing_required` warning); a hard rejection only when `strict:true`.
+   */
+  required?: boolean;
+  /**
+   * Cardinality constraint for the field's value. `"one"` (the implicit
+   * default) means a single scalar — an array value is a `cardinality`
+   * violation. `"many"` means the value must be an array. Advisory under
+   * `strict:false`; a hard rejection when `strict:true`. Distinct from the
+   * relationship cardinality vocabulary (that governs typed links, not
+   * metadata fields).
+   */
+  cardinality?: "one" | "many";
 }
 
 /**
@@ -83,19 +110,35 @@ export interface ValidationWarning {
   /**
    * `type_mismatch` — value's type contradicts the declared `type`.
    * `enum_mismatch` — string value not in the declared `enum`.
+   * `missing_required` — a `required` field is absent or null (vault#299).
+   * `cardinality_mismatch` — value's shape (scalar vs array) contradicts the
+   *   declared `cardinality` (vault#299).
    * `schema_conflict` — two ancestors declared the same field with
    * different specs; first-in-walk wins, the loser surfaces here so the
    * operator can resolve the disagreement.
    */
-  reason: "type_mismatch" | "enum_mismatch" | "schema_conflict";
+  reason:
+    | "type_mismatch"
+    | "enum_mismatch"
+    | "missing_required"
+    | "cardinality_mismatch"
+    | "schema_conflict";
   message: string;
   /**
    * `schema_conflict` only — the tag whose declaration was overridden. Set
-   * when `reason === "schema_conflict"`; absent on type/enum mismatches.
+   * when `reason === "schema_conflict"`; absent on other reasons.
    * Surfaces structurally so agents don't have to regex `message` to find
    * the loser.
    */
   loser_schema?: string;
+  /**
+   * `true` when this violation comes from a `strict:true` field (vault#299).
+   * A strict violation is an ENFORCEMENT error — the write path rejects it.
+   * Absent/false for advisory warnings (the historical guidance behavior).
+   * Surfaced structurally so the write path can split "block" from "warn"
+   * without re-deriving the field's strict flag.
+   */
+  strict?: boolean;
 }
 
 export interface ValidationStatus {
@@ -126,6 +169,9 @@ function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
     if (typeof f.type === "string") field.type = f.type as SchemaField["type"];
     if (Array.isArray(f.enum)) field.enum = f.enum.filter((x): x is string => typeof x === "string");
     if (typeof f.description === "string") field.description = f.description;
+    if (f.strict === true) field.strict = true;
+    if (f.required === true) field.required = true;
+    if (f.cardinality === "one" || f.cardinality === "many") field.cardinality = f.cardinality;
     fields[k] = field;
   }
   return fields;
@@ -301,15 +347,23 @@ function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
  * Validate a note's metadata against the merged schema. Returns null when no
  * ancestor declares any fields (so the caller can omit `validation_status`
  * entirely). Otherwise returns the status with conflict warnings prepended,
- * followed by per-field type/enum mismatches.
+ * followed by per-field violations.
  *
  * Rules per merged field:
+ * - `required` declared and value absent/null → `missing_required`
  * - Present and `type` declared and value's type doesn't match → `type_mismatch`
  * - Present and `enum` declared and value not in enum → `enum_mismatch`
+ * - Present and `cardinality` declared and shape (scalar vs array) wrong
+ *   → `cardinality_mismatch`
  *
- * Fields not declared by any ancestor's schema are ignored entirely (this
- * isn't a "strict" validator — it's a guide). There is no `required` concept
- * (post-v17); declarations are advisory only.
+ * Every violation carries `strict: true` iff its field declared `strict:true`
+ * (vault#299). The list itself is the SAME whether or not a field is strict —
+ * the difference is only the per-warning `strict` flag, which the write path
+ * uses to decide block-vs-warn. Under `strict:false` this is byte-identical to
+ * the historical advisory behavior PLUS the new `required`/`cardinality`
+ * advisory reasons (which fire for any field declaring those, strict or not).
+ *
+ * Fields not declared by any ancestor's schema are ignored entirely.
  */
 export function validateNote(
   resolved: ResolvedSchemas,
@@ -322,9 +376,25 @@ export function validateNote(
   const warnings: ValidationWarning[] = [...resolution.conflicts];
 
   for (const [fieldName, { spec, sourceTag }] of resolution.mergedFields) {
-    if (!(fieldName in m)) continue;
-    const value = m[fieldName];
-    if (value === undefined || value === null) continue;
+    const strictFlag = spec.strict === true ? { strict: true } : {};
+    const present = fieldName in m;
+    const value = present ? m[fieldName] : undefined;
+    const absent = !present || value === undefined || value === null;
+
+    if (spec.required === true && absent) {
+      warnings.push({
+        field: fieldName,
+        schema: sourceTag,
+        reason: "missing_required",
+        message: `'${fieldName}' is required (tag '${sourceTag}')`,
+        ...strictFlag,
+      });
+      // A required field that's absent has no value to type/enum/cardinality
+      // check — the missing_required violation stands alone.
+      continue;
+    }
+
+    if (absent) continue;
 
     if (spec.type && !valueMatchesType(value, spec.type)) {
       warnings.push({
@@ -332,6 +402,7 @@ export function validateNote(
         schema: sourceTag,
         reason: "type_mismatch",
         message: `'${fieldName}' should be ${spec.type} (tag '${sourceTag}')`,
+        ...strictFlag,
       });
     }
 
@@ -341,9 +412,91 @@ export function validateNote(
         schema: sourceTag,
         reason: "enum_mismatch",
         message: `'${fieldName}' must be one of [${spec.enum.join(", ")}] (tag '${sourceTag}')`,
+        ...strictFlag,
       });
+    }
+
+    if (spec.cardinality) {
+      const isArray = Array.isArray(value);
+      const wantMany = spec.cardinality === "many";
+      if (wantMany !== isArray) {
+        warnings.push({
+          field: fieldName,
+          schema: sourceTag,
+          reason: "cardinality_mismatch",
+          message: wantMany
+            ? `'${fieldName}' must be an array (cardinality 'many', tag '${sourceTag}')`
+            : `'${fieldName}' must be a single value, not an array (cardinality 'one', tag '${sourceTag}')`,
+          ...strictFlag,
+        });
+      }
     }
   }
 
   return { schemas: resolution.effectiveTags, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// Strict enforcement (vault#299)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by the write path when a note violates one or more `strict:true`
+ * field constraints. Carries ALL per-field violations in a single error (the
+ * settled design lead — one `SchemaValidationError`, not per-axis errors), so
+ * an agent sees the whole contract it broke in one response and can fix every
+ * field before retrying.
+ *
+ * Each entry is a `ValidationWarning` with `strict: true`. `code` is stable
+ * (`SCHEMA_VALIDATION`) for transport mapping (MCP error / HTTP 422).
+ */
+export class SchemaValidationError extends Error {
+  code = "SCHEMA_VALIDATION" as const;
+  violations: ValidationWarning[];
+
+  constructor(violations: ValidationWarning[]) {
+    const summary = violations
+      .map((v) => `${v.field}: ${v.reason}`)
+      .join("; ");
+    super(`schema_validation: ${violations.length} strict field violation(s) — ${summary}`);
+    this.name = "SchemaValidationError";
+    this.violations = violations;
+  }
+}
+
+/**
+ * Extract the enforcement-level (strict) subset of a validation status —
+ * the violations the write path must reject. Conflict warnings are advisory
+ * by nature (they describe operator schema disagreements, not note data) and
+ * are never enforced even when a field is strict. Returns `[]` when nothing
+ * strict was violated (the common case — the caller then proceeds with the
+ * write).
+ */
+export function strictViolations(status: ValidationStatus | null): ValidationWarning[] {
+  if (!status) return [];
+  return status.warnings.filter((w) => w.strict === true && w.reason !== "schema_conflict");
+}
+
+/**
+ * Validate-and-enforce: run `validateNote`, and if any `strict:true` field is
+ * violated, throw a single `SchemaValidationError` carrying every violation.
+ * Returns the full advisory `ValidationStatus` (or null) on success so the
+ * caller can still surface advisory warnings on the response. `bypass: true`
+ * skips the throw entirely (migration-bypass scope) — the caller is
+ * responsible for logging the bypass.
+ *
+ * The write path calls this BEFORE persisting so a rejection leaves the note
+ * untouched.
+ */
+export function enforceStrictSchema(
+  resolved: ResolvedSchemas,
+  note: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  opts?: { bypass?: boolean },
+): { status: ValidationStatus | null; violations: ValidationWarning[] } {
+  const status = validateNote(resolved, note);
+  const violations = strictViolations(status);
+  if (violations.length > 0 && opts?.bypass !== true) {
+    throw new SchemaValidationError(violations);
+  }
+  return { status, violations };
 }

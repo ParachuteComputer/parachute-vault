@@ -9,16 +9,40 @@ import {
   SCOPE_READ,
   SCOPE_WRITE,
   SCOPE_ADMIN,
+  SCOPE_MIGRATE,
   parseScopes,
   parseScopeFlags,
   hasScope,
   hasScopeForVault,
+  hasMigrateScopeForVault,
   findBroadVaultScopes,
   scopeForMethod,
   verbForMethod,
   legacyPermissionToScopes,
   serializeScopes,
 } from "./scopes.ts";
+
+describe("hasMigrateScopeForVault — migration-bypass capability (vault#299)", () => {
+  test("broad vault:migrate satisfies any vault", () => {
+    expect(hasMigrateScopeForVault([SCOPE_MIGRATE], "default")).toBe(true);
+    expect(hasMigrateScopeForVault([SCOPE_MIGRATE], "anything")).toBe(true);
+  });
+
+  test("narrowed vault:<name>:migrate satisfies only that vault", () => {
+    expect(hasMigrateScopeForVault(["vault:gitcoin:migrate"], "gitcoin")).toBe(true);
+    expect(hasMigrateScopeForVault(["vault:gitcoin:migrate"], "default")).toBe(false);
+  });
+
+  test("admin does NOT imply migrate — orthogonal axis", () => {
+    expect(hasMigrateScopeForVault([SCOPE_ADMIN], "default")).toBe(false);
+    expect(hasMigrateScopeForVault(["vault:default:admin"], "default")).toBe(false);
+  });
+
+  test("no migrate scope → false", () => {
+    expect(hasMigrateScopeForVault([SCOPE_WRITE, SCOPE_READ], "default")).toBe(false);
+    expect(hasMigrateScopeForVault([], "default")).toBe(false);
+  });
+});
 
 describe("parseScopes", () => {
   test("returns [] for null or empty input", () => {

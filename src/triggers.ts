@@ -30,6 +30,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
 import crypto from "node:crypto";
 import type { Note, Store, Attachment } from "../core/src/types.ts";
 import type { HookRegistry, HookEvent, NoteHookPayload } from "../core/src/hooks.ts";
+import { matchesOperator } from "../core/src/query-operators.ts";
 import type { TriggerConfig, TriggerWhen } from "./config.ts";
 import type { StoredTrigger } from "../core/src/triggers-store.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
@@ -103,6 +104,22 @@ export function buildPredicate(when: TriggerWhen, triggerName: string): (note: N
     if (when.has_metadata?.length) {
       for (const key of when.has_metadata) {
         if (meta?.[key] == null) return false;
+      }
+    }
+
+    // Value-matched metadata filter (vault#299 Part B). Each field's
+    // operator-object is evaluated against the note's live metadata with the
+    // SAME engine query-notes uses. ALL fields must match (AND). A malformed
+    // operator throws at registration-time validation, not here — by the time
+    // the predicate runs the shape is known-good, but we guard defensively so
+    // a bad config can never crash the hook dispatch loop (treat as no-match).
+    if (when.metadata) {
+      for (const [field, opObj] of Object.entries(when.metadata)) {
+        try {
+          if (!matchesOperator(field, meta?.[field], opObj)) return false;
+        } catch {
+          return false;
+        }
       }
     }
 
