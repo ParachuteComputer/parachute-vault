@@ -1831,6 +1831,43 @@ export function filterMetadata(obj: any, includeMetadata: boolean | string[] | u
   return { ...obj, metadata: Object.keys(filtered).length > 0 ? filtered : undefined };
 }
 
+/**
+ * Shallow-merge an incoming metadata patch onto a note's existing metadata,
+ * with RFC 7386 (JSON Merge Patch) null-as-delete semantics — the canonical
+ * merge for every metadata write surface (REST `PATCH /api/notes`, MCP
+ * `update-note`, batch).
+ *
+ * An incoming value of `null` is a DELETE tombstone: the key is removed from
+ * the result rather than persisted as a literal JSON `null`. This is the only
+ * way to remove a metadata key through the API — under a plain
+ * `{ ...existing, ...incoming }` merge, omission can't delete (it preserves the
+ * prior value) and `null` used to persist literally, leaving no removal path.
+ * Now key renames are pure-API: `{ new_key: "v", "old-key": null }` adds the
+ * new key and drops the old one in one PATCH. See vault#478 / #479.
+ *
+ * Shallow by design — top-level keys only, matching the existing wholesale
+ * top-level merge. A nested object value replaces its key wholesale (we do not
+ * recurse), so an incoming `null` removes the whole key regardless of depth.
+ * Compat: storing a literal null is no longer possible via this path; the
+ * boulder migration confirmed zero callers relied on that (vault#478). A caller
+ * that genuinely needs an absent-vs-null distinction should model it with a
+ * sentinel string, not a JSON null.
+ */
+export function mergeMetadata(
+  existing: Record<string, unknown> | null | undefined,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...(existing ?? {}) };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === null) {
+      delete result[key];
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 // ---- Vault stats (aggregate situational awareness) ----
 
 /**

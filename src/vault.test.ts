@@ -4012,6 +4012,36 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.metadata).toEqual({ a: 1, b: 2 });
   });
 
+  test("PATCH metadata null DELETES the key (RFC 7386), not a literal null (vault#478/#479)", async () => {
+    await store.createNote("doc", { id: "x", metadata: { keep: "yes", drop: "old", n: 3 } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { metadata: { drop: null }, force: true }),
+      store,
+      "/x",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    // Key removed entirely — must NOT survive as a literal JSON null.
+    expect(body.metadata).not.toHaveProperty("drop");
+    expect(body.metadata).toEqual({ keep: "yes", n: 3 });
+    // Persisted state matches the response (round-trips).
+    const fresh = await store.getNote("x");
+    expect(fresh!.metadata).not.toHaveProperty("drop");
+    expect(fresh!.metadata).toEqual({ keep: "yes", n: 3 });
+  });
+
+  test("PATCH metadata key-rename in one call: set new, null-delete old (vault#478)", async () => {
+    await store.createNote("doc", { id: "x", metadata: { "old-key": "v", stable: true } });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/x", { metadata: { new_key: "v", "old-key": null }, force: true }),
+      store,
+      "/x",
+    );
+    const body = await res.json() as any;
+    expect(body.metadata).not.toHaveProperty("old-key");
+    expect(body.metadata).toEqual({ new_key: "v", stable: true });
+  });
+
   test("PATCH adds/removes tags", async () => {
     await store.createNote("x", { id: "x", tags: ["old"] });
     const res = await handleNotes(
@@ -4788,6 +4818,28 @@ describe("HTTP /tags", async () => {
       .map((r) => r.name)
       .filter((n) => n.startsWith("meta_"));
   }
+
+  test("PUT /tags/:name with a bad indexed-field name returns 400 + leaves schema unchanged (vault#478)", async () => {
+    // kebab-case indexed field violates [A-Za-z0-9_]. Pre-fix this persisted
+    // the declaration then 500'd on index creation, leaving a tag claiming an
+    // index the engine couldn't build (the "lying schema" loop).
+    const res = await handleTags(
+      mkReq("PUT", "/tags/meeting", { fields: { "meeting-type": { type: "string", indexed: true } } }),
+      store,
+      "/meeting",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_indexed_field");
+    expect(body.error).toMatch(/invalid field name/);
+
+    // Schema is untouched — no poisoned field declared.
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.["meeting-type"]).toBeUndefined();
+    // No orphan/lying index: neither the generated column nor an indexed_fields row.
+    expect(notesMetaCols()).not.toContain("meta_meeting-type");
+    expect(buildVaultProjection(db).indexed_fields.map((f) => f.name)).not.toContain("meeting-type");
+  });
 
   test("PUT /tags/:name {fields:null} drops the orphaned generated column", async () => {
     // Declare an indexed field via REST PUT — column materializes.

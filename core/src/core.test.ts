@@ -5,6 +5,7 @@ import { generateMcpTools } from "./mcp.js";
 import { initSchema } from "./schema.js";
 import { decodeCursor } from "./cursor.js";
 import { traverseLinks } from "./links.js";
+import * as indexedFieldOps from "./indexed-fields.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -2167,6 +2168,50 @@ describe("MCP tools", async () => {
     }) as any;
     expect(result.created).toBe(true);
     expect(result.extension).toBe("csv");
+  });
+
+  // ---- Metadata key-deletion via null tombstone (vault#478 / #479) ---------
+
+  it("update-note deletes a metadata key when its value is null (RFC 7386)", async () => {
+    const note = await store.createNote("m", {
+      metadata: { keep: "yes", drop: "old", other: 1 },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, metadata: { drop: null }, force: true });
+
+    const fresh = await store.getNote(note.id);
+    // The deleted key is GONE — not a literal JSON null.
+    expect(fresh!.metadata).not.toHaveProperty("drop");
+    // Other keys are untouched.
+    expect(fresh!.metadata).toMatchObject({ keep: "yes", other: 1 });
+  });
+
+  it("update-note metadata key-rename in one call (new key set, old key deleted)", async () => {
+    const note = await store.createNote("m", {
+      metadata: { "old-key": "v", stable: true },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({
+      id: note.id,
+      metadata: { new_key: "v", "old-key": null },
+      force: true,
+    });
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.metadata).not.toHaveProperty("old-key");
+    expect(fresh!.metadata).toMatchObject({ new_key: "v", stable: true });
+  });
+
+  it("deleting an absent metadata key is a no-op (round-trips cleanly)", async () => {
+    const note = await store.createNote("m", { metadata: { a: 1 } });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await updateNote.execute({ id: note.id, metadata: { ghost: null }, force: true });
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.metadata).toEqual({ a: 1 });
+    expect(fresh!.metadata).not.toHaveProperty("ghost");
   });
 
   it("query-notes filters by extension (vault#328)", async () => {
@@ -5300,6 +5345,87 @@ describe("tag record API (patterns/tag-data-model.md)", async () => {
     await store.deleteTag("voice");
     expect((await store.queryNotes({ tags: ["manual"] })).length).toBe(0);
     expect(await store.getTagRecord("voice")).toBeNull();
+  });
+
+  // ---- Indexed-field atomicity (vault#478) ----------------------------------
+
+  it("upsertTagRecord with a bad indexed-field name throws IndexedFieldError and leaves the schema unchanged", async () => {
+    // kebab-case field name violates [A-Za-z0-9_] / no-leading-digit. The
+    // declaration must NOT persist, and no orphan/lying index may be created.
+    await expect(
+      store.upsertTagRecord("meeting", {
+        description: "meetings",
+        fields: { "meeting-type": { type: "string", indexed: true } },
+      }),
+    ).rejects.toThrow(indexedFieldOps.IndexedFieldError);
+
+    // Schema is untouched — the tag row may not even exist, and definitely
+    // doesn't claim the poisoned field.
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.["meeting-type"]).toBeUndefined();
+
+    // No backing index row was created for the bad field.
+    expect(indexedFieldOps.getIndexedField(db, "meeting-type")).toBeNull();
+    // And the generated column doesn't exist either.
+    const cols = (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(cols).not.toContain("meta_meeting-type");
+  });
+
+  it("upsertTagRecord with an unindexable type throws and leaves the schema unchanged", async () => {
+    await expect(
+      store.upsertTagRecord("meeting", {
+        fields: { attendees: { type: "json", indexed: true } },
+      }),
+    ).rejects.toThrow(indexedFieldOps.IndexedFieldError);
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.attendees).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "attendees")).toBeNull();
+  });
+
+  it("a bad indexed field does NOT corrupt a prior valid declaration on the same tag", async () => {
+    // First, a clean valid indexed field.
+    await store.upsertTagRecord("meeting", {
+      fields: { held_on: { type: "string", indexed: true } },
+    });
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+
+    // Now an update that adds a poisoned field. The whole write must roll
+    // back — the prior valid field survives untouched.
+    await expect(
+      store.upsertTagRecord("meeting", {
+        fields: {
+          held_on: { type: "string", indexed: true },
+          "bad-field": { type: "string", indexed: true },
+        },
+      }),
+    ).rejects.toThrow(indexedFieldOps.IndexedFieldError);
+
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields?.held_on?.indexed).toBe(true);
+    expect(record?.fields?.["bad-field"]).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+    expect(indexedFieldOps.getIndexedField(db, "bad-field")).toBeNull();
+  });
+
+  it("upsertTagRecord with fields:null releases indexed fields (transaction commits the release path)", async () => {
+    // Declare an indexed field, then clear all fields — the release path runs
+    // inside the same transaction as the persist. It must commit cleanly:
+    // the row, generated column, and index all drop.
+    await store.upsertTagRecord("meeting", {
+      fields: { held_on: { type: "string", indexed: true } },
+    });
+    expect(indexedFieldOps.getIndexedField(db, "held_on")?.declarerTags).toContain("meeting");
+
+    await store.upsertTagRecord("meeting", { fields: null });
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields).toBeUndefined();
+    expect(indexedFieldOps.getIndexedField(db, "held_on")).toBeNull();
+    const cols = (db.prepare("PRAGMA table_xinfo(notes)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    expect(cols).not.toContain("meta_held_on");
   });
 });
 

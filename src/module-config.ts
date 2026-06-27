@@ -14,31 +14,26 @@
  *
  * PUT /.parachute/config is Phase 3 — not implemented here.
  *
+ * Scope boundary (vault#478): `GET /.parachute/config` is gated by
+ * `vault:<name>:admin` — admin over *your* vault only — so it describes and
+ * returns ONLY per-vault config, never daemon-GLOBAL settings.
+ *
  * Fields currently described:
  *   - audio_retention:      per-vault enum, backed by VaultConfig.audio_retention.
- *   - port:                 GlobalConfig.port, exposed read-only.
- *   - autoTranscribe.*:     vault↔scribe handoff (vault#353, design 2026-05-21
- *                           Part 2). Three nested fields per design Q4:
- *       - enabled:          boolean toggle, default true when scribe is
- *                           reachable (persisted in
- *                           GlobalConfig.auto_transcribe.enabled). Default
- *                           flipped from off → on so installing scribe is
- *                           the only opt-in signal needed.
- *       - scribeUrl:        readOnly — resolved per-process from
- *                           `~/.parachute/services.json` via
- *                           `scribe-discovery.ts`. Operators can't point at an
- *                           arbitrary scribe; the discovery layer is the gate.
- *       - scribeBearer:     writeOnly — sourced from SCRIBE_AUTH_TOKEN env var.
- *                           Hub install generates one at first boot
- *                           (see scribe-env.ts:ensureScribeBearer); manual
- *                           rotation is via `parachute-vault config set`.
- *   - scribe_url / scribe_token (deprecated): kept under their legacy names
- *                           through one release for the hub admin SPA's prior
- *                           render path; new code should read autoTranscribe.*.
+ *   - autoTranscribe.enabled: per-vault toggle (vault#353). Reports the value
+ *                           THIS vault will use, resolving per-vault override
+ *                           (VaultConfig.auto_transcribe.enabled) → server
+ *                           default (GlobalConfig.auto_transcribe.enabled) →
+ *                           true. The inherited fallback is the per-vault
+ *                           truth, not a leak of the global setting.
+ *
+ * Deliberately NOT exposed here (daemon-global → operator-only surface):
+ *   - port:                 GlobalConfig.port (deployment-wide listen port).
+ *   - autoTranscribe.scribeUrl / scribe_url: discovery-resolved per-process.
+ *   - autoTranscribe.scribeBearer / scribe_token: shared SCRIBE_AUTH_TOKEN.
  */
 
 import type { VaultConfig, GlobalConfig } from "./config.ts";
-import { resolveScribeUrl } from "./scribe-discovery.ts";
 
 export interface ModuleConfigSchema {
   $schema: string;
@@ -75,83 +70,54 @@ export function buildConfigSchema(): ModuleConfigSchema {
             default: true,
             title: "Enable auto-transcription",
             description:
-              "Master toggle. Default on — audio uploads transcribe automatically when scribe is reachable. Set to false to disable. Global — persisted in `GlobalConfig.auto_transcribe.enabled` and applies to every vault on this server. Per-vault control is a future enhancement when multi-vault deployments need it.",
-          },
-          scribeUrl: {
-            type: "string",
-            format: "uri",
-            readOnly: true,
-            title: "Scribe URL",
-            description:
-              "URL of the scribe service. Auto-populated from `~/.parachute/services.json` at vault startup (or from the SCRIBE_URL env var when set). Read-only — operators can't point at an arbitrary scribe.",
-          },
-          scribeBearer: {
-            type: "string",
-            writeOnly: true,
-            title: "Scribe auth bearer",
-            description:
-              "Shared bearer for the vault→scribe loopback contract. Hub install generates one at first boot. Write-only — never returned by GET.",
+              "Per-vault toggle. Default on — audio uploads transcribe automatically when scribe is reachable. Set to false to disable for THIS vault. Resolves per-vault override → server default → on, so leaving it unset inherits the deployment default.",
           },
         },
       },
-      // Legacy aliases kept for back-compat with callers that read the
-      // pre-vault#353 shape. New consumers should read `autoTranscribe.*`.
-      scribe_url: {
-        type: "string",
-        format: "uri",
-        title: "Scribe URL (deprecated alias)",
-        description:
-          "Legacy alias for `autoTranscribe.scribeUrl`. Will be removed in a future release.",
-        readOnly: true,
-        deprecated: true,
-      },
-      scribe_token: {
-        type: "string",
-        title: "Scribe auth token (deprecated alias)",
-        description:
-          "Legacy alias for `autoTranscribe.scribeBearer`. Will be removed in a future release.",
-        writeOnly: true,
-        deprecated: true,
-      },
-      port: {
-        type: "integer",
-        minimum: 1,
-        maximum: 65535,
-        title: "HTTP port",
-        description: "Port the vault server listens on. Set at init time; changing requires a restart.",
-        readOnly: true,
-      },
+      // NOTE (vault#478): daemon-GLOBAL fields (the listen `port`, the
+      // discovery-resolved scribe URL, the shared scribe bearer) are
+      // deliberately NOT described here. This endpoint is gated by
+      // `vault:<name>:admin` — admin over *your* vault only — so it neither
+      // describes nor returns deployment-wide settings. Those live behind the
+      // operator-only surface (CLI / global config).
     },
   };
 }
 
 /**
- * Effective config values, with `writeOnly` fields stripped. `scribeBearer`
- * (and its legacy alias `scribe_token`) are declared `writeOnly` and never
- * returned, even when set in the environment.
+ * Effective config values for ONE vault. The shared scribe bearer is
+ * daemon-global and never returned (see the scope boundary below).
+ *
+ * Scope boundary (vault#478): the `GET /vault/<name>/.parachute/config`
+ * endpoint is gated by `vault:<name>:admin` — "admin over *your* vault only".
+ * It must therefore return ONLY per-vault config, never daemon-GLOBAL settings
+ * (the listen `port`, the discovery-resolved scribe URL, the server-wide
+ * auto-transcribe default). Those describe the whole deployment, not this
+ * vault, and leaking them across the per-vault admin boundary matters once a
+ * shared multi-vault daemon hands admin-on-one-vault to a beta signup. They
+ * live behind the operator-only surface (the CLI / global config), not here.
+ *
+ * `autoTranscribe.enabled` IS per-vault: it reports the value THIS vault will
+ * actually use, resolving per-vault override → global default → true (mirrors
+ * `shouldAutoTranscribe`). That's a per-vault effective value, not the raw
+ * daemon-global toggle — reporting it doesn't leak the global setting (an
+ * unset vault simply inherits, which is the per-vault truth).
  */
 export function buildConfigValues(
   vaultConfig: VaultConfig,
   globalConfig: GlobalConfig,
-  env: { SCRIBE_URL?: string | undefined } = process.env as { SCRIBE_URL?: string },
 ): Record<string, unknown> {
-  // Resolve scribe URL through the discovery layer so the GET shape reflects
-  // what the worker will actually use (services.json > SCRIBE_URL > unset).
-  // Pass env through so the test harness's override is honored.
-  const scribeUrl = resolveScribeUrl(env as NodeJS.ProcessEnv) ?? "";
   return {
     audio_retention: vaultConfig.audio_retention ?? "keep",
     autoTranscribe: {
-      // Match shouldAutoTranscribe's `?? true` so the admin SPA displays
-      // the same value runtime uses. An unset config row shows `true`
-      // because that's what vault will actually do on the next audio upload.
-      enabled: globalConfig.auto_transcribe?.enabled ?? true,
-      scribeUrl,
+      // Per-vault effective value: this vault's own override wins; otherwise it
+      // inherits the server default; otherwise true. Same ladder as
+      // shouldAutoTranscribe, so the admin SPA shows what this vault will do.
+      enabled:
+        vaultConfig.auto_transcribe?.enabled
+        ?? globalConfig.auto_transcribe?.enabled
+        ?? true,
     },
-    // Legacy alias mirrors `autoTranscribe.scribeUrl` so hubs reading the
-    // pre-vault#353 shape don't regress.
-    scribe_url: scribeUrl,
-    port: globalConfig.port,
   };
 }
 
