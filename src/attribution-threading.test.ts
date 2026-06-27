@@ -249,6 +249,43 @@ describe("attribution threading — MCP refines via to 'mcp' and stamps the writ
     expect(after?.lastUpdatedVia).toBe("mcp"); // refined channel of the latest edit
   });
 
+  test("update-note with if_missing:'create' on a MISSING note attributes the created row", async () => {
+    // Regression: the upsert-create branch built createOpts without actor/via,
+    // so an MCP-driven upsert that CREATES a note wrote NULL attribution while
+    // create-note + REST upsert-create did it right. (vault#298 review.)
+    seedVaultNoKey("journal");
+    const store = getVaultStore("journal");
+
+    const tools = generateScopedMcpTools("journal", authFor("aaron", "journal"), null);
+    const update = tools.find((t) => t.name === "update-note")!;
+    const created = (await update.execute({
+      id: "Projects/Brand New",
+      content: "born via upsert",
+      if_missing: "create",
+    })) as { id: string; createdBy?: string | null; createdVia?: string | null };
+
+    // The note did not exist → this is a create; attribution must be set.
+    expect(created.createdBy).toBe("aaron");
+    expect(created.createdVia).toBe("mcp"); // refined channel, not NULL
+
+    // Confirm it persisted to the row, not just the echoed shape.
+    const row = store.db
+      .prepare(
+        "SELECT created_by, created_via, last_updated_by, last_updated_via FROM notes WHERE id = ?",
+      )
+      .get(created.id) as {
+      created_by: string | null;
+      created_via: string | null;
+      last_updated_by: string | null;
+      last_updated_via: string | null;
+    };
+    expect(row.created_by).toBe("aaron");
+    expect(row.created_via).toBe("mcp");
+    // First write IS the latest write — the last_updated_* pair mirrors it.
+    expect(row.last_updated_by).toBe("aaron");
+    expect(row.last_updated_via).toBe("mcp");
+  });
+
   test("the operator bearer keeps via='operator' even on the MCP channel", async () => {
     seedVaultNoKey("journal");
     const auth: AuthResult = {

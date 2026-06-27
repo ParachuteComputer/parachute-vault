@@ -943,6 +943,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 ...(item.metadata !== undefined ? { metadata: item.metadata as Record<string, unknown> } : {}),
                 ...(item.created_at !== undefined ? { created_at: item.created_at as string } : {}),
                 ...(createExt !== undefined ? { extension: createExt } : {}),
+                // Write-attribution (vault#298) — the if_missing:"create" upsert
+                // branch is still a CREATE, so it must stamp the same actor/via
+                // as the create-note tool + the REST upsert-create path. Without
+                // this an MCP-driven upsert-create wrote NULL attribution.
+                actor: writeActor,
+                via: writeVia,
               };
               const content = (item.content as string | undefined) ?? "";
               const created = await store.createNote(content, createOpts);
