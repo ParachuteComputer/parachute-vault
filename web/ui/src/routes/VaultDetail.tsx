@@ -38,6 +38,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
   const isPerVaultMount = vaultName !== undefined;
   const tokensHref = isPerVaultMount ? "/tokens" : `/vault/${encodeURIComponent(name ?? "")}/tokens`;
   const mirrorHref = isPerVaultMount ? "/mirror" : `/vault/${encodeURIComponent(name ?? "")}/mirror`;
+  const schemaHref = isPerVaultMount ? "/schema" : `/vault/${encodeURIComponent(name ?? "")}/schema`;
   const [state, setState] = useState<State>({ kind: "loading" });
   const [reloadTick, setReloadTick] = useState(0);
   const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
@@ -202,6 +203,10 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
           <li>
             <Link to={mirrorHref}>Git backup →</Link>
             <span className="dim"> mirror this vault to a git repository on a schedule, or on demand</span>
+          </li>
+          <li>
+            <Link to={schemaHref}>Schema →</Link>
+            <span className="dim"> edit tag schemas — fields, indexing, hierarchy, strict validation</span>
           </li>
           <PermissionsLink vaultName={vault.name} />
         </ul>

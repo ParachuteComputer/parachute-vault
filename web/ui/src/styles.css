@@ -612,3 +612,205 @@ select:focus {
   cursor: not-allowed;
 }
 
+
+/* ===========================================================================
+ * Schema editor (vault#283) — tag list + per-tag fields editor + previews.
+ * =========================================================================== */
+
+.schema-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) 1fr;
+  gap: 1.25rem;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .schema-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.schema-taglist {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem;
+  background: var(--bg-soft);
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.tag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.tag-list-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  align-items: flex-start;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 0.4rem 0.5rem;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+.tag-list-item:hover {
+  background: white;
+  border-color: var(--border);
+}
+.tag-list-item.selected {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.tag-list-item .tag-name {
+  font-size: 0.9rem;
+}
+.tag-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+.badge-strict {
+  background: var(--error-soft);
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.schema-detail {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  min-width: 0;
+}
+
+.schema-fields,
+.schema-parents {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin: 1rem 0;
+}
+.schema-fields legend,
+.schema-parents legend {
+  font-weight: 600;
+  font-size: 0.9rem;
+  padding: 0 0.4rem;
+}
+
+.field-row {
+  border-bottom: 1px solid var(--border-light);
+  padding: 0.5rem 0;
+}
+.field-row:last-of-type {
+  border-bottom: none;
+}
+.field-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.field-name-input {
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+.field-row-main select {
+  flex: 0 0 auto;
+  width: auto;
+}
+.field-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.field-flag input {
+  width: auto;
+  margin: 0;
+}
+.field-remove {
+  padding: 0.2rem 0.5rem;
+  line-height: 1;
+}
+.field-row-extra {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+.field-enum-input,
+.field-desc-input {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+.field-codeclarers {
+  margin: 0.35rem 0 0;
+}
+.field-codeclarers code {
+  margin-left: 0.25rem;
+}
+
+.parent-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.parent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.85rem;
+}
+.parent-chip input {
+  width: auto;
+  margin: 0;
+}
+
+.schema-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+.schema-table th,
+.schema-table td {
+  text-align: left;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--border-light);
+}
+.schema-table th {
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.schema-table td code {
+  margin-right: 0.3rem;
+}
+.schema-table .tag-self {
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 0.2rem;
+}
+.schema-table .row-this-tag td {
+  background: var(--accent-soft);
+}
