@@ -9,6 +9,11 @@ import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import {
+  SchemaValidationError,
+  strictViolations,
+  type ValidationWarning,
+} from "./schema-defaults.js";
+import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
   MAX_EXPAND_DEPTH,
@@ -130,6 +135,28 @@ export interface GenerateMcpToolsOpts {
    * Omitted (internal / unattributed callers) → writes leave attribution NULL.
    */
   writeContext?: { actor?: string | null; via?: string | null };
+  /**
+   * Strict-schema enforcement controls (vault#299 Part A). By default every
+   * write through these tools enforces `strict:true` field constraints — a
+   * violation throws `SchemaValidationError` and the note is NOT written.
+   *
+   *   `strictBypass: true` — the caller holds the migration-bypass scope
+   *     (`vault:migrate`); skip enforcement so non-conforming notes can be
+   *     migrated/backfilled. Every bypassed write that WOULD have been
+   *     rejected calls `onStrictBypass` for logging (the audit-log table,
+   *     #300, is deferred — we log to the daemon's structured log for now).
+   *   `onStrictBypass` — invoked once per bypassed write with the would-be
+   *     violations plus the actor/via from `writeContext`. Server-layer
+   *     supplies a structured logger; core stays log-sink-agnostic.
+   */
+  strictBypass?: boolean;
+  onStrictBypass?: (info: {
+    actor: string | null;
+    via: string | null;
+    path?: string | null;
+    tags?: string[];
+    violations: ValidationWarning[];
+  }) => void;
   expandVisibility?: (note: Note) => boolean;
   /**
    * `nearTraversable` (vault#439) is an OPTIONAL per-note predicate threaded
@@ -156,6 +183,39 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   // and folded into every create/update the tools perform.
   const writeActor = opts?.writeContext?.actor ?? null;
   const writeVia = opts?.writeContext?.via ?? null;
+  const strictBypass = opts?.strictBypass === true;
+  const onStrictBypass = opts?.onStrictBypass;
+
+  /**
+   * Pre-write strict-schema gate (vault#299 Part A). Validate the PROSPECTIVE
+   * note shape (final tags + merged metadata) against the resolved schemas.
+   * - No strict violations → no-op (the write proceeds; advisory warnings
+   *   still surface later via `attachValidationStatus`).
+   * - Strict violations + no bypass → throw `SchemaValidationError` (single
+   *   error, all per-field violations) so nothing is written.
+   * - Strict violations + bypass → log via `onStrictBypass` and proceed.
+   * Called immediately before `store.createNote` / `store.updateNote` so a
+   * rejection leaves the note untouched.
+   */
+  const enforceStrict = (shape: {
+    path?: string | null;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+  }): void => {
+    enforceStrictWrite(store, shape, {
+      bypass: strictBypass,
+      onBypass: onStrictBypass
+        ? (violations) =>
+            onStrictBypass({
+              actor: writeActor,
+              via: writeVia,
+              path: shape.path ?? null,
+              tags: shape.tags,
+              violations,
+            })
+        : undefined,
+    });
+  };
 
   return [
 
@@ -661,6 +721,13 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             const extension = item.extension !== undefined
               ? validateExtension(item.extension)
               : undefined;
+            // Strict-schema gate (vault#299) — reject before any write so a
+            // mid-batch violation rolls back via the outer BEGIN/ROLLBACK.
+            enforceStrict({
+              path: item.path as string | undefined,
+              tags: item.tags as string[] | undefined,
+              metadata: item.metadata as Record<string, unknown> | undefined,
+            });
             const note = await store.createNote(item.content as string ?? "", {
               path: item.path as string | undefined,
               tags: item.tags as string[] | undefined,
@@ -768,6 +835,16 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           if_updated_at: { type: "string", description: "Optimistic concurrency check: the updated_at value you last read. Rejects with a conflict error if the note has been modified since. Required unless `force: true` is set or the call is `append`/`prepend`-only." },
           force: { type: "boolean", description: "Waive the *requirement to supply* `if_updated_at` and run the update unconditionally. Use only for bulk migrations or scripted writes where concurrency is known-safe. Note: this does not override an `if_updated_at` you actually pass — if you supply both, the precondition still applies and a mismatch returns a conflict error." },
           if_missing: { type: "string", enum: ["fail", "create"], description: "What to do when the note (by `id`/path) doesn't exist. `\"fail\"` (default) — error, current behavior. `\"create\"` — create the note from this same payload (content/path/tags/metadata become the create fields; the response carries `created: true`). Skips the `if_updated_at` precondition on the create branch (nothing to conflict with). Idempotent for sync loops that don't know ahead of time whether the note exists. See vault#309." },
+          state_transition: {
+            type: "object",
+            properties: {
+              field: { type: "string", description: "Metadata field to transition." },
+              from: { description: "Required current value. The transition only commits if the field currently equals this. A missing field is a conflict; pass `null` to match a field that is absent or explicitly null." },
+              to: { description: "New value to set when the `from` precondition holds." },
+            },
+            required: ["field", "from", "to"],
+            description: "Atomic compare-and-set state transition (vault#299). If the metadata `field` currently equals `from`, set it to `to` and commit; otherwise the write is rejected with a `transition_conflict` error (a missing field counts as a conflict; `from: null` matches absent-or-null). A transition-ONLY update needs no `if_updated_at`/`force` — the compare-and-set is the precondition. Combinable with other field updates (they land in the same atomic UPDATE), but a combined call still needs `if_updated_at`/`force` for the OTHER fields — the CAS only guards the transitioned field. Use this to advance a state machine race-safely in one round trip instead of read → check → conditional update.",
+          },
           tags: {
             type: "object",
             properties: {
@@ -837,6 +914,16 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 if_updated_at: { type: "string", description: "Optimistic concurrency check for this item; rejects with a conflict error if the note has been modified since. Required unless `force: true` is set on this item or the item is `append`/`prepend`-only." },
                 force: { type: "boolean", description: "Waive the *requirement to supply* `if_updated_at` for this item. Does not override an `if_updated_at` you actually pass — a supplied precondition still applies and a mismatch conflicts." },
                 if_missing: { type: "string", enum: ["fail", "create"], description: "Per-item: see top-level `if_missing` docs. Each batch item carries its own setting." },
+                state_transition: {
+                  type: "object",
+                  properties: {
+                    field: { type: "string" },
+                    from: {},
+                    to: {},
+                  },
+                  required: ["field", "from", "to"],
+                  description: "Per-item compare-and-set state transition (vault#299). See top-level `state_transition` docs.",
+                },
                 tags: { type: "object" },
                 links: { type: "object" },
                 include_links: { type: "boolean", description: "Per-item: echo hydrated links on this item's response (vault feedback #8). Also implied when this item mutates links." },
@@ -951,6 +1038,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 via: writeVia,
               };
               const content = (item.content as string | undefined) ?? "";
+              // Strict-schema gate (vault#299) — the if_missing:"create"
+              // branch is still a create, so it enforces too. Tags come from
+              // createOpts (already normalized from the {add} dict / array).
+              enforceStrict({
+                path: createOpts.path ?? undefined,
+                tags: createOpts.tags,
+                metadata: createOpts.metadata,
+              });
               const created = await store.createNote(content, createOpts);
               await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
               // Apply links.add if the caller declared any.
@@ -1009,7 +1104,19 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             && item.created_at === undefined
             && item.tags === undefined
             && item.links === undefined;
-          if (!isAppendOnly && item.if_updated_at === undefined && item.force !== true) {
+          // A state_transition is itself a compare-and-set precondition
+          // (vault#299 Part B) — a transition-only update doesn't need
+          // `if_updated_at`/`force`, the CAS guards the lost-write window.
+          const isTransitionOnly = item.state_transition !== undefined
+            && !hasContent
+            && !hasAppendPrepend
+            && !hasContentEdit
+            && item.path === undefined
+            && item.metadata === undefined
+            && item.created_at === undefined
+            && item.tags === undefined
+            && item.links === undefined;
+          if (!isAppendOnly && !isTransitionOnly && item.if_updated_at === undefined && item.force !== true) {
             throw new PreconditionRequiredError(note.id, note.path ?? null);
           }
 
@@ -1093,6 +1200,32 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           }
           if (item.created_at !== undefined) updates.created_at = item.created_at;
           if (item.if_updated_at !== undefined) updates.if_updated_at = item.if_updated_at as string;
+          // Compare-and-set state transition (vault#299 Part B). Combinable
+          // with other field updates — it folds into the same atomic UPDATE.
+          const stItem = item.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
+          if (stItem !== undefined) {
+            if (typeof stItem.field !== "string" || stItem.field.length === 0) {
+              throw new Error(
+                `update-note: \`state_transition.field\` must be a non-empty string (note "${note.id}").`,
+              );
+            }
+            updates.state_transition = { field: stItem.field, from: stItem.from, to: stItem.to };
+          }
+
+          // --- Strict-schema gate (vault#299 Part A) ---
+          // Validate the PROSPECTIVE shape (final tags + merged metadata,
+          // including a state_transition's `to`) before the write so a
+          // rejection leaves the note untouched.
+          {
+            const removeSet = new Set<string>((item.tags as any)?.remove ?? []);
+            const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
+            for (const t of ((item.tags as any)?.add as string[] | undefined) ?? []) projectedTags.add(t);
+            const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
+            const projectedMeta = stItem !== undefined
+              ? { ...baseMeta, [stItem.field as string]: stItem.to }
+              : baseMeta;
+            enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta });
+          }
 
           let result: Note;
           if (Object.keys(updates).length > 0) {
@@ -1287,14 +1420,17 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           description: { type: "string", description: "Human-readable description of what this tag means" },
           fields: {
             type: "object",
-            description: 'Metadata fields notes with this tag should have. E.g., { "status": { "type": "string", "enum": ["active", "archived"] } }',
+            description: 'Metadata fields notes with this tag should have. E.g., { "status": { "type": "string", "enum": ["active", "archived"], "strict": true } }. Constraints are ADVISORY by default (violations surface as validation_status warnings; the write still succeeds). Mark a field `strict: true` to ENFORCE all its constraints — type + enum + required + cardinality flip to hard write rejections (vault#299).',
             additionalProperties: {
               type: "object",
               properties: {
-                type: { type: "string", description: "Field type: string, boolean, integer" },
+                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object" },
                 description: { type: "string" },
                 enum: { type: "array", items: { type: "string" }, description: "Allowed values (first is default)" },
                 indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed." },
+                strict: { type: "boolean", description: "vault#299. Default false (advisory). When true, ALL of this field's declared constraints (type + enum + required + cardinality) are ENFORCED — a violating write is rejected with a schema_validation error, not just warned. All-or-nothing per field; free-form fields on a strict tag simply leave strict off." },
+                required: { type: "boolean", description: "vault#299. The field must be present + non-null on a note with this tag. Advisory unless `strict: true`." },
+                cardinality: { type: "string", enum: ["one", "many"], description: "vault#299. 'one' (scalar, default) or 'many' (array). Advisory unless `strict: true`." },
               },
               required: ["type"],
             },
@@ -1545,6 +1681,15 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
  * actually written — callers use this to re-read ONLY the mutated notes (and
  * to skip the re-read entirely when nothing changed). The common no-schema /
  * no-defaults path returns an empty array.
+ *
+ * vault#299: this runs AFTER the create write (so AFTER the strict gate) and
+ * intentionally does NOT re-run `enforceStrict`. Defaults are always
+ * conforming by construction — `defaultForField` returns the first enum value
+ * / the type's zero-value, so a default can never violate type/enum. And a
+ * `required` strict field is already caught at the pre-write gate, so a note
+ * that would need a default to satisfy `required` never reaches this filler
+ * (the create was rejected first). Don't add a defaults path that could
+ * inject a violating value without re-gating.
  */
 async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<string[]> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
@@ -1610,6 +1755,36 @@ function defaultForField(field: { type: string; enum?: string[] }): unknown {
  * the same recipe — see vault#287 for the asymmetry that motivated
  * exposing it.
  */
+/**
+ * Pre-write strict-schema gate (vault#299 Part A). Shared by both write
+ * transports (MCP tools here, REST PATCH/POST in `src/routes.ts`) so the
+ * enforcement contract can't drift between them — the same recipe the
+ * `validation_status` attachment shares via `attachValidationStatus`.
+ *
+ * Validates the PROSPECTIVE note shape (final tags + merged metadata) against
+ * the resolved schemas and:
+ *   - no strict violations → no-op, the write proceeds.
+ *   - violations + `bypass:false` → throw `SchemaValidationError` (one error,
+ *     all per-field violations — settled lead #1). Caller writes nothing.
+ *   - violations + `bypass:true` → invoke `onBypass(violations)` (migration
+ *     scope) and return; the caller proceeds with the non-conforming write.
+ *
+ * Returns the would-be violations (empty when none) so a caller can inspect
+ * them; the throw / bypass decision is already made internally.
+ */
+export function enforceStrictWrite(
+  store: Store,
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+  opts?: { bypass?: boolean; onBypass?: (violations: ValidationWarning[]) => void },
+): ValidationWarning[] {
+  const status = store.validateNoteAgainstSchemas(shape);
+  const violations = strictViolations(status);
+  if (violations.length === 0) return [];
+  if (opts?.bypass !== true) throw new SchemaValidationError(violations);
+  opts.onBypass?.(violations);
+  return violations;
+}
+
 export function attachValidationStatus(store: Store, _db: Database, note: Note): Note {
   // Short-circuit cheaply: when no tag declares fields, the resolver
   // returns null without us paying a re-read of the note.
@@ -1649,7 +1824,11 @@ function normalizeLinkCountDirection(v: unknown): "both" | "outbound" | "inbound
 // conditional-UPDATE implementation that raises it. AmbiguousPathError
 // joins the set (vault#331 N2) so external callers can `instanceof`
 // it without crossing module boundaries.
-export { ConflictError, PathConflictError, AmbiguousPathError, MAX_BATCH_SIZE } from "./notes.js";
+export { ConflictError, PathConflictError, AmbiguousPathError, TransitionConflictError, MAX_BATCH_SIZE } from "./notes.js";
+// vault#299: strict-schema enforcement error, re-exported alongside the other
+// write-path domain errors so external callers can `instanceof` it without
+// crossing module boundaries.
+export { SchemaValidationError } from "./schema-defaults.js";
 
 /**
  * Thrown by the `update-note` MCP tool (and the REST PATCH handler) when a

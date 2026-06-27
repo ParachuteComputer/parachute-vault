@@ -188,3 +188,120 @@ export function buildOperatorClause(
     params,
   };
 }
+
+// ---------------------------------------------------------------------------
+// In-memory operator evaluation (vault#299 — value-matched triggers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluate an operator object against a single in-memory value — the
+ * non-SQL twin of {@link buildOperatorClause}. The trigger engine fires on a
+ * live `note.metadata` object (not a DB row), so it can't route through the
+ * indexed generated columns; this gives it the SAME operator vocabulary +
+ * semantics without re-implementing them. An object with multiple operators
+ * is AND-composed (`{ gt: 5, lt: 10 }`), matching the SQL clause builder.
+ *
+ * `value` is the field's current value (`undefined` when the field is
+ * absent). Semantics mirror the SQL builder, including the NULL/missing
+ * handling: `ne`/`not_in` treat an absent/null value as "matches" (the SQL
+ * `(col IS NULL OR ...)` shape); `eq: null` matches an absent/null value.
+ *
+ * Throws `QueryError` on an unknown operator or a malformed operand — the
+ * trigger validator surfaces it as a 400 at registration time.
+ */
+export function matchesOperator(
+  field: string,
+  value: unknown,
+  opObj: Record<string, unknown>,
+): boolean {
+  validateOperatorObject(field, opObj);
+  const absent = value === undefined || value === null;
+
+  for (const [op, operand] of Object.entries(opObj)) {
+    switch (op as QueryOp) {
+      case "eq":
+        if (operand === null) {
+          if (!absent) return false;
+        } else if (absent || !looseEquals(value, operand)) {
+          return false;
+        }
+        break;
+      case "ne":
+        if (operand === null) {
+          if (absent) return false;
+        } else if (!absent && looseEquals(value, operand)) {
+          return false;
+        }
+        break;
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte": {
+        if (absent) return false;
+        const cmp = compareScalar(value, operand);
+        if (cmp === null) return false;
+        if (op === "gt" && !(cmp > 0)) return false;
+        if (op === "gte" && !(cmp >= 0)) return false;
+        if (op === "lt" && !(cmp < 0)) return false;
+        if (op === "lte" && !(cmp <= 0)) return false;
+        break;
+      }
+      case "in":
+      case "not_in": {
+        if (!Array.isArray(operand)) {
+          throw new QueryError(
+            `operator "${op}" on metadata field "${field}" expects an array`,
+            "INVALID_OPERATOR_VALUE",
+          );
+        }
+        const present = !absent && operand.some((o) => looseEquals(value, o));
+        if (op === "in" && !present) return false;
+        // not_in: absent/null matches (mirrors SQL `col IS NULL OR ...`).
+        if (op === "not_in" && present) return false;
+        break;
+      }
+      case "exists":
+        if (typeof operand !== "boolean") {
+          throw new QueryError(
+            `operator "exists" on metadata field "${field}" expects a boolean`,
+            "INVALID_OPERATOR_VALUE",
+          );
+        }
+        if (operand === !absent) break;
+        return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Loose scalar equality used by in-memory `eq`/`ne`/`in`. Matches SQLite's
+ * affinity-tolerant comparison closely enough for trigger value-matching:
+ * exact for same-type scalars; cross-type number/string compares by string
+ * form (`5` matches `"5"`), since metadata round-trips through JSON and a
+ * note may carry either shape.
+ */
+function looseEquals(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (
+    (typeof a === "number" || typeof a === "string") &&
+    (typeof b === "number" || typeof b === "string")
+  ) {
+    return String(a) === String(b);
+  }
+  return false;
+}
+
+/**
+ * Three-way comparison for ordered operators (gt/gte/lt/lte). Returns a
+ * negative/zero/positive number, or `null` when the operands aren't
+ * order-comparable (so the caller treats it as "no match"). Numbers compare
+ * numerically; strings lexicographically; mixed types don't compare.
+ */
+function compareScalar(a: unknown, b: unknown): number | null {
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "string" && typeof b === "string") {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  return null;
+}

@@ -30,6 +30,7 @@ import {
   type TriggerInput,
 } from "../core/src/triggers-store.ts";
 import { registerVaultTrigger } from "./triggers.ts";
+import { SUPPORTED_OPS } from "../core/src/query-operators.ts";
 import { hasScopeForVault, SCOPE_ADMIN } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 
@@ -134,6 +135,29 @@ function validateInput(body: unknown):
 
   if (typeof b.when !== "object" || b.when === null || Array.isArray(b.when)) {
     return { ok: false, message: "`when` is required and must be an object" };
+  }
+  // Value-matched metadata predicate (vault#299 Part B): when present, each
+  // field must map to an operator-object whose keys are all supported
+  // operators. Fail at registration so a typo'd operator (`{ state: { equals:
+  // ... } }`) is a 400, not a silently-never-firing trigger.
+  const whenMeta = (b.when as Record<string, unknown>).metadata;
+  if (whenMeta !== undefined) {
+    if (typeof whenMeta !== "object" || whenMeta === null || Array.isArray(whenMeta)) {
+      return { ok: false, message: "`when.metadata` must be an object mapping field → operator-object" };
+    }
+    for (const [field, opObj] of Object.entries(whenMeta as Record<string, unknown>)) {
+      if (typeof opObj !== "object" || opObj === null || Array.isArray(opObj)) {
+        return { ok: false, message: `\`when.metadata.${field}\` must be an operator-object, e.g. { eq: "published" }` };
+      }
+      for (const op of Object.keys(opObj as Record<string, unknown>)) {
+        if (!SUPPORTED_OPS.includes(op as (typeof SUPPORTED_OPS)[number])) {
+          return {
+            ok: false,
+            message: `\`when.metadata.${field}\` has unknown operator "${op}". Supported: ${SUPPORTED_OPS.join(", ")}.`,
+          };
+        }
+      }
+    }
   }
 
   if (typeof b.action !== "object" || b.action === null || Array.isArray(b.action)) {

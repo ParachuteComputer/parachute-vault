@@ -6,7 +6,7 @@
  */
 
 import { generateMcpTools } from "../core/src/mcp.ts";
-import type { McpToolDef } from "../core/src/mcp.ts";
+import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
 import { getNoteTags } from "../core/src/notes.ts";
 import type { Note } from "../core/src/types.ts";
 import {
@@ -16,7 +16,7 @@ import {
 } from "../core/src/vault-projection.ts";
 import { readVaultConfig, writeVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
-import { hasScopeForVault, parseScopes, validateMintedScopes } from "./scopes.ts";
+import { hasScopeForVault, hasMigrateScopeForVault, parseScopes, validateMintedScopes, logStrictBypass } from "./scopes.ts";
 import type { AuthResult } from "./auth.ts";
 import {
   expandTokenTagScope,
@@ -177,13 +177,25 @@ export function generateScopedMcpTools(
     ? { actor: auth.actor, via: auth.via === "operator" ? "operator" : "mcp" }
     : undefined;
 
+  // Migration-bypass (vault#299): a `vault:migrate`-scoped MCP session skips
+  // strict-schema enforcement and logs every bypassed write. Orthogonal to
+  // read/write/admin — an admin token does NOT bypass unless it also holds
+  // `migrate`. `onStrictBypass` writes the same structured log line the REST
+  // path uses (the audit-log table, #300, is deferred).
+  const strictBypass = auth ? hasMigrateScopeForVault(auth.scopes, vaultName) : false;
+  const onStrictBypass: GenerateMcpToolsOpts["onStrictBypass"] = strictBypass
+    ? (info) => logStrictBypass(info)
+    : undefined;
+
   const tools = generateMcpTools(
     store,
-    expandVisibility || nearTraversable || writeContext
+    expandVisibility || nearTraversable || writeContext || strictBypass
       ? {
           ...(expandVisibility ? { expandVisibility } : {}),
           ...(nearTraversable ? { nearTraversable } : {}),
           ...(writeContext ? { writeContext } : {}),
+          ...(strictBypass ? { strictBypass } : {}),
+          ...(onStrictBypass ? { onStrictBypass } : {}),
         }
       : undefined,
   );

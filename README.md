@@ -273,6 +273,31 @@ description: |
 
 Sent as the MCP server instruction at session start.
 
+### Schema enforcement & state machines (vault#299)
+
+Tag-field schemas (`update-tag`'s `fields`) are **advisory by default** — a violating write succeeds and the response carries `validation_status` warnings the agent can self-correct on. That's right for organic single-vault use. Once a vault has multiple writers (humans + agents), opt individual fields into **strict** enforcement:
+
+```yaml
+tag: concept-seed
+fields:
+  state:    { type: string, enum: [idea, drafted, scripted, produced, published, killed], strict: true }
+  title:    { type: string, required: true, strict: true }
+  owners:   { type: array,  cardinality: many, strict: true }
+  priority: { type: number }   # advisory (default)
+  notes:    { type: string }   # advisory — free-form stays free-form
+```
+
+`strict: true` flips **all** of that field's declared constraints together — `type` + `enum` + `required` + `cardinality` — from warnings to hard write rejections (all-or-nothing per field). A violating create/update is rejected with a single `schema_validation` error carrying **every** per-field violation (MCP `data.error_type: "schema_validation"` / HTTP 422), and nothing is written. Strictness is **per-field**, so a free-form `notes` field stays advisory on an otherwise-strict tag. Declared strict fields surface in `vault-info` and the connect-time brief so an agent knows the contract before writing.
+
+**Migration bypass.** A token holding the `vault:migrate` scope (broad) or `vault:<name>:migrate` (narrowed) skips strict enforcement — for backfilling/migrating existing non-conforming notes. It's an orthogonal capability (an `admin` token does **not** bypass unless it also holds `migrate`), and every bypassed write is logged to the daemon's structured log (`[schema-bypass] {...}` with the actor/via and waived violations) for later audit.
+
+**Compare-and-set state transitions.** Advance a state machine race-safely in one round trip instead of read → check → conditional update. `update-note`'s `state_transition: { field, from, to }` atomically sets `field` to `to` **only if** it currently equals `from`; otherwise it's rejected with a distinct `transition_conflict` error. A **missing field** counts as a conflict; pass `from: null` to match a field that is absent or explicitly null. A **transition-only** update needs no `if_updated_at`/`force` — the compare-and-set IS the precondition. Combinable with other field updates in the same call (they land in the same atomic UPDATE), but a combined call still needs `if_updated_at`/`force` for the *other* fields — the CAS only guards the transitioned field, not the rest of the merge.
+
+```jsonc
+// advance a seed from idea → drafted, race-safely
+update-note { "id": "Seeds/my-idea", "state_transition": { "field": "state", "from": "idea", "to": "drafted" } }
+```
+
 ## Features
 
 ### Wikilink auto-linking
@@ -321,7 +346,19 @@ triggers:
       send: content
 ```
 
-**Predicate fields**: `tags` (all must match), `has_content` (true/false), `missing_metadata` (keys that must be absent), `has_metadata` (keys that must be present).
+**Predicate fields**: `tags` (all must match), `has_content` (true/false), `missing_metadata` (keys that must be absent), `has_metadata` (keys that must be present), and `metadata` (value-matched — a field → operator-object map using the same operators as `query-notes`: `eq/ne/gt/gte/lt/lte/in/not_in/exists`). All predicate fields are ANDed. Value-matching lets a trigger fire on a specific transition rather than every edit (vault#299):
+
+```yaml
+  - name: announce-published
+    events: [updated]
+    when:
+      tags: [piece]
+      metadata:
+        state: { eq: published }     # fire only when state reaches "published"
+      missing_metadata: [announced_at]
+    action:
+      webhook: https://example.com/announce
+```
 
 **Two-phase markers**: On match, the trigger sets `<name>_pending_at` metadata before calling the webhook, then replaces it with `<name>_rendered_at` on success. This prevents re-entry and concurrent runs.
 

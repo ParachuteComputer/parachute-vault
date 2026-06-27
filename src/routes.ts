@@ -21,7 +21,9 @@ import {
   contentRangeRequiresContent,
   type ContentRange,
 } from "../core/src/content-range.ts";
-import { attachValidationStatus } from "../core/src/mcp.ts";
+import { attachValidationStatus, enforceStrictWrite } from "../core/src/mcp.ts";
+import type { ValidationWarning } from "../core/src/schema-defaults.ts";
+import { logStrictBypass } from "./scopes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import {
@@ -51,9 +53,45 @@ const NO_TAG_SCOPE: TagScopeCtx = { allowed: null, raw: null };
  * `store.createNote` / `store.updateNote`. Both null for paths without an auth
  * context (the no-op default). See `WriteContext` in core/src/notes.ts.
  */
-export type WriteCtx = { actor: string | null; via: string | null };
+export type WriteCtx = {
+  actor: string | null;
+  via: string | null;
+  /**
+   * Migration-bypass (vault#299). True when the caller holds `vault:migrate`
+   * — strict-schema enforcement is skipped and the bypass is logged. Defaults
+   * to false (full enforcement) for every normal write.
+   */
+  bypassStrict?: boolean;
+};
 
 const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
+
+/**
+ * Run the shared strict-schema gate for a REST write (vault#299). Mirrors the
+ * MCP path's `enforceStrict` closure: enforce unless the caller holds the
+ * migration-bypass scope, and log every bypassed write to the daemon's
+ * structured log (the audit-log table, #300, is deferred). Throws
+ * `SchemaValidationError` (caught by the route's catch → 422) when not bypassed.
+ */
+function gateStrictWrite(
+  store: Store,
+  writeCtx: WriteCtx,
+  shape: { path?: string | null; tags?: string[]; metadata?: Record<string, unknown> },
+): void {
+  enforceStrictWrite(store, shape, {
+    bypass: writeCtx.bypassStrict === true,
+    onBypass: (violations: ValidationWarning[]) => {
+      logStrictBypass({
+        actor: writeCtx.actor,
+        via: writeCtx.via,
+        path: shape.path ?? null,
+        tags: shape.tags,
+        violations,
+      });
+    },
+  });
+}
+
 import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
@@ -1121,6 +1159,13 @@ async function handleNotesInner(
           const extension = item.extension !== undefined
             ? validateExtension(item.extension)
             : undefined;
+          // Strict-schema gate (vault#299) — reject before any write so a
+          // mid-batch violation rolls back via the outer BEGIN/ROLLBACK.
+          gateStrictWrite(store, writeCtx, {
+            path: item.path,
+            tags: item.tags,
+            metadata: item.metadata,
+          });
           const note = await store.createNote(item.content ?? "", {
             id: item.id,
             path: item.path,
@@ -1151,6 +1196,13 @@ async function handleNotesInner(
           return json(
             { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
             409,
+          );
+        }
+        // Strict-schema rejection (vault#299 Part A) on create — 422.
+        if (e && e.code === "SCHEMA_VALIDATION") {
+          return json(
+            { error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message },
+            422,
           );
         }
         if (e && e.code === "INVALID_EXTENSION") {
@@ -1410,6 +1462,12 @@ async function handleNotesInner(
             via: writeCtx.via,
           };
           const content = (body.content as string | undefined) ?? "";
+          // Strict-schema gate (vault#299) — if_missing:"create" is a create.
+          gateStrictWrite(store, writeCtx, {
+            path: createOpts.path ?? undefined,
+            tags: createOpts.tags,
+            metadata: createOpts.metadata,
+          });
           const created = await store.createNote(content, createOpts);
           if (tagsArr.length > 0) {
             await applySchemaDefaults(store, db, [created.id], tagsArr);
@@ -1499,7 +1557,19 @@ async function handleNotesInner(
         && body.createdAt === undefined
         && body.tags === undefined
         && body.links === undefined;
-      if (!isAppendOnly && body.if_updated_at === undefined && body.force !== true) {
+      // A state_transition is itself a compare-and-set precondition (vault#299
+      // Part B) — a transition-only PATCH needs no if_updated_at/force.
+      const isTransitionOnly = body.state_transition !== undefined
+        && !hasContent
+        && !hasAppendPrepend
+        && !hasContentEdit
+        && body.path === undefined
+        && body.metadata === undefined
+        && body.created_at === undefined
+        && body.createdAt === undefined
+        && body.tags === undefined
+        && body.links === undefined;
+      if (!isAppendOnly && !isTransitionOnly && body.if_updated_at === undefined && body.force !== true) {
         return json(
           {
             error_type: "precondition_required",
@@ -1590,6 +1660,33 @@ async function handleNotesInner(
       }
       if (body.if_updated_at !== undefined) {
         updates.if_updated_at = body.if_updated_at;
+      }
+      // Compare-and-set state transition (vault#299 Part B). Combinable with
+      // other field updates; folds into the same atomic UPDATE.
+      const stBody = body.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
+      if (stBody !== undefined) {
+        if (typeof stBody.field !== "string" || stBody.field.length === 0) {
+          return json(
+            { error: "bad_request", message: "`state_transition.field` must be a non-empty string." },
+            400,
+          );
+        }
+        updates.state_transition = { field: stBody.field, from: stBody.from, to: stBody.to };
+      }
+
+      // --- Strict-schema gate (vault#299 Part A) ---
+      // Validate the PROSPECTIVE shape (final tags + merged metadata, incl. a
+      // state_transition's `to`) before the write so a rejection leaves the
+      // note untouched. Throws SchemaValidationError → 422 in the catch.
+      {
+        const removeSet = new Set<string>((body.tags?.remove as string[] | undefined) ?? []);
+        const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
+        for (const t of (body.tags?.add as string[] | undefined) ?? []) projectedTags.add(t);
+        const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
+        const projectedMeta = stBody !== undefined
+          ? { ...baseMeta, [stBody.field as string]: stBody.to }
+          : baseMeta;
+        gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
       }
 
       if (Object.keys(updates).length > 0) {
@@ -1688,6 +1785,39 @@ async function handleNotesInner(
             expected_updated_at: e.expected_updated_at,
           },
           409,
+        );
+      }
+      // State-transition compare-and-set conflict (vault#299 Part B). A
+      // DISTINCT error vocabulary from `conflict` (settled lead #3): the
+      // field VALUE didn't match `from`, not the updated_at token. 409.
+      if (e && e.code === "TRANSITION_CONFLICT") {
+        return json(
+          {
+            error_type: "transition_conflict",
+            error: "transition_conflict",
+            note_id: e.note_id,
+            path: e.note_path ?? null,
+            field: e.field,
+            expected_from: e.expected_from,
+            to: e.to,
+            current: e.current ?? null,
+            message: e.message,
+          },
+          409,
+        );
+      }
+      // Strict-schema rejection (vault#299 Part A). One error carrying ALL
+      // per-field violations (settled lead #1). 422 Unprocessable Entity —
+      // the note exists / request is well-formed but violates the contract.
+      if (e && e.code === "SCHEMA_VALIDATION") {
+        return json(
+          {
+            error_type: "schema_validation",
+            error: "schema_validation",
+            violations: e.violations ?? [],
+            message: e.message,
+          },
+          422,
         );
       }
       // Path-rename collision — schema's UNIQUE(path) tripped. Issue #126.

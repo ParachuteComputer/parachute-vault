@@ -30,6 +30,18 @@ export interface TagFieldSchema {
   // across declarers — all tags declaring this field must agree on both
   // `type` and `indexed`. See core/src/indexed-fields.ts for lifecycle.
   indexed?: boolean;
+  // Strict-enforcement opt-in (vault#299). Default false (advisory). When
+  // true, ALL declared constraints on this field (type + enum + required +
+  // cardinality) flip from validation_status warnings to hard write
+  // rejections — all-or-nothing per field. Stored verbatim in the `fields`
+  // JSON column; the resolver (schema-defaults.ts) interprets it.
+  strict?: boolean;
+  // The field must be present + non-null on a note carrying this tag.
+  // Advisory unless `strict:true`. vault#299.
+  required?: boolean;
+  // "one" (scalar, default) or "many" (array). Advisory unless `strict:true`.
+  // Distinct from relationship cardinality. vault#299.
+  cardinality?: "one" | "many";
 }
 
 /**

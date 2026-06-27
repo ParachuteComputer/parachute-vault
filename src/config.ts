@@ -215,6 +215,17 @@ export interface TriggerWhen {
   missing_metadata?: string[];
   /** Note.metadata must have ALL of these keys set (non-null). */
   has_metadata?: string[];
+  /**
+   * Value-matched metadata predicate (vault#299 Part B). A map of
+   * field → operator-object, evaluated against the note's live metadata with
+   * the SAME operators as `query-notes` (eq/ne/gt/gte/lt/lte/in/not_in/exists)
+   * via the shared `matchesOperator` engine. ALL entries must match (AND).
+   * Lets a trigger fire only on a specific transition — e.g.
+   * `metadata: { state: { eq: "published" } }` fires when a note reaches
+   * `published`, not on every edit. Combines with the presence/tag/content
+   * filters above (all must hold).
+   */
+  metadata?: Record<string, Record<string, unknown>>;
 }
 
 /**

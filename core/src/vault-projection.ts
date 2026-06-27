@@ -369,6 +369,25 @@ export function projectionToMarkdown(args: {
     lines.push(`- No indexed metadata fields.`);
   }
 
+  // Strict fields (vault#299): surface the enforced contract so an agent knows
+  // BEFORE writing which fields hard-reject on violation (not just warn).
+  // Derived from each schema tag's effective fields carrying `strict: true`.
+  const strictLines: string[] = [];
+  for (const t of projection.tags) {
+    const strictNames = Object.entries(t.effective_fields)
+      .filter(([, spec]) => (spec as { strict?: boolean }).strict === true)
+      .map(([name]) => name);
+    if (strictNames.length > 0) {
+      strictLines.push(`  - #${t.name}: ${strictNames.join(", ")}`);
+    }
+  }
+  if (strictLines.length > 0) {
+    lines.push(
+      `- Strict fields (writes that violate these are REJECTED, not just warned — enum/type/required/cardinality enforced):`,
+    );
+    lines.push(...strictLines);
+  }
+
   lines.push("");
   lines.push("## Querying");
   lines.push("");

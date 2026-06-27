@@ -209,6 +209,50 @@ export class ConflictError extends Error {
 }
 
 /**
+ * Thrown by `updateNote` when a `state_transition` precondition fails: the
+ * named metadata field's current value does not equal `from` (a missing field
+ * counts as a mismatch). Distinct from `ConflictError` (vault#299 settled lead
+ * #3) — a state-transition conflict is about a VALUE not matching, not a
+ * stale `updated_at` token, so it carries its own `transition_conflict` code
+ * and the from/to/current triple rather than the if_updated_at vocabulary.
+ *
+ * The check + set is one atomic conditional UPDATE (`... WHERE
+ * json_extract(metadata,'$.field') IS ?`), so two racing transitioners can't
+ * both observe `from` and both commit — exactly one wins, the other gets this.
+ */
+export class TransitionConflictError extends Error {
+  code = "TRANSITION_CONFLICT" as const;
+  note_id: string;
+  note_path: string | null;
+  field: string;
+  expected_from: unknown;
+  to: unknown;
+  current: unknown;
+
+  constructor(
+    noteId: string,
+    notePath: string | null,
+    field: string,
+    from: unknown,
+    to: unknown,
+    current: unknown,
+  ) {
+    super(
+      `transition_conflict: note "${noteId}" field "${field}" is ${JSON.stringify(
+        current ?? null,
+      )}, expected ${JSON.stringify(from)} to transition to ${JSON.stringify(to)}`,
+    );
+    this.name = "TransitionConflictError";
+    this.note_id = noteId;
+    this.note_path = notePath;
+    this.field = field;
+    this.expected_from = from;
+    this.to = to;
+    this.current = current;
+  }
+}
+
+/**
  * Thrown by `createNote` / `updateNote` when the requested path is already
  * taken by another note. Surfaces as 409 at the HTTP layer so clients can
  * distinguish "path taken — pick another" from a generic 500.
@@ -375,6 +419,18 @@ export function updateNote(
      * note still exists, a `ConflictError` is thrown.
      */
     if_updated_at?: string;
+    /**
+     * Compare-and-set state transition (vault#299 Part B). Atomically: if the
+     * named metadata field currently equals `from`, set it to `to` and commit;
+     * otherwise throw `TransitionConflictError` (a missing field is a
+     * conflict). The check rides the same conditional UPDATE — an additional
+     * `AND json_extract(metadata,'$.<field>') IS ?` clause — so two racing
+     * transitioners can't both pass. Combinable with `metadata` (other field
+     * updates merge alongside the transition) and `if_updated_at` (both
+     * preconditions must hold). `from`/`to` are JSON scalars (string / number /
+     * boolean / null).
+     */
+    state_transition?: { field: string; from: unknown; to: unknown };
   },
 ): Note {
   if (updates.content !== undefined && (updates.append !== undefined || updates.prepend !== undefined)) {
@@ -463,16 +519,37 @@ export function updateNote(
     sets.push("extension = ?");
     values.push(updates.extension);
   }
+  // State-transition (vault#299 Part B). The `to` value must land in the
+  // metadata field. Two sub-cases keep the metadata write consistent:
+  //   - caller ALSO passed `metadata` (the MCP/REST layer merges before
+  //     calling): fold `to` into that object so the single `metadata = ?`
+  //     SET carries it. The transition value wins over a merged value for
+  //     the same field — the transition is the authoritative state write.
+  //   - caller passed NO `metadata`: use SQL `json_set` so the field is
+  //     updated in place without a read-merge-write (keeps it atomic).
+  // The atomic GUARD (current value == from) is appended to the WHERE below.
+  const st = updates.state_transition;
+  if (st !== undefined && updates.metadata !== undefined) {
+    (updates.metadata as Record<string, unknown>)[st.field] = st.to;
+  }
   if (updates.metadata !== undefined) {
     sets.push("metadata = ?");
     values.push(JSON.stringify(updates.metadata));
+  } else if (st !== undefined) {
+    // No metadata payload — set the single field via json_set. The path is
+    // bound as a parameter (mirrors the json_extract pattern elsewhere); the
+    // value is bound as a JSON-typed argument via `json(?)` so booleans /
+    // numbers / null land as their JSON types, not stringified text.
+    sets.push(`metadata = json_set(COALESCE(metadata, '{}'), ?, json(?))`);
+    values.push(`$.${jsonPathKey(st.field)}`, JSON.stringify(st.to));
   }
   if (updates.created_at !== undefined) {
     sets.push("created_at = ?");
     values.push(updates.created_at);
   }
 
-  // No-op: no SET fields. If a caller still passed `if_updated_at`, we
+  // No-op: no SET fields. If a caller still passed `if_updated_at` (and no
+  // state_transition — that always pushes a metadata SET above), we
   // need to validate the precondition; a conditional UPDATE that sets
   // updated_at to itself does exactly that atomically — even a no-net-
   // change UPDATE takes the write lock in WAL mode, so it still serializes
@@ -497,10 +574,23 @@ export function updateNote(
     sql += " AND updated_at IS ?";
     values.push(updates.if_updated_at);
   }
+  // State-transition guard (vault#299 Part B): the atomic compare. The UPDATE
+  // only fires when the stored field currently equals `from`; otherwise zero
+  // rows match and we raise TransitionConflictError below. `IS` (not `=`) so
+  // a `from: null` correctly matches a stored JSON null / missing field, and
+  // a non-null `from` never matches a NULL/missing field (= conflict).
+  if (st !== undefined) {
+    sql += ` AND json_extract(metadata, ?) IS json_extract(json(?), '$')`;
+    values.push(`$.${jsonPathKey(st.field)}`, JSON.stringify(st.from));
+  }
 
+  // A value-conditional WHERE (if_updated_at OR state_transition) needs
+  // RETURNING to distinguish "matched + updated" from "no match" — `.changes`
+  // is unreliable inside transactions (vault#261).
+  const conditional = updates.if_updated_at !== undefined || st !== undefined;
   let matched: { id: string } | null = null;
   try {
-    if (updates.if_updated_at !== undefined) {
+    if (conditional) {
       matched = db.prepare(`${sql} RETURNING id`).get(...values) as
         | { id: string }
         | null;
@@ -520,11 +610,45 @@ export function updateNote(
     throw err;
   }
 
-  if (updates.if_updated_at !== undefined && matched === null) {
-    throwConflictOrMissing(db, id, updates.if_updated_at);
+  if (conditional && matched === null) {
+    // No row matched. Disambiguate the cause, checking the if_updated_at
+    // precondition first (it's the cheaper, pre-existing contract), then the
+    // state-transition value, then not-found.
+    const row = db.prepare("SELECT updated_at, path, metadata FROM notes WHERE id = ?").get(id) as
+      | { updated_at: string | null; path: string | null; metadata: string | null }
+      | null;
+    if (!row) throw new Error(`Note not found: "${id}"`);
+    if (updates.if_updated_at !== undefined && row.updated_at !== updates.if_updated_at) {
+      throw new ConflictError(id, row.path, row.updated_at, updates.if_updated_at);
+    }
+    if (st !== undefined) {
+      // if_updated_at (if any) matched, so the mismatch is the transition.
+      let current: unknown;
+      try {
+        const meta = row.metadata ? JSON.parse(row.metadata) : {};
+        current = (meta as Record<string, unknown>)[st.field];
+      } catch {
+        current = undefined;
+      }
+      throw new TransitionConflictError(id, row.path, st.field, st.from, st.to, current);
+    }
+    // if_updated_at-only path that fell through (timestamp matched but row
+    // vanished mid-flight): preserve the prior contract.
+    throwConflictOrMissing(db, id, updates.if_updated_at!);
   }
 
   return getNote(db, id)!;
+}
+
+/**
+ * Build the dotted JSON-path key fragment for a metadata field name. Field
+ * names that contain characters JSON-path treats specially (`.`, `[`, `"`,
+ * etc.) are double-quoted; simple identifiers pass through bare. Mirrors the
+ * SQLite JSON1 path grammar.
+ */
+function jsonPathKey(field: string): string {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(field)) return field;
+  return `"${field.replace(/"/g, '\\"')}"`;
 }
 
 function throwConflictOrMissing(db: Database, id: string, expected: string): never {

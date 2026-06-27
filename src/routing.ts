@@ -52,7 +52,7 @@ import {
   authenticateGlobalRequest,
   extractApiKey,
 } from "./auth.ts";
-import { hasScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
+import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
 import { getVaultStore } from "./vault-store.ts";
 import { handleScopedMcp } from "./mcp-http.ts";
 import {
@@ -818,7 +818,15 @@ export async function route(
   // `operator` for the env-var bearer). The REST surface IS the `api` channel,
   // so no refinement is needed here — the base via stands (the MCP handler is
   // the one that refines to `mcp`). Threaded only into the write handler.
-  const writeCtx: WriteCtx = { actor: auth.actor, via: auth.via };
+  // Migration-bypass (vault#299): a `vault:migrate`-scoped caller may write
+  // notes that violate `strict:true` field constraints (for backfill /
+  // migration). Every bypassed write is logged. Orthogonal to read/write/admin
+  // — an admin token does NOT bypass unless it also holds `migrate`.
+  const writeCtx: WriteCtx = {
+    actor: auth.actor,
+    via: auth.via,
+    bypassStrict: hasMigrateScopeForVault(auth.scopes, vaultName),
+  };
 
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
   // Live-query SSE subscription (design 2026-06-08). Snapshot + scoped live

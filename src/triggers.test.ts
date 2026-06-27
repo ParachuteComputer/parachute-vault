@@ -95,6 +95,39 @@ describe("buildPredicate", () => {
     expect(pred(makeNote({ tags: ["reader"] }))).toBe(false);
     expect(pred(makeNote({ tags: ["reader", "important"] }))).toBe(true);
   });
+
+  // Value-matched metadata grammar (vault#299 Part B).
+  it("metadata eq: fires only when the field equals the value", () => {
+    const pred = buildPredicate({ metadata: { state: { eq: "published" } } }, "publish_hook");
+    expect(pred(makeNote({ metadata: { state: "published" } }))).toBe(true);
+    expect(pred(makeNote({ metadata: { state: "drafted" } }))).toBe(false);
+    expect(pred(makeNote({ metadata: {} }))).toBe(false); // absent → no fire
+  });
+
+  it("metadata in: fires on membership", () => {
+    const pred = buildPredicate({ metadata: { state: { in: ["produced", "published"] } } }, "h");
+    expect(pred(makeNote({ metadata: { state: "produced" } }))).toBe(true);
+    expect(pred(makeNote({ metadata: { state: "idea" } }))).toBe(false);
+  });
+
+  it("metadata combines with tag + presence filters (all must hold)", () => {
+    const pred = buildPredicate(
+      { tags: ["piece"], metadata: { state: { eq: "published" } }, missing_metadata: ["notified_at"] },
+      "h",
+    );
+    expect(pred(makeNote({ tags: ["piece"], metadata: { state: "published" } }))).toBe(true);
+    // right state, wrong tag.
+    expect(pred(makeNote({ tags: ["other"], metadata: { state: "published" } }))).toBe(false);
+    // right tag + state but already notified.
+    expect(
+      pred(makeNote({ tags: ["piece"], metadata: { state: "published", notified_at: "x" } })),
+    ).toBe(false);
+  });
+
+  it("a malformed operator never throws from the predicate (treated as no-match)", () => {
+    const pred = buildPredicate({ metadata: { state: { bogus: "x" } as any } }, "h");
+    expect(pred(makeNote({ metadata: { state: "published" } }))).toBe(false);
+  });
 });
 
 describe("registerTriggers — dispatch modes", async () => {
