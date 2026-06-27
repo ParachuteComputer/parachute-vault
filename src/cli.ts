@@ -3345,11 +3345,17 @@ async function cmdExport(args: string[]) {
  */
 async function cmdSchema(args: string[] = []) {
   const sub = args[0];
+  if (sub === "migrate-field") {
+    await cmdSchemaMigrateField(args.slice(1));
+    return;
+  }
   if (sub !== "prune") {
-    console.error("Usage: parachute-vault schema prune [--vault <name>] [--dry-run|--apply|--yes]");
+    console.error("Usage: parachute-vault schema <prune|migrate-field> ...");
     console.error("\nSubcommands:");
-    console.error("  prune    Drop orphaned indexed-field columns whose declaring tags are gone.");
-    console.error("           Dry-run by default (--dry-run is an explicit alias); pass --apply (or --yes) to execute.");
+    console.error("  prune          Drop orphaned indexed-field columns whose declaring tags are gone.");
+    console.error("                 Dry-run by default (--dry-run is an explicit alias); pass --apply (or --yes) to execute.");
+    console.error("  migrate-field  Evolve a tag-schema field across existing notes (rename/remap/set-default/retype).");
+    console.error("                 Dry-run by default; pass --apply (or --yes) to write. See `schema migrate-field --help`.");
     process.exit(1);
   }
 
@@ -3413,6 +3419,154 @@ async function cmdSchema(args: string[] = []) {
   );
   if (!apply) {
     console.log("Re-run with --apply (or --yes) to execute.");
+  }
+}
+
+/**
+ * `parachute-vault schema migrate-field <tag> <field> --transform <spec>` —
+ * evolve a tag-schema field's type / values across the existing notes that
+ * carry the tag (vault#314). Dry-run by default — prints the count + a sample
+ * of what WOULD change and writes nothing; `--apply` (alias `--yes`) executes.
+ *
+ * Transform specs (the built-in set — issue #314):
+ *   rename:<newkey>          move the field's value to <newkey>, drop the old key
+ *   remap:<old>=<new>[,…]    rewrite enum-style values (repeatable / comma-sep)
+ *   set-default:<value>      fill the field where missing/null
+ *   set-default-invalid:<v>  set <v> where missing/null OR currently schema-invalid
+ *   to_string | to_int | to_number | to_boolean   retype the value
+ *
+ * The migration writes through `strict` enforcement (the migrate-bypass path,
+ * vault#299) so a freshly-declared strict field that the back-catalog violates
+ * doesn't block the rewrite, and every bypassed write is logged. Rewrites are
+ * attributed `migrate` (last_updated_*); created_* is preserved.
+ *
+ * Atomic by default: if any note's value can't be converted (e.g. `to_int` on
+ * "banana"), the apply aborts BEFORE writing anything and lists the offenders.
+ * Pass `--continue-on-error` for best-effort (write the convertible, skip the rest).
+ */
+async function cmdSchemaMigrateField(args: string[]) {
+  const usageLine =
+    "Usage: parachute-vault schema migrate-field <tag> <field> --transform <spec> [--vault <name>] [--apply|--yes] [--continue-on-error]";
+  if (args[0] === "--help" || args[0] === "-h") {
+    console.log(usageLine);
+    console.log("\nTransform specs:");
+    console.log("  rename:<newkey>          Move the field's value to <newkey>, drop the old key.");
+    console.log("  remap:<old>=<new>[,...]  Rewrite enum-style values (repeatable, comma-separated).");
+    console.log("  set-default:<value>      Set <value> on notes where the field is missing/null.");
+    console.log("  set-default-invalid:<v>  Set <v> where missing/null OR the current value is schema-invalid.");
+    console.log("  to_string | to_int | to_number | to_boolean   Retype the field's value.");
+    console.log("\nDry-run by default — prints the plan. Pass --apply (or --yes) to write.");
+    return;
+  }
+
+  let vaultName = "default";
+  let apply = false;
+  let continueOnError = false;
+  let transformSpec: string | undefined;
+  const positionals: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--vault") {
+      const v = args[++i];
+      if (!v) { console.error("--vault requires a value."); process.exit(1); }
+      vaultName = v;
+    } else if (arg === "--transform") {
+      const v = args[++i];
+      if (!v) { console.error("--transform requires a value."); process.exit(1); }
+      transformSpec = v;
+    } else if (arg === "--apply" || arg === "--yes") {
+      apply = true;
+    } else if (arg === "--dry-run") {
+      // default; accept as an explicit affirmative
+    } else if (arg === "--continue-on-error") {
+      continueOnError = true;
+    } else if (arg.startsWith("--")) {
+      console.error(`Unknown flag for \`schema migrate-field\`: ${arg}`);
+      process.exit(1);
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  const [tag, field] = positionals;
+  if (!tag || !field || !transformSpec) {
+    console.error(usageLine);
+    console.error("\n  <tag> <field> and --transform <spec> are all required.");
+    console.error("  Run `schema migrate-field --help` for the transform spec list.");
+    process.exit(1);
+  }
+
+  const { parseTransformSpec } = await import("../core/src/migrate-tag-field.ts");
+  let transform;
+  try {
+    transform = parseTransformSpec(transformSpec);
+  } catch (err) {
+    console.error(`Invalid --transform "${transformSpec}": ${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  const config = readVaultConfig(vaultName);
+  if (!config) {
+    console.error(`Vault "${vaultName}" not found.`);
+    process.exit(1);
+  }
+
+  const { getVaultStore } = await import("./vault-store.ts");
+  const { migrateTagField } = await import("../core/src/migrate-tag-field.ts");
+  const { logStrictBypass } = await import("./scopes.ts");
+  const store = getVaultStore(vaultName);
+
+  const result = await migrateTagField(store, {
+    tag,
+    field,
+    transform: transform!,
+    apply,
+    continueOnError,
+    // The CLI is the operator path — it bypasses strict enforcement by nature
+    // (writes go through the store, not the scope-gated transport). Log every
+    // waived violation so the bypass is auditable, exactly as MW2 intends.
+    onStrictBypass: (info) => logStrictBypass(info),
+  });
+
+  const verb = result.applied ? "Migrated" : "Would migrate";
+  console.log(
+    `${verb} field "${result.field}" on #${result.tag} in vault "${vaultName}"${result.applied ? "" : " (dry-run)"}:`,
+  );
+  console.log(
+    `  scanned ${result.scanned} · ${result.applied ? "changed" : "would change"} ${result.changed} · unchanged ${result.unchanged} · errored ${result.errored}`,
+  );
+
+  if (result.sample.length > 0) {
+    console.log(`\n  ${result.applied ? "Changes" : "Sample of changes"} (${result.sample.length}${result.changed > result.sample.length ? ` of ${result.changed}` : ""}):`);
+    for (const c of result.sample) {
+      const ref = c.path ?? c.id;
+      if (c.renamedTo) {
+        console.log(`    ${ref}: ${field} → ${c.renamedTo} = ${JSON.stringify(c.after)}`);
+      } else {
+        console.log(`    ${ref}: ${JSON.stringify(c.before)} → ${JSON.stringify(c.after)}`);
+      }
+    }
+  }
+
+  if (result.errors.length > 0) {
+    console.log(`\n  Unconvertible (${result.errors.length}):`);
+    for (const e of result.errors) {
+      console.log(`    ${e.path ?? e.id}: ${e.error}`);
+    }
+    if (apply && !result.applied) {
+      console.log(
+        "\n  Aborted without writing — some notes can't be converted (atomic by default).",
+      );
+      console.log("  Fix the data, or re-run with --continue-on-error to migrate the rest.");
+      process.exit(1);
+    }
+  }
+
+  if (!apply && result.changed > 0) {
+    console.log("\n  Re-run with --apply (or --yes) to write these changes.");
+  }
+  if (result.changed === 0 && result.errored === 0) {
+    console.log("\n  Nothing to migrate — the back-catalog already conforms.");
   }
 }
 
@@ -3961,6 +4115,13 @@ Schema maintenance:
   parachute-vault schema prune --apply                Execute the prune (alias: --yes). Co-declared
                                                        fields keep their column; a drop loses only
                                                        the index (data lives in notes.metadata).
+  parachute-vault schema migrate-field <tag> <field>  Evolve a tag-schema field across existing
+    --transform <spec>                                 notes (rename:<key>, remap:<old>=<new>,
+                                                       set-default:<v>, to_string/to_int/to_number/
+                                                       to_boolean). Dry-run by default — prints the
+                                                       plan; pass --apply (or --yes) to write.
+                                                       Writes through strict enforcement (migrate
+                                                       bypass). See \`schema migrate-field --help\`.
 
 ── Advanced / standalone ──────────────────────────────────────────────
 
