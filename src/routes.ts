@@ -44,6 +44,16 @@ import { findTokensReferencingTag } from "./token-store.ts";
 export type TagScopeCtx = { allowed: Set<string> | null; raw: string[] | null };
 
 const NO_TAG_SCOPE: TagScopeCtx = { allowed: null, raw: null };
+
+/**
+ * Write-attribution context (vault#298) for REST writes — the principal
+ * (`actor`) and interface (`via`) threaded from the authenticated request into
+ * `store.createNote` / `store.updateNote`. Both null for paths without an auth
+ * context (the no-op default). See `WriteContext` in core/src/notes.ts.
+ */
+export type WriteCtx = { actor: string | null; via: string | null };
+
+const NO_WRITE_CTX: WriteCtx = { actor: null, via: null };
 import {
   expandContent,
   DEFAULT_EXPAND_DEPTH,
@@ -567,6 +577,13 @@ export function parseNotesQueryOpts(url: URL): {
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
     extension: parseExtensionFilter(url),
     metadata: bracket.metadata ?? metadataAlias.metadata,
+    // Write-attribution filters (vault#298) — symmetric with the MCP
+    // query-notes tool so a REST caller can ask "what did Mathilda write" /
+    // "what came in via the meeting-ingest surface" the same way.
+    createdBy: parseQuery(url, "created_by") ?? undefined,
+    lastUpdatedBy: parseQuery(url, "last_updated_by") ?? undefined,
+    createdVia: parseQuery(url, "created_via") ?? undefined,
+    lastUpdatedVia: parseQuery(url, "last_updated_via") ?? undefined,
     ...(bracket.dateFilter
       ? { dateFilter: bracket.dateFilter }
       : parseQuery(url, "date_field")
@@ -704,9 +721,10 @@ export async function handleNotes(
   subpath: string,
   vault?: string,
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
   try {
-    return await handleNotesInner(req, store, subpath, vault, tagScope);
+    return await handleNotesInner(req, store, subpath, vault, tagScope, writeCtx);
   } catch (e: any) {
     const ambig = ambiguousPathResponse(e);
     if (ambig) return ambig;
@@ -720,6 +738,7 @@ async function handleNotesInner(
   subpath: string,
   vault?: string,
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  writeCtx: WriteCtx = NO_WRITE_CTX,
 ): Promise<Response> {
   const url = new URL(req.url);
   const method = req.method;
@@ -1109,6 +1128,9 @@ async function handleNotesInner(
             metadata: item.metadata,
             created_at: item.createdAt ?? item.created_at,
             ...(extension !== undefined ? { extension } : {}),
+            // Write-attribution (vault#298) — REST batch create.
+            actor: writeCtx.actor,
+            via: writeCtx.via,
           });
 
           // Create explicit links
@@ -1383,6 +1405,9 @@ async function handleNotesInner(
             ...(body.created_at !== undefined ? { created_at: body.created_at as string } : {}),
             ...(body.createdAt !== undefined ? { created_at: body.createdAt as string } : {}),
             ...(createExt !== undefined ? { extension: createExt } : {}),
+            // Write-attribution (vault#298) — REST upsert-create branch.
+            actor: writeCtx.actor,
+            via: writeCtx.via,
           };
           const content = (body.content as string | undefined) ?? "";
           const created = await store.createNote(content, createOpts);
@@ -1568,6 +1593,10 @@ async function handleNotesInner(
       }
 
       if (Object.keys(updates).length > 0) {
+        // Write-attribution (vault#298) — REST update. Stamp the most-recent-
+        // write columns on the same UPDATE that bumps updated_at.
+        updates.actor = writeCtx.actor;
+        updates.via = writeCtx.via;
         await store.updateNote(note.id, updates);
       }
 

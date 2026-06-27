@@ -100,7 +100,7 @@ export class BunSqliteStore implements Store {
 
   // ---- Notes ----
 
-  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note> {
+  async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null }): Promise<Note> {
     const note = noteOps.createNote(this.db, content, opts);
 
     if (content) {
@@ -140,6 +140,9 @@ export class BunSqliteStore implements Store {
       metadata?: Record<string, unknown>;
       created_at?: string;
       skipUpdatedAt?: boolean;
+      // Write-attribution (vault#298) — principal + interface of this edit.
+      actor?: string | null;
+      via?: string | null;
       if_updated_at?: string;
     },
   ): Promise<Note> {

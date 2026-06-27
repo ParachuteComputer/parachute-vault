@@ -71,6 +71,7 @@ import {
   handleStorage,
   handleViewNote,
   type TagScopeCtx,
+  type WriteCtx,
 } from "./routes.ts";
 import { handleSubscribe } from "./subscribe.ts";
 import { handleTriggers } from "./triggers-api.ts";
@@ -812,7 +813,14 @@ export async function route(
     raw: auth.scoped_tags,
   };
 
-  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope);
+  // Write-attribution context (vault#298). `auth.actor` is the principal;
+  // `auth.via` is the credential class (`api` for hub JWTs + legacy keys,
+  // `operator` for the env-var bearer). The REST surface IS the `api` channel,
+  // so no refinement is needed here — the base via stands (the MCP handler is
+  // the one that refines to `mcp`). Threaded only into the write handler.
+  const writeCtx: WriteCtx = { actor: auth.actor, via: auth.via };
+
+  if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
   // Live-query SSE subscription (design 2026-06-08). Snapshot + scoped live
   // upsert/remove events over text/event-stream. Auth + tag-scope already
   // resolved above and threaded through, mirroring the /notes branch.

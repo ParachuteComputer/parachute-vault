@@ -22,6 +22,36 @@ import { getIndexedField, releaseField } from "./indexed-fields.js";
 
 let idCounter = 0;
 
+/**
+ * Write-attribution context (vault#298) — the two axes of provenance threaded
+ * from the authenticated request down into every note write.
+ *
+ *   actor — WHO: the principal the write is attributed to (a JWT `sub`, or an
+ *           operator / `token:<id>` label for non-JWT auth). Lands in
+ *           `created_by` on the first write and `last_updated_by` on every
+ *           write.
+ *   via   — VIA WHAT: the interface/channel the write arrived through
+ *           (`mcp`, `surface:<name>`, `agent:<id>`, `operator`/`cli`, `api`).
+ *           Lands in `created_via` / `last_updated_via` symmetrically.
+ *
+ * Both are independently optional — an internal/import write may carry
+ * neither, and a non-JWT operator write carries an `actor`/`via` pair without
+ * a `sub`. `undefined` (or a missing context) means "don't write this column,"
+ * so legacy callers and importers leave attribution NULL rather than
+ * fabricating it.
+ */
+export interface WriteContext {
+  actor?: string | null;
+  via?: string | null;
+}
+
+/** Normalize an attribution value: empty/whitespace → null (never store ""). */
+function attrValue(v: string | null | undefined): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length === 0 ? null : t;
+}
+
 /** Generate a timestamp-based ID: YYYY-MM-DD-HH-MM-SS-ffffff */
 export function generateId(): string {
   const now = new Date();
@@ -41,7 +71,7 @@ export function generateId(): string {
 export function createNote(
   db: Database,
   content: string,
-  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string },
+  opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null },
 ): Note {
   const id = opts?.id ?? generateId();
   const createdAt = opts?.created_at ?? new Date().toISOString();
@@ -51,6 +81,14 @@ export function createNote(
   // Validation happens at the API surface (MCP/REST) — the Store accepts
   // whatever the caller passed; importer paths trust the export's shape.
   const extension = opts?.extension ?? "md";
+
+  // Write-attribution (vault#298). On CREATE both axes land in the
+  // `created_*` columns AND mirror into `last_updated_*` — the first write IS
+  // the most-recent write, so a never-updated note reports the same author on
+  // both. NULL when the caller passed no attribution (internal/import writes),
+  // never an empty string.
+  const actor = attrValue(opts?.actor);
+  const via = attrValue(opts?.via);
 
   // Empty content is a valid state (vault#323): skeleton notes, drafts
   // saved before content, organizing-only notes, capture-then-fill flows.
@@ -66,8 +104,8 @@ export function createNote(
   // "user-touched since creation."
   try {
     db.prepare(
-      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at, extension) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, content, path, metadata, createdAt, createdAt, extension);
+      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at, extension, created_by, created_via, last_updated_by, last_updated_via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, content, path, metadata, createdAt, createdAt, extension, actor, via, actor, via);
   } catch (err) {
     if (path !== null && isPathUniqueError(err)) {
       throw new PathConflictError(path);
@@ -322,6 +360,16 @@ export function updateNote(
     created_at?: string;
     skipUpdatedAt?: boolean;
     /**
+     * Write-attribution (vault#298). When set, the most-recent-write columns
+     * `last_updated_by` / `last_updated_via` are bumped to this principal /
+     * channel as part of the same UPDATE. Gated on the same condition as
+     * `updated_at` — a `skipUpdatedAt` machine write doesn't claim authorship,
+     * symmetric with not bumping the timestamp. `created_*` is never touched by
+     * an update (it's set-once at create). Omitted → attribution left as-is.
+     */
+    actor?: string | null;
+    via?: string | null;
+    /**
      * Optimistic concurrency token. When provided, the UPDATE runs with an
      * additional `AND updated_at IS ?` clause; if no row is affected and the
      * note still exists, a `ConflictError` is thrown.
@@ -358,6 +406,17 @@ export function updateNote(
     }
     sets.push("updated_at = ?");
     values.push(now);
+
+    // Write-attribution (vault#298): the most-recent-write columns ride the
+    // SAME gate as `updated_at`. A `skipUpdatedAt` machine write doesn't bump
+    // the timestamp, so it doesn't claim authorship either. Set unconditionally
+    // within this branch (even to NULL) so a write that arrives without
+    // attribution honestly records "unknown author for the latest edit" rather
+    // than leaving a stale prior principal — the latest writer wasn't them.
+    sets.push("last_updated_by = ?");
+    values.push(attrValue(updates.actor));
+    sets.push("last_updated_via = ?");
+    values.push(attrValue(updates.via));
   }
 
   if (updates.content !== undefined) {
@@ -599,6 +658,29 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
       conditions.push(`LOWER(n.extension) IN (${placeholders})`);
       params.push(...cleaned);
     }
+  }
+
+  // Write-attribution filters (vault#298). Exact match on the indexed
+  // attribution columns. Each rides its own B-tree (idx_notes_<col>), so
+  // "everything Mathilda wrote" / "everything via the meeting-ingest surface"
+  // is a seek, not a scan. NULL columns never match a non-null filter value
+  // (SQL `=` is unknown against NULL), so legacy/unattributed rows are
+  // correctly excluded from an attribution query.
+  if (opts.createdBy !== undefined) {
+    conditions.push("n.created_by = ?");
+    params.push(opts.createdBy);
+  }
+  if (opts.lastUpdatedBy !== undefined) {
+    conditions.push("n.last_updated_by = ?");
+    params.push(opts.lastUpdatedBy);
+  }
+  if (opts.createdVia !== undefined) {
+    conditions.push("n.created_via = ?");
+    params.push(opts.createdVia);
+  }
+  if (opts.lastUpdatedVia !== undefined) {
+    conditions.push("n.last_updated_via = ?");
+    params.push(opts.lastUpdatedVia);
   }
 
   // Metadata filters — operator objects route through the indexed generated
@@ -898,6 +980,10 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
     extension: opts.extension,
     ids: opts.ids,
     metadata: opts.metadata,
+    createdBy: opts.createdBy,
+    lastUpdatedBy: opts.lastUpdatedBy,
+    createdVia: opts.createdVia,
+    lastUpdatedVia: opts.lastUpdatedVia,
     dateFrom: opts.dateFrom,
     dateTo: opts.dateTo,
     dateFilter: opts.dateFilter,
@@ -1587,6 +1673,10 @@ export function toNoteIndex(note: Note): NoteIndex {
     extension: note.extension,
     createdAt: note.createdAt,
     updatedAt: note.updatedAt,
+    createdBy: note.createdBy ?? null,
+    createdVia: note.createdVia ?? null,
+    lastUpdatedBy: note.lastUpdatedBy ?? null,
+    lastUpdatedVia: note.lastUpdatedVia ?? null,
     tags: note.tags,
     metadata: note.metadata,
     byteSize,
@@ -1703,6 +1793,10 @@ export interface BulkNoteInput {
   metadata?: Record<string, unknown>;
   created_at?: string;
   extension?: string;
+  /** Write-attribution (vault#298) — see WriteContext. Per-item so a batch can
+   *  carry the same actor/via on every row. */
+  actor?: string | null;
+  via?: string | null;
 }
 
 export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
@@ -1719,6 +1813,8 @@ export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
           metadata: input.metadata,
           created_at: input.created_at,
           extension: input.extension,
+          actor: input.actor,
+          via: input.via,
         }),
       );
     }
@@ -1787,6 +1883,14 @@ interface NoteRow {
   created_at: string;
   updated_at: string | null;
   extension: string | null;
+  // Write-attribution (vault#298). All four nullable — NULL on legacy rows and
+  // on writes that carried no attribution context. A v22 vault reading these
+  // before its migration runs would see them absent on the row object
+  // (`SELECT *` simply omits non-existent columns); `?? null` normalizes.
+  created_by?: string | null;
+  created_via?: string | null;
+  last_updated_by?: string | null;
+  last_updated_via?: string | null;
 }
 
 function rowToNote(row: NoteRow): Note {
@@ -1807,5 +1911,13 @@ function rowToNote(row: NoteRow): Note {
     // Legacy notes (pre-#70) may have NULL updated_at. Fall back to created_at
     // so the optimistic-concurrency contract always has a real token to echo.
     updatedAt: row.updated_at ?? row.created_at,
+    // Write-attribution (vault#298). NULL passes through verbatim — a missing
+    // author is meaningful ("pre-attribution / unknown"), so we don't coerce
+    // to a placeholder. `?? null` collapses both SQL NULL and an absent column
+    // (pre-migration read) to the same `null`.
+    createdBy: row.created_by ?? null,
+    createdVia: row.created_via ?? null,
+    lastUpdatedBy: row.last_updated_by ?? null,
+    lastUpdatedVia: row.last_updated_via ?? null,
   };
 }

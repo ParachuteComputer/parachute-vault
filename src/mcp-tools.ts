@@ -166,10 +166,25 @@ export function generateScopedMcpTools(
         )
     : undefined;
 
+  // Write-attribution (vault#298). Every write through an MCP session arrives
+  // on the `mcp` channel — so we REFINE the auth's base `via` (the generic
+  // credential class) to `mcp` here, where the path/channel is known. The
+  // operator bearer keeps `operator` (its credential class IS its channel and
+  // is more informative than `mcp` for cross-container hub→vault writes); any
+  // other credential's via becomes `mcp`. `actor` (the principal) passes
+  // through unchanged.
+  const writeContext = auth
+    ? { actor: auth.actor, via: auth.via === "operator" ? "operator" : "mcp" }
+    : undefined;
+
   const tools = generateMcpTools(
     store,
-    expandVisibility || nearTraversable
-      ? { ...(expandVisibility ? { expandVisibility } : {}), ...(nearTraversable ? { nearTraversable } : {}) }
+    expandVisibility || nearTraversable || writeContext
+      ? {
+          ...(expandVisibility ? { expandVisibility } : {}),
+          ...(nearTraversable ? { nearTraversable } : {}),
+          ...(writeContext ? { writeContext } : {}),
+        }
       : undefined,
   );
 
