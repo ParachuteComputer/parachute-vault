@@ -36,7 +36,8 @@
  */
 
 import type { Store, Note } from "./types.js";
-import { strictViolations, type ValidationWarning } from "./schema-defaults.js";
+import type { ValidationWarning } from "./schema-defaults.js";
+import { enforceStrictWrite } from "./mcp.js";
 
 // Re-export for callers (tests, server layer) that work with the bypass
 // logger's violation list without importing schema-defaults directly.
@@ -383,7 +384,11 @@ export async function migrateTagField(
   // field (enum / type), so `onlyInvalid` means "the current value violates the
   // declared schema." Absent schema → never invalid (so onlyInvalid is a no-op,
   // which is the safe reading: with nothing to validate against, don't clobber).
-  const isValid = makeFieldValidator(store, tag, field);
+  // Only built for the transform that uses it; other transforms never call it.
+  const isValid =
+    transform.kind === "set_default" && transform.onlyInvalid
+      ? makeFieldValidator(store, tag, field)
+      : undefined;
 
   const notes = await collectTaggedNotes(store, tag);
 
@@ -452,21 +457,29 @@ export async function migrateTagField(
       delete nextMeta[result.dropField];
     }
 
-    // Run strict enforcement with bypass ON (MW2). The migration must write
-    // through a `strict:true` field that the back-catalog violates — bypass
-    // skips the throw, and `onBypass` logs the waived violations for audit.
-    const violations = strictViolations(
-      store.validateNoteAgainstSchemas({ path: note.path, tags: note.tags, metadata: nextMeta }),
+    // Run strict enforcement with bypass ON (MW2) through the SAME gate the
+    // MCP/REST write transports use, so the migration can't drift from the
+    // canonical enforcement contract (e.g. when audit-log #300 lands and
+    // `onBypass` grows a DB write). The migration must write THROUGH a
+    // `strict:true` field the back-catalog violates — bypass skips the throw,
+    // and `onBypass` logs the waived violations with attribution for audit.
+    enforceStrictWrite(
+      store,
+      { path: note.path, tags: note.tags, metadata: nextMeta },
+      {
+        bypass: true,
+        onBypass: opts.onStrictBypass
+          ? (violations) =>
+              opts.onStrictBypass!({
+                actor,
+                via,
+                path: note.path ?? null,
+                tags: note.tags,
+                violations,
+              })
+          : undefined,
+      },
     );
-    if (violations.length > 0) {
-      opts.onStrictBypass?.({
-        actor,
-        via,
-        path: note.path ?? null,
-        tags: note.tags,
-        violations,
-      });
-    }
 
     await store.updateNote(note.id, { metadata: nextMeta, actor, via });
   }

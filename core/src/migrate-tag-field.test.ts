@@ -91,6 +91,38 @@ describe("apply performs the transform correctly", () => {
     expect((await getMeta(b.id)).state).toBe("shipped"); // value not in map — untouched
   });
 
+  it("remap with a default fills missing/null AND remaps present values", async () => {
+    const missing = await store.createNote("missing", { tags: ["kpi"], metadata: {} });
+    const old = await store.createNote("old", { tags: ["kpi"], metadata: { state: "wip" } });
+    const kept = await store.createNote("kept", { tags: ["kpi"], metadata: { state: "shipped" } });
+
+    const result = await migrateTagField(store, {
+      tag: "kpi",
+      field: "state",
+      transform: { kind: "remap", map: { wip: "in_progress" }, default: "unknown" },
+      apply: true,
+    });
+
+    expect(result.changed).toBe(2); // missing (filled) + old (remapped)
+    expect((await getMeta(missing.id)).state).toBe("unknown"); // default filled
+    expect((await getMeta(old.id)).state).toBe("in_progress"); // remapped
+    expect((await getMeta(kept.id)).state).toBe("shipped"); // not in map — kept
+  });
+
+  it("set_default onlyInvalid is a no-op when no schema declares the field", async () => {
+    // No upsertTagRecord here — nothing to validate against, so onlyInvalid
+    // must NOT clobber an existing value (the conservative reading).
+    const a = await store.createNote("a", { tags: ["freeform"], metadata: { x: "anything" } });
+    const result = await migrateTagField(store, {
+      tag: "freeform",
+      field: "x",
+      transform: { kind: "set_default", value: "default", onlyInvalid: true },
+      apply: true,
+    });
+    expect(result.changed).toBe(0);
+    expect((await getMeta(a.id)).x).toBe("anything");
+  });
+
   it("sets a default on notes missing the field", async () => {
     const a = await store.createNote("a", { tags: ["task"], metadata: { title: "t" } });
     const b = await store.createNote("b", { tags: ["task"], metadata: { title: "u", priority: "high" } });
