@@ -1862,13 +1862,15 @@ describe("HTTP /notes", async () => {
     expect(body.map((n) => n.content)).toEqual(["plain"]);
   });
 
-  // ---- updated_at filter via date_field (vault#285 friction point 1.5) ----
+  // ---- updated_at filter via bracket date (vault#285 friction point 1.5) ----
   //
-  // HTTP plumbing routes `date_field=updated_at&date_from=…` straight to
-  // the core `dateFilter` resolver, which now recognizes `updated_at` as
-  // a real column. Smoke-tests the end-to-end HTTP path; the engine-side
-  // semantics are exercised in core.test.ts.
-  test("GET /notes?date_field=updated_at filters by last-write time", async () => {
+  // HTTP plumbing routes `meta[updated_at][gte]=…` straight to the core
+  // `dateFilter` resolver, which recognizes `updated_at` as a real column.
+  // Smoke-tests the end-to-end HTTP path; the engine-side semantics are
+  // exercised in core.test.ts. (The flat `date_field=updated_at&date_from=…`
+  // shape was removed in 0.6.4 — vault#288 — bracket-style is the only
+  // query-string date filter.)
+  test("GET /notes?meta[updated_at][gte]=… filters by last-write time", async () => {
     const a = await store.createNote("untouched", { id: "ua", path: "ua" });
     const b = await store.createNote("modified", { id: "ub", path: "ub" });
     // Bump b's updated_at into the test window, leave a's at its createdAt.
@@ -1878,7 +1880,7 @@ describe("HTTP /notes", async () => {
       .run("2026-04-25T00:00:00.000Z", b.id);
 
     const res = await handleNotes(
-      mkReq("GET", "/notes?date_field=updated_at&date_from=2026-04-01&include_content=true"),
+      mkReq("GET", "/notes?meta[updated_at][gte]=2026-04-01&include_content=true"),
       store,
       "",
     );
@@ -2880,7 +2882,7 @@ describe("HTTP /notes", async () => {
     });
 
     // ---- Bridge: created_at / updated_at via brackets route to dateFilter ----
-    test("`meta[created_at][gte]=…` routes to dateFilter (same result as flat date_field)", async () => {
+    test("`meta[created_at][gte]=…` routes to dateFilter", async () => {
       await store.createNote("old", { created_at: "2026-01-15T00:00:00.000Z" });
       await store.createNote("new", { created_at: "2026-04-15T00:00:00.000Z" });
 
@@ -2890,14 +2892,37 @@ describe("HTTP /notes", async () => {
         "",
       );
       const bracketBody = await bracketRes.json() as any[];
-      const flatRes = await handleNotes(
+      expect(bracketBody.map((n) => n.content)).toEqual(["new"]);
+    });
+
+    // ---- Removed: flat date params are now ignored (vault#288, breaking) ----
+    // The flat `date_field` / `date_from` / `date_to` query params were
+    // removed in 0.6.4. A request that passes ONLY the flat shape is no
+    // longer date-filtered — it comes back unfiltered. Use bracket-style
+    // (`meta[created_at][gte]=…`) instead. (The MCP `date_from`/`date_to`
+    // shorthand is a separate, supported path and is unaffected.)
+    test("flat date params (date_field/date_from/date_to) are ignored", async () => {
+      await store.createNote("old", { created_at: "2026-01-15T00:00:00.000Z" });
+      await store.createNote("new", { created_at: "2026-04-15T00:00:00.000Z" });
+
+      const targetedRes = await handleNotes(
         mkReq("GET", "/notes?date_field=created_at&date_from=2026-04-01&include_content=true"),
         store,
         "",
       );
-      const flatBody = await flatRes.json() as any[];
-      expect(bracketBody.map((n) => n.content)).toEqual(["new"]);
-      expect(bracketBody.map((n) => n.content)).toEqual(flatBody.map((n) => n.content));
+      const targetedBody = await targetedRes.json() as any[];
+      expect(targetedRes.status).toBe(200);
+      // Both notes returned — the flat param did not filter.
+      expect(targetedBody.map((n) => n.content).sort()).toEqual(["new", "old"]);
+
+      const bareRes = await handleNotes(
+        mkReq("GET", "/notes?date_from=2026-04-01&include_content=true"),
+        store,
+        "",
+      );
+      const bareBody = await bareRes.json() as any[];
+      expect(bareRes.status).toBe(200);
+      expect(bareBody.map((n) => n.content).sort()).toEqual(["new", "old"]);
     });
 
     test("`meta[updated_at][gte]=…` routes to dateFilter on n.updated_at", async () => {
@@ -3047,13 +3072,14 @@ describe("HTTP /notes", async () => {
       expect(body.error).toContain("not_in");
     });
 
-    // ---- Precedence on overlap ----
-    test("when both flat and bracket date params overlap, bracket wins", async () => {
+    // ---- Bracket applies; co-passed flat params are ignored (vault#288) ----
+    test("bracket date filter applies even when removed flat params are also passed", async () => {
       await store.createNote("old", { created_at: "2026-01-15T00:00:00.000Z" });
       await store.createNote("new", { created_at: "2026-04-15T00:00:00.000Z" });
-      // Bracket says "from 2026-04-01"; flat says "from 2020-01-01". If
-      // flat won, both notes would match. The bracket-wins precedence is
-      // verified by getting back only the post-April note.
+      // Bracket says "from 2026-04-01"; the (removed) flat params say "from
+      // 2020-01-01". The flat params are now inert, so only the bracket
+      // filter applies — back comes only the post-April note. (Pre-0.6.4
+      // this exercised bracket-wins precedence; flat is now simply ignored.)
       const res = await handleNotes(
         mkReq(
           "GET",

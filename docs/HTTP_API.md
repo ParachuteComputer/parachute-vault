@@ -52,7 +52,7 @@ That's the whole happy path. Everything else in this doc is detail.
   tool surface, but a few legacy fields (`createdAt`, `mimeType`) accept
   both. When in doubt, snake_case is the contract.
 - **Query params are snake_case**: `?include_content=true`, `?tag_match=any`,
-  `?date_from=2025-01-01`. This matches the MCP tool-arg convention, so one
+  `?path_prefix=Projects`. This matches the MCP tool-arg convention, so one
   concept ports cleanly between HTTP and MCP.
 - **Timestamps are ISO-8601** UTC strings (e.g. `2026-04-07T15:30:00.000Z`).
 - **No envelope**. Successful responses are the data itself (`{...}` or
@@ -244,8 +244,8 @@ to walk newly-written rows without losing the millisecond-tie edge.
 
 **When to use.** Agent loops, `parachute-runner` polling, "give me what's
 new since my last call" patterns. Wall-clock watermarks (passing back a
-prior `updated_at` as `date_from`) miss or double-count at the millisecond
-boundary; cursors eliminate the bookkeeping.
+prior `updated_at` as `meta[updated_at][gte]`) miss or double-count at the
+millisecond boundary; cursors eliminate the bookkeeping.
 
 **Format.** Opaque. Treat as a black box — base64url over an internal
 shape, self-contained, survives process restarts. Cursors bind to the query
@@ -481,13 +481,16 @@ Query params:
   - `extension=md&extension=csv` — filter by file extension (vault#328).
 
 - **Date filters**
-  - **Canonical (bracket-style)**: `meta[created_at][gte]=ISO`,
+  - **Bracket-style** (the query-string date filter): `meta[created_at][gte]=ISO`,
     `meta[updated_at][lt]=ISO`, etc. Composes with arbitrary metadata
-    filters through the same grammar.
-  - **Flat (deprecated)**: `date_field=created_at&date_from=ISO&date_to=ISO`
-    and the legacy two-param `date_from=ISO&date_to=ISO` (implicit
-    `created_at`). Still functional through 0.5.x; removal in a later 0.x
-    (vault#288). Bracket-style wins on overlap.
+    filters through the same grammar. Only `gte` (inclusive lower) and `lt`
+    (exclusive upper) are accepted on the `created_at` / `updated_at` columns.
+  - **Removed (vault#288)**: the flat `date_field` / `date_from` / `date_to`
+    query params (and the legacy bare `date_from`/`date_to` shape) were removed
+    in 0.6.4 and are now silently ignored — a request that passes only flat date
+    params comes back unfiltered. Use bracket-style. (The MCP `query-notes`
+    `date_from` / `date_to` shorthand is a separate, supported convenience and
+    is unaffected.)
 
 - **Metadata filters (bracket-style)**
 
