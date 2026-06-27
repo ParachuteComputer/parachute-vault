@@ -27,6 +27,8 @@ import { logStrictBypass } from "./scopes.ts";
 import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { buildVaultProjection, resolveTagInheritance } from "../core/src/vault-projection.ts";
+import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
   filterHydratedLinksByTagScope,
@@ -1997,6 +1999,64 @@ export async function handleTags(
     return json(result);
   }
 
+  // POST /tags/:name/conformance — count existing notes that would VIOLATE a
+  // proposed field spec for the tag (vault#283 tightening warning). Read-only
+  // (POST because it carries a proposed `fields` body). Must precede the
+  // /:name matcher so "conformance" isn't read as a tag name.
+  const conformanceMatch = subpath.match(/^\/([^/]+)\/conformance$/);
+  if (conformanceMatch) {
+    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    const cTag = decodeURIComponent(conformanceMatch[1]!);
+    if (tagScope.allowed && !tagScope.allowed.has(cTag)) {
+      return json({ error: "Tag not found", tag: cTag }, 404);
+    }
+    const body = (await req.json().catch(() => null)) as
+      | { fields?: Record<string, unknown> | null }
+      | null;
+    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    // The proposed fields the operator intends to save. Sanitized through the
+    // same parse the resolver uses (drop non-object specs). Empty/absent →
+    // nothing to enforce → zero violations.
+    const proposed: Record<string, tagSchemaOps.TagFieldSchema> = {};
+    if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      for (const [k, v] of Object.entries(body.fields)) {
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          proposed[k] = v as tagSchemaOps.TagFieldSchema;
+        }
+      }
+    }
+    const report = await store.countTagConformance(cTag, proposed);
+    return json(report);
+  }
+
+  // GET /tags/:name/effective — the tag's effective (own ∪ inherited) fields +
+  // direct/effective parents + schema-conflict info, drawn from the same
+  // projection vault-info exposes. Read-only inheritance preview for the
+  // Schema editor (vault#283). Must precede the /:name matcher.
+  const effectiveMatch = subpath.match(/^\/([^/]+)\/effective$/);
+  if (effectiveMatch) {
+    if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    const eTag = decodeURIComponent(effectiveMatch[1]!);
+    if (tagScope.allowed && !tagScope.allowed.has(eTag)) {
+      return json({ error: "Tag not found", tag: eTag }, 404);
+    }
+    const projection = buildVaultProjection(store.db);
+    const record = await store.getTagRecord(eTag);
+    // Resolve inheritance directly (not via projection.tags, which omits
+    // hierarchy-only tags carrying no own schema) so the editor's preview
+    // works even for a tag the operator is just starting to give fields.
+    const resolved = loadSchemaConfig(store.db);
+    const { effective_parents, effective_fields } = resolveTagInheritance(resolved, eTag);
+    return json({
+      name: eTag,
+      parents: record?.parent_names ?? [],
+      effective_parents,
+      fields: record?.fields ?? null,
+      effective_fields,
+      indexed_fields: projection.indexed_fields,
+    });
+  }
+
   // Routes with tag name
   const nameMatch = subpath.match(/^\/([^/]+)$/);
   if (!nameMatch) return json({ error: "Not found" }, 404);
@@ -2034,7 +2094,18 @@ export async function handleTags(
       fields?: Record<string, unknown> | null;
       relationships?: Record<string, unknown> | null;
       parent_names?: unknown;
+      /**
+       * When true, `fields` is treated as the FULL intended field map for the
+       * tag — fields absent from the payload are DROPPED (a replace, not a
+       * merge). Default false preserves the historical partial-update merge
+       * the MCP `update-tag` tool relies on (omitted keys preserved). The
+       * Schema editor (vault#283) sends the full map + `replace_fields: true`
+       * so removing a field row actually deletes the field. See
+       * patterns/tag-data-model.md.
+       */
+      replace_fields?: unknown;
     };
+    const replaceFields = body.replace_fields === true;
 
     // Validate the relationships payload up front so a bad payload returns
     // 400, not a thrown 500. `relationships` is an opaque vocabulary map
@@ -2071,7 +2142,10 @@ export async function handleTags(
     }
 
     // Field merge mirrors MCP update-tag — preserves prior keys when the
-    // payload only declares new ones.
+    // payload only declares new ones. UNLESS `replace_fields: true`, in which
+    // case `fields` is the full intended map and absent keys are dropped (the
+    // Schema editor's full-replacement save — vault#283; without this a
+    // removed field row is silently resurrected by the merge).
     let fieldsPatch:
       | Record<string, tagSchemaOps.TagFieldSchema>
       | null
@@ -2079,12 +2153,17 @@ export async function handleTags(
     if (body.fields === null) {
       fieldsPatch = null;
     } else if (body.fields !== undefined) {
-      const existing = await store.getTagSchema(tagName);
-      const merged: Record<string, tagSchemaOps.TagFieldSchema> = {
-        ...(existing?.fields ?? {}),
-        ...(body.fields as Record<string, tagSchemaOps.TagFieldSchema>),
-      };
-      fieldsPatch = Object.keys(merged).length > 0 ? merged : null;
+      if (replaceFields) {
+        const full = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
+        fieldsPatch = Object.keys(full).length > 0 ? full : null;
+      } else {
+        const existing = await store.getTagSchema(tagName);
+        const merged: Record<string, tagSchemaOps.TagFieldSchema> = {
+          ...(existing?.fields ?? {}),
+          ...(body.fields as Record<string, tagSchemaOps.TagFieldSchema>),
+        };
+        fieldsPatch = Object.keys(merged).length > 0 ? merged : null;
+      }
     }
 
     // A bad indexed-field name (or an unindexable type, or a cross-tag type

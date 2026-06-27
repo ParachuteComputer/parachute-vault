@@ -28,6 +28,10 @@ import {
   type ResolvedSchemas,
   type ValidationStatus,
 } from "./schema-defaults.js";
+import {
+  countConformanceViolations,
+  type ConformanceReport,
+} from "./conformance.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -714,6 +718,21 @@ export class BunSqliteStore implements Store {
     // contents the mirror persists.
     this.hooks.dispatchTag("upserted", tag, this);
     return result;
+  }
+
+  /**
+   * Conformance check (vault#283) — count how many EXISTING notes carrying
+   * `tag` (descendants included) would violate the PROPOSED field spec, so a
+   * tightening edit (strict / required / narrowed enum / changed type) can
+   * warn the operator BEFORE save. Pure read — no mutation. See
+   * core/src/conformance.ts.
+   */
+  async countTagConformance(
+    tag: string,
+    proposedFields: Record<string, tagSchemaOps.TagFieldSchema>,
+    opts?: { sampleLimit?: number },
+  ): Promise<ConformanceReport> {
+    return countConformanceViolations(this.db, tag, proposedFields, opts);
   }
 
   // ---- Batch Wikilink Sync ----

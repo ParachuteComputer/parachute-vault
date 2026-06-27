@@ -3,12 +3,14 @@ import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } f
 import type { PrunedField } from "./indexed-fields.js";
 import type { TagExpandMode } from "./tag-hierarchy.js";
 import type { ValidationStatus } from "./schema-defaults.js";
+import type { ConformanceReport } from "./conformance.js";
 
 // ---- Re-exports ----
 
 export type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 export type { PrunedField } from "./indexed-fields.js";
 export type { TagExpandMode } from "./tag-hierarchy.js";
+export type { ConformanceReport } from "./conformance.js";
 
 // ---- Note ----
 
@@ -412,6 +414,19 @@ export interface Store {
       parent_names?: string[] | null;
     },
   ): Promise<TagRecord>;
+
+  /**
+   * Conformance check (vault#283) — count existing notes carrying `tag`
+   * (descendants included) that would violate the PROPOSED field spec, so a
+   * tightening edit (strict / required / narrowed enum / changed type) can
+   * warn before save. Pure read. `proposedFields` is the full merged field
+   * map the operator intends to save; only those fields are checked.
+   */
+  countTagConformance(
+    tag: string,
+    proposedFields: Record<string, TagFieldSchema>,
+    opts?: { sampleLimit?: number },
+  ): Promise<ConformanceReport>;
 
   // Schema validation (post-v17: backed by `tags.fields` only — the
   // standalone note_schemas + schema_mappings subsystem retired in v17, see

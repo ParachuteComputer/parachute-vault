@@ -831,9 +831,17 @@ export async function route(
   // and the broad-vs-narrowed shape (`vault:<verb>` from pvt_*, or
   // `vault:<vaultName>:<verb>` from hub JWTs) are handled by
   // `hasScopeForVault`.
-  const requiredVerb = verbForMethod(req.method);
+  //
+  // Read-only POST carve-out (vault#283): the conformance check is a POST
+  // (it carries a proposed-fields body) but mutates nothing — it counts
+  // notes. Gate it on `read`, not `write`, so a read-scoped caller can
+  // preview a schema tightening without holding a write credential.
+  const apiSubpath = apiMatch[1] ?? "";
+  const isReadOnlyPost =
+    req.method === "POST" && /^\/tags\/[^/]+\/conformance$/.test(apiSubpath);
+  const requiredVerb = isReadOnlyPost ? "read" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
-    const requiredApiScope = scopeForMethod(req.method);
+    const requiredApiScope = isReadOnlyPost ? SCOPE_READ : scopeForMethod(req.method);
     return Response.json(
       {
         error: "Forbidden",

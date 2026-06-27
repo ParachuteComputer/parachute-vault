@@ -1956,6 +1956,131 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(200);
   });
 
+  // ----- vault#283: Schema editor read endpoints -------------------------
+
+  test("POST /api/tags/:name/conformance → counts notes violating a proposed spec", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("ok", { tags: ["task"], metadata: { status: "open" } });
+    await store.createNote("missing", { tags: ["task"], metadata: {} });
+    const admin = await createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/task/conformance";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" },
+        body: JSON.stringify({ fields: { status: { type: "string", required: true } } }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      tag: string;
+      total_notes: number;
+      violating_notes: number;
+      checked_fields: string[];
+    };
+    expect(body.tag).toBe("task");
+    expect(body.total_notes).toBe(2);
+    expect(body.violating_notes).toBe(1);
+    expect(body.checked_fields).toEqual(["status"]);
+  });
+
+  test("POST /api/tags/:name/conformance is read-only — a read token may run it", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("missing", { tags: ["task"], metadata: {} });
+    const readToken = await mintToken("journal", {
+      permission: "read",
+      scopes: ["vault:read"],
+    });
+
+    const path = "/vault/journal/api/tags/task/conformance";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${readToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ fields: { status: { type: "string", required: true } } }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { violating_notes: number };
+    expect(body.violating_notes).toBe(1);
+  });
+
+  test("PUT /api/tags/:name with replace_fields drops omitted fields (no merge resurrection)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string" }, due: { type: "string" } },
+    });
+    const admin = await createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/task";
+    // Send only `status` WITH replace_fields → `due` must be dropped.
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" },
+        body: JSON.stringify({ fields: { status: { type: "string" } }, replace_fields: true }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(200);
+    const rec = await store.getTagRecord("task");
+    expect(Object.keys(rec?.fields ?? {})).toEqual(["status"]);
+    expect(rec?.fields?.due).toBeUndefined();
+  });
+
+  test("PUT /api/tags/:name WITHOUT replace_fields preserves omitted fields (merge — MCP contract)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string" }, due: { type: "string" } },
+    });
+    const admin = await createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/task";
+    // Send only `status` WITHOUT the flag → `due` preserved (partial update).
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" },
+        body: JSON.stringify({ fields: { status: { type: "string", enum: ["a"] } } }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(200);
+    const rec = await store.getTagRecord("task");
+    expect(Object.keys(rec?.fields ?? {}).sort()).toEqual(["due", "status"]);
+  });
+
+  test("GET /api/tags/:name/effective → surfaces inherited fields + parents", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    // dev declares a field; dev/log inherits it via parent_names.
+    await store.upsertTagRecord("dev", {
+      fields: { area: { type: "string" } },
+    });
+    await store.upsertTagRecord("dev/log", { parent_names: ["dev"] });
+    const admin = await createAdminToken("journal");
+
+    const path = "/vault/journal/api/tags/dev%2Flog/effective";
+    const res = await route(authed(admin, "GET", path), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      name: string;
+      parents: string[];
+      effective_parents: string[];
+      effective_fields: Record<string, { type?: string }>;
+    };
+    expect(body.parents).toEqual(["dev"]);
+    expect(body.effective_parents).toContain("dev");
+    expect(body.effective_fields.area?.type).toBe("string");
+  });
+
   test("POST /api/tags/:name/rename → 200 cascades token allowlists (vault#240)", async () => {
     createVault("journal");
     const store = getVaultStore("journal");
