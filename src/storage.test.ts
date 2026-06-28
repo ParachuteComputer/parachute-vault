@@ -146,10 +146,13 @@ describe("storage upload allowlist", () => {
     expect(body.error).toContain(".html");
   });
 
-  test("rejects .js / .xhtml — active-content types stay out even after widening", async () => {
+  test("rejects active-content types (.js/.mjs/.xhtml/.htm/.xml) even after widening", async () => {
     for (const [name, mime] of [
       ["script.js", "text/javascript"],
+      ["mod.mjs", "text/javascript"],
       ["page.xhtml", "application/xhtml+xml"],
+      ["page.htm", "text/html"],
+      ["feed.xml", "application/xml"],
     ] as const) {
       const res = await handleStorage(uploadRequest(name, mime), "/upload", "default", uploadStore);
       expect(res.status).toBe(400);
