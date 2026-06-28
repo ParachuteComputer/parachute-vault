@@ -1,17 +1,16 @@
 /**
- * Storage upload allowlist tests (issue #127; widened for documents/ebooks).
+ * Storage upload policy tests (issue #127 origin; vault#517 deny-list).
  *
- * The allowlist guards `POST /api/storage/upload` against turning user
- * uploads into XSS vectors when the asset is later served back from
- * `/storage/`. We pin both the accepted set and the deliberate exclusions
- * so a future widening doesn't quietly let SVG/HTML in.
- *
- * The accepted set is intentionally broad — a knowledge vault stores ebooks
- * (.epub/.mobi), office docs, plain text / markdown / data, and .zip archives,
- * not just media. But it stays an ALLOWLIST (fail-closed): active-content
- * extensions (.svg/.html/.js…) and unknown binaries (.exe) are rejected. The
- * GET serve path additionally pins `X-Content-Type-Options: nosniff` so a
- * served asset can never be sniffed into an executable type.
+ * `POST /api/storage/upload` accepts ANY file EXCEPT the active-content set a
+ * browser can execute when the asset is served back same-origin from
+ * `/storage/` (.svg/.html/.htm/.xhtml/.xml/.js/.mjs/.cjs/.css). A knowledge
+ * vault stores arbitrary files — ebooks, office docs, datasets, archives,
+ * binaries — so the long tail (.epub/.csv/.zip/.exe/…) is accepted, not
+ * rejected. We pin the accepted breadth AND the deliberate blocklist so a
+ * future edit can't quietly let SVG/HTML in (or quietly start rejecting docs).
+ * Two guards keep served files inert: every non-curated type serves as
+ * application/octet-stream, and the GET serve path pins
+ * `X-Content-Type-Options: nosniff`.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
@@ -124,12 +123,15 @@ describe("storage upload allowlist", () => {
     }
   });
 
-  test("an allowed extension without an explicit MIME serves as octet-stream (download)", async () => {
-    // .pages is allowed (iWork doc) but has no entry in MIME_TYPES → octet-stream.
-    const res = await handleStorage(uploadRequest("deck.pages", "application/octet-stream"), "/upload", "default", uploadStore);
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as { mimeType: string };
-    expect(body.mimeType).toBe("application/octet-stream");
+  test("accepts arbitrary / unknown files — served as octet-stream (download), never run", async () => {
+    // Deny-list policy (vault#517): anything not in the active-content blocklist
+    // is accepted. Unknown/no-MIME extensions serve as octet-stream — a download.
+    for (const name of ["deck.pages", "tool.exe", "data.bin", "Makefile", "archive.tar.gz"] as const) {
+      const res = await handleStorage(uploadRequest(name, "application/octet-stream"), "/upload", "default", uploadStore);
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { mimeType: string };
+      expect(body.mimeType).toBe("application/octet-stream");
+    }
   });
 
   test("rejects .svg — XSS vector via inline <script> (#127)", async () => {
@@ -146,22 +148,22 @@ describe("storage upload allowlist", () => {
     expect(body.error).toContain(".html");
   });
 
-  test("rejects active-content types (.js/.mjs/.xhtml/.htm/.xml) even after widening", async () => {
+  test("rejects the active-content set (.js/.mjs/.cjs/.xhtml/.htm/.xml/.css/.shtml)", async () => {
     for (const [name, mime] of [
       ["script.js", "text/javascript"],
       ["mod.mjs", "text/javascript"],
+      ["mod.cjs", "text/javascript"],
       ["page.xhtml", "application/xhtml+xml"],
       ["page.htm", "text/html"],
+      ["page.shtml", "text/html"],
       ["feed.xml", "application/xml"],
+      ["style.css", "text/css"],
     ] as const) {
       const res = await handleStorage(uploadRequest(name, mime), "/upload", "default", uploadStore);
       expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("not allowed");
     }
-  });
-
-  test("rejects unknown extensions (default-deny)", async () => {
-    const res = await handleStorage(uploadRequest("payload.exe", "application/octet-stream"), "/upload", "default", uploadStore);
-    expect(res.status).toBe(400);
   });
 });
 

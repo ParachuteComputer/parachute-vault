@@ -2908,44 +2908,43 @@ async function handleRetryLegacyInBody(
 
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
-// Storage allowlist policy (default-deny — `storage.test.ts` pins this stance):
-//   - Media: audio + image + video formats people actually capture/store.
-//   - Documents: knowledge-vault content — PDFs, ebooks (.epub/.mobi),
-//     office docs, plain text / markdown / data files, and .zip archives.
-//   - DELIBERATELY EXCLUDED — anything a browser can execute as active
-//     content in our origin when served back from /storage/:
-//     .svg / .html / .htm / .xhtml / .xml (embed `<script>`), and
-//     .js / .mjs / .css. These would turn an upload into a same-origin XSS
-//     vector. The set is an allowlist (fail-closed): a truly unknown
-//     extension (.exe, random binaries) is rejected, not served. If a future
-//     use case needs SVG, sanitize on read (strip <script>/<foreignObject>)
-//     and revisit. Defense-in-depth: served bytes always carry
-//     `X-Content-Type-Options: nosniff` (see handleStorage GET) and any
-//     extension without an explicit safe MIME below serves as
-//     application/octet-stream (download, never rendered).
-const ALLOWED_EXTENSIONS = new Set([
-  // Audio
-  ".wav", ".mp3", ".m4a", ".ogg", ".oga", ".opus", ".aac", ".flac", ".webm",
-  // Image
-  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
-  ".tiff", ".tif", ".heic", ".heif", ".avif",
-  // Video
-  ".mp4", ".m4v", ".mov",
-  // Documents / ebooks / data (knowledge-vault content)
-  ".pdf", ".epub", ".mobi", ".azw3",
-  ".txt", ".md", ".markdown", ".rtf",
-  ".csv", ".tsv", ".json",
-  ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
-  ".odt", ".ods", ".odp",
-  ".pages", ".key", ".numbers",
-  ".zip",
+// Storage upload policy: DENY-LIST (vault#517). A knowledge vault stores
+// arbitrary files — ebooks, office docs, datasets, archives, binaries — so we
+// accept ANY upload EXCEPT the handful of types a browser can execute as
+// active content in our origin when served back from /storage/. (The prior
+// allowlist rejected the long tail: .epub/.csv/.zip/… all came back "File type
+// not allowed".)
+//
+// BLOCKED — same-origin-XSS / active-content set:
+//   .html/.htm/.xhtml/.shtml/.xht  HTML — embeds <script>
+//   .svg                           XML image — embeds <script>
+//   .xml                           can carry XSLT / be parsed as XHTML
+//   .js/.mjs/.cjs                  JavaScript
+//   .css                           style-injection / UI-redress vector
+//
+// Two independent guards keep every STORED file inert when served:
+//   1. Only the curated MIME_TYPES below map to a real (always passive) type;
+//      every other extension serves as application/octet-stream — a download,
+//      never rendered.
+//   2. The GET byte-serve response pins `X-Content-Type-Options: nosniff`, so
+//      a browser can't sniff an octet-stream body into an executable type.
+// The blocklist is belt-and-suspenders on top of those: even if a future MIME
+// entry or an upstream proxy weakened (1) or (2), these extensions still never
+// land on disk. If a future use case needs SVG, sanitize on read (strip
+// <script>/<foreignObject>) and revisit.
+const BLOCKED_EXTENSIONS = new Set([
+  ".html", ".htm", ".xhtml", ".shtml", ".xht",
+  ".svg",
+  ".xml",
+  ".js", ".mjs", ".cjs",
+  ".css",
 ]);
 
-// Explicit MIME types for the safe, commonly-previewed formats. Anything in
-// ALLOWED_EXTENSIONS but absent here serves as application/octet-stream — a
-// download, never rendered (e.g. .pages/.key/.numbers/.azw3). None of these
-// map to an active type (text/html, image/svg+xml), so a served asset can't
-// execute script; `nosniff` on the GET response makes that ironclad.
+// Explicit MIME types for the commonly-previewed formats. Anything accepted
+// but absent here serves as application/octet-stream — a download, never
+// rendered (e.g. .pages/.key/.numbers/.azw3/.exe/arbitrary binaries). None of
+// these map to an active type (text/html, image/svg+xml), so a served asset
+// can't execute script; `nosniff` on the GET response makes that ironclad.
 const MIME_TYPES: Record<string, string> = {
   // Audio
   ".wav": "audio/wav",
@@ -3015,8 +3014,12 @@ export async function handleStorage(
       return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
     }
     const ext = extname(file.name).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) {
-      return json({ error: `File type ${ext} not allowed` }, 400);
+    if (BLOCKED_EXTENSIONS.has(ext)) {
+      // Active-content types only — blocked because they execute as script when
+      // served same-origin from /storage/ (see BLOCKED_EXTENSIONS). Everything
+      // else (incl. unknown/arbitrary files) is accepted and served as a
+      // download (octet-stream + nosniff).
+      return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
     }
 
     const date = new Date().toISOString().split("T")[0]!;
