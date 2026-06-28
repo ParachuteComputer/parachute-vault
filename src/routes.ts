@@ -2908,32 +2908,96 @@ async function handleRetryLegacyInBody(
 
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
 
-// Storage allowlist policy:
-//   - audio + image + .pdf (knowledge-vault content: papers, scans, receipts)
-//     + .mp4 (mobile capture default; iOS records mp4, not webm).
-//   - .svg and .html are deliberately excluded — both can embed `<script>`
-//     tags, which would turn an upload into a same-origin XSS vector when
-//     the asset is served back from /storage/. If a future use case needs
-//     SVG, sanitize on read (strip <script>/<foreignObject>) and revisit.
-const ALLOWED_EXTENSIONS = new Set([
-  ".wav", ".mp3", ".m4a", ".ogg", ".webm",
-  ".png", ".jpg", ".jpeg", ".gif", ".webp",
-  ".pdf", ".mp4",
+// Storage upload policy: DENY-LIST (vault#517). A knowledge vault stores
+// arbitrary files — ebooks, office docs, datasets, archives, binaries — so we
+// accept ANY upload EXCEPT the handful of types a browser can execute as
+// active content in our origin when served back from /storage/. (The prior
+// allowlist rejected the long tail: .epub/.csv/.zip/… all came back "File type
+// not allowed".)
+//
+// BLOCKED — same-origin-XSS / active-content set:
+//   .html/.htm/.xhtml/.shtml/.xht  HTML — embeds <script>
+//   .svg                           XML image — embeds <script>
+//   .xml                           can carry XSLT / be parsed as XHTML
+//   .js/.mjs/.cjs                  JavaScript
+//   .css                           style-injection / UI-redress vector
+//
+// Two independent guards keep every STORED file inert when served:
+//   1. Only the curated MIME_TYPES below map to a real (always passive) type;
+//      every other extension serves as application/octet-stream — a download,
+//      never rendered.
+//   2. The GET byte-serve response pins `X-Content-Type-Options: nosniff`, so
+//      a browser can't sniff an octet-stream body into an executable type.
+// The blocklist is belt-and-suspenders on top of those: even if a future MIME
+// entry or an upstream proxy weakened (1) or (2), these extensions still never
+// land on disk. If a future use case needs SVG, sanitize on read (strip
+// <script>/<foreignObject>) and revisit.
+const BLOCKED_EXTENSIONS = new Set([
+  ".html", ".htm", ".xhtml", ".shtml", ".xht",
+  ".svg",
+  ".xml",
+  ".js", ".mjs", ".cjs",
+  ".css",
 ]);
 
+// Explicit MIME types for the commonly-previewed formats. Anything accepted
+// but absent here serves as application/octet-stream — a download, never
+// rendered (e.g. .pages/.key/.numbers/.azw3/.exe/arbitrary binaries). None of
+// these map to an active type (text/html, image/svg+xml), so a served asset
+// can't execute script; `nosniff` on the GET response makes that ironclad.
+//
+// INVARIANT: never add an entry that maps to a browser-active type —
+// text/html, image/svg+xml, application/xhtml+xml, text/javascript,
+// application/wasm, text/css. Doing so re-enables same-origin execution for
+// that extension (and would mean it must also join BLOCKED_EXTENSIONS).
 const MIME_TYPES: Record<string, string> = {
+  // Audio
   ".wav": "audio/wav",
   ".mp3": "audio/mpeg",
   ".m4a": "audio/mp4",
   ".ogg": "audio/ogg",
+  ".oga": "audio/ogg",
+  ".opus": "audio/opus",
+  ".aac": "audio/aac",
+  ".flac": "audio/flac",
   ".webm": "audio/webm",
+  // Image
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".gif": "image/gif",
   ".webp": "image/webp",
-  ".pdf": "application/pdf",
+  ".bmp": "image/bmp",
+  ".tiff": "image/tiff",
+  ".tif": "image/tiff",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
+  ".avif": "image/avif",
+  // Video
   ".mp4": "video/mp4",
+  ".m4v": "video/x-m4v",
+  ".mov": "video/quicktime",
+  // Documents / ebooks / data
+  ".pdf": "application/pdf",
+  ".epub": "application/epub+zip",
+  ".mobi": "application/x-mobipocket-ebook",
+  ".txt": "text/plain; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8",
+  ".markdown": "text/markdown; charset=utf-8",
+  ".rtf": "application/rtf",
+  ".csv": "text/csv; charset=utf-8",
+  ".tsv": "text/tab-separated-values; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".odt": "application/vnd.oasis.opendocument.text",
+  ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+  ".odp": "application/vnd.oasis.opendocument.presentation",
+  ".zip": "application/zip",
 };
 
 export async function handleStorage(
@@ -2954,9 +3018,17 @@ export async function handleStorage(
     if (file.size > MAX_UPLOAD_BYTES) {
       return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
     }
-    const ext = extname(file.name).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) {
-      return json({ error: `File type ${ext} not allowed` }, 400);
+    // Strip trailing dots/whitespace before extracting the extension so a
+    // `evil.html.` / `evil.svg ` can't slip past the blocklist
+    // (extname("evil.html.") === "."). The blocklist is belt-and-suspenders;
+    // anything that still gets through serves as octet-stream + nosniff anyway.
+    const ext = extname(file.name.replace(/[.\s]+$/, "")).toLowerCase();
+    if (BLOCKED_EXTENSIONS.has(ext)) {
+      // Active-content types only — blocked because they execute as script when
+      // served same-origin from /storage/ (see BLOCKED_EXTENSIONS). Everything
+      // else (incl. unknown/arbitrary files) is accepted and served as a
+      // download (octet-stream + nosniff).
+      return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
     }
 
     const date = new Date().toISOString().split("T")[0]!;
@@ -3057,6 +3129,12 @@ export async function handleStorage(
       headers: {
         "Content-Type": contentType,
         "Content-Length": String(stat.size),
+        // Defense-in-depth: never let a browser MIME-sniff a stored asset into
+        // an active type (e.g. an octet-stream body sniffed as text/html).
+        // Combined with the upload blocklist (no .svg/.html) this closes the
+        // same-origin XSS surface for served attachments. Mirrors routing.ts's
+        // SPA-asset stance.
+        "X-Content-Type-Options": "nosniff",
       },
     });
   }

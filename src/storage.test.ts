@@ -1,10 +1,16 @@
 /**
- * Storage upload allowlist tests (issue #127).
+ * Storage upload policy tests (issue #127 origin; vault#517 deny-list).
  *
- * The allowlist guards `POST /api/storage/upload` against turning user
- * uploads into XSS vectors when the asset is later served back from
- * `/storage/`. We pin both the accepted set and the deliberate exclusions
- * so a future widening doesn't quietly let SVG/HTML in.
+ * `POST /api/storage/upload` accepts ANY file EXCEPT the active-content set a
+ * browser can execute when the asset is served back same-origin from
+ * `/storage/` (.svg/.html/.htm/.xhtml/.xml/.js/.mjs/.cjs/.css). A knowledge
+ * vault stores arbitrary files — ebooks, office docs, datasets, archives,
+ * binaries — so the long tail (.epub/.csv/.zip/.exe/…) is accepted, not
+ * rejected. We pin the accepted breadth AND the deliberate blocklist so a
+ * future edit can't quietly let SVG/HTML in (or quietly start rejecting docs).
+ * Two guards keep served files inert: every non-curated type serves as
+ * application/octet-stream, and the GET serve path pins
+ * `X-Content-Type-Options: nosniff`.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
@@ -91,6 +97,43 @@ describe("storage upload allowlist", () => {
     }
   });
 
+  test("accepts .epub — the reported gap (ebooks are knowledge content)", async () => {
+    const res = await handleStorage(uploadRequest("book.epub", "application/epub+zip"), "/upload", "default", uploadStore);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { mimeType: string; path: string };
+    expect(body.mimeType).toBe("application/epub+zip");
+    expect(body.path).toMatch(/\.epub$/);
+  });
+
+  test("accepts common document / text / data / archive types", async () => {
+    for (const [name, mime, expected] of [
+      ["notes.txt", "text/plain", "text/plain; charset=utf-8"],
+      ["readme.md", "text/markdown", "text/markdown; charset=utf-8"],
+      ["data.csv", "text/csv", "text/csv; charset=utf-8"],
+      ["data.json", "application/json", "application/json; charset=utf-8"],
+      ["doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+      ["archive.zip", "application/zip", "application/zip"],
+      ["clip.mov", "video/quicktime", "video/quicktime"],
+      ["photo.heic", "image/heic", "image/heic"],
+    ] as const) {
+      const res = await handleStorage(uploadRequest(name, mime), "/upload", "default", uploadStore);
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { mimeType: string };
+      expect(body.mimeType).toBe(expected);
+    }
+  });
+
+  test("accepts arbitrary / unknown files — served as octet-stream (download), never run", async () => {
+    // Deny-list policy (vault#517): anything not in the active-content blocklist
+    // is accepted. Unknown/no-MIME extensions serve as octet-stream — a download.
+    for (const name of ["deck.pages", "tool.exe", "data.bin", "Makefile", "archive.tar.gz"] as const) {
+      const res = await handleStorage(uploadRequest(name, "application/octet-stream"), "/upload", "default", uploadStore);
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { mimeType: string };
+      expect(body.mimeType).toBe("application/octet-stream");
+    }
+  });
+
   test("rejects .svg — XSS vector via inline <script> (#127)", async () => {
     const res = await handleStorage(uploadRequest("evil.svg", "image/svg+xml"), "/upload", "default", uploadStore);
     expect(res.status).toBe(400);
@@ -105,9 +148,31 @@ describe("storage upload allowlist", () => {
     expect(body.error).toContain(".html");
   });
 
-  test("rejects unknown extensions (default-deny)", async () => {
-    const res = await handleStorage(uploadRequest("payload.exe", "application/octet-stream"), "/upload", "default", uploadStore);
-    expect(res.status).toBe(400);
+  test("rejects the active-content set (.js/.mjs/.cjs/.xhtml/.htm/.xml/.css/.shtml)", async () => {
+    for (const [name, mime] of [
+      ["script.js", "text/javascript"],
+      ["mod.mjs", "text/javascript"],
+      ["mod.cjs", "text/javascript"],
+      ["page.xhtml", "application/xhtml+xml"],
+      ["page.xht", "application/xhtml+xml"],
+      ["page.htm", "text/html"],
+      ["page.shtml", "text/html"],
+      ["feed.xml", "application/xml"],
+      ["style.css", "text/css"],
+    ] as const) {
+      const res = await handleStorage(uploadRequest(name, mime), "/upload", "default", uploadStore);
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("not allowed");
+    }
+  });
+
+  test("trailing-dot / trailing-space can't slip a blocked type past the guard", async () => {
+    // extname("evil.html.") === "." — normalize the trailing run first.
+    for (const name of ["evil.html.", "evil.svg ", "evil.js."] as const) {
+      const res = await handleStorage(uploadRequest(name, "text/plain"), "/upload", "default", uploadStore);
+      expect(res.status).toBe(400);
+    }
   });
 });
 
@@ -166,6 +231,8 @@ describe("storage GET tag-scope enforcement", () => {
     const res = await handleStorage(getReq(inScopePath), `/${inScopePath}`, VAULT, store, ctx);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/pdf");
+    // Served bytes pin nosniff so a browser can't sniff them into an active type.
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect((await res.arrayBuffer()).byteLength).toBe(4);
   });
 
