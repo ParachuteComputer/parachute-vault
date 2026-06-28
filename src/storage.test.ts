@@ -154,6 +154,7 @@ describe("storage upload allowlist", () => {
       ["mod.mjs", "text/javascript"],
       ["mod.cjs", "text/javascript"],
       ["page.xhtml", "application/xhtml+xml"],
+      ["page.xht", "application/xhtml+xml"],
       ["page.htm", "text/html"],
       ["page.shtml", "text/html"],
       ["feed.xml", "application/xml"],
@@ -163,6 +164,14 @@ describe("storage upload allowlist", () => {
       expect(res.status).toBe(400);
       const body = (await res.json()) as { error: string };
       expect(body.error).toContain("not allowed");
+    }
+  });
+
+  test("trailing-dot / trailing-space can't slip a blocked type past the guard", async () => {
+    // extname("evil.html.") === "." — normalize the trailing run first.
+    for (const name of ["evil.html.", "evil.svg ", "evil.js."] as const) {
+      const res = await handleStorage(uploadRequest(name, "text/plain"), "/upload", "default", uploadStore);
+      expect(res.status).toBe(400);
     }
   });
 });

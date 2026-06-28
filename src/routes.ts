@@ -2945,6 +2945,11 @@ const BLOCKED_EXTENSIONS = new Set([
 // rendered (e.g. .pages/.key/.numbers/.azw3/.exe/arbitrary binaries). None of
 // these map to an active type (text/html, image/svg+xml), so a served asset
 // can't execute script; `nosniff` on the GET response makes that ironclad.
+//
+// INVARIANT: never add an entry that maps to a browser-active type —
+// text/html, image/svg+xml, application/xhtml+xml, text/javascript,
+// application/wasm, text/css. Doing so re-enables same-origin execution for
+// that extension (and would mean it must also join BLOCKED_EXTENSIONS).
 const MIME_TYPES: Record<string, string> = {
   // Audio
   ".wav": "audio/wav",
@@ -3013,7 +3018,11 @@ export async function handleStorage(
     if (file.size > MAX_UPLOAD_BYTES) {
       return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
     }
-    const ext = extname(file.name).toLowerCase();
+    // Strip trailing dots/whitespace before extracting the extension so a
+    // `evil.html.` / `evil.svg ` can't slip past the blocklist
+    // (extname("evil.html.") === "."). The blocklist is belt-and-suspenders;
+    // anything that still gets through serves as octet-stream + nosniff anyway.
+    const ext = extname(file.name.replace(/[.\s]+$/, "")).toLowerCase();
     if (BLOCKED_EXTENSIONS.has(ext)) {
       // Active-content types only — blocked because they execute as script when
       // served same-origin from /storage/ (see BLOCKED_EXTENSIONS). Everything
@@ -3122,7 +3131,7 @@ export async function handleStorage(
         "Content-Length": String(stat.size),
         // Defense-in-depth: never let a browser MIME-sniff a stored asset into
         // an active type (e.g. an octet-stream body sniffed as text/html).
-        // Combined with the upload allowlist (no .svg/.html) this closes the
+        // Combined with the upload blocklist (no .svg/.html) this closes the
         // same-origin XSS surface for served attachments. Mirrors routing.ts's
         // SPA-asset stance.
         "X-Content-Type-Options": "nosniff",
