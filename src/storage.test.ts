@@ -1,10 +1,17 @@
 /**
- * Storage upload allowlist tests (issue #127).
+ * Storage upload allowlist tests (issue #127; widened for documents/ebooks).
  *
  * The allowlist guards `POST /api/storage/upload` against turning user
  * uploads into XSS vectors when the asset is later served back from
  * `/storage/`. We pin both the accepted set and the deliberate exclusions
  * so a future widening doesn't quietly let SVG/HTML in.
+ *
+ * The accepted set is intentionally broad — a knowledge vault stores ebooks
+ * (.epub/.mobi), office docs, plain text / markdown / data, and .zip archives,
+ * not just media. But it stays an ALLOWLIST (fail-closed): active-content
+ * extensions (.svg/.html/.js…) and unknown binaries (.exe) are rejected. The
+ * GET serve path additionally pins `X-Content-Type-Options: nosniff` so a
+ * served asset can never be sniffed into an executable type.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
@@ -91,6 +98,40 @@ describe("storage upload allowlist", () => {
     }
   });
 
+  test("accepts .epub — the reported gap (ebooks are knowledge content)", async () => {
+    const res = await handleStorage(uploadRequest("book.epub", "application/epub+zip"), "/upload", "default", uploadStore);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { mimeType: string; path: string };
+    expect(body.mimeType).toBe("application/epub+zip");
+    expect(body.path).toMatch(/\.epub$/);
+  });
+
+  test("accepts common document / text / data / archive types", async () => {
+    for (const [name, mime, expected] of [
+      ["notes.txt", "text/plain", "text/plain; charset=utf-8"],
+      ["readme.md", "text/markdown", "text/markdown; charset=utf-8"],
+      ["data.csv", "text/csv", "text/csv; charset=utf-8"],
+      ["data.json", "application/json", "application/json; charset=utf-8"],
+      ["doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+      ["archive.zip", "application/zip", "application/zip"],
+      ["clip.mov", "video/quicktime", "video/quicktime"],
+      ["photo.heic", "image/heic", "image/heic"],
+    ] as const) {
+      const res = await handleStorage(uploadRequest(name, mime), "/upload", "default", uploadStore);
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as { mimeType: string };
+      expect(body.mimeType).toBe(expected);
+    }
+  });
+
+  test("an allowed extension without an explicit MIME serves as octet-stream (download)", async () => {
+    // .pages is allowed (iWork doc) but has no entry in MIME_TYPES → octet-stream.
+    const res = await handleStorage(uploadRequest("deck.pages", "application/octet-stream"), "/upload", "default", uploadStore);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { mimeType: string };
+    expect(body.mimeType).toBe("application/octet-stream");
+  });
+
   test("rejects .svg — XSS vector via inline <script> (#127)", async () => {
     const res = await handleStorage(uploadRequest("evil.svg", "image/svg+xml"), "/upload", "default", uploadStore);
     expect(res.status).toBe(400);
@@ -103,6 +144,16 @@ describe("storage upload allowlist", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain(".html");
+  });
+
+  test("rejects .js / .xhtml — active-content types stay out even after widening", async () => {
+    for (const [name, mime] of [
+      ["script.js", "text/javascript"],
+      ["page.xhtml", "application/xhtml+xml"],
+    ] as const) {
+      const res = await handleStorage(uploadRequest(name, mime), "/upload", "default", uploadStore);
+      expect(res.status).toBe(400);
+    }
   });
 
   test("rejects unknown extensions (default-deny)", async () => {
@@ -166,6 +217,8 @@ describe("storage GET tag-scope enforcement", () => {
     const res = await handleStorage(getReq(inScopePath), `/${inScopePath}`, VAULT, store, ctx);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/pdf");
+    // Served bytes pin nosniff so a browser can't sniff them into an active type.
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect((await res.arrayBuffer()).byteLength).toBe(4);
   });
 
