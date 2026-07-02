@@ -1,0 +1,10 @@
+{
+  ".parachute/notes-meta/01HX005.yaml": "id: 01HX005\npath: Data/table\nextension: csv\ntags:\n  - z-other\nmetadata:\n  rows: 2\ncreated_at: 2026-01-01T00:00:00.000Z\nupdated_at: 2026-01-01T00:00:00.000Z\n",
+  ".parachute/schemas/project.yaml": "description: A long-running effort\nfields:\n  status:\n    enum:\n      - active\n      - done\n    indexed: true\n    type: string\nname: project\nrelationships:\n  based-at:\n    from: project\n    note: freeform\n    to: place\n  works-on:\n    from: person\n    to: project\n",
+  ".parachute/vault.yaml": "description: portable-md byte-stability fixture\nexport_format_version: 1\nexported_at: 2026-07-02T00:00:00.000Z\nname: golden\n",
+  "Data/table.csv": "col1,col2\n1,2\n",
+  "Inbox/alpha.md": "---\nid: 01HX001\npath: Inbox/alpha\ntags:\n  - project\n  - z-other\nmetadata:\n  ctrl: \"a\\tb\"\n  notes: \"line1\\nline2\\nline3\"\n  priority: high\n  status: active\nlinks:\n  - metadata:\n      source: git://example\n    relationship: derived-from\n    target: 01HX002\ncreated_at: 2026-01-01T00:00:00.000Z\nupdated_at: 2026-01-01T00:01:00.000Z\n---\nalpha body\n",
+  "Inbox/beta.md": "---\nid: 01HX002\npath: Inbox/beta\ntags:\n  - project\nmetadata:\n  status: done\ncreated_at: 2026-01-01T00:00:00.000Z\nupdated_at: 2026-01-01T00:00:00.000Z\n---\nbeta body\n",
+  "Inbox/skeleton.md": "---\nid: 01HX004\npath: Inbox/skeleton\ntags:\n  - project\ncreated_at: 2026-01-01T00:00:00.000Z\nupdated_at: 2026-01-01T00:00:00.000Z\n---\n",
+  "_unpathed/01HX003.md": "---\nid: 01HX003\ncreated_at: 2026-01-01T00:00:00.000Z\nupdated_at: 2026-01-01T00:00:00.000Z\n---\nunpathed jot\n"
+}
