@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
 import { rebuildIndexes } from "./indexed-fields.js";
+import { transaction } from "./txn.js";
 
 export const SCHEMA_VERSION = 23;
 
@@ -680,8 +681,7 @@ function migrateToV13(db: Database): void {
 function migrateToV14(db: Database): void {
   if (!hasTable(db, "tags")) return;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  const { copiedSchemas, copiedHierarchy } = transaction(db, () => {
     // 1. ALTER TABLE — additive, idempotent.
     const cols: [string, string][] = [
       ["description", "TEXT"],
@@ -762,16 +762,13 @@ function migrateToV14(db: Database): void {
       db.exec("DROP TABLE tag_schemas");
     }
 
-    db.exec("COMMIT");
+    return { copiedSchemas, copiedHierarchy };
+  });
 
-    if (copiedSchemas > 0 || copiedHierarchy > 0) {
-      console.log(
-        `[vault] migrated to schema v14: copied ${copiedSchemas} tag_schemas + ${copiedHierarchy} _tags/* hierarchies onto tags rows`,
-      );
-    }
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
+  if (copiedSchemas > 0 || copiedHierarchy > 0) {
+    console.log(
+      `[vault] migrated to schema v14: copied ${copiedSchemas} tag_schemas + ${copiedHierarchy} _tags/* hierarchies onto tags rows`,
+    );
   }
 }
 
@@ -806,8 +803,7 @@ function migrateToV15(db: Database): void {
   ).get()) !== null;
   if (hasSchemas || hasMappings) return;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  const { copiedSchemas, copiedMappings } = transaction(db, () => {
     const now = new Date().toISOString();
     let copiedSchemas = 0;
     let copiedMappings = 0;
@@ -884,16 +880,13 @@ function migrateToV15(db: Database): void {
       }
     }
 
-    db.exec("COMMIT");
+    return { copiedSchemas, copiedMappings };
+  });
 
-    if (copiedSchemas > 0 || copiedMappings > 0) {
-      console.log(
-        `[vault] migrated to schema v15: copied ${copiedSchemas} _schemas/* + ${copiedMappings} _schema_defaults mappings into note_schemas/schema_mappings`,
-      );
-    }
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
+  if (copiedSchemas > 0 || copiedMappings > 0) {
+    console.log(
+      `[vault] migrated to schema v15: copied ${copiedSchemas} _schemas/* + ${copiedMappings} _schema_defaults mappings into note_schemas/schema_mappings`,
+    );
   }
 }
 
@@ -922,15 +915,10 @@ function migrateToV16(db: Database): void {
   // ALTER block so a fresh vault — where the column exists but the index
   // doesn't — still gets it.
   if (!hasColumn(db, "tokens", "vault_name")) {
-    db.exec("BEGIN IMMEDIATE");
-    try {
+    transaction(db, () => {
       db.exec("ALTER TABLE tokens ADD COLUMN vault_name TEXT");
       db.exec("CREATE INDEX IF NOT EXISTS idx_tokens_vault_name ON tokens(vault_name)");
-      db.exec("COMMIT");
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
-    }
+    });
     return;
   }
 
@@ -980,8 +968,7 @@ function migrateToV17(db: Database): void {
     ).all() as { schema_name: string; match_kind: string; match_value: string }[];
   }
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  transaction(db, () => {
     // Drop the index first — the index references the table; SQLite would
     // tear it down on DROP TABLE but the explicit DROP keeps the order
     // obvious if a future migration reads from sqlite_master mid-flight.
@@ -993,11 +980,7 @@ function migrateToV17(db: Database): void {
     if (hasNoteSchemas) {
       db.exec("DROP TABLE note_schemas");
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 
   if (droppedSchemas.length > 0 || droppedMappings.length > 0) {
     const schemaNames = droppedSchemas.map((s) => s.name).join(", ");
@@ -1052,8 +1035,7 @@ function migrateToV18(db: Database): void {
   const hasNewUnique = indexes.some((r) => r.name === "idx_notes_path_ext_unique");
   if (!needsColumn && hasNewUnique && !hasOldUnique) return;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  transaction(db, () => {
     if (needsColumn) {
       db.exec("ALTER TABLE notes ADD COLUMN extension TEXT NOT NULL DEFAULT 'md'");
     }
@@ -1065,11 +1047,7 @@ function migrateToV18(db: Database): void {
         "CREATE UNIQUE INDEX idx_notes_path_ext_unique ON notes(path, extension) WHERE path IS NOT NULL",
       );
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 }
 
 /**

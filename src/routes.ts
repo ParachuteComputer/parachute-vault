@@ -14,6 +14,7 @@
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
+import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import {
   parseContentRange,
@@ -1143,17 +1144,16 @@ async function handleNotesInner(
       // don't collide with concurrent single-item callers on the shared
       // bun:sqlite connection.
       const batched = items.length > 1;
-      if (batched) db.exec("BEGIN");
-      try {
+      const runBatch = async (): Promise<void> => {
         for (const item of items) {
           // Validate extension before reaching the Store (vault#328).
-          // Thrown inside the BEGIN block — outer catch rolls the batch
-          // back, same shape as the path-conflict path.
+          // Thrown inside the batch transaction — rolls the batch back,
+          // same shape as the path-conflict path.
           const extension = item.extension !== undefined
             ? validateExtension(item.extension)
             : undefined;
           // Strict-schema gate (vault#299) — reject before any write so a
-          // mid-batch violation rolls back via the outer BEGIN/ROLLBACK.
+          // mid-batch violation rolls back the batch transaction.
           gateStrictWrite(store, writeCtx, {
             path: item.path,
             tags: item.tags,
@@ -1181,9 +1181,10 @@ async function handleNotesInner(
 
           created.push((await store.getNote(note.id)) ?? note);
         }
-        if (batched) db.exec("COMMIT");
+      };
+      try {
+        await (batched ? transactionAsync(db, runBatch) : runBatch());
       } catch (e: any) {
-        if (batched) db.exec("ROLLBACK");
         // Duck-type for module-boundary robustness (matches the PATCH branch).
         if (e && e.code === "PATH_CONFLICT") {
           return json(

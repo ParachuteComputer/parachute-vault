@@ -705,36 +705,168 @@ export class CaseCollisionError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Export sink — the destination seam (Phase-1 shared-core, cloud design §4)
+// ---------------------------------------------------------------------------
+
+/** Result of a sink write: `ok`, or a refusal the engine records as a skip
+ *  (path-traversal, missing source) and surfaces in `ExportStats` without
+ *  aborting the whole export. */
+export type SinkWriteResult = { ok: true } | { ok: false; reason: string };
+
 /**
- * Export a vault to a portable-markdown directory. Writes:
- *   - `<outDir>/.parachute/vault.yaml`
- *   - `<outDir>/.parachute/schemas/<tag>.yaml` for each tag that declares
- *     description/fields/relationships/parent_names.
- *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
- *   - `<outDir>/.parachute/attachments/<id>/<basename>` for each attachment
- *     (only when `opts.assetsDir` is set; the path-traversal guard rejects
- *     attachments whose source path escapes assetsDir and whose dest path
- *     would escape outDir).
- *
- * The frontmatter `attachments[].path` value preserves the original
- * vault-internal path (relative to `assetsDir`). Import restores the
- * binary to that path. The sidecar location is derived from `id` so it
- * stays stable across renames + different export runs.
+ * Where an export's bytes land. `exportVault` (the engine) owns every
+ * format, ordering, case-collision and since-filter decision and asks the
+ * sink only to persist bytes — so a Durable-Object/R2 backend plugs a
+ * key-value sink in behind the same engine (cloud design §4/§5). The
+ * `caseSensitive` flag lets a key-addressed sink opt out of the
+ * disambiguation path; `attachmentsEnabled` gates binary copies.
  */
-export async function exportVaultToDir(
-  store: Store,
-  opts: ExportOptions,
-): Promise<ExportStats> {
-  const outDir = opts.outDir;
-  mkdirSync(outDir, { recursive: true });
-  const sidecar = join(outDir, SIDECAR_DIR);
-  mkdirSync(sidecar, { recursive: true });
-  mkdirSync(join(sidecar, "schemas"), { recursive: true });
-  // attachments dir only when assetsDir is wired (caller opted in).
-  if (opts.assetsDir) {
-    mkdirSync(join(sidecar, "attachments"), { recursive: true });
+export interface ExportSink {
+  /** Whether the destination namespace distinguishes filenames by case.
+   *  The fs sink probes the real filesystem (macOS/Windows default to
+   *  case-insensitive); a key-addressed sink (R2/DO) is always true. */
+  readonly caseSensitive: boolean;
+  /** Whether attachment binaries are copied. The fs sink enables this only
+   *  when an `assetsDir` is wired; markdown-only exports still emit the
+   *  frontmatter refs but leave the binaries in place. */
+  readonly attachmentsEnabled: boolean;
+  /** Persist a UTF-8 text document at export-root-relative `relPath`,
+   *  creating any parent structure. */
+  writeText(relPath: string, content: string): SinkWriteResult;
+  /** Copy one attachment binary into the export. `srcRelPath` is relative
+   *  to the attachment source (fs: `assetsDir`); `destRelPath` is export-
+   *  root-relative. Only called when `attachmentsEnabled`. */
+  copyAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult;
+}
+
+/**
+ * Filesystem `ExportSink` — the bun backend. Reproduces the pre-seam
+ * on-disk layout byte-for-byte (pinned by `portable-md-golden.test.ts`).
+ * Owns the case-sensitivity probe, the path-traversal guards (a note whose
+ * `path` escapes the export root is refused, never written off-tree), and
+ * attachment source resolution against `assetsDir`.
+ *
+ * Every guard resolves against the export root: keeping a write inside the
+ * export dir is the security property (the pre-seam per-subtree checks were
+ * belt-and-suspenders — a ULID sidecar id or a `basename()`-ed attachment
+ * name can't escape a subtree without also escaping the root).
+ */
+export class FsExportSink implements ExportSink {
+  readonly caseSensitive: boolean;
+  readonly attachmentsEnabled: boolean;
+  private readonly root: string;
+  private readonly rootResolved: string;
+  private readonly assetsDirResolved?: string;
+
+  constructor(opts: { outDir: string; assetsDir?: string; caseSensitiveOverride?: boolean }) {
+    this.root = opts.outDir;
+    mkdirSync(this.root, { recursive: true });
+    const sidecar = join(this.root, SIDECAR_DIR);
+    mkdirSync(sidecar, { recursive: true });
+    mkdirSync(join(sidecar, "schemas"), { recursive: true });
+    // attachments dir only when assetsDir is wired (caller opted in).
+    if (opts.assetsDir) {
+      mkdirSync(join(sidecar, "attachments"), { recursive: true });
+      this.assetsDirResolved = resolvePath(opts.assetsDir);
+    }
+    this.attachmentsEnabled = !!opts.assetsDir;
+    this.rootResolved = resolvePath(this.root);
+    // Probe AFTER outDir exists — probeCaseSensitive writes a tempfile into it.
+    this.caseSensitive = opts.caseSensitiveOverride ?? probeCaseSensitive(this.root);
   }
 
+  writeText(relPath: string, content: string): SinkWriteResult {
+    const full = join(this.root, relPath);
+    const fullResolved = resolvePath(full);
+    if (!isWithinDir(fullResolved, this.rootResolved)) {
+      return {
+        ok: false,
+        reason: `path-traversal: resolved write target "${fullResolved}" escapes export root "${this.rootResolved}"`,
+      };
+    }
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, content);
+    return { ok: true };
+  }
+
+  copyAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
+    // attachmentsEnabled guarantees assetsDirResolved is set.
+    const assetsDirResolved = this.assetsDirResolved!;
+    const srcResolved = resolvePath(join(assetsDirResolved, srcRelPath));
+    if (!isWithinDir(srcResolved, assetsDirResolved)) {
+      return {
+        ok: false,
+        reason: `path-traversal: source "${srcResolved}" escapes assetsDir "${assetsDirResolved}"`,
+      };
+    }
+    if (!existsSync(srcResolved)) {
+      return { ok: false, reason: `source file missing at "${srcResolved}"` };
+    }
+    const destFull = join(this.root, destRelPath);
+    const destResolved = resolvePath(destFull);
+    if (!isWithinDir(destResolved, this.rootResolved)) {
+      return {
+        ok: false,
+        reason: `path-traversal: dest "${destResolved}" escapes export root "${this.rootResolved}"`,
+      };
+    }
+    mkdirSync(dirname(destFull), { recursive: true });
+    copyFileSync(srcResolved, destResolved);
+    return { ok: true };
+  }
+}
+
+/** Note-iteration batch size for the export walk — bounds the working set so
+ *  a large vault never materializes its whole corpus at once (the pre-seam
+ *  full `limit: 1_000_000` load was the flagged memory-spike hazard). */
+const EXPORT_BATCH_SIZE = 500;
+
+/**
+ * Iterate every note in `(created_at ASC, id ASC)` order — the exact order
+ * the pre-seam `queryNotes({ sort: "asc", limit: 1_000_000 })` produced — in
+ * batches of `EXPORT_BATCH_SIZE`, so the export streams instead of
+ * materializing the full corpus. Windowing uses `limit`/`offset`, not the
+ * opaque cursor: the cursor path forces `updated_at` ordering, which would
+ * change which of two case-colliding notes keeps the plain filename (that
+ * choice is order-pinned by tests). A `(created_at, id)` keyset predicate
+ * isn't on the Store API surface; if offset re-scan cost ever bites on a
+ * very large vault that's a follow-up — the memory hazard the refactor
+ * targets is already closed by the windowing.
+ */
+async function* iterateAllNotes(store: Store): AsyncGenerator<Note> {
+  let offset = 0;
+  for (;;) {
+    const batch = await store.queryNotes({ sort: "asc", limit: EXPORT_BATCH_SIZE, offset });
+    for (const note of batch) yield note;
+    if (batch.length < EXPORT_BATCH_SIZE) break;
+    offset += EXPORT_BATCH_SIZE;
+  }
+}
+
+/** Engine-level export options — the subset of `ExportOptions` that isn't
+ *  fs-sink-specific (`outDir`/`assetsDir`/`caseSensitiveOverride` are owned
+ *  by `FsExportSink`). */
+export interface ExportEngineOptions {
+  vaultName?: string;
+  vaultDescription?: string;
+  since?: string;
+  exportedAt?: string;
+  failOnCaseCollision?: boolean;
+}
+
+/**
+ * Sink-agnostic export engine (Phase-1 shared-core, cloud design §4). Walks
+ * the vault in bounded batches and drives an `ExportSink`: `exportVaultToDir`
+ * wires the fs backend; a DO/R2 backend supplies its own sink. All format,
+ * ordering, case-collision and since-filter policy lives here — the sink only
+ * persists bytes, so the two runtimes stay byte-identical by construction.
+ */
+export async function exportVault(
+  store: Store,
+  sink: ExportSink,
+  opts: ExportEngineOptions = {},
+): Promise<ExportStats> {
   // 1. vault.yaml — vault meta + export format version. Trailing
   // export-time timestamp is the one place where re-exports legitimately
   // produce different bytes; callers wanting byte-equiv re-export pass
@@ -745,7 +877,7 @@ export async function exportVaultToDir(
     ...(opts.vaultName ? { name: opts.vaultName } : {}),
     ...(opts.vaultDescription ? { description: opts.vaultDescription } : {}),
   };
-  writeFileSync(join(sidecar, "vault.yaml"), emitYamlDoc(vaultMeta as unknown as Record<string, unknown>));
+  sink.writeText(join(SIDECAR_DIR, "vault.yaml"), emitYamlDoc(vaultMeta as unknown as Record<string, unknown>));
 
   // 2. Per-tag schemas. Only tags carrying at least one schema-shaped
   // field (description, fields, relationships, parent_names) get a file;
@@ -762,25 +894,15 @@ export async function exportVaultToDir(
     if (tag.parent_names !== undefined && tag.parent_names.length > 0) {
       doc.parent_names = tag.parent_names;
     }
-    writeFileSync(join(sidecar, "schemas", filename), emitYamlDoc(doc));
+    sink.writeText(join(SIDECAR_DIR, "schemas", filename), emitYamlDoc(doc));
     schemasWritten++;
   }
 
-  // 3. Per-note files. Iterate the full vault; if `since` is set, filter
-  // by updated_at >= since (incremental export).
-  //
-  // Note: in-memory bulk load. The 1M cap is a defensive ceiling — for
-  // very large vaults (>>100k notes) we should swap to a cursor /
-  // streaming query so the whole result set doesn't have to materialize
-  // at once. PR 2 follow-up if a real workload surfaces (vault#317 F5).
-  const allNotes = await store.queryNotes({ limit: 1_000_000, sort: "asc" });
+  // 3. Per-note files — streamed in `EXPORT_BATCH_SIZE` batches (no
+  // full-corpus load). If `since` is set, filter by updated_at >= since
+  // (incremental export).
   const since = opts.since;
-  const outDirResolved = resolvePath(outDir);
-  const assetsDirResolved = opts.assetsDir ? resolvePath(opts.assetsDir) : undefined;
-  const attachmentsRoot = join(sidecar, "attachments");
-  const attachmentsRootResolved = resolvePath(attachmentsRoot);
-  const notesMetaRoot = join(sidecar, NOTES_META_DIR);
-  const notesMetaRootResolved = resolvePath(notesMetaRoot);
+  const caseSensitive = sink.caseSensitive;
   let notesWritten = 0;
   let attachmentsWritten = 0;
   let sidecarsWritten = 0;
@@ -788,48 +910,32 @@ export async function exportVaultToDir(
   const skippedAttachments: { note_id: string; attachment_id: string; path: string; reason: string }[] = [];
   const disambiguatedPaths: ExportStats["disambiguated_paths"] = [];
 
-  // Case-collision detection (vault#327). On case-insensitive
-  // filesystems (macOS APFS-default, Windows NTFS-default, FAT/exFAT),
-  // two notes whose paths differ only by case collapse into one file
-  // on write — silent data loss. We probe the export dir's filesystem
-  // once, then either ship as-is (case-sensitive) or build a lowercase
-  // `(path, extension)` index during the walk and disambiguate
-  // colliding notes with an `__<id-short>` filename suffix.
-  //
-  // The note's stored `path` (in frontmatter + sidecar) stays canonical;
-  // only the on-disk filename is suffixed. Import recovers the
-  // canonical path from frontmatter/sidecar, not from the filename.
-  const caseSensitive = opts.caseSensitiveOverride ?? probeCaseSensitive(outDir);
-  // Lowercased `<path>|<ext>` → first-write note-id. Subsequent matches
-  // on the same key trigger disambiguation. Only populated on
-  // case-insensitive filesystems.
+  // Case-collision detection (vault#327). On case-insensitive filesystems
+  // (macOS APFS-default, Windows NTFS-default, FAT/exFAT), two notes whose
+  // paths differ only by case collapse into one file on write — silent
+  // data loss. The sink reports its namespace's case-sensitivity; on a
+  // case-insensitive sink we build a lowercase `(path, extension)` index
+  // during the walk and disambiguate colliding notes with an `__<id-short>`
+  // filename suffix. The note's stored `path` (in frontmatter + sidecar)
+  // stays canonical; only the on-disk filename is suffixed. Import recovers
+  // the canonical path from frontmatter/sidecar, not from the filename.
   const seenLowerKeys = new Map<string, string>();
 
   // Strict-mode pre-scan (vault#327 Phase 2). When the caller passes
-  // `failOnCaseCollision: true`, surface every collision group in one
-  // typed error BEFORE any write lands on disk — partial-export-then-
-  // throw would leave the operator with a half-mirrored output dir to
-  // clean up. The pre-scan walks every note in the vault (NOT
-  // since-filtered: a since-filter belongs in the write loop —
-  // collisions can involve one old + one new path, and a since-only
-  // pre-scan would miss those entirely, silently degrading the strict
-  // guarantee on every poll cycle after the initial export). When no
-  // collisions exist on a case-insensitive FS, the pre-scan is a
-  // no-op (cheap); on a case-sensitive FS it's skipped entirely.
-  //
-  // Perf: the pre-scan calls `noteToPortable` (3 DB queries per note:
-  // links, attachments, content). The main loop below also calls
-  // `noteToPortable` — without caching, every note that ALSO passes
-  // the since-filter would be serialized twice (~2x the DB round-
-  // trips on a large strict-mode export). Stash every pre-scan result
-  // in `prescanPortables` and reuse it below; cache-miss falls back
-  // to a fresh `noteToPortable` for safety. vault#350.
-  const prescanPortables = new Map<string, PortableNote>();
+  // `failOnCaseCollision: true`, surface every collision group in one typed
+  // error BEFORE any note write lands — partial-export-then-throw would
+  // leave the operator a half-mirrored dir to clean up. The pre-scan walks
+  // every note (NOT since-filtered: a collision can involve one old + one
+  // new path). It streams in the same batches as the main pass and keeps
+  // only lightweight `(id, path, extension)` entries — the pre-seam version
+  // cached every full PortableNote to avoid a second `noteToPortable`, but
+  // that reintroduced the whole-corpus memory hazard this refactor closes;
+  // strict mode is a one-shot CLI flow, so the second serialize pass is an
+  // acceptable trade for bounded memory.
   if (opts.failOnCaseCollision && !caseSensitive) {
     const groups = new Map<string, Array<{ note_id: string; path: string; extension: string }>>();
-    for (const note of allNotes) {
+    for await (const note of iterateAllNotes(store)) {
       const portable = await noteToPortable(note, store);
-      prescanPortables.set(portable.id, portable);
       if (!portable.path) continue; // _unpathed/<id>.<ext> is case-stable
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
@@ -847,28 +953,24 @@ export async function exportVaultToDir(
     }
   }
 
-  for (const note of allNotes) {
+  for await (const note of iterateAllNotes(store)) {
     if (since && !shouldIncludeForSince(note, since)) continue;
-    // Reuse a pre-scan result when strict-mode populated the cache;
-    // otherwise serialize fresh. Same PortableNote shape either way,
-    // so the rest of the loop is untouched. vault#350.
-    const portable = prescanPortables.get(note.id) ?? (await noteToPortable(note, store));
+    const portable = await noteToPortable(note, store);
     let relPath = portableExportFilePath(portable);
 
-    // Decide whether this note's filename needs disambiguation
-    // (vault#327). Only meaningful when the FS is case-insensitive AND
-    // a prior note's (path, ext) tuple already claimed the same
-    // lowercased filename slot. Pathless notes (`_unpathed/<id>.<ext>`)
-    // are immune by construction — their filename embeds the id, which
-    // is case-stable already.
+    // Decide whether this note's filename needs disambiguation (vault#327).
+    // Only meaningful when the sink is case-insensitive AND a prior note's
+    // (path, ext) tuple already claimed the same lowercased filename slot.
+    // Pathless notes (`_unpathed/<id>.<ext>`) are immune by construction —
+    // their filename embeds the id, which is case-stable already.
     if (!caseSensitive && portable.path) {
       const ext = portable.extension ?? "md";
       const key = `${portable.path.toLowerCase()}|${ext.toLowerCase()}`;
       const prior = seenLowerKeys.get(key);
       if (prior !== undefined && prior !== portable.id) {
-        // Collision: emit the disambiguated form. The frontmatter /
-        // sidecar `path:` still holds the canonical (original) path so
-        // import recovers the truth.
+        // Collision: emit the disambiguated form. The frontmatter / sidecar
+        // `path:` still holds the canonical (original) path so import
+        // recovers the truth.
         const disambig = disambiguateFilename(portable.path, ext, portable.id);
         relPath = disambig;
         disambiguatedPaths.push({
@@ -881,100 +983,61 @@ export async function exportVaultToDir(
       }
     }
 
-    const fullPath = join(outDir, relPath);
-    // vault#317 F3 — path-traversal guard. A note with
-    // `path: "../../.ssh/authorized_keys"` would otherwise write outside
-    // outDir. Refuse the write and surface the offending note's path so
-    // the operator can fix the note (self-inflicted at vault level —
-    // user owns the data — but programmatic callers might not control
-    // the note path source, e.g. ingest from external systems).
-    const fullPathResolved = resolvePath(fullPath);
-    if (!isWithinDir(fullPathResolved, outDirResolved)) {
-      skipped.push({
-        path: portable.path,
-        reason: `path-traversal: resolved write target "${fullPathResolved}" escapes export root "${outDirResolved}"`,
-      });
+    // vault#317 F3 — path-traversal guard now lives in the sink: a note with
+    // `path: "../../.ssh/authorized_keys"` is refused (not written off-tree)
+    // and surfaced in `skipped_notes` so the operator can fix the note.
+    const noteWrite = sink.writeText(relPath, toPortableMarkdown(portable));
+    if (!noteWrite.ok) {
+      skipped.push({ path: portable.path, reason: noteWrite.reason });
       continue;
     }
-    mkdirSync(dirname(fullPath), { recursive: true });
-    writeFileSync(fullPath, toPortableMarkdown(portable));
     notesWritten++;
 
     // Sidecar metadata write for non-frontmatter-compat extensions
-    // (vault#328). The content file holds raw bytes (no YAML); the
-    // sidecar at .parachute/notes-meta/<id>.yaml carries id/path/tags/
-    // metadata/links/attachments/timestamps.
+    // (vault#328). The content file holds raw bytes (no YAML); the sidecar
+    // at .parachute/notes-meta/<id>.yaml carries id/path/tags/metadata/
+    // links/attachments/timestamps.
     const portableExt = portable.extension ?? "md";
     if (!supportsInlineFrontmatter(portableExt)) {
-      const sidecarFile = join(notesMetaRoot, `${portable.id}.yaml`);
-      const sidecarResolved = resolvePath(sidecarFile);
-      // Path-traversal guard symmetric with the attachments path: the
-      // sidecar lives under the .parachute/notes-meta/ subtree, period.
-      if (!isWithinDir(sidecarResolved, notesMetaRootResolved)) {
-        skipped.push({
-          path: portable.path,
-          reason: `path-traversal: sidecar write target "${sidecarResolved}" escapes notes-meta root "${notesMetaRootResolved}"`,
-        });
+      const sidecarWrite = sink.writeText(
+        join(SIDECAR_DIR, NOTES_META_DIR, `${portable.id}.yaml`),
+        toSidecarYaml(portable),
+      );
+      if (!sidecarWrite.ok) {
+        skipped.push({ path: portable.path, reason: sidecarWrite.reason });
       } else {
-        mkdirSync(notesMetaRoot, { recursive: true });
-        writeFileSync(sidecarResolved, toSidecarYaml(portable));
         sidecarsWritten++;
       }
     }
 
-    // Copy attachment binaries when assetsDir is wired. Each attachment
-    // is path-traversal-guarded on both ends: source under assetsDir,
-    // dest under outDir's sidecar attachments root. Missing source files
-    // are skipped (warn) rather than aborting — assetsDir state may
-    // legitimately lag the DB (e.g. file evicted while row persists).
-    if (assetsDirResolved && portable.attachments && portable.attachments.length > 0) {
+    // Copy attachment binaries when the sink has them enabled. Each
+    // attachment is path-traversal-guarded on both ends by the sink; missing
+    // source files are skipped (warn) rather than aborting — the assets state
+    // may legitimately lag the DB (e.g. file evicted while row persists).
+    if (sink.attachmentsEnabled && portable.attachments && portable.attachments.length > 0) {
       for (const att of portable.attachments) {
-        const srcPath = join(assetsDirResolved, att.path);
-        const srcResolved = resolvePath(srcPath);
-        if (!isWithinDir(srcResolved, assetsDirResolved)) {
+        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>. Using
+        // att.id as the directory name keeps multiple attachments with the
+        // same basename from colliding; basename keeps it human-readable.
+        const destRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
+        const copyResult = sink.copyAttachment(att.path, destRelPath);
+        if (copyResult.ok) {
+          attachmentsWritten++;
+        } else {
           skippedAttachments.push({
             note_id: portable.id,
             attachment_id: att.id,
             path: att.path,
-            reason: `path-traversal: source "${srcResolved}" escapes assetsDir "${assetsDirResolved}"`,
+            reason: copyResult.reason,
           });
-          continue;
         }
-        if (!existsSync(srcResolved)) {
-          skippedAttachments.push({
-            note_id: portable.id,
-            attachment_id: att.id,
-            path: att.path,
-            reason: `source file missing at "${srcResolved}"`,
-          });
-          continue;
-        }
-        // Dest: .parachute/attachments/<att-id>/<basename(att.path)>.
-        // Using att.id as the directory name keeps multiple attachments
-        // with the same basename from colliding; basename keeps the
-        // filename human-readable.
-        const destDir = join(attachmentsRoot, att.id);
-        const destFile = join(destDir, basename(att.path));
-        const destResolved = resolvePath(destFile);
-        if (!isWithinDir(destResolved, attachmentsRootResolved)) {
-          skippedAttachments.push({
-            note_id: portable.id,
-            attachment_id: att.id,
-            path: att.path,
-            reason: `path-traversal: dest "${destResolved}" escapes attachments root "${attachmentsRootResolved}"`,
-          });
-          continue;
-        }
-        mkdirSync(destDir, { recursive: true });
-        copyFileSync(srcResolved, destResolved);
-        attachmentsWritten++;
       }
     }
   }
   if (skipped.length > 0) {
-    // Surface to the caller without aborting — partial export is more
-    // useful than no export. CLI prints the list; programmatic callers
-    // can inspect via the return value.
+    // Surface to the caller without aborting — partial export is more useful
+    // than no export. CLI prints the list; programmatic callers inspect the
+    // return value.
     for (const s of skipped) {
       // eslint-disable-next-line no-console
       console.warn(`[export] skipped note (path="${s.path ?? "<unpathed>"}"): ${s.reason}`);
@@ -999,6 +1062,41 @@ export async function exportVaultToDir(
     skipped_notes: skipped,
     skipped_attachments: skippedAttachments,
   };
+}
+
+/**
+ * Export a vault to a portable-markdown directory (the bun/fs backend —
+ * thin wrapper over `exportVault` with an `FsExportSink`). Writes:
+ *   - `<outDir>/.parachute/vault.yaml`
+ *   - `<outDir>/.parachute/schemas/<tag>.yaml` for each tag that declares
+ *     description/fields/relationships/parent_names.
+ *   - `<outDir>/<note.path>.md` for each note (or `_unpathed/<id>.md`).
+ *   - `<outDir>/.parachute/attachments/<id>/<basename>` for each attachment
+ *     (only when `opts.assetsDir` is set; the sink's path-traversal guard
+ *     rejects attachments whose source escapes assetsDir or whose dest would
+ *     escape outDir).
+ *
+ * The frontmatter `attachments[].path` value preserves the original
+ * vault-internal path (relative to `assetsDir`). Import restores the binary
+ * to that path. The sidecar location is derived from `id` so it stays stable
+ * across renames + different export runs.
+ */
+export async function exportVaultToDir(
+  store: Store,
+  opts: ExportOptions,
+): Promise<ExportStats> {
+  const sink = new FsExportSink({
+    outDir: opts.outDir,
+    assetsDir: opts.assetsDir,
+    caseSensitiveOverride: opts.caseSensitiveOverride,
+  });
+  return exportVault(store, sink, {
+    vaultName: opts.vaultName,
+    vaultDescription: opts.vaultDescription,
+    since: opts.since,
+    exportedAt: opts.exportedAt,
+    failOnCaseCollision: opts.failOnCaseCollision,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,12 +1643,137 @@ export interface ImportStats {
   indexes_declared: number;
 }
 
+// ---------------------------------------------------------------------------
+// Import source — the read seam (Phase-1 shared-core, cloud design §4)
+// ---------------------------------------------------------------------------
+
 /**
- * Read a portable-md export directory back into a vault. Lossless
- * counterpart to `exportVaultToDir`. With `blowAway: true`, replaces
- * vault state byte-equivalent to the export (the disaster-recovery
- * path). Without it, upserts by frontmatter `id` — existing notes
- * updated in place, new notes created.
+ * Where an import reads its bytes from. `importVault` (the engine) owns all
+ * replay policy (schema-before-notes ordering, sidecar resolution, upsert
+ * merge, forward-ref link replay) and asks the source only to enumerate +
+ * read — so a DO/R2 import (from an uploaded tarball / bucket) plugs its own
+ * source in behind the same engine. `FsImportSource` is the bun backend
+ * (reads an `exportVaultToDir` output directory).
+ */
+export interface ImportSource {
+  /** `*.yaml` schema docs under `.parachute/schemas/` (name + raw text). */
+  readSchemaFiles(): Array<{ name: string; text: string }>;
+  /** Raw text of each `*.yaml` sidecar under `.parachute/notes-meta/`. */
+  readNotesMetaFiles(): string[];
+  /** Content files as export-root-relative POSIX paths (sorted, dot-dirs
+   *  excluded, containment-guarded). */
+  listContentFiles(): string[];
+  /** Read one content file by its export-relative path. */
+  readContentFile(relPath: string): string;
+  /** Whether attachment binaries are restored (fs: `assetsDir` wired). */
+  readonly attachmentsEnabled: boolean;
+  /** Restore one attachment binary. `srcRelPath` is export-root-relative
+   *  (`.parachute/attachments/<att.id>/<basename>`); `destRelPath` is
+   *  assets-relative (the note's `attachments[].path`). Only meaningful
+   *  when `attachmentsEnabled`. */
+  restoreAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult;
+}
+
+/**
+ * Filesystem `ImportSource` — reads an `exportVaultToDir` output directory.
+ * Owns the read-side path-traversal guards (refuse to follow a symlink out
+ * of the sidecar, refuse an attachment whose source escapes the attachments
+ * root or whose dest escapes assetsDir) so the engine consumes clean data.
+ */
+export class FsImportSource implements ImportSource {
+  readonly attachmentsEnabled: boolean;
+  private readonly inDir: string;
+  private readonly inDirResolved: string;
+  private readonly sidecar: string;
+  private readonly assetsDirResolved?: string;
+
+  constructor(opts: { inDir: string; assetsDir?: string }) {
+    this.inDir = opts.inDir;
+    this.inDirResolved = resolvePath(opts.inDir);
+    this.sidecar = join(opts.inDir, SIDECAR_DIR);
+    if (opts.assetsDir) this.assetsDirResolved = resolvePath(opts.assetsDir);
+    this.attachmentsEnabled = !!opts.assetsDir;
+  }
+
+  readSchemaFiles(): Array<{ name: string; text: string }> {
+    const dir = join(this.sidecar, "schemas");
+    if (!existsSync(dir)) return [];
+    const dirResolved = resolvePath(dir);
+    const out: Array<{ name: string; text: string }> = [];
+    for (const entry of readdirSync(dir)) {
+      if (!entry.endsWith(".yaml")) continue;
+      const fullPath = join(dir, entry);
+      // Path-traversal guard on the read side: refuse to follow a symlink
+      // out of the sidecar (readdirSync only surfaces names — belt-and-
+      // suspenders).
+      if (!isWithinDir(resolvePath(fullPath), dirResolved)) continue;
+      out.push({ name: entry, text: readFileSync(fullPath, "utf-8") });
+    }
+    return out;
+  }
+
+  readNotesMetaFiles(): string[] {
+    const dir = join(this.sidecar, NOTES_META_DIR);
+    if (!existsSync(dir)) return [];
+    const dirResolved = resolvePath(dir);
+    const out: string[] = [];
+    for (const entry of readdirSync(dir)) {
+      if (!entry.endsWith(".yaml")) continue;
+      if (entry.startsWith(".")) continue;
+      const fullPath = join(dir, entry);
+      if (!isWithinDir(resolvePath(fullPath), dirResolved)) continue;
+      out.push(readFileSync(fullPath, "utf-8"));
+    }
+    return out;
+  }
+
+  listContentFiles(): string[] {
+    const out: string[] = [];
+    for (const filePath of walkContentFiles(this.inDir)) {
+      // Containment check — walkContentFiles should already be safe, but
+      // verify the resolved path is inside inDir (symlinks).
+      if (!isWithinDir(resolvePath(filePath), this.inDirResolved)) continue;
+      out.push(relative(this.inDir, filePath).split(pathSep).join("/"));
+    }
+    return out;
+  }
+
+  readContentFile(relPath: string): string {
+    return readFileSync(join(this.inDir, relPath), "utf-8");
+  }
+
+  restoreAttachment(srcRelPath: string, destRelPath: string): SinkWriteResult {
+    const attachmentsRootResolved = resolvePath(join(this.sidecar, "attachments"));
+    const srcResolved = resolvePath(join(this.inDir, srcRelPath));
+    if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
+      return { ok: false, reason: `path-traversal on source: "${srcResolved}" escapes attachments root` };
+    }
+    if (!existsSync(srcResolved)) {
+      return { ok: false, reason: `source attachment file missing at "${srcResolved}"` };
+    }
+    // attachmentsEnabled guarantees assetsDirResolved is set.
+    const assetsDirResolved = this.assetsDirResolved!;
+    const destResolved = resolvePath(join(assetsDirResolved, destRelPath));
+    if (!isWithinDir(destResolved, assetsDirResolved)) {
+      return { ok: false, reason: `path-traversal on dest: "${destResolved}" escapes assetsDir` };
+    }
+    mkdirSync(dirname(destResolved), { recursive: true });
+    copyFileSync(srcResolved, destResolved);
+    return { ok: true };
+  }
+}
+
+/** Engine-level import options — the subset of `ImportOptions` that isn't
+ *  fs-source-specific (`inDir`/`assetsDir` are owned by `FsImportSource`). */
+export interface ImportEngineOptions {
+  blowAway?: boolean;
+  dryRun?: boolean;
+}
+
+/**
+ * Sink-agnostic import engine (Phase-1 shared-core, cloud design §4). Reads
+ * an `ImportSource` and replays it into `store`. `importPortableVault` wires
+ * the fs backend; a DO/R2 backend supplies its own source.
  *
  * Restoration order (matters for forward refs):
  *   1. Tag schemas (so notes with schema-bearing tags validate cleanly).
@@ -1561,25 +1784,15 @@ export interface ImportStats {
  *      pattern). Wikilinks rebuild themselves from `[[brackets]]` in
  *      content via the existing `syncAllWikilinks` pass.
  *   4. Attachments — DB row first, then file copy from sidecar to
- *      `<assetsDir>/<path>` when `assetsDir` is wired.
+ *      `<assetsDir>/<path>` when the source has attachments enabled.
  *
  * See vault#308 PR 2.
  */
-export async function importPortableVault(
+export async function importVault(
   store: Store,
-  opts: ImportOptions,
+  source: ImportSource,
+  opts: ImportEngineOptions = {},
 ): Promise<ImportStats> {
-  const inDir = opts.inDir;
-  const inDirResolved = resolvePath(inDir);
-  const sidecar = join(inDir, SIDECAR_DIR);
-  if (!existsSync(join(sidecar, "vault.yaml"))) {
-    throw new Error(
-      `not a portable-md export: missing ${join(SIDECAR_DIR, "vault.yaml")} in "${inDir}". ` +
-      `If this is a legacy Obsidian-shape directory, use the obsidian.ts \`parseObsidianVault\` ` +
-      `path instead — vault#308 importer only handles the portable-md format.`,
-    );
-  }
-
   const stats: ImportStats = {
     notes_created: 0,
     notes_updated: 0,
@@ -1593,17 +1806,22 @@ export async function importPortableVault(
     indexes_declared: 0,
   };
 
-  // 1. Optional wipe. Notes are deleted via the public Store API so
-  // hooks fire (callers depend on `attachment.deleted` hooks for
-  // assets-dir cleanup; we don't bypass that on blow-away).
+  // 1. Optional wipe. Notes are deleted via the public Store API so hooks
+  // fire (callers depend on `attachment.deleted` hooks for assets-dir
+  // cleanup; we don't bypass that on blow-away). Deleted in bounded batches
+  // — always take the first N remaining rows, so deletion never has to
+  // materialize the whole corpus (the pre-seam `limit: 1_000_000` load).
   if (opts.blowAway && !opts.dryRun) {
-    const existing = await store.queryNotes({ limit: 1_000_000 });
-    for (const note of existing) {
-      await store.deleteNote(note.id);
+    for (;;) {
+      const batch = await store.queryNotes({ sort: "asc", limit: EXPORT_BATCH_SIZE });
+      if (batch.length === 0) break;
+      for (const note of batch) {
+        await store.deleteNote(note.id);
+        stats.notes_wiped++;
+      }
     }
-    stats.notes_wiped = existing.length;
-    // Clear tag rows too — `deleteNote` clears note_tags via FK cascade
-    // but leaves the `tags` table rows in place (orphaned schemas).
+    // Clear tag rows too — `deleteNote` clears note_tags via FK cascade but
+    // leaves the `tags` table rows in place (orphaned schemas).
     const tagRecords = await store.listTagRecords();
     for (const tag of tagRecords) {
       await store.deleteTag(tag.tag);
@@ -1612,147 +1830,115 @@ export async function importPortableVault(
 
   // 2. Tag schemas — restore before notes so any tag a note carries can
   // validate against its schema on insert.
-  const schemasDir = join(sidecar, "schemas");
-  if (existsSync(schemasDir)) {
-    for (const entry of readdirSync(schemasDir)) {
-      if (!entry.endsWith(".yaml")) continue;
-      const fullPath = join(schemasDir, entry);
-      // Path-traversal guard on the read side: refuse to follow a
-      // symlink out of the sidecar (the readdirSync already only
-      // surfaces names; this is belt-and-suspenders).
-      const resolved = resolvePath(fullPath);
-      if (!isWithinDir(resolved, resolvePath(schemasDir))) continue;
-      const text = readFileSync(fullPath, "utf-8");
-      // Reuse the frontmatter parser by wrapping the doc in `---`s.
-      // The schema file is a YAML doc (no `---` markers); pad with them
-      // so `parseFrontmatter` can chew on it via the same code path.
-      const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-      const { frontmatter } = parseFrontmatter(wrapped);
-      const tagName = typeof frontmatter.name === "string" ? frontmatter.name : null;
-      if (!tagName) continue;
-      if (opts.dryRun) {
-        stats.schemas_restored++;
-        continue;
-      }
-      await store.upsertTagRecord(tagName, {
-        description: (frontmatter.description as string | null | undefined) ?? null,
-        fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
-        relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
-        parent_names: (frontmatter.parent_names as string[] | null | undefined) ?? null,
-      });
+  for (const { text } of source.readSchemaFiles()) {
+    // Reuse the frontmatter parser by wrapping the doc in `---`s. The schema
+    // file is a YAML doc (no `---` markers); pad with them so
+    // `parseFrontmatter` can chew on it via the same code path.
+    const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+    const { frontmatter } = parseFrontmatter(wrapped);
+    const tagName = typeof frontmatter.name === "string" ? frontmatter.name : null;
+    if (!tagName) continue;
+    if (opts.dryRun) {
       stats.schemas_restored++;
+      continue;
     }
+    await store.upsertTagRecord(tagName, {
+      description: (frontmatter.description as string | null | undefined) ?? null,
+      fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
+      relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
+      parent_names: (frontmatter.parent_names as string[] | null | undefined) ?? null,
+    });
+    stats.schemas_restored++;
   }
 
-  // 3. Notes. Walk every content file under inDir (dot-dirs already
-  // excluded). For frontmatter-compatible extensions (md, mdx) parse
-  // inline metadata. For sidecar-required extensions (csv, yaml, json,
-  // etc.) look up metadata in `.parachute/notes-meta/<id>.yaml`.
+  // 3. Notes. Walk every content file (dot-dirs already excluded by the
+  // source). For frontmatter-compatible extensions (md, mdx) parse inline
+  // metadata. For sidecar-required extensions (csv, yaml, json, etc.) look
+  // up metadata in `.parachute/notes-meta/<id>.yaml`.
   //
   // The sidecar's `path` + `extension` are the source of truth for the
-  // user-visible filename — but we walk filenames first and INDEX
-  // sidecars by `(path, extension)` for O(1) lookup per content file.
-  // Sidecars with no matching content file are warned about (and
-  // skipped) rather than triggering a write — preserves the
-  // export-bytes-are-truth invariant.
-  // Sidecar index: keyed by lowercased `<path>|<ext>` so the walker's
-  // filename-derived key (also lowered) matches. The bucket holds the
-  // full sidecar(s) — multiple entries occur when two notes share a
-  // case-insensitive path (vault#327 collisions). The lookup logic
-  // picks the right sidecar from the bucket using the walker's
-  // case-preserved filename + the disambiguated-id-suffix heuristic.
-  const notesMetaDir = join(sidecar, NOTES_META_DIR);
+  // user-visible filename — but we walk filenames first and INDEX sidecars
+  // by `(path, extension)` for O(1) lookup per content file. Sidecars with
+  // no matching content file are warned about (and skipped) rather than
+  // triggering a write — preserves the export-bytes-are-truth invariant.
+  // Sidecar index keyed by lowercased `<path>|<ext>` so the walker's
+  // filename-derived key (also lowered) matches. The bucket holds the full
+  // sidecar(s) — multiple entries occur when two notes share a
+  // case-insensitive path (vault#327 collisions). The lookup picks the right
+  // sidecar from the bucket using the walker's case-preserved filename + the
+  // disambiguated-id-suffix heuristic.
   const sidecarByKey = new Map<string, Record<string, unknown>[]>();
   const sidecarByIdLeftover = new Map<string, Record<string, unknown>>();
-  if (existsSync(notesMetaDir)) {
-    const notesMetaRootResolved = resolvePath(notesMetaDir);
-    for (const entry of readdirSync(notesMetaDir)) {
-      if (!entry.endsWith(".yaml")) continue;
-      if (entry.startsWith(".")) continue;
-      const fullPath = join(notesMetaDir, entry);
-      const resolved = resolvePath(fullPath);
-      if (!isWithinDir(resolved, notesMetaRootResolved)) continue;
-      const text = readFileSync(fullPath, "utf-8");
-      // The sidecar is a bare YAML doc (no `---`); wrap to reuse the
-      // shared frontmatter parser.
-      const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-      const { frontmatter } = parseFrontmatter(wrapped);
-      const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
-      const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
-      const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
-      if (!sidecarId) continue;
-      // Index by (path, ext) tuple lowered so case-insensitive walks
-      // match. Multi-value bucket lets two case-collided sidecars coexist
-      // until the per-file lookup picks the right one.
-      if (sidecarPath && sidecarExt) {
-        const key = `${sidecarPath.toLowerCase()}|${sidecarExt.toLowerCase()}`;
-        const bucket = sidecarByKey.get(key);
-        if (bucket) bucket.push(frontmatter);
-        else sidecarByKey.set(key, [frontmatter]);
-      }
-      sidecarByIdLeftover.set(sidecarId, frontmatter);
+  for (const text of source.readNotesMetaFiles()) {
+    // The sidecar is a bare YAML doc (no `---`); wrap to reuse the shared
+    // frontmatter parser.
+    const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+    const { frontmatter } = parseFrontmatter(wrapped);
+    const sidecarId = typeof frontmatter.id === "string" ? frontmatter.id : null;
+    const sidecarPath = typeof frontmatter.path === "string" ? frontmatter.path : null;
+    const sidecarExt = typeof frontmatter.extension === "string" ? frontmatter.extension : null;
+    if (!sidecarId) continue;
+    // Index by (path, ext) tuple lowered so case-insensitive walks match.
+    // Multi-value bucket lets two case-collided sidecars coexist until the
+    // per-file lookup picks the right one.
+    if (sidecarPath && sidecarExt) {
+      const key = `${sidecarPath.toLowerCase()}|${sidecarExt.toLowerCase()}`;
+      const bucket = sidecarByKey.get(key);
+      if (bucket) bucket.push(frontmatter);
+      else sidecarByKey.set(key, [frontmatter]);
     }
+    sidecarByIdLeftover.set(sidecarId, frontmatter);
   }
 
-  // Track per-import (id → portable) so we can replay typed links
-  // after all notes exist.
+  // Track per-import (id → portable) so we can replay typed links after all
+  // notes exist.
   const seenNotes = new Map<string, PortableNote>();
-  for (const filePath of walkContentFiles(inDir)) {
-    // Containment check — readdirSync should already be safe, but
-    // verify the resolved path is inside inDir (symlinks).
-    const resolved = resolvePath(filePath);
-    if (!isWithinDir(resolved, inDirResolved)) continue;
-
+  for (const relPath of source.listContentFiles()) {
     // Derive the file's extension (lowercased, no leading dot) and the
-    // user-visible note path (everything between inDir and the
-    // extension).
-    const extWithDot = extname(filePath); // e.g. ".csv"
+    // user-visible note path (everything between the export root and the
+    // extension). The source returns POSIX-relative paths already.
+    const extWithDot = extname(relPath); // e.g. ".csv"
     const fileExt = extWithDot.slice(1).toLowerCase();
     if (fileExt.length === 0) continue;
-    const relWithExt = relative(inDir, filePath);
-    const relNoExt = relWithExt.slice(0, relWithExt.length - extWithDot.length);
-    // Normalize path separators for cross-platform exports.
-    const userPath = relNoExt.split(pathSep).join("/");
+    const userPath = relPath.slice(0, relPath.length - extWithDot.length);
 
     let frontmatter: Record<string, unknown>;
     let content: string;
     if (supportsInlineFrontmatter(fileExt)) {
-      const raw = readFileSync(filePath, "utf-8");
+      const raw = source.readContentFile(relPath);
       const parsed = parseFrontmatter(raw);
       frontmatter = parsed.frontmatter;
       content = parsed.content;
     } else {
-      // Resolve which sidecar this content file belongs to. Two
-      // sources of ambiguity to handle:
-      //   1. vault#327 case-collisions on a case-insensitive FS —
-      //      multiple sidecars share the same lowered (path, ext) key.
-      //   2. Disambiguated filenames — `<base>__<id-prefix>.<ext>` —
-      //      where the walker's path doesn't match any sidecar's
-      //      canonical path.
+      // Resolve which sidecar this content file belongs to. Two sources of
+      // ambiguity to handle:
+      //   1. vault#327 case-collisions on a case-insensitive FS — multiple
+      //      sidecars share the same lowered (path, ext) key.
+      //   2. Disambiguated filenames — `<base>__<id-prefix>.<ext>` — where
+      //      the walker's path doesn't match any sidecar's canonical path.
       // Resolution order: exact-case match within the bucket → id-prefix
-      // match against the disambiguation suffix → first remaining
-      // sidecar in the bucket → fall through to id-prefix scan of all
-      // leftovers.
+      // match against the disambiguation suffix → first remaining sidecar in
+      // the bucket → fall through to id-prefix scan of all leftovers.
       let found: Record<string, unknown> | undefined;
       const key = `${userPath.toLowerCase()}|${fileExt}`;
       const bucket = sidecarByKey.get(key);
       if (bucket && bucket.length > 0) {
         // Try exact-case match on canonical path first — distinguishes
-        // case-collided notes when the FS preserves filename case but
-        // not equality.
+        // case-collided notes when the FS preserves filename case but not
+        // equality.
         found = bucket.find((s) => typeof s.path === "string" && s.path === userPath);
         if (!found) {
-          // No exact-case match. Pick a sidecar from the bucket whose
-          // id is still in `leftover` (i.e. not yet consumed by a prior
-          // file in the walk). This keeps two case-collided notes on a
-          // case-sensitive replay from claiming the same sidecar twice.
+          // No exact-case match. Pick a sidecar from the bucket whose id is
+          // still in `leftover` (i.e. not yet consumed by a prior file in
+          // the walk). This keeps two case-collided notes on a case-sensitive
+          // replay from claiming the same sidecar twice.
           found = bucket.find((s) => typeof s.id === "string" && sidecarByIdLeftover.has(s.id));
         }
       }
       if (!found) {
-        // Disambiguated filename fallback: `<base>__<id-prefix>.<ext>`.
-        // Strip the suffix, then find a leftover sidecar whose id
-        // starts with that prefix.
+        // Disambiguated filename fallback: `<base>__<id-prefix>.<ext>`. Strip
+        // the suffix, then find a leftover sidecar whose id starts with that
+        // prefix.
         const disambigMatch = userPath.match(/^(.*)__([A-Za-z0-9-]{6,})$/);
         if (disambigMatch) {
           const idPrefix = disambigMatch[2]!;
@@ -1765,16 +1951,15 @@ export async function importPortableVault(
         }
       }
       if (!found) {
-        // No sidecar — log and skip. Importing the raw bytes with no
-        // metadata would orphan the row (no id, no path, no
-        // timestamps). Better to surface the gap than silently lose
-        // shape.
+        // No sidecar — log and skip. Importing the raw bytes with no metadata
+        // would orphan the row (no id, no path, no timestamps). Better to
+        // surface the gap than silently lose shape.
         // eslint-disable-next-line no-console
-        console.warn(`[import] skipped "${filePath}": no matching sidecar at ${NOTES_META_DIR}/<id>.yaml (path="${userPath}", extension="${fileExt}")`);
+        console.warn(`[import] skipped "${relPath}": no matching sidecar at ${NOTES_META_DIR}/<id>.yaml (path="${userPath}", extension="${fileExt}")`);
         continue;
       }
       frontmatter = found;
-      content = readFileSync(filePath, "utf-8");
+      content = source.readContentFile(relPath);
       // Mark this sidecar as consumed so subsequent files (and the
       // stale-sidecar pass) don't double-count.
       const sidecarId = typeof found.id === "string" ? found.id : null;
@@ -1784,18 +1969,18 @@ export async function importPortableVault(
     const id = typeof frontmatter.id === "string" ? frontmatter.id : null;
     if (!id) {
       // No `id` → legacy obsidian-style note. Skip with a warning; the
-      // importer is for the portable-md format, the legacy path stays
-      // on the obsidian.ts parseObsidianVault flow.
+      // importer is for the portable-md format, the legacy path stays on the
+      // obsidian.ts parseObsidianVault flow.
       // eslint-disable-next-line no-console
-      console.warn(`[import] skipped "${filePath}": no \`id\` in frontmatter (legacy obsidian format — use parseObsidianVault)`);
+      console.warn(`[import] skipped "${relPath}": no \`id\` in frontmatter (legacy obsidian format — use parseObsidianVault)`);
       continue;
     }
     const created_at = typeof frontmatter.created_at === "string" ? frontmatter.created_at : new Date().toISOString();
     const updated_at = typeof frontmatter.updated_at === "string" ? frontmatter.updated_at : created_at;
     const path = typeof frontmatter.path === "string" ? frontmatter.path : undefined;
     // Trust the frontmatter/sidecar extension first; fall back to the
-    // filename extension. Notes without an explicit extension default
-    // to "md" (back-compat with pre-vault#328 exports).
+    // filename extension. Notes without an explicit extension default to "md"
+    // (back-compat with pre-vault#328 exports).
     const extension = typeof frontmatter.extension === "string"
       ? frontmatter.extension
       : fileExt || "md";
@@ -1829,35 +2014,27 @@ export async function importPortableVault(
     // Upsert by id. createNote will throw on duplicate id; check first.
     const existing = await store.getNote(id);
     if (existing) {
-      // **Upsert merge policy** (vault#319 F2 — pinned here so future
-      // edits don't drift):
+      // **Upsert merge policy** (vault#319 F2 — pinned here so future edits
+      // don't drift):
       //
-      //   - `content`:   ALWAYS replaced from the import. (Required —
-      //                  the import always has content, even if empty
-      //                  string, and that's the unambiguous source of
-      //                  truth on a non-blow-away upsert.)
-      //   - `tags`:      REPLACED WHOLESALE — existing tags removed,
-      //                  imported set applied. The export is the source
-      //                  of truth for the current tag set.
-      //   - `path`:      REPLACED if the frontmatter declares one;
-      //                  otherwise the existing vault path is preserved.
-      //                  This is upsert-by-field, NOT replace-by-id: a
-      //                  note that lost its path before export keeps the
-      //                  vault's existing path on a non-blow-away
-      //                  import.
-      //   - `metadata`:  REPLACED if the frontmatter declares one;
-      //                  otherwise existing metadata is preserved. Same
-      //                  upsert-by-field asymmetry as `path`.
+      //   - `content`:   ALWAYS replaced from the import. (Required — the
+      //                  import always has content, even if empty string,
+      //                  and that's the unambiguous source of truth on a
+      //                  non-blow-away upsert.)
+      //   - `tags`:      REPLACED WHOLESALE — existing tags removed, imported
+      //                  set applied. The export is the source of truth for
+      //                  the current tag set.
+      //   - `path`:      REPLACED if the frontmatter declares one; otherwise
+      //                  the existing vault path is preserved. This is
+      //                  upsert-by-field, NOT replace-by-id.
+      //   - `metadata`:  REPLACED if the frontmatter declares one; otherwise
+      //                  existing metadata is preserved. Same upsert-by-field
+      //                  asymmetry as `path`.
       //
-      // For a strict replace-by-id ("the vault should look exactly like
-      // the export, no surviving fields"), use `--blow-away`. The
-      // wipe-first-replay-from-export path drops every row and rebuilds,
-      // so absent fields can't survive.
-      //
-      // Store-level updateNote has no `if_updated_at` set → always
-      // succeeds (precondition gate lives at the HTTP/MCP layer; the
-      // Store accepts unconditional writes from importer/internal
-      // callers).
+      // For a strict replace-by-id, use `--blow-away`. Store-level updateNote
+      // has no `if_updated_at` set → always succeeds (precondition gate lives
+      // at the HTTP/MCP layer; the Store accepts unconditional writes from
+      // importer/internal callers).
       await store.updateNote(id, {
         content,
         ...(path !== undefined ? { path } : {}),
@@ -1884,19 +2061,17 @@ export async function importPortableVault(
       stats.notes_created++;
     }
     // Restore both timestamps explicitly. Two reasons:
-    //   1. createNote sets updated_at = created_at; we want the
-    //      exported updated_at (may differ if the note was edited).
-    //   2. update path bumped updated_at to now(); we want to peg it
-    //      back to the exported value.
+    //   1. createNote sets updated_at = created_at; we want the exported
+    //      updated_at (may differ if the note was edited).
+    //   2. update path bumped updated_at to now(); we want to peg it back to
+    //      the exported value.
     await store.restoreNoteTimestamps(id, created_at, updated_at);
   }
 
   // 3b. Drain remaining sidecars (vault#330 S2). Any entry still in
-  // `sidecarByIdLeftover` after the content-file walk is orphaned —
-  // its expected content file wasn't on disk. Record the gap in
+  // `sidecarByIdLeftover` after the content-file walk is orphaned — its
+  // expected content file wasn't on disk. Record the gap in
   // `skipped_sidecars` so programmatic callers can surface or repair.
-  // Common cause: an operator removed a content file by hand without
-  // deleting the matching sidecar.
   for (const [sidecarId, sidecar] of sidecarByIdLeftover) {
     const expectedPath = typeof sidecar.path === "string" ? sidecar.path : null;
     const expectedExt = typeof sidecar.extension === "string" ? sidecar.extension : null;
@@ -1912,15 +2087,15 @@ export async function importPortableVault(
     console.warn(`[import] orphaned sidecar "${sidecarId}.yaml": ${stats.skipped_sidecars[stats.skipped_sidecars.length - 1]!.reason}`);
   }
 
-  // 4. Typed links — replay only now that all notes exist. Wikilinks
-  // (which the exporter excludes from `links:`) rebuild from
-  // content brackets via syncAllWikilinks (a callable Store method).
+  // 4. Typed links — replay only now that all notes exist. Wikilinks (which
+  // the exporter excludes from `links:`) rebuild from content brackets via
+  // syncAllWikilinks (a callable Store method).
   for (const [sourceId, portable] of seenNotes) {
     if (!portable.links) continue;
     for (const link of portable.links) {
-      // Confirm target exists. Forward refs to notes the export
-      // didn't include (subset export) are skipped with a warning
-      // rather than aborting.
+      // Confirm target exists. Forward refs to notes the export didn't
+      // include (subset export) are skipped with a warning rather than
+      // aborting.
       const target = await store.getNote(link.target);
       if (!target) {
         stats.skipped_links.push({
@@ -1940,11 +2115,9 @@ export async function importPortableVault(
     }
   }
 
-  // 5. Attachments — DB row then file copy (when assetsDir wired).
-  // Skip the file-copy phase when assetsDir isn't set; the DB row still
+  // 5. Attachments — DB row then file copy (when the source has attachments
+  // enabled). Skip the file-copy phase when it isn't; the DB row still
   // restores so callers operating without an assetsDir keep parity.
-  const assetsDirResolved = opts.assetsDir ? resolvePath(opts.assetsDir) : undefined;
-  const attachmentsRootResolved = resolvePath(join(sidecar, "attachments"));
   for (const [noteId, portable] of seenNotes) {
     if (!portable.attachments) continue;
     for (const att of portable.attachments) {
@@ -1952,28 +2125,11 @@ export async function importPortableVault(
         stats.attachments_restored++;
         continue;
       }
-      // DB row first so the path column matches the export. The store's
-      // generateId() would mint a fresh id; we need to preserve the
-      // exported att.id so downstream refs (note frontmatter, other
-      // tools) stay stable. Use a direct route — see comment.
-      //
-      // The public addAttachment generates a fresh id. To preserve the
-      // exported id we need a low-level path; there isn't one in the
-      // Store interface today. Workaround: addAttachment, then update
-      // the row's id via the DB if the Store is a SqliteStore.
-      // TODO: surface a `restoreAttachment(id, noteId, path, mimeType, metadata, createdAt)`
-      // import-only method on the Store interface (parallel to
-      // restoreNoteTimestamps). For now, attachment ids are
-      // re-minted on import — this is a known PR-2-scope limitation
-      // documented in CHANGELOG. Frontmatter refs still resolve by
-      // (note_id, path) tuple on a round-trip; only the att.id values
-      // change. Mark in skipped_attachments? No — the data is there.
-      //
-      // The exporter writes `attachments` keyed by exported att.id;
-      // a round-trip where ids change will produce a byte-different
-      // export (different att.id values). PR 2 round-trip test
-      // therefore can't claim byte-equivalent attachment ids in the
-      // first version — call this out in CHANGELOG.
+      // DB row first so the path column matches the export. The public
+      // addAttachment re-mints the attachment id (there's no id-preserving
+      // Store method today), so a round-trip changes att.id values while
+      // (note_id, path) stays stable — a known PR-2-scope limitation
+      // documented in CHANGELOG.
       const attachment = await store.addAttachment(
         noteId,
         att.path,
@@ -1981,93 +2137,81 @@ export async function importPortableVault(
         att.metadata,
       );
 
-      // File copy: from sidecar to assetsDir.
-      if (assetsDirResolved) {
-        // Source: .parachute/attachments/<exported-att-id>/<basename>.
-        // Use the EXPORTED id from the frontmatter — that's what the
-        // exporter wrote, even though our newly-created DB row has a
-        // fresh `attachment.id`.
-        const srcFile = join(sidecar, "attachments", att.id, basename(att.path));
-        const srcResolved = resolvePath(srcFile);
-        if (!isWithinDir(srcResolved, attachmentsRootResolved)) {
+      // File copy: from sidecar to assetsDir. Source uses the EXPORTED
+      // att.id (what the exporter wrote), not our freshly-minted row id.
+      if (source.attachmentsEnabled) {
+        const srcRelPath = join(SIDECAR_DIR, "attachments", att.id, basename(att.path));
+        const result = source.restoreAttachment(srcRelPath, att.path);
+        if (!result.ok) {
           stats.skipped_attachments.push({
             note_id: noteId,
             attachment_id: attachment.id,
-            reason: `path-traversal on source: "${srcResolved}" escapes attachments root`,
+            reason: result.reason,
           });
           continue;
         }
-        if (!existsSync(srcResolved)) {
-          stats.skipped_attachments.push({
-            note_id: noteId,
-            attachment_id: attachment.id,
-            reason: `source attachment file missing at "${srcResolved}"`,
-          });
-          continue;
-        }
-        const destFile = join(assetsDirResolved, att.path);
-        const destResolved = resolvePath(destFile);
-        if (!isWithinDir(destResolved, assetsDirResolved)) {
-          stats.skipped_attachments.push({
-            note_id: noteId,
-            attachment_id: attachment.id,
-            reason: `path-traversal on dest: "${destResolved}" escapes assetsDir`,
-          });
-          continue;
-        }
-        mkdirSync(dirname(destResolved), { recursive: true });
-        copyFileSync(srcResolved, destResolved);
       }
       stats.attachments_restored++;
     }
   }
 
-  // 6. Sync wikilinks across the imported set so `[[brackets]]` in
-  // content rebuild link rows for the imported notes.
+  // 6. Sync wikilinks across the imported set so `[[brackets]]` in content
+  // rebuild link rows for the imported notes.
   if (!opts.dryRun) {
     await store.syncAllWikilinks();
   }
 
   // 7. Re-declare indexed fields (belt-and-suspenders + authoritative count).
-  // Step 2 restored tag schemas via `store.upsertTagRecord`, which — now that
-  // the indexed-field lifecycle is centralized in the store — already
+  // Step 2 restored tag schemas via `store.upsertTagRecord`, which already
   // materializes the backing generated columns + indexes as it persists each
-  // schema. This explicit reconcile is therefore idempotent on the happy path;
-  // it stays as a safety net (covers any schema written through a path that
-  // skipped the lifecycle) and gives the authoritative `indexes_declared`
-  // count. Without it, a regression in step 2 would silently leave the
-  // imported schemas advertising `indexed: true` while queries full-scan.
+  // schema. This explicit reconcile is therefore idempotent on the happy
+  // path; it stays as a safety net and gives the authoritative
+  // `indexes_declared` count.
   if (!opts.dryRun) {
     stats.indexes_declared = await store.reconcileDeclaredIndexes();
   } else {
-    // Dry-run: count what WOULD be declared without touching the DB. Both
-    // paths count per (tag, field) declaration (a co-declared field counts
-    // once per declaring tag). The one asymmetry: this dry-run counts every
-    // `indexed: true` field including unsupported types, whereas the applied
-    // `reconcileDeclaredIndexes` skips fields whose type can't be indexed —
-    // so the dry-run can over-count by the number of mis-typed indexed
-    // fields. It's a "how much indexing work" signal, not a row-exact promise.
-    const schemasDir2 = join(sidecar, "schemas");
-    if (existsSync(schemasDir2)) {
-      for (const entry of readdirSync(schemasDir2)) {
-        if (!entry.endsWith(".yaml")) continue;
-        const fullPath = join(schemasDir2, entry);
-        const resolved = resolvePath(fullPath);
-        if (!isWithinDir(resolved, resolvePath(schemasDir2))) continue;
-        const text = readFileSync(fullPath, "utf-8");
-        const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
-        const { frontmatter } = parseFrontmatter(wrapped);
-        const fields = frontmatter.fields;
-        if (fields && typeof fields === "object" && !Array.isArray(fields)) {
-          for (const spec of Object.values(fields as Record<string, { indexed?: boolean }>)) {
-            if (spec?.indexed === true) stats.indexes_declared++;
-          }
+    // Dry-run: count what WOULD be declared without touching the DB. Counts
+    // every `indexed: true` field including unsupported types, whereas the
+    // applied `reconcileDeclaredIndexes` skips un-indexable types — so the
+    // dry-run can over-count. It's a "how much indexing work" signal, not a
+    // row-exact promise.
+    for (const { text } of source.readSchemaFiles()) {
+      const wrapped = `---\n${text}${text.endsWith("\n") ? "" : "\n"}---\n`;
+      const { frontmatter } = parseFrontmatter(wrapped);
+      const fields = frontmatter.fields;
+      if (fields && typeof fields === "object" && !Array.isArray(fields)) {
+        for (const spec of Object.values(fields as Record<string, { indexed?: boolean }>)) {
+          if (spec?.indexed === true) stats.indexes_declared++;
         }
       }
     }
   }
 
   return stats;
+}
+
+/**
+ * Read a portable-md export directory back into a vault (the bun/fs backend
+ * — thin wrapper over `importVault` with an `FsImportSource`). Lossless
+ * counterpart to `exportVaultToDir`. With `blowAway: true`, replaces vault
+ * state byte-equivalent to the export (the disaster-recovery path). Without
+ * it, upserts by frontmatter `id` — existing notes updated in place, new
+ * notes created. See `importVault` for the restoration order.
+ */
+export async function importPortableVault(
+  store: Store,
+  opts: ImportOptions,
+): Promise<ImportStats> {
+  const sidecar = join(opts.inDir, SIDECAR_DIR);
+  if (!existsSync(join(sidecar, "vault.yaml"))) {
+    throw new Error(
+      `not a portable-md export: missing ${join(SIDECAR_DIR, "vault.yaml")} in "${opts.inDir}". ` +
+      `If this is a legacy Obsidian-shape directory, use the obsidian.ts \`parseObsidianVault\` ` +
+      `path instead — vault#308 importer only handles the portable-md format.`,
+    );
+  }
+  const source = new FsImportSource({ inDir: opts.inDir, assetsDir: opts.assetsDir });
+  return importVault(store, source, { blowAway: opts.blowAway, dryRun: opts.dryRun });
 }
 
 // ---------------------------------------------------------------------------

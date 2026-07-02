@@ -1,6 +1,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats } from "./types.js";
 import { normalizePath } from "./paths.js";
+import { transaction } from "./txn.js";
 import {
   buildOperatorClause,
   isOperatorObject,
@@ -1438,8 +1439,7 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     return { error: "target_exists", conflicting };
   }
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  const result = transaction(db, (): RenameTagSuccess => {
     let renamedNoteTags = 0;
     let pathsRenamed = 0;
 
@@ -1600,9 +1600,7 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       }
     }
 
-    db.exec("COMMIT");
-
-    const result: RenameTagSuccess = {
+    return {
       renamed: renamedNoteTags,
       sub_tags_renamed: renames.length - 1,
       parent_refs_updated: parentRefsUpdated,
@@ -1611,21 +1609,18 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       notes_rewritten: notesRewritten,
       paths_renamed: pathsRenamed,
     };
+  });
 
-    // Audit log: single line so operators searching `[vault] tag rename`
-    // can correlate cascades after the fact. Includes the stats and the
-    // mapping for non-trivial sub-tag cases.
-    console.error(
-      `[vault] tag rename cascade: ${oldName} → ${newName}` +
-        (renames.length > 1 ? ` (+${renames.length - 1} sub-tags)` : "") +
-        ` — note_tags:${result.renamed} parent_refs:${result.parent_refs_updated} tokens:${result.tokens_updated} indexed:${result.indexed_field_declarers_updated} notes:${result.notes_rewritten} paths:${result.paths_renamed}`,
-    );
+  // Audit log: single line so operators searching `[vault] tag rename`
+  // can correlate cascades after the fact. Includes the stats and the
+  // mapping for non-trivial sub-tag cases.
+  console.error(
+    `[vault] tag rename cascade: ${oldName} → ${newName}` +
+      (renames.length > 1 ? ` (+${renames.length - 1} sub-tags)` : "") +
+      ` — note_tags:${result.renamed} parent_refs:${result.parent_refs_updated} tokens:${result.tokens_updated} indexed:${result.indexed_field_declarers_updated} notes:${result.notes_rewritten} paths:${result.paths_renamed}`,
+  );
 
-    return result;
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  return result;
 }
 
 function emptyCascadeResult(): RenameTagSuccess {
@@ -1768,8 +1763,7 @@ export function mergeTags(
 
   const merged: Record<string, number> = {};
 
-  db.exec("BEGIN");
-  try {
+  transaction(db, () => {
     // Target might not exist yet. Seed it so INSERT OR IGNORE into note_tags
     // can reference it; leave any existing schema on target untouched.
     db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)").run(target);
@@ -1796,12 +1790,7 @@ export function mergeTags(
       deleteTagStmt.run(source);
       merged[source] = before;
     }
-
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 
   return { merged, target };
 }
@@ -1999,8 +1988,7 @@ export interface BulkNoteInput {
 export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
   const results: Note[] = [];
 
-  db.exec("BEGIN");
-  try {
+  transaction(db, () => {
     for (const input of inputs) {
       results.push(
         createNote(db, input.content, {
@@ -2015,11 +2003,7 @@ export function createNotes(db: Database, inputs: BulkNoteInput[]): Note[] {
         }),
       );
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 
   return results;
 }
@@ -2032,8 +2016,7 @@ export function batchTag(db: Database, noteIds: string[], tags: string[]): numbe
   const bareTags = tags.map(stripTagHash).filter((t) => t !== "");
   let count = 0;
 
-  db.exec("BEGIN");
-  try {
+  transaction(db, () => {
     for (const tag of bareTags) {
       insertTag.run(tag);
     }
@@ -2043,11 +2026,7 @@ export function batchTag(db: Database, noteIds: string[], tags: string[]): numbe
         count++;
       }
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 
   return count;
 }
@@ -2059,19 +2038,14 @@ export function batchUntag(db: Database, noteIds: string[], tags: string[]): num
   const bareTags = tags.map(stripTagHash).filter((t) => t !== "");
   let count = 0;
 
-  db.exec("BEGIN");
-  try {
+  transaction(db, () => {
     for (const noteId of noteIds) {
       for (const tag of bareTags) {
         stmt.run(noteId, tag);
         count++;
       }
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  });
 
   return count;
 }

@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
+import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
@@ -711,18 +712,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // colliding with concurrent callers on the shared bun:sqlite
         // connection.
         const batched = items.length > 1;
-        if (batched) db.exec("BEGIN");
-        try {
+        const runBatch = async (): Promise<void> => {
           for (const item of items) {
             // Validate extension up front (vault#328). Throwing here while
-            // we're inside the BEGIN block on a batch rolls back the
-            // transaction in the outer catch — the same behavior as a
-            // path conflict mid-batch.
+            // inside the batch transaction rolls it back — the same behavior
+            // as a path conflict mid-batch.
             const extension = item.extension !== undefined
               ? validateExtension(item.extension)
               : undefined;
             // Strict-schema gate (vault#299) — reject before any write so a
-            // mid-batch violation rolls back via the outer BEGIN/ROLLBACK.
+            // mid-batch violation rolls back the batch transaction.
             enforceStrict({
               path: item.path as string | undefined,
               tags: item.tags as string[] | undefined,
@@ -752,11 +751,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
             created.push(noteOps.getNote(db, note.id) ?? note);
           }
-          if (batched) db.exec("COMMIT");
-        } catch (e) {
-          if (batched) db.exec("ROLLBACK");
-          throw e;
-        }
+        };
+        await (batched ? transactionAsync(db, runBatch) : runBatch());
 
         // Apply tag schema effects, then re-read the notes whose metadata was
         // actually default-filled so the response reflects the final on-disk
@@ -963,333 +959,329 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         // Single-item calls skip the wrap so concurrent callers don't
         // collide on the shared bun:sqlite connection.
         const batched = items.length > 1;
-        if (batched) db.exec("BEGIN");
-        try {
-        for (const item of items) {
-          // Try ID-then-path resolve. If not found AND
-          // `if_missing: "create"` is set, fall through to the create
-          // branch using this same item's payload. Otherwise mirror the
-          // existing `requireNote` behavior (throw "Note not found").
-          // vault#309.
-          const resolved = resolveNote(db, item.id as string);
-          if (!resolved) {
-            if (item.if_missing === "create") {
-              // Treat the update payload as a create payload. Minimum:
-              // content OR a path/id (something the createNote-empty-row
-              // invariant accepts). createNote enforces its own
-              // not-both-empty check — we leave that to the Store and
-              // surface any error to the caller verbatim.
-              //
-              // Field mapping (mirrors the create-note tool surface):
-              //   - `item.id` → both the note's `id` AND a fallback
-              //     `path` when `item.path` isn't set. Treating `id` as
-              //     the path-or-id lookup key matches Gitcoin's nightly
-              //     sync shape where the canonical key is a path string
-              //     like "Inbox/2026-05-13-meeting". If the caller
-              //     supplied an opaque ULID as `id` and no `path`, we
-              //     still create with that as `id` (path stays null).
-              //   - `item.content` / `item.path` / `item.tags` /
-              //     `item.metadata` / `item.created_at` → forwarded.
-              //   - `if_updated_at` / `force` / `content_edit` /
-              //     `append` / `prepend` are update-only — silently
-              //     ignored on the create branch. (Content-edit on a
-              //     non-existent note is a nonsense combination; the
-              //     caller's intent on missing-note is "create the
-              //     row", not "patch in this section".)
-              //   - `links.remove` is also ignored on create (nothing
-              //     to remove on a fresh note).
-              //   - `links.add` IS applied below — the drift sync can
-              //     declare typed links at upsert time and have them
-              //     materialize alongside the create. See vault#320
-              //     reviewer F1 — the prior comment claimed all
-              //     `links` were ignored, but `links.add` was already
-              //     processed and used by Gitcoin's sync; the
-              //     misleading wording is fixed here so a future
-              //     reader doesn't trust it and break the workflow.
-              const idOrPath = item.id as string;
-              // Heuristic: if `path` isn't set AND the `id` looks like a
-              // path (contains "/" or doesn't match a typical opaque-id
-              // shape), use it as the path too. Otherwise treat it as a
-              // pure id. The shared `id` field for update is ID-or-path
-              // already (see `resolveNote`), so this preserves the
-              // caller's intent.
-              const idLooksLikePath = idOrPath.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPath);
-              const explicitPath = typeof item.path === "string" ? item.path as string : undefined;
-              // Validate extension before reaching the Store — same
-              // contract as the create-note tool.
-              const createExt = item.extension !== undefined
-                ? validateExtension(item.extension)
-                : undefined;
-              const createOpts: Parameters<Store["createNote"]>[1] = {
-                ...(idLooksLikePath ? { path: explicitPath ?? idOrPath } : { id: idOrPath, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
-                ...(item.tags && Array.isArray((item.tags as any).add)
-                  ? { tags: (item.tags as any).add as string[] }
-                  : Array.isArray(item.tags)
-                    ? { tags: item.tags as string[] }
-                    : {}),
-                ...(item.metadata !== undefined ? { metadata: item.metadata as Record<string, unknown> } : {}),
-                ...(item.created_at !== undefined ? { created_at: item.created_at as string } : {}),
-                ...(createExt !== undefined ? { extension: createExt } : {}),
-                // Write-attribution (vault#298) — the if_missing:"create" upsert
-                // branch is still a CREATE, so it must stamp the same actor/via
-                // as the create-note tool + the REST upsert-create path. Without
-                // this an MCP-driven upsert-create wrote NULL attribution.
-                actor: writeActor,
-                via: writeVia,
-              };
-              const content = (item.content as string | undefined) ?? "";
-              // Strict-schema gate (vault#299) — the if_missing:"create"
-              // branch is still a create, so it enforces too. Tags come from
-              // createOpts (already normalized from the {add} dict / array).
-              enforceStrict({
-                path: createOpts.path ?? undefined,
-                tags: createOpts.tags,
-                metadata: createOpts.metadata,
-              });
-              const created = await store.createNote(content, createOpts);
-              await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
-              // Apply links.add if the caller declared any.
-              const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
-              if (linksAdd) {
-                for (const link of linksAdd) {
-                  const target = resolveNote(db, link.target);
-                  if (target) await store.createLink(created.id, target.id, link.relationship, link.metadata);
+        const runBatch = async (): Promise<void> => {
+          for (const item of items) {
+            // Try ID-then-path resolve. If not found AND
+            // `if_missing: "create"` is set, fall through to the create
+            // branch using this same item's payload. Otherwise mirror the
+            // existing `requireNote` behavior (throw "Note not found").
+            // vault#309.
+            const resolved = resolveNote(db, item.id as string);
+            if (!resolved) {
+              if (item.if_missing === "create") {
+                // Treat the update payload as a create payload. Minimum:
+                // content OR a path/id (something the createNote-empty-row
+                // invariant accepts). createNote enforces its own
+                // not-both-empty check — we leave that to the Store and
+                // surface any error to the caller verbatim.
+                //
+                // Field mapping (mirrors the create-note tool surface):
+                //   - `item.id` → both the note's `id` AND a fallback
+                //     `path` when `item.path` isn't set. Treating `id` as
+                //     the path-or-id lookup key matches Gitcoin's nightly
+                //     sync shape where the canonical key is a path string
+                //     like "Inbox/2026-05-13-meeting". If the caller
+                //     supplied an opaque ULID as `id` and no `path`, we
+                //     still create with that as `id` (path stays null).
+                //   - `item.content` / `item.path` / `item.tags` /
+                //     `item.metadata` / `item.created_at` → forwarded.
+                //   - `if_updated_at` / `force` / `content_edit` /
+                //     `append` / `prepend` are update-only — silently
+                //     ignored on the create branch. (Content-edit on a
+                //     non-existent note is a nonsense combination; the
+                //     caller's intent on missing-note is "create the
+                //     row", not "patch in this section".)
+                //   - `links.remove` is also ignored on create (nothing
+                //     to remove on a fresh note).
+                //   - `links.add` IS applied below — the drift sync can
+                //     declare typed links at upsert time and have them
+                //     materialize alongside the create. See vault#320
+                //     reviewer F1 — the prior comment claimed all
+                //     `links` were ignored, but `links.add` was already
+                //     processed and used by Gitcoin's sync; the
+                //     misleading wording is fixed here so a future
+                //     reader doesn't trust it and break the workflow.
+                const idOrPath = item.id as string;
+                // Heuristic: if `path` isn't set AND the `id` looks like a
+                // path (contains "/" or doesn't match a typical opaque-id
+                // shape), use it as the path too. Otherwise treat it as a
+                // pure id. The shared `id` field for update is ID-or-path
+                // already (see `resolveNote`), so this preserves the
+                // caller's intent.
+                const idLooksLikePath = idOrPath.includes("/") || !/^[A-Za-z0-9_-]+$/.test(idOrPath);
+                const explicitPath = typeof item.path === "string" ? item.path as string : undefined;
+                // Validate extension before reaching the Store — same
+                // contract as the create-note tool.
+                const createExt = item.extension !== undefined
+                  ? validateExtension(item.extension)
+                  : undefined;
+                const createOpts: Parameters<Store["createNote"]>[1] = {
+                  ...(idLooksLikePath ? { path: explicitPath ?? idOrPath } : { id: idOrPath, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
+                  ...(item.tags && Array.isArray((item.tags as any).add)
+                    ? { tags: (item.tags as any).add as string[] }
+                    : Array.isArray(item.tags)
+                      ? { tags: item.tags as string[] }
+                      : {}),
+                  ...(item.metadata !== undefined ? { metadata: item.metadata as Record<string, unknown> } : {}),
+                  ...(item.created_at !== undefined ? { created_at: item.created_at as string } : {}),
+                  ...(createExt !== undefined ? { extension: createExt } : {}),
+                  // Write-attribution (vault#298) — the if_missing:"create" upsert
+                  // branch is still a CREATE, so it must stamp the same actor/via
+                  // as the create-note tool + the REST upsert-create path. Without
+                  // this an MCP-driven upsert-create wrote NULL attribution.
+                  actor: writeActor,
+                  via: writeVia,
+                };
+                const content = (item.content as string | undefined) ?? "";
+                // Strict-schema gate (vault#299) — the if_missing:"create"
+                // branch is still a create, so it enforces too. Tags come from
+                // createOpts (already normalized from the {add} dict / array).
+                enforceStrict({
+                  path: createOpts.path ?? undefined,
+                  tags: createOpts.tags,
+                  metadata: createOpts.metadata,
+                });
+                const created = await store.createNote(content, createOpts);
+                await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
+                // Apply links.add if the caller declared any.
+                const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+                if (linksAdd) {
+                  for (const link of linksAdd) {
+                    const target = resolveNote(db, link.target);
+                    if (target) await store.createLink(created.id, target.id, link.relationship, link.metadata);
+                  }
+                }
+                const fresh = noteOps.getNote(db, created.id) ?? created;
+                updated.push(fresh);
+                createdIds.add(fresh.id);
+                // Echo links if this create-on-missing declared `links.add`
+                // (the only link op honored on create) or asked explicitly.
+                if (linksAdd !== undefined || item.include_links === true) {
+                  echoLinkIds.add(fresh.id);
+                }
+                continue;
+              }
+              // Fallthrough: not-found + no if_missing → existing error
+              // contract. Match `requireNote`'s message shape so existing
+              // callers see no behavior change.
+              throw new Error(`Note not found: "${item.id}"`);
+            }
+            const note = resolved;
+
+            // --- Validate mutual exclusion of content modes ---
+            const hasContent = item.content !== undefined;
+            const hasAppendPrepend = item.append !== undefined || item.prepend !== undefined;
+            const hasContentEdit = item.content_edit !== undefined;
+            const contentModes = (hasContent ? 1 : 0) + (hasAppendPrepend ? 1 : 0) + (hasContentEdit ? 1 : 0);
+            if (contentModes > 1) {
+              throw new Error(
+                `update-note: \`content\`, \`append\`/\`prepend\`, and \`content_edit\` are mutually exclusive — pick one mode of content update for note "${note.id}".`,
+              );
+            }
+
+            // --- Safety-by-default: refuse mutations without a precondition ---
+            // The caller must either echo the note's last-seen `updated_at`
+            // (`if_updated_at`) so the conditional UPDATE can catch lost
+            // writes, or explicitly opt out with `force: true`. This runs
+            // *before* any DB writes so a rejection leaves the note untouched.
+            //
+            // Append/prepend-only updates are exempt: they're SQL-atomic
+            // concatenations that can't lose data on a stale read, so the
+            // precondition would be ceremony for no benefit. Tag and link
+            // mutations are *not* exempt — they're idempotent set-ops at
+            // the SQL layer but still represent a non-content change the
+            // caller should have observed before re-asserting (#201).
+            const isAppendOnly = hasAppendPrepend
+              && !hasContent
+              && !hasContentEdit
+              && item.path === undefined
+              && item.metadata === undefined
+              && item.created_at === undefined
+              && item.tags === undefined
+              && item.links === undefined;
+            // A state_transition is itself a compare-and-set precondition
+            // (vault#299 Part B) — a transition-only update doesn't need
+            // `if_updated_at`/`force`, the CAS guards the lost-write window.
+            const isTransitionOnly = item.state_transition !== undefined
+              && !hasContent
+              && !hasAppendPrepend
+              && !hasContentEdit
+              && item.path === undefined
+              && item.metadata === undefined
+              && item.created_at === undefined
+              && item.tags === undefined
+              && item.links === undefined;
+            if (!isAppendOnly && !isTransitionOnly && item.if_updated_at === undefined && item.force !== true) {
+              throw new PreconditionRequiredError(note.id, note.path ?? null);
+            }
+
+            // --- Resolve content_edit into a full content string ---
+            // We do the find-and-replace at the JS level (read note.content,
+            // validate occurrence count, replace). The race window between
+            // this read and the UPDATE is closed by `if_updated_at` for
+            // strict callers; without it, content_edit is fail-closed —
+            // a stale read where someone else removed `old_text` produces
+            // a "not found" error instead of silently overwriting.
+            let contentOverride = item.content as string | undefined;
+            if (hasContentEdit) {
+              const ce = item.content_edit as { old_text: string; new_text: string };
+              if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
+                throw new Error(
+                  "update-note: `content_edit` requires { old_text: string, new_text: string }.",
+                );
+              }
+              const idx = note.content.indexOf(ce.old_text);
+              if (idx < 0) {
+                throw new Error(
+                  `update-note content_edit: \`old_text\` not found in note "${note.id}". The note may have been edited — re-read and retry.`,
+                );
+              }
+              const second = note.content.indexOf(ce.old_text, idx + 1);
+              if (second >= 0) {
+                throw new Error(
+                  `update-note content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context to disambiguate.`,
+                );
+              }
+              contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
+            }
+
+            // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
+            // We compute the cleaned content so we can do the core UPDATE first
+            // (with if_updated_at atomically) before any link deletions. If the
+            // UPDATE fails on a conflict, nothing has been mutated.
+            const linksRemove = (item.links as any)?.remove as { target: string; relationship: string }[] | undefined;
+            const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
+            if (linksRemove) {
+              for (const link of linksRemove) {
+                const target = resolveNote(db, link.target);
+                if (!target) continue;
+                resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
+                if (link.relationship === "wikilink" && target.path) {
+                  // Wikilink-removal bracket cleanup operates on the prospective
+                  // *full* content. Coexists with content_edit; would fight
+                  // append/prepend (which leave existing content untouched at
+                  // the JS layer), so we pre-materialize the would-be content
+                  // for those callers and switch to a `content`-style update.
+                  const currentContent = contentOverride
+                    ?? (hasAppendPrepend
+                      ? (item.prepend as string ?? "") + note.content + (item.append as string ?? "")
+                      : note.content);
+                  const cleaned = removeWikilinkBrackets(currentContent, target.path);
+                  if (cleaned !== currentContent) {
+                    contentOverride = cleaned;
+                  }
                 }
               }
-              const fresh = noteOps.getNote(db, created.id) ?? created;
-              updated.push(fresh);
-              createdIds.add(fresh.id);
-              // Echo links if this create-on-missing declared `links.add`
-              // (the only link op honored on create) or asked explicitly.
-              if (linksAdd !== undefined || item.include_links === true) {
-                echoLinkIds.add(fresh.id);
+            }
+
+            // --- Core update (content, path, metadata, created_at + concurrency check) ---
+            const updates: any = {};
+            if (contentOverride !== undefined) {
+              updates.content = contentOverride;
+            } else if (hasAppendPrepend) {
+              // No content_edit and no wikilink-removal pre-materialization —
+              // route the append/prepend down to the SQL-atomic path.
+              if (item.append !== undefined) updates.append = item.append;
+              if (item.prepend !== undefined) updates.prepend = item.prepend;
+            }
+            if (item.path !== undefined) updates.path = item.path;
+            if (item.extension !== undefined) {
+              updates.extension = validateExtension(item.extension);
+            }
+            if (item.metadata !== undefined) {
+              // Merge metadata (RFC 7386: keys are merged, incoming `null`
+              // removes the key rather than persisting a literal null —
+              // vault#478/#479). Mirrors the REST PATCH path.
+              updates.metadata = noteOps.mergeMetadata(
+                note.metadata as Record<string, unknown> | null | undefined,
+                item.metadata as Record<string, unknown>,
+              );
+            }
+            if (item.created_at !== undefined) updates.created_at = item.created_at;
+            if (item.if_updated_at !== undefined) updates.if_updated_at = item.if_updated_at as string;
+            // Compare-and-set state transition (vault#299 Part B). Combinable
+            // with other field updates — it folds into the same atomic UPDATE.
+            const stItem = item.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
+            if (stItem !== undefined) {
+              if (typeof stItem.field !== "string" || stItem.field.length === 0) {
+                throw new Error(
+                  `update-note: \`state_transition.field\` must be a non-empty string (note "${note.id}").`,
+                );
               }
-              continue;
+              updates.state_transition = { field: stItem.field, from: stItem.from, to: stItem.to };
             }
-            // Fallthrough: not-found + no if_missing → existing error
-            // contract. Match `requireNote`'s message shape so existing
-            // callers see no behavior change.
-            throw new Error(`Note not found: "${item.id}"`);
-          }
-          const note = resolved;
 
-          // --- Validate mutual exclusion of content modes ---
-          const hasContent = item.content !== undefined;
-          const hasAppendPrepend = item.append !== undefined || item.prepend !== undefined;
-          const hasContentEdit = item.content_edit !== undefined;
-          const contentModes = (hasContent ? 1 : 0) + (hasAppendPrepend ? 1 : 0) + (hasContentEdit ? 1 : 0);
-          if (contentModes > 1) {
-            throw new Error(
-              `update-note: \`content\`, \`append\`/\`prepend\`, and \`content_edit\` are mutually exclusive — pick one mode of content update for note "${note.id}".`,
-            );
-          }
-
-          // --- Safety-by-default: refuse mutations without a precondition ---
-          // The caller must either echo the note's last-seen `updated_at`
-          // (`if_updated_at`) so the conditional UPDATE can catch lost
-          // writes, or explicitly opt out with `force: true`. This runs
-          // *before* any DB writes so a rejection leaves the note untouched.
-          //
-          // Append/prepend-only updates are exempt: they're SQL-atomic
-          // concatenations that can't lose data on a stale read, so the
-          // precondition would be ceremony for no benefit. Tag and link
-          // mutations are *not* exempt — they're idempotent set-ops at
-          // the SQL layer but still represent a non-content change the
-          // caller should have observed before re-asserting (#201).
-          const isAppendOnly = hasAppendPrepend
-            && !hasContent
-            && !hasContentEdit
-            && item.path === undefined
-            && item.metadata === undefined
-            && item.created_at === undefined
-            && item.tags === undefined
-            && item.links === undefined;
-          // A state_transition is itself a compare-and-set precondition
-          // (vault#299 Part B) — a transition-only update doesn't need
-          // `if_updated_at`/`force`, the CAS guards the lost-write window.
-          const isTransitionOnly = item.state_transition !== undefined
-            && !hasContent
-            && !hasAppendPrepend
-            && !hasContentEdit
-            && item.path === undefined
-            && item.metadata === undefined
-            && item.created_at === undefined
-            && item.tags === undefined
-            && item.links === undefined;
-          if (!isAppendOnly && !isTransitionOnly && item.if_updated_at === undefined && item.force !== true) {
-            throw new PreconditionRequiredError(note.id, note.path ?? null);
-          }
-
-          // --- Resolve content_edit into a full content string ---
-          // We do the find-and-replace at the JS level (read note.content,
-          // validate occurrence count, replace). The race window between
-          // this read and the UPDATE is closed by `if_updated_at` for
-          // strict callers; without it, content_edit is fail-closed —
-          // a stale read where someone else removed `old_text` produces
-          // a "not found" error instead of silently overwriting.
-          let contentOverride = item.content as string | undefined;
-          if (hasContentEdit) {
-            const ce = item.content_edit as { old_text: string; new_text: string };
-            if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
-              throw new Error(
-                "update-note: `content_edit` requires { old_text: string, new_text: string }.",
-              );
+            // --- Strict-schema gate (vault#299 Part A) ---
+            // Validate the PROSPECTIVE shape (final tags + merged metadata,
+            // including a state_transition's `to`) before the write so a
+            // rejection leaves the note untouched.
+            {
+              const removeSet = new Set<string>((item.tags as any)?.remove ?? []);
+              const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
+              for (const t of ((item.tags as any)?.add as string[] | undefined) ?? []) projectedTags.add(t);
+              const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
+              const projectedMeta = stItem !== undefined
+                ? { ...baseMeta, [stItem.field as string]: stItem.to }
+                : baseMeta;
+              enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta });
             }
-            const idx = note.content.indexOf(ce.old_text);
-            if (idx < 0) {
-              throw new Error(
-                `update-note content_edit: \`old_text\` not found in note "${note.id}". The note may have been edited — re-read and retry.`,
-              );
-            }
-            const second = note.content.indexOf(ce.old_text, idx + 1);
-            if (second >= 0) {
-              throw new Error(
-                `update-note content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context to disambiguate.`,
-              );
-            }
-            contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
-          }
 
-          // --- Plan bracket cleanup for wikilink removals (no DB writes yet) ---
-          // We compute the cleaned content so we can do the core UPDATE first
-          // (with if_updated_at atomically) before any link deletions. If the
-          // UPDATE fails on a conflict, nothing has been mutated.
-          const linksRemove = (item.links as any)?.remove as { target: string; relationship: string }[] | undefined;
-          const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
-          if (linksRemove) {
-            for (const link of linksRemove) {
-              const target = resolveNote(db, link.target);
-              if (!target) continue;
-              resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
-              if (link.relationship === "wikilink" && target.path) {
-                // Wikilink-removal bracket cleanup operates on the prospective
-                // *full* content. Coexists with content_edit; would fight
-                // append/prepend (which leave existing content untouched at
-                // the JS layer), so we pre-materialize the would-be content
-                // for those callers and switch to a `content`-style update.
-                const currentContent = contentOverride
-                  ?? (hasAppendPrepend
-                    ? (item.prepend as string ?? "") + note.content + (item.append as string ?? "")
-                    : note.content);
-                const cleaned = removeWikilinkBrackets(currentContent, target.path);
-                if (cleaned !== currentContent) {
-                  contentOverride = cleaned;
+            let result: Note;
+            if (Object.keys(updates).length > 0) {
+              // Write-attribution (vault#298): stamp the most-recent-write
+              // columns on the same UPDATE that bumps `updated_at`. Only set when
+              // there's a real change to write (the empty-updates branch below
+              // leaves attribution untouched, symmetric with not bumping
+              // updated_at on a no-op).
+              updates.actor = writeActor;
+              updates.via = writeVia;
+              // store.updateNote routes through noteOps.updateNote, which runs
+              // the UPDATE (with optional `AND updated_at IS ?`) atomically and
+              // throws ConflictError on mismatch. No mutations have happened
+              // yet, so a throw here leaves the note untouched.
+              result = await store.updateNote(note.id, updates);
+            } else {
+              result = note;
+            }
+
+            // --- Remove links (after core UPDATE so a conflict leaves them intact) ---
+            for (const { targetId, relationship } of resolvedLinksToRemove) {
+              await store.deleteLink(note.id, targetId, relationship);
+            }
+
+            // --- Tags ---
+            const tagsOp = item.tags as { add?: string[]; remove?: string[] } | undefined;
+            if (tagsOp?.add?.length) {
+              await store.tagNote(note.id, tagsOp.add);
+              await applySchemaDefaults(store, db, [note.id], tagsOp.add);
+            }
+            if (tagsOp?.remove?.length) {
+              await store.untagNote(note.id, tagsOp.remove);
+            }
+
+            // --- Add links ---
+            const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+            if (linksAdd) {
+              for (const link of linksAdd) {
+                const target = resolveNote(db, link.target);
+                if (target) {
+                  await store.createLink(note.id, target.id, link.relationship, link.metadata);
                 }
               }
             }
-          }
 
-          // --- Core update (content, path, metadata, created_at + concurrency check) ---
-          const updates: any = {};
-          if (contentOverride !== undefined) {
-            updates.content = contentOverride;
-          } else if (hasAppendPrepend) {
-            // No content_edit and no wikilink-removal pre-materialization —
-            // route the append/prepend down to the SQL-atomic path.
-            if (item.append !== undefined) updates.append = item.append;
-            if (item.prepend !== undefined) updates.prepend = item.prepend;
-          }
-          if (item.path !== undefined) updates.path = item.path;
-          if (item.extension !== undefined) {
-            updates.extension = validateExtension(item.extension);
-          }
-          if (item.metadata !== undefined) {
-            // Merge metadata (RFC 7386: keys are merged, incoming `null`
-            // removes the key rather than persisting a literal null —
-            // vault#478/#479). Mirrors the REST PATCH path.
-            updates.metadata = noteOps.mergeMetadata(
-              note.metadata as Record<string, unknown> | null | undefined,
-              item.metadata as Record<string, unknown>,
-            );
-          }
-          if (item.created_at !== undefined) updates.created_at = item.created_at;
-          if (item.if_updated_at !== undefined) updates.if_updated_at = item.if_updated_at as string;
-          // Compare-and-set state transition (vault#299 Part B). Combinable
-          // with other field updates — it folds into the same atomic UPDATE.
-          const stItem = item.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
-          if (stItem !== undefined) {
-            if (typeof stItem.field !== "string" || stItem.field.length === 0) {
-              throw new Error(
-                `update-note: \`state_transition.field\` must be a non-empty string (note "${note.id}").`,
-              );
+            // Echo links if this update mutated them (`links.add`/`links.remove`)
+            // or the caller asked explicitly. vault feedback #8.
+            const linkMutated = (item.links as any)?.add !== undefined || (item.links as any)?.remove !== undefined;
+            if (linkMutated || item.include_links === true) {
+              echoLinkIds.add(note.id);
             }
-            updates.state_transition = { field: stItem.field, from: stItem.from, to: stItem.to };
-          }
 
-          // --- Strict-schema gate (vault#299 Part A) ---
-          // Validate the PROSPECTIVE shape (final tags + merged metadata,
-          // including a state_transition's `to`) before the write so a
-          // rejection leaves the note untouched.
-          {
-            const removeSet = new Set<string>((item.tags as any)?.remove ?? []);
-            const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
-            for (const t of ((item.tags as any)?.add as string[] | undefined) ?? []) projectedTags.add(t);
-            const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
-            const projectedMeta = stItem !== undefined
-              ? { ...baseMeta, [stItem.field as string]: stItem.to }
-              : baseMeta;
-            enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta });
+            // Re-read for final state
+            updated.push(noteOps.getNote(db, note.id) ?? result);
           }
-
-          let result: Note;
-          if (Object.keys(updates).length > 0) {
-            // Write-attribution (vault#298): stamp the most-recent-write
-            // columns on the same UPDATE that bumps `updated_at`. Only set when
-            // there's a real change to write (the empty-updates branch below
-            // leaves attribution untouched, symmetric with not bumping
-            // updated_at on a no-op).
-            updates.actor = writeActor;
-            updates.via = writeVia;
-            // store.updateNote routes through noteOps.updateNote, which runs
-            // the UPDATE (with optional `AND updated_at IS ?`) atomically and
-            // throws ConflictError on mismatch. No mutations have happened
-            // yet, so a throw here leaves the note untouched.
-            result = await store.updateNote(note.id, updates);
-          } else {
-            result = note;
-          }
-
-          // --- Remove links (after core UPDATE so a conflict leaves them intact) ---
-          for (const { targetId, relationship } of resolvedLinksToRemove) {
-            await store.deleteLink(note.id, targetId, relationship);
-          }
-
-          // --- Tags ---
-          const tagsOp = item.tags as { add?: string[]; remove?: string[] } | undefined;
-          if (tagsOp?.add?.length) {
-            await store.tagNote(note.id, tagsOp.add);
-            await applySchemaDefaults(store, db, [note.id], tagsOp.add);
-          }
-          if (tagsOp?.remove?.length) {
-            await store.untagNote(note.id, tagsOp.remove);
-          }
-
-          // --- Add links ---
-          const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
-          if (linksAdd) {
-            for (const link of linksAdd) {
-              const target = resolveNote(db, link.target);
-              if (target) {
-                await store.createLink(note.id, target.id, link.relationship, link.metadata);
-              }
-            }
-          }
-
-          // Echo links if this update mutated them (`links.add`/`links.remove`)
-          // or the caller asked explicitly. vault feedback #8.
-          const linkMutated = (item.links as any)?.add !== undefined || (item.links as any)?.remove !== undefined;
-          if (linkMutated || item.include_links === true) {
-            echoLinkIds.add(note.id);
-          }
-
-          // Re-read for final state
-          updated.push(noteOps.getNote(db, note.id) ?? result);
-        }
-          if (batched) db.exec("COMMIT");
-        } catch (e) {
-          if (batched) db.exec("ROLLBACK");
-          throw e;
-        }
+        };
+        await (batched ? transactionAsync(db, runBatch) : runBatch());
 
         // Response shape: full Note (back-compat default) or lean NoteIndex
         // (#285 friction point 2.response — opt-out for callers making

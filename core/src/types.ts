@@ -263,6 +263,15 @@ export interface Store {
    */
   readonly db: Database;
 
+  /**
+   * Run `fn` inside a single atomic write transaction (commit on return,
+   * rollback on throw). The transaction seam (see core/src/txn.ts): the
+   * bun backend implements it as `BEGIN IMMEDIATE … COMMIT`, a future
+   * Durable-Object backend as `ctx.storage.transactionSync`. Synchronous —
+   * `fn` must not await. Nesting is unsupported (matches raw-SQLite BEGIN).
+   */
+  transaction<T>(fn: () => T): T;
+
   // Notes. `actor` / `via` carry write-attribution (vault#298) — the
   // principal + interface stamped onto created_by/created_via (and mirrored
   // into the last_updated_* pair on create). Omitted → attribution NULL.
