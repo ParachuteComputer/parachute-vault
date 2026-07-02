@@ -12,6 +12,7 @@ import {
 } from "./indexed-fields.js";
 import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
+import { transaction } from "./txn.js";
 import { HookRegistry } from "./hooks.js";
 import {
   loadTagHierarchy,
@@ -53,6 +54,15 @@ export class BunSqliteStore implements Store {
   constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
     initSchema(db);
     this.hooks = opts?.hooks ?? new HookRegistry();
+  }
+
+  /**
+   * The transaction seam (see core/src/txn.ts). bun backs it with
+   * `BEGIN IMMEDIATE … COMMIT`; a DO-backed Store overrides this with
+   * `ctx.storage.transactionSync`. Synchronous — `fn` must not await.
+   */
+  transaction<T>(fn: () => T): T {
+    return transaction(this.db, fn);
   }
 
   /**
@@ -716,10 +726,8 @@ export class BunSqliteStore implements Store {
     // mismatch only detectable once the existing declarer set is consulted),
     // the whole write rolls back — the schema never ends up claiming an index
     // that doesn't exist. vault#478 transactional fix.
-    let result: tagSchemaOps.TagRecord;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      result = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
+    const result = this.transaction(() => {
+      const record = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
 
       if (patch.fields !== undefined) {
         for (const fieldName of nextIndexed) {
@@ -734,11 +742,8 @@ export class BunSqliteStore implements Store {
           }
         }
       }
-      this.db.exec("COMMIT");
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    }
+      return record;
+    });
 
     if (patch.parent_names !== undefined) {
       // parent_names drives both query expansion (tag hierarchy) AND, post

@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Store, Note } from "./types.js";
+import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
@@ -711,18 +712,16 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // colliding with concurrent callers on the shared bun:sqlite
         // connection.
         const batched = items.length > 1;
-        if (batched) db.exec("BEGIN");
-        try {
+        const runBatch = async (): Promise<void> => {
           for (const item of items) {
             // Validate extension up front (vault#328). Throwing here while
-            // we're inside the BEGIN block on a batch rolls back the
-            // transaction in the outer catch — the same behavior as a
-            // path conflict mid-batch.
+            // inside the batch transaction rolls it back — the same behavior
+            // as a path conflict mid-batch.
             const extension = item.extension !== undefined
               ? validateExtension(item.extension)
               : undefined;
             // Strict-schema gate (vault#299) — reject before any write so a
-            // mid-batch violation rolls back via the outer BEGIN/ROLLBACK.
+            // mid-batch violation rolls back the batch transaction.
             enforceStrict({
               path: item.path as string | undefined,
               tags: item.tags as string[] | undefined,
@@ -752,11 +751,8 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 
             created.push(noteOps.getNote(db, note.id) ?? note);
           }
-          if (batched) db.exec("COMMIT");
-        } catch (e) {
-          if (batched) db.exec("ROLLBACK");
-          throw e;
-        }
+        };
+        await (batched ? transactionAsync(db, runBatch) : runBatch());
 
         // Apply tag schema effects, then re-read the notes whose metadata was
         // actually default-filled so the response reflects the final on-disk
@@ -963,8 +959,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         // Single-item calls skip the wrap so concurrent callers don't
         // collide on the shared bun:sqlite connection.
         const batched = items.length > 1;
-        if (batched) db.exec("BEGIN");
-        try {
+        const runBatch = async (): Promise<void> => {
         for (const item of items) {
           // Try ID-then-path resolve. If not found AND
           // `if_missing: "create"` is set, fall through to the create
@@ -1285,11 +1280,8 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           // Re-read for final state
           updated.push(noteOps.getNote(db, note.id) ?? result);
         }
-          if (batched) db.exec("COMMIT");
-        } catch (e) {
-          if (batched) db.exec("ROLLBACK");
-          throw e;
-        }
+        };
+        await (batched ? transactionAsync(db, runBatch) : runBatch());
 
         // Response shape: full Note (back-compat default) or lean NoteIndex
         // (#285 friction point 2.response — opt-out for callers making
