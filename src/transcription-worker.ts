@@ -123,8 +123,12 @@ export interface TranscriptionWorkerOpts {
   vaultList: () => string[];
   /** Get a store for a vault name. */
   getStore: (name: string) => Store;
-  /** Scribe base URL (no trailing slash). */
-  scribeUrl: string;
+  /**
+   * Scribe base URL (no trailing slash). Only used to build the default
+   * `scribe-http` provider when no `provider` is injected — a `transcribe-cpp`
+   * (or any injected) provider needs no scribe URL, so this is optional.
+   */
+  scribeUrl?: string;
   /** Optional bearer token for scribe. */
   scribeToken?: string;
   /** Resolve the assets root for a vault name. */

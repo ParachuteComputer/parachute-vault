@@ -17,9 +17,9 @@
  *   parachute-vault status                  — show full status
  */
 
-import { resolve } from "path";
+import { resolve, join } from "path";
 import { homedir } from "os";
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, copyFileSync, chmodSync } from "fs";
 // JSON import — resolved at module load, works for both dev runs
 // (`bun src/cli.ts …`) and the published package (`bunx @openparachute/vault`)
 // because package.json ships at the root next to src/.
@@ -140,6 +140,20 @@ import {
   verifyAndConsumeBackupCode,
   getTotpSecret,
 } from "./two-factor.ts";
+import {
+  planInstall,
+  detectTotalRamBytes,
+  MODELS,
+  type InstallPlan,
+  type ModelChoice,
+} from "./transcription/install.ts";
+import {
+  resolveTranscribeCppPaths,
+  resolveTranscriptionProviderName,
+  transcribeCppInstalled,
+  readManifest,
+  type TranscribeCppManifest,
+} from "./transcription/select.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -248,6 +262,9 @@ switch (command) {
     break;
   case "schema":
     await cmdSchema(cmdArgs);
+    break;
+  case "transcription":
+    await cmdTranscription(cmdArgs);
     break;
   case "help":
   case "--help":
@@ -3500,6 +3517,218 @@ function printHistoryUsage(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Transcription — `parachute-vault transcription <subcommand>` (scribe-fold 2a)
+// ---------------------------------------------------------------------------
+
+/**
+ * `parachute-vault transcription install` — set up the local `transcribe-cpp`
+ * provider: detect OS/arch + RAM, pick a tier-appropriate GGUF model
+ * (scribe#82 fix — Parakeet floored to ≥4GB), download the prebuilt
+ * transcribe-cli release asset + the model into
+ * `~/.parachute/transcription/`, and switch `TRANSCRIPTION_PROVIDER` in the
+ * vault `.env`. Idempotent (skips already-present files unless `--force`),
+ * non-fatal. `--dry-run`/`--plan` prints the selection without downloading —
+ * the path tests exercise (no network).
+ *
+ * `parachute-vault transcription status` — show the configured provider +
+ * install state.
+ */
+async function cmdTranscription(args: string[]) {
+  const sub = args[0];
+  if (sub === "install") {
+    await cmdTranscriptionInstall(args.slice(1));
+    return;
+  }
+  if (sub === "status" || sub === undefined) {
+    cmdTranscriptionStatus();
+    return;
+  }
+  console.error(`Unknown transcription subcommand: ${sub}`);
+  console.error("Usage: parachute-vault transcription install [--dry-run] [--model <id>] [--provider <name>]");
+  console.error("       parachute-vault transcription status");
+  process.exit(1);
+}
+
+/** Render an install plan for the human (shared by --dry-run + the real run). */
+function printTranscriptionPlan(plan: InstallPlan): void {
+  console.log(`Host:  ${plan.platform}/${plan.arch}, ${plan.totalRamGb}GB RAM`);
+  if (!plan.supported) {
+    console.log(`\n  ${plan.refused ? "Refused" : "Unsupported"}: ${plan.reason}`);
+    return;
+  }
+  const m = plan.model!;
+  console.log(`Binary: ${plan.asset!.asset}`);
+  console.log(`Model:  ${m.name}  (${m.file})`);
+  console.log(`        ${m.note}`);
+  console.log(`        ~${m.approxSizeMb}MB download, ~${m.approxRuntimeGb}GB peak RAM while transcribing`);
+}
+
+async function cmdTranscriptionInstall(args: string[]) {
+  const dryRun = args.includes("--dry-run") || args.includes("--plan");
+  const force = args.includes("--force");
+  const yes = args.includes("--yes") || args.includes("-y");
+  const overrideModel = takeArgValue(args, "--model").value;
+  const provider = takeArgValue(args, "--provider").value ?? "transcribe-cpp";
+
+  if (provider === "scribe-http") {
+    // Just flip config back to the remote provider — no download.
+    if (dryRun) {
+      console.log("Would set TRANSCRIPTION_PROVIDER=scribe-http in the vault .env (remote provider; no download).");
+      return;
+    }
+    setEnvVar("TRANSCRIPTION_PROVIDER", "scribe-http");
+    console.log("Set TRANSCRIPTION_PROVIDER=scribe-http. Restart vault to apply. (Remote provider — no local binary/model needed.)");
+    return;
+  }
+  if (provider !== "transcribe-cpp") {
+    console.error(`Unknown --provider "${provider}". Valid: transcribe-cpp, scribe-http.`);
+    process.exit(1);
+  }
+
+  const plan = planInstall({
+    platform: process.platform,
+    arch: process.arch,
+    totalRamBytes: detectTotalRamBytes(),
+    overrideModel,
+  });
+
+  console.log("Transcription install plan (transcribe-cpp — local, no Python):\n");
+  printTranscriptionPlan(plan);
+
+  if (!plan.supported) {
+    // Refused / unsupported is not a hard error — it's a steer to remote.
+    console.log("\nNo local install performed. See the note above.");
+    process.exit(dryRun ? 0 : 1);
+  }
+
+  const paths = resolveTranscribeCppPaths();
+  console.log(`\nInstall dir: ${paths.dir}`);
+
+  if (dryRun) {
+    console.log("\n(--dry-run) No files downloaded.");
+    return;
+  }
+
+  if (!yes) {
+    const ok = await confirm(`Download ~${plan.footprintMb}MB and install to ${paths.dir}?`, true);
+    if (!ok) {
+      console.log("Aborted.");
+      return;
+    }
+  }
+
+  // ffmpeg hint (non-fatal — the transcode path checks at runtime).
+  if (!Bun.which("ffmpeg")) {
+    console.warn(
+      "\n⚠  ffmpeg not found on PATH. transcribe-cli needs 16kHz mono WAV; non-WAV capture audio is transcoded via ffmpeg.\n" +
+        "   Install it: apt install ffmpeg  (Debian/Ubuntu)  |  brew install ffmpeg  (macOS)",
+    );
+  }
+
+  try {
+    mkdirSync(paths.binDir, { recursive: true });
+    mkdirSync(paths.modelsDir, { recursive: true });
+
+    // 1) Binary bundle → extract → locate transcribe-cli → place at binPath.
+    if (existsSync(paths.binPath) && !force) {
+      console.log(`\n✓ transcribe-cli already present (${paths.binPath}) — skipping (use --force to re-download).`);
+    } else {
+      console.log(`\nDownloading ${plan.asset!.asset} …`);
+      await installBinary(plan, paths);
+    }
+
+    // 2) Model GGUF.
+    const modelDest = join(paths.modelsDir, plan.model!.file);
+    if (existsSync(modelDest) && !force) {
+      console.log(`✓ model already present (${modelDest}) — skipping (use --force to re-download).`);
+    } else {
+      console.log(`Downloading model ${plan.model!.file} (~${plan.model!.approxSizeMb}MB) …`);
+      await downloadTo(plan.model!.url, modelDest);
+    }
+
+    // 3) Manifest + provider selection.
+    const manifest: TranscribeCppManifest = {
+      version: plan.asset!.asset,
+      asset: plan.asset!.asset,
+      binFile: "transcribe-cli",
+      model: plan.model!.name,
+      modelFile: plan.model!.file,
+      os: plan.platform,
+      arch: plan.arch,
+      ram_gb: plan.totalRamGb,
+      installedAt: new Date().toISOString(),
+    };
+    writeFileSync(paths.manifestPath, JSON.stringify(manifest, null, 2));
+    setEnvVar("TRANSCRIPTION_PROVIDER", "transcribe-cpp");
+
+    console.log(`\n✓ Installed. TRANSCRIPTION_PROVIDER=transcribe-cpp set in the vault .env.`);
+    console.log("  Restart vault to activate:  parachute restart vault");
+  } catch (err) {
+    console.error(`\nInstall failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.error("The verb is idempotent — fix the issue and re-run. Or use the remote provider: parachute-vault transcription install --provider scribe-http");
+    process.exit(1);
+  }
+}
+
+/** Download a URL to a destination file (streamed via fetch → Bun.write). */
+async function downloadTo(url: string, dest: string): Promise<void> {
+  const resp = await fetch(url, { redirect: "follow" });
+  if (!resp.ok) throw new Error(`download failed (${resp.status}) for ${url}`);
+  await Bun.write(dest, resp);
+}
+
+/**
+ * Download the release tarball, extract it, locate the `transcribe-cli`
+ * binary anywhere in the tree, copy it to `paths.binPath`, and chmod +x.
+ * Uses system `tar` (present on Linux + macOS). Kept out of the plan/dry-run
+ * path so tests never hit the network.
+ */
+async function installBinary(plan: InstallPlan, paths: ReturnType<typeof resolveTranscribeCppPaths>): Promise<void> {
+  const tmpRoot = join(paths.dir, ".dl");
+  mkdirSync(tmpRoot, { recursive: true });
+  const tarball = join(tmpRoot, plan.asset!.asset);
+  await downloadTo(plan.asset!.url, tarball);
+
+  const extractDir = join(tmpRoot, "x");
+  rmSync(extractDir, { recursive: true, force: true });
+  mkdirSync(extractDir, { recursive: true });
+  const tarProc = Bun.spawnSync(["tar", "-xzf", tarball, "-C", extractDir]);
+  if (tarProc.exitCode !== 0) {
+    throw new Error(`tar extract failed: ${new TextDecoder().decode(tarProc.stderr)}`);
+  }
+
+  // Locate the transcribe-cli binary anywhere under extractDir.
+  const found = Bun.spawnSync(["find", extractDir, "-name", "transcribe-cli", "-type", "f"]);
+  const hit = new TextDecoder().decode(found.stdout).split("\n").map((l) => l.trim()).find(Boolean);
+  if (!hit) throw new Error(`transcribe-cli not found inside ${plan.asset!.asset}`);
+
+  copyFileSync(hit, paths.binPath);
+  chmodSync(paths.binPath, 0o755);
+  rmSync(tmpRoot, { recursive: true, force: true });
+}
+
+/** `parachute-vault transcription status` — provider + install state. */
+function cmdTranscriptionStatus(): void {
+  const active = resolveTranscriptionProviderName();
+  console.log(`Configured provider: ${active}`);
+  const paths = resolveTranscribeCppPaths();
+  const manifest = readManifest(paths.manifestPath);
+  const installed = transcribeCppInstalled(paths);
+  console.log(`transcribe-cpp installed: ${installed ? "yes" : "no"}`);
+  if (manifest) {
+    console.log(`  model:   ${manifest.model} (${manifest.modelFile})`);
+    console.log(`  binary:  ${paths.binPath}`);
+    console.log(`  ram:     ${manifest.ram_gb}GB at install (${manifest.os}/${manifest.arch})`);
+  } else {
+    console.log(`  (nothing installed — run: parachute-vault transcription install)`);
+  }
+  if (active === "transcribe-cpp" && !installed) {
+    console.log("\n⚠  provider is transcribe-cpp but nothing is installed — transcription is offline until you run `transcription install`.");
+  }
+  console.log(`\nAvailable models (override with --model): ${Object.values(MODELS).map((m: ModelChoice) => m.name).join(", ")}`);
+}
+
+// ---------------------------------------------------------------------------
 // Schema maintenance — `parachute-vault schema <subcommand>`
 // ---------------------------------------------------------------------------
 
@@ -4404,6 +4633,22 @@ Schema maintenance:
                                                        plan; pass --apply (or --yes) to write.
                                                        Writes through strict enforcement (migrate
                                                        bypass). See \`schema migrate-field --help\`.
+
+Transcription (scribe-fold):
+  parachute-vault transcription install [--dry-run] [--model <id>] [--force] [--yes]
+                                           Install the local transcribe-cpp provider — detects
+                                           OS/arch + RAM, downloads the prebuilt transcribe-cli +
+                                           a RAM-tier-appropriate GGUF model into
+                                           ~/.parachute/transcription/, and sets
+                                           TRANSCRIPTION_PROVIDER=transcribe-cpp. --dry-run prints
+                                           the pick + footprint without downloading. --model
+                                           overrides the RAM-tier choice (whisper-tiny.en |
+                                           whisper-small.en | parakeet-tdt-0.6b-v3). --force
+                                           re-downloads; --yes skips the confirm. Needs ffmpeg on
+                                           PATH for non-WAV audio (hinted if missing).
+  parachute-vault transcription install --provider scribe-http
+                                           Switch back to the remote scribe-http provider (no download).
+  parachute-vault transcription status     Show the configured provider + local install state.
 
 ── Advanced / standalone ──────────────────────────────────────────────
 
