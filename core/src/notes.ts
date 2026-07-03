@@ -179,11 +179,16 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
 
 export function getNotes(db: Database, ids: string[]): Note[] {
   if (ids.length === 0) return [];
+  // Dedupe before chunking: a duplicate id straddling two chunk boundaries
+  // would otherwise be fetched (and returned) twice, unlike the old single
+  // IN-list which returned each matching row once regardless of duplicate
+  // params. Matches getNoteTagsForNotes / getNoteSummaries.
+  const uniqueIds = [...new Set(ids)];
   // Chunk under the DO 100-bound-param cap (see sql-in.ts). Each chunk is its
   // own IN-list query; results are merged and re-sorted by created_at (with id
   // as a deterministic tiebreak) to preserve the single-statement ORDER BY.
   const rows: NoteRow[] = [];
-  for (const chunk of chunkForInClause(ids)) {
+  for (const chunk of chunkForInClause(uniqueIds)) {
     const placeholders = chunk.map(() => "?").join(", ");
     rows.push(...db.prepare(
       `SELECT * FROM notes WHERE id IN (${placeholders})`,
