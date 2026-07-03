@@ -164,6 +164,10 @@ export interface BuildCliDeps {
   exists: (p: string) => boolean;
   /** Remove a stale / half-built binary (production: `fs.rmSync{force}`). */
   removeBin: (p: string) => void;
+  /** Move a file into place (production: `fs.renameSync`). Used to promote the
+   *  freshly-built binary atomically, so a failed rebuild never clobbers a
+   *  previously working binary. */
+  rename: (from: string, to: string) => void;
 }
 
 export interface BuildCliInput {
@@ -219,23 +223,21 @@ export async function buildTranscribeCli(
     };
   }
 
-  const argv = buildCompileCommand({
-    platform: deps.platform,
-    compiler,
-    srcDir: input.srcDir,
-    libsDir: input.libsDir,
-    outPath: input.binPath,
-  });
-  const command = argv.join(" ");
+  const common = { platform: deps.platform, compiler, srcDir: input.srcDir, libsDir: input.libsDir };
+  // The reported command targets the FINAL binPath (what an operator would run
+  // by hand to reproduce). The actual compile writes to a temp sibling and is
+  // promoted on success — so a failed rebuild (e.g. `--force` that then fails)
+  // never clobbers a previously working binary, and no half-built artifact is
+  // ever left where available() would treat it as runnable. The temp is a
+  // sibling in the same dir, so the @loader_path/../libs rpath is unaffected.
+  const command = buildCompileCommand({ ...common, outPath: input.binPath }).join(" ");
+  const tmpOut = `${input.binPath}.building`;
+  const argv = buildCompileCommand({ ...common, outPath: tmpOut });
 
-  // Never compile over a stale binary — a failed compile must not leave the
-  // previous artifact looking fresh.
-  deps.removeBin(input.binPath);
-
+  deps.removeBin(tmpOut); // clear any stale temp from a prior interrupted build
   const res = await deps.compile(argv);
-  if (res.exitCode !== 0 || !deps.exists(input.binPath)) {
-    // Never leave a half-built binary that available() would treat as runnable.
-    deps.removeBin(input.binPath);
+  if (res.exitCode !== 0 || !deps.exists(tmpOut)) {
+    deps.removeBin(tmpOut); // drop any partial output; the existing binary stands
     return {
       ok: false,
       stage: "compile",
@@ -245,5 +247,6 @@ export async function buildTranscribeCli(
     };
   }
 
+  deps.rename(tmpOut, input.binPath); // atomic promote over any prior binary
   return { ok: true, binPath: input.binPath, compiler, command };
 }

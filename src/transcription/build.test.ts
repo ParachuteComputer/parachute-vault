@@ -106,9 +106,9 @@ describe("buildCompileCommand — the proven recipe shape", () => {
 
 /** Build a deps object with call-recording mocks; overrides win. */
 function mkDeps(over: Partial<BuildCliDeps> = {}): BuildCliDeps & {
-  calls: { fetch: number; compile: number; removed: string[] };
+  calls: { fetch: number; compile: number; removed: string[]; renamed: Array<[string, string]> };
 } {
-  const calls = { fetch: 0, compile: 0, removed: [] as string[] };
+  const calls = { fetch: 0, compile: 0, removed: [] as string[], renamed: [] as Array<[string, string]> };
   const deps: BuildCliDeps = {
     platform: "darwin",
     which: (c) => (c === "c++" ? "/usr/bin/c++" : null),
@@ -123,27 +123,35 @@ function mkDeps(over: Partial<BuildCliDeps> = {}): BuildCliDeps & {
     removeBin: (p) => {
       calls.removed.push(p);
     },
+    rename: (from, to) => {
+      calls.renamed.push([from, to]);
+    },
     ...over,
   };
   return Object.assign(deps, { calls });
 }
 
 const INPUT = { srcDir: "/t/.src", libsDir: "/t/libs", binPath: "/t/bin/transcribe-cli" };
+const TMP = `${INPUT.binPath}.building`; // the temp output the build compiles to
 
 describe("buildTranscribeCli — orchestration branches", () => {
-  test("SUCCESS: fetch → compile ok → binary exists ⇒ { ok:true }", async () => {
+  test("SUCCESS: fetch → compile ok → temp exists ⇒ promote (rename) + { ok:true }", async () => {
     const deps = mkDeps();
     const r = await buildTranscribeCli(INPUT, deps);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.binPath).toBe(INPUT.binPath);
       expect(r.compiler).toBe("/usr/bin/c++");
+      // reported command targets the FINAL binPath (reproducible by hand), not the temp
       expect(r.command).toContain("-ltranscribe");
+      expect(r.command).toContain(`-o ${INPUT.binPath}`);
+      expect(r.command).not.toContain(TMP);
     }
     expect(deps.calls.fetch).toBe(1);
     expect(deps.calls.compile).toBe(1);
-    // removed once pre-compile (never compile over a stale binary), not again on success
-    expect(deps.calls.removed).toEqual([INPUT.binPath]);
+    // only the TEMP is cleared pre-compile; the fresh temp is renamed into place
+    expect(deps.calls.removed).toEqual([TMP]);
+    expect(deps.calls.renamed).toEqual([[TMP, INPUT.binPath]]);
   });
 
   test("TOOLCHAIN ABSENT: no compiler ⇒ { ok:false, stage:'toolchain' }, no fetch/compile", async () => {
@@ -175,7 +183,7 @@ describe("buildTranscribeCli — orchestration branches", () => {
     expect(deps.calls.compile).toBe(0);
   });
 
-  test("COMPILE FAILURE (nonzero exit): keeps provider + surfaces stderr + command; removes half-built binary", async () => {
+  test("COMPILE FAILURE (nonzero exit): keeps provider + surfaces stderr + command; only the temp is cleaned", async () => {
     const deps = mkDeps({
       compile: async () => ({ exitCode: 1, stderr: "main.cpp:9: fatal error: transcribe.h not found" }),
     });
@@ -186,15 +194,31 @@ describe("buildTranscribeCli — orchestration branches", () => {
       expect(r.message).toContain("transcribe.h not found");
       expect(r.command).toContain("-ltranscribe");
     }
-    // removeBin called twice: pre-compile guard + post-failure cleanup (never leave a half-built binary)
-    expect(deps.calls.removed).toEqual([INPUT.binPath, INPUT.binPath]);
+    // ONLY the temp is touched (pre-clear + post-cleanup) — the real binPath is never removed
+    expect(deps.calls.removed).toEqual([TMP, TMP]);
+    expect(deps.calls.removed).not.toContain(INPUT.binPath);
+    expect(deps.calls.renamed).toEqual([]);
   });
 
-  test("COMPILE 'succeeds' but output missing ⇒ { ok:false, stage:'compile' } + cleanup", async () => {
+  test("COMPILE 'succeeds' but output missing ⇒ { ok:false, stage:'compile' } + only temp cleaned", async () => {
     const deps = mkDeps({ exists: () => false });
     const r = await buildTranscribeCli(INPUT, deps);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.stage).toBe("compile");
-    expect(deps.calls.removed).toEqual([INPUT.binPath, INPUT.binPath]);
+    expect(deps.calls.removed).toEqual([TMP, TMP]);
+    expect(deps.calls.renamed).toEqual([]);
+  });
+
+  test("ATOMIC: a failed rebuild NEVER removes/renames the existing binary (--force safety)", async () => {
+    // Simulate an existing working binary present at binPath; the rebuild fails.
+    const deps = mkDeps({
+      exists: (p) => p === INPUT.binPath, // real binary exists; the temp never appears
+      compile: async () => ({ exitCode: 1, stderr: "boom" }),
+    });
+    const r = await buildTranscribeCli(INPUT, deps);
+    expect(r.ok).toBe(false);
+    // The existing binary is untouched: no removeBin/rename ever names binPath.
+    expect(deps.calls.removed).not.toContain(INPUT.binPath);
+    expect(deps.calls.renamed).toEqual([]);
   });
 });

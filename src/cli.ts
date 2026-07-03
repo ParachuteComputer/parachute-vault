@@ -19,7 +19,7 @@
 
 import { resolve, join, dirname } from "path";
 import { homedir } from "os";
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, copyFileSync, chmodSync, readdirSync, statSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, copyFileSync, chmodSync, readdirSync, statSync, renameSync } from "fs";
 // JSON import — resolved at module load, works for both dev runs
 // (`bun src/cli.ts …`) and the published package (`bunx @openparachute/vault`)
 // because package.json ships at the root next to src/.
@@ -3775,7 +3775,11 @@ async function maybeBuildTranscribeCli(
   force: boolean,
 ): Promise<CliBuildResult | null> {
   if (process.env.TRANSCRIBE_CPP_BIN?.trim()) {
-    console.log(`\n✓ Using operator-provided TRANSCRIBE_CPP_BIN=${paths.binPath} — skipping source build.`);
+    console.log(
+      existsSync(paths.binPath)
+        ? `\n✓ Using operator-provided TRANSCRIBE_CPP_BIN=${paths.binPath} — skipping source build.`
+        : `\n⚠  TRANSCRIBE_CPP_BIN=${paths.binPath} is set but no file exists there — skipping source build; nothing will be activated until it points at a real binary.`,
+    );
     return null;
   }
   if (existsSync(paths.binPath) && !force) {
@@ -3809,6 +3813,7 @@ async function maybeBuildTranscribeCli(
       },
       exists: existsSync,
       removeBin: (p) => rmSync(p, { force: true }),
+      rename: (from, to) => renameSync(from, to),
     },
   );
 
@@ -3838,6 +3843,15 @@ function noRunnableCliGuidance(
       `\n⚠  Could not build transcribe-cli — ${build.message}`,
       "   To finish, either:",
       `     • install a C++ compiler and re-run this verb (${compilerInstallHint(process.platform)}); OR`,
+      "     • build transcribe-cli yourself, point TRANSCRIBE_CPP_BIN at it, and re-run; OR",
+      "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
+    );
+  } else if (build && !build.ok && build.stage === "fetch") {
+    lines.push(
+      `\n⚠  Could not fetch the transcribe-cli source — ${build.message}`,
+      "   The libraries + model are installed; only the source download failed (check network/proxy).",
+      "   To finish, either:",
+      "     • re-run this verb once connectivity is restored; OR",
       "     • build transcribe-cli yourself, point TRANSCRIBE_CPP_BIN at it, and re-run; OR",
       "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
     );
