@@ -359,7 +359,7 @@ describe("vault create — services.json registration (#208)", () => {
  * reshaped for named seed packs).
  *
  * A freshly-created vault must contain the `welcome` pack (three-note welcome
- * web + the capture tags Notes requires) and the `getting-started` guide — and
+ * web + the one capture tag Notes requires) and the `getting-started` guide — and
  * NOT the `surface-starter` pack, which is opt-in via `add-pack` (ratified
  * 2026-07-02). Idempotent + best-effort: the seed never fails a create and
  * never clobbers an edited note.
@@ -412,11 +412,11 @@ describe("vault create — default pack seeding (welcome + getting-started)", ()
     expect(gs!.content).not.toContain("[[Surface Starter]]");
     expect(gs!.content).toContain("add-pack surface-starter");
 
-    // The capture tags Notes requires arrive with the welcome pack.
-    const tags = readTagNames("guided");
-    for (const tag of ["capture", "capture/text", "capture/voice"]) {
-      expect(tags).toContain(tag);
-    }
+    // The ONE capture tag Notes requires arrives with the welcome pack —
+    // and nothing else (fresh-vault seed = 4 notes + 1 tag; the retired
+    // capture/text + capture/voice subtypes are no longer seeded).
+    expect(readTagNames("guided")).toEqual(["capture"]);
+    expect(notes).toHaveLength(4);
   });
 
   test("seeding doesn't break --json stdout (notes seeded silently)", () => {

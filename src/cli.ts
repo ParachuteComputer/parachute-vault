@@ -3965,7 +3965,7 @@ async function createVault(
   // row is written — vault is a pure hub resource-server post-0.5.0.
   const seedStore = getVaultStore(name);
 
-  // Seed the default packs (welcome web + capture tags, Getting Started guide)
+  // Seed the default packs (welcome web + capture tag, Getting Started guide)
   // so the first minute shows a small living graph and a connected AI can read
   // the guide and help the operator set the vault up. Surface Starter is NOT
   // default-seeded — `parachute-vault add-pack surface-starter` adds it later.
