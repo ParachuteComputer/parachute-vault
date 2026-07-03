@@ -30,6 +30,12 @@ import { setTranscriptionWorker } from "./transcription-registry.ts";
 import { assetsDir } from "./routes.ts";
 import { resolveScribeAuthToken, ensureScribeBearer } from "./scribe-env.ts";
 import { getCachedScribeUrl } from "./scribe-discovery.ts";
+import { TranscribeCppProvider } from "./transcription/providers/transcribe-cpp.ts";
+import {
+  resolveTranscriptionProviderName,
+  resolveTranscribeCppPaths,
+  transcribeCppInstalled,
+} from "./transcription/select.ts";
 import { readEnvFile, setEnvVar } from "./config.ts";
 import { resolveBindHostname } from "./bind.ts";
 import { MirrorManager } from "./mirror-manager.ts";
@@ -107,40 +113,77 @@ registerConfiguredTriggers();
  * Authorization header on a 401 and transcription fails with a friendly
  * error captured on the transcript note.
  */
-const scribeUrl = getCachedScribeUrl();
 let transcriptionWorker: TranscriptionWorker | null = null;
-if (scribeUrl) {
-  // Generate + persist the shared bearer on first boot. Subsequent boots
-  // pick up the existing value and don't rotate. Loading the .env back
-  // into process.env happens above (`loadEnvFile()`); we re-load here to
-  // pick up the just-written value without restart.
-  const { created, token } = ensureScribeBearer(readEnvFile, setEnvVar);
-  if (created) {
-    process.env.SCRIBE_AUTH_TOKEN = token;
-    console.log("[transcribe] generated SCRIBE_AUTH_TOKEN (32 bytes, base64url) — mirror this value into scribe's config");
-  }
-  transcriptionWorker = startTranscriptionWorker({
-    vaultList: () => listVaults(),
-    getStore: (name) => getVaultStore(name),
-    scribeUrl,
-    scribeToken: resolveScribeAuthToken(),
-    resolveAssetsDir: (vault) => assetsDir(vault),
-    getAudioRetention: (vault) => readVaultConfig(vault)?.audio_retention ?? "keep",
-    getContextPredicates: (vault) => readVaultConfig(vault)?.transcription?.context,
-  });
-  // Event-driven hot path — the `attachment:created` hook fires the worker
-  // in a microtask instead of waiting for the 30s sweep.
+
+// Shared worker wiring: the event-driven `attachment:created` hot path + the
+// REST-retry registry. Same for whichever provider the worker was built with.
+function wireTranscriptionWorker(worker: TranscriptionWorker): void {
   registerTranscriptionHook(
     defaultHookRegistry,
-    transcriptionWorker,
+    worker,
     (store) => getVaultNameForStore(store as never),
   );
-  // Expose the worker to the REST retry endpoint so retries kick immediately
-  // instead of waiting for the sweep. Idempotent on second boot.
-  setTranscriptionWorker(transcriptionWorker);
-  console.log(`[transcribe] worker started → ${scribeUrl}`);
+  setTranscriptionWorker(worker);
+}
+
+// Fields the worker needs regardless of provider (queue/retention/context).
+const commonWorkerOpts = {
+  vaultList: () => listVaults(),
+  getStore: (name: string) => getVaultStore(name),
+  resolveAssetsDir: (vault: string) => assetsDir(vault),
+  getAudioRetention: (vault: string) => readVaultConfig(vault)?.audio_retention ?? "keep",
+  getContextPredicates: (vault: string) => readVaultConfig(vault)?.transcription?.context,
+};
+
+// Provider selection (scribe-fold Phase 2a). Default is `scribe-http` — unset
+// TRANSCRIPTION_PROVIDER means the existing scribe-http path runs unchanged.
+const providerName = resolveTranscriptionProviderName();
+if (providerName === "transcribe-cpp") {
+  // Local, no-Python provider: subprocess the prebuilt transcribe-cli. Only
+  // start the worker when it's actually installed — otherwise every pending
+  // item would terminal-fail with `missing_provider`. `transcribeCppInstalled`
+  // is a cheap existsSync check (no spawn), matching `available()`.
+  const tcPaths = resolveTranscribeCppPaths();
+  if (transcribeCppInstalled(tcPaths)) {
+    transcriptionWorker = startTranscriptionWorker({
+      ...commonWorkerOpts,
+      provider: new TranscribeCppProvider({ binPath: tcPaths.binPath, modelPath: tcPaths.modelPath }),
+    });
+    wireTranscriptionWorker(transcriptionWorker);
+    console.log(`[transcribe] worker started → transcribe-cpp (${tcPaths.modelPath})`);
+  } else {
+    console.log(
+      "[transcribe] TRANSCRIPTION_PROVIDER=transcribe-cpp but no binary/model installed — run `parachute-vault transcription install`",
+    );
+  }
 } else {
-  console.log("[transcribe] worker disabled (no scribe in services.json and SCRIBE_URL unset)");
+  // Default scribe-http path — behavior-preserving (Phase 1). Start the worker
+  // if scribe is discoverable; otherwise transcription is a no-op.
+  //
+  // Scribe URL resolution order (per `scribe-discovery.ts`): `SCRIBE_URL` env
+  // var, then `~/.parachute/services.json` `parachute-scribe` entry, then none.
+  //
+  // Bearer generation (vault#353): if neither `SCRIBE_AUTH_TOKEN` nor the
+  // legacy `SCRIBE_TOKEN` is set, generate a fresh 32-byte base64url bearer
+  // and persist it to vault's `.env` so subsequent restarts use the same
+  // value. The operator (or hub install) mirrors this bearer to scribe.
+  const scribeUrl = getCachedScribeUrl();
+  if (scribeUrl) {
+    const { created, token } = ensureScribeBearer(readEnvFile, setEnvVar);
+    if (created) {
+      process.env.SCRIBE_AUTH_TOKEN = token;
+      console.log("[transcribe] generated SCRIBE_AUTH_TOKEN (32 bytes, base64url) — mirror this value into scribe's config");
+    }
+    transcriptionWorker = startTranscriptionWorker({
+      ...commonWorkerOpts,
+      scribeUrl,
+      scribeToken: resolveScribeAuthToken(),
+    });
+    wireTranscriptionWorker(transcriptionWorker);
+    console.log(`[transcribe] worker started → ${scribeUrl}`);
+  } else {
+    console.log("[transcribe] worker disabled (no scribe in services.json and SCRIBE_URL unset)");
+  }
 }
 
 if (process.env.VAULT_AUTH_TOKEN?.trim()) {

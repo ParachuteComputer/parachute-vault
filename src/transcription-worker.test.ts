@@ -140,6 +140,50 @@ describe("transcription worker", () => {
     expect(att.metadata?.transcript).toBe("hello world transcript");
   });
 
+  test("injected provider (scribe-fold 2a): worker routes audio→text through it, not scribe-http", async () => {
+    const note = await store.createNote(
+      "# 🎙️ Voice memo\n\n_Transcript pending._\n",
+      { id: "n1cpp", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/cpp.webm");
+    await store.addAttachment(note.id, "memos/cpp.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    // A fake local provider (stands in for transcribe-cpp). If the worker used
+    // it, the note gets this text; a `fetchImpl` that throws proves scribe-http
+    // was NOT called.
+    let called = 0;
+    const provider = {
+      name: "transcribe-cpp",
+      available: async () => ({ ok: true }),
+      transcribe: async () => {
+        called++;
+        return { text: "local transcript" };
+      },
+    };
+    const worker = startTranscriptionWorker({
+      vaultList: () => ["default"],
+      getStore: () => store as unknown as Store,
+      resolveAssetsDir: () => assetsRoot,
+      provider,
+      fetchImpl: (() => {
+        throw new Error("scribe-http must not be called when a provider is injected");
+      }) as unknown as typeof fetch,
+      pollIntervalMs: 10_000_000,
+      logger: silentLogger,
+    });
+    try {
+      expect(await worker.tick()).toBe(1);
+    } finally {
+      await worker.stop();
+    }
+
+    expect(called).toBe(1);
+    const updated = await store.getNote("n1cpp");
+    expect(updated!.content).toBe("# 🎙️ Voice memo\n\nlocal transcript\n");
+  });
+
   test("no-clobber: stub flag absent → does not touch note content", async () => {
     await store.createNote("my own edit", { id: "n2" });
     seedAudio("memos/b.webm");

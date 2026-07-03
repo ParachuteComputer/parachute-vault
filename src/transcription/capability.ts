@@ -16,8 +16,10 @@
 
 import type { TranscriptionProvider } from "../../core/src/transcription/provider.ts";
 import { ScribeHttpProvider } from "./providers/scribe-http.ts";
+import { TranscribeCppProvider } from "./providers/transcribe-cpp.ts";
 import { getCachedScribeUrl } from "../scribe-discovery.ts";
 import { resolveScribeAuthToken } from "../scribe-env.ts";
+import { resolveTranscriptionProviderName, resolveTranscribeCppPaths } from "./select.ts";
 
 export interface TranscriptionCapability {
   /** True when a provider is configured AND available. Notes gates the mic on this. */
@@ -27,12 +29,23 @@ export interface TranscriptionCapability {
 }
 
 /**
- * Build the default provider from live per-process config — the same
- * `scribe-http` provider the worker uses (URL from `SCRIBE_URL`/services.json,
- * bearer from `SCRIBE_AUTH_TOKEN`). When scribe isn't discoverable the URL is
- * undefined, and the provider reports itself unavailable rather than throwing.
+ * Build the default provider from live per-process config, honoring
+ * `TRANSCRIPTION_PROVIDER` (scribe-fold Phase 2a) so the capability flag
+ * reflects whichever provider is actually configured:
+ *
+ *   - `transcribe-cpp` → the local provider, resolving the installed binary +
+ *     GGUF model paths; `available()` is `false` until `transcription install`
+ *     has run.
+ *   - `scribe-http` (default) → the remote provider (URL from
+ *     `SCRIBE_URL`/services.json, bearer from `SCRIBE_AUTH_TOKEN`). When scribe
+ *     isn't discoverable the URL is undefined and it reports itself unavailable
+ *     rather than throwing.
  */
 export function defaultTranscriptionProvider(): TranscriptionProvider {
+  if (resolveTranscriptionProviderName() === "transcribe-cpp") {
+    const paths = resolveTranscribeCppPaths();
+    return new TranscribeCppProvider({ binPath: paths.binPath, modelPath: paths.modelPath });
+  }
   return new ScribeHttpProvider({
     url: getCachedScribeUrl(),
     token: resolveScribeAuthToken(),

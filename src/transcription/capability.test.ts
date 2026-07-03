@@ -1,6 +1,7 @@
-import { describe, test, expect } from "bun:test";
-import { resolveTranscriptionCapability } from "./capability.ts";
+import { describe, test, expect, afterEach } from "bun:test";
+import { resolveTranscriptionCapability, defaultTranscriptionProvider } from "./capability.ts";
 import { ScribeHttpProvider } from "./providers/scribe-http.ts";
+import { TranscribeCppProvider } from "./providers/transcribe-cpp.ts";
 import type { TranscriptionProvider } from "../../core/src/transcription/provider.ts";
 
 /**
@@ -47,5 +48,46 @@ describe("resolveTranscriptionCapability", () => {
   test("never omits minutes_remaining as an unmetered self-host concern", async () => {
     const cap = await resolveTranscriptionCapability(fakeProvider(true));
     expect("minutes_remaining" in cap).toBe(false);
+  });
+
+  test("a transcribe-cpp provider (installed) resolves to enabled: transcribe-cpp", async () => {
+    // existsImpl stubs the binary + model as present so available() is ok
+    // without touching disk.
+    const p = new TranscribeCppProvider({
+      binPath: "/tc/transcribe-cli",
+      modelPath: "/tc/model.gguf",
+      existsImpl: () => true,
+    });
+    const cap = await resolveTranscriptionCapability(p);
+    expect(cap).toEqual({ enabled: true, provider: "transcribe-cpp" });
+  });
+
+  test("a transcribe-cpp provider (not installed) resolves to disabled", async () => {
+    const p = new TranscribeCppProvider({ binPath: "/tc/transcribe-cli", modelPath: "/tc/model.gguf", existsImpl: () => false });
+    const cap = await resolveTranscriptionCapability(p);
+    expect(cap.enabled).toBe(false);
+    expect(cap.provider).toBeUndefined();
+  });
+});
+
+/**
+ * `defaultTranscriptionProvider` honors `TRANSCRIPTION_PROVIDER` so the
+ * capability flag reflects whichever provider is configured (scribe-fold 2a).
+ */
+describe("defaultTranscriptionProvider — provider selection", () => {
+  const saved = process.env.TRANSCRIPTION_PROVIDER;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.TRANSCRIPTION_PROVIDER;
+    else process.env.TRANSCRIPTION_PROVIDER = saved;
+  });
+
+  test("default (unset) → the scribe-http provider", () => {
+    delete process.env.TRANSCRIPTION_PROVIDER;
+    expect(defaultTranscriptionProvider().name).toBe("scribe-http");
+  });
+
+  test("TRANSCRIPTION_PROVIDER=transcribe-cpp → the transcribe-cpp provider", () => {
+    process.env.TRANSCRIPTION_PROVIDER = "transcribe-cpp";
+    expect(defaultTranscriptionProvider().name).toBe("transcribe-cpp");
   });
 });
