@@ -199,7 +199,7 @@ export class TranscribeCppProvider implements TranscriptionProvider {
       return {
         ok: false,
         reason:
-          "no runnable transcribe-cli (v0.1.1 ships a library, not a CLI — set TRANSCRIBE_CPP_BIN to a built transcribe-cli, or see `parachute-vault transcription status`)",
+          "no runnable transcribe-cli (run `parachute-vault transcription install` to build one against the prebuilt libs — needs a C++ compiler — or set TRANSCRIBE_CPP_BIN; see `parachute-vault transcription status`)",
       };
     }
     if (!this.modelPath || !this.existsImpl(this.modelPath)) {
