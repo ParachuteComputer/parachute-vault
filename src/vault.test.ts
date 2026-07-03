@@ -6505,3 +6505,51 @@ describe("handleVault: auto_transcribe (per-vault)", async () => {
 
 });
 
+describe("handleVault: transcription capability (scribe-fold Phase 1)", async () => {
+  test("GET surfaces transcription: { enabled, provider } when a provider is available", async () => {
+    const cfg = { name: "default" } as { name: string };
+    const res = await handleVault(
+      mkReq("GET", "/vault"),
+      store,
+      cfg as any,
+      undefined,
+      async () => ({ enabled: true, provider: "scribe-http" }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.transcription).toEqual({ enabled: true, provider: "scribe-http" });
+  });
+
+  test("GET surfaces transcription.enabled=false when no provider is available (no crash)", async () => {
+    const cfg = { name: "default" } as { name: string };
+    const res = await handleVault(
+      mkReq("GET", "/vault"),
+      store,
+      cfg as any,
+      undefined,
+      async () => ({ enabled: false }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.transcription).toEqual({ enabled: false });
+    expect(body.transcription.provider).toBeUndefined();
+  });
+
+  test("capability is a distinct axis from the auto_transcribe policy toggle", async () => {
+    // A vault with auto_transcribe.enabled=true but NO provider available still
+    // reports transcription.enabled=false — the mic should be gated on
+    // capability, not policy.
+    const cfg = { name: "default", auto_transcribe: { enabled: true } };
+    const res = await handleVault(
+      mkReq("GET", "/vault"),
+      store,
+      cfg as any,
+      undefined,
+      async () => ({ enabled: false }),
+    );
+    const body = await res.json() as any;
+    expect(body.config.auto_transcribe.enabled).toBe(true);
+    expect(body.transcription.enabled).toBe(false);
+  });
+});
+

@@ -55,9 +55,14 @@ import { join, normalize } from "path";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import type { Store, Attachment, Note } from "../core/src/types.ts";
 import type { HookRegistry } from "../core/src/hooks.ts";
-import { appendContextPart, fetchContextEntries, type ContextPayload } from "./context.ts";
+import { fetchContextEntries, type ContextPayload } from "./context.ts";
 import type { TriggerIncludeContext } from "./config.ts";
 import { upsertTranscriptNote } from "./transcript-note.ts";
+import {
+  TranscriptionError,
+  type TranscriptionProvider,
+} from "../core/src/transcription/provider.ts";
+import { ScribeHttpProvider } from "./transcription/providers/scribe-http.ts";
 
 /** Placeholder pattern written by the voice-memo capture stub. */
 const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
@@ -138,6 +143,15 @@ export interface TranscriptionWorkerOpts {
   maxAttempts?: number;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /**
+   * Transcription provider (scribe-fold Phase 1). When omitted, a behavior-
+   * preserving `scribe-http` provider is built from `scribeUrl` / `scribeToken`
+   * / `timeoutMs` / `fetchImpl` — reproducing exactly the former `callScribe`.
+   * Phase 2+ (local-ASR backends, the cloud Workers-AI provider) inject one
+   * here; the worker's queue/backoff/retry/transcript-note/retention logic is
+   * unchanged regardless.
+   */
+  provider?: TranscriptionProvider;
   logger?: { info?: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
 }
 
@@ -181,25 +195,6 @@ interface PendingMeta {
 }
 
 /**
- * Structured error thrown when scribe returns a 4xx with a recognized
- * `error_code` — we surface the code on the transcript note's frontmatter
- * so callers can branch on stable strings instead of regex-matching message
- * text. Today the canonical code is `missing_provider` (scribe#47).
- */
-class ScribeApiError extends Error {
-  readonly errorCode?: string;
-  readonly httpStatus: number;
-  readonly retriable: boolean;
-  constructor(message: string, opts: { errorCode?: string; httpStatus: number; retriable: boolean }) {
-    super(message);
-    this.name = "ScribeApiError";
-    this.errorCode = opts.errorCode;
-    this.httpStatus = opts.httpStatus;
-    this.retriable = opts.retriable;
-  }
-}
-
-/**
  * Start the worker loop. Returns a handle with `stop()` + `tick()`.
  * Tests should build the worker and call `tick()` directly; production
  * calls `start()` implicitly by constructing the worker.
@@ -216,6 +211,18 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retentionFor = opts.getAudioRetention ?? (() => "keep" as const);
+
+  // Resolve the transcription provider (scribe-fold Phase 1). Default: the
+  // behavior-preserving `scribe-http` provider built from the same
+  // scribeUrl/token/timeout/fetch the worker was already constructed with —
+  // so existing installs transcribe byte-identically. Callers may inject a
+  // different provider without touching any of the queue/retry logic below.
+  const provider: TranscriptionProvider = opts.provider ?? new ScribeHttpProvider({
+    url: opts.scribeUrl,
+    token: opts.scribeToken,
+    timeoutMs,
+    fetchImpl,
+  });
 
   let stopped = false;
   let inflight: Promise<void> = Promise.resolve();
@@ -474,30 +481,35 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
 
     let scribeResult: { text: string; durationMs: number };
     try {
-      scribeResult = await callScribe({
-        url: opts.scribeUrl,
-        token: opts.scribeToken,
-        filePath,
+      // Read the audio + call the provider inside this try so a read failure
+      // (a race deleting the file between existsSync and read) is handled the
+      // same way as a transcription failure — as a retriable error — exactly
+      // as the former `callScribe` (which read the file internally) did. The
+      // worker owns the wall-clock timing (`durationMs`); the provider owns
+      // only the audio→text step.
+      const audio = readFileSync(filePath);
+      const startedAt = Date.now();
+      const result = await provider.transcribe({
+        audio,
         filename: attachment.path.split("/").pop() ?? "audio",
         mimeType: attachment.mimeType,
         context,
-        timeoutMs,
-        fetchImpl,
       });
+      scribeResult = { text: result.text, durationMs: Date.now() - startedAt };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      const apiErr = err instanceof ScribeApiError ? err : null;
-      // 4xx with structured error code → terminal immediately. Re-POSTing the
-      // same audio at a scribe with no provider configured (or that rejects
-      // our bearer) will keep failing — the operator has to act, retries don't
-      // help. This is the "graceful first-boot path" from design Q5.
+      const apiErr = err instanceof TranscriptionError ? err : null;
+      // A non-retriable provider error (a 4xx the operator must fix — no
+      // provider configured, bad auth) is terminal immediately. Re-POSTing the
+      // same audio would keep failing; retries don't help. This is the
+      // "graceful first-boot path" from design Q5.
       const nonRetriable = apiErr !== null && !apiErr.retriable;
       const nextAttempts = attempts + 1;
       const terminal = nonRetriable || nextAttempts >= maxAttempts;
 
       if (terminal) {
         if (nonRetriable) {
-          logger.error(`[transcribe] non-retriable scribe error on attachment ${attachment.id} (status ${apiErr!.httpStatus}${apiErr!.errorCode ? `, ${apiErr!.errorCode}` : ""}):`, errMsg);
+          logger.error(`[transcribe] non-retriable provider error on attachment ${attachment.id} (status ${apiErr!.httpStatus ?? "n/a"}${apiErr!.code ? `, ${apiErr!.code}` : ""}):`, errMsg);
         } else {
           logger.error(`[transcribe] giving up on attachment ${attachment.id} after ${nextAttempts} attempts:`, errMsg);
         }
@@ -506,10 +518,10 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
           transcribe_status: "failed",
           transcribe_attempts: nextAttempts,
           transcribe_error: errMsg,
-          ...(apiErr?.errorCode ? { transcribe_error_code: apiErr.errorCode } : {}),
+          ...(apiErr?.code ? { transcribe_error_code: apiErr.code } : {}),
         });
         if (isAutoOrigin) {
-          await writeFailureTranscriptNote(store, attachment, errMsg, apiErr?.errorCode, undefined);
+          await writeFailureTranscriptNote(store, attachment, errMsg, apiErr?.code, undefined);
         } else {
           await applyFailureMarker(store, attachment.noteId);
         }
@@ -744,90 +756,9 @@ export function registerTranscriptionHook(
 }
 
 /**
- * Call scribe's `POST /v1/audio/transcriptions` with the audio file + optional
- * context part. Returns the transcript text plus the wall-clock duration of
- * the request, so the worker can surface `transcript_duration_ms` on the
- * transcript note.
- *
- * Failure modes (encoded as throws):
- *   - 4xx with a JSON body carrying `error_code`: throws `ScribeApiError`
- *     with the code (`missing_provider` etc.). Treated as a non-retriable
- *     terminal failure — re-POSTing the same audio at the same broken scribe
- *     would just fail the same way; the operator has to act.
- *   - 4xx without `error_code` (auth, malformed multipart): throws
- *     `ScribeApiError` with the body text. Non-retriable.
- *   - 5xx, network error, or timeout: throws a plain `Error`. Retriable —
- *     the worker's backoff path picks it up.
- *   - 200 with missing/invalid `text` field: throws a plain `Error`.
- *     Retriable (could be a transient provider-output glitch).
+ * Re-export the structured provider error so tests + callers can
+ * `instanceof`-check for terminal-failure semantics. The scribe HTTP call
+ * itself now lives in `src/transcription/providers/scribe-http.ts` behind the
+ * `TranscriptionProvider` seam (scribe-fold Phase 1).
  */
-async function callScribe(args: {
-  url: string;
-  token?: string;
-  filePath: string;
-  filename: string;
-  mimeType: string;
-  context: ContextPayload | null;
-  timeoutMs: number;
-  fetchImpl: typeof fetch;
-}): Promise<{ text: string; durationMs: number }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), args.timeoutMs);
-  const startedAt = Date.now();
-  try {
-    const fileBuffer = readFileSync(args.filePath);
-    const file = new File([fileBuffer], args.filename, { type: args.mimeType });
-    const form = new FormData();
-    form.append("file", file);
-    if (args.context) appendContextPart(form, args.context);
-
-    const endpoint = `${args.url.replace(/\/$/, "")}/v1/audio/transcriptions`;
-    const headers: Record<string, string> = {};
-    if (args.token) headers["Authorization"] = `Bearer ${args.token}`;
-
-    const resp = await args.fetchImpl(endpoint, {
-      method: "POST",
-      headers,
-      body: form,
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      // Try to extract structured error_code from JSON body (scribe#47).
-      let errorCode: string | undefined;
-      let errorMessage: string | undefined;
-      try {
-        const parsed = JSON.parse(body) as { error?: string; error_code?: string; message?: string };
-        if (typeof parsed.error_code === "string") errorCode = parsed.error_code;
-        if (typeof parsed.error === "string") errorMessage = parsed.error;
-        else if (typeof parsed.message === "string") errorMessage = parsed.message;
-      } catch {
-        // Not JSON — leave errorCode undefined; the raw body becomes the message.
-      }
-      // 4xx is terminal (re-POSTing the same audio at the same broken scribe
-      // will just fail again). 5xx is retriable — provider hiccup, will likely
-      // succeed on backoff.
-      const retriable = resp.status >= 500;
-      const message = errorMessage
-        ?? (errorCode ? `scribe ${errorCode}` : `scribe returned ${resp.status}: ${body}`);
-      throw new ScribeApiError(message, {
-        errorCode,
-        httpStatus: resp.status,
-        retriable,
-      });
-    }
-    const result = await resp.json() as { text?: string };
-    if (typeof result.text !== "string") {
-      throw new Error("scribe response missing text field");
-    }
-    return { text: result.text, durationMs: Date.now() - startedAt };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Re-export the structured error type so tests + callers can `instanceof`-check
- * for terminal-failure semantics.
- */
-export { ScribeApiError };
+export { TranscriptionError };
