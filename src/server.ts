@@ -206,9 +206,10 @@ if (listVaults().length === 0) {
       }
       writeGlobalConfig(globalConfig);
       console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
-      // Seed the in-vault onboarding guide so a connected AI can self-orient and
-      // help set the vault up — same as the `create`/`init` CLI path. Idempotent
-      // + best-effort (never fails first boot). Mirrors createVault() in cli.ts.
+      // Seed the default packs (welcome web + capture tags, Getting Started
+      // guide) so a connected AI can self-orient and help set the vault up —
+      // same as the `create`/`init` CLI path. Idempotent + best-effort (never
+      // fails first boot). Mirrors createVault() in cli.ts.
       await seedOnboardingNotesBestEffort(getVaultStore(vaultName));
     } else if (firstBoot.source === "env-invalid") {
       // PARACHUTE_VAULT_NAME was set but failed validation — do NOT silently

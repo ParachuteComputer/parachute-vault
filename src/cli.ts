@@ -181,6 +181,9 @@ switch (command) {
   case "create":
     await cmdCreate(cmdArgs);
     break;
+  case "add-pack":
+    await cmdAddPack(cmdArgs);
+    break;
   case "list":
   case "ls":
     cmdList();
@@ -3962,11 +3965,14 @@ async function createVault(
   // row is written — vault is a pure hub resource-server post-0.5.0.
   const seedStore = getVaultStore(name);
 
-  // Seed the in-vault onboarding guide (Getting Started + Surface Starter) so a
-  // connected AI can read it and help the operator set the vault up. Idempotent
-  // + best-effort: only writes notes that are absent, and never fails the
-  // create. Runs BEFORE the mirror bootstrap so the seeded notes land in the
-  // initial mirror commit. See src/onboarding-seed.ts + core/src/onboarding.ts.
+  // Seed the default packs (welcome web + capture tags, Getting Started guide)
+  // so the first minute shows a small living graph and a connected AI can read
+  // the guide and help the operator set the vault up. Surface Starter is NOT
+  // default-seeded — `parachute-vault add-pack surface-starter` adds it later.
+  // Idempotent + best-effort: only writes notes that are absent, and never
+  // fails the create. Runs BEFORE the mirror bootstrap so the seeded content
+  // lands in the initial mirror commit. See src/onboarding-seed.ts +
+  // core/src/seed-packs.ts.
   await seedOnboardingNotesBestEffort(seedStore);
 
   // Default new vaults to an internal live mirror (local git backup of the
@@ -4088,6 +4094,99 @@ function installMcpConfig(opts: InstallMcpConfigOpts): void {
   writeFileSync(targetPath, JSON.stringify(config, null, 2) + "\n");
 }
 
+/**
+ * `parachute-vault add-pack <pack> [--vault <name>]` — apply a named seed
+ * pack (starter notes + tags) to a vault.
+ *
+ * New vaults default-seed the `welcome` + `getting-started` packs at create;
+ * this verb adds the opt-in ones (today: `surface-starter`) — or re-applies a
+ * default pack to an older vault that predates it. Idempotent per item: a
+ * note is created only when no note lives at its path (a re-run never
+ * clobbers an edited note); tag upserts converge on the same rows.
+ *
+ * Unlike `import` (bulk stream writes, vault#323 daemon-busy guard), this is
+ * a handful of tiny writes against a WAL database, so it runs fine next to a
+ * live daemon; a write-lock collision (SQLITE_BUSY) is caught with a
+ * retry-is-safe message instead of pre-emptively demanding a daemon stop.
+ */
+async function cmdAddPack(args: string[]) {
+  let vaultName = "default";
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--vault") {
+      const v = args[++i];
+      if (!v) {
+        console.error("--vault requires a value.");
+        process.exit(1);
+      }
+      vaultName = v;
+    } else {
+      positional.push(arg);
+    }
+  }
+  const packName = positional[0];
+
+  const { listSeedPacks, getSeedPack, applySeedPack } = await import(
+    "../core/src/seed-packs.ts"
+  );
+
+  const printPacks = () => {
+    console.error("\nAvailable packs:");
+    for (const p of listSeedPacks()) {
+      console.error(`  ${p.name.padEnd(17)} ${p.description}`);
+    }
+  };
+
+  if (!packName) {
+    console.error("Usage: parachute-vault add-pack <pack> [--vault <name>]");
+    printPacks();
+    process.exit(1);
+  }
+
+  const pack = getSeedPack(packName);
+  if (!pack) {
+    console.error(`Unknown pack: "${packName}"`);
+    printPacks();
+    process.exit(1);
+  }
+
+  const config = readVaultConfig(vaultName);
+  if (!config) {
+    console.error(`Vault "${vaultName}" not found. Run: parachute-vault create ${vaultName}`);
+    process.exit(1);
+  }
+
+  const store = getVaultStore(vaultName);
+  try {
+    const result = await applySeedPack(store, pack);
+    console.log(`Pack "${pack.name}" applied to vault "${vaultName}":`);
+    for (const path of result.seededNotes) {
+      console.log(`  + note  ${path}`);
+    }
+    for (const path of result.skippedNotes) {
+      console.log(`  = note  ${path} (already exists — left untouched)`);
+    }
+    for (const tag of result.tags) {
+      console.log(`  ~ tag   ${tag} (upserted)`);
+    }
+    if (result.seededNotes.length === 0 && result.tags.length === 0) {
+      console.log("  Nothing to add — everything was already in place.");
+    }
+  } catch (err) {
+    const message = (err as Error)?.message ?? String(err);
+    if (message.includes("SQLITE_BUSY") || (err as { code?: string })?.code === "SQLITE_BUSY") {
+      console.error(
+        `error: the vault database is busy (a running daemon holds the write lock). ` +
+          `add-pack is idempotent — re-run it, or stop the daemon first with: parachute stop vault`,
+      );
+    } else {
+      console.error(`error: failed to apply pack "${pack.name}": ${message}`);
+    }
+    process.exit(1);
+  }
+}
+
 function usage() {
   console.log(`
 Parachute Vault — self-hosted knowledge graph
@@ -4153,6 +4252,14 @@ Vaults:
                                            opt-in upgrade). --no-mirror creates a bare vault with no mirror config.
                                            Operators can flip the server-wide default with 'default_mirror: off' in
                                            config.yaml (recommended for cloud / disk-constrained boxes).
+  parachute-vault add-pack <pack> [--vault <name>]
+                                           Add a named seed pack (starter notes + tags) to a vault
+                                           (default vault: "default"). Run with no arguments to list
+                                           the available packs. New vaults seed the "welcome" +
+                                           "getting-started" packs automatically; "surface-starter"
+                                           is opt-in via this command. Idempotent: notes are only
+                                           created when absent — a re-run never clobbers an edited
+                                           note.
   parachute-vault list                     List all vaults
   parachute-vault remove <name> [--yes]    Remove a vault
   parachute-vault mcp-install [--mint|--token <t>]

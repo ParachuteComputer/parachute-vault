@@ -33,7 +33,7 @@ import {
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
 import type { VaultStats } from "./types.ts";
-import { GETTING_STARTED_PATH } from "./onboarding.ts";
+import { GETTING_STARTED_PATH } from "./seed-packs.ts";
 
 /**
  * Does a note live at the seeded onboarding path? Used to gate the "Start here"
