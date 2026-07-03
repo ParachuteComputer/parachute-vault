@@ -103,6 +103,10 @@ export interface TranscribeCppManifest {
   /** Runtime shared-library filenames extracted under `libs/` (libtranscribe +
    *  libggml). v0.1.1 ships these instead of a CLI. */
   libFiles?: string[];
+  /** When the `transcribe-cli` was built from source at install, the pinned
+   *  upstream source ref it was compiled from. Absent when no CLI was built
+   *  (build skipped/failed, or an operator-supplied `TRANSCRIBE_CPP_BIN`). */
+  binBuiltFrom?: string;
   os: string;
   arch: string;
   ram_gb: number;

@@ -1,8 +1,8 @@
 # Transcription provider seam — the scribe-fold (Phase 1)
 
-**Status:** Phase 1 shipped (vault#529). Phase 2a shipped (vault#530); provider contract corrected against a live v0.1.1 run (this PR). Phases 2b–3 planned.
-**Ratified:** 2026-07-03 (Aaron) — scribe folds into vault as a built-in transcription feature; adopt transcribe.cpp (subprocess) as the recommended local provider.
-**Repo:** parachute-vault (`0.6.5-rc.7`).
+**Status:** Phase 1 shipped (vault#529). Phase 2a shipped (vault#530); provider contract corrected against a live v0.1.1 run (vault#532). **Build-transcribe-cli-at-install shipped (this PR)** — the v0.1.1 library→CLI gap is now closed by an install-time source compile (live-verified on macOS arm64). Phase 3 planned.
+**Ratified:** 2026-07-03 (Aaron) — scribe folds into vault as a built-in transcription feature; adopt transcribe.cpp (subprocess) as the recommended local provider; "build the CLI ourselves if it's easy" — it is.
+**Repo:** parachute-vault (`0.6.5-rc.8`).
 
 ## Why
 
@@ -129,15 +129,64 @@ made:
    line and returns it; `text: (empty)` is the no-result sentinel → `""`. (The
    earlier parser concatenated every stdout line into silent garbage.)
 
-**Binary acquisition — the plan.** The clean path is a **prebuilt
-`transcribe-cli` per platform in upstream releases** — that's the concrete
-**UPSTREAM ASK to CJ Pais / handy-computer** and a natural collaboration item.
-Interim, if we don't wait for upstream, we can **build the CLI at install** —
-compiling `examples/cli/main.cpp` + `examples/common/wav.cpp` against the
-prebuilt `libtranscribe` dylib is proven to work (~127KB, a tiny compile, no
-ggml rebuild). Until either lands, an operator points `TRANSCRIBE_CPP_BIN` at a
-CLI they built. transcribe-cpp therefore stays **opt-in and unpromoted** until
-binary acquisition is solved.
+**Binary acquisition — IMPLEMENTED as an install-time source build (this PR).**
+`transcription install` now **builds `transcribe-cli` from source** against the
+prebuilt dylibs it just extracted, so the library-only v0.1.1 reality yields a
+runnable CLI on any host with a C++ compiler — no manual step, no waiting on
+upstream. The clean *future* path is still a **prebuilt `transcribe-cli` per
+platform in upstream releases** (the concrete **UPSTREAM ASK to CJ Pais /
+handy-computer**); when that lands, `installTranscribeLibs` already places a
+prebuilt CLI opportunistically and the build step is skipped — the build
+collapses back to a simple download.
+
+#### The build (`src/transcription/build.ts`)
+
+Live-verified 2026-07-03 on macOS arm64 (M4), whisper-tiny.en-Q5_K_M — a
+`say`-generated 16kHz WAV round-tripped through the freshly built CLI and
+returned the correct transcript. The proven recipe:
+
+```
+c++ -std=c++17 -O2 \
+  -I<srcDir>/include \
+  -I<srcDir>/examples/common \
+  <srcDir>/examples/cli/main.cpp \
+  <srcDir>/examples/common/wav.cpp \
+  -L<libsDir> -ltranscribe \
+  -Wl,-rpath,@loader_path/../libs \      # Linux: $ORIGIN/../libs
+  -o <binDir>/transcribe-cli
+```
+
+produces a **127,648-byte** arm64 executable (no ggml/Metal rebuild). The
+source is fetched from raw.githubusercontent at the **pinned v0.1.1 tag commit**
+(`d89ecb7…`, `TRANSCRIBE_CPP_SOURCE_REF`) — `main.cpp` + `wav.cpp` + `wav.h` +
+`dr_wav.h` + the `include/` headers. The **rpath is load-bearing**:
+`libtranscribe.dylib`'s install_name is `@rpath/libtranscribe.dylib` with no
+rpath of its own, so the CLI carries `@loader_path/../libs` to find it from the
+sibling `bin/`↔`libs/` layout; `libtranscribe` in turn references `libggml*` via
+`@loader_path/libggml*.dylib`, so co-locating all dylibs in `libs/` is
+sufficient (the CLI never links libggml directly). On Linux the analogous
+`$ORIGIN/../libs` is passed as a single argv element — we spawn the compiler
+directly (not through a shell), so `$ORIGIN` is NOT expanded and lands literally
+in the ELF RUNPATH for the loader.
+
+**Toolchain requirement + failure handling.** The build detects a C++ compiler
+(`c++`/`clang++`/`g++` via `Bun.which`). It is **entirely non-fatal**:
+
+- **compiler absent** → keep the current provider; print a platform hint
+  (`xcode-select --install` on macOS; `apt install build-essential` /
+  `dnf install gcc-c++` on Linux).
+- **fetch / compile failure** → keep the current provider; print the captured
+  compiler stderr **plus the exact compile command tried** (so an operator can
+  build by hand and set `TRANSCRIBE_CPP_BIN`), and leave the `.src/` tree in
+  place for a manual retry. A nonzero compile **removes** any partial output so
+  `available()` can never mistake a half-built artifact for a runnable CLI.
+- **`TRANSCRIBE_CPP_BIN` set** or **CLI already built** (no `--force`) → skip the
+  build and respect what's there.
+
+Because activation still gates on `existsSync(binPath)`, a build failure simply
+leaves the vault on `scribe-http` — never offline behind a CLI that can't run.
+The install manifest records `binBuiltFrom: <ref>` when the CLI was built from
+source; `transcription status` surfaces it.
 
 ### Why the SUBPROCESS path (not the N-API binding)
 

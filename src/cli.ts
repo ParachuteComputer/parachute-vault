@@ -17,7 +17,7 @@
  *   parachute-vault status                  — show full status
  */
 
-import { resolve, join } from "path";
+import { resolve, join, dirname } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, copyFileSync, chmodSync, readdirSync, statSync } from "fs";
 // JSON import — resolved at module load, works for both dev runs
@@ -155,6 +155,13 @@ import {
   readManifest,
   type TranscribeCppManifest,
 } from "./transcription/select.ts";
+import {
+  buildTranscribeCli,
+  cliSourceUrl,
+  compilerInstallHint,
+  TRANSCRIBE_CPP_SOURCE_REF,
+  type CliBuildResult,
+} from "./transcription/build.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -3658,7 +3665,14 @@ async function cmdTranscriptionInstall(args: string[]) {
       await downloadTo(plan.model!.url, modelDest);
     }
 
-    // 3) Manifest.
+    // 3) Build transcribe-cli from source against the extracted dylibs.
+    //    transcribe.cpp v0.1.1 ships a LIBRARY, not a prebuilt CLI, so we
+    //    compile examples/cli/main.cpp + examples/common/wav.cpp against
+    //    libtranscribe (a tiny ~127KB compile — no ggml rebuild). Non-fatal:
+    //    any failure keeps the current provider + prints guidance.
+    const buildResult = await maybeBuildTranscribeCli(paths, libFiles, force);
+
+    // 4) Manifest.
     const manifest: TranscribeCppManifest = {
       version: plan.asset!.asset,
       asset: plan.asset!.asset,
@@ -3666,6 +3680,7 @@ async function cmdTranscriptionInstall(args: string[]) {
       model: plan.model!.name,
       modelFile: plan.model!.file,
       libFiles,
+      binBuiltFrom: buildResult?.ok ? TRANSCRIBE_CPP_SOURCE_REF : undefined,
       os: plan.platform,
       arch: plan.arch,
       ram_gb: plan.totalRamGb,
@@ -3673,8 +3688,8 @@ async function cmdTranscriptionInstall(args: string[]) {
     };
     writeFileSync(paths.manifestPath, JSON.stringify(manifest, null, 2));
 
-    // 4) CLI resolution + provider switch — honest, no silent success. `binPath`
-    //    resolves to TRANSCRIBE_CPP_BIN or a located binary; we activate
+    // 5) CLI resolution + provider switch — honest, no silent success. `binPath`
+    //    resolves to TRANSCRIBE_CPP_BIN or the built binary; we activate
     //    transcribe-cpp only when one actually exists, else we keep the current
     //    provider and report the acquisition gap rather than taking
     //    transcription offline behind a provider that can't run.
@@ -3685,19 +3700,7 @@ async function cmdTranscriptionInstall(args: string[]) {
       console.log(`  Restart vault to activate:  parachute restart vault`);
     } else {
       console.log(`\n✓ Libraries + model installed to ${paths.dir} — transcription is NOT yet activated.`);
-      console.log(
-        "\n⚠  transcribe.cpp v0.1.1 ships a LIBRARY (libtranscribe + libggml), not a\n" +
-          "   `transcribe-cli` executable, so there is no CLI to run yet. To finish:\n" +
-          `     • build a transcribe-cli from source — compile examples/cli/main.cpp +\n` +
-          `       examples/common/wav.cpp against ${paths.libsDir}/libtranscribe.* (a tiny\n` +
-          "       compile, ~127KB, no ggml rebuild) — then point TRANSCRIBE_CPP_BIN at it\n" +
-          "       and re-run this verb; OR\n" +
-          "     • wait for upstream to ship a prebuilt transcribe-cli per platform\n" +
-          "       (tracking: the collaboration ask to handy-computer / CJ Pais).\n" +
-          `   At runtime the CLI must find these libs: macOS set DYLD_LIBRARY_PATH=${paths.libsDir},\n` +
-          `   Linux LD_LIBRARY_PATH=${paths.libsDir}.\n` +
-          "   Your current provider is unchanged — check with `parachute-vault transcription status`.",
-      );
+      console.log(noRunnableCliGuidance(paths, buildResult));
     }
   } catch (err) {
     console.error(`\nInstall failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3759,6 +3762,107 @@ async function installTranscribeLibs(
   return libFiles;
 }
 
+/**
+ * Build `transcribe-cli` from source against the extracted dylibs, honoring
+ * idempotency + the `TRANSCRIBE_CPP_BIN` operator override. Returns the build
+ * result, or `null` when the build was intentionally skipped (already built /
+ * operator-provided binary / no libs to link). Non-fatal — logs progress and
+ * warnings; failures come back as a typed `{ ok:false }` the caller reports.
+ */
+async function maybeBuildTranscribeCli(
+  paths: ReturnType<typeof resolveTranscribeCppPaths>,
+  libFiles: string[],
+  force: boolean,
+): Promise<CliBuildResult | null> {
+  if (process.env.TRANSCRIBE_CPP_BIN?.trim()) {
+    console.log(`\n✓ Using operator-provided TRANSCRIBE_CPP_BIN=${paths.binPath} — skipping source build.`);
+    return null;
+  }
+  if (existsSync(paths.binPath) && !force) {
+    console.log(`\n✓ transcribe-cli already built (${paths.binPath}) — skipping build (use --force to rebuild).`);
+    return null;
+  }
+  if (libFiles.length === 0) {
+    console.warn(`\n⚠  no runtime libraries were extracted — cannot build transcribe-cli. Skipping build.`);
+    return null;
+  }
+
+  console.log(`\nBuilding transcribe-cli from source (transcribe.cpp @ ${TRANSCRIBE_CPP_SOURCE_REF.slice(0, 12)}) …`);
+  mkdirSync(paths.binDir, { recursive: true });
+  const srcDir = join(paths.dir, ".src");
+  const result = await buildTranscribeCli(
+    { srcDir, libsDir: paths.libsDir, binPath: paths.binPath },
+    {
+      platform: process.platform,
+      which: (c) => Bun.which(c),
+      fetchSource: async (files, dir) => {
+        rmSync(dir, { recursive: true, force: true });
+        for (const rel of files) {
+          const dest = join(dir, rel);
+          mkdirSync(dirname(dest), { recursive: true });
+          await downloadTo(cliSourceUrl(rel), dest);
+        }
+      },
+      compile: (cmd) => {
+        const p = Bun.spawnSync(cmd);
+        return { exitCode: p.exitCode ?? 1, stderr: new TextDecoder().decode(p.stderr) };
+      },
+      exists: existsSync,
+      removeBin: (p) => rmSync(p, { force: true }),
+    },
+  );
+
+  if (result.ok) {
+    chmodSync(paths.binPath, 0o755); // belt-and-suspenders; the compiler emits 0755
+    rmSync(srcDir, { recursive: true, force: true }); // tidy — source is re-fetchable
+    console.log(`✓ Built transcribe-cli → ${result.binPath}`);
+  } else {
+    // Keep srcDir on failure so the printed compile command can be re-run by hand.
+    console.warn(`⚠  transcribe-cli build failed (${result.stage}): ${result.message}`);
+    if (result.command) console.warn(`   compile command tried:\n     ${result.command}`);
+  }
+  return result;
+}
+
+/**
+ * The "no runnable CLI" guidance printed when activation can't proceed —
+ * tailored to WHY (build failed at toolchain vs compile, or was skipped).
+ */
+function noRunnableCliGuidance(
+  paths: ReturnType<typeof resolveTranscribeCppPaths>,
+  build: CliBuildResult | null,
+): string {
+  const lines: string[] = [];
+  if (build && !build.ok && build.stage === "toolchain") {
+    lines.push(
+      `\n⚠  Could not build transcribe-cli — ${build.message}`,
+      "   To finish, either:",
+      `     • install a C++ compiler and re-run this verb (${compilerInstallHint(process.platform)}); OR`,
+      "     • build transcribe-cli yourself, point TRANSCRIBE_CPP_BIN at it, and re-run; OR",
+      "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
+    );
+  } else if (build && !build.ok) {
+    lines.push(
+      `\n⚠  transcribe-cli build failed (${build.stage}). The libraries + model are installed;`,
+      "   the CLI is not. To finish, either:",
+      "     • fix the toolchain and re-run this verb; OR",
+      "     • build transcribe-cli yourself (the compile command tried is printed above),",
+      "       point TRANSCRIBE_CPP_BIN at the result, and re-run; OR",
+      "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
+    );
+  } else {
+    // Build skipped (no libs, or an operator-provided binary that isn't present).
+    lines.push(
+      "\n⚠  No runnable transcribe-cli is available yet. To finish, either:",
+      `     • re-run this verb so it builds a transcribe-cli against ${paths.libsDir} (needs a C++ compiler); OR`,
+      "     • point TRANSCRIBE_CPP_BIN at a transcribe-cli you built, and re-run; OR",
+      "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
+    );
+  }
+  lines.push("   Your current provider is unchanged — check with `parachute-vault transcription status`.");
+  return lines.join("\n");
+}
+
 /** `parachute-vault transcription status` — provider + install state. */
 function cmdTranscriptionStatus(): void {
   const active = resolveTranscriptionProviderName();
@@ -3775,8 +3879,8 @@ function cmdTranscriptionStatus(): void {
     );
     console.log(
       cliPresent
-        ? `  cli:     ${paths.binPath}`
-        : `  cli:     NOT FOUND — v0.1.1 ships a library, not a CLI; set TRANSCRIBE_CPP_BIN to a built transcribe-cli`,
+        ? `  cli:     ${paths.binPath}${manifest.binBuiltFrom ? ` (built from source @ ${manifest.binBuiltFrom.slice(0, 12)})` : ""}`
+        : `  cli:     NOT FOUND — re-run \`transcription install\` to build one (needs a C++ compiler), or set TRANSCRIBE_CPP_BIN`,
     );
     console.log(`  ram:     ${manifest.ram_gb}GB at install (${manifest.os}/${manifest.arch})`);
   } else {
