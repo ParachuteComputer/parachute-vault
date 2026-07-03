@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Link, NoteSummary, HydratedLink } from "./types.js";
 import { getNoteTagsForNotes } from "./notes.js";
+import { chunkForInClause } from "./sql-in.js";
 
 export function createLink(
   db: Database,
@@ -103,16 +104,13 @@ function parseMetadata(raw: string | null): Record<string, unknown> | undefined 
   try { return JSON.parse(raw); } catch { return undefined; }
 }
 
-/** IN-list chunk size — matches getLinkCounts' conservative bound-variable floor. */
-const IN_CHUNK = 900;
-
 function getNoteSummaries(db: Database, noteIds: string[]): Map<string, NoteSummary> {
   const map = new Map<string, NoteSummary>();
   if (noteIds.length === 0) return map;
   const ids = [...new Set(noteIds)];
   const rows: SummaryRow[] = [];
-  for (let i = 0; i < ids.length; i += IN_CHUNK) {
-    const chunk = ids.slice(i, i + IN_CHUNK);
+  // Chunk under the DO 100-bound-param cap (see sql-in.ts).
+  for (const chunk of chunkForInClause(ids)) {
     const placeholders = chunk.map(() => "?").join(", ");
     rows.push(...db.prepare(
       `SELECT id, path, metadata, created_at, updated_at FROM notes WHERE id IN (${placeholders})`,
@@ -193,8 +191,8 @@ export function getLinksHydratedForNotes(
   // (source, target, relationship) primary key so a link whose endpoints
   // are both on the page is fetched once.
   const rowsByKey = new Map<string, LinkRow>();
-  for (let i = 0; i < ids.length; i += IN_CHUNK) {
-    const chunk = ids.slice(i, i + IN_CHUNK);
+  // Chunk under the DO 100-bound-param cap (see sql-in.ts).
+  for (const chunk of chunkForInClause(ids)) {
     const placeholders = chunk.map(() => "?").join(", ");
     for (const column of ["source_id", "target_id"] as const) {
       const rows = db.prepare(
@@ -265,12 +263,9 @@ export function getLinkCounts(
   const wantOutbound = direction === "outbound" || direction === "both";
   const wantInbound = direction === "inbound" || direction === "both";
 
-  // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds and
-  // 32766 on newer ones; chunk well under the conservative floor so the
-  // IN-list never trips the bind limit on a large page.
-  const CHUNK = 900;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const chunk = ids.slice(i, i + CHUNK);
+  // Chunk under the Cloudflare Durable Object SQLite 100-bound-param cap
+  // (bun:sqlite tolerates 999+, DO SQLite rejects >100). See sql-in.ts.
+  for (const chunk of chunkForInClause(ids)) {
     const placeholders = chunk.map(() => "?").join(", ");
 
     if (wantOutbound) {

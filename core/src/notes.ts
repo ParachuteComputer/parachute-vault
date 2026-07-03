@@ -21,6 +21,7 @@ import {
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
 import { stripTagHash } from "./tag-hierarchy.js";
+import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 
 let idCounter = 0;
 
@@ -178,10 +179,26 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
 
 export function getNotes(db: Database, ids: string[]): Note[] {
   if (ids.length === 0) return [];
-  const placeholders = ids.map(() => "?").join(", ");
-  const rows = db.prepare(
-    `SELECT * FROM notes WHERE id IN (${placeholders}) ORDER BY created_at`,
-  ).all(...ids) as NoteRow[];
+  // Dedupe before chunking: a duplicate id straddling two chunk boundaries
+  // would otherwise be fetched (and returned) twice, unlike the old single
+  // IN-list which returned each matching row once regardless of duplicate
+  // params. Matches getNoteTagsForNotes / getNoteSummaries.
+  const uniqueIds = [...new Set(ids)];
+  // Chunk under the DO 100-bound-param cap (see sql-in.ts). Each chunk is its
+  // own IN-list query; results are merged and re-sorted by created_at (with id
+  // as a deterministic tiebreak) to preserve the single-statement ORDER BY.
+  const rows: NoteRow[] = [];
+  for (const chunk of chunkForInClause(uniqueIds)) {
+    const placeholders = chunk.map(() => "?").join(", ");
+    rows.push(...db.prepare(
+      `SELECT * FROM notes WHERE id IN (${placeholders})`,
+    ).all(...chunk) as NoteRow[]);
+  }
+  rows.sort((a, b) =>
+    a.created_at < b.created_at ? -1
+    : a.created_at > b.created_at ? 1
+    : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+  );
   return notesWithTags(db, rows);
 }
 
@@ -756,9 +773,13 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
       // with an always-false condition; building `IN ()` would be a SQL error.
       conditions.push("0 = 1");
     } else {
-      const placeholders = opts.ids.map(() => "?").join(", ");
-      conditions.push(`n.id IN (${placeholders})`);
-      params.push(...opts.ids);
+      // Bind the id-set as ONE json_each param, not one `?` per id: this IN is
+      // embedded in a paginated statement (shared ORDER BY / LIMIT / OFFSET),
+      // so it can't be chunked, and `near` neighborhoods routinely exceed the
+      // DO 100-bound-param cap. json_each keeps the whole set at a single
+      // bound param. See sql-in.ts.
+      conditions.push(`n.id IN ${IN_VIA_JSON_EACH}`);
+      params.push(jsonEachParam(opts.ids));
     }
   }
 
@@ -1044,10 +1065,6 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   return fetchNotesByIdsOrdered(db, idRows.map((r) => r.id));
 }
 
-/** Chunk size for IN-list queries — comfortably under SQLite's conservative
- *  999 bound-variable floor (older builds), matching getLinkCounts. */
-const IN_CHUNK = 900;
-
 /**
  * Fetch full note rows for `ids`, preserving the input order, with tags
  * hydrated via ONE batched query per chunk (not one per note). Ids not
@@ -1056,8 +1073,9 @@ const IN_CHUNK = 900;
 function fetchNotesByIdsOrdered(db: Database, ids: string[]): Note[] {
   if (ids.length === 0) return [];
   const rowsById = new Map<string, NoteRow>();
-  for (let i = 0; i < ids.length; i += IN_CHUNK) {
-    const chunk = ids.slice(i, i + IN_CHUNK);
+  // Chunk under the DO 100-bound-param cap (see sql-in.ts) — a single export
+  // page (EXPORT_BATCH_SIZE=500) or a large query result exceeds it otherwise.
+  for (const chunk of chunkForInClause(ids)) {
     const placeholders = chunk.map(() => "?").join(", ");
     const rows = db.prepare(
       `SELECT * FROM notes WHERE id IN (${placeholders})`,
@@ -1084,8 +1102,8 @@ export function getNoteTagsForNotes(db: Database, noteIds: string[]): Map<string
   if (noteIds.length === 0) return map;
   const ids = [...new Set(noteIds)];
   for (const id of ids) map.set(id, []);
-  for (let i = 0; i < ids.length; i += IN_CHUNK) {
-    const chunk = ids.slice(i, i + IN_CHUNK);
+  // Chunk under the DO 100-bound-param cap (see sql-in.ts).
+  for (const chunk of chunkForInClause(ids)) {
     const placeholders = chunk.map(() => "?").join(", ");
     const rows = db.prepare(
       `SELECT note_id, tag_name FROM note_tags WHERE note_id IN (${placeholders}) ORDER BY tag_name`,
