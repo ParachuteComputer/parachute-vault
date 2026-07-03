@@ -7,8 +7,10 @@
  *
  * The load-bearing pin: the `welcome` pack's tags must stay byte-equal to
  * notes-ui's NOTES_REQUIRED_SCHEMA — the Notes PWA's connect-time audit
- * compares `description` and `parent_names` verbatim, and its schema banner
- * only clears when the tags genuinely carry the semantics Notes declares.
+ * compares `description` verbatim, and its schema banner only clears when the
+ * tags genuinely carry the semantics Notes declares. ONE tag since 2026-07-03:
+ * `#capture` only — entry method (text|voice) is note `metadata.source`
+ * provenance, not taxonomy (sibling notes-ui PR carries the client side).
  */
 
 import { describe, test, expect } from "bun:test";
@@ -43,16 +45,6 @@ const NOTES_UI_REQUIRED_SCHEMA_TAGS = [
     name: "capture",
     description: "Notes captured directly by the user (text or voice).",
   },
-  {
-    name: "capture/text",
-    parent_names: ["capture"],
-    description: "Text capture.",
-  },
-  {
-    name: "capture/voice",
-    parent_names: ["capture"],
-    description: "Voice capture.",
-  },
 ];
 
 describe("welcome pack — notes-ui schema parity", () => {
@@ -63,8 +55,16 @@ describe("welcome pack — notes-ui schema parity", () => {
     for (const [i, expected] of NOTES_UI_REQUIRED_SCHEMA_TAGS.entries()) {
       expect(NOTES_REQUIRED_TAGS[i]!.name).toBe(expected.name);
       expect(NOTES_REQUIRED_TAGS[i]!.description).toBe(expected.description);
-      expect(NOTES_REQUIRED_TAGS[i]!.parent_names).toEqual(expected.parent_names);
     }
+  });
+
+  test("exactly ONE capture tag — no subtype tags, no parent_names (2026-07-03)", () => {
+    // Entry method is metadata.source (text|voice), not taxonomy. The old
+    // capture/text + capture/voice subtypes must not creep back into the seed
+    // (existing vaults carrying them stay valid — tags are user data).
+    expect(NOTES_REQUIRED_TAGS).toHaveLength(1);
+    expect(NOTES_REQUIRED_TAGS[0]!.name).toBe("capture");
+    expect(NOTES_REQUIRED_TAGS[0]!.parent_names).toBeUndefined();
   });
 });
 

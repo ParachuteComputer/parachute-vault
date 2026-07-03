@@ -3,7 +3,7 @@
  * A1/A2/A3; reshaped for named seed packs).
  *
  * Store-direct (no CLI subprocess) so they're fast. Covers:
- *   - default seed = `welcome` (3-note web + capture tags) + `getting-started`
+ *   - default seed = `welcome` (3-note web + the capture tag) + `getting-started`
  *     — and NOT `surface-starter` (out of the default seed, ratified 2026-07-02).
  *   - A1: the Getting Started doctrine markers.
  *   - A3 (reshaped): the welcome web's wikilinks resolve; Getting Started
@@ -86,9 +86,9 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     }
   });
 
-  test("seeds the capture tags Notes requires (byte-equal semantics)", async () => {
+  test("seeds the ONE capture tag Notes requires (byte-equal semantics)", async () => {
     const result = await seedOnboardingNotes(store);
-    expect(result.tags).toEqual(["capture", "capture/text", "capture/voice"]);
+    expect(result.tags).toEqual(["capture"]);
 
     for (const decl of NOTES_REQUIRED_TAGS) {
       const record = await store.getTagRecord(decl.name);
@@ -96,6 +96,12 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
       expect(record!.description).toBe(decl.description);
       expect(record!.parent_names ?? []).toEqual(decl.parent_names ?? []);
     }
+
+    // The retired subtype tags are NOT seeded — entry method is note
+    // metadata.source (text|voice), not taxonomy (2026-07-03). Existing
+    // vaults carrying these tags stay valid; new vaults don't get them.
+    expect(await store.getTagRecord("capture/text")).toBeNull();
+    expect(await store.getTagRecord("capture/voice")).toBeNull();
   });
 
   test("GAP 4: Getting Started shows a concrete update-tag fields example + write gotchas", async () => {

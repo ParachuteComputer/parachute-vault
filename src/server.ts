@@ -206,7 +206,7 @@ if (listVaults().length === 0) {
       }
       writeGlobalConfig(globalConfig);
       console.log(`Auto-created vault "${vaultName}" (API key: ${fullKey})`);
-      // Seed the default packs (welcome web + capture tags, Getting Started
+      // Seed the default packs (welcome web + capture tag, Getting Started
       // guide) so a connected AI can self-orient and help set the vault up —
       // same as the `create`/`init` CLI path. Idempotent + best-effort (never
       // fails first boot). Mirrors createVault() in cli.ts.

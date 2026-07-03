@@ -6,7 +6,7 @@
  * no note already lives at the path). Three packs ship today:
  *
  *   - `welcome` — the person-voiced three-note welcome web + the `capture`
- *     tags the Notes surface expects. Default-seeded on vault creation.
+ *     tag the Notes surface expects. Default-seeded on vault creation.
  *   - `getting-started` — the AI-facing start-here guide (SKILL.md-style
  *     doctrine addressed to a connected assistant). Default-seeded.
  *   - `surface-starter` — the living starter guide for building a custom
@@ -60,30 +60,26 @@ export interface SeedPack {
 // ---------------------------------------------------------------------------
 
 /**
- * The tags Notes requires — name/description/parent_names must stay BYTE-EQUAL
- * to notes-ui's `NOTES_REQUIRED_SCHEMA`
+ * The tag Notes requires — name/description must stay BYTE-EQUAL to notes-ui's
+ * `NOTES_REQUIRED_SCHEMA`
  * (parachute-surface/packages/notes-ui/src/lib/vault/schema.ts): the PWA's
- * connect-time audit (schema-audit.ts) compares `description` and
- * `parent_names` verbatim, so its schema banner clears because the tags
- * genuinely exist with the semantics Notes declares — not because we gamed
- * the check. Do not edit these strings without changing notes-ui in lockstep.
- * (Ported verbatim from parachute-cloud workers/vault/src/welcome.ts, which
- * carried the same constraint.)
+ * connect-time audit (schema-audit.ts) compares `description` verbatim, so its
+ * schema banner clears because the tag genuinely exists with the semantics
+ * Notes declares — not because we gamed the check. Do not edit these strings
+ * without changing notes-ui in lockstep.
+ *
+ * ONE tag since 2026-07-03 (Aaron-ratified): `#capture` carries the sacred
+ * raw-input semantics; entry method (text vs voice) is provenance, not
+ * user-facing taxonomy, and moves to note `metadata.source` (`text` | `voice`)
+ * — a sibling notes-ui PR lands the client side. The old `capture/text` /
+ * `capture/voice` subtype tags are no longer seeded; existing vaults that
+ * carry them remain valid (tags are user data — this changes only what NEW
+ * vaults get).
  */
 export const NOTES_REQUIRED_TAGS: ReadonlyArray<SeedPackTag> = [
   {
     name: "capture",
     description: "Notes captured directly by the user (text or voice).",
-  },
-  {
-    name: "capture/text",
-    parent_names: ["capture"],
-    description: "Text capture.",
-  },
-  {
-    name: "capture/voice",
-    parent_names: ["capture"],
-    description: "Voice capture.",
   },
 ];
 
@@ -94,7 +90,7 @@ export const CONNECT_AI_PATH = "Connect your AI";
 /**
  * Build the `welcome` pack: a three-note welcome web (welcome → try-linking →
  * back, connect-AI → welcome) so the graph view shows a connected structure
- * from minute one, plus the `capture` tags above. The notes are ordinary
+ * from minute one, plus the `capture` tag above. The notes are ordinary
  * notes — no special flags, deletable like anything else.
  *
  * Content is ported EXACTLY from parachute-cloud workers/vault/src/welcome.ts
@@ -111,7 +107,7 @@ export function welcomePack(opts: { consoleOrigin?: string } = {}): SeedPack {
   return {
     name: "welcome",
     description:
-      "A small linked welcome web (three notes) + the capture tags the Notes surface uses. Seeded by default on new vaults.",
+      "A small linked welcome web (three notes) + the capture tag the Notes surface uses. Seeded by default on new vaults.",
     tags: NOTES_REQUIRED_TAGS,
     // `[[wikilinks]]` resolve by note path — pending links auto-resolve when
     // the target is created, so order only affects how briefly a link sits
@@ -183,7 +179,7 @@ shape the vault around how they actually think and work.
 
 A vault is **notes + tags + links** in one graph, reachable over MCP (you, now),
 a REST API (scripts), and any surface (a UI). It ships *nearly blank* — just a
-small welcome web and the \`capture\` tags the Notes surface uses; no other
+small welcome web and the \`capture\` tag the Notes surface uses; no other
 predefined tags or schema. You and the operator design the structure that fits
 *their* life and work. The vault is the engine; the meaning is yours to bring.
 
