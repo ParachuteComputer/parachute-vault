@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as linkOps from "./links.js";
+import { chunkForInClause } from "./sql-in.js";
 
 // ---------------------------------------------------------------------------
 // Parser — extract [[wikilinks]] from markdown content
@@ -272,10 +273,15 @@ export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved:
   if (rows.length === 0) return { unresolved: [], count: total };
 
   const sourceIds = [...new Set(rows.map((r) => r.source_id))];
-  const placeholders = sourceIds.map(() => "?").join(", ");
-  const pathRows = db.prepare(
-    `SELECT id, path FROM notes WHERE id IN (${placeholders})`,
-  ).all(...sourceIds) as { id: string; path: string | null }[];
+  // Chunk under the DO 100-bound-param cap (see sql-in.ts) — with a large
+  // `limit` this hydrates >100 source ids in one IN-list otherwise.
+  const pathRows: { id: string; path: string | null }[] = [];
+  for (const chunk of chunkForInClause(sourceIds)) {
+    const placeholders = chunk.map(() => "?").join(", ");
+    pathRows.push(...db.prepare(
+      `SELECT id, path FROM notes WHERE id IN (${placeholders})`,
+    ).all(...chunk) as { id: string; path: string | null }[]);
+  }
   const pathMap = new Map(pathRows.map((r) => [r.id, r.path]));
 
   const unresolved: UnresolvedWikilink[] = rows.map((r) => ({
