@@ -29,6 +29,10 @@ import * as linkOps from "../core/src/links.ts";
 import * as tagSchemaOps from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 import { buildVaultProjection, resolveTagInheritance } from "../core/src/vault-projection.ts";
+import {
+  resolveTranscriptionCapability,
+  type TranscriptionCapability,
+} from "./transcription/capability.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -2328,11 +2332,24 @@ export async function handleVault(
   store: Store,
   vaultConfig: VaultConfigLike,
   persist?: () => void,
+  /**
+   * Injection seam (scribe-fold Phase 1) for the transcription capability
+   * probe on the GET landing. Production omits it and resolves the live
+   * default (scribe-http) provider's availability; tests inject a deterministic
+   * resolver. Kept separate from the `auto_transcribe` POLICY toggle: this
+   * reports whether transcription is actually POSSIBLE (a provider is
+   * configured AND available), which is what a surface gates its mic on.
+   */
+  resolveCapability: () => Promise<TranscriptionCapability> = resolveTranscriptionCapability,
 ): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === "GET") {
     const result: Record<string, unknown> = vaultResponse(vaultConfig);
+    // Transcription capability flag — `enabled` iff a provider is configured
+    // and available. `minutes_remaining` is omitted (cloud/plan concern;
+    // self-host is unmetered). This is the field Notes gates the mic on.
+    result.transcription = await resolveCapability();
     if (parseBool(parseQuery(url, "include_stats"), false)) {
       result.stats = await store.getVaultStats();
     }
