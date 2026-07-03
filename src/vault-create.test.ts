@@ -355,13 +355,16 @@ describe("vault create — services.json registration (#208)", () => {
 });
 
 /**
- * Onboarding-guide seeding on create (demo-prep Workstream A — A1/A3).
+ * Default-pack seeding on create (originally demo-prep Workstream A — A1/A3;
+ * reshaped for named seed packs).
  *
- * A freshly-created vault must contain the `Getting Started` + `Surface Starter`
- * notes so a connected AI can read them and help set the vault up. Idempotent +
- * best-effort: the seed never fails a create and never clobbers an edited note.
+ * A freshly-created vault must contain the `welcome` pack (three-note welcome
+ * web + the capture tags Notes requires) and the `getting-started` guide — and
+ * NOT the `surface-starter` pack, which is opt-in via `add-pack` (ratified
+ * 2026-07-02). Idempotent + best-effort: the seed never fails a create and
+ * never clobbers an edited note.
  */
-describe("vault create — onboarding guide seeding (A1/A3)", () => {
+describe("vault create — default pack seeding (welcome + getting-started)", () => {
   /** Read all (path, content) rows from a created vault's SQLite DB. */
   function readNotes(name: string): { path: string | null; content: string }[] {
     const dbPath = join(home, "vault", "data", name, "vault.db");
@@ -375,7 +378,20 @@ describe("vault create — onboarding guide seeding (A1/A3)", () => {
     }
   }
 
-  test("create seeds Getting Started + Surface Starter notes", () => {
+  /** Read all tag names from a created vault's SQLite DB. */
+  function readTagNames(name: string): string[] {
+    const dbPath = join(home, "vault", "data", name, "vault.db");
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      return (db.query("SELECT name FROM tags").all() as { name: string }[]).map(
+        (r) => r.name,
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  test("create seeds the welcome web + Getting Started — and NOT Surface Starter", () => {
     const { exitCode } = runCli(["create", "guided", "--json"], {
       PARACHUTE_HOME: home,
     });
@@ -383,12 +399,24 @@ describe("vault create — onboarding guide seeding (A1/A3)", () => {
 
     const notes = readNotes("guided");
     const gs = notes.find((n) => n.path === "Getting Started");
-    const ss = notes.find((n) => n.path === "Surface Starter");
+    const welcome = notes.find((n) => n.path === "Welcome to your vault 🪂");
+    const tryLinking = notes.find((n) => n.path === "Try linking notes");
+    const connectAi = notes.find((n) => n.path === "Connect your AI");
     expect(gs).toBeDefined();
-    expect(ss).toBeDefined();
+    expect(welcome).toBeDefined();
+    expect(tryLinking).toBeDefined();
+    expect(connectAi).toBeDefined();
     expect(gs!.content).toContain("# Getting Started");
-    expect(gs!.content).toContain("[[Surface Starter]]");
-    expect(ss!.content).toContain("@openparachute/surface-client");
+    // Surface Starter is out of the default seed — no note, no dangling link.
+    expect(notes.find((n) => n.path === "Surface Starter")).toBeUndefined();
+    expect(gs!.content).not.toContain("[[Surface Starter]]");
+    expect(gs!.content).toContain("add-pack surface-starter");
+
+    // The capture tags Notes requires arrive with the welcome pack.
+    const tags = readTagNames("guided");
+    for (const tag of ["capture", "capture/text", "capture/voice"]) {
+      expect(tags).toContain(tag);
+    }
   });
 
   test("seeding doesn't break --json stdout (notes seeded silently)", () => {
