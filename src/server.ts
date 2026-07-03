@@ -139,10 +139,12 @@ const commonWorkerOpts = {
 // TRANSCRIPTION_PROVIDER means the existing scribe-http path runs unchanged.
 const providerName = resolveTranscriptionProviderName();
 if (providerName === "transcribe-cpp") {
-  // Local, no-Python provider: subprocess the prebuilt transcribe-cli. Only
-  // start the worker when it's actually installed — otherwise every pending
-  // item would terminal-fail with `missing_provider`. `transcribeCppInstalled`
-  // is a cheap existsSync check (no spawn), matching `available()`.
+  // Local, no-Python provider: subprocess a transcribe-cli. Only start the
+  // worker when a runnable CLI + model are actually present — otherwise every
+  // pending item would terminal-fail with `missing_provider`. (v0.1.1 ships a
+  // library, not a CLI, so this gate stays closed until TRANSCRIBE_CPP_BIN or a
+  // build-from-source CLI exists.) `transcribeCppInstalled` is a cheap
+  // existsSync check (no spawn), matching `available()`.
   const tcPaths = resolveTranscribeCppPaths();
   if (transcribeCppInstalled(tcPaths)) {
     transcriptionWorker = startTranscriptionWorker({
@@ -153,7 +155,7 @@ if (providerName === "transcribe-cpp") {
     console.log(`[transcribe] worker started → transcribe-cpp (${tcPaths.modelPath})`);
   } else {
     console.log(
-      "[transcribe] TRANSCRIPTION_PROVIDER=transcribe-cpp but no binary/model installed — run `parachute-vault transcription install`",
+      "[transcribe] TRANSCRIPTION_PROVIDER=transcribe-cpp but no runnable transcribe-cli + model installed — see `parachute-vault transcription status` (v0.1.1 ships a library, not a CLI; set TRANSCRIBE_CPP_BIN or build one)",
     );
   }
 } else {

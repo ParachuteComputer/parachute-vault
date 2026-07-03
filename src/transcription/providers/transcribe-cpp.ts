@@ -11,12 +11,20 @@
  *
  * ## The audio path
  *
- * `transcribe-cli` requires **16kHz mono WAV** input. Incoming capture audio is
- * usually webm/m4a, so a non-WAV blob is transcoded via `ffmpeg` first
- * (`-ar 16000 -ac 1`). Already-WAV input is passed straight through (we trust
- * the caller's WAV is usable; the surface's captures go through ffmpeg anyway).
- * The install verb prints an ffmpeg hint when it's missing; here a missing
+ * `transcribe-cli` STRICTLY requires **16kHz mono WAV** input — it rejects other
+ * sample rates (a 44.1kHz .wav exits non-zero; verified against v0.1.1). So we
+ * ALWAYS transcode the incoming audio through `ffmpeg -ar 16000 -ac 1` first,
+ * even when it's already a `.wav` — we can't trust an incoming WAV's sample
+ * rate. The install verb prints an ffmpeg hint when it's missing; here a missing
  * ffmpeg surfaces as a terminal `ffmpeg_missing` error the operator must fix.
+ *
+ * ## Reading the output
+ *
+ * `transcribe-cli` prints a human-readable report to STDOUT (audio/model/run
+ * lines, a `text: <transcript>` line, then per-segment lines) and sends its
+ * library `[info]`/`[debug]` logs to STDERR. The transcript is the single
+ * `text:` line; `text: (empty)` is its no-result sentinel. See
+ * `parseTranscribeCliOutput`.
  *
  * ## Error mapping (mirrors scribe-http's terminal-vs-retriable contract)
  *
@@ -115,14 +123,6 @@ export interface TranscribeCppProviderOpts {
 }
 
 /**
- * Decide whether the input is already a WAV we can feed straight to
- * `transcribe-cli`. Non-WAV goes through ffmpeg. Exported for tests.
- */
-export function looksLikeWav(filename: string, mimeType: string): boolean {
-  return /\.wav$/i.test(filename) || /(?:^|\/)(x-)?wav$/i.test(mimeType.split(";")[0]!.trim());
-}
-
-/**
  * Build the `transcribe-cli` argv. Upstream usage:
  *   `transcribe-cli -m <model.gguf> <audio.wav>`
  * (model via `-m`, audio as a positional). Exported so a test pins the shape.
@@ -137,33 +137,24 @@ export function buildFfmpegArgs(ffmpegPath: string, inputPath: string, wavPath: 
 }
 
 /**
- * Parse `transcribe-cli` stdout into a transcript string. Robust to:
- *   - a JSON object with a `text` field;
- *   - whisper-style timestamped lines (`[00:00:00.000 --> ...]  text`);
- *   - plain text.
- * Returns "" when nothing transcript-like is present (caller treats "" as a
- * retriable empty-output failure). Exported for tests.
+ * Extract the transcript from `transcribe-cli`'s stdout report. The CLI prints a
+ * human report whose transcript is the single `text: <transcript>` line at
+ * column 0 (library `[info]`/`[debug]` logs go to STDERR, and the indented
+ * per-segment lines start with a bracket, not `text:`). We return the first
+ * `text:` line trimmed; the `text: (empty)` no-result sentinel maps to "" so the
+ * caller treats it as a retriable empty-output failure. Returns "" when no
+ * `text:` line is present. Validated against transcribe.cpp v0.1.1. Exported for
+ * tests.
  */
 export function parseTranscribeCliOutput(stdout: string): string {
-  const trimmed = stdout.trim();
-  if (!trimmed) return "";
-
-  // JSON envelope?
-  if (trimmed.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(trimmed) as { text?: unknown };
-      if (typeof parsed.text === "string") return parsed.text.trim();
-    } catch {
-      // not JSON — fall through to line parsing
+  for (const line of stdout.split("\n")) {
+    const m = line.match(/^text:\s?(.*)$/);
+    if (m) {
+      const t = m[1]!.trim();
+      return t === "(empty)" ? "" : t;
     }
   }
-
-  // Strip leading whisper-style timestamp brackets from each line, drop blanks.
-  const lines = trimmed
-    .split("\n")
-    .map((line) => line.replace(/^\s*\[[0-9:.\s>\-]+\]\s*/, "").trim())
-    .filter((line) => line.length > 0);
-  return lines.join(" ").trim();
+  return "";
 }
 
 export class TranscribeCppProvider implements TranscriptionProvider {
@@ -190,16 +181,25 @@ export class TranscribeCppProvider implements TranscriptionProvider {
   }
 
   /**
-   * Cheap readiness probe — binary + model both present on disk. NEVER spawns
-   * (it gates the capability flag on every `/api/vault` GET). Memoizes the
-   * once-true result so repeated landing reads don't re-stat.
+   * Cheap readiness probe — a runnable `transcribe-cli` binary AND the model
+   * both present on disk. NEVER spawns (it gates the capability flag on every
+   * `/api/vault` GET). Memoizes the once-true result so repeated landing reads
+   * don't re-stat.
+   *
+   * The binary check is load-bearing for honesty: transcribe.cpp v0.1.1 ships a
+   * *library*, not a prebuilt CLI, so `transcription install` can leave the libs
+   * + model in place with no runnable CLI. `binPath` resolves to
+   * `TRANSCRIBE_CPP_BIN` or a located binary; when neither exists we report
+   * `ok:false` (capability `enabled:false`) rather than claiming a capability we
+   * can't deliver.
    */
   async available(): Promise<ProviderAvailability> {
     if (this.cachedAvailable) return { ok: true };
     if (!this.binPath || !this.existsImpl(this.binPath)) {
       return {
         ok: false,
-        reason: "transcribe-cli not installed (run `parachute-vault transcription install`)",
+        reason:
+          "no runnable transcribe-cli (v0.1.1 ships a library, not a CLI — set TRANSCRIBE_CPP_BIN to a built transcribe-cli, or see `parachute-vault transcription status`)",
       };
     }
     if (!this.modelPath || !this.existsImpl(this.modelPath)) {
@@ -229,30 +229,26 @@ export class TranscribeCppProvider implements TranscriptionProvider {
     const id = randomUUID();
     const inExt = extFor(input.filename, input.mimeType);
     const inputPath = join(this.tmpDir, `parachute-tc-${id}.${inExt}`);
-    const cleanup: string[] = [inputPath];
+    const wavPath = join(this.tmpDir, `parachute-tc-${id}.16k.wav`);
+    const cleanup: string[] = [inputPath, wavPath];
 
     try {
       await writeFile(inputPath, input.audio);
 
-      // Resolve the WAV `transcribe-cli` will read — transcode non-WAV first.
-      let wavPath: string;
-      if (looksLikeWav(input.filename, input.mimeType)) {
-        wavPath = inputPath;
-      } else {
-        wavPath = join(this.tmpDir, `parachute-tc-${id}.16k.wav`);
-        cleanup.push(wavPath);
-        const ff = await this.spawn(buildFfmpegArgs(this.ffmpegPath, inputPath, wavPath), {
-          timeoutMs: this.timeoutMs,
-        });
-        if (ff.exitCode !== 0) {
-          const missing = ff.exitCode === 127;
-          throw new TranscriptionError(
-            missing
-              ? "ffmpeg not found — install it to transcode non-WAV audio for transcribe-cpp (apt install ffmpeg / brew install ffmpeg)"
-              : `ffmpeg transcode failed (exit ${ff.exitCode}): ${ff.stderr.trim().slice(0, 500)}`,
-            { code: missing ? "ffmpeg_missing" : "transcode_failed", retriable: false },
-          );
-        }
+      // transcribe-cli STRICTLY requires 16kHz mono WAV and rejects other sample
+      // rates (a 44.1kHz .wav exits non-zero). ALWAYS transcode — even an
+      // incoming .wav, whose sample rate we can't trust — via ffmpeg.
+      const ff = await this.spawn(buildFfmpegArgs(this.ffmpegPath, inputPath, wavPath), {
+        timeoutMs: this.timeoutMs,
+      });
+      if (ff.exitCode !== 0) {
+        const missing = ff.exitCode === 127;
+        throw new TranscriptionError(
+          missing
+            ? "ffmpeg not found — install it to transcode audio to 16kHz mono WAV for transcribe-cpp (apt install ffmpeg / brew install ffmpeg)"
+            : `ffmpeg transcode failed (exit ${ff.exitCode}): ${ff.stderr.trim().slice(0, 500)}`,
+          { code: missing ? "ffmpeg_missing" : "transcode_failed", retriable: false },
+        );
       }
 
       const res = await this.spawn(buildTranscribeArgs(this.binPath, this.modelPath, wavPath), {

@@ -3,6 +3,7 @@ import {
   planInstall,
   selectModelForRam,
   selectAsset,
+  isSharedLibFile,
   MODELS,
   TRANSCRIBE_CPP_VERSION,
 } from "./install.ts";
@@ -141,5 +142,26 @@ describe("MODELS registry", () => {
       expect(m.url).toContain(m.file);
       expect(m.approxSizeMb).toBeGreaterThan(0);
     }
+  });
+
+  test("whisper-tiny.en footprint reflects the real Q5_K_M size (~42MB)", () => {
+    // Live-verified: whisper-tiny.en-Q5_K_M.gguf is 44,135,072 B ≈ 42MB (was 35).
+    expect(MODELS["whisper-tiny.en"]!.approxSizeMb).toBe(42);
+  });
+});
+
+describe("isSharedLibFile — what we keep from the v0.1.1 library tarball", () => {
+  test("matches macOS + Linux shared libs (incl. versioned .so)", () => {
+    expect(isSharedLibFile("libtranscribe.dylib")).toBe(true);
+    expect(isSharedLibFile("libggml-metal.dylib")).toBe(true);
+    expect(isSharedLibFile("libtranscribe.so")).toBe(true);
+    expect(isSharedLibFile("libggml.so.1")).toBe(true);
+    expect(isSharedLibFile("libggml.so.0.9.4")).toBe(true);
+  });
+  test("rejects non-libs (the CLI, manifests, licenses)", () => {
+    expect(isSharedLibFile("transcribe-cli")).toBe(false);
+    expect(isSharedLibFile("contract.json")).toBe(false);
+    expect(isSharedLibFile("LICENSE")).toBe(false);
+    expect(isSharedLibFile("model.gguf")).toBe(false);
   });
 });

@@ -14,11 +14,21 @@
  * Ratified 2026-07-03 (Aaron): adopt **transcribe.cpp**
  * (github.com/handy-computer/transcribe.cpp — CJ Pais / Mozilla.ai, MIT,
  * "llama.cpp for STT") as the recommended low-RAM / no-Python local provider,
- * ahead of whisper.cpp. It ships prebuilt Linux x86_64 + aarch64 and macOS
- * binaries plus GGUF models. Its in-process N-API/TypeScript binding crashes on
- * Bun, so we drive the prebuilt `transcribe-cli` as a subprocess instead —
- * structurally like the `scribe-http` provider but local. See
- * `providers/transcribe-cpp.ts`.
+ * ahead of whisper.cpp. Its in-process N-API/TypeScript binding crashes on Bun,
+ * so we drive a `transcribe-cli` as a subprocess instead — structurally like
+ * the `scribe-http` provider but local. See `providers/transcribe-cpp.ts`.
+ *
+ * ## What v0.1.1 actually ships (live-verified 2026-07-03)
+ *
+ * IMPORTANT: the v0.1.1 macOS/Linux release tarballs contain a **library** —
+ * `libtranscribe.{dylib,so}` + `libggml*.{dylib,so}` + `contract.json` +
+ * licenses — and **NO prebuilt `transcribe-cli` executable** (the CLI is
+ * build-from-source in v0.1.1). So the install verb fetches the tarball for its
+ * runtime shared libraries, downloads the GGUF model, and then honestly reports
+ * the CLI-acquisition gap: activate transcribe-cpp only when a runnable CLI is
+ * available (`TRANSCRIBE_CPP_BIN`, or a binary a future asset includes, or one
+ * built from source against these libs). GGUF models ARE published under the
+ * handy-computer HuggingFace org and download normally.
  *
  * ## The RAM-tier matrix (scribe#82 fix)
  *
@@ -85,7 +95,7 @@ export const MODELS: Record<string, ModelChoice> = {
     "whisper-tiny.en",
     "whisper-tiny.en-gguf",
     "whisper-tiny.en-Q5_K_M.gguf",
-    35,
+    42,
     0.4,
     "fastest, lowest quality — English only",
   ),
@@ -138,17 +148,30 @@ export function selectModelForRam(totalRamBytes: number): ModelChoice | null {
   return null;
 }
 
-/** A prebuilt release asset: its filename + full download URL. */
+/** A release asset: its filename + full download URL. */
 export interface AssetChoice {
   asset: string;
   url: string;
 }
 
 /**
- * Map a Node `platform`/`arch` to the matching prebuilt `transcribe-cli`
- * release asset, or `null` when no prebuilt exists for the host (→ steer to the
- * scribe-http remote provider). Asset names follow the upstream
- * `transcribe-native-<version>-<platform>-<backend>.tar.gz` convention.
+ * Does `name` look like a shared library we keep from the release tarball?
+ * transcribe.cpp v0.1.1's macOS/Linux assets ship `libtranscribe.{dylib,so}` +
+ * `libggml*.{dylib,so}` (the ggml runtime the CLI links against) — NOT a
+ * prebuilt `transcribe-cli`. The install verb extracts these so a
+ * build-from-source or `TRANSCRIBE_CPP_BIN` CLI can link against them.
+ */
+export function isSharedLibFile(name: string): boolean {
+  return /\.(dylib|so)(\.\d+)*$/i.test(name);
+}
+
+/**
+ * Map a Node `platform`/`arch` to the matching `transcribe-native` release
+ * asset, or `null` when no asset exists for the host (→ steer to the scribe-http
+ * remote provider). Asset names follow the upstream
+ * `transcribe-native-<version>-<platform>-<backend>.tar.gz` convention. NOTE: in
+ * v0.1.1 this asset is a **library** bundle (see the module header), not a
+ * prebuilt CLI.
  *
  * `arch` is Node's `os.arch()` value: `"x64"` / `"arm64"`.
  */
@@ -218,7 +241,7 @@ export function planInstall(input: PlanInput): InstallPlan {
     return {
       ...base,
       supported: false,
-      reason: `no prebuilt transcribe-cli for ${platform}/${arch}. Use the scribe-http remote provider (set TRANSCRIPTION_PROVIDER=scribe-http and point at a scribe install).`,
+      reason: `no transcribe.cpp release asset for ${platform}/${arch}. Use the scribe-http remote provider (set TRANSCRIPTION_PROVIDER=scribe-http and point at a scribe install).`,
     };
   }
 

@@ -16,10 +16,14 @@
  * of truth. Unset ⇒ `scribe-http`, so no config change means no behavior
  * change.
  *
- * The `transcribe-cli` binary + GGUF model live under
- * `$PARACHUTE_HOME/transcription/` (parallel to the vault's other ecosystem
- * state), written there by `transcription install`. Paths are resolved
- * per-call so `PARACHUTE_HOME` overrides (tests, Docker) apply.
+ * The `transcribe-cli` binary, GGUF model, and runtime shared libraries live
+ * under `$PARACHUTE_HOME/transcription/` (parallel to the vault's other
+ * ecosystem state), written there by `transcription install`. NOTE:
+ * transcribe.cpp v0.1.1 ships a *library*, not a prebuilt CLI, so after an
+ * install the `libs/` + `models/` are present but `bin/transcribe-cli` may be
+ * absent until a CLI is built or `TRANSCRIBE_CPP_BIN` is set — the readiness
+ * checks below gate on the binary existing. Paths are resolved per-call so
+ * `PARACHUTE_HOME` overrides (tests, Docker) apply.
  */
 
 import { join } from "path";
@@ -68,8 +72,12 @@ export interface TranscribeCppPaths {
   dir: string;
   /** `<dir>/bin/`. */
   binDir: string;
-  /** The `transcribe-cli` binary path (env `TRANSCRIBE_CPP_BIN` overrides). */
+  /** The `transcribe-cli` binary path (env `TRANSCRIBE_CPP_BIN` overrides).
+   *  May not exist on disk — v0.1.1 ships a library, not a CLI. */
   binPath: string;
+  /** `<dir>/libs/` — the extracted runtime shared libraries (libtranscribe +
+   *  libggml) the CLI links against. */
+  libsDir: string;
   /** `<dir>/models/`. */
   modelsDir: string;
   /** `<dir>/install.json` — the install manifest. */
@@ -92,6 +100,9 @@ export interface TranscribeCppManifest {
   model: string;
   /** GGUF filename under `models/`. */
   modelFile: string;
+  /** Runtime shared-library filenames extracted under `libs/` (libtranscribe +
+   *  libggml). v0.1.1 ships these instead of a CLI. */
+  libFiles?: string[];
   os: string;
   arch: string;
   ram_gb: number;
@@ -108,6 +119,7 @@ export function resolveTranscribeCppPaths(
 ): TranscribeCppPaths {
   const dir = transcriptionHomeDir(env);
   const binDir = join(dir, "bin");
+  const libsDir = join(dir, "libs");
   const modelsDir = join(dir, "models");
   const manifestPath = join(dir, "install.json");
 
@@ -119,7 +131,7 @@ export function resolveTranscribeCppPaths(
     if (manifest?.modelFile) modelPath = join(modelsDir, manifest.modelFile);
   }
 
-  return { dir, binDir, binPath, modelsDir, manifestPath, modelPath };
+  return { dir, binDir, binPath, libsDir, modelsDir, manifestPath, modelPath };
 }
 
 /** Read + parse the install manifest, or `null` when absent/unreadable. */
@@ -134,8 +146,12 @@ export function readManifest(manifestPath: string): TranscribeCppManifest | null
 }
 
 /**
- * Cheap, spawn-free readiness check: the binary AND a model both exist on disk.
- * Used by the worker-boot gate (`server.ts`) and the provider's `available()`.
+ * Cheap, spawn-free readiness check: a runnable `transcribe-cli` binary AND a
+ * model both exist on disk. Used by the worker-boot gate (`server.ts`) and
+ * mirrors the provider's `available()`. Because v0.1.1 ships a library (no CLI),
+ * this stays `false` after an install until a CLI is built or
+ * `TRANSCRIBE_CPP_BIN` points at one — so the worker never starts only to
+ * terminal-fail every item.
  */
 export function transcribeCppInstalled(
   paths: TranscribeCppPaths = resolveTranscribeCppPaths(),
