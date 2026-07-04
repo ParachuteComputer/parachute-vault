@@ -20,6 +20,7 @@ import {
   buildSnapshotFrames,
   parseClientMessage,
   vaultVerbRank,
+  sameTagScope,
   validateWsSubscribeQuery,
   subscriptionCapResponse,
   urlFromQuery,
@@ -156,6 +157,24 @@ describe("vaultVerbRank — narrow-or-equal ordering", () => {
   it("a widen is strictly greater (the 4403 trigger)", () => {
     expect(vaultVerbRank(["vault:v:admin"], "v") > vaultVerbRank(["vault:v:read"], "v")).toBe(true);
     expect(vaultVerbRank(["vault:v:read"], "v") > vaultVerbRank(["vault:v:admin"], "v")).toBe(false);
+  });
+});
+
+describe("sameTagScope — the WS re-auth tag-scope-delta gate", () => {
+  it("both unscoped (null) → same", () => {
+    expect(sameTagScope(null, null)).toBe(true);
+  });
+  it("null vs scoped → differ (a drop/gain of scoping)", () => {
+    expect(sameTagScope(null, ["work/eng"])).toBe(false);
+    expect(sameTagScope(["work/eng"], null)).toBe(false);
+  });
+  it("same set (order/dupe-insensitive) → same", () => {
+    expect(sameTagScope(["a", "b"], ["b", "a"])).toBe(true);
+    expect(sameTagScope(["a", "a", "b"], ["b", "a"])).toBe(true);
+  });
+  it("different membership → differ", () => {
+    expect(sameTagScope(["work/eng"], ["work/sales"])).toBe(false);
+    expect(sameTagScope(["a"], ["a", "b"])).toBe(false);
   });
 });
 

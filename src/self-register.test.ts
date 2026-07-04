@@ -382,6 +382,25 @@ describe("self-register", () => {
     });
   });
 
+  test("websocket capability flows from manifest to row when set (hub ws-bridge gate)", () => {
+    withParachuteHome((home) => {
+      const { log, warn } = captureLogs();
+      selfRegister({
+        version: "0.4.8-rc.3",
+        log,
+        warn,
+        readManifest: () => ({ ...TEST_MANIFEST, websocket: true }),
+        resolvePackageRoot: () => "/fake/install/dir",
+        listVaults: () => [],
+        readGlobalConfig: () => ({ port: 1940 }),
+      });
+
+      const raw = readFileSync(join(home, "services.json"), "utf8");
+      const parsed = JSON.parse(raw) as { services: Record<string, unknown>[] };
+      expect(parsed.services[0]!.websocket).toBe(true);
+    });
+  });
+
   test("changed=true when installDir differs from prior row", () => {
     withParachuteHome(() => {
       const { log, warn } = captureLogs();

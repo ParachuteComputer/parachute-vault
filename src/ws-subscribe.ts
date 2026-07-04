@@ -36,7 +36,13 @@ import { unsupportedSubscriptionReason } from "./live-match.ts";
 import { hasScopeForVault, type VaultVerb } from "./scopes.ts";
 
 /** Per-vault concurrent WS-subscription cap (mirrors the SSE cap). Enforced at
- *  upgrade via the live-socket count — over it → 503. */
+ *  upgrade via the live-socket count — over it → 503.
+ *
+ *  This cap is SEPARATE from the SSE route's per-vault manager cap (also 100) —
+ *  WS subs register with `countsTowardCap:false`, so worst case a vault holds up
+ *  to 200 concurrent live connections (100 SSE + 100 WS). Intentional on
+ *  self-host (no per-connection billing, so no reason to contend one budget);
+ *  the two caps converge to one when SSE retires (migration Phase 5). */
 export const MAX_WS_SUBSCRIPTIONS = 100;
 
 /** A pending (accepted-but-unauthed) socket must send `{type:"auth"}` within
@@ -209,4 +215,28 @@ export function vaultVerbRank(scopes: string[], vaultName: string): number {
   if (hasScopeForVault(scopes, vaultName, "write")) return VERB_RANK.write;
   if (hasScopeForVault(scopes, vaultName, "read")) return VERB_RANK.read;
   return -1;
+}
+
+/**
+ * True iff two tag-scope allowlists (`scoped_tags`) are the SAME restriction —
+ * both unscoped (`null`), or the same set of root tags (order/dupe-insensitive).
+ *
+ * The WS re-auth check: unlike the SSE route (a token refresh means a fresh
+ * reconnect that re-derives tag-scope on the initial-connect path), a WS socket
+ * persists across a token refresh. Its live matcher + tag-scope are FROZEN at
+ * initial auth and NOT re-derived per message, so a re-auth that changed the
+ * tag-scope — a narrowed/revoked/differently-scoped agent token — would keep
+ * receiving events for the ORIGINAL (possibly wider) scope. Tag-scoped tokens
+ * are a load-bearing per-agent isolation boundary
+ * (docs/contracts/tag-scoped-tokens.md), so a re-auth whose tag-scope differs in
+ * ANY way is refused (4403) → the client reconnects fresh and re-derives scope
+ * via the correct initial-connect path. Verb narrowing (same scope, extended
+ * expiry) passes unchanged.
+ */
+export function sameTagScope(a: string[] | null, b: string[] | null): boolean {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  const sa = [...new Set(a)].sort();
+  const sb = [...new Set(b)].sort();
+  return sa.length === sb.length && sa.every((v, i) => v === sb[i]);
 }

@@ -35,11 +35,11 @@ const vaultConfig = { name: VAULT, created_at: new Date().toISOString(), api_key
 async function fakeAuth(req: Request, _cfg: VaultConfig): Promise<{ error: Response } | AuthResult> {
   const header = req.headers.get("authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const mk = (scopes: string[]): AuthResult => ({
+  const mk = (scopes: string[], scoped_tags: string[] | null = null): AuthResult => ({
     permission: "full",
     scopes,
     legacyDerived: false,
-    scoped_tags: null,
+    scoped_tags,
     vault_name: null,
     caller_jti: null,
     actor: "test",
@@ -53,6 +53,11 @@ async function fakeAuth(req: Request, _cfg: VaultConfig): Promise<{ error: Respo
       return mk(["vault:read"]);
     case "noscope":
       return mk([]); // authenticates but grants no read → 4403
+    case "scoped-eng":
+    case "scoped-eng-2": // same tag-scope as scoped-eng (a normal refresh)
+      return mk(["vault:read"], ["work/eng"]);
+    case "scoped-sales":
+      return mk(["vault:read"], ["work/sales"]); // a DIFFERENT tag-scope
     case "forbidden":
       return { error: Response.json({ error: "Forbidden" }, { status: 403 }) };
     default:
@@ -332,6 +337,69 @@ describe("WS live-query — close codes", () => {
   });
 });
 
+describe("WS live-query — tag-scope isolation (per-agent boundary)", () => {
+  it("a tag-scoped token receives ONLY in-scope notes (snapshot + live)", async () => {
+    await store.createNote("eng note", { tags: ["shared", "work/eng"] });
+    await store.createNote("sales note", { tags: ["shared", "work/sales"] });
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    await h.ready();
+    h.send({ type: "auth", token: "scoped-eng" }); // scoped to work/eng
+
+    const snap = await h.readSnapshot();
+    expect(snap.notes.map((n: any) => n.content)).toEqual(["eng note"]); // sales filtered out
+
+    // Live: an out-of-scope insert is SILENT; the next in-scope insert arrives.
+    await store.createNote("sales live", { tags: ["shared", "work/sales"] });
+    await settle();
+    await store.createNote("eng live", { tags: ["shared", "work/eng"] });
+    const m = await h.nextMessage();
+    expect(m.type).toBe("upsert");
+    expect(m.note.content).toBe("eng live");
+    h.close();
+  });
+
+  it("re-auth with a CHANGED tag-scope → 4403 (forces a clean reconnect)", async () => {
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    await h.ready();
+    h.send({ type: "auth", token: "scoped-eng" });
+    await h.readSnapshot();
+    h.send({ type: "auth", token: "scoped-sales" }); // ["work/sales"] ≠ ["work/eng"]
+    expect((await h.waitClose()).code).toBe(4403);
+  });
+
+  it("re-auth that DROPS tag-scoping (scoped → unscoped, same verb) → 4403", async () => {
+    // The load-bearing case: verb-rank is unchanged (read→read), so ONLY the
+    // tag-scope delta check catches this widen-the-scope-without-changing-verb.
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    await h.ready();
+    h.send({ type: "auth", token: "scoped-eng" });
+    await h.readSnapshot();
+    h.send({ type: "auth", token: "readonly" }); // scoped_tags null, still vault:read
+    expect((await h.waitClose()).code).toBe(4403);
+  });
+
+  it("re-auth with the SAME tag-scope stays ready (normal refresh)", async () => {
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=shared`);
+    await h.ready();
+    h.send({ type: "auth", token: "scoped-eng" });
+    await h.readSnapshot();
+    h.send({ type: "auth", token: "scoped-eng-2" }); // identical ["work/eng"]
+    await settle();
+    // Still live + still correctly scoped: an in-scope write arrives, out-of-scope stays silent.
+    await store.createNote("sales after refresh", { tags: ["shared", "work/sales"] });
+    await settle();
+    await store.createNote("eng after refresh", { tags: ["shared", "work/eng"] });
+    const m = await h.nextMessage();
+    expect(m.type).toBe("upsert");
+    expect(m.note.content).toBe("eng after refresh");
+    h.close();
+  });
+});
+
 describe("WS live-query — re-auth (narrow-or-equal)", () => {
   it("a narrowing re-auth keeps the socket open", async () => {
     const { server } = makeServer();
@@ -375,7 +443,15 @@ describe("WS live-query — bad query + cap", () => {
   it("refuses over the per-vault cap (503) and self-heals when a socket closes", async () => {
     const { binding } = makeServer({ maxSubscriptions: 2 });
     const fakeWs = (): { data: SubscribeWsData; close(): void; send(): void } => ({
-      data: { vaultName: VAULT, rawQuery: "", state: "pending", grantedScopes: [], handle: null, authTimer: null },
+      data: {
+        vaultName: VAULT,
+        rawQuery: "",
+        state: "pending",
+        grantedScopes: [],
+        grantedTagScope: null,
+        handle: null,
+        authTimer: null,
+      },
       close() {},
       send() {},
     });

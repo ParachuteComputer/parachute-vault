@@ -50,6 +50,7 @@ import {
   WS_CLOSE,
   buildSnapshotFrames,
   parseClientMessage,
+  sameTagScope,
   subscriptionCapResponse,
   urlFromQuery,
   validateWsSubscribeQuery,
@@ -64,6 +65,10 @@ export interface SubscribeWsData {
   state: "pending" | "ready";
   /** Granted scopes recorded at auth (the re-auth narrow-or-equal check). */
   grantedScopes: string[];
+  /** Granted tag-scope (`scoped_tags`) recorded at auth. The live matcher's
+   *  tag-scope is frozen at initial auth, so a re-auth that changes this is
+   *  refused (4403) rather than silently keeping the old scope. */
+  grantedTagScope: string[] | null;
   /** Manager handle once the sub is live (null while pending). */
   handle: SubscriptionHandle | null;
   /** Pending-auth deadline timer (cleared on auth success / close). */
@@ -249,6 +254,7 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
     clearAuthTimer(ws);
     ws.data.state = "ready";
     ws.data.grantedScopes = auth.scopes;
+    ws.data.grantedTagScope = auth.scoped_tags;
     const handle = manager.register({
       vaultName,
       matcher,
@@ -274,9 +280,15 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
    * the recorded scopes. NO re-snapshot, NO re-register — the matcher + socket
    * are unchanged (the self-host socket lives in memory regardless of exp; the
    * re-auth check exists for wire-contract congruence with the cloud door).
+   *
+   * The live matcher's TAG-scope is frozen at initial auth (not re-derived per
+   * message), so a re-auth whose tag-scope differs in ANY way is refused (4403).
+   * The client reconnects fresh → the initial-connect path re-derives scope
+   * correctly. This closes a WS-only per-agent-isolation gap the SSE route can't
+   * have (SSE reconnects re-derive scope every time). See `sameTagScope`.
    */
   async function reauthReadySocket(ws: ServerWebSocket<SubscribeWsData>, token: string): Promise<void> {
-    const { vaultName, grantedScopes, rawQuery } = ws.data;
+    const { vaultName, grantedScopes, grantedTagScope, rawQuery } = ws.data;
     const vaultConfig = getVaultConfig(vaultName);
     if (!vaultConfig) {
       closeWs(ws, WS_CLOSE.PROTOCOL, "vault not found");
@@ -292,6 +304,12 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
     }
     if (vaultVerbRank(auth.scopes, vaultName) > vaultVerbRank(grantedScopes, vaultName)) {
       closeWs(ws, WS_CLOSE.FORBIDDEN, "re-auth widens scope");
+      return;
+    }
+    // Tag-scope delta → force a clean reconnect (which re-derives scope). A
+    // narrowed/revoked/differently-scoped token must NOT keep the frozen matcher.
+    if (!sameTagScope(auth.scoped_tags, grantedTagScope)) {
+      closeWs(ws, WS_CLOSE.FORBIDDEN, "re-auth changes tag scope");
       return;
     }
     ws.data.grantedScopes = auth.scopes;
@@ -326,6 +344,7 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
       rawQuery: url.search,
       state: "pending",
       grantedScopes: [],
+      grantedTagScope: null,
       handle: null,
       authTimer: null,
     };
