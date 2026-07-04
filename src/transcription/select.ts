@@ -182,6 +182,69 @@ export function transcribeCppInstalled(
   return existsSync(paths.binPath) && !!paths.modelPath && existsSync(paths.modelPath);
 }
 
+/** Outcome of the EXECUTED runnable probe (`probeTranscribeCliRunnable`). */
+export interface RunnableProbeResult {
+  ok: boolean;
+  /** Why the probe failed, for the `runnable: no (<reason>)` print. */
+  reason?: string;
+}
+
+/**
+ * EXECUTED runnable probe: actually launch `transcribe-cli --help` and check
+ * the exit code. Cheap (no model load, no inference — upstream's `--help`
+ * prints usage and exits 0) but honest where a stat can't be: it catches a
+ * binary whose shared libraries don't resolve (broken/missing `libs/`, a bad
+ * rpath), a wrong-arch or corrupt binary, and a missing exec bit — all cases
+ * where `existsSync` says "yes" while every real run fails (the vault#534
+ * honesty bug: Linux installs reported `runnable: yes` while the CLI exited 1
+ * on every transcription).
+ *
+ * Deliberately NOT used by the per-request capability gate or the provider's
+ * `available()` (both are documented spawn-free); this is for the human-paced
+ * paths — `transcription status` and the install verb's activation check.
+ */
+export async function probeTranscribeCliRunnable(
+  binPath: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<RunnableProbeResult> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn([binPath, "--help"], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `could not launch ${binPath}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGKILL"); // diagnostic probe — no graceful shutdown to preserve
+  }, timeoutMs);
+  try {
+    const exitCode = await proc.exited;
+    if (timedOut) return { ok: false, reason: `--help did not exit within ${timeoutMs}ms` };
+    // stderr normally EOFs at exit; the race guards against a wrapper-script
+    // binary whose orphaned grandchild still holds the pipe open.
+    const stderr = await Promise.race([
+      new Response(proc.stderr as ReadableStream).text(),
+      new Promise<string>((resolve) => setTimeout(resolve, 2_000, "")),
+    ]);
+    const detail = stderr.trim().split("\n")[0]?.slice(0, 200);
+    if (proc.signalCode) {
+      // e.g. macOS dyld aborts with SIGABRT when a linked dylib is missing.
+      return { ok: false, reason: `--help died on ${proc.signalCode}${detail ? `: ${detail}` : ""}` };
+    }
+    if (exitCode !== 0) {
+      return { ok: false, reason: `--help exited ${exitCode}${detail ? `: ${detail}` : ""}` };
+    }
+    return { ok: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Python-based local providers (parakeet-mlx / onnx-asr) — scribe-fold 2b
 // ---------------------------------------------------------------------------

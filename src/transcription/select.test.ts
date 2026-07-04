@@ -1,11 +1,12 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, rmSync, chmodSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
   resolveTranscriptionProviderName,
   resolveTranscribeCppPaths,
   transcribeCppInstalled,
+  probeTranscribeCliRunnable,
   readManifest,
   transcriptionHomeDir,
   pythonVenvDir,
@@ -117,6 +118,45 @@ describe("transcribeCppInstalled", () => {
     // Model too → true.
     writeFileSync(join(tcDir, "models", "m.gguf"), "gguf");
     expect(transcribeCppInstalled(resolveTranscribeCppPaths({ PARACHUTE_HOME: home }))).toBe(true);
+  });
+});
+
+describe("probeTranscribeCliRunnable — EXECUTED, not stat'd (vault#534)", () => {
+  // Tiny real shell scripts stand in for transcribe-cli: the probe's whole
+  // point is that it actually runs the binary, so mocks would test nothing.
+  function script(home: string, body: string): string {
+    const p = join(home, "fake-cli");
+    writeFileSync(p, `#!/bin/sh\n${body}\n`);
+    chmodSync(p, 0o755);
+    return p;
+  }
+
+  test("exit 0 ⇒ ok", async () => {
+    const bin = script(mkTmpHome(), "exit 0");
+    expect(await probeTranscribeCliRunnable(bin)).toEqual({ ok: true });
+  });
+
+  test("nonzero exit ⇒ not ok, reason carries the exit code + first stderr line", async () => {
+    // Mirrors the vault#534 Linux failure shape: binary present + launches,
+    // but errors out (there: empty ggml backend registry, exit 1).
+    const bin = script(mkTmpHome(), 'echo "whisper: failed to initialize CPU backend" >&2\nexit 1');
+    const r = await probeTranscribeCliRunnable(bin);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain("exited 1");
+    expect(r.reason).toContain("failed to initialize CPU backend");
+  });
+
+  test("unlaunchable binary (missing) ⇒ not ok with a reason", async () => {
+    const r = await probeTranscribeCliRunnable(join(mkTmpHome(), "no-such-cli"));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBeTruthy();
+  });
+
+  test("hang ⇒ not ok after the timeout", async () => {
+    const bin = script(mkTmpHome(), "sleep 30");
+    const r = await probeTranscribeCliRunnable(bin, { timeoutMs: 250 });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain("250ms");
   });
 });
 

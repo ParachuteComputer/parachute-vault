@@ -6,8 +6,10 @@
  * `install.ts` + the provider-seam design doc. This module closes that gap: it
  * fetches the CLI's source (`examples/cli/main.cpp` + `examples/common/wav.cpp`
  * + the public headers) from the transcribe.cpp repo pinned at the v0.1.1 tag
- * commit, then compiles it with the host C++ compiler against the extracted
- * prebuilt dylibs. The result is a ~127KB driver that links the prebuilt
+ * commit, applies the **vault#534 backend-init patch** (see
+ * `patchMainCppBackendInit` below — temporary until upstream ships the fix),
+ * then compiles it with the host C++ compiler against the extracted prebuilt
+ * dylibs. The result is a ~127KB driver that links the prebuilt
  * `libtranscribe` at runtime — **no ggml / Metal rebuild**.
  *
  * ## The proven recipe (live-verified 2026-07-03, macOS arm64 M4)
@@ -34,10 +36,11 @@
  * ## Testability
  *
  * `buildTranscribeCli` is a pure orchestrator over injected side effects
- * (`which` / `fetchSource` / `compile` / `exists` / `removeBin`), mirroring the
- * provider's `SpawnRunner` seam. Tests exercise every branch — toolchain
- * absent, fetch failure, compile failure, success — with no network and no real
- * compiler. The real compile is exercised only by the install-time live verify.
+ * (`which` / `fetchSource` / `readFile` / `writeFile` / `compile` / `exists` /
+ * `removeBin`), mirroring the provider's `SpawnRunner` seam. Tests exercise
+ * every branch — toolchain absent, fetch failure, patch failure, compile
+ * failure, success — with no network and no real compiler. The real compile is
+ * exercised only by the install-time live verify.
  */
 
 import { join } from "path";
@@ -76,6 +79,63 @@ export const CLI_SOURCE_FILES: readonly string[] = [
 /** Full raw.githubusercontent URL for a repo-relative path at the pinned ref. */
 export function cliSourceUrl(repoPath: string): string {
   return `${RAW_BASE}/${repoPath}`;
+}
+
+// ---------------------------------------------------------------------------
+// Build-time source patch: unconditional backend init (vault#534 blocker 2)
+// ---------------------------------------------------------------------------
+
+/** Marker comment baked into the injected code — makes the patch idempotent
+ *  and greppable in a fetched source tree. */
+export const BACKEND_INIT_PATCH_MARKER = "[parachute-vault vault#534 backend-init patch]";
+
+/**
+ * The anchor line in the pinned `examples/cli/main.cpp` the patch injects
+ * before: the batch-mode comment that opens the inference half of `main()`,
+ * directly AFTER the log-sink install (so backend plugin-load logs route
+ * through the CLI's log callback) and after the `--list-devices` early return.
+ * Unique at the pinned ref (verified); if the pin ever advances and this
+ * anchor drifts, the build fails LOUDLY (stage "patch") so the patch gets
+ * re-evaluated against the new source instead of silently shipping a CLI that
+ * can't transcribe on Linux.
+ */
+export const BACKEND_INIT_PATCH_ANCHOR =
+  "    // Batch mode: --batch reads a file list, one wav path per line. Loads";
+
+const BACKEND_INIT_PATCH_BLOCK = `    // ${BACKEND_INIT_PATCH_MARKER}
+    // Upstream (at the pinned ${TRANSCRIBE_CPP_SOURCE_REF.slice(0, 12)}) only calls
+    // transcribe_init_backends_default() in the --list-devices path. On Linux
+    // the CPU backends are dlopen plugins (libggml-cpu-*.so), so with no init
+    // the ggml device registry is empty and EVERY transcription fails
+    // ("whisper: failed to initialize CPU backend", exit 1). macOS is masked:
+    // its libtranscribe.dylib direct-links libggml-cpu, which self-registers
+    // at library load. Init the default backends unconditionally before any
+    // inference (batch or single-file). Verified fix on real Linux containers,
+    // both arches — see vault#534. DROP THIS PATCH when upstream ships the fix
+    // and the source pin advances past it.
+    transcribe_init_backends_default();
+
+`;
+
+/**
+ * Apply the vault#534 backend-init patch to the fetched `main.cpp` source.
+ * Pure (string → string) so tests pin the behavior without a filesystem.
+ * Idempotent: an already-patched source is returned unchanged. Throws with a
+ * clear operator-facing message when the anchor is missing — the caller
+ * surfaces it as a `stage: "patch"` build failure (fail loudly; never compile
+ * an unpatched CLI on the assumption it'll work).
+ */
+export function patchMainCppBackendInit(source: string): string {
+  if (source.includes(BACKEND_INIT_PATCH_MARKER)) return source;
+  const idx = source.indexOf(BACKEND_INIT_PATCH_ANCHOR);
+  if (idx === -1) {
+    throw new Error(
+      `backend-init patch anchor not found in examples/cli/main.cpp at ${TRANSCRIBE_CPP_SOURCE_REF.slice(0, 12)} — ` +
+        `the pinned source no longer matches the vault#534 patch. If the pin advanced, check whether upstream ` +
+        `now calls transcribe_init_backends_default() unconditionally (then drop the patch); otherwise re-anchor it.`,
+    );
+  }
+  return source.slice(0, idx) + BACKEND_INIT_PATCH_BLOCK + source.slice(idx);
 }
 
 /** C++ compiler binaries we probe for, in preference order. */
@@ -158,6 +218,10 @@ export interface BuildCliDeps {
   which: (cmd: string) => string | null | undefined;
   /** Fetch `files` (repo-relative) into `srcDir`. Throws on network failure. */
   fetchSource: (files: readonly string[], srcDir: string) => Promise<void>;
+  /** Read a fetched source file as UTF-8 (production: `fs.readFileSync`). */
+  readFile: (p: string) => string;
+  /** Write a patched source file (production: `fs.writeFileSync`). */
+  writeFile: (p: string, content: string) => void;
   /** Run the compiler argv. */
   compile: (cmd: string[]) => CompileResult | Promise<CompileResult>;
   /** Existence probe (production: `fs.existsSync`). */
@@ -185,7 +249,7 @@ export type CliBuildResult =
   | {
       ok: false;
       /** Which stage failed — drives the operator guidance. */
-      stage: "toolchain" | "fetch" | "compile";
+      stage: "toolchain" | "fetch" | "patch" | "compile";
       message: string;
       compiler?: string;
       /** The compile argv (as a string) when we got far enough to build one. */
@@ -220,6 +284,22 @@ export async function buildTranscribeCli(
       stage: "fetch",
       compiler,
       message: `failed to fetch transcribe-cli source at ${TRANSCRIBE_CPP_SOURCE_REF}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  // Apply the vault#534 backend-init source patch BEFORE compiling — without
+  // it the built CLI exits 1 on every transcription on Linux (dlopen'd CPU
+  // backends are never registered). A missing anchor is a loud, typed failure,
+  // never a silent skip.
+  const mainCppPath = join(input.srcDir, "examples", "cli", "main.cpp");
+  try {
+    deps.writeFile(mainCppPath, patchMainCppBackendInit(deps.readFile(mainCppPath)));
+  } catch (err) {
+    return {
+      ok: false,
+      stage: "patch",
+      compiler,
+      message: err instanceof Error ? err.message : String(err),
     };
   }
 

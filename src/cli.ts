@@ -152,6 +152,7 @@ import {
   resolveTranscribeCppPaths,
   resolveTranscriptionProviderName,
   transcribeCppInstalled,
+  probeTranscribeCliRunnable,
   readManifest,
   transcriptionHomeDir,
   pythonVenvDir,
@@ -173,6 +174,7 @@ import {
   TRANSCRIBE_CPP_SOURCE_REF,
   type CliBuildResult,
 } from "./transcription/build.ts";
+import { downloadTo } from "./transcription/download.ts";
 import { selectDefaultProvider, NOMINAL_SLACK_GB, type TierPlan } from "./transcription/tiers.ts";
 import {
   PYTHON_PROVIDERS,
@@ -3572,7 +3574,7 @@ async function cmdTranscription(args: string[]) {
     return;
   }
   if (sub === "status" || sub === undefined) {
-    cmdTranscriptionStatus();
+    await cmdTranscriptionStatus();
     return;
   }
   console.error(`Unknown transcription subcommand: ${sub}`);
@@ -3867,14 +3869,25 @@ async function runTranscribeCppInstall(opts: {
 
     // 5) CLI resolution + provider switch — honest, no silent success. `binPath`
     //    resolves to TRANSCRIBE_CPP_BIN or the built binary; we activate
-    //    transcribe-cpp only when one actually exists, else we keep the current
-    //    provider and report the acquisition gap rather than taking
-    //    transcription offline behind a provider that can't run.
+    //    transcribe-cpp only when one actually EXECUTES (`--help` exits 0 —
+    //    vault#534: an existsSync-only check activated Linux installs whose CLI
+    //    exited 1 on every run). Otherwise we keep the current provider and
+    //    report the gap rather than taking transcription offline behind a
+    //    provider that can't run.
     if (existsSync(paths.binPath)) {
-      setEnvVar("TRANSCRIPTION_PROVIDER", "transcribe-cpp");
-      console.log(`\n✓ Installed and activated → TRANSCRIPTION_PROVIDER=transcribe-cpp set in the vault .env.`);
-      console.log(`  CLI:   ${paths.binPath}`);
-      console.log(`  Restart vault to activate:  parachute restart vault`);
+      const probe = await probeTranscribeCliRunnable(paths.binPath);
+      if (probe.ok) {
+        setEnvVar("TRANSCRIPTION_PROVIDER", "transcribe-cpp");
+        console.log(`\n✓ Installed and activated → TRANSCRIPTION_PROVIDER=transcribe-cpp set in the vault .env.`);
+        console.log(`  CLI:   ${paths.binPath} (verified runnable)`);
+        console.log(`  Restart vault to activate:  parachute restart vault`);
+      } else {
+        console.log(
+          `\n⚠  transcribe-cli exists at ${paths.binPath} but is NOT runnable (${probe.reason}).`,
+        );
+        console.log("   NOT activating transcribe-cpp — your current provider is unchanged.");
+        console.log(noRunnableCliGuidance(paths, buildResult));
+      }
     } else {
       console.log(`\n✓ Libraries + model installed to ${paths.dir} — transcription is NOT yet activated.`);
       console.log(noRunnableCliGuidance(paths, buildResult));
@@ -3884,13 +3897,6 @@ async function runTranscribeCppInstall(opts: {
     console.error("The verb is idempotent — fix the issue and re-run. Or use the remote provider: parachute-vault transcription install --provider scribe-http");
     process.exit(1);
   }
-}
-
-/** Download a URL to a destination file (streamed via fetch → Bun.write). */
-async function downloadTo(url: string, dest: string): Promise<void> {
-  const resp = await fetch(url, { redirect: "follow" });
-  if (!resp.ok) throw new Error(`download failed (${resp.status}) for ${url}`);
-  await Bun.write(dest, resp);
 }
 
 /**
@@ -3984,6 +3990,8 @@ async function maybeBuildTranscribeCli(
           await downloadTo(cliSourceUrl(rel), dest);
         }
       },
+      readFile: (p) => readFileSync(p, "utf8"),
+      writeFile: (p, content) => writeFileSync(p, content),
       compile: (cmd) => {
         const p = Bun.spawnSync(cmd);
         return { exitCode: p.exitCode ?? 1, stderr: new TextDecoder().decode(p.stderr) };
@@ -4032,6 +4040,14 @@ function noRunnableCliGuidance(
       "     • build transcribe-cli yourself, point TRANSCRIBE_CPP_BIN at it, and re-run; OR",
       "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
     );
+  } else if (build && !build.ok && build.stage === "patch") {
+    lines.push(
+      `\n⚠  Could not apply the vault#534 backend-init source patch — ${build.message}`,
+      "   The pinned upstream source no longer matches the patch anchor. This needs a code fix",
+      "   (re-anchor or drop the patch), not a toolchain fix. Until then, either:",
+      "     • build a transcribe-cli yourself, point TRANSCRIBE_CPP_BIN at it, and re-run; OR",
+      "     • use the remote provider:  parachute-vault transcription install --provider scribe-http",
+    );
   } else if (build && !build.ok) {
     lines.push(
       `\n⚠  transcribe-cli build failed (${build.stage}). The libraries + model are installed;`,
@@ -4055,7 +4071,7 @@ function noRunnableCliGuidance(
 }
 
 /** `parachute-vault transcription status` — provider + per-provider install state. */
-function cmdTranscriptionStatus(): void {
+async function cmdTranscriptionStatus(): Promise<void> {
   const active = resolveTranscriptionProviderName();
   console.log(`Configured provider: ${active}`);
 
@@ -4069,12 +4085,24 @@ function cmdTranscriptionStatus(): void {
     `Tier default for this host (${tier.platform}/${tier.arch}, ${tier.totalRamGb}GB): ${tier.provider}${tier.model ? ` (${tier.model})` : ""}`,
   );
 
-  // transcribe-cpp — prebuilt libs + GGUF model + built CLI.
+  // transcribe-cpp — prebuilt libs + GGUF model + built CLI. "runnable" is an
+  // EXECUTED verdict, not a stat: `--help` must actually exit 0 (vault#534 —
+  // an existsSync-only check said "yes" on Linux while the CLI exited 1 on
+  // every real transcription because its dlopen'd CPU backends never loaded).
   const paths = resolveTranscribeCppPaths();
   const manifest = readManifest(paths.manifestPath);
   const cliPresent = existsSync(paths.binPath);
-  const installed = transcribeCppInstalled(paths); // runnable CLI + model both present
-  console.log(`\ntranscribe-cpp runnable: ${installed ? "yes" : "no"}`);
+  const filesPresent = transcribeCppInstalled(paths); // CLI + model both on disk
+  let installed = false;
+  let notRunnableReason: string | undefined;
+  if (!filesPresent) {
+    notRunnableReason = !cliPresent ? "no transcribe-cli binary" : "no GGUF model on disk";
+  } else {
+    const probe = await probeTranscribeCliRunnable(paths.binPath);
+    installed = probe.ok;
+    notRunnableReason = probe.reason;
+  }
+  console.log(`\ntranscribe-cpp runnable: ${installed ? "yes" : `no (${notRunnableReason})`}`);
   if (manifest) {
     console.log(`  model:   ${manifest.model} (${manifest.modelFile})`);
     console.log(

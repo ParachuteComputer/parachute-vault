@@ -6,6 +6,9 @@ import {
   detectCompiler,
   compilerInstallHint,
   cliSourceUrl,
+  patchMainCppBackendInit,
+  BACKEND_INIT_PATCH_ANCHOR,
+  BACKEND_INIT_PATCH_MARKER,
   CLI_SOURCE_FILES,
   CXX_CANDIDATES,
   TRANSCRIBE_CPP_SOURCE_REF,
@@ -17,9 +20,25 @@ import {
  * transcribe-cli build tests (scribe-fold Phase 2b). Pure recipe shape +
  * fully-mocked orchestration — NO network, NO real compiler (the real compile
  * is exercised only by the install-time live verify). Covers the toolchain-
- * absent, fetch-failure, compile-failure, and success branches, and the
- * "never leave a half-built binary" invariant.
+ * absent, fetch-failure, patch-failure, compile-failure, and success branches,
+ * and the "never leave a half-built binary" invariant.
  */
+
+/** A minimal stand-in for the pinned main.cpp: log-sink install + the batch-
+ *  mode comment the vault#534 patch anchors on. */
+const MAIN_CPP_FIXTURE = [
+  "int main(int argc, char ** argv) {",
+  "    if (!args.quiet) {",
+  "        transcribe_log_set(log_cb, nullptr);",
+  "    }",
+  "",
+  BACKEND_INIT_PATCH_ANCHOR,
+  "    // the model ONCE and reuses the context across all files.",
+  "    if (!args.batch_file.empty()) {",
+  "    }",
+  "}",
+  "",
+].join("\n");
 
 describe("detectCompiler", () => {
   test("returns the first candidate found (c++ preferred)", () => {
@@ -106,14 +125,30 @@ describe("buildCompileCommand — the proven recipe shape", () => {
 
 /** Build a deps object with call-recording mocks; overrides win. */
 function mkDeps(over: Partial<BuildCliDeps> = {}): BuildCliDeps & {
-  calls: { fetch: number; compile: number; removed: string[]; renamed: Array<[string, string]> };
+  calls: {
+    fetch: number;
+    compile: number;
+    removed: string[];
+    renamed: Array<[string, string]>;
+    written: Array<[string, string]>;
+  };
 } {
-  const calls = { fetch: 0, compile: 0, removed: [] as string[], renamed: [] as Array<[string, string]> };
+  const calls = {
+    fetch: 0,
+    compile: 0,
+    removed: [] as string[],
+    renamed: [] as Array<[string, string]>,
+    written: [] as Array<[string, string]>,
+  };
   const deps: BuildCliDeps = {
     platform: "darwin",
     which: (c) => (c === "c++" ? "/usr/bin/c++" : null),
     fetchSource: async () => {
       calls.fetch++;
+    },
+    readFile: () => MAIN_CPP_FIXTURE,
+    writeFile: (p, content) => {
+      calls.written.push([p, content]);
     },
     compile: async (): Promise<CompileResult> => {
       calls.compile++;
@@ -134,8 +169,36 @@ function mkDeps(over: Partial<BuildCliDeps> = {}): BuildCliDeps & {
 const INPUT = { srcDir: "/t/.src", libsDir: "/t/libs", binPath: "/t/bin/transcribe-cli" };
 const TMP = `${INPUT.binPath}.building`; // the temp output the build compiles to
 
+describe("patchMainCppBackendInit — the vault#534 backend-init source patch", () => {
+  test("injects transcribe_init_backends_default() before the batch-mode anchor", () => {
+    const patched = patchMainCppBackendInit(MAIN_CPP_FIXTURE);
+    expect(patched).toContain("transcribe_init_backends_default();");
+    expect(patched).toContain(BACKEND_INIT_PATCH_MARKER);
+    // The init call lands BEFORE the inference paths (the anchor) and AFTER
+    // the log-sink install, so backend plugin-load logs route through the sink.
+    const initAt = patched.indexOf("transcribe_init_backends_default();");
+    expect(initAt).toBeGreaterThan(patched.indexOf("transcribe_log_set(log_cb, nullptr);"));
+    expect(initAt).toBeLessThan(patched.indexOf(BACKEND_INIT_PATCH_ANCHOR));
+    // Everything else is preserved verbatim: removing the injected block
+    // restores the original source exactly.
+    const [before, after] = patched.split(/    \/\/ \[parachute-vault[\s\S]*?transcribe_init_backends_default\(\);\n\n/);
+    expect(`${before}${after}`).toBe(MAIN_CPP_FIXTURE);
+  });
+
+  test("idempotent: an already-patched source is returned unchanged", () => {
+    const once = patchMainCppBackendInit(MAIN_CPP_FIXTURE);
+    expect(patchMainCppBackendInit(once)).toBe(once);
+  });
+
+  test("anchor missing ⇒ throws a loud, actionable error naming the pin + vault#534", () => {
+    expect(() => patchMainCppBackendInit("int main() { return 0; }\n")).toThrow(
+      /anchor not found[\s\S]*vault#534/,
+    );
+  });
+});
+
 describe("buildTranscribeCli — orchestration branches", () => {
-  test("SUCCESS: fetch → compile ok → temp exists ⇒ promote (rename) + { ok:true }", async () => {
+  test("SUCCESS: fetch → patch → compile ok → temp exists ⇒ promote (rename) + { ok:true }", async () => {
     const deps = mkDeps();
     const r = await buildTranscribeCli(INPUT, deps);
     expect(r.ok).toBe(true);
@@ -149,9 +212,27 @@ describe("buildTranscribeCli — orchestration branches", () => {
     }
     expect(deps.calls.fetch).toBe(1);
     expect(deps.calls.compile).toBe(1);
+    // the vault#534 backend-init patch was written into the fetched main.cpp
+    expect(deps.calls.written).toHaveLength(1);
+    const [patchedPath, patchedContent] = deps.calls.written[0]!;
+    expect(patchedPath).toBe(join(INPUT.srcDir, "examples", "cli", "main.cpp"));
+    expect(patchedContent).toContain("transcribe_init_backends_default();");
     // only the TEMP is cleared pre-compile; the fresh temp is renamed into place
     expect(deps.calls.removed).toEqual([TMP]);
     expect(deps.calls.renamed).toEqual([[TMP, INPUT.binPath]]);
+  });
+
+  test("PATCH FAILURE: anchor missing in fetched source ⇒ { ok:false, stage:'patch' }, no write, no compile", async () => {
+    const deps = mkDeps({ readFile: () => "int main() { return 0; }\n" });
+    const r = await buildTranscribeCli(INPUT, deps);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.stage).toBe("patch");
+      expect(r.message).toContain("anchor not found");
+      expect(r.message).toContain("vault#534");
+    }
+    expect(deps.calls.written).toEqual([]);
+    expect(deps.calls.compile).toBe(0);
   });
 
   test("TOOLCHAIN ABSENT: no compiler ⇒ { ok:false, stage:'toolchain' }, no fetch/compile", async () => {
