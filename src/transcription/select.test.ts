@@ -8,6 +8,17 @@ import {
   transcribeCppInstalled,
   readManifest,
   transcriptionHomeDir,
+  pythonVenvDir,
+  pythonManifestPath,
+  readPythonManifest,
+  resolveParakeetMlxBin,
+  resolveOnnxAsrBin,
+  resolveParakeetMlxModel,
+  resolveOnnxAsrModel,
+  parakeetMlxInstalled,
+  onnxAsrInstalled,
+  DEFAULT_PARAKEET_MLX_MODEL,
+  DEFAULT_ONNX_ASR_MODEL,
 } from "./select.ts";
 
 /**
@@ -27,6 +38,14 @@ describe("resolveTranscriptionProviderName", () => {
   test("explicit transcribe-cpp", () => {
     expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "transcribe-cpp" }, silent)).toBe(
       "transcribe-cpp",
+    );
+  });
+  test("explicit parakeet-mlx / onnx-asr (scribe-fold Phase 2b)", () => {
+    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "parakeet-mlx" }, silent)).toBe(
+      "parakeet-mlx",
+    );
+    expect(resolveTranscriptionProviderName({ TRANSCRIPTION_PROVIDER: "onnx-asr" }, silent)).toBe(
+      "onnx-asr",
     );
   });
   test("explicit scribe-http", () => {
@@ -110,6 +129,112 @@ describe("readManifest", () => {
     writeManifest(home, { model: "whisper-tiny.en", modelFile: "t.gguf" });
     const m = readManifest(join(home, "transcription", "install.json"));
     expect(m?.model).toBe("whisper-tiny.en");
+  });
+});
+
+// --- python providers (parakeet-mlx / onnx-asr) — scribe-fold Phase 2b ------
+
+describe("python provider bin resolution (env → venv → PATH)", () => {
+  const noHit = { existsImpl: () => false, whichImpl: () => null };
+
+  test("pythonVenvDir lives under the transcription home", () => {
+    expect(pythonVenvDir({ PARACHUTE_HOME: "/h" })).toBe(join("/h", "transcription", "venv"));
+  });
+
+  test("env override wins and is returned verbatim (existence is the caller's check)", () => {
+    expect(resolveParakeetMlxBin({ PARACHUTE_HOME: "/h", PARAKEET_MLX_BIN: "/opt/pk" }, noHit)).toBe("/opt/pk");
+    expect(resolveOnnxAsrBin({ PARACHUTE_HOME: "/h", ONNX_ASR_BIN: "/opt/ox" }, noHit)).toBe("/opt/ox");
+  });
+
+  test("managed venv binary beats PATH", () => {
+    const venvPk = join("/h", "transcription", "venv", "bin", "parakeet-mlx");
+    const bin = resolveParakeetMlxBin(
+      { PARACHUTE_HOME: "/h" },
+      { existsImpl: (p) => p === venvPk, whichImpl: () => "/usr/local/bin/parakeet-mlx" },
+    );
+    expect(bin).toBe(venvPk);
+  });
+
+  test("falls back to PATH when no venv binary exists", () => {
+    const bin = resolveOnnxAsrBin(
+      { PARACHUTE_HOME: "/h" },
+      { existsImpl: () => false, whichImpl: (b) => (b === "onnx-asr" ? "/usr/local/bin/onnx-asr" : null) },
+    );
+    expect(bin).toBe("/usr/local/bin/onnx-asr");
+  });
+
+  test("nothing anywhere → undefined (provider reports unavailable)", () => {
+    expect(resolveParakeetMlxBin({ PARACHUTE_HOME: "/h" }, noHit)).toBeUndefined();
+    expect(resolveOnnxAsrBin({ PARACHUTE_HOME: "/h" }, noHit)).toBeUndefined();
+  });
+});
+
+describe("parakeetMlxInstalled / onnxAsrInstalled", () => {
+  test("true only when the resolved binary exists on disk", () => {
+    const home = mkTmpHome();
+    const env = { PARACHUTE_HOME: home };
+    expect(parakeetMlxInstalled(env, { whichImpl: () => null })).toBe(false);
+    expect(onnxAsrInstalled(env, { whichImpl: () => null })).toBe(false);
+
+    const binDir = join(home, "transcription", "venv", "bin");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, "onnx-asr"), "#!/bin/sh\n");
+    expect(onnxAsrInstalled(env, { whichImpl: () => null })).toBe(true);
+    expect(parakeetMlxInstalled(env, { whichImpl: () => null })).toBe(false);
+  });
+
+  test("an env override pointing at a missing file is NOT installed (honesty)", () => {
+    const home = mkTmpHome();
+    expect(
+      onnxAsrInstalled({ PARACHUTE_HOME: home, ONNX_ASR_BIN: "/nope/onnx-asr" }, { whichImpl: () => null }),
+    ).toBe(false);
+  });
+});
+
+describe("python model resolution (env → manifest → ratified default)", () => {
+  test("defaults are the ratified v3 models", () => {
+    const home = mkTmpHome();
+    expect(resolveParakeetMlxModel({ PARACHUTE_HOME: home })).toBe(DEFAULT_PARAKEET_MLX_MODEL);
+    expect(resolveOnnxAsrModel({ PARACHUTE_HOME: home })).toBe(DEFAULT_ONNX_ASR_MODEL);
+  });
+
+  test("env overrides win", () => {
+    const home = mkTmpHome();
+    expect(resolveParakeetMlxModel({ PARACHUTE_HOME: home, PARAKEET_MLX_MODEL: "mlx-community/custom" })).toBe(
+      "mlx-community/custom",
+    );
+    expect(resolveOnnxAsrModel({ PARACHUTE_HOME: home, ONNX_ASR_MODEL: "whisper-base" })).toBe("whisper-base");
+  });
+
+  test("the install manifest's model applies to ITS provider only", () => {
+    const home = mkTmpHome();
+    const tcDir = join(home, "transcription");
+    mkdirSync(tcDir, { recursive: true });
+    writeFileSync(
+      join(tcDir, "install-python.json"),
+      JSON.stringify({ provider: "onnx-asr", model: "manifest-model" }),
+    );
+    expect(resolveOnnxAsrModel({ PARACHUTE_HOME: home })).toBe("manifest-model");
+    // A parakeet lookup ignores an onnx manifest.
+    expect(resolveParakeetMlxModel({ PARACHUTE_HOME: home })).toBe(DEFAULT_PARAKEET_MLX_MODEL);
+  });
+});
+
+describe("readPythonManifest", () => {
+  test("returns null for a missing manifest", () => {
+    const home = mkTmpHome();
+    expect(readPythonManifest(pythonManifestPath({ PARACHUTE_HOME: home }))).toBeNull();
+  });
+  test("parses a written manifest", () => {
+    const home = mkTmpHome();
+    const tcDir = join(home, "transcription");
+    mkdirSync(tcDir, { recursive: true });
+    writeFileSync(
+      join(tcDir, "install-python.json"),
+      JSON.stringify({ provider: "parakeet-mlx", model: "m", pipTarget: "parakeet-mlx" }),
+    );
+    const m = readPythonManifest(pythonManifestPath({ PARACHUTE_HOME: home }));
+    expect(m?.provider).toBe("parakeet-mlx");
   });
 });
 

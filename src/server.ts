@@ -31,10 +31,18 @@ import { assetsDir } from "./routes.ts";
 import { resolveScribeAuthToken, ensureScribeBearer } from "./scribe-env.ts";
 import { getCachedScribeUrl } from "./scribe-discovery.ts";
 import { TranscribeCppProvider } from "./transcription/providers/transcribe-cpp.ts";
+import { ParakeetMlxProvider } from "./transcription/providers/parakeet-mlx.ts";
+import { OnnxAsrProvider } from "./transcription/providers/onnx-asr.ts";
 import {
   resolveTranscriptionProviderName,
   resolveTranscribeCppPaths,
   transcribeCppInstalled,
+  resolveParakeetMlxBin,
+  resolveParakeetMlxModel,
+  resolveOnnxAsrBin,
+  resolveOnnxAsrModel,
+  parakeetMlxInstalled,
+  onnxAsrInstalled,
 } from "./transcription/select.ts";
 import { readEnvFile, setEnvVar } from "./config.ts";
 import { resolveBindHostname } from "./bind.ts";
@@ -156,6 +164,29 @@ if (providerName === "transcribe-cpp") {
   } else {
     console.log(
       "[transcribe] TRANSCRIPTION_PROVIDER=transcribe-cpp but no runnable transcribe-cli + model installed — see `parachute-vault transcription status` (v0.1.1 ships a library, not a CLI; set TRANSCRIBE_CPP_BIN or build one)",
+    );
+  }
+} else if (providerName === "parakeet-mlx" || providerName === "onnx-asr") {
+  // Python-based local providers (scribe-fold Phase 2b): subprocess the
+  // parakeet-mlx / onnx-asr CLI. Only start the worker when a runnable binary
+  // resolves (env override → managed venv → PATH) — otherwise every pending
+  // item would terminal-fail with `missing_provider`. Cheap existsSync check
+  // (no spawn), matching the providers' `available()`.
+  const installed = providerName === "parakeet-mlx" ? parakeetMlxInstalled() : onnxAsrInstalled();
+  if (installed) {
+    const provider =
+      providerName === "parakeet-mlx"
+        ? new ParakeetMlxProvider({
+            binPath: resolveParakeetMlxBin(),
+            model: resolveParakeetMlxModel(),
+          })
+        : new OnnxAsrProvider({ binPath: resolveOnnxAsrBin(), model: resolveOnnxAsrModel() });
+    transcriptionWorker = startTranscriptionWorker({ ...commonWorkerOpts, provider });
+    wireTranscriptionWorker(transcriptionWorker);
+    console.log(`[transcribe] worker started → ${providerName}`);
+  } else {
+    console.log(
+      `[transcribe] TRANSCRIPTION_PROVIDER=${providerName} but no runnable ${providerName} binary found — run \`parachute-vault transcription install\` (see \`transcription status\`)`,
     );
   }
 } else {

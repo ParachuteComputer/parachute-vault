@@ -90,4 +90,29 @@ describe("defaultTranscriptionProvider — provider selection", () => {
     process.env.TRANSCRIPTION_PROVIDER = "transcribe-cpp";
     expect(defaultTranscriptionProvider().name).toBe("transcribe-cpp");
   });
+
+  test("TRANSCRIPTION_PROVIDER=parakeet-mlx → the parakeet-mlx provider (2b)", () => {
+    process.env.TRANSCRIPTION_PROVIDER = "parakeet-mlx";
+    expect(defaultTranscriptionProvider().name).toBe("parakeet-mlx");
+  });
+
+  test("TRANSCRIPTION_PROVIDER=onnx-asr → the onnx-asr provider (2b)", () => {
+    process.env.TRANSCRIPTION_PROVIDER = "onnx-asr";
+    expect(defaultTranscriptionProvider().name).toBe("onnx-asr");
+  });
+
+  test("an unconfigured python provider resolves to disabled (no throw)", async () => {
+    // No venv/PATH binary in a fresh env → available() is ok:false and the
+    // landing capability is {enabled:false} rather than a crash.
+    process.env.TRANSCRIPTION_PROVIDER = "parakeet-mlx";
+    const prevBin = process.env.PARAKEET_MLX_BIN;
+    process.env.PARAKEET_MLX_BIN = "/definitely/not/a/real/parakeet-mlx";
+    try {
+      const cap = await resolveTranscriptionCapability(defaultTranscriptionProvider());
+      expect(cap.enabled).toBe(false);
+    } finally {
+      if (prevBin === undefined) delete process.env.PARAKEET_MLX_BIN;
+      else process.env.PARAKEET_MLX_BIN = prevBin;
+    }
+  });
 });

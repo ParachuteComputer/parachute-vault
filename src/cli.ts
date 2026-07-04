@@ -153,7 +153,18 @@ import {
   resolveTranscriptionProviderName,
   transcribeCppInstalled,
   readManifest,
+  transcriptionHomeDir,
+  pythonVenvDir,
+  pythonManifestPath,
+  readPythonManifest,
+  resolveParakeetMlxBin,
+  resolveParakeetMlxModel,
+  resolveOnnxAsrBin,
+  resolveOnnxAsrModel,
+  parakeetMlxInstalled,
+  onnxAsrInstalled,
   type TranscribeCppManifest,
+  type PythonInstallManifest,
 } from "./transcription/select.ts";
 import {
   buildTranscribeCli,
@@ -162,6 +173,13 @@ import {
   TRANSCRIBE_CPP_SOURCE_REF,
   type CliBuildResult,
 } from "./transcription/build.ts";
+import { selectDefaultProvider, NOMINAL_SLACK_GB, type TierPlan } from "./transcription/tiers.ts";
+import {
+  PYTHON_PROVIDERS,
+  buildDefaultPythonDeps,
+  installPythonBackend,
+  type PythonProviderName,
+} from "./transcription/install-python.ts";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -3529,17 +3547,23 @@ function printHistoryUsage(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * `parachute-vault transcription install` — set up the local `transcribe-cpp`
- * provider: detect OS/arch + RAM, pick a tier-appropriate GGUF model
- * (scribe#82 fix — Parakeet floored to ≥4GB), download the prebuilt
- * transcribe-cli release asset + the model into
- * `~/.parachute/transcription/`, and switch `TRANSCRIPTION_PROVIDER` in the
- * vault `.env`. Idempotent (skips already-present files unless `--force`),
- * non-fatal. `--dry-run`/`--plan` prints the selection without downloading —
- * the path tests exercise (no network).
+ * `parachute-vault transcription install` — set up a LOCAL transcription
+ * provider. With no `--provider`, the ratified RAM/arch/OS tier table
+ * (scribe-fold Phase 2b, `tiers.ts`) picks the host's default:
+ *
+ *   - macOS Apple Silicon 8GB+ → parakeet-mlx (Python venv, MLX)
+ *   - Linux 4GB+               → onnx-asr (Python venv, int8 ONNX)
+ *   - Linux ~2GB               → transcribe-cpp + small whisper GGUF
+ *   - ~1GB / below floor       → remote steer (scribe-http), never forced
+ *
+ * The pick + footprint is printed and the operator confirms (or overrides
+ * with `--provider`/`--model`). Every path is idempotent + non-fatal, and
+ * activation is HONEST: `TRANSCRIPTION_PROVIDER` flips only when a runnable
+ * binary actually exists (PRs #532/#533 precedent). `--dry-run`/`--plan`
+ * prints the selection without downloading.
  *
  * `parachute-vault transcription status` — show the configured provider +
- * install state.
+ * per-provider install state.
  */
 async function cmdTranscription(args: string[]) {
   const sub = args[0];
@@ -3552,7 +3576,9 @@ async function cmdTranscription(args: string[]) {
     return;
   }
   console.error(`Unknown transcription subcommand: ${sub}`);
-  console.error("Usage: parachute-vault transcription install [--dry-run] [--model <id>] [--provider <name>]");
+  console.error(
+    "Usage: parachute-vault transcription install [--dry-run] [--model <id>] [--provider <transcribe-cpp|parakeet-mlx|onnx-asr|scribe-http>]",
+  );
   console.error("       parachute-vault transcription status");
   process.exit(1);
 }
@@ -3576,9 +3602,9 @@ async function cmdTranscriptionInstall(args: string[]) {
   const force = args.includes("--force");
   const yes = args.includes("--yes") || args.includes("-y");
   const overrideModel = takeArgValue(args, "--model").value;
-  const provider = takeArgValue(args, "--provider").value ?? "transcribe-cpp";
+  const providerArg = takeArgValue(args, "--provider").value;
 
-  if (provider === "scribe-http") {
+  if (providerArg === "scribe-http") {
     // Just flip config back to the remote provider — no download.
     if (dryRun) {
       console.log("Would set TRANSCRIPTION_PROVIDER=scribe-http in the vault .env (remote provider; no download).");
@@ -3588,11 +3614,162 @@ async function cmdTranscriptionInstall(args: string[]) {
     console.log("Set TRANSCRIPTION_PROVIDER=scribe-http. Restart vault to apply. (Remote provider — no local binary/model needed.)");
     return;
   }
-  if (provider !== "transcribe-cpp") {
-    console.error(`Unknown --provider "${provider}". Valid: transcribe-cpp, scribe-http.`);
+
+  let provider: string;
+  let tierModel: string | undefined;
+  if (providerArg) {
+    if (!["transcribe-cpp", "parakeet-mlx", "onnx-asr"].includes(providerArg)) {
+      console.error(
+        `Unknown --provider "${providerArg}". Valid: transcribe-cpp, parakeet-mlx, onnx-asr, scribe-http.`,
+      );
+      process.exit(1);
+    }
+    provider = providerArg;
+  } else {
+    // Auto-default: the ratified RAM/arch/OS tier table (tiers.ts). Probe the
+    // host, print the pick + footprint; the operator confirms below (or
+    // re-runs with --provider/--model to override).
+    const tier = selectDefaultProvider({
+      platform: process.platform,
+      arch: process.arch,
+      totalRamBytes: detectTotalRamBytes(),
+    });
+    printTierPick(tier);
+    if (tier.provider === "scribe-http") {
+      // Remote steer — never force a local install on a below-tier box.
+      console.log("\nNo local install performed. To point at a remote provider now:");
+      console.log("  parachute-vault transcription install --provider scribe-http");
+      if (tier.localOptIn) {
+        console.log(`\nLocal opt-in (explicit only — not auto-installed): ${tier.localOptIn.note}`);
+      }
+      process.exit(dryRun ? 0 : 1);
+    }
+    provider = tier.provider;
+    tierModel = tier.model;
+    console.log("");
+  }
+
+  if (provider === "transcribe-cpp") {
+    // The tier's model pick (e.g. the Linux ~2GB whisper-small tier) seeds the
+    // transcribe-cpp flow; an explicit --model always wins.
+    await runTranscribeCppInstall({ dryRun, force, yes, overrideModel: overrideModel ?? tierModel });
+    return;
+  }
+  await runPythonProviderInstall(provider as PythonProviderName, {
+    dryRun,
+    force,
+    yes,
+    overrideModel,
+  });
+}
+
+/** Print the tier-table pick for this host (the install auto-default). */
+function printTierPick(tier: TierPlan): void {
+  console.log(`Host: ${tier.platform}/${tier.arch}, ${tier.totalRamGb}GB RAM`);
+  console.log(`Tier default: ${tier.provider}${tier.model ? ` (${tier.model})` : ""}`);
+  console.log(`  ${tier.reason}`);
+  if (tier.approxDiskMb) {
+    console.log(`  ~${tier.approxDiskMb}MB download${tier.peakRamNote ? `, ${tier.peakRamNote}` : ""}`);
+  }
+  console.log("  (override with --provider <transcribe-cpp|parakeet-mlx|onnx-asr|scribe-http>)");
+}
+
+/**
+ * Install a Python-based local provider (parakeet-mlx / onnx-asr) into the
+ * managed venv under `~/.parachute/transcription/venv/` and — honestly —
+ * activate it only when a runnable binary verified (`install-python.ts` owns
+ * the apt/venv/warm-pull steps; activation + manifest stay here, mirroring
+ * the transcribe-cpp flow).
+ */
+async function runPythonProviderInstall(
+  provider: PythonProviderName,
+  opts: { dryRun: boolean; force: boolean; yes: boolean; overrideModel?: string },
+): Promise<void> {
+  const spec = PYTHON_PROVIDERS[provider];
+  const venv = pythonVenvDir();
+  // `--model` wins; else env/manifest/ratified default. The pick lands in the
+  // install manifest, which the runtime model resolution reads back.
+  const model =
+    opts.overrideModel ??
+    (provider === "parakeet-mlx" ? resolveParakeetMlxModel() : resolveOnnxAsrModel());
+  const totalRamGb = Math.round((detectTotalRamBytes() / 2 ** 30) * 10) / 10;
+
+  console.log(`Transcription install plan (${provider} — local, Python venv):\n`);
+  console.log(`Host:    ${process.platform}/${process.arch}, ${totalRamGb}GB RAM`);
+  console.log(`Package: ${spec.pipTarget} → ${venv}`);
+  console.log(`Model:   ${model}`);
+  console.log(`         ~${spec.approxDiskMb}MB model download, ${spec.peakRamNote}`);
+
+  if (opts.dryRun) {
+    // Preview the guards the real run would hit — pure, no side effects.
+    if (spec.platform && spec.platform !== process.platform) {
+      console.log(`\n  Refused: ${provider} only runs on ${spec.platform}; this host is ${process.platform}.`);
+    } else if (spec.arch && spec.arch !== process.arch) {
+      console.log(`\n  Refused: ${provider} needs ${spec.arch} (Apple Silicon); this host is ${process.arch}.`);
+    } else if (totalRamGb < spec.minRamGb - NOMINAL_SLACK_GB && !opts.force) {
+      console.log(`\n  Refused: ${totalRamGb}GB RAM < the ~${spec.minRamGb}GB ${provider} floor. ${spec.ramFloorRationale}`);
+    }
+    console.log("\n(--dry-run) Nothing installed.");
+    return;
+  }
+
+  if (!opts.yes) {
+    const ok = await confirm(
+      `Install ${spec.pipTarget} into ${venv} (model ~${spec.approxDiskMb}MB ${provider === "parakeet-mlx" ? "downloads on first use" : "warm-pulled now"})?`,
+      true,
+    );
+    if (!ok) {
+      console.log("Aborted.");
+      return;
+    }
+  }
+
+  const outcome = await installPythonBackend(buildDefaultPythonDeps(), {
+    provider,
+    force: opts.force,
+    model,
+  });
+
+  if (!outcome.ok || !outcome.binPath) {
+    console.error(`\n✗ ${outcome.summary}`);
+    console.error(
+      "Your current provider is unchanged — the verb is idempotent; fix the issue and re-run. Or use the remote provider: parachute-vault transcription install --provider scribe-http",
+    );
     process.exit(1);
   }
 
+  // Manifest + honest activation (a runnable binary exists — verified above).
+  const manifest: PythonInstallManifest = {
+    provider,
+    pipTarget: spec.pipTarget,
+    bin: outcome.binPath,
+    venv: outcome.venv ?? "",
+    model,
+    os: process.platform,
+    arch: process.arch,
+    ram_gb: totalRamGb,
+    installedAt: new Date().toISOString(),
+  };
+  mkdirSync(transcriptionHomeDir(), { recursive: true });
+  writeFileSync(pythonManifestPath(), JSON.stringify(manifest, null, 2));
+
+  setEnvVar("TRANSCRIPTION_PROVIDER", provider);
+  console.log(`\n✓ Installed and activated → TRANSCRIPTION_PROVIDER=${provider} set in the vault .env.`);
+  console.log(`  Binary: ${outcome.binPath}`);
+  console.log(`  Model:  ${model}`);
+  if (provider === "parakeet-mlx") {
+    console.log(`  NOTE: the model (~${spec.approxDiskMb}MB) downloads into the HuggingFace cache on the first transcription.`);
+  }
+  console.log(`  Restart vault to activate:  parachute restart vault`);
+}
+
+async function runTranscribeCppInstall(opts: {
+  dryRun: boolean;
+  force: boolean;
+  yes: boolean;
+  overrideModel?: string;
+}) {
+  const { dryRun, force, yes, overrideModel } = opts;
   const plan = planInstall({
     platform: process.platform,
     arch: process.arch,
@@ -3877,15 +4054,27 @@ function noRunnableCliGuidance(
   return lines.join("\n");
 }
 
-/** `parachute-vault transcription status` — provider + install state. */
+/** `parachute-vault transcription status` — provider + per-provider install state. */
 function cmdTranscriptionStatus(): void {
   const active = resolveTranscriptionProviderName();
   console.log(`Configured provider: ${active}`);
+
+  // What the ratified tier table would pick for this host (install default).
+  const tier = selectDefaultProvider({
+    platform: process.platform,
+    arch: process.arch,
+    totalRamBytes: detectTotalRamBytes(),
+  });
+  console.log(
+    `Tier default for this host (${tier.platform}/${tier.arch}, ${tier.totalRamGb}GB): ${tier.provider}${tier.model ? ` (${tier.model})` : ""}`,
+  );
+
+  // transcribe-cpp — prebuilt libs + GGUF model + built CLI.
   const paths = resolveTranscribeCppPaths();
   const manifest = readManifest(paths.manifestPath);
   const cliPresent = existsSync(paths.binPath);
   const installed = transcribeCppInstalled(paths); // runnable CLI + model both present
-  console.log(`transcribe-cpp runnable: ${installed ? "yes" : "no"}`);
+  console.log(`\ntranscribe-cpp runnable: ${installed ? "yes" : "no"}`);
   if (manifest) {
     console.log(`  model:   ${manifest.model} (${manifest.modelFile})`);
     console.log(
@@ -3898,14 +4087,56 @@ function cmdTranscriptionStatus(): void {
     );
     console.log(`  ram:     ${manifest.ram_gb}GB at install (${manifest.os}/${manifest.arch})`);
   } else {
-    console.log(`  (nothing installed — run: parachute-vault transcription install)`);
+    console.log(`  (not installed — run: parachute-vault transcription install --provider transcribe-cpp)`);
   }
-  if (active === "transcribe-cpp" && !installed) {
+
+  // parakeet-mlx / onnx-asr — Python venv providers (scribe-fold Phase 2b).
+  const pyManifest = readPythonManifest(pythonManifestPath());
+  const pkBin = resolveParakeetMlxBin();
+  const pkRunnable = parakeetMlxInstalled();
+  console.log(`\nparakeet-mlx runnable: ${pkRunnable ? "yes" : "no"}`);
+  if (pkRunnable) {
+    console.log(`  bin:     ${pkBin}`);
+    console.log(`  model:   ${resolveParakeetMlxModel()} (HF cache; downloads on first use)`);
+  } else {
     console.log(
-      "\n⚠  provider is transcribe-cpp but no runnable transcribe-cli is installed — transcription is offline until a CLI is available (TRANSCRIBE_CPP_BIN, or a build from source).",
+      process.platform === "darwin" && process.arch === "arm64"
+        ? `  (not installed — run: parachute-vault transcription install${tier.provider === "parakeet-mlx" ? "" : " --provider parakeet-mlx"})`
+        : "  (macOS Apple Silicon only)",
     );
   }
-  console.log(`\nAvailable models (override with --model): ${Object.values(MODELS).map((m: ModelChoice) => m.name).join(", ")}`);
+
+  const oxBin = resolveOnnxAsrBin();
+  const oxRunnable = onnxAsrInstalled();
+  console.log(`onnx-asr runnable: ${oxRunnable ? "yes" : "no"}`);
+  if (oxRunnable) {
+    console.log(`  bin:     ${oxBin}`);
+    console.log(`  model:   ${resolveOnnxAsrModel()} (HF cache)`);
+  } else {
+    console.log(
+      `  (not installed — run: parachute-vault transcription install${tier.provider === "onnx-asr" ? "" : " --provider onnx-asr"})`,
+    );
+  }
+  if (pyManifest) {
+    console.log(
+      `  python install: ${pyManifest.provider} (${pyManifest.pipTarget}) @ ${pyManifest.installedAt}${pyManifest.venv ? ` — venv ${pyManifest.venv}` : ""}`,
+    );
+  }
+
+  // Offline warning when the ACTIVE provider isn't runnable.
+  const activeRunnable =
+    active === "scribe-http" ||
+    (active === "transcribe-cpp" && installed) ||
+    (active === "parakeet-mlx" && pkRunnable) ||
+    (active === "onnx-asr" && oxRunnable);
+  if (!activeRunnable) {
+    console.log(
+      `\n⚠  provider is ${active} but no runnable ${active} install was found — transcription is offline until one is available (\`parachute-vault transcription install\`).`,
+    );
+  }
+  console.log(
+    `\nAvailable transcribe-cpp models (override with --model): ${Object.values(MODELS).map((m: ModelChoice) => m.name).join(", ")}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4816,22 +5047,27 @@ Schema maintenance:
 
 Transcription (scribe-fold):
   parachute-vault transcription install [--dry-run] [--model <id>] [--force] [--yes]
-                                           Install the local transcribe-cpp provider — detects
-                                           OS/arch + RAM, downloads the transcribe.cpp runtime
-                                           libraries + a RAM-tier-appropriate GGUF model into
-                                           ~/.parachute/transcription/. NOTE: v0.1.1 ships a library,
-                                           not a CLI — it activates (sets
-                                           TRANSCRIPTION_PROVIDER=transcribe-cpp) only when a runnable
-                                           transcribe-cli is available (TRANSCRIBE_CPP_BIN or a build
-                                           from source), else it reports the gap. --dry-run prints the
-                                           pick + footprint without downloading. --model overrides the
-                                           RAM-tier choice (whisper-tiny.en | whisper-small.en |
-                                           parakeet-tdt-0.6b-v3). --force re-downloads; --yes skips the
-                                           confirm. Needs ffmpeg on PATH to transcode audio to 16kHz
-                                           mono WAV (hinted if missing).
-  parachute-vault transcription install --provider scribe-http
-                                           Switch back to the remote scribe-http provider (no download).
-  parachute-vault transcription status     Show the configured provider + local install state.
+                                           Install this host's tier-default LOCAL provider (probes
+                                           OS/arch + RAM, prints the pick + footprint, confirms):
+                                             macOS Apple Silicon 8GB+ → parakeet-mlx (Python venv, MLX)
+                                             Linux 4GB+               → onnx-asr (Python venv, int8 ONNX)
+                                             Linux ~2GB               → transcribe-cpp + small whisper GGUF
+                                             ~1GB / below floor       → remote steer (never forced)
+                                           Activation is honest: TRANSCRIPTION_PROVIDER flips only when
+                                           a runnable binary exists. Idempotent; --dry-run prints the
+                                           pick without downloading; --force re-downloads / bypasses the
+                                           RAM floor on an explicit --provider; --yes skips the confirm.
+  parachute-vault transcription install --provider <name>
+                                           Override the tier default. transcribe-cpp downloads the
+                                           runtime libs + a GGUF (--model overrides the RAM-tier pick:
+                                           whisper-tiny.en | whisper-small.en | parakeet-tdt-0.6b-v3;
+                                           builds transcribe-cli from source — needs a C++ compiler).
+                                           parakeet-mlx / onnx-asr install a Python venv under
+                                           ~/.parachute/transcription/venv (needs python3; apt-installs
+                                           python3/ffmpeg on Linux). scribe-http switches back to the
+                                           remote provider (no download).
+  parachute-vault transcription status     Show the configured provider, this host's tier default, and
+                                           per-provider install state.
 
 ── Advanced / standalone ──────────────────────────────────────────────
 

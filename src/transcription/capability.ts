@@ -17,9 +17,18 @@
 import type { TranscriptionProvider } from "../../core/src/transcription/provider.ts";
 import { ScribeHttpProvider } from "./providers/scribe-http.ts";
 import { TranscribeCppProvider } from "./providers/transcribe-cpp.ts";
+import { ParakeetMlxProvider } from "./providers/parakeet-mlx.ts";
+import { OnnxAsrProvider } from "./providers/onnx-asr.ts";
 import { getCachedScribeUrl } from "../scribe-discovery.ts";
 import { resolveScribeAuthToken } from "../scribe-env.ts";
-import { resolveTranscriptionProviderName, resolveTranscribeCppPaths } from "./select.ts";
+import {
+  resolveTranscriptionProviderName,
+  resolveTranscribeCppPaths,
+  resolveParakeetMlxBin,
+  resolveParakeetMlxModel,
+  resolveOnnxAsrBin,
+  resolveOnnxAsrModel,
+} from "./select.ts";
 
 export interface TranscriptionCapability {
   /** True when a provider is configured AND available. Notes gates the mic on this. */
@@ -36,15 +45,31 @@ export interface TranscriptionCapability {
  *   - `transcribe-cpp` → the local provider, resolving the installed binary +
  *     GGUF model paths; `available()` is `false` until `transcription install`
  *     has run.
+ *   - `parakeet-mlx` / `onnx-asr` (scribe-fold Phase 2b) → the Python-based
+ *     local providers, resolving the binary via env override → managed venv →
+ *     PATH; `available()` is `false` until a runnable binary exists.
  *   - `scribe-http` (default) → the remote provider (URL from
  *     `SCRIBE_URL`/services.json, bearer from `SCRIBE_AUTH_TOKEN`). When scribe
  *     isn't discoverable the URL is undefined and it reports itself unavailable
  *     rather than throwing.
  */
 export function defaultTranscriptionProvider(): TranscriptionProvider {
-  if (resolveTranscriptionProviderName() === "transcribe-cpp") {
+  const name = resolveTranscriptionProviderName();
+  if (name === "transcribe-cpp") {
     const paths = resolveTranscribeCppPaths();
     return new TranscribeCppProvider({ binPath: paths.binPath, modelPath: paths.modelPath });
+  }
+  if (name === "parakeet-mlx") {
+    return new ParakeetMlxProvider({
+      binPath: resolveParakeetMlxBin(),
+      model: resolveParakeetMlxModel(),
+    });
+  }
+  if (name === "onnx-asr") {
+    return new OnnxAsrProvider({
+      binPath: resolveOnnxAsrBin(),
+      model: resolveOnnxAsrModel(),
+    });
   }
   return new ScribeHttpProvider({
     url: getCachedScribeUrl(),
