@@ -82,7 +82,14 @@ describe("downloadTo", () => {
         await downloadTo(`http://127.0.0.1:${listener.port}/flaky`, dest);
       } catch (err) {
         threw = true;
-        expect(String(err)).toMatch(/failed after \d+ bytes|truncated/);
+        // The truncation surfaces differently per platform: on macOS the body
+        // stream errors mid-pump (wrapped "failed after N bytes") or the
+        // short read trips the content-length check ("truncated"); on Linux
+        // Bun's fetch() itself rejects on the early socket close. All are
+        // loud failures — the invariants are THROWS + NO PARTIAL FILE.
+        expect(String(err)).toMatch(
+          /failed after \d+ bytes|truncated|socket connection was closed|connection closed/i,
+        );
       }
       expect(threw).toBe(true);
       // The half-written file must not survive to be mistaken for a good artifact.
