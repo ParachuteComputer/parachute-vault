@@ -135,8 +135,16 @@ export function selectDefaultProvider(input: TierInput): TierPlan {
   // Phase 2a RAM matrix (which already floors Parakeet-GGUF at 4GB).
   const asset = selectAsset(platform, arch);
   if (asset && gb >= 2 - NOMINAL_SLACK_GB) {
+    // Model pick: slack belongs to TIER-ENTRY boundaries, never to model-floor
+    // checks. The 4GB Parakeet-GGUF floor is checked against the UN-INFLATED
+    // RAM (adding slack here once picked a ~3.5GB-peak model for a real-3.6GB
+    // Intel Mac — ~0.1GB headroom, the scribe#82 OOM class resurrected).
+    // Below a true 4GB, the ratified "~2GB → small whisper" row covers the
+    // whole band (entry already vetted ≥ ~2GB nominal above).
     const model: ModelChoice =
-      selectModelForRam(totalRamBytes + NOMINAL_SLACK_GB * GB) ?? MODELS["whisper-small.en"]!;
+      gb >= 4
+        ? (selectModelForRam(totalRamBytes) ?? MODELS["whisper-small.en"]!)
+        : MODELS["whisper-small.en"]!;
     return {
       ...base,
       provider: "transcribe-cpp",
@@ -144,7 +152,7 @@ export function selectDefaultProvider(input: TierInput): TierPlan {
       approxDiskMb: model.approxSizeMb,
       peakRamNote: `~${model.approxRuntimeGb}GB peak while transcribing`,
       reason:
-        gb < 4 - NOMINAL_SLACK_GB
+        gb < 4
           ? `~${base.totalRamGb}GB RAM — a small whisper GGUF via transcribe-cpp fits; Parakeet's peak RAM exceeds 2GB on meeting-length audio (scribe#82).`
           : `${platform}/${arch} isn't a parakeet-mlx/onnx-asr tier host — transcribe-cpp with a RAM-tier GGUF is the local default.`,
     };

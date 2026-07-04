@@ -104,6 +104,39 @@ describe("selectDefaultProvider — the 2GB-not-Parakeet floor (scribe#82)", () 
       expect(plan.provider).not.toBe("parakeet-mlx");
     }
   });
+
+  // Regression for the double-applied-slack bug (reviewer, PR #537): the
+  // transcribe-cpp fallback used to add NOMINAL_SLACK_GB a SECOND time before
+  // install.ts's 4GB Parakeet-GGUF floor, so a real-3.6GB Darwin box picked a
+  // ~3.5GB-peak Parakeet model (~0.1GB headroom — the scribe#82 OOM class).
+  // Slack belongs to tier-entry boundaries only, never to model-floor checks.
+  test("darwin/x64 in the 3.6–3.9GB band → whisper-small.en, NEVER a Parakeet variant", () => {
+    for (const gb of [3.6, 3.8, 3.9]) {
+      const plan = pick("darwin", "x64", gb);
+      expect(plan.provider).toBe("transcribe-cpp");
+      expect(plan.model).toBe("whisper-small.en");
+      expect(isParakeet(plan)).toBe(false);
+    }
+  });
+
+  test("darwin/arm64 in the 3.6–3.9GB band → whisper-small.en, NEVER a Parakeet variant", () => {
+    for (const gb of [3.6, 3.9]) {
+      const plan = pick("darwin", "arm64", gb);
+      expect(plan.provider).toBe("transcribe-cpp");
+      expect(plan.model).toBe("whisper-small.en");
+      expect(isParakeet(plan)).toBe(false);
+    }
+  });
+
+  test("darwin just over a TRUE 4GB → the un-inflated Phase 2a pick (parakeet GGUF)", () => {
+    // At a genuine ≥4GB, install.ts's own matrix governs — same model an
+    // explicit `--provider transcribe-cpp` install would choose.
+    for (const [arch, gb] of [["x64", 4], ["x64", 4.1], ["arm64", 4]] as const) {
+      const plan = pick("darwin", arch, gb);
+      expect(plan.provider).toBe("transcribe-cpp");
+      expect(plan.model).toBe("parakeet-tdt-0.6b-v3");
+    }
+  });
 });
 
 describe("selectDefaultProvider — the ~1GB remote tier", () => {
