@@ -48,6 +48,14 @@ export interface VaultModuleManifest {
   readonly paths: readonly string[];
   readonly health: string;
   readonly stripPrefix?: boolean;
+  /**
+   * When `true`, vault's daemon accepts WebSocket upgrades (the live-query WS
+   * binding) and the hub's ws-bridge forwards `Upgrade: websocket` requests on
+   * vault's mounts. DENY BY DEFAULT on the hub side. Carried onto the
+   * self-registered services.json row too (`ServiceEntry.websocket`); the hub
+   * honors either source. See `parachute-hub/src/ws-bridge.ts`.
+   */
+  readonly websocket?: boolean;
 }
 
 /**

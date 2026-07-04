@@ -15,6 +15,14 @@ export interface ServiceEntry {
   paths: string[];
   health: string;
   version: string;
+  /**
+   * When `true`, the hub's ws-bridge forwards `Upgrade: websocket` requests on
+   * this module's mounts to it (deny-by-default). Carried from the module's
+   * `.parachute/module.json` `websocket` field by self-registration; the hub
+   * honors either source. Optional + free-riding — extra fields survive the
+   * read/merge via the `...e` spread in `validateEntry` / `upsertService`.
+   */
+  websocket?: boolean;
 }
 
 export interface ServicesManifest {

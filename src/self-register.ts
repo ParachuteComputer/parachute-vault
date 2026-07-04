@@ -191,6 +191,7 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
     displayName?: string;
     tagline?: string;
     stripPrefix?: boolean;
+    websocket?: boolean;
   } = {
     name: manifest.manifestName,
     port,
@@ -202,6 +203,9 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
   if (manifest.displayName !== undefined) entry.displayName = manifest.displayName;
   if (manifest.tagline !== undefined) entry.tagline = manifest.tagline;
   if (manifest.stripPrefix !== undefined) entry.stripPrefix = manifest.stripPrefix;
+  // Carry the live-query WS capability onto the row so the hub ws-bridge admits
+  // upgrades without having to read module.json (the row is its first source).
+  if (manifest.websocket !== undefined) entry.websocket = manifest.websocket;
 
   // Detect whether the existing row already matches (no-op idempotency
   // signal). We don't gate the write on this — `upsertService` itself is
@@ -232,7 +236,8 @@ export function selfRegister(deps: SelfRegisterDeps): SelfRegisterResult {
     priorRow.health !== health ||
     (priorRow as { displayName?: string }).displayName !== manifest.displayName ||
     (priorRow as { tagline?: string }).tagline !== manifest.tagline ||
-    (priorRow as { stripPrefix?: boolean }).stripPrefix !== manifest.stripPrefix;
+    (priorRow as { stripPrefix?: boolean }).stripPrefix !== manifest.stripPrefix ||
+    (priorRow as { websocket?: boolean }).websocket !== manifest.websocket;
 
   try {
     upsertImpl(entry);
