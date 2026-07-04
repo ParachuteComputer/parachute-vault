@@ -2089,7 +2089,7 @@ export async function handleTags(
 
   // PUT /tags/:name — upsert tag identity row. Body accepts any combination
   // of { description, fields, relationships, parent_names }; omitted keys
-  // are preserved, explicit null clears. See patterns/tag-data-model.md.
+  // are preserved, explicit null clears. See docs/contracts/tag-data-model.md.
   if (req.method === "PUT") {
     // Canonical-bare-tag guard (vault#XXX): normalize the upserted tag NAME so
     // the existing-field merge read (store.getTagSchema below) and the upsert
@@ -2114,7 +2114,7 @@ export async function handleTags(
        * the MCP `update-tag` tool relies on (omitted keys preserved). The
        * Schema editor (vault#283) sends the full map + `replace_fields: true`
        * so removing a field row actually deletes the field. See
-       * patterns/tag-data-model.md.
+       * docs/contracts/tag-data-model.md.
        */
       replace_fields?: unknown;
     };
@@ -2211,7 +2211,7 @@ export async function handleTags(
     // Tag-scoped tokens reference root tags by name; deleting a referenced
     // tag would silently orphan the token's allowlist. Fail closed (409)
     // and name the offending tokens so the operator can revoke or re-mint
-    // before retrying. patterns/tag-scoped-tokens.md §Dependencies.
+    // before retrying. docs/contracts/tag-scoped-tokens.md §Dependencies.
     const referenced_by = findTokensReferencingTag(store.db, tagName);
     if (referenced_by.length > 0) {
       return json(

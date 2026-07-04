@@ -406,7 +406,7 @@ export interface Store {
 
   // Tag records — full v14 identity row (description + fields + typed
   // relationships + parent_names + timestamps). See
-  // parachute-patterns/patterns/tag-data-model.md.
+  // docs/contracts/tag-data-model.md.
   listTagRecords(): Promise<TagRecord[]>;
   getTagRecord(tag: string): Promise<TagRecord | null>;
   /**

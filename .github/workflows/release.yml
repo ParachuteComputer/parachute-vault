@@ -1,6 +1,6 @@
 # Release workflow — triggered by pushing a semver tag.
 #
-# Tag conventions (matches parachute-patterns governance rule 2):
+# Tag conventions (matches governance rule 2 — https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
 #   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.4.8-rc.7)
 #   - stable: v<X>.<Y>.<Z>          (e.g. v0.4.8)
 #

@@ -9,7 +9,7 @@ Vault has no container image artifact — the `ghcr.io` step that ships with the
 
 ## Tag conventions
 
-Per [parachute-patterns governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md):
+Per [governance rule 2](https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
 
 | Tag shape | Example | npm `dist-tag` |
 |---|---|---|

@@ -1,12 +1,12 @@
 /**
- * Tag-scope enforcement for tag-scoped tokens (patterns/tag-scoped-tokens.md).
+ * Tag-scope enforcement for tag-scoped tokens (docs/contracts/tag-scoped-tokens.md).
  *
  * A token's `scoped_tags` allowlist narrows its effective access to notes
  * carrying one of the allowlisted tags or a sub-tag thereof. The expansion
  * to descendants happens via the per-vault `_tags/<name>` config-note
  * hierarchy (see core/src/tag-hierarchy.ts).
  *
- * Auth check pseudocode (from patterns/tag-scoped-tokens.md):
+ * Auth check pseudocode (from docs/contracts/tag-scoped-tokens.md):
  *
  *   if (!hasScope(token, ...)) return forbidden();
  *   if (token.scoped_tags === null) return ok();   // unscoped
@@ -38,7 +38,7 @@ export async function expandTokenTagScope(
 
 /**
  * Return true iff the note's tag set intersects the expanded allowlist OR
- * — fail-open per patterns/tag-scoped-tokens.md §Storage — any of the
+ * — fail-open per docs/contracts/tag-scoped-tokens.md §Storage — any of the
  * note's tags has a string-form root inside `rawRoots`. The string-form
  * fallback covers the orphan-sub-tag case: a token allowlisted for
  * `health` should still see `#health/food` even when no `_tags/health/food`

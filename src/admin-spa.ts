@@ -8,7 +8,8 @@
  *
  * Per-vault mount (vault#252): the SPA lives under `/vault/<name>/admin/*`
  * rather than the origin-rooted `/admin/*` it shipped with. The hub only
- * proxies `/vault/<name>/*` paths (per parachute-patterns/module-protocol),
+ * proxies `/vault/<name>/*` paths (per the module protocol —
+ * https://github.com/ParachuteComputer/parachute-hub/blob/main/docs/contracts/module-protocol.md),
  * so an origin-rooted SPA is unreachable through the hub. Asset URLs are
  * relative (Vite `base: "./"`), so the same bundle works at any mount
  * point — no rebuild per vault.

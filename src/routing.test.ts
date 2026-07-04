@@ -1631,7 +1631,7 @@ describe("scope enforcement on /api/*", () => {
     expect(res.status).toBe(401);
   });
 
-  // ----- tag-scoped tokens (patterns/tag-scoped-tokens.md) -----------------
+  // ----- tag-scoped tokens (docs/contracts/tag-scoped-tokens.md) -----------------
 
   /**
    * Mint a tag-scoped token. Mirrors `mintToken` above but threads
@@ -1745,7 +1745,7 @@ describe("scope enforcement on /api/*", () => {
   });
 
   // ----- Q6: orphan-sub-tag fail-open ------------------------------------
-  // patterns/tag-scoped-tokens.md §Storage: when a sub-tag has no declared
+  // docs/contracts/tag-scoped-tokens.md §Storage: when a sub-tag has no declared
   // schema, the string-form root authorizes. Token allowlisted for `health`
   // must see `#health/food` even when no `_tags/health/food` schema exists.
 
