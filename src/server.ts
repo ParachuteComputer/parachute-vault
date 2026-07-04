@@ -61,6 +61,7 @@ import {
 } from "./mirror-config.ts";
 import { GLOBAL_CONFIG_PATH } from "./config.ts";
 import { selfRegister } from "./self-register.ts";
+import { createSubscribeWsBinding, isWebSocketUpgrade } from "./ws-server.ts";
 import { warnLegacyGlobalApiKeys } from "./auth.ts";
 import pkg from "../package.json" with { type: "json" };
 
@@ -490,10 +491,18 @@ const hostname = resolveBindHostname();
   }
 }
 
+// Live-query WebSocket binding (WS-hibernation migration Phase 3). Same
+// subscription contract as the SSE route, WebSocket transport. Handlers +
+// upgrade decision live in ws-server.ts; the per-vault WS cap is closure state
+// there. Advertised via `"websocket": true` in `.parachute/module.json` so the
+// hub ws-bridge admits the upgrade.
+const subscribeWs = createSubscribeWsBinding();
+
 const server = Bun.serve({
   port,
   hostname,
   idleTimeout: 120, // seconds — webhook triggers can take a while
+  websocket: subscribeWs.handlers,
   async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -515,6 +524,21 @@ const server = Bun.serve({
 
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Live-query WebSocket upgrade — detected BEFORE the fetch pipeline because
+    // WS upgrades don't traverse `route()`. Non-upgrade requests (incl. the SSE
+    // fallback, which has no Upgrade header) fall straight through unchanged.
+    if (isWebSocketUpgrade(req)) {
+      const verdict = subscribeWs.tryUpgrade(req, server, path);
+      if (verdict.kind === "upgraded") return undefined; // Bun owns the socket now
+      if (verdict.kind === "response") {
+        for (const [k, v] of Object.entries(corsHeaders)) {
+          verdict.response.headers.set(k, v);
+        }
+        return verdict.response;
+      }
+      // "pass" → not a subscribe WS upgrade; fall through to the pipeline.
     }
 
     try {

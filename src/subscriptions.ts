@@ -8,6 +8,25 @@
  * connection-scoped, driving a live UI. Same event source, same predicate,
  * different durability.
  *
+ * ## Two transports, one contract (WS-hibernation migration, 2026-07-04)
+ *
+ * The manager is transport-agnostic: it emits abstract `(event, data)` tuples
+ * and a {@link SubscriptionSink} renders them for its wire.
+ *   - {@link SseSink} renders `event:`/`data:` frames — bytes UNCHANGED from the
+ *     original SSE contract (surface-client parses them identically).
+ *   - {@link WsSink} renders a WebSocket message `{ type: event, ...data }` — the
+ *     SSE `event:` name folds into a `type` discriminator; the inner payload
+ *     (`note` / `id` / `notes`) serializes byte-for-byte identically to the SSE
+ *     `data:` body. That parity is pinned by the shared frame-corpus fixture and
+ *     is congruent with the cloud door (`parachute-cloud/workers/vault/src/
+ *     live/subscriptions.ts`). See `parachute-cloud/workers/vault/docs/
+ *     live-query-ws.md`.
+ *
+ * Both transports share ONE process-wide {@link SubscriptionManager}. Self-host
+ * has no hibernation (a self-run Bun box has no per-connection duration bill) —
+ * the WS binding adds bidirectionality + contract-congruence with cloud, nothing
+ * more. The Bun.serve WS integration lives in `ws-server.ts` + `ws-subscribe.ts`.
+ *
  * ## How fan-out works
  *
  * All vault stores share the process-wide `defaultHookRegistry`
@@ -54,16 +73,19 @@ export const DEFAULT_MAX_SUBSCRIPTIONS_PER_VAULT = 100;
  * Default bound on a single subscription's pending (unflushed) event buffer.
  * If a slow client lets the buffer grow past this, the stream is closed — it
  * reconnects and re-snapshots rather than the server growing memory unbounded.
+ * Only enforced for flush-tracking sinks (SSE); the WS transport delegates
+ * outgoing-buffer bounds to the Bun runtime.
  */
 export const DEFAULT_MAX_BUFFERED_EVENTS = 1000;
 
-/** A serialized SSE frame ready to write to the wire. */
-type SseFrame = string;
-
+/**
+ * The abstract sink an event is rendered to. The manager calls `send(event,
+ * data)`; each transport formats for its wire. Returns `false` when the sink is
+ * gone (the manager then drops the subscription).
+ */
 export interface SubscriptionSink {
-  /** Enqueue a serialized SSE frame. Returns false if the sink is closed. */
-  write(frame: SseFrame): boolean;
-  /** Close the underlying stream (teardown). Idempotent. */
+  send(event: string, data: unknown): boolean;
+  /** Close the underlying stream/socket (teardown). Idempotent. */
   close(): void;
 }
 
@@ -75,14 +97,82 @@ interface Subscription {
   /** Raw root-tag allowlist (null = unscoped) — `noteWithinTagScope` arg. */
   readonly tagScopeRaw: string[] | null;
   readonly sink: SubscriptionSink;
-  /** Pending unflushed frame count (backpressure bound). */
+  /** SSE tracks unflushed frames to bound memory; WS delegates to the runtime. */
+  readonly tracksFlush: boolean;
+  /** Whether this sub counts against the per-vault manager cap (SSE) — the WS
+   *  transport enforces its own cap via the live-socket count at upgrade. */
+  readonly countsTowardCap: boolean;
+  /** Pending unflushed frame count (backpressure bound; SSE only). */
   buffered: number;
   readonly maxBuffered: number;
   closed: boolean;
 }
 
-function sseEvent(event: string, data: unknown): SseFrame {
+/** SSE wire frame: `event: <name>\ndata: <json>\n\n`. The ONE place SSE bytes
+ *  are formatted (route + tests + SseSink all route through it). */
+export function sseFrame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/** WebSocket message: `{ type: <event>, ...data }`. The SSE `event:` name folds
+ *  into `type`; the inner payload serializes identically to the SSE `data:`
+ *  body. The ONE place WS bytes are formatted. */
+export function wsFrame(event: string, data: unknown): string {
+  const body = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
+  return JSON.stringify({ type: event, ...body });
+}
+
+/** SSE sink: renders `(event, data)` to an SSE frame and hands it to `push`
+ *  (the route's stream-queue writer). `push` returns false when the stream is
+ *  gone. `comment()` emits a raw `:` keepalive (SSE-only; not part of the
+ *  abstract contract). Bytes are byte-identical to the pre-migration SSE path. */
+export class SseSink implements SubscriptionSink {
+  constructor(
+    private readonly push: (frame: string) => boolean,
+    private readonly onClose: () => void,
+  ) {}
+  send(event: string, data: unknown): boolean {
+    return this.push(sseFrame(event, data));
+  }
+  comment(text = ""): boolean {
+    return this.push(`:${text}\n\n`);
+  }
+  close(): void {
+    this.onClose();
+  }
+}
+
+/** Minimal structural shape of a Bun `ServerWebSocket` (or a test double) that
+ *  {@link WsSink} needs — keeps this module free of a hard Bun-server import. */
+export interface WsLike {
+  send(data: string): unknown;
+  close(code?: number, reason?: string): unknown;
+}
+
+/** WebSocket sink: renders `(event, data)` to a `{ type, ...data }` message and
+ *  sends it on the socket. `sendRaw` is for pre-formatted frames (the chunked
+ *  snapshot the WS binding builds directly). A send on a dead socket returns
+ *  false → the manager drops the sub. */
+export class WsSink implements SubscriptionSink {
+  constructor(private readonly ws: WsLike) {}
+  send(event: string, data: unknown): boolean {
+    return this.sendRaw(wsFrame(event, data));
+  }
+  sendRaw(frame: string): boolean {
+    try {
+      this.ws.send(frame);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  close(): void {
+    try {
+      this.ws.close(1011, "subscription closed");
+    } catch {
+      /* already closing/closed */
+    }
+  }
 }
 
 export class SubscriptionManager {
@@ -140,9 +230,15 @@ export class SubscriptionManager {
     tagScopeRaw: string[] | null;
     sink: SubscriptionSink;
     maxBuffered?: number;
+    /** SSE (default true) tracks unflushed frames; WS passes false. */
+    tracksFlush?: boolean;
+    /** SSE (default true) counts against the per-vault manager cap; WS passes
+     *  false — the WS transport caps via the live-socket count at upgrade. */
+    countsTowardCap?: boolean;
   }): SubscriptionHandle | null {
+    const countsTowardCap = args.countsTowardCap ?? true;
     const current = this.countForVault(args.vaultName);
-    if (current >= this.maxPerVault) return null;
+    if (countsTowardCap && current >= this.maxPerVault) return null;
 
     this.ensureHooks();
 
@@ -152,12 +248,14 @@ export class SubscriptionManager {
       tagScopeAllowed: args.tagScopeAllowed,
       tagScopeRaw: args.tagScopeRaw,
       sink: args.sink,
+      tracksFlush: args.tracksFlush ?? true,
+      countsTowardCap,
       buffered: 0,
       maxBuffered: args.maxBuffered ?? DEFAULT_MAX_BUFFERED_EVENTS,
       closed: false,
     };
     this.subs.add(sub);
-    this.perVaultCount.set(args.vaultName, current + 1);
+    if (countsTowardCap) this.perVaultCount.set(args.vaultName, current + 1);
 
     return {
       /** Note that a previously-buffered frame flushed to the wire. */
@@ -172,9 +270,11 @@ export class SubscriptionManager {
     if (sub.closed) return;
     sub.closed = true;
     this.subs.delete(sub);
-    const n = this.perVaultCount.get(sub.vaultName) ?? 0;
-    if (n <= 1) this.perVaultCount.delete(sub.vaultName);
-    else this.perVaultCount.set(sub.vaultName, n - 1);
+    if (sub.countsTowardCap) {
+      const n = this.perVaultCount.get(sub.vaultName) ?? 0;
+      if (n <= 1) this.perVaultCount.delete(sub.vaultName);
+      else this.perVaultCount.set(sub.vaultName, n - 1);
+    }
     try {
       sub.sink.close();
     } catch {
@@ -182,33 +282,21 @@ export class SubscriptionManager {
     }
   }
 
-  /**
-   * Send a keepalive comment to every open subscription (the route's timer
-   * calls this). A `:` comment defeats idle-proxy timeouts; it's not an event
-   * so it never counts against the buffer bound.
-   */
-  keepaliveAll(): void {
-    for (const sub of this.subs) {
-      if (sub.closed) continue;
-      const ok = sub.sink.write(":\n\n");
-      if (!ok) this.remove(sub);
-    }
-  }
-
-  /** Emit a frame to one subscription, enforcing the buffer bound. */
-  private emit(sub: Subscription, frame: SseFrame): void {
+  /** Emit an `(event, data)` tuple to one subscription, enforcing the buffer
+   *  bound for flush-tracking (SSE) sinks. */
+  private emit(sub: Subscription, event: string, data: unknown): void {
     if (sub.closed) return;
-    if (sub.buffered >= sub.maxBuffered) {
+    if (sub.tracksFlush && sub.buffered >= sub.maxBuffered) {
       // Backpressure: client can't keep up. Close → it reconnects + re-snapshots.
       this.remove(sub);
       return;
     }
-    const ok = sub.sink.write(frame);
+    const ok = sub.sink.send(event, data);
     if (!ok) {
       this.remove(sub);
       return;
     }
-    sub.buffered++;
+    if (sub.tracksFlush) sub.buffered++;
   }
 
   /** Lazily register the three broad hooks (once per manager). */
@@ -244,7 +332,7 @@ export class SubscriptionManager {
         // the client ignores ids it never held. Documented low-sensitivity
         // existence leak (see design §scope-intersection).
         const ref = payload as DeletedNoteRef;
-        this.emit(sub, sseEvent("remove", { id: ref.id }));
+        this.emit(sub, "remove", { id: ref.id });
         continue;
       }
 
@@ -257,14 +345,14 @@ export class SubscriptionManager {
       const matches = sub.matcher.match(note) && inScope;
 
       if (matches) {
-        this.emit(sub, sseEvent("upsert", { note }));
+        this.emit(sub, "upsert", { note });
       } else if (event === "updated" && inScope) {
         // Left the set (predicate no longer true) BUT still within this
         // token's scope, so the sub could have held it — idempotent remove
         // (client drops the id if held, no-op otherwise). When the note is
         // OUT of scope the sub never had it; emitting would leak its id, so
         // we stay silent.
-        this.emit(sub, sseEvent("remove", { id: note.id }));
+        this.emit(sub, "remove", { id: note.id });
       }
       // created that doesn't match → nothing (it was never in the set).
     }
@@ -286,9 +374,9 @@ export interface SubscriptionHandle {
   close: () => void;
 }
 
-/** Serialize a snapshot frame (exported for the route + tests). */
-export function snapshotFrame(notes: Note[]): SseFrame {
-  return sseEvent("snapshot", { notes });
+/** Serialize a snapshot SSE frame (exported for the SSE route + tests). */
+export function snapshotFrame(notes: Note[]): string {
+  return sseFrame("snapshot", { notes });
 }
 
 /** Process-wide manager — shared like `defaultHookRegistry`. */

@@ -24,8 +24,8 @@ import { buildLiveMatcher, unsupportedSubscriptionReason } from "./live-match.ts
 import {
   snapshotFrame,
   subscriptionManager,
+  SseSink,
   type SubscriptionManager,
-  type SubscriptionSink,
 } from "./subscriptions.ts";
 
 /** Keepalive interval — `:` comment every ~25s to defeat idle-proxy timeouts. */
@@ -160,27 +160,28 @@ export async function handleSubscribe(
     }
   };
 
-  const sink: SubscriptionSink = {
-    write(frame: string): boolean {
-      if (cancelled) return false;
-      queue.push(frame);
-      flushQueue();
-      return true;
-    },
-    close(): void {
-      if (cancelled) return;
-      cancelled = true;
-      if (keepalive) {
-        clearInterval(keepalive);
-        keepalive = null;
-      }
-      try {
-        controllerRef?.close();
-      } catch {
-        /* already closed */
-      }
-    },
+  // SSE sink over the stream queue. `send(event, data)` and the `:` keepalive
+  // comment both route through this same push → the emitted bytes are identical
+  // to the pre-WS-migration SSE contract (surface-client parses them unchanged).
+  const push = (frame: string): boolean => {
+    if (cancelled) return false;
+    queue.push(frame);
+    flushQueue();
+    return true;
   };
+  const sink = new SseSink(push, () => {
+    if (cancelled) return;
+    cancelled = true;
+    if (keepalive) {
+      clearInterval(keepalive);
+      keepalive = null;
+    }
+    try {
+      controllerRef?.close();
+    } catch {
+      /* already closed */
+    }
+  });
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -219,7 +220,7 @@ export async function handleSubscribe(
       // 3. Keepalive comments.
       keepalive = setInterval(() => {
         if (cancelled) return;
-        sink.write(":\n\n");
+        sink.comment(); // `:\n\n` — byte-identical keepalive comment.
       }, KEEPALIVE_MS);
     },
     pull() {

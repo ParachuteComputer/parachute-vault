@@ -12,6 +12,7 @@
   "focus": "core",
   "adminCapabilities": ["config", "credentials"],
   "startCmd": ["parachute-vault", "serve"],
+  "websocket": true,
   "scopes": {
     "defines": ["vault:read", "vault:write", "vault:admin"]
   },
