@@ -4046,7 +4046,7 @@ describe("query-notes link expansion", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tag hierarchy via tags.parent_names (post-v14, patterns/tag-data-model.md)
+// Tag hierarchy via tags.parent_names (post-v14, docs/contracts/tag-data-model.md)
 // ---------------------------------------------------------------------------
 
 describe("tag hierarchy (tags.parent_names)", async () => {
@@ -5107,7 +5107,7 @@ describe("schema inheritance via parent_names (vault#270)", async () => {
   });
 });
 
-describe("expandTagsWithDescendants (tag-scoped tokens — patterns/tag-scoped-tokens.md)", async () => {
+describe("expandTagsWithDescendants (tag-scoped tokens — docs/contracts/tag-scoped-tokens.md)", async () => {
   it("returns the union of root + every descendant per tags.parent_names", async () => {
     await store.upsertTagRecord("health/food", { parent_names: ["health"] });
     await store.upsertTagRecord("health/food/breakfast", { parent_names: ["health/food"] });
@@ -5143,10 +5143,10 @@ describe("expandTagsWithDescendants (tag-scoped tokens — patterns/tag-scoped-t
 });
 
 // ---------------------------------------------------------------------------
-// Tag record API — patterns/tag-data-model.md
+// Tag record API — docs/contracts/tag-data-model.md
 // ---------------------------------------------------------------------------
 
-describe("tag record API (patterns/tag-data-model.md)", async () => {
+describe("tag record API (docs/contracts/tag-data-model.md)", async () => {
   it("upsertTagRecord persists description + fields + relationships + parent_names", async () => {
     await store.upsertTagRecord("project", {
       description: "long-running deliverable",
@@ -5430,7 +5430,7 @@ describe("tag record API (patterns/tag-data-model.md)", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Schema migration v13 → v14 — patterns/tag-data-model.md
+// Schema migration v13 → v14 — docs/contracts/tag-data-model.md
 // ---------------------------------------------------------------------------
 
 describe("schema migration v13 → v14", async () => {
@@ -5809,7 +5809,7 @@ describe("schema migration v15 → v16", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tag-scope auth post-v14 — patterns/tag-scoped-tokens.md
+// Tag-scope auth post-v14 — docs/contracts/tag-scoped-tokens.md
 // ---------------------------------------------------------------------------
 
 describe("tag-scope auth (post-v14 hierarchy)", async () => {
@@ -5824,7 +5824,7 @@ describe("tag-scope auth (post-v14 hierarchy)", async () => {
   });
 
   it("orphan sub-tag fallback: token for `health` still sees `#health/food` even with no declared hierarchy", async () => {
-    // Per patterns/tag-scoped-tokens.md §Storage details, the auth check
+    // Per docs/contracts/tag-scoped-tokens.md §Storage details, the auth check
     // also splits on '/' and matches the root verbatim against the raw
     // allowlist. This survives the v14 source-of-truth swap because the
     // fallback lives in src/tag-scope.ts, not in the resolver.

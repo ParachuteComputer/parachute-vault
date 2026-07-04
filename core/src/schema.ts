@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS notes (
 
 -- Tags: first-class identity carrying schema, hierarchy, and typed-link
 -- declarations. One row per tag; no notes-as-config sidecars for these
--- concerns. See parachute-patterns/patterns/tag-data-model.md.
+-- concerns. See docs/contracts/tag-data-model.md.
 --
 -- description    — human-readable blurb (markdown).
 -- fields         — JSON: indexed metadata field declarations per
@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS indexed_fields (
 -- scoped_tags is a JSON-encoded array of root tag names that constrain the
 -- token's effective access (intersection with the scopes column). NULL
 -- means unscoped — full vault access per scopes. Introduced in v13 per
--- patterns/tag-scoped-tokens.md. Hierarchy expansion is applied at auth
+-- docs/contracts/tag-scoped-tokens.md. Hierarchy expansion is applied at auth
 -- time via getTagDescendants; the column stores root names only.
 --
 -- vault_name (v16) binds the token to a single vault. NULL means the
@@ -443,7 +443,7 @@ export function initSchema(db: Database): void {
   // Migrate v13 → v14: tag-data-model reshape. Augment `tags` row with
   // description/fields/relationships/parent_names/timestamps; copy data
   // from the v6-era tag_schemas sidecar and from `_tags/<name>` config
-  // notes; drop tag_schemas after copy. See patterns/tag-data-model.md.
+  // notes; drop tag_schemas after copy. See docs/contracts/tag-data-model.md.
   migrateToV14(db);
 
   // Migrate v14 → v15: retire the `_schemas/<name>` and `_schema_defaults`
@@ -650,7 +650,7 @@ function migrateToV12(db: Database): void {
  * (current full-vault behavior); a JSON array of root tag names narrows the
  * token's access to notes carrying one of those tags or a sub-tag thereof
  * (hierarchy expansion via getTagDescendants at auth time). See
- * parachute-patterns/patterns/tag-scoped-tokens.md.
+ * docs/contracts/tag-scoped-tokens.md.
  */
 function migrateToV13(db: Database): void {
   if (hasTable(db, "tokens") && !hasColumn(db, "tokens", "scoped_tags")) {
@@ -659,7 +659,7 @@ function migrateToV13(db: Database): void {
 }
 
 /**
- * Migrate v13 → v14: tag-data-model reshape (patterns/tag-data-model.md).
+ * Migrate v13 → v14: tag-data-model reshape (docs/contracts/tag-data-model.md).
  *
  * Augments the `tags` table with five new columns and one timestamp pair,
  * then copies pre-existing data from two notes-as-config sidecars:

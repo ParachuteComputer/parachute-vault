@@ -1093,7 +1093,7 @@ describe("scoped MCP wrapper", async () => {
     close();
   });
 
-  // -- tag-scoped MCP wrappers (patterns/tag-scoped-tokens.md) ------------
+  // -- tag-scoped MCP wrappers (docs/contracts/tag-scoped-tokens.md) ------------
   //
   // These pin the behavior of `applyTagScopeWrappers` in mcp-tools.ts: each
   // wrapped tool's execute() honors the auth's scoped_tags allowlist. The

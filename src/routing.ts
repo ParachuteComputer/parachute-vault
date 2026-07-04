@@ -856,7 +856,7 @@ export async function route(
 
   const apiPath = apiMatch[1] ?? "";
 
-  // Tag-scoped tokens (patterns/tag-scoped-tokens.md): expand the token's
+  // Tag-scoped tokens (docs/contracts/tag-scoped-tokens.md): expand the token's
   // root-tag allowlist into `{root} ∪ descendants(root)` once per request,
   // so handlers can intersect against the note's tag set without re-walking
   // the `_tags/<name>` hierarchy on every check. `tagScope.allowed` is null

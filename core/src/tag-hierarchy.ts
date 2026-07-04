@@ -9,7 +9,7 @@
  * History: pre-v14 vaults stored hierarchy in notes-as-config at
  * `_tags/<name>`. The v14 migration (see core/src/schema.ts:migrateToV14)
  * lifts those parent declarations onto the tags row and the resolver here
- * was swapped accordingly. See parachute-patterns/patterns/tag-data-model.md.
+ * was swapped accordingly. See docs/contracts/tag-data-model.md.
  *
  * Resolution model:
  * - Lazy: built on first access, cached on the store.

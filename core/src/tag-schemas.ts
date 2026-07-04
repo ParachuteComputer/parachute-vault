@@ -4,7 +4,7 @@
  * Each tag row carries: human-readable description, indexed metadata field
  * declarations (`fields`), typed-link relationship declarations
  * (`relationships`), and the hierarchy parent list (`parent_names`).
- * See parachute-patterns/patterns/tag-data-model.md.
+ * See docs/contracts/tag-data-model.md.
  *
  * This module retains the historical `tag-schemas` filename and exports
  * (`TagSchema`, `listTagSchemas`, `getTagSchema`, `upsertTagSchema`,
@@ -51,7 +51,7 @@ export interface TagFieldSchema {
  * `{ target_tag, cardinality }` declaration — but `relationships` is now an
  * opaque vocabulary map (see `TagRelationshipMap` / `validateRelationships`),
  * so this is one valid value shape among many, not a required one.
- * See patterns/tag-data-model.md §Relationships.
+ * See docs/contracts/tag-data-model.md §Relationships.
  */
 export type TagRelCardinality = "one" | "optional" | "many" | "many-required";
 

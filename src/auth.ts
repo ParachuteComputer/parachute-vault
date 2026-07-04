@@ -123,7 +123,7 @@ export interface AuthResult {
    * Tag-allowlist (root tag names) for tag-scoped tokens. NULL = unscoped
    * (current full-vault behavior). Hub-issued JWTs and legacy YAML keys
    * always have null — tag scoping is a per-token vault-DB attribute, not
-   * an OAuth-claim concern. See patterns/tag-scoped-tokens.md.
+   * an OAuth-claim concern. See docs/contracts/tag-scoped-tokens.md.
    */
   scoped_tags: string[] | null;
   /**

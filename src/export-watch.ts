@@ -10,7 +10,7 @@
  * cursor captured at the *start* of the previous cycle. Vault writes are
  * HTTP-mediated and don't surface to filesystem watchers (the bun:sqlite DB
  * is opaque), so polling on `updated_at >= cursor` is the simplest robust
- * detection. See `parachute-patterns/cookbook/vault-portable-export.md`.
+ * detection. See `docs/contracts/vault-portable-export.md`.
  */
 
 import { ensureGitAvailable } from "./git-preflight.ts";

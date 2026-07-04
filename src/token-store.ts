@@ -54,7 +54,7 @@ export interface Token {
    * access is the intersection of `scopes` and notes carrying one of these
    * tags or a sub-tag thereof (hierarchy expansion via getTagDescendants).
    * NULL = unscoped, full vault access per `scopes`. See
-   * patterns/tag-scoped-tokens.md.
+   * docs/contracts/tag-scoped-tokens.md.
    */
   scoped_tags: string[] | null;
   /**
@@ -301,7 +301,7 @@ export function markMcpMintLedgerRevoked(
  * Returns display ID + label pairs (no token-hash exposure) so error
  * envelopes can name the offending tokens for the operator. The match is
  * exact on the root name — `scoped_tags` only ever stores roots per
- * patterns/tag-scoped-tokens.md.
+ * docs/contracts/tag-scoped-tokens.md.
  */
 export function findTokensReferencingTag(
   db: Database,
