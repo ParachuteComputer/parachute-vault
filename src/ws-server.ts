@@ -14,7 +14,7 @@
  *   - `ws-subscribe.ts` — the PURE half (close codes, query validation, chunked
  *     snapshot, message parsing, verb-rank) shared byte-shaped with cloud.
  *   - `subscriptions.ts` — the transport-agnostic manager + `WsSink`
- *     (`{ type, ...data }`) / `SseSink` (`event:`/`data:`).
+ *     (`{ type, ...data }`), the sole live-transport sink since Phase 5.
  *   - this module — the Bun.serve upgrade decision + `open`/`message`/`close`
  *     handlers + the per-vault live-socket registry (the WS cap).
  *

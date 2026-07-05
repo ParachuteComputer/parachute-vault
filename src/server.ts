@@ -527,8 +527,9 @@ const server = Bun.serve({
     }
 
     // Live-query WebSocket upgrade — detected BEFORE the fetch pipeline because
-    // WS upgrades don't traverse `route()`. Non-upgrade requests (incl. the SSE
-    // fallback, which has no Upgrade header) fall straight through unchanged.
+    // WS upgrades don't traverse `route()`. Non-upgrade requests (incl. a
+    // straggler non-WS GET /subscribe, which now gets a 410 Gone in routing.ts —
+    // the SSE transport was removed in Phase 5) fall straight through unchanged.
     if (isWebSocketUpgrade(req)) {
       const verdict = subscribeWs.tryUpgrade(req, server, path);
       if (verdict.kind === "upgraded") return undefined; // Bun owns the socket now

@@ -1,21 +1,22 @@
 /**
- * Live-query frame PARITY + the pure WS helpers (WS-hibernation migration
- * Phase 3, self-host door).
+ * Live-query frame PARITY + the pure WS helpers (WS-hibernation migration,
+ * self-host door).
  *
  * The load-bearing CROSS-DOOR conformance check: for the shared frame corpus
- * (mirrored byte-for-byte from the cloud door), the self-host WS payload and the
- * self-host SSE `data:` body carry a byte-IDENTICAL serialization of the inner
- * payload (`notes` / `note` / `id`) — the ONLY difference is the `type`
- * discriminator the WS message folds in (plus the snapshot `done` chunk flag).
- * Because the corpus AND the `sseFrame`/`wsFrame` formatters are byte-shaped
- * identical to cloud's, this transitively proves: self-host WS bytes === corpus
- * === self-host SSE bytes === cloud WS/SSE bytes.
+ * (mirrored byte-for-byte from the cloud door), the self-host WS message folds
+ * the event name into a `type` discriminator (plus the snapshot `done` chunk
+ * flag) over an inner payload (`notes` / `note` / `id`) that serializes
+ * byte-IDENTICALLY to the corpus. Because the corpus AND the `wsFrame` formatter
+ * are byte-shaped identical to cloud's, this transitively proves: self-host WS
+ * bytes === corpus === cloud WS bytes. (SSE was the original transport; it was
+ * removed in Phase 5 — WebSocket is now the sole live transport, polling the
+ * client floor.)
  *
  * Plus unit coverage of the pure helpers that back the Bun.serve integration:
  * snapshot chunking, first-message parsing, verb-rank, and the query rejects.
  */
 import { describe, it, expect } from "bun:test";
-import { sseFrame, wsFrame, SseSink, WsSink, snapshotFrame } from "./subscriptions.ts";
+import { wsFrame, WsSink } from "./subscriptions.ts";
 import {
   buildSnapshotFrames,
   parseClientMessage,
@@ -30,22 +31,10 @@ import {
 import { unsupportedSubscriptionReason } from "./live-match.ts";
 import { FRAME_CORPUS, NOTE_A } from "./test-support/live-frame-corpus.ts";
 
-/** Strip the SSE `data:` body out of a single-event SSE frame. */
-function sseDataBody(frame: string): string {
-  const line = frame.split("\n").find((l) => l.startsWith("data:"))!;
-  return line.slice("data:".length).replace(/^ /, "");
-}
-
-describe("live-frame parity — self-host WS bytes === corpus === SSE data body", () => {
+describe("live-frame parity — self-host WS bytes === corpus === cloud WS bytes", () => {
   for (const c of FRAME_CORPUS) {
-    it(`${c.name}: identical inner payload across transports`, () => {
-      const sse = sseFrame(c.event, c.data);
+    it(`${c.name}: WS message folds the event into \`type\` over the corpus payload`, () => {
       const ws = wsFrame(c.event, c.data);
-
-      // SSE frame shape (byte-identical to the pre-WS-migration contract).
-      expect(sse).toBe(`event: ${c.event}\ndata: ${JSON.stringify(c.data)}\n\n`);
-      // SSE data body parses back to exactly the payload.
-      expect(JSON.parse(sseDataBody(sse))).toEqual(c.data);
 
       // WS message is `{ type, ...data }` — the event name folds into `type`.
       const parsedWs = JSON.parse(ws) as Record<string, unknown>;
@@ -55,21 +44,16 @@ describe("live-frame parity — self-host WS bytes === corpus === SSE data body"
       expect(rest).toEqual(c.data);
 
       // BYTE parity of the inner payload: whatever value the event carries
-      // (`notes` / `note` / `id`) serializes IDENTICALLY in both frames AND
-      // equals the corpus serialization (the cross-door invariant).
+      // (`notes` / `note` / `id`) serializes IDENTICALLY to the corpus
+      // serialization (the cross-door invariant).
       const innerKey = c.event === "snapshot" ? "notes" : c.event === "upsert" ? "note" : "id";
       const innerBytes = JSON.stringify((c.data as Record<string, unknown>)[innerKey]);
-      expect(sse.includes(innerBytes)).toBe(true);
       expect(ws.includes(innerBytes)).toBe(true);
     });
   }
-
-  it("snapshotFrame() is the SSE snapshot frame for a note set", () => {
-    expect(snapshotFrame([NOTE_A as any])).toBe(sseFrame("snapshot", { notes: [NOTE_A] }));
-  });
 });
 
-describe("sink classes render through the ONE formatter each", () => {
+describe("sink classes render through the ONE formatter", () => {
   it("WsSink.send emits exactly wsFrame(event, data)", () => {
     const sent: string[] = [];
     const sink = new WsSink({ send: (d: string) => sent.push(d), close: () => {} });
@@ -77,15 +61,6 @@ describe("sink classes render through the ONE formatter each", () => {
       sink.send(c.event, c.data);
       expect(sent.at(-1)).toBe(wsFrame(c.event, c.data));
     }
-  });
-
-  it("SseSink.send emits exactly sseFrame(event, data); comment() emits `:\\n\\n`", () => {
-    const pushed: string[] = [];
-    const sink = new SseSink((f) => (pushed.push(f), true), () => {});
-    sink.send("upsert", { note: NOTE_A });
-    expect(pushed.at(-1)).toBe(sseFrame("upsert", { note: NOTE_A }));
-    sink.comment();
-    expect(pushed.at(-1)).toBe(":\n\n");
   });
 });
 

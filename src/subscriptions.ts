@@ -1,6 +1,8 @@
 /**
- * Live-query subscription registry (live-query SSE — design
- * `design/2026-06-08-live-query-sse.md`).
+ * Live-query subscription registry — fans out post-commit note events to live
+ * WebSocket subscriptions (originally an SSE fan-out — design
+ * `design/2026-06-08-live-query-sse.md`; the SSE transport was removed in
+ * Phase 5 of the WS-hibernation migration).
  *
  * A second consumer of the post-commit hook dispatcher (`core/src/hooks.ts`),
  * alongside the durable webhook-trigger sink. Where a trigger survives across
@@ -8,24 +10,23 @@
  * connection-scoped, driving a live UI. Same event source, same predicate,
  * different durability.
  *
- * ## Two transports, one contract (WS-hibernation migration, 2026-07-04)
+ * ## The live transport: WebSocket (WS-hibernation migration)
  *
  * The manager is transport-agnostic: it emits abstract `(event, data)` tuples
  * and a {@link SubscriptionSink} renders them for its wire.
- *   - {@link SseSink} renders `event:`/`data:` frames — bytes UNCHANGED from the
- *     original SSE contract (surface-client parses them identically).
- *   - {@link WsSink} renders a WebSocket message `{ type: event, ...data }` — the
- *     SSE `event:` name folds into a `type` discriminator; the inner payload
- *     (`note` / `id` / `notes`) serializes byte-for-byte identically to the SSE
- *     `data:` body. That parity is pinned by the shared frame-corpus fixture and
- *     is congruent with the cloud door (`parachute-cloud/workers/vault/src/
- *     live/subscriptions.ts`). See `parachute-cloud/workers/vault/docs/
- *     live-query-ws.md`.
+ *   - {@link WsSink} renders a WebSocket message `{ type: event, ...data }`. The
+ *     inner payload (`note` / `id` / `notes`) is pinned byte-for-byte against the
+ *     shared frame-corpus fixture and is congruent with the cloud door
+ *     (`parachute-cloud/workers/vault/src/live/subscriptions.ts`). See
+ *     `parachute-cloud/workers/vault/docs/live-query-ws.md`.
  *
- * Both transports share ONE process-wide {@link SubscriptionManager}. Self-host
- * has no hibernation (a self-run Bun box has no per-connection duration bill) —
- * the WS binding adds bidirectionality + contract-congruence with cloud, nothing
- * more. The Bun.serve WS integration lives in `ws-server.ts` + `ws-subscribe.ts`.
+ * WebSocket is the SOLE live transport as of Phase 5 — the earlier SSE binding
+ * was removed once cached notes-ui bundles converged, and polling (client-side)
+ * is the floor beneath live. All subscriptions share ONE process-wide
+ * {@link SubscriptionManager}. Self-host has no hibernation (a self-run Bun box
+ * has no per-connection duration bill) — the WS binding gives bidirectionality +
+ * contract-congruence with cloud, nothing more. The Bun.serve WS integration
+ * lives in `ws-server.ts` + `ws-subscribe.ts`.
  *
  * ## How fan-out works
  *
@@ -108,38 +109,12 @@ interface Subscription {
   closed: boolean;
 }
 
-/** SSE wire frame: `event: <name>\ndata: <json>\n\n`. The ONE place SSE bytes
- *  are formatted (route + tests + SseSink all route through it). */
-export function sseFrame(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-/** WebSocket message: `{ type: <event>, ...data }`. The SSE `event:` name folds
- *  into `type`; the inner payload serializes identically to the SSE `data:`
- *  body. The ONE place WS bytes are formatted. */
+/** WebSocket message: `{ type: <event>, ...data }` — the event name becomes the
+ *  `type` discriminator and the inner payload (`note` / `id` / `notes`)
+ *  serializes as-is. The ONE place WS bytes are formatted. */
 export function wsFrame(event: string, data: unknown): string {
   const body = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
   return JSON.stringify({ type: event, ...body });
-}
-
-/** SSE sink: renders `(event, data)` to an SSE frame and hands it to `push`
- *  (the route's stream-queue writer). `push` returns false when the stream is
- *  gone. `comment()` emits a raw `:` keepalive (SSE-only; not part of the
- *  abstract contract). Bytes are byte-identical to the pre-migration SSE path. */
-export class SseSink implements SubscriptionSink {
-  constructor(
-    private readonly push: (frame: string) => boolean,
-    private readonly onClose: () => void,
-  ) {}
-  send(event: string, data: unknown): boolean {
-    return this.push(sseFrame(event, data));
-  }
-  comment(text = ""): boolean {
-    return this.push(`:${text}\n\n`);
-  }
-  close(): void {
-    this.onClose();
-  }
 }
 
 /** Minimal structural shape of a Bun `ServerWebSocket` (or a test double) that
@@ -372,11 +347,6 @@ export interface SubscriptionHandle {
   flushed: () => void;
   /** Unregister + close. Called on stream cancel/close. Idempotent. */
   close: () => void;
-}
-
-/** Serialize a snapshot SSE frame (exported for the SSE route + tests). */
-export function snapshotFrame(notes: Note[]): string {
-  return sseFrame("snapshot", { notes });
 }
 
 /** Process-wide manager — shared like `defaultHookRegistry`. */
