@@ -73,7 +73,6 @@ import {
   type TagScopeCtx,
   type WriteCtx,
 } from "./routes.ts";
-import { handleSubscribe } from "./subscribe.ts";
 import { handleTriggers } from "./triggers-api.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import {
@@ -883,10 +882,23 @@ export async function route(
   };
 
   if (apiPath.startsWith("/notes")) return handleNotes(req, store, apiPath.slice(6), vaultName, tagScope, writeCtx);
-  // Live-query SSE subscription (design 2026-06-08). Snapshot + scoped live
-  // upsert/remove events over text/event-stream. Auth + tag-scope already
-  // resolved above and threaded through, mirroring the /notes branch.
-  if (apiPath === "/subscribe") return handleSubscribe(req, store, vaultName, tagScope);
+  // Live-query SSE transport REMOVED (WS-hibernation migration Phase 5). The
+  // WebSocket binding (an `Upgrade: websocket` GET /subscribe, handled in
+  // server.ts before this pipeline) is now the SOLE live transport; polling
+  // GET /notes is the client floor beneath it. A non-WS GET /subscribe — a
+  // straggler on a cached pre-WS notes-ui bundle — gets a clean 410 Gone
+  // pointing at the WS binding so its consumer degrades to polling gracefully;
+  // NEVER a 500 or an unhandled path.
+  if (apiPath === "/subscribe") {
+    return Response.json(
+      {
+        error:
+          "The live-query SSE transport has been removed. Reconnect with an `Upgrade: websocket` request to GET /api/subscribe, or poll GET /notes.",
+        code: "SSE_TRANSPORT_REMOVED",
+      },
+      { status: 410 },
+    );
+  }
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
