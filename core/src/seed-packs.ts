@@ -16,9 +16,9 @@
  *     `parachute-vault add-pack surface-starter` or a console affordance.
  *
  * Guides are the vault's skill files — the Parachute equivalent of a
- * `SKILL.md`. They're tagged `#guide` (GUIDE_TAG), and a `written_for` schema
- * field on that tag records who each guide is written for (`ai` | `human` |
- * `both`; `ai` first = the default, since guides lean AI).
+ * `SKILL.md`. They're tagged `#guide` (GUIDE_TAG). Written for a connected AI
+ * first (it reads them to learn the vault), but they're plain markdown, so the
+ * human reads them just as well — no per-guide audience field is needed.
  *
  * This module is the single source of truth for pack content across BOTH
  * runtimes: the bun vault (`src/onboarding-seed.ts` default seed + the
@@ -69,8 +69,8 @@ export const IMPORTED_VAULT_DESCRIPTION =
  *
  * `fields` carries an optional typed-metadata schema — the same
  * `Record<field, { type, enum?, indexed? }>` shape `update-tag` accepts — so a
- * pack can declare a schema-carrying tag (e.g. GUIDE_TAG's `written_for`
- * enum). The applier passes it straight through to `upsertTagRecord`.
+ * pack can declare a schema-carrying tag. The applier passes it straight
+ * through to `upsertTagRecord`.
  */
 export interface SeedPackTag {
   name: string;
@@ -82,7 +82,7 @@ export interface SeedPackTag {
 /**
  * A note a pack seeds — created only when no note exists at `path`. `tags` +
  * `metadata` are applied at create time (both runtimes' `createNote` accepts
- * them); a guide note carries `tags: ["guide"]` + `metadata: { written_for }`.
+ * them); a guide note carries `tags: ["guide"]`.
  */
 export interface SeedPackNote {
   path: string;
@@ -131,10 +131,9 @@ export const NOTES_REQUIRED_TAGS: ReadonlyArray<SeedPackTag> = [
 
 /**
  * The `guide` tag — the vault's skill-file tag. Guides are the Parachute
- * equivalent of a `SKILL.md`: notes that teach a connected AI (and the human)
- * how this vault works and how to work it. The `written_for` schema field says
- * who a guide is written for; `ai` is the enum's FIRST value, so it's the
- * schema default — guides lean AI.
+ * equivalent of a `SKILL.md`: notes that teach a connected AI (and the human it
+ * belongs to) how this vault works and how to work it. Written for the AI
+ * first; plain markdown, so the human reads them just as well.
  *
  * Declared by every pack that ships guide notes (welcome / getting-started /
  * surface-starter). The upserts converge on one row, so each pack stays
@@ -143,11 +142,7 @@ export const NOTES_REQUIRED_TAGS: ReadonlyArray<SeedPackTag> = [
 export const GUIDE_TAG: SeedPackTag = {
   name: "guide",
   description:
-    "Guides — the vault's skill files. Notes that teach a connected AI (and the human) how this vault works and how to work it. `written_for` says who a guide is written for.",
-  fields: {
-    // First enum value is the schema default — guides lean AI.
-    written_for: { type: "string", enum: ["ai", "human", "both"] },
-  },
+    "Guides — the vault's skill files. Notes that teach a connected AI (and the human it belongs to) how this vault works and how to work it. Written for the AI first; plain markdown, so a good read for the human too.",
 };
 
 /** The `pinned` tag — notes pinned to the top of the Notes app. No schema. */
@@ -166,8 +161,8 @@ export const YOURS_TO_KEEP_PATH = "Yours to keep";
  * Build the `welcome` pack: the five-guide welcome ring — Welcome, Capture
  * anything, Tags and the graph, Connect your AI, Yours to keep — plus the
  * `capture` / `guide` / `pinned` tags. The guides are ordinary notes tagged
- * `#guide` (the vault's skill-file tag), each `metadata.written_for: "human"`;
- * Welcome is `#pinned` so it sits at the top of the Notes app. They form a
+ * `#guide` (the vault's skill-file tag); Welcome is also `#pinned` so it sits
+ * at the top of the Notes app. They form a
  * small linked web (Welcome → all four; the rest chain 2→3→4→5→1; Connect
  * your AI also links the AI-facing [[Getting Started]]) so the graph view
  * shows a connected structure from minute one. Deletable like anything else.
@@ -182,13 +177,13 @@ export function welcomePack(opts: { consoleOrigin?: string } = {}): SeedPack {
   const consoleLine = opts.consoleOrigin
     ? `Grab the connection URL from your console at ${opts.consoleOrigin}.`
     : `Grab the connection URL from your console.`;
-  const guideHuman = { tags: ["guide"], metadata: { written_for: "human" } };
+  const guideNote = { tags: ["guide"] };
   return {
     name: "welcome",
     description:
       "The five-guide welcome ring (Welcome, Capture anything, Tags and the graph, Connect your AI, Yours to keep) — the vault's #guide skill files — plus the capture/guide/pinned tags. Seeded by default on new vaults.",
-    // capture (Notes surface) + guide (the skill-file tag, carries the
-    // written_for schema) + pinned (top-of-app). Upserts are idempotent.
+    // capture (Notes surface) + guide (the skill-file tag) + pinned
+    // (top-of-app). Upserts are idempotent.
     tags: [...NOTES_REQUIRED_TAGS, GUIDE_TAG, PINNED_TAG],
     // `[[wikilinks]]` resolve by note path — pending links auto-resolve when
     // the target is created, so order only affects how briefly a link sits
@@ -199,7 +194,6 @@ export function welcomePack(opts: { consoleOrigin?: string } = {}): SeedPack {
       {
         path: WELCOME_PATH,
         tags: ["guide", "pinned"],
-        metadata: { written_for: "human" },
         content: `# ${WELCOME_PATH}
 
 This vault is yours.
@@ -219,7 +213,7 @@ lot — the vault is yours, remember.
       },
       {
         path: CAPTURE_ANYTHING_PATH,
-        ...guideHuman,
+        ...guideNote,
         content: `# ${CAPTURE_ANYTHING_PATH}
 
 The one habit that makes a vault work: when a thought strikes, write it down.
@@ -241,7 +235,7 @@ Next: [[${TAGS_GRAPH_PATH}]].
       },
       {
         path: TAGS_GRAPH_PATH,
-        ...guideHuman,
+        ...guideNote,
         content: `# ${TAGS_GRAPH_PATH}
 
 Notes and links come first. Tags come later, when you notice a pattern.
@@ -267,7 +261,7 @@ Next: [[${CONNECT_AI_PATH}]].
       },
       {
         path: CONNECT_AI_PATH,
-        ...guideHuman,
+        ...guideNote,
         content: `# ${CONNECT_AI_PATH}
 
 Your vault speaks MCP — an open standard — so any AI can read and write it:
@@ -291,7 +285,7 @@ Next: [[${YOURS_TO_KEEP_PATH}]].
       },
       {
         path: YOURS_TO_KEEP_PATH,
-        ...guideHuman,
+        ...guideNote,
         content: `# ${YOURS_TO_KEEP_PATH}
 
 Everything here — every note, tag, and link — exports as plain markdown files
@@ -577,7 +571,6 @@ export const GETTING_STARTED_PACK: SeedPack = {
     {
       path: GETTING_STARTED_PATH,
       tags: ["guide"],
-      metadata: { written_for: "ai" },
       content: GETTING_STARTED_CONTENT,
     },
   ],
@@ -723,7 +716,6 @@ export const SURFACE_STARTER_PACK: SeedPack = {
     {
       path: SURFACE_STARTER_PATH,
       tags: ["guide"],
-      metadata: { written_for: "ai" },
       content: SURFACE_STARTER_CONTENT,
     },
   ],

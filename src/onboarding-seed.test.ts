@@ -114,11 +114,11 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
       expect(record!.parent_names ?? []).toEqual(decl.parent_names ?? []);
     }
 
-    // The guide tag lands with its written_for enum schema (applier passes
-    // `fields` through to upsertTagRecord). "ai" is the default (first value).
+    // The guide tag lands with no metadata schema — guides are AI-first,
+    // human-readable markdown, so no per-guide audience field (written_for dropped).
     const guide = await store.getTagRecord("guide");
     expect(guide).not.toBeNull();
-    expect(guide!.fields?.written_for?.enum).toEqual(["ai", "human", "both"]);
+    expect(guide!.fields?.written_for).toBeUndefined();
     const pinned = await store.getTagRecord("pinned");
     expect(pinned).not.toBeNull();
 
@@ -129,15 +129,14 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(await store.getTagRecord("capture/voice")).toBeNull();
   });
 
-  test("seeded guides carry #guide + metadata.written_for (create-time tag/metadata write-through)", async () => {
+  test("seeded guides carry #guide (create-time tag write-through)", async () => {
     await seedOnboardingNotes(store);
 
-    // Human-facing welcome guide: tagged guide + pinned, written_for human.
+    // Welcome guide: tagged guide + pinned.
     const welcome = await store.getNoteByPath(WELCOME_PATH);
     expect([...(welcome!.tags ?? [])].sort()).toEqual(["guide", "pinned"]);
-    expect(welcome!.metadata?.written_for).toBe("human");
 
-    // The four sibling guides: guide only, written_for human.
+    // The four sibling guides: guide only.
     for (const path of [
       CAPTURE_ANYTHING_PATH,
       TAGS_GRAPH_PATH,
@@ -146,13 +145,11 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     ]) {
       const note = await store.getNoteByPath(path);
       expect(note!.tags).toEqual(["guide"]);
-      expect(note!.metadata?.written_for).toBe("human");
     }
 
-    // The AI-facing Getting Started guide: guide, written_for ai.
+    // The AI-facing Getting Started guide: guide.
     const gs = await store.getNoteByPath(GETTING_STARTED_PATH);
     expect(gs!.tags).toEqual(["guide"]);
-    expect(gs!.metadata?.written_for).toBe("ai");
   });
 
   test("GAP 4: Getting Started shows a concrete update-tag fields example + write gotchas", async () => {
@@ -242,7 +239,7 @@ describe("applySeedPack — surface-starter via add-pack", () => {
     expect(result.pack).toBe("surface-starter");
     expect(result.seededNotes).toEqual([SURFACE_STARTER_PATH]);
     expect(result.skippedNotes).toEqual([]);
-    // surface-starter now declares GUIDE_TAG (it's a guide, written_for ai).
+    // surface-starter now declares GUIDE_TAG (it's a guide).
     expect(result.tags).toEqual(["guide"]);
 
     const ss = await store.getNoteByPath(SURFACE_STARTER_PATH);
