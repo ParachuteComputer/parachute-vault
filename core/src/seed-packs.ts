@@ -5,14 +5,20 @@
  * A pack is a named bundle of `tags` (upserted) + `notes` (created only when
  * no note already lives at the path). Three packs ship today:
  *
- *   - `welcome` — the person-voiced three-note welcome web + the `capture`
- *     tag the Notes surface expects. Default-seeded on vault creation.
+ *   - `welcome` — the five-guide welcome ring (Welcome, Capture anything, Tags
+ *     and the graph, Connect your AI, Yours to keep) + the `capture` / `guide`
+ *     / `pinned` tags the Notes surface expects. Default-seeded on creation.
  *   - `getting-started` — the AI-facing start-here guide (SKILL.md-style
  *     doctrine addressed to a connected assistant). Default-seeded.
  *   - `surface-starter` — the living starter guide for building a custom
  *     surface (UI) over the vault. NOT default-seeded (ratified 2026-07-02:
  *     Surface Starter is out of the default seed) — added on demand via
  *     `parachute-vault add-pack surface-starter` or a console affordance.
+ *
+ * Guides are the vault's skill files — the Parachute equivalent of a
+ * `SKILL.md`. They're tagged `#guide` (GUIDE_TAG), and a `written_for` schema
+ * field on that tag records who each guide is written for (`ai` | `human` |
+ * `both`; `ai` first = the default, since guides lean AI).
  *
  * This module is the single source of truth for pack content across BOTH
  * runtimes: the bun vault (`src/onboarding-seed.ts` default seed + the
@@ -26,23 +32,37 @@
  * Getting Started / Surface Starter path + content constants.
  */
 
-import type { Store } from "./types.ts";
+import type { Store, TagFieldSchema } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Pack shape
 // ---------------------------------------------------------------------------
 
-/** A tag declaration a pack upserts (identity row, not a schema migration). */
+/**
+ * A tag declaration a pack upserts (identity row, not a schema migration).
+ *
+ * `fields` carries an optional typed-metadata schema — the same
+ * `Record<field, { type, enum?, indexed? }>` shape `update-tag` accepts — so a
+ * pack can declare a schema-carrying tag (e.g. GUIDE_TAG's `written_for`
+ * enum). The applier passes it straight through to `upsertTagRecord`.
+ */
 export interface SeedPackTag {
   name: string;
   description: string;
   parent_names?: string[];
+  fields?: Record<string, TagFieldSchema>;
 }
 
-/** A note a pack seeds — created only when no note exists at `path`. */
+/**
+ * A note a pack seeds — created only when no note exists at `path`. `tags` +
+ * `metadata` are applied at create time (both runtimes' `createNote` accepts
+ * them); a guide note carries `tags: ["guide"]` + `metadata: { written_for }`.
+ */
 export interface SeedPackNote {
   path: string;
   content: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 /** A named bundle of starter tags + notes. */
@@ -83,58 +103,188 @@ export const NOTES_REQUIRED_TAGS: ReadonlyArray<SeedPackTag> = [
   },
 ];
 
+/**
+ * The `guide` tag — the vault's skill-file tag. Guides are the Parachute
+ * equivalent of a `SKILL.md`: notes that teach a connected AI (and the human)
+ * how this vault works and how to work it. The `written_for` schema field says
+ * who a guide is written for; `ai` is the enum's FIRST value, so it's the
+ * schema default — guides lean AI.
+ *
+ * Declared by every pack that ships guide notes (welcome / getting-started /
+ * surface-starter). The upserts converge on one row, so each pack stays
+ * self-sufficient — applying any one of them alone still lands the tag.
+ */
+export const GUIDE_TAG: SeedPackTag = {
+  name: "guide",
+  description:
+    "Guides — the vault's skill files. Notes that teach a connected AI (and the human) how this vault works and how to work it. `written_for` says who a guide is written for.",
+  fields: {
+    // First enum value is the schema default — guides lean AI.
+    written_for: { type: "string", enum: ["ai", "human", "both"] },
+  },
+};
+
+/** The `pinned` tag — notes pinned to the top of the Notes app. No schema. */
+export const PINNED_TAG: SeedPackTag = {
+  name: "pinned",
+  description: "Notes pinned to the top of the Notes app.",
+};
+
 export const WELCOME_PATH = "Welcome to your vault 🪂";
-export const TRY_LINKING_PATH = "Try linking notes";
+export const CAPTURE_ANYTHING_PATH = "Capture anything";
+export const TAGS_GRAPH_PATH = "Tags and the graph";
 export const CONNECT_AI_PATH = "Connect your AI";
+export const YOURS_TO_KEEP_PATH = "Yours to keep";
 
 /**
- * Build the `welcome` pack: a three-note welcome web (welcome → try-linking →
- * back, connect-AI → welcome) so the graph view shows a connected structure
- * from minute one, plus the `capture` tag above. The notes are ordinary
- * notes — no special flags, deletable like anything else.
+ * Build the `welcome` pack: the five-guide welcome ring — Welcome, Capture
+ * anything, Tags and the graph, Connect your AI, Yours to keep — plus the
+ * `capture` / `guide` / `pinned` tags. The guides are ordinary notes tagged
+ * `#guide` (the vault's skill-file tag), each `metadata.written_for: "human"`;
+ * Welcome is `#pinned` so it sits at the top of the Notes app. They form a
+ * small linked web (Welcome → all four; the rest chain 2→3→4→5→1; Connect
+ * your AI also links the AI-facing [[Getting Started]]) so the graph view
+ * shows a connected structure from minute one. Deletable like anything else.
  *
- * Content is ported EXACTLY from parachute-cloud workers/vault/src/welcome.ts
- * (person-voiced, addressed to the everyday user). `consoleOrigin` is the
- * origin of the operator's console (the cloud console, or a hub portal) —
- * when known, the Connect-your-AI note names it; when omitted (the bun vault
- * seeds at create time, often pre-expose, and must never bake in a loopback
- * origin) the line stays generic.
+ * These five bodies are the ratified guides (already live at
+ * parachute.computer/guides). `consoleOrigin` is the origin of the operator's
+ * console (the cloud console, or a hub portal) — when known, the Connect-your-AI
+ * note names it; when omitted (the bun vault seeds at create time, often
+ * pre-expose, and must never bake in a loopback origin) the line stays generic.
  */
 export function welcomePack(opts: { consoleOrigin?: string } = {}): SeedPack {
   const consoleLine = opts.consoleOrigin
     ? `Grab the connection URL from your console at ${opts.consoleOrigin}.`
     : `Grab the connection URL from your console.`;
+  const guideHuman = { tags: ["guide"], metadata: { written_for: "human" } };
   return {
     name: "welcome",
     description:
-      "A small linked welcome web (three notes) + the capture tag the Notes surface uses. Seeded by default on new vaults.",
-    tags: NOTES_REQUIRED_TAGS,
+      "The five-guide welcome ring (Welcome, Capture anything, Tags and the graph, Connect your AI, Yours to keep) — the vault's #guide skill files — plus the capture/guide/pinned tags. Seeded by default on new vaults.",
+    // capture (Notes surface) + guide (the skill-file tag, carries the
+    // written_for schema) + pinned (top-of-app). Upserts are idempotent.
+    tags: [...NOTES_REQUIRED_TAGS, GUIDE_TAG, PINNED_TAG],
     // `[[wikilinks]]` resolve by note path — pending links auto-resolve when
     // the target is created, so order only affects how briefly a link sits
-    // unresolved during the seed.
+    // unresolved during the seed. Every [[target]] here resolves to a note the
+    // default seed writes (the four siblings + [[Getting Started]] from the
+    // getting-started pack) — no dangling links on a fresh vault.
     notes: [
       {
         path: WELCOME_PATH,
+        tags: ["guide", "pinned"],
+        metadata: { written_for: "human" },
         content: `# ${WELCOME_PATH}
 
 This vault is yours.
-Write anything.
-Notes can link to each other, like this: [[${TRY_LINKING_PATH}]].
+
+Write anything — ideas, people, plans, wifi passwords. Notes can link to each
+other, like this: [[${CAPTURE_ANYTHING_PATH}]]. Follow that link and keep going — these
+guides form a small web you can wander:
+
+- [[${CAPTURE_ANYTHING_PATH}]] — get thoughts in and link them together
+- [[${TAGS_GRAPH_PATH}]] — structure that grows out of what you write
+- [[${CONNECT_AI_PATH}]] — any AI can read and write your vault
+- [[${YOURS_TO_KEEP_PATH}]] — export everything, anytime
+
+They're ordinary notes, tagged #guide. Edit them, add to them, or delete the
+lot — the vault is yours, remember.
 `,
       },
       {
-        path: TRY_LINKING_PATH,
-        content: `# ${TRY_LINKING_PATH}
+        path: CAPTURE_ANYTHING_PATH,
+        ...guideHuman,
+        content: `# ${CAPTURE_ANYTHING_PATH}
 
-Wrap a note's name in double square brackets to make a wikilink, like this one back to [[${WELCOME_PATH}]].
+The one habit that makes a vault work: when a thought strikes, write it down.
+Don't sort it. Don't file it. Let it land.
+
+A note can be two words or two pages. The blog idea on a trail, the follow-up
+from a meeting, the dream at 2am — capture first. Organizing can happen later,
+or never; that's what tags and your AI are for.
+
+To connect two notes, wrap a note's name in double square brackets:
+[[${WELCOME_PATH}]] is a link back to where you started. If the note
+doesn't exist yet, the link waits patiently and connects the moment it does.
+
+That's the whole trick. Storage is easy — connection is everything. A linked
+note is a thought your future self, and your AI, can find again.
+
+Next: [[${TAGS_GRAPH_PATH}]].
+`,
+      },
+      {
+        path: TAGS_GRAPH_PATH,
+        ...guideHuman,
+        content: `# ${TAGS_GRAPH_PATH}
+
+Notes and links come first. Tags come later, when you notice a pattern.
+
+A tag answers "what kind of thing is this?" — #person, #recipe, #idea. Tag a
+few notes the same way and a view lights up: all your people, all your recipes,
+everything half-finished. Your vault starts with just two:
+
+- #capture — the Notes app puts it on whatever you write or speak in directly,
+  marking your own raw words.
+- #guide — these notes.
+
+Underneath, everything is one graph: every note a node, every link an edge.
+Open the graph view and watch it grow; ask a connected AI "what's near this
+note?" and it walks the edges for you.
+
+The structure isn't a filing system you design on day one. It grows out of what
+you actually write — so don't over-organize an empty vault. Write, link, and
+let the shape appear.
+
+Next: [[${CONNECT_AI_PATH}]].
 `,
       },
       {
         path: CONNECT_AI_PATH,
+        ...guideHuman,
         content: `# ${CONNECT_AI_PATH}
 
-Your vault speaks MCP. ${consoleLine}
-Start from [[${WELCOME_PATH}]].
+Your vault speaks MCP — an open standard — so any AI can read and write it:
+Claude, ChatGPT, Claude Code, Cursor, or an agent you build. ${consoleLine}
+
+Once you're connected, try:
+
+- "Read the Getting Started note and help me set this vault up."
+- "What did I want to write about?"
+- "Tag my untagged notes."
+
+Your AI sees what you see — the same notes, links, and tags — and what it
+writes lands here, as notes you can read, edit, or delete. There's even a note
+in this vault written for it: [[${GETTING_STARTED_PATH}]], the vault-design brief your
+AI reads so you don't have to.
+
+One memory, shared with every AI you choose to connect. That's the point.
+
+Next: [[${YOURS_TO_KEEP_PATH}]].
+`,
+      },
+      {
+        path: YOURS_TO_KEEP_PATH,
+        ...guideHuman,
+        content: `# ${YOURS_TO_KEEP_PATH}
+
+Everything here — every note, tag, and link — exports as plain markdown files
+with the structure intact. On Parachute Cloud, it's the Export button in your
+console. Self-hosting, it's one command: \`parachute-vault export <dir>\`.
+
+What you get is a folder any app can open, and another Parachute can import
+losslessly. Move from our cloud to your own machine, or the other way — same
+software, same format, nothing held hostage between the doors.
+
+We build it this way on purpose. A connection you can't leave isn't a
+relationship. You can always leave — which is exactly why you can trust
+staying.
+
+Export isn't a feature we grudgingly support; it's the moral center of the
+design. We test it constantly, because a promise you don't test is just a
+hope.
+
+Back to [[${WELCOME_PATH}]].
 `,
       },
     ],
@@ -313,8 +463,17 @@ export const GETTING_STARTED_PACK: SeedPack = {
   name: "getting-started",
   description:
     "The AI-facing start-here guide: vault design vocabulary (tags/paths/schemas), imports, write gotchas. Seeded by default on new vaults.",
-  tags: [],
-  notes: [{ path: GETTING_STARTED_PATH, content: GETTING_STARTED_CONTENT }],
+  // Declares GUIDE_TAG too — each pack is self-sufficient; the upsert converges
+  // with the welcome pack's. This guide is written FOR the AI.
+  tags: [GUIDE_TAG],
+  notes: [
+    {
+      path: GETTING_STARTED_PATH,
+      tags: ["guide"],
+      metadata: { written_for: "ai" },
+      content: GETTING_STARTED_CONTENT,
+    },
+  ],
 };
 
 // ---------------------------------------------------------------------------
@@ -450,8 +609,17 @@ export const SURFACE_STARTER_PACK: SeedPack = {
   name: "surface-starter",
   description:
     "A living starter guide for building a custom surface (UI) over this vault with the published surface packages. Opt-in — not seeded by default.",
-  tags: [],
-  notes: [{ path: SURFACE_STARTER_PATH, content: SURFACE_STARTER_CONTENT }],
+  // A guide too (written for the AI) — declares GUIDE_TAG so the opt-in
+  // add-pack path lands the tag even if this pack is applied on its own.
+  tags: [GUIDE_TAG],
+  notes: [
+    {
+      path: SURFACE_STARTER_PATH,
+      tags: ["guide"],
+      metadata: { written_for: "ai" },
+      content: SURFACE_STARTER_CONTENT,
+    },
+  ],
 };
 
 // ---------------------------------------------------------------------------
@@ -541,18 +709,23 @@ export async function applySeedPack(
     await store.upsertTagRecord(decl.name, {
       description: decl.description,
       ...(decl.parent_names ? { parent_names: decl.parent_names } : {}),
+      ...(decl.fields ? { fields: decl.fields } : {}),
     });
     result.tags.push(decl.name);
   }
 
-  for (const { path, content } of pack.notes) {
-    const existing = await store.getNoteByPath(path);
+  for (const note of pack.notes) {
+    const existing = await store.getNoteByPath(note.path);
     if (existing) {
-      result.skippedNotes.push(path);
+      result.skippedNotes.push(note.path);
       continue;
     }
-    await store.createNote(content, { path });
-    result.seededNotes.push(path);
+    await store.createNote(note.content, {
+      path: note.path,
+      tags: note.tags,
+      metadata: note.metadata,
+    });
+    result.seededNotes.push(note.path);
   }
 
   return result;

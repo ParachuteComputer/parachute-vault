@@ -358,11 +358,11 @@ describe("vault create — services.json registration (#208)", () => {
  * Default-pack seeding on create (originally demo-prep Workstream A — A1/A3;
  * reshaped for named seed packs).
  *
- * A freshly-created vault must contain the `welcome` pack (three-note welcome
- * web + the one capture tag Notes requires) and the `getting-started` guide — and
- * NOT the `surface-starter` pack, which is opt-in via `add-pack` (ratified
- * 2026-07-02). Idempotent + best-effort: the seed never fails a create and
- * never clobbers an edited note.
+ * A freshly-created vault must contain the `welcome` pack (the five-guide
+ * welcome ring + the capture/guide/pinned tags) and the `getting-started`
+ * guide — and NOT the `surface-starter` pack, which is opt-in via `add-pack`
+ * (ratified 2026-07-02). Idempotent + best-effort: the seed never fails a
+ * create and never clobbers an edited note.
  */
 describe("vault create — default pack seeding (welcome + getting-started)", () => {
   /** Read all (path, content) rows from a created vault's SQLite DB. */
@@ -400,23 +400,28 @@ describe("vault create — default pack seeding (welcome + getting-started)", ()
     const notes = readNotes("guided");
     const gs = notes.find((n) => n.path === "Getting Started");
     const welcome = notes.find((n) => n.path === "Welcome to your vault 🪂");
-    const tryLinking = notes.find((n) => n.path === "Try linking notes");
+    const captureAnything = notes.find((n) => n.path === "Capture anything");
+    const tagsGraph = notes.find((n) => n.path === "Tags and the graph");
     const connectAi = notes.find((n) => n.path === "Connect your AI");
+    const yoursToKeep = notes.find((n) => n.path === "Yours to keep");
     expect(gs).toBeDefined();
     expect(welcome).toBeDefined();
-    expect(tryLinking).toBeDefined();
+    expect(captureAnything).toBeDefined();
+    expect(tagsGraph).toBeDefined();
     expect(connectAi).toBeDefined();
+    expect(yoursToKeep).toBeDefined();
     expect(gs!.content).toContain("# Getting Started");
     // Surface Starter is out of the default seed — no note, no dangling link.
     expect(notes.find((n) => n.path === "Surface Starter")).toBeUndefined();
     expect(gs!.content).not.toContain("[[Surface Starter]]");
     expect(gs!.content).toContain("add-pack surface-starter");
 
-    // The ONE capture tag Notes requires arrives with the welcome pack —
-    // and nothing else (fresh-vault seed = 4 notes + 1 tag; the retired
+    // The capture tag Notes requires arrives with the welcome pack, alongside
+    // the guide (skill-file) + pinned tags — and nothing else (fresh-vault
+    // seed = 6 notes: the 5-guide ring + Getting Started. The retired
     // capture/text + capture/voice subtypes are no longer seeded).
-    expect(readTagNames("guided")).toEqual(["capture"]);
-    expect(notes).toHaveLength(4);
+    expect(readTagNames("guided").sort()).toEqual(["capture", "guide", "pinned"]);
+    expect(notes).toHaveLength(6);
   });
 
   test("seeding doesn't break --json stdout (notes seeded silently)", () => {
