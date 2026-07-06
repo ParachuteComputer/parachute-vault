@@ -23,24 +23,29 @@ import { BunStore } from "./vault-store.ts";
 import { seedOnboardingNotes } from "./onboarding-seed.ts";
 import {
   applySeedPack,
+  CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   GETTING_STARTED_PATH,
   NOTES_REQUIRED_TAGS,
   SURFACE_STARTER_PACK,
   SURFACE_STARTER_PATH,
-  TRY_LINKING_PATH,
+  TAGS_GRAPH_PATH,
   WELCOME_PATH,
+  YOURS_TO_KEEP_PATH,
 } from "../core/src/seed-packs.ts";
 import {
   buildVaultProjection,
   projectionToMarkdown,
 } from "../core/src/vault-projection.ts";
 
-/** Every note path the default seed writes on a blank vault. */
+/** Every note path the default seed writes on a blank vault (the five-guide
+ *  welcome ring + the AI-facing Getting Started). */
 const DEFAULT_SEED_PATHS = [
   WELCOME_PATH,
-  TRY_LINKING_PATH,
+  CAPTURE_ANYTHING_PATH,
+  TAGS_GRAPH_PATH,
   CONNECT_AI_PATH,
+  YOURS_TO_KEEP_PATH,
   GETTING_STARTED_PATH,
 ];
 
@@ -80,15 +85,24 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(gs!.content).toContain("parachute-vault import");
     expect(gs!.content).toContain("Adapt this note");
 
-    // The welcome web: three person-voiced notes.
-    for (const path of [WELCOME_PATH, TRY_LINKING_PATH, CONNECT_AI_PATH]) {
+    // The welcome ring: five person-voiced guide notes.
+    for (const path of [
+      WELCOME_PATH,
+      CAPTURE_ANYTHING_PATH,
+      TAGS_GRAPH_PATH,
+      CONNECT_AI_PATH,
+      YOURS_TO_KEEP_PATH,
+    ]) {
       expect(await store.getNoteByPath(path)).not.toBeNull();
     }
   });
 
-  test("seeds the ONE capture tag Notes requires (byte-equal semantics)", async () => {
+  test("seeds the capture tag Notes requires (byte-equal semantics) + the guide/pinned tags", async () => {
     const result = await seedOnboardingNotes(store);
-    expect(result.tags).toEqual(["capture"]);
+    // welcome upserts [capture, guide, pinned]; getting-started re-upserts
+    // [guide] (converges). applySeedPack reports every declared tag per pack,
+    // so the concatenation carries guide twice — deterministic.
+    expect(result.tags).toEqual(["capture", "guide", "pinned", "guide"]);
 
     for (const decl of NOTES_REQUIRED_TAGS) {
       const record = await store.getTagRecord(decl.name);
@@ -97,11 +111,45 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
       expect(record!.parent_names ?? []).toEqual(decl.parent_names ?? []);
     }
 
+    // The guide tag lands with its written_for enum schema (applier passes
+    // `fields` through to upsertTagRecord). "ai" is the default (first value).
+    const guide = await store.getTagRecord("guide");
+    expect(guide).not.toBeNull();
+    expect(guide!.fields?.written_for?.enum).toEqual(["ai", "human", "both"]);
+    const pinned = await store.getTagRecord("pinned");
+    expect(pinned).not.toBeNull();
+
     // The retired subtype tags are NOT seeded — entry method is note
     // metadata.source (text|voice), not taxonomy (2026-07-03). Existing
     // vaults carrying these tags stay valid; new vaults don't get them.
     expect(await store.getTagRecord("capture/text")).toBeNull();
     expect(await store.getTagRecord("capture/voice")).toBeNull();
+  });
+
+  test("seeded guides carry #guide + metadata.written_for (create-time tag/metadata write-through)", async () => {
+    await seedOnboardingNotes(store);
+
+    // Human-facing welcome guide: tagged guide + pinned, written_for human.
+    const welcome = await store.getNoteByPath(WELCOME_PATH);
+    expect([...(welcome!.tags ?? [])].sort()).toEqual(["guide", "pinned"]);
+    expect(welcome!.metadata?.written_for).toBe("human");
+
+    // The four sibling guides: guide only, written_for human.
+    for (const path of [
+      CAPTURE_ANYTHING_PATH,
+      TAGS_GRAPH_PATH,
+      CONNECT_AI_PATH,
+      YOURS_TO_KEEP_PATH,
+    ]) {
+      const note = await store.getNoteByPath(path);
+      expect(note!.tags).toEqual(["guide"]);
+      expect(note!.metadata?.written_for).toBe("human");
+    }
+
+    // The AI-facing Getting Started guide: guide, written_for ai.
+    const gs = await store.getNoteByPath(GETTING_STARTED_PATH);
+    expect(gs!.tags).toEqual(["guide"]);
+    expect(gs!.metadata?.written_for).toBe("ai");
   });
 
   test("GAP 4: Getting Started shows a concrete update-tag fields example + write gotchas", async () => {
@@ -121,24 +169,36 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(gs!.content).toContain("first listed value");
   });
 
-  test("A3 (reshaped): the welcome web's wikilinks resolve; Getting Started has no dangling Surface Starter link", async () => {
+  test("A3 (reshaped): the welcome ring resolves to real link edges; Getting Started has no dangling Surface Starter link", async () => {
     await seedOnboardingNotes(store);
 
-    // welcome → try-linking, try-linking → welcome, connect-AI → welcome.
     const welcome = await store.getNoteByPath(WELCOME_PATH);
-    const tryLinking = await store.getNoteByPath(TRY_LINKING_PATH);
+    const capture = await store.getNoteByPath(CAPTURE_ANYTHING_PATH);
+    const tags = await store.getNoteByPath(TAGS_GRAPH_PATH);
     const connectAi = await store.getNoteByPath(CONNECT_AI_PATH);
+    const yours = await store.getNoteByPath(YOURS_TO_KEEP_PATH);
+    const gs = await store.getNoteByPath(GETTING_STARTED_PATH);
 
-    const welcomeOut = await store.getLinks(welcome!.id, { direction: "outbound" });
-    expect(welcomeOut.some((l) => l.targetId === tryLinking!.id)).toBe(true);
-    const tryOut = await store.getLinks(tryLinking!.id, { direction: "outbound" });
-    expect(tryOut.some((l) => l.targetId === welcome!.id)).toBe(true);
-    const connectOut = await store.getLinks(connectAi!.id, { direction: "outbound" });
-    expect(connectOut.some((l) => l.targetId === welcome!.id)).toBe(true);
+    const outbound = async (id: string) =>
+      (await store.getLinks(id, { direction: "outbound" })).map((l) => l.targetId);
+
+    // Welcome → all four siblings.
+    const welcomeOut = await outbound(welcome!.id);
+    for (const t of [capture!.id, tags!.id, connectAi!.id, yours!.id]) {
+      expect(welcomeOut).toContain(t);
+    }
+    // The chain forward: capture → tags → connect → yours → welcome.
+    expect(await outbound(capture!.id)).toContain(tags!.id);
+    expect(await outbound(tags!.id)).toContain(connectAi!.id);
+    const connectOut = await outbound(connectAi!.id);
+    expect(connectOut).toContain(yours!.id);
+    // Connect your AI also links the AI-facing Getting Started note (seeded by
+    // the getting-started pack) — the ring's cross-link resolves, no dangle.
+    expect(connectOut).toContain(gs!.id);
+    expect(await outbound(yours!.id)).toContain(welcome!.id);
 
     // Getting Started mentions the surface-starter PACK — not a wikilink to a
     // note that the default seed no longer creates.
-    const gs = await store.getNoteByPath(GETTING_STARTED_PATH);
     expect(gs!.content).not.toContain("[[Surface Starter]]");
     expect(gs!.content).toContain("add-pack surface-starter");
   });
@@ -179,7 +239,8 @@ describe("applySeedPack — surface-starter via add-pack", () => {
     expect(result.pack).toBe("surface-starter");
     expect(result.seededNotes).toEqual([SURFACE_STARTER_PATH]);
     expect(result.skippedNotes).toEqual([]);
-    expect(result.tags).toEqual([]);
+    // surface-starter now declares GUIDE_TAG (it's a guide, written_for ai).
+    expect(result.tags).toEqual(["guide"]);
 
     const ss = await store.getNoteByPath(SURFACE_STARTER_PATH);
     expect(ss).not.toBeNull();

@@ -1,35 +1,46 @@
 /**
  * Content + registry pins for the named seed packs (core/src/seed-packs.ts).
  *
- * Pure content tests — no DB. The applier's behavior (idempotence, seeding)
- * is exercised store-level in src/onboarding-seed.test.ts and CLI-level in
- * src/add-pack.test.ts.
+ * Pure content tests — no DB. The applier's behavior (idempotence, seeding,
+ * tag/metadata write-through) is exercised store-level in
+ * src/onboarding-seed.test.ts and CLI-level in src/add-pack.test.ts.
  *
- * The load-bearing pin: the `welcome` pack's tags must stay byte-equal to
- * notes-ui's NOTES_REQUIRED_SCHEMA — the Notes PWA's connect-time audit
- * compares `description` verbatim, and its schema banner only clears when the
- * tags genuinely carry the semantics Notes declares. ONE tag since 2026-07-03:
- * `#capture` only — entry method (text|voice) is note `metadata.source`
- * provenance, not taxonomy (sibling notes-ui PR carries the client side).
+ * The load-bearing pins:
+ *   - the `welcome` pack's tags must CONTAIN notes-ui's NOTES_REQUIRED_SCHEMA
+ *     byte-for-byte — the Notes PWA's connect-time audit compares `description`
+ *     verbatim, and its schema banner only clears when the capture tag genuinely
+ *     carries the semantics Notes declares. (Containment, not equality: the
+ *     welcome pack now also ships the #guide + #pinned tags.)
+ *   - `#guide` is the vault's skill-file tag, carrying a `written_for` enum
+ *     schema (`ai` | `human` | `both`, `ai` first = default). Every seeded guide
+ *     note is tagged `#guide` + `metadata.written_for`.
+ *   - the five-guide welcome ring links into a connected web with no dangling
+ *     wikilinks across the default seed.
  */
 
 import { describe, test, expect } from "bun:test";
 import {
   applySeedPack,
+  CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   GETTING_STARTED_CONTENT,
   GETTING_STARTED_PACK,
   GETTING_STARTED_PATH,
   getSeedPack,
+  GUIDE_TAG,
   listSeedPacks,
   NOTES_REQUIRED_TAGS,
+  PINNED_TAG,
   SEED_PACK_NAMES,
   SURFACE_STARTER_CONTENT,
   SURFACE_STARTER_PACK,
   SURFACE_STARTER_PATH,
-  TRY_LINKING_PATH,
+  TAGS_GRAPH_PATH,
   WELCOME_PATH,
   welcomePack,
+  YOURS_TO_KEEP_PATH,
+  type SeedPack,
+  type SeedPackNote,
 } from "./seed-packs.ts";
 import * as onboardingShim from "./onboarding.ts";
 
@@ -47,15 +58,72 @@ const NOTES_UI_REQUIRED_SCHEMA_TAGS = [
   },
 ];
 
-describe("welcome pack — notes-ui schema parity", () => {
-  test("welcome tags are byte-equal to notes-ui's NOTES_REQUIRED_SCHEMA", () => {
+/**
+ * Extract every REAL `[[wikilink]]` target from note content — mirroring the
+ * store's parser (core/src/wikilinks.ts), which ignores wikilinks inside
+ * fenced/inline code. So an illustrative `[[wikilinks]]` in a code span (as in
+ * the Getting Started guide) is not counted — it never becomes a link.
+ */
+function wikilinkTargets(content: string): string[] {
+  const stripped = content
+    .replace(/```[\s\S]*?```/g, (m) => " ".repeat(m.length)) // fenced code
+    .replace(/`[^`]*`/g, (m) => " ".repeat(m.length)); // inline code
+  return [...stripped.matchAll(/\[\[([^\]]+)\]\]/g)].map((m) => m[1]!);
+}
+
+/** A note in a pack, by path (fails loudly if absent). */
+function noteAt(pack: SeedPack, path: string): SeedPackNote {
+  const note = pack.notes.find((n) => n.path === path);
+  if (!note) throw new Error(`no note at path ${path}`);
+  return note;
+}
+
+describe("guide tag — the vault's skill-file tag", () => {
+  test("GUIDE_TAG carries the written_for enum, ai first (= default)", () => {
+    expect(GUIDE_TAG.name).toBe("guide");
+    // The description's last sentence names the schema field.
+    expect(GUIDE_TAG.description).toContain(
+      "`written_for` says who a guide is written for.",
+    );
+    const wf = GUIDE_TAG.fields?.written_for;
+    expect(wf).toBeDefined();
+    expect(wf!.type).toBe("string");
+    expect(wf!.enum).toEqual(["ai", "human", "both"]);
+    // First enum value is the schema default — guides lean AI.
+    expect(wf!.enum![0]).toBe("ai");
+  });
+
+  test("PINNED_TAG is a plain identity tag (no schema)", () => {
+    expect(PINNED_TAG.name).toBe("pinned");
+    expect(PINNED_TAG.description).toBe(
+      "Notes pinned to the top of the Notes app.",
+    );
+    expect(PINNED_TAG.fields).toBeUndefined();
+  });
+});
+
+describe("welcome pack — notes-ui schema parity (containment)", () => {
+  test("welcome tags CONTAIN notes-ui's NOTES_REQUIRED_SCHEMA byte-for-byte", () => {
+    // The independent copy still matches, and the welcome pack still ships it.
     expect(NOTES_REQUIRED_TAGS).toEqual(NOTES_UI_REQUIRED_SCHEMA_TAGS);
-    expect(welcomePack().tags).toEqual(NOTES_UI_REQUIRED_SCHEMA_TAGS);
-    // Field-level byte pins (toEqual ignores key order; these don't).
-    for (const [i, expected] of NOTES_UI_REQUIRED_SCHEMA_TAGS.entries()) {
-      expect(NOTES_REQUIRED_TAGS[i]!.name).toBe(expected.name);
-      expect(NOTES_REQUIRED_TAGS[i]!.description).toBe(expected.description);
+    for (const req of NOTES_UI_REQUIRED_SCHEMA_TAGS) {
+      const found = welcomePack().tags.find((t) => t.name === req.name);
+      expect(found).toBeDefined();
+      // Field-level byte pins (toEqual ignores key order; these don't).
+      expect(found!.name).toBe(req.name);
+      expect(found!.description).toBe(req.description);
+      expect(found!.parent_names).toBeUndefined();
     }
+  });
+
+  test("welcome tags = capture + guide + pinned (the guide/pinned tags ride along)", () => {
+    expect(welcomePack().tags.map((t) => t.name)).toEqual([
+      "capture",
+      "guide",
+      "pinned",
+    ]);
+    expect(welcomePack().tags).toContain(GUIDE_TAG);
+    expect(welcomePack().tags).toContain(PINNED_TAG);
   });
 
   test("exactly ONE capture tag — no subtype tags, no parent_names (2026-07-03)", () => {
@@ -68,63 +136,144 @@ describe("welcome pack — notes-ui schema parity", () => {
   });
 });
 
-describe("welcome pack — person-voiced welcome web", () => {
-  test("three notes forming a linked web (welcome ⇄ try-linking, connect-AI → welcome)", () => {
+describe("welcome pack — the five-guide ring", () => {
+  test("five guides at the ratified paths, in order", () => {
     const pack = welcomePack();
     expect(pack.name).toBe("welcome");
     expect(pack.notes.map((n) => n.path)).toEqual([
       WELCOME_PATH,
-      TRY_LINKING_PATH,
+      CAPTURE_ANYTHING_PATH,
+      TAGS_GRAPH_PATH,
       CONNECT_AI_PATH,
+      YOURS_TO_KEEP_PATH,
     ]);
-
-    const [welcome, tryLinking, connectAi] = pack.notes;
-    expect(welcome!.content).toContain(`[[${TRY_LINKING_PATH}]]`);
-    expect(tryLinking!.content).toContain(`[[${WELCOME_PATH}]]`);
-    expect(connectAi!.content).toContain(`[[${WELCOME_PATH}]]`);
   });
 
-  test("content with consoleOrigin is byte-equal to the cloud's welcome copy", () => {
-    // Pinned against parachute-cloud workers/vault/src/welcome.ts
-    // `welcomeNotes(consoleOrigin)` — the sibling cloud PR swaps that module
-    // for this pack, so the ported content must not drift.
-    const origin = "https://cloud.parachute.computer";
-    const pack = welcomePack({ consoleOrigin: origin });
+  test("the link web: welcome → all four; 2→3→4→5→1; connect → Getting Started", () => {
+    const pack = welcomePack();
 
-    expect(pack.notes[0]!.content).toBe(`# ${WELCOME_PATH}
+    // Welcome wikilinks to all four siblings.
+    const welcomeLinks = wikilinkTargets(noteAt(pack, WELCOME_PATH).content);
+    for (const target of [
+      CAPTURE_ANYTHING_PATH,
+      TAGS_GRAPH_PATH,
+      CONNECT_AI_PATH,
+      YOURS_TO_KEEP_PATH,
+    ]) {
+      expect(welcomeLinks).toContain(target);
+    }
 
-This vault is yours.
-Write anything.
-Notes can link to each other, like this: [[${TRY_LINKING_PATH}]].
-`);
-    expect(pack.notes[1]!.content).toBe(`# ${TRY_LINKING_PATH}
-
-Wrap a note's name in double square brackets to make a wikilink, like this one back to [[${WELCOME_PATH}]].
-`);
-    expect(pack.notes[2]!.content).toBe(`# ${CONNECT_AI_PATH}
-
-Your vault speaks MCP. Grab the connection URL from your console at ${origin}.
-Start from [[${WELCOME_PATH}]].
-`);
-  });
-
-  test("without consoleOrigin the Connect-AI line stays generic (no baked origin)", () => {
-    const connectAi = welcomePack().notes[2]!;
-    expect(connectAi.content).toContain(
-      "Your vault speaks MCP. Grab the connection URL from your console.",
+    // The chain forward: 2→3, 3→4, 4→5, 5→1.
+    expect(wikilinkTargets(noteAt(pack, CAPTURE_ANYTHING_PATH).content)).toContain(
+      TAGS_GRAPH_PATH,
     );
-    expect(connectAi.content).not.toContain("undefined");
-    expect(connectAi.content).not.toContain("at .");
+    expect(wikilinkTargets(noteAt(pack, TAGS_GRAPH_PATH).content)).toContain(
+      CONNECT_AI_PATH,
+    );
+    expect(wikilinkTargets(noteAt(pack, CONNECT_AI_PATH).content)).toContain(
+      YOURS_TO_KEEP_PATH,
+    );
+    expect(wikilinkTargets(noteAt(pack, YOURS_TO_KEEP_PATH).content)).toContain(
+      WELCOME_PATH,
+    );
+
+    // Connect your AI points the human at the AI-facing Getting Started note.
+    expect(wikilinkTargets(noteAt(pack, CONNECT_AI_PATH).content)).toContain(
+      GETTING_STARTED_PATH,
+    );
+  });
+
+  test("NO dangling wikilinks across the default seed (welcome + getting-started)", () => {
+    // Both packs auto-seed on create, so every [[target]] across their notes
+    // must resolve to a note one of them writes — including [[Getting Started]].
+    const seededPaths = new Set<string>([
+      ...welcomePack().notes.map((n) => n.path),
+      ...GETTING_STARTED_PACK.notes.map((n) => n.path),
+    ]);
+    for (const pack of [welcomePack(), GETTING_STARTED_PACK]) {
+      for (const note of pack.notes) {
+        for (const target of wikilinkTargets(note.content)) {
+          expect(seededPaths.has(target)).toBe(true);
+        }
+      }
+    }
+  });
+
+  test("every guide is tagged #guide with metadata.written_for = human", () => {
+    for (const note of welcomePack().notes) {
+      expect(note.tags).toContain("guide");
+      expect(note.metadata).toEqual({ written_for: "human" });
+    }
+  });
+
+  test("Welcome is the ONLY pinned note", () => {
+    const pinned = welcomePack().notes.filter((n) => n.tags?.includes("pinned"));
+    expect(pinned.map((n) => n.path)).toEqual([WELCOME_PATH]);
+    // Welcome carries both guide + pinned.
+    expect(noteAt(welcomePack(), WELCOME_PATH).tags).toEqual(["guide", "pinned"]);
+  });
+
+  test("content anchors: the ratified copy is present (guards body drift)", () => {
+    const pack = welcomePack();
+    expect(noteAt(pack, WELCOME_PATH).content).toContain("This vault is yours.");
+    expect(noteAt(pack, WELCOME_PATH).content).toContain("tagged #guide");
+    expect(noteAt(pack, CAPTURE_ANYTHING_PATH).content).toContain(
+      "The one habit that makes a vault work",
+    );
+    expect(noteAt(pack, TAGS_GRAPH_PATH).content).toContain(
+      "Notes and links come first. Tags come later",
+    );
+    expect(noteAt(pack, YOURS_TO_KEEP_PATH).content).toContain(
+      "the moral center of the",
+    );
+    // Yours to keep carries the self-host export command (backtick-wrapped).
+    expect(noteAt(pack, YOURS_TO_KEEP_PATH).content).toContain(
+      "`parachute-vault export <dir>`",
+    );
+  });
+
+  test("consoleOrigin renders both modes on the Connect-your-AI note", () => {
+    const origin = "https://cloud.parachute.computer";
+
+    // With origin: the console sentence names it, no `undefined`, no `at .`.
+    const withOrigin = noteAt(welcomePack({ consoleOrigin: origin }), CONNECT_AI_PATH);
+    expect(withOrigin.content).toContain(
+      `Grab the connection URL from your console at ${origin}.`,
+    );
+    expect(withOrigin.content).not.toContain("undefined");
+
+    // Without origin: the line stays generic — no baked loopback, no `at .`.
+    const generic = noteAt(welcomePack(), CONNECT_AI_PATH);
+    expect(generic.content).toContain(
+      "Grab the connection URL from your console.",
+    );
+    expect(generic.content).not.toContain("undefined");
+    expect(generic.content).not.toContain("at .");
+    expect(generic.content).not.toContain(origin);
   });
 });
 
 describe("getting-started pack", () => {
-  test("carries the doctrine note at the canonical path", () => {
+  test("carries the AI-facing guide note, tagged #guide / written_for ai", () => {
     expect(GETTING_STARTED_PACK.name).toBe("getting-started");
-    expect(GETTING_STARTED_PACK.tags).toEqual([]);
+    // Declares the guide tag (self-sufficient — converges with the welcome pack).
+    expect(GETTING_STARTED_PACK.tags).toEqual([GUIDE_TAG]);
     expect(GETTING_STARTED_PACK.notes).toEqual([
-      { path: GETTING_STARTED_PATH, content: GETTING_STARTED_CONTENT },
+      {
+        path: GETTING_STARTED_PATH,
+        tags: ["guide"],
+        metadata: { written_for: "ai" },
+        content: GETTING_STARTED_CONTENT,
+      },
     ]);
+  });
+
+  test("the Getting Started body is byte-unchanged", () => {
+    // The AI-facing doctrine copy is not touched by the ring rewrite.
+    expect(noteAt(GETTING_STARTED_PACK, GETTING_STARTED_PATH).content).toBe(
+      GETTING_STARTED_CONTENT,
+    );
+    expect(GETTING_STARTED_CONTENT.startsWith("# Getting Started\n")).toBe(true);
   });
 
   test("no dangling [[Surface Starter]] wikilink — points at the add-pack flow instead", () => {
@@ -141,11 +290,16 @@ describe("getting-started pack", () => {
 });
 
 describe("surface-starter pack", () => {
-  test("carries the surface guide at the canonical path (opt-in, not default)", () => {
+  test("carries the surface guide, tagged #guide / written_for ai (opt-in, not default)", () => {
     expect(SURFACE_STARTER_PACK.name).toBe("surface-starter");
-    expect(SURFACE_STARTER_PACK.tags).toEqual([]);
+    expect(SURFACE_STARTER_PACK.tags).toEqual([GUIDE_TAG]);
     expect(SURFACE_STARTER_PACK.notes).toEqual([
-      { path: SURFACE_STARTER_PATH, content: SURFACE_STARTER_CONTENT },
+      {
+        path: SURFACE_STARTER_PATH,
+        tags: ["guide"],
+        metadata: { written_for: "ai" },
+        content: SURFACE_STARTER_CONTENT,
+      },
     ]);
     expect(SURFACE_STARTER_PACK.description).toContain("not seeded by default");
   });

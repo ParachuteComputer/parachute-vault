@@ -1,8 +1,8 @@
 /**
  * Seed the default packs on vault creation.
  *
- * A freshly-created vault gets the `welcome` pack (the person-voiced
- * three-note welcome web + the `capture` tag the Notes surface expects) and
+ * A freshly-created vault gets the `welcome` pack (the five-guide welcome ring
+ * + the `capture` / `guide` / `pinned` tags the Notes surface expects) and
  * the `getting-started` pack (the AI-legible start-here doctrine) — so the
  * first minute shows a small living graph, and a connected AI can read the
  * guide and help the operator set the vault up.
