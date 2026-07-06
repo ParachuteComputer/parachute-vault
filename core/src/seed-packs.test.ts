@@ -11,9 +11,9 @@
  *     verbatim, and its schema banner only clears when the capture tag genuinely
  *     carries the semantics Notes declares. (Containment, not equality: the
  *     welcome pack now also ships the #guide + #pinned tags.)
- *   - `#guide` is the vault's skill-file tag, carrying a `written_for` enum
- *     schema (`ai` | `human` | `both`, `ai` first = default). Every seeded guide
- *     note is tagged `#guide` + `metadata.written_for`.
+ *   - `#guide` is the vault's skill-file tag (no schema — guides are AI-first
+ *     and human-readable markdown, so no per-guide audience field). Every seeded
+ *     guide note is tagged `#guide`.
  *   - the five-guide welcome ring links into a connected web with no dangling
  *     wikilinks across the default seed.
  */
@@ -82,18 +82,12 @@ function noteAt(pack: SeedPack, path: string): SeedPackNote {
 }
 
 describe("guide tag — the vault's skill-file tag", () => {
-  test("GUIDE_TAG carries the written_for enum, ai first (= default)", () => {
+  test("GUIDE_TAG is the skill-file tag with no per-guide audience schema", () => {
     expect(GUIDE_TAG.name).toBe("guide");
-    // The description's last sentence names the schema field.
-    expect(GUIDE_TAG.description).toContain(
-      "`written_for` says who a guide is written for.",
-    );
-    const wf = GUIDE_TAG.fields?.written_for;
-    expect(wf).toBeDefined();
-    expect(wf!.type).toBe("string");
-    expect(wf!.enum).toEqual(["ai", "human", "both"]);
-    // First enum value is the schema default — guides lean AI.
-    expect(wf!.enum![0]).toBe("ai");
+    expect(GUIDE_TAG.description).toContain("skill file");
+    // written_for was dropped (2026-07-06): guides are AI-first + human-readable
+    // markdown, so a per-guide audience field earns nothing. No schema on the tag.
+    expect(GUIDE_TAG.fields).toBeUndefined();
   });
 
   test("PINNED_TAG is a plain identity tag (no schema)", () => {
@@ -202,10 +196,9 @@ describe("welcome pack — the five-guide ring", () => {
     }
   });
 
-  test("every guide is tagged #guide with metadata.written_for = human", () => {
+  test("every welcome guide is tagged #guide", () => {
     for (const note of welcomePack().notes) {
       expect(note.tags).toContain("guide");
-      expect(note.metadata).toEqual({ written_for: "human" });
     }
   });
 
@@ -257,7 +250,7 @@ describe("welcome pack — the five-guide ring", () => {
 });
 
 describe("getting-started pack", () => {
-  test("carries the AI-facing guide note, tagged #guide / written_for ai", () => {
+  test("carries the AI-facing guide note, tagged #guide", () => {
     expect(GETTING_STARTED_PACK.name).toBe("getting-started");
     // Declares the guide tag (self-sufficient — converges with the welcome pack).
     expect(GETTING_STARTED_PACK.tags).toEqual([GUIDE_TAG]);
@@ -265,7 +258,6 @@ describe("getting-started pack", () => {
       {
         path: GETTING_STARTED_PATH,
         tags: ["guide"],
-        metadata: { written_for: "ai" },
         content: GETTING_STARTED_CONTENT,
       },
     ]);
@@ -320,14 +312,13 @@ describe("getting-started pack", () => {
 });
 
 describe("surface-starter pack", () => {
-  test("carries the surface guide, tagged #guide / written_for ai (opt-in, not default)", () => {
+  test("carries the surface guide, tagged #guide (opt-in, not default)", () => {
     expect(SURFACE_STARTER_PACK.name).toBe("surface-starter");
     expect(SURFACE_STARTER_PACK.tags).toEqual([GUIDE_TAG]);
     expect(SURFACE_STARTER_PACK.notes).toEqual([
       {
         path: SURFACE_STARTER_PATH,
         tags: ["guide"],
-        metadata: { written_for: "ai" },
         content: SURFACE_STARTER_CONTENT,
       },
     ]);
