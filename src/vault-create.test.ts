@@ -414,7 +414,7 @@ describe("vault create — default pack seeding (welcome + getting-started)", ()
     // Surface Starter is out of the default seed — no note, no dangling link.
     expect(notes.find((n) => n.path === "Surface Starter")).toBeUndefined();
     expect(gs!.content).not.toContain("[[Surface Starter]]");
-    expect(gs!.content).toContain("add-pack surface-starter");
+    expect(gs!.content).toContain("add-pack");
 
     // The capture tag Notes requires arrives with the welcome pack, alongside
     // the guide (skill-file) + pinned tags — and nothing else (fresh-vault

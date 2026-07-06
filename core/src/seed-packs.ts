@@ -35,6 +35,32 @@
 import type { Store, TagFieldSchema } from "./types.ts";
 
 // ---------------------------------------------------------------------------
+// Default vault descriptions — the single source of truth
+// ---------------------------------------------------------------------------
+
+/**
+ * The `vault-info` description a **brand-new** vault ships with. It's the first
+ * thing a connected AI reads about the vault, so it doubles as a nudge: orient
+ * the person, read the Getting Started brief, do one small real thing, and — once
+ * real structure lands — REPLACE this text with a current picture of the vault.
+ *
+ * Exported as the single source of truth; the runtimes (bun vault default seed +
+ * cloud vault DO) consume it in a follow-up PR. Not wired into `applySeedPack`
+ * here — a description is vault metadata, not a pack note.
+ */
+export const DEFAULT_VAULT_DESCRIPTION =
+  'This is a brand-new personal vault — just its starter guides so far; the person it belongs to is probably new to Parachute. Before helping them set it up, read the "Getting Started" note — it\'s your onboarding brief. Short version: start with a conversation, not a filing system; learn how they want to use this and where their notes live today; do one small real thing first. When the vault has real structure, replace this description (vault-info { description: "..." }) with a current picture of what lives here and how to work it — so every future session, yours or another AI\'s, starts oriented.';
+
+/**
+ * The `vault-info` description a vault gets when it was **imported/restored** —
+ * it arrived with content. Flips the AI's first job from seed-it to learn-it:
+ * orient over the existing shape, reflect it back, and only then replace this
+ * text with a current picture.
+ */
+export const IMPORTED_VAULT_DESCRIPTION =
+  'This vault was imported — it arrived with its own notes, tags, and history. Orient before you write: vault-info { include_stats: true }, list-tags, read a sample, and read "Getting Started" if present. Your first job is to learn the shape that\'s already here and reflect it back to the person — not to propose new structure cold. When you understand it, replace this description (vault-info { description: "..." }) with a current picture.';
+
+// ---------------------------------------------------------------------------
 // Pack shape
 // ---------------------------------------------------------------------------
 
@@ -306,24 +332,98 @@ export const SURFACE_STARTER_PATH = "Surface Starter";
 /**
  * Body of the seeded `Getting Started` note.
  *
- * Voice: addressed to the connected AI ("you"), practical, SKILL.md-style.
- * Covers (a) what a Parachute vault is, (b) tags-vs-paths-vs-schemas design,
- * (c) importing existing notes, (d) that it's an adaptable starting point.
- * Mentions the Surface Starter PACK by name (no wikilink — the note isn't
- * seeded by default, and a dangling `[[Surface Starter]]` would sit unresolved
- * on every fresh vault).
+ * Voice: addressed to the connected AI ("you"), warm and practical, SKILL.md-style.
+ * ONE note, two labeled parts:
+ *   - Part 1 — Onboarding the person: lead with a real conversation, leverage
+ *     prior context, offer to survey their content, do one small real thing
+ *     first, the data-in menu (import UI / MCP bridge / paste-and-file — NOT the
+ *     CLI, NOT Obsidian-first), the arrived-with-content branch, and closing the
+ *     loop by updating the vault description (see DEFAULT_VAULT_DESCRIPTION).
+ *   - Part 2 — Vault mechanics: the preserved reference — what a vault is + the
+ *     tool list, tags-vs-paths-vs-schemas, write gotchas, the custom-surface
+ *     pointer, and "Adapt this note."
+ *
+ * Deliberately points AIs at the import UI + MCP bridge, never at a
+ * `parachute-vault import` CLI (that verb doesn't exist on cloud — the old copy
+ * shipped that live bug to every hosted user). Mentions the Surface Starter PACK
+ * by name (no wikilink — the note isn't seeded by default, and a dangling
+ * `[[Surface Starter]]` would sit unresolved on every fresh vault).
  */
 export const GETTING_STARTED_CONTENT = `# Getting Started
 
-This is the **start-here guide** for this Parachute vault — think of it like a
-\`SKILL.md\`: practical instructions for setting up and growing the vault. Read it
-when you're **getting the vault started** or orienting yourself to it — you don't
-need to re-read it every session. It's a **starting point, not a script**, and
-it's adaptable: edit it (see "Adapt this note") as the vault takes shape.
+This is the **start-here guide** for this Parachute vault — instructions for a
+connected AI (you), like a \`SKILL.md\`. Read it when the vault is new, when
+you're orienting yourself, or when the person says *"help me set up my
+parachute."* You don't need to re-read it every session. It has two parts:
+**how to onboard the person** (start there if they're new) and **vault
+mechanics** (reference for operating the vault). It's a starting point, not a
+script — and it's editable (see "Adapt this note" at the end).
 
-When the operator says something like *"help me set up my parachute,"* this is
-your brief: design their structure with them, import what they already have, and
-shape the vault around how they actually think and work.
+---
+
+## Part 1 — Onboarding the person
+
+### Start with a conversation, not a filing system
+
+If this vault is fresh, this is probably the person's first real session with
+it. Don't start building — orient them, briefly, in your own words: this vault
+is **their** memory, one place every AI they choose to connect can read and
+write, and they can export all of it anytime as plain markdown. Then have a
+real conversation:
+
+- **How do they imagine using this?** A journal, a project brain, a people
+  directory, meeting notes, a commonplace book — or they don't know yet
+  (that's fine; capture-first works).
+- **Where do their notes and data live now?** Another app, a pile of markdown,
+  another Parachute — or nowhere yet.
+- **What's alive for them right now?** A project, a decision, a trip, a draft.
+  The first note should be about something real.
+
+**Use what you already know.** If you have memory or context about this person
+from working with them, bring it — propose the two or three kinds of
+information *they specifically* would want here ("you mention a lot of book
+ideas — want a place for those?"). Propose, confirm, then write; never
+bulk-create structure they didn't agree to. You can also **offer to survey**
+what they already have — "want me to look through what you've brought in and
+suggest a few ways to organize it?" — then read a sample and propose, don't
+impose.
+
+### Do one small real thing first
+
+The failure mode of every notes tool is over-organizing an empty vault. So:
+**one small real thing this session.** Capture a thought they actually have,
+file one document, or bring in one small batch — then stop and show them what
+happened. Structure grows from real notes (that's Part 2's design vocabulary).
+Setup is a relationship over many sessions, not an install step.
+
+Five short guides ship in this vault for the person to read (tagged \`#guide\`):
+[[Welcome to your vault 🪂]], [[Capture anything]], [[Tags and the graph]],
+[[Connect your AI]], and [[Yours to keep]]. Point them there for anything you'd
+otherwise lecture about — they're the return-point between sessions. If a
+session ends mid-setup, leave a breadcrumb (update this note or the vault
+description) so the next one picks up where you left off.
+
+### If this vault already has content
+
+Some vaults arrive full — an import, a restore, months of use. Then your first
+job is to **learn it, not seed it**: \`vault-info { include_stats: true }\`,
+\`list-tags\`, read a sample (\`query-notes { search: "..." }\`), then reflect the
+shape back to the person and ask what's missing or wrong. Propose structure
+only once you can describe what's already there.
+
+### Close the loop: describe the vault
+
+When the first real structure lands, update the vault description —
+\`vault-info { description: "..." }\` — so every future session (yours or another
+AI's) starts oriented: what this vault is for, its main tags, its conventions.
+The default description says "brand-new vault"; once that stops being true,
+replace it. Keep it a few sentences (the projection carries the schema detail,
+and this note carries the richer conventions — see "Adapt this note"). Bringing
+their existing data in is covered under "Bringing existing notes in" below.
+
+---
+
+## Part 2 — Vault mechanics
 
 ## What a Parachute vault is
 
@@ -417,33 +517,40 @@ A few behaviors worth knowing before you write at scale:
 
 (Full design guide, with copy-paste examples: https://parachute.computer/scripting/)
 
-## Importing existing notes
+## Bringing existing notes in
 
-If the operator already keeps notes (Obsidian, Markdown, etc.), bring them in
-rather than starting cold:
+If the person already keeps notes somewhere, help them bring what matters —
+start with what's alive for them, not the whole archive. What works today:
 
-- **Obsidian / a Markdown folder:** \`parachute-vault import <path>\` — preserves
-  frontmatter, tags, \`[[wikilinks]]\`, and file paths.
-- **A portable Parachute export** (a dir with \`.parachute/vault.yaml\`): the same
-  \`import\` command auto-detects it and does a lossless round-trip (ids, typed
-  links, tag schemas, attachments).
-- **Ad hoc / pasted content:** just \`create-note\` it. Then help the operator tag
-  and schematize: read a sample of imported notes, propose a small tag
-  vocabulary, and apply it.
+- **Connect the source over MCP (the flexible path).** If their AI client can
+  add other MCP servers — a Google Drive server, a Notion server, a filesystem
+  server — connect it alongside this vault in the same session. Then read from
+  there and \`create-note\` here: a selective, conversational migration, no
+  export file needed.
+- **Paste and file.** They paste anything — a doc, a list, an export — and you
+  \`create-note\` it (batch mode for many at once).
+- **Import a Parachute export.** Moving between Parachute vaults (cloud ⇄
+  self-host) is lossless — on Parachute Cloud, the console's Import button —
+  ids, tags, links, schemas, and attachments round-trip.
 
-After an import, orient yourself: \`vault-info\` for the new schema picture,
-\`list-tags\` to see what vocabulary arrived, \`query-notes { search: "..." }\` to
-spot-check. Then propose structure — don't impose it silently.
+Bringing a whole Obsidian or Markdown library in is getting easier, and a
+flexible import is on the way; for now the connect-over-MCP and paste paths
+handle it without anyone touching a terminal. Whatever they bring, offer to
+survey it and suggest a first structure — read a sample, propose a small tag
+vocabulary, confirm, then apply. Don't impose structure silently.
+
+After bringing content in, orient: \`vault-info\` for the schema picture,
+\`list-tags\` for the vocabulary that arrived, \`query-notes { search: "..." }\`
+to spot-check.
 
 ## Later: a custom surface
 
 Building a custom UI over the vault (a dashboard, a notes app) is usually **not**
-the starting point — get the notes and structure right first. If and when the
-operator wants one, add the **Surface Starter** guide to this vault — it's a
-seed pack that isn't installed by default. Run
-\`parachute-vault add-pack surface-starter\` (or use the console's add-pack
-affordance) to seed it; it covers building a surface with
-\`@openparachute/surface-client\` + \`@openparachute/surface-render\`.
+the starting point — get the notes and structure right first. When the person
+wants one, add the **Surface Starter** guide to this vault — an optional pack
+(not installed by default) that covers building a surface with
+\`@openparachute/surface-client\` + \`@openparachute/surface-render\`. On Parachute
+Cloud it's the console's add-pack affordance.
 
 ## Adapt this note
 
