@@ -23,6 +23,9 @@ import {
   applySeedPack,
   CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
+  DEFAULT_VAULT_DESCRIPTION,
+  IMPORTED_VAULT_DESCRIPTION,
+  YOURS_TO_KEEP_PATH,
   GETTING_STARTED_CONTENT,
   GETTING_STARTED_PACK,
   GETTING_STARTED_PATH,
@@ -282,10 +285,37 @@ describe("getting-started pack", () => {
     // exist. It names the pack + the way to add it.
     expect(GETTING_STARTED_CONTENT).not.toContain("[[Surface Starter]]");
     expect(GETTING_STARTED_CONTENT).toContain("Surface Starter");
-    expect(GETTING_STARTED_CONTENT).toContain("add-pack surface-starter");
+    // Points at the add-pack flow (console affordance / CLI) without spelling
+    // out a terminal command — de-emphasise the CLI (Aaron 2026-07-06).
+    expect(GETTING_STARTED_CONTENT).toContain("add-pack");
     // The surface packages are still named for discoverability.
     expect(GETTING_STARTED_CONTENT).toContain("@openparachute/surface-client");
     expect(GETTING_STARTED_CONTENT).toContain("@openparachute/surface-render");
+  });
+
+  test("Getting Started is onboarding-first + carries no dead CLI guidance (2026-07-06 rewrite)", () => {
+    // Two-part structure: onboarding conversation leads, mechanics reference follows.
+    expect(GETTING_STARTED_CONTENT).toContain("## Part 1 — Onboarding the person");
+    expect(GETTING_STARTED_CONTENT).toContain("## Part 2 — Vault mechanics");
+    // Points the person at the five human guides by name (all resolve to seeds).
+    for (const g of [WELCOME_PATH, CAPTURE_ANYTHING_PATH, TAGS_GRAPH_PATH, CONNECT_AI_PATH, YOURS_TO_KEEP_PATH]) {
+      expect(GETTING_STARTED_CONTENT).toContain("[[" + g + "]]");
+    }
+    // The old live bug: it told cloud AIs to run a CLI that doesn't exist there.
+    expect(GETTING_STARTED_CONTENT).not.toContain("parachute-vault import");
+    // Data-in leads with the import UI + MCP bridge, not the terminal.
+    expect(GETTING_STARTED_CONTENT).toContain("Import button");
+    expect(GETTING_STARTED_CONTENT).toContain("over MCP");
+  });
+
+  test("default vault-description constants orient + tell the AI to self-replace them", () => {
+    for (const d of [DEFAULT_VAULT_DESCRIPTION, IMPORTED_VAULT_DESCRIPTION]) {
+      expect(d.length).toBeGreaterThan(100);
+      expect(d).toContain("Getting Started");
+      expect(d).toContain("vault-info { description:"); // the self-replace instruction
+    }
+    expect(DEFAULT_VAULT_DESCRIPTION).toContain("brand-new");
+    expect(IMPORTED_VAULT_DESCRIPTION).toContain("imported");
   });
 });
 

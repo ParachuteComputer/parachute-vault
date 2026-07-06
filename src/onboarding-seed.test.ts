@@ -82,7 +82,10 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(gs!.content).toContain("Tags = types");
     expect(gs!.content).toContain("Paths = organization");
     expect(gs!.content).toContain("Schemas = typed metadata fields");
-    expect(gs!.content).toContain("parachute-vault import");
+    // Data-in leads with the import UI + MCP bridge; the old `parachute-vault
+    // import` CLI line (a live bug on cloud) is gone (2026-07-06 rewrite).
+    expect(gs!.content).not.toContain("parachute-vault import");
+    expect(gs!.content).toContain("Bringing existing notes in");
     expect(gs!.content).toContain("Adapt this note");
 
     // The welcome ring: five person-voiced guide notes.
@@ -200,7 +203,7 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     // Getting Started mentions the surface-starter PACK — not a wikilink to a
     // note that the default seed no longer creates.
     expect(gs!.content).not.toContain("[[Surface Starter]]");
-    expect(gs!.content).toContain("add-pack surface-starter");
+    expect(gs!.content).toContain("add-pack");
   });
 
   test("idempotent: a second seed run skips all notes (does not duplicate)", async () => {
