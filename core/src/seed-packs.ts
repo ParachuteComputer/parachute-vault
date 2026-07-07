@@ -7,7 +7,7 @@
  *
  *   - `welcome` — the five-guide welcome ring (Welcome, Capture anything, Tags
  *     and the graph, Connect your AI, Yours to keep) + the `capture` / `guide`
- *     / `pinned` tags the Notes surface expects. Default-seeded on creation.
+ *     tags the Notes surface expects. Default-seeded on creation.
  *   - `getting-started` — the AI-facing start-here guide (SKILL.md-style
  *     doctrine addressed to a connected assistant). Default-seeded.
  *   - `surface-starter` — the living starter guide for building a custom
@@ -16,9 +16,10 @@
  *     `parachute-vault add-pack surface-starter` or a console affordance.
  *
  * Guides are the vault's skill files — the Parachute equivalent of a
- * `SKILL.md`. They're tagged `#guide` (GUIDE_TAG). Written for a connected AI
- * first (it reads them to learn the vault), but they're plain markdown, so the
- * human reads them just as well — no per-guide audience field is needed.
+ * `SKILL.md`. They're tagged `#guide` (GUIDE_TAG): notes that teach how this
+ * vault works and how to work it, for you and your AI alike. Some (the welcome
+ * ring) are voiced to the person; some (Getting Started) to the assistant; all
+ * are plain markdown either reads — so no per-guide audience field is needed.
  *
  * This module is the single source of truth for pack content across BOTH
  * runtimes: the bun vault (`src/onboarding-seed.ts` default seed + the
@@ -131,9 +132,8 @@ export const NOTES_REQUIRED_TAGS: ReadonlyArray<SeedPackTag> = [
 
 /**
  * The `guide` tag — the vault's skill-file tag. Guides are the Parachute
- * equivalent of a `SKILL.md`: notes that teach a connected AI (and the human it
- * belongs to) how this vault works and how to work it. Written for the AI
- * first; plain markdown, so the human reads them just as well.
+ * equivalent of a `SKILL.md`: notes that teach how this vault works and how to
+ * work it, for you and your AI alike. Plain markdown, so either reads them.
  *
  * Declared by every pack that ships guide notes (welcome / getting-started /
  * surface-starter). The upserts converge on one row, so each pack stays
@@ -142,13 +142,7 @@ export const NOTES_REQUIRED_TAGS: ReadonlyArray<SeedPackTag> = [
 export const GUIDE_TAG: SeedPackTag = {
   name: "guide",
   description:
-    "Guides — the vault's skill files. Notes that teach a connected AI (and the human it belongs to) how this vault works and how to work it. Written for the AI first; plain markdown, so a good read for the human too.",
-};
-
-/** The `pinned` tag — notes pinned to the top of the Notes app. No schema. */
-export const PINNED_TAG: SeedPackTag = {
-  name: "pinned",
-  description: "Notes pinned to the top of the Notes app.",
+    "Guides — the vault's skill files. Notes that teach how this vault works and how to work it, for you and your AI alike. Plain markdown, so either reads them.",
 };
 
 export const WELCOME_PATH = "Welcome to your vault 🪂";
@@ -160,9 +154,8 @@ export const YOURS_TO_KEEP_PATH = "Yours to keep";
 /**
  * Build the `welcome` pack: the five-guide welcome ring — Welcome, Capture
  * anything, Tags and the graph, Connect your AI, Yours to keep — plus the
- * `capture` / `guide` / `pinned` tags. The guides are ordinary notes tagged
- * `#guide` (the vault's skill-file tag); Welcome is also `#pinned` so it sits
- * at the top of the Notes app. They form a
+ * `capture` / `guide` tags. The guides are ordinary notes tagged `#guide`
+ * (the vault's skill-file tag). They form a
  * small linked web (Welcome → all four; the rest chain 2→3→4→5→1; Connect
  * your AI also links the AI-facing [[Getting Started]]) so the graph view
  * shows a connected structure from minute one. Deletable like anything else.
@@ -181,10 +174,9 @@ export function welcomePack(opts: { consoleOrigin?: string } = {}): SeedPack {
   return {
     name: "welcome",
     description:
-      "The five-guide welcome ring (Welcome, Capture anything, Tags and the graph, Connect your AI, Yours to keep) — the vault's #guide skill files — plus the capture/guide/pinned tags. Seeded by default on new vaults.",
-    // capture (Notes surface) + guide (the skill-file tag) + pinned
-    // (top-of-app). Upserts are idempotent.
-    tags: [...NOTES_REQUIRED_TAGS, GUIDE_TAG, PINNED_TAG],
+      "The five-guide welcome ring (Welcome, Capture anything, Tags and the graph, Connect your AI, Yours to keep) — the vault's #guide skill files — plus the capture/guide tags. Seeded by default on new vaults.",
+    // capture (Notes surface) + guide (the skill-file tag). Upserts are idempotent.
+    tags: [...NOTES_REQUIRED_TAGS, GUIDE_TAG],
     // `[[wikilinks]]` resolve by note path — pending links auto-resolve when
     // the target is created, so order only affects how briefly a link sits
     // unresolved during the seed. Every [[target]] here resolves to a note the
@@ -193,7 +185,7 @@ export function welcomePack(opts: { consoleOrigin?: string } = {}): SeedPack {
     notes: [
       {
         path: WELCOME_PATH,
-        tags: ["guide", "pinned"],
+        tags: ["guide"],
         content: `# ${WELCOME_PATH}
 
 This vault is yours.

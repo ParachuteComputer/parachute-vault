@@ -100,12 +100,12 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     }
   });
 
-  test("seeds the capture tag Notes requires (byte-equal semantics) + the guide/pinned tags", async () => {
+  test("seeds the capture tag Notes requires (byte-equal semantics) + the guide tag", async () => {
     const result = await seedOnboardingNotes(store);
-    // welcome upserts [capture, guide, pinned]; getting-started re-upserts
-    // [guide] (converges). applySeedPack reports every declared tag per pack,
-    // so the concatenation carries guide twice — deterministic.
-    expect(result.tags).toEqual(["capture", "guide", "pinned", "guide"]);
+    // welcome upserts [capture, guide]; getting-started re-upserts [guide]
+    // (converges). applySeedPack reports every declared tag per pack, so the
+    // concatenation carries guide twice — deterministic.
+    expect(result.tags).toEqual(["capture", "guide", "guide"]);
 
     for (const decl of NOTES_REQUIRED_TAGS) {
       const record = await store.getTagRecord(decl.name);
@@ -114,13 +114,14 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
       expect(record!.parent_names ?? []).toEqual(decl.parent_names ?? []);
     }
 
-    // The guide tag lands with no metadata schema — guides are AI-first,
-    // human-readable markdown, so no per-guide audience field (written_for dropped).
+    // The guide tag lands with no metadata schema — guides are for you and your
+    // AI alike, plain markdown, so no per-guide audience field (written_for dropped).
     const guide = await store.getTagRecord("guide");
     expect(guide).not.toBeNull();
     expect(guide!.fields?.written_for).toBeUndefined();
-    const pinned = await store.getTagRecord("pinned");
-    expect(pinned).not.toBeNull();
+    // #pinned is NOT seeded (dropped 2026-07-07 — did nothing visible on a fresh
+    // vault). Pinning still works when the user pins a note in the app.
+    expect(await store.getTagRecord("pinned")).toBeNull();
 
     // The retired subtype tags are NOT seeded — entry method is note
     // metadata.source (text|voice), not taxonomy (2026-07-03). Existing
@@ -132,9 +133,9 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
   test("seeded guides carry #guide (create-time tag write-through)", async () => {
     await seedOnboardingNotes(store);
 
-    // Welcome guide: tagged guide + pinned.
+    // Welcome guide: tagged guide (no longer pinned).
     const welcome = await store.getNoteByPath(WELCOME_PATH);
-    expect([...(welcome!.tags ?? [])].sort()).toEqual(["guide", "pinned"]);
+    expect([...(welcome!.tags ?? [])].sort()).toEqual(["guide"]);
 
     // The four sibling guides: guide only.
     for (const path of [
