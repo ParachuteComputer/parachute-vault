@@ -10,7 +10,7 @@
  *     byte-for-byte — the Notes PWA's connect-time audit compares `description`
  *     verbatim, and its schema banner only clears when the capture tag genuinely
  *     carries the semantics Notes declares. (Containment, not equality: the
- *     welcome pack now also ships the #guide + #pinned tags.)
+ *     welcome pack now also ships the #guide tag.)
  *   - `#guide` is the vault's skill-file tag (no schema — guides are AI-first
  *     and human-readable markdown, so no per-guide audience field). Every seeded
  *     guide note is tagged `#guide`.
@@ -33,7 +33,6 @@ import {
   GUIDE_TAG,
   listSeedPacks,
   NOTES_REQUIRED_TAGS,
-  PINNED_TAG,
   SEED_PACK_NAMES,
   SURFACE_STARTER_CONTENT,
   SURFACE_STARTER_PACK,
@@ -90,13 +89,6 @@ describe("guide tag — the vault's skill-file tag", () => {
     expect(GUIDE_TAG.fields).toBeUndefined();
   });
 
-  test("PINNED_TAG is a plain identity tag (no schema)", () => {
-    expect(PINNED_TAG.name).toBe("pinned");
-    expect(PINNED_TAG.description).toBe(
-      "Notes pinned to the top of the Notes app.",
-    );
-    expect(PINNED_TAG.fields).toBeUndefined();
-  });
 });
 
 describe("welcome pack — notes-ui schema parity (containment)", () => {
@@ -113,14 +105,12 @@ describe("welcome pack — notes-ui schema parity (containment)", () => {
     }
   });
 
-  test("welcome tags = capture + guide + pinned (the guide/pinned tags ride along)", () => {
+  test("welcome tags = capture + guide (the guide tag rides along)", () => {
     expect(welcomePack().tags.map((t) => t.name)).toEqual([
       "capture",
       "guide",
-      "pinned",
     ]);
     expect(welcomePack().tags).toContain(GUIDE_TAG);
-    expect(welcomePack().tags).toContain(PINNED_TAG);
   });
 
   test("exactly ONE capture tag — no subtype tags, no parent_names (2026-07-03)", () => {
@@ -202,11 +192,12 @@ describe("welcome pack — the five-guide ring", () => {
     }
   });
 
-  test("Welcome is the ONLY pinned note", () => {
+  test("no seeded note is pinned (pinning is a user action, not seeded)", () => {
+    // The vestigial #pinned seed was dropped 2026-07-07 — it did nothing visible
+    // on a fresh vault. Pinning still works when a user pins a note in the app.
     const pinned = welcomePack().notes.filter((n) => n.tags?.includes("pinned"));
-    expect(pinned.map((n) => n.path)).toEqual([WELCOME_PATH]);
-    // Welcome carries both guide + pinned.
-    expect(noteAt(welcomePack(), WELCOME_PATH).tags).toEqual(["guide", "pinned"]);
+    expect(pinned).toEqual([]);
+    expect(noteAt(welcomePack(), WELCOME_PATH).tags).toEqual(["guide"]);
   });
 
   test("content anchors: the ratified copy is present (guards body drift)", () => {
