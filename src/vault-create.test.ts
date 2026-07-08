@@ -359,7 +359,7 @@ describe("vault create — services.json registration (#208)", () => {
  * reshaped for named seed packs).
  *
  * A freshly-created vault must contain the `welcome` pack (the five-guide
- * welcome ring + the capture/guide/pinned tags) and the `getting-started`
+ * welcome ring + the capture/guide tags) and the `getting-started`
  * guide — and NOT the `surface-starter` pack, which is opt-in via `add-pack`
  * (ratified 2026-07-02). Idempotent + best-effort: the seed never fails a
  * create and never clobbers an edited note.
@@ -417,10 +417,10 @@ describe("vault create — default pack seeding (welcome + getting-started)", ()
     expect(gs!.content).toContain("add-pack");
 
     // The capture tag Notes requires arrives with the welcome pack, alongside
-    // the guide (skill-file) + pinned tags — and nothing else (fresh-vault
-    // seed = 6 notes: the 5-guide ring + Getting Started. The retired
-    // capture/text + capture/voice subtypes are no longer seeded).
-    expect(readTagNames("guided").sort()).toEqual(["capture", "guide", "pinned"]);
+    // the guide (skill-file) tag — and nothing else (fresh-vault seed = 6 notes:
+    // the 5-guide ring + Getting Started. The retired capture/text + capture/voice
+    // subtypes and the vestigial #pinned seed are no longer seeded).
+    expect(readTagNames("guided").sort()).toEqual(["capture", "guide"]);
     expect(notes).toHaveLength(6);
   });
 
