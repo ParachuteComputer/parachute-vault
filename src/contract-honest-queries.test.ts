@@ -210,6 +210,42 @@ describe("contract: honest queries — warnings channel (#550)", () => {
     const headerWarnings = decodeWarningsHeader(res);
     expect(headerWarnings).toEqual(body.warnings);
   });
+
+  it("format=graph carries warnings INLINE in the {nodes, edges} envelope (in addition to the header)", async () => {
+    await store.createNote("a note", { tags: ["real"] });
+    const res = await getNotes("format=graph&tag=doesnotexist");
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(Array.isArray(body.nodes)).toBe(true);
+    expect(Array.isArray(body.edges)).toBe(true);
+    expect(Array.isArray(body.warnings)).toBe(true);
+    expect(body.warnings[0].code).toBe("unknown_tag");
+    const headerWarnings = decodeWarningsHeader(res);
+    expect(headerWarnings).toEqual(body.warnings);
+  });
+
+  it("format=graph with no warnings carries NO warnings key and no header (shape unchanged)", async () => {
+    await store.createNote("a note", { tags: ["real"] });
+    const res = await getNotes("format=graph&tag=real");
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.warnings).toBeUndefined();
+    expect(res.headers.get("X-Parachute-Warnings")).toBeNull();
+  });
+
+  it("unknown_tag warnings are capped at 8 with a warnings_truncated marker (garbage tags array can't inflate the header unboundedly)", async () => {
+    const junkTags = Array.from({ length: 12 }, (_, i) => `zz-junk-tag-${i}`);
+    const res = await getNotes(`tag=${junkTags.join(",")}`);
+    expect(res.status).toBe(200);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings).not.toBeNull();
+    const unknown = warnings!.filter((w) => w.code === "unknown_tag");
+    const truncated = warnings!.filter((w) => w.code === "warnings_truncated");
+    expect(unknown).toHaveLength(8);
+    expect(truncated).toHaveLength(1);
+    expect(truncated[0].suppressed).toBe(4); // 12 junk tags − 8 reported
+    expect(truncated[0].limit).toBe(8);
+  });
 });
 
 describe("contract: honest queries — cursor bootstrap (#550, the P1)", () => {

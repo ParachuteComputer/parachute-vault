@@ -31,6 +31,7 @@ import {
   stripTagHash,
   suggestSimilarTag,
   type TagExpandMode,
+  type TagHierarchy,
 } from "./tag-hierarchy.js";
 import { chunkForInClause } from "./sql-in.js";
 
@@ -39,6 +40,15 @@ export interface QueryWarning {
   message: string;
   [key: string]: unknown;
 }
+
+/**
+ * Cap on `unknown_tag` warnings per query (vault#550 fold). A caller
+ * passing a garbage `tags` array (hundreds of junk names) would otherwise
+ * inflate the response — and the REST `X-Parachute-Warnings` header —
+ * unboundedly. Past the cap, a single `warnings_truncated` entry reports
+ * how many were suppressed.
+ */
+export const MAX_UNKNOWN_TAG_WARNINGS = 8;
 
 /**
  * Membership counts for a specific set of candidate tag names — NOT a
@@ -85,40 +95,60 @@ function countMembership(db: Database, names: ReadonlySet<string>): Map<string, 
  * checked (excluding a nonexistent tag is a harmless no-op, not a sign of
  * a mistaken query) and this does not run under `search=` (out of scope
  * for this wave — see #551).
+ *
+ * Perf shape (vault#550 fold): this runs on EVERY tag-filtered structured
+ * query, so the common all-tags-known case must cost ~nothing. Pass the
+ * store's cached `hierarchy` (`Store.getTagHierarchy()` — invalidated on
+ * tag writes) so no fresh `tags`-table scan happens per request; the
+ * `note_tags` membership query below only runs for input tags MISSING
+ * from the identity set (`h.allTags`), which for a well-formed query is
+ * none — a tag with an identity row can never warn (`hasIdentity`
+ * short-circuits), so there's nothing to look up. The `hierarchy` param
+ * stays optional for direct-core callers/tests (falls back to a fresh
+ * load).
  */
 export function collectUnknownTagWarnings(
   db: Database,
   tags: string[] | undefined,
   expandMode: TagExpandMode | undefined,
+  hierarchy?: TagHierarchy,
 ): QueryWarning[] {
   if (!tags || tags.length === 0) return [];
 
-  const h = loadTagHierarchy(db);
+  const h = hierarchy ?? loadTagHierarchy(db);
   const mode = expandMode ?? DEFAULT_TAG_EXPAND_MODE;
 
-  // Dedupe inputs and pre-compute each one's expansion set (memoized via
-  // `h.descendantsCache` for the subtypes axis) BEFORE hitting the DB, so
-  // the membership query below can be a single batched IN-list over the
-  // union rather than one query per input tag.
-  const cleanedInputs: string[] = [];
-  const expansions = new Map<string, Set<string>>();
+  // Fast path: dedupe inputs and drop every tag with an identity row —
+  // those can never warn. For a well-formed query this empties the list
+  // and we return without touching the DB at all.
+  const suspects: string[] = [];
   const seen = new Set<string>();
   for (const raw of tags) {
     const tag = stripTagHash(raw);
     if (tag === "" || seen.has(tag)) continue;
     seen.add(tag);
-    cleanedInputs.push(tag);
-    expansions.set(tag, getTagExpansion(h, tag, mode));
+    if (h.allTags.has(tag)) continue; // identity row → never unknown
+    suspects.push(tag);
   }
-  if (cleanedInputs.length === 0) return [];
+  if (suspects.length === 0) return [];
 
+  // Slow path (only for identity-less names): pre-compute each suspect's
+  // expansion set (memoized on `h.descendantsCache` — safe to share with
+  // the store's cache, entries are pure derived state) so the membership
+  // check is ONE batched IN-list query over the union, not one per tag.
+  // An identity-less tag can still be "known" two ways: a `note_tags` row
+  // exists without a `tags` row (not produced by current writers, but
+  // contract-tolerated), or children declared it a parent (`childrenOf`
+  // edges exist for undeclared parents) and a descendant has notes.
+  const expansions = new Map<string, Set<string>>();
+  for (const tag of suspects) expansions.set(tag, getTagExpansion(h, tag, mode));
   const candidateNames = new Set<string>();
   for (const set of expansions.values()) for (const name of set) candidateNames.add(name);
   const counts = countMembership(db, candidateNames);
 
   const warnings: QueryWarning[] = [];
-  for (const tag of cleanedInputs) {
-    const hasIdentity = h.allTags.has(tag);
+  let suppressed = 0;
+  for (const tag of suspects) {
     const hasOwnMembership = (counts.get(tag) ?? 0) > 0;
     let hasExpansionMembers = false;
     for (const t of expansions.get(tag)!) {
@@ -128,7 +158,11 @@ export function collectUnknownTagWarnings(
       }
     }
 
-    if (!hasIdentity && !hasOwnMembership && !hasExpansionMembers) {
+    if (!hasOwnMembership && !hasExpansionMembers) {
+      if (warnings.length >= MAX_UNKNOWN_TAG_WARNINGS) {
+        suppressed++;
+        continue;
+      }
       const suggestion = suggestSimilarTag(h.allTags, tag);
       warnings.push({
         code: "unknown_tag",
@@ -137,6 +171,14 @@ export function collectUnknownTagWarnings(
         ...(suggestion ? { did_you_mean: suggestion } : {}),
       });
     }
+  }
+  if (suppressed > 0) {
+    warnings.push({
+      code: "warnings_truncated",
+      message: `${suppressed} additional unknown_tag warning(s) suppressed — at most ${MAX_UNKNOWN_TAG_WARNINGS} are reported per query.`,
+      suppressed,
+      limit: MAX_UNKNOWN_TAG_WARNINGS,
+    });
   }
   return warnings;
 }

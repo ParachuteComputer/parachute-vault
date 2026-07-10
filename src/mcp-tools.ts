@@ -351,9 +351,41 @@ function applyTagScopeWrappers(
 
   wrapReadTool(tools, "list-tags", async (orig, params) => {
     const allowed = await getAllowed();
+    if (!allowed) return await orig(params);
+    // Single-tag detail (`{tag}` param) — the non-array shape the old
+    // wrapper silently passed through, which leaked BOTH the full record of
+    // an existing out-of-scope tag (vault#560) AND, post-#550, a vault-wide
+    // `did_you_mean` suggestion for a nonexistent one. This wrapper is the
+    // enforcement layer for tag scope on this tool; core's list-tags stays
+    // scope-unaware by architecture (same division as every other wrapper
+    // in this file).
+    const singleTag = typeof (params as any).tag === "string" ? ((params as any).tag as string) : null;
+    if (singleTag !== null && !allowed.has(singleTag)) {
+      // Out-of-scope name — whether the tag exists or not. Same
+      // "tag_not_found, no leak" shape as the REST handlers' early-return,
+      // and deliberately NO did_you_mean (any suggestion would be computed
+      // vault-wide). Short-circuits BEFORE core runs, so the full record /
+      // suggestion is never even computed.
+      return { error: "Tag not found", error_type: "tag_not_found", tag: singleTag };
+    }
     const result = await orig(params);
-    if (!allowed || !Array.isArray(result)) return result;
-    return result.filter((t: any) => allowed.has(t.name));
+    if (Array.isArray(result)) {
+      return result.filter((t: any) => allowed.has(t.name));
+    }
+    // In-scope single-tag miss (nonexistent but allowlisted name): core's
+    // tag_not_found may carry a vault-wide `did_you_mean` — keep it only
+    // when the suggestion itself is inside the allowlist.
+    if (
+      result &&
+      typeof result === "object" &&
+      (result as any).error_type === "tag_not_found" &&
+      typeof (result as any).did_you_mean === "string" &&
+      !allowed.has((result as any).did_you_mean)
+    ) {
+      const { did_you_mean: _dropped, ...scrubbed } = result as Record<string, unknown>;
+      return scrubbed;
+    }
+    return result;
   });
 
   wrapReadTool(tools, "find-path", async (orig, params) => {

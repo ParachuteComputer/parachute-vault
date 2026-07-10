@@ -77,6 +77,8 @@ export interface TagListEntry {
 export interface TagRecordResult {
   name: string;
   count: number;
+  /** Subtypes-axis rollup count (vault#550, additive server-side). */
+  expanded_count?: number;
   description: string | null;
   fields: Record<string, SchemaFieldSpec> | null;
   relationships: Record<string, unknown> | null;
@@ -152,15 +154,23 @@ export async function listSchemaTags(vaultName: string): Promise<TagListEntry[]>
   return (await res.json()) as TagListEntry[];
 }
 
-/** Fetch a single tag's full record. */
+/**
+ * Fetch a single tag's full record. Returns `null` on 404 — since
+ * vault#550 the server answers `tag_not_found` for a name with no
+ * identity row and no notes (it used to synthesize an all-null 200), and
+ * a TOCTOU between the schema list load and clicking a row (tag deleted
+ * underneath) should degrade to the pre-#550 empty-record editor, not
+ * the generic error banner.
+ */
 export async function getTagRecord(
   vaultName: string,
   tag: string,
-): Promise<TagRecordResult> {
+): Promise<TagRecordResult | null> {
   const res = await _authedFetch(
     vaultName,
     `${base(vaultName)}/${encodeURIComponent(tag)}`,
   );
+  if (res.status === 404) return null;
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as TagRecordResult;
 }

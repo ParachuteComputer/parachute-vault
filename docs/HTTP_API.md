@@ -332,7 +332,10 @@ ran and the result is still meaningful. Two warning codes today:
   notes carrying it, and (given the request's `expand` axis) no expansion
   members either. Carries `tag` and, when a close match exists,
   `did_you_mean` (case variant, prefix relationship, or small edit
-  distance against the vault's real tag catalog).
+  distance against the vault's real tag catalog). Capped at **8 per
+  query** — past the cap a single `warnings_truncated` entry (carrying
+  `suppressed` + `limit`) reports how many were dropped, so a garbage
+  `tags` array can't inflate the response or the header unboundedly.
 - `removed_param` — the flat `date_field` / `date_from` / `date_to` query
   params (removed at 0.6.4, see below) are present. Carries `param`. One
   entry per removed param present.
@@ -992,6 +995,14 @@ before using it is fine) — the 404 only fires when NEITHER an identity row
 NOR any membership exists. The MCP `list-tags` tool returns the same
 `{error, error_type: "tag_not_found", tag, did_you_mean?}` shape (as a
 returned object, not a thrown error) for a nonexistent `tag` param.
+
+Tag-scoped tokens: an out-of-scope name (whether the tag exists or not)
+gets the bare `tag_not_found` with **no** `did_you_mean` and no record
+fields — same "no leak" stance as note reads; and for an in-scope miss,
+`did_you_mean` only surfaces suggestions inside the token's allowlist.
+Enforced on both REST (handler early-return + scoped candidate pool) and
+MCP (the `list-tags` scope wrapper — also closes the pre-#550 full-record
+leak for existing out-of-scope tags, vault#560).
 
 #### `GET /vault/{name}/api/tags/{name}` — `vault:read`
 Same as the `?tag=` query — single-tag detail by path, same 404 shape.

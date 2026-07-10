@@ -1083,7 +1083,7 @@ async function handleNotesInner(
       const queryWarnings: QueryWarning[] = [
         ...collectRemovedParamWarnings(url),
         ...(tagScope.allowed === null
-          ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand)
+          ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
           : []),
       ];
       let results: Note[];
@@ -1225,7 +1225,12 @@ async function handleNotesInner(
             }
           }
         }
-        return jsonWithWarnings({ nodes, edges }, queryWarnings);
+        // Envelope shape → warnings inline (same policy as the cursor
+        // envelope below), plus the header via jsonWithWarnings.
+        return jsonWithWarnings(
+          { nodes, edges, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+          queryWarnings,
+        );
       }
 
       if (includeLinks || includeAttachments) {

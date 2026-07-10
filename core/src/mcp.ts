@@ -574,7 +574,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
             offset: params.offset as number | undefined,
             cursor: cursorMode ? (params.cursor as string) : undefined,
           };
-          queryWarnings = collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand);
+          queryWarnings = collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy());
           if (cursorMode) {
             const page = await store.queryNotesPaged(queryOpts);
             results = page.notes;
@@ -1407,9 +1407,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           // isn't a legitimate (if empty) tag, it's a typo or a tag from a
           // different vault. Return a structured miss instead of a
           // synthesized all-null 200. `did_you_mean` searches the full
-          // vault-wide tag catalog (this code path has no tag-scope
-          // awareness today — see the pre-existing single-tag lookup
-          // scope note below).
+          // vault-wide tag catalog — core is scope-unaware by architecture.
+          // Tag-scope enforcement lives in the server layer's list-tags
+          // wrapper (src/mcp-tools.ts:applyTagScopeWrappers): a scoped
+          // session's out-of-scope `tag` param short-circuits to
+          // tag_not_found BEFORE this executes, and an in-scope miss gets
+          // its `did_you_mean` dropped unless the suggestion is also
+          // in-scope.
           if (!found && !record) {
             const suggestion = suggestSimilarTag(allTags.map((t) => t.name), singleTag);
             return {

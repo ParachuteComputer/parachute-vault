@@ -98,6 +98,25 @@ to `@latest`.
     Both are called out per the umbrella issue's compat note ("limit/date/
     cursor errors behavioral; tags 404 breaking-lite — rides the 0.7.0
     train").
+  - **Review folds (same rc):** (1) the MCP `list-tags` single-tag path is
+    now tag-scope enforced in the server wrapper (`src/mcp-tools.ts`) — an
+    out-of-scope name returns bare `tag_not_found` with no record fields
+    and no `did_you_mean` (also closes vault#560's pre-existing
+    full-record leak for existing out-of-scope tags), and an in-scope
+    miss drops any suggestion outside the allowlist; (2) `unknown_tag`
+    warnings reuse the store's cached tag hierarchy and skip the
+    `note_tags` membership query entirely when every input tag has an
+    identity row (the common case costs ~nothing); (3) `unknown_tag`
+    warnings are capped at 8 per query with a `warnings_truncated`
+    marker (`suppressed` + `limit`) so a garbage tags array can't inflate
+    the `X-Parachute-Warnings` header unboundedly; (4) `?format=graph`
+    now carries `warnings` inline in the `{nodes, edges}` body (docs said
+    so; code only set the header); (5) the live-subscription cursor guard
+    (`cursor: ""` rejected, omitted accepted) is now pinned by tests;
+    (6) the admin SPA's `getTagRecord` returns null on the new 404
+    (TOCTOU: tag deleted between list load and click) and the schema
+    editor degrades to the pre-#550 empty-record view instead of the
+    generic error banner.
 
 ## [0.7.0-rc.1] - 2026-07-09
 

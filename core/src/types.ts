@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
-import type { TagExpandMode } from "./tag-hierarchy.js";
+import type { TagExpandMode, TagHierarchy } from "./tag-hierarchy.js";
 import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
@@ -10,7 +10,7 @@ import type { FindPathResult } from "./links.js";
 
 export type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 export type { PrunedField } from "./indexed-fields.js";
-export type { TagExpandMode } from "./tag-hierarchy.js";
+export type { TagExpandMode, TagHierarchy } from "./tag-hierarchy.js";
 export type { ConformanceReport } from "./conformance.js";
 export type { FindPathResult } from "./links.js";
 
@@ -338,6 +338,14 @@ export interface Store {
    * IDENTICAL expansion the snapshot query engine uses for the same `expand`.
    */
   expandTags(tags: string[], mode?: TagExpandMode): Promise<Set<string>>;
+  /**
+   * The store's cached tag hierarchy (invalidated on tag/parent_names
+   * writes). Sync, like `db` and `transaction`. Exposed (vault#550 fold)
+   * so per-query consumers — the `unknown_tag` warning collector — reuse
+   * the cache instead of re-scanning the `tags` table per request. Treat
+   * the returned object as READ-ONLY shared state.
+   */
+  getTagHierarchy(): TagHierarchy;
   /**
    * `expanded_count` (vault#550): distinct notes matching the tag OR any
    * transitive descendant under the DEFAULT (subtypes) expansion axis,
