@@ -42,10 +42,13 @@ import {
   filterNotesByTagScope,
   noteWithinTagScope,
   scrubIndexedFieldConflictError,
+  scrubParentCycleError,
+  scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
+import { ParentCycleError } from "../core/src/tag-schemas.ts";
 import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
@@ -2665,6 +2668,29 @@ export async function handleTags(
           400,
         );
       }
+      if (err instanceof ParentCycleError) {
+        // vault#552: parent_names would close a cycle. Nothing was
+        // persisted. Scope-scrub the cycle path for a tag-scoped caller —
+        // the write stays rejected either way. `error` is a SHORT code and
+        // `message` the human sentence — the same split every sibling 409 in
+        // this file uses (target_exists, tag_in_use_by_tokens,
+        // tag_referenced_as_parent). parachute-surface's shared VaultClient
+        // 409 handler reads `body.message` (falling back to a hardcoded
+        // "Note was edited elsewhere"), so the message key is load-bearing:
+        // without it the Tags parent_names editor would show the wrong
+        // conflict text.
+        const scrubbed = scrubParentCycleError(err, tagScope.allowed);
+        return json(
+          {
+            error: "ParentCycle",
+            error_type: "parent_cycle",
+            tag: scrubbed.tag,
+            cycle: scrubbed.cycle,
+            message: scrubbed.message,
+          },
+          409,
+        );
+      }
       throw err;
     }
     return json(result);
@@ -2692,7 +2718,33 @@ export async function handleTags(
         409,
       );
     }
-    return json(await store.deleteTag(tagName));
+    // `?cascade=true` / `?detach=true` (synonyms — see DeleteTagOpts):
+    // required to delete a tag another tag's parent_names still references
+    // (vault#552). Query params, not a DELETE body, so the flag is visible
+    // in access logs and works with any HTTP client without body support.
+    const cascade = parseBool(parseQuery(url, "cascade"), false);
+    const detach = parseBool(parseQuery(url, "detach"), false);
+    const result = await store.deleteTag(tagName, { cascade, detach });
+    if ("error" in result) {
+      // Referential-integrity refusal (vault#552). Scope-scrub the
+      // referencing tag names for a tag-scoped caller — the delete is
+      // still refused (integrity is scope-independent), but an
+      // out-of-scope referrer's name must not leak. Same posture as
+      // `tag_field_conflict`'s scrub.
+      const referencing_tags = scrubReferencingTagsByScope(result.referencing_tags, tagScope.allowed);
+      return json(
+        {
+          error: "TagReferencedAsParent",
+          error_type: "tag_referenced_as_parent",
+          tag: tagName,
+          referencing_tags,
+          message: `Tag "${tagName}" is referenced by ${referencing_tags.length} other tag(s)' parent_names; pass ?cascade=true or ?detach=true to also remove the reference, or update the referencing tag(s) first.`,
+          hint: "pass ?cascade=true or ?detach=true, or fix the referencing tag(s)' parent_names first",
+        },
+        409,
+      );
+    }
+    return json(result);
   }
 
   return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
@@ -2922,6 +2974,27 @@ export function handleUnresolvedWikilinks(
     return note !== null && noteWithinTagScope(note, tagScope.allowed, tagScope.raw);
   });
   return Response.json({ unresolved: filtered, count: filtered.length });
+}
+
+// ---------------------------------------------------------------------------
+// Doctor — GET /api/doctor (vault#552, admin-gated in routing.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /vault/{name}/api/doctor` — read-only taxonomy/metadata integrity
+ * scan. Method + `vault:admin` scope are already enforced by the caller
+ * (`src/routing.ts`, dispatched before the generic read/write gate — same
+ * shape as `/api/triggers`); this handler just runs the scan with the
+ * caller's tag-scope allowlist. See `core/src/doctor.ts` for the finding
+ * catalog.
+ */
+export async function handleDoctor(
+  _req: Request,
+  store: Store,
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
+): Promise<Response> {
+  const report = await store.doctor({ allowedTags: tagScope.allowed });
+  return json(report);
 }
 
 // ---------------------------------------------------------------------------

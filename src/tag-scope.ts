@@ -21,7 +21,11 @@
 
 import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
 import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
+import { ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+
+/** Generic replacement for a redacted out-of-scope tag name — never the real name. */
+const OUT_OF_SCOPE_LABEL = "(outside your token's tag scope)";
 
 /**
  * Build the effective tag-allowlist for a token: union of `{root} ∪
@@ -231,6 +235,45 @@ export function scrubIndexedFieldConflictError(
   return new IndexedFieldError(
     `field "${err.field ?? "?"}" is already indexed by another tag (outside your token's tag scope) with a conflicting type. Types must agree across all declarers.`,
   );
+}
+
+/**
+ * Scrub the `referencing_tags` list on a `tag_referenced_as_parent` refusal
+ * (vault#552 — deleteTag's referential-integrity guard) for a tag-scoped
+ * caller. The delete is refused regardless of scope (referential integrity
+ * is scope-independent, same posture as `tag_field_conflict`), but a
+ * referencing tag OUTSIDE the caller's allowlist must not be named — same
+ * "in doubt, scrub" convention `scrubTagFieldViolationsByScope` uses.
+ * No-op for unscoped callers (`allowed === null`).
+ */
+export function scrubReferencingTagsByScope(
+  referencing: string[],
+  allowed: Set<string> | null,
+): string[] {
+  if (allowed === null) return referencing;
+  return referencing.map((t) => (allowed.has(t) ? t : OUT_OF_SCOPE_LABEL));
+}
+
+/**
+ * Scrub a `ParentCycleError`'s `cycle` path (vault#552 — the `parent_names`
+ * cycle guard) for a tag-scoped caller. The write is still rejected — a
+ * cycle is a structural problem independent of who's asking — but the
+ * cycle path can walk through tags OUTSIDE the caller's allowlist (the
+ * hierarchy `upsertTagRecord` validates against is vault-wide, scope-unaware
+ * by architecture, same as the cross-tag field checks). Returns a
+ * REPLACEMENT error with out-of-scope hops in `cycle` generalized; the
+ * caller's own tag (`err.tag`) is always in-scope by the time this runs (the
+ * update-tag wrapper already gates on it) so it's never redacted. No-op for
+ * unscoped callers or a cycle with no out-of-scope hop.
+ */
+export function scrubParentCycleError(
+  err: ParentCycleError,
+  allowed: Set<string> | null,
+): ParentCycleError {
+  if (allowed === null) return err;
+  if (err.cycle.every((t) => allowed.has(t))) return err;
+  const scrubbedCycle = err.cycle.map((t) => (allowed.has(t) ? t : OUT_OF_SCOPE_LABEL));
+  return new ParentCycleError(err.tag, scrubbedCycle);
 }
 
 /**

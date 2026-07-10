@@ -6,6 +6,7 @@ import type { SearchMode } from "./search-query.js";
 import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
+import type { DoctorReport, DoctorScanOpts } from "./doctor.js";
 
 // ---- Re-exports ----
 
@@ -14,6 +15,7 @@ export type { PrunedField } from "./indexed-fields.js";
 export type { TagExpandMode, TagHierarchy } from "./tag-hierarchy.js";
 export type { ConformanceReport } from "./conformance.js";
 export type { FindPathResult } from "./links.js";
+export type { DoctorReport, DoctorFinding, DoctorFindingType, DoctorSeverity, DoctorScanOpts } from "./doctor.js";
 
 // ---- Note ----
 
@@ -364,7 +366,20 @@ export interface Store {
    * alongside the literal `count`. See `core/src/tag-hierarchy.ts:computeExpandedTagCounts`.
    */
   listTags(): Promise<{ name: string; count: number; expanded_count: number }[]>;
-  deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
+  /**
+   * Delete a tag. Refused (vault#552) when another tag's `parent_names`
+   * still references it — pass `cascade` or `detach` (synonyms; either
+   * strips the stale reference from the referencing tags' `parent_names`
+   * in the same transaction) to proceed anyway. Notes are never deleted,
+   * only untagged.
+   */
+  deleteTag(
+    name: string,
+    opts?: { cascade?: boolean; detach?: boolean },
+  ): Promise<
+    | { deleted: boolean; notes_untagged: number; parent_refs_detached?: number }
+    | { error: "tag_referenced_as_parent"; referencing_tags: string[] }
+  >;
   renameTag(
     oldName: string,
     newName: string,
@@ -430,6 +445,13 @@ export interface Store {
    * vault would. Returns the count of (tag, field) declarations replayed.
    */
   reconcileDeclaredIndexes(): Promise<number>;
+
+  /**
+   * Read-only taxonomy/metadata integrity scan (vault#552). Never mutates —
+   * every finding carries a suggested `remedy` the caller applies
+   * deliberately. See `core/src/doctor.ts` for the finding-type catalog.
+   */
+  doctor(opts?: DoctorScanOpts): Promise<DoctorReport>;
 
   // Tag records — full v14 identity row (description + fields + typed
   // relationships + parent_names + timestamps). See

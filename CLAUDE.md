@@ -45,15 +45,17 @@ Metadata is a JSON column on notes, links, and attachments. Queryable via `json_
 
 Path is unique (when set), normalized (no .md, no trailing slashes), and used for wikilink resolution.
 
-### MCP Tools (9)
+### MCP Tools (13, +1 server-layer)
 
 Notes: `query-notes` (single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata merge), `delete-note`
 
-Tags: `list-tags` (with optional schema detail), `update-tag` (upsert schema), `delete-tag`
+Tags: `list-tags` (with optional schema detail), `update-tag` (upsert schema), `delete-tag` (cascade/detach flags — vault#552), `rename-tag` (atomic cascading rename — vault#552), `merge-tags` (N sources → one target — vault#552)
 
 Graph: `find-path` (BFS shortest path)
 
 Vault: `vault-info` (get/update description + stats)
+
+Admin: `prune-schema` (drop orphaned indexed-field columns), `doctor` (read-only taxonomy/metadata integrity scan — vault#552); `manage-token` is appended at the server layer (src/mcp-tools.ts), not generated in core.
 
 
 ## Bun-native

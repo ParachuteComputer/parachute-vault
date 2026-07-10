@@ -76,6 +76,7 @@ import { readdirSync, readFileSync, realpathSync, statSync, mkdirSync, writeFile
 import { basename, join, relative, extname, dirname, resolve as resolvePath, sep as pathSep } from "path";
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
+import { ParentCycleError } from "./tag-schemas.js";
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -1631,6 +1632,17 @@ export interface ImportStats {
    * content file during the walk.
    */
   skipped_sidecars: Array<{ sidecar_id: string; expected_path: string | null; expected_extension: string | null; reason: string }>;
+  /**
+   * Tag schemas whose `parent_names` was DROPPED on restore because it
+   * would have created a hierarchy cycle (vault#552 — the write-time cycle
+   * guard in `upsertTagRecord`). The tag itself is still restored (its
+   * description/fields/relationships land); only the offending
+   * `parent_names` is skipped, so the import completes instead of aborting
+   * mid-flight on an uncaught `ParentCycleError`. An OLD export that carried
+   * a mutual-cycle fixture (accepted before the guard shipped) still
+   * imports — the cycle is warned, not fatal. Empty in the common case.
+   */
+  skipped_schema_parents: Array<{ tag: string; parent_names: string[]; reason: string }>;
   /** Set when the caller passed `blowAway: true`; counts notes removed. */
   notes_wiped: number;
   /**
@@ -1802,6 +1814,7 @@ export async function importVault(
     skipped_links: [],
     skipped_attachments: [],
     skipped_sidecars: [],
+    skipped_schema_parents: [],
     notes_wiped: 0,
     indexes_declared: 0,
   };
@@ -1821,10 +1834,18 @@ export async function importVault(
       }
     }
     // Clear tag rows too — `deleteNote` clears note_tags via FK cascade but
-    // leaves the `tags` table rows in place (orphaned schemas).
+    // leaves the `tags` table rows in place (orphaned schemas). `cascade:
+    // true` is REQUIRED here (vault#552): a blow-away is a full wipe, and
+    // `listTagRecords` returns rows `ORDER BY name`, so a namespace parent
+    // (`task`) sorts before its child (`task/work`) and is visited while the
+    // child's `parent_names` still references it — without `cascade`,
+    // `deleteTag` would RETURN `{error: "tag_referenced_as_parent"}` (it no
+    // longer throws) and silently leave the parent's row behind, defeating
+    // the "clean slate." Since we're deleting every tag anyway, cascading the
+    // parent_names strip is exactly right.
     const tagRecords = await store.listTagRecords();
     for (const tag of tagRecords) {
-      await store.deleteTag(tag.tag);
+      await store.deleteTag(tag.tag, { cascade: true });
     }
   }
 
@@ -1842,12 +1863,37 @@ export async function importVault(
       stats.schemas_restored++;
       continue;
     }
-    await store.upsertTagRecord(tagName, {
+    const parentNames = (frontmatter.parent_names as string[] | null | undefined) ?? null;
+    const patch = {
       description: (frontmatter.description as string | null | undefined) ?? null,
       fields: (frontmatter.fields as Record<string, unknown> | null | undefined) as any ?? null,
       relationships: (frontmatter.relationships as Record<string, unknown> | null | undefined) as any ?? null,
-      parent_names: (frontmatter.parent_names as string[] | null | undefined) ?? null,
-    });
+      parent_names: parentNames,
+    };
+    try {
+      await store.upsertTagRecord(tagName, patch);
+    } catch (err) {
+      // vault#552: the write-time cycle guard rejects a `parent_names` that
+      // would close a hierarchy cycle. An OLD export carrying a mutual-cycle
+      // fixture (accepted before the guard shipped) must still import —
+      // dropping the offending `parent_names` and warning, not aborting the
+      // whole import mid-flight (import isn't atomic; on a blow-away replace
+      // the vault was already wiped in step 1, so an uncaught throw here
+      // would leave it EMPTY). Retry WITHOUT parent_names so the tag's
+      // description/fields/relationships still land; record a skip warning
+      // mirroring the skipped_links/skipped_attachments/skipped_sidecars
+      // precedent. Any OTHER error still propagates.
+      if (err instanceof ParentCycleError) {
+        stats.skipped_schema_parents.push({
+          tag: tagName,
+          parent_names: parentNames ?? [],
+          reason: `parent_names would create a hierarchy cycle (${err.cycle.join(" → ")}); dropped on import`,
+        });
+        await store.upsertTagRecord(tagName, { ...patch, parent_names: null });
+      } else {
+        throw err;
+      }
+    }
     stats.schemas_restored++;
   }
 

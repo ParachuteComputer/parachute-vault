@@ -190,9 +190,11 @@ export interface GenerateMcpToolsOpts {
 }
 
 /**
- * Generate the consolidated MCP tools for a vault. Surface (10):
+ * Generate the consolidated MCP tools for a vault. Surface (13):
  * query-notes, create-note, update-note, delete-note, list-tags, update-tag,
- * delete-tag, find-path, vault-info, prune-schema (admin).
+ * delete-tag, rename-tag, merge-tags, find-path, vault-info, prune-schema
+ * (admin), doctor (admin). `manage-token` (admin) is appended by the SERVER
+ * layer (src/mcp-tools.ts), not here — see that file's doc comment.
  */
 export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): McpToolDef[] {
   const db: Database = store.db;
@@ -1716,11 +1718,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // mgmt + future config writes; deletes are write-tier mutations.
       // See delete-note rationale.
       requiredVerb: "write",
-      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged.",
+      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway.",
       inputSchema: {
         type: "object",
         properties: {
           tag: { type: "string", description: "Tag name to delete" },
+          cascade: { type: "boolean", description: "Proceed even though another tag's parent_names references this one, stripping the reference. Synonym of detach." },
+          detach: { type: "boolean", description: "Same as cascade — proceed and strip the stale parent_names reference from referencing tag(s)." },
         },
         required: ["tag"],
       },
@@ -1731,8 +1735,107 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         // Indexed-field release is handled inside store.deleteTag →
         // noteOps.deleteTag so every entry point (MCP, REST, import sweep)
         // releases consistently with the co-declaration guard. See the
-        // gitcoin orphaned-fields bug report.
-        return await store.deleteTag(tag);
+        // gitcoin orphaned-fields bug report. The referential-integrity
+        // guard (vault#552) is ALSO inside store.deleteTag, so it returns
+        // (not throws) `{error: "tag_referenced_as_parent", ...}` when
+        // refused — same in-band shape delete-tag has always used for its
+        // token-reference guard (applyTagDependencyGuards, src/mcp-tools.ts).
+        return await store.deleteTag(tag, {
+          cascade: params.cascade === true,
+          detach: params.detach === true,
+        });
+      },
+    },
+
+    // =====================================================================
+    // 7a. rename-tag — atomic cascading rename (vault#552 MCP parity)
+    // =====================================================================
+    {
+      name: "rename-tag",
+      requiredVerb: "write",
+      description:
+        "Atomically rename a tag across EVERY surface that references it: note memberships, OTHER tags' parent_names, tag-scoped tokens' allowlists, indexed-field declarer lists, inline #tag mentions in note bodies, and _tags/<name> config-note paths — all in one transaction. THIS is the fix for the manual retag→delete dance (create the new tag, retag notes, delete the old one): that dance silently orphans parent_names references (the renamed-away tag stays a live query surface via subtype expansion while list-tags reports it at count 0, and the new tag misses every child-tagged note) and leaves stale #tag mentions behind. Sub-tags rename recursively — renaming \"task\" to \"todo\" also renames \"task/work\" to \"todo/work\". Does NOT rewrite metadata values that happen to equal the old tag name (e.g. metadata.epic: \"task\") — that's a distinct drift class the doctor tool's dead_tag_metadata_reference finding flags heuristically; rename-tag's job is structural (tags/note_tags/parent_names/tokens/content), not a blind string search-and-replace over arbitrary metadata.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          old_name: { type: "string", description: "The tag to rename. Aliases: from, tag." },
+          new_name: { type: "string", description: "The new name. Alias: to." },
+          from: { type: "string", description: "Alias for old_name." },
+          to: { type: "string", description: "Alias for new_name." },
+          tag: { type: "string", description: "Alias for old_name." },
+        },
+      },
+      execute: async (params) => {
+        const oldName = (params.old_name ?? params.from ?? params.tag) as string | undefined;
+        const newName = (params.new_name ?? params.to) as string | undefined;
+        if (typeof oldName !== "string" || oldName.length === 0) {
+          throw structuredError("rename-tag: old_name (or from/tag) is required", {
+            error_type: "invalid_request",
+            field: "old_name",
+          });
+        }
+        if (typeof newName !== "string" || newName.length === 0) {
+          throw structuredError("rename-tag: new_name (or to) is required", {
+            error_type: "invalid_request",
+            field: "new_name",
+          });
+        }
+        const result = await store.renameTag(oldName, newName);
+        if ("error" in result) {
+          if (result.error === "not_found") {
+            throw structuredError(`rename-tag: tag "${oldName}" not found`, {
+              error_type: "tag_not_found",
+              field: "old_name",
+            });
+          }
+          throw Object.assign(
+            new Error(
+              `rename-tag: target "${newName}" (or one of its sub-tags) already exists — use merge-tags to combine them instead`,
+            ),
+            {
+              error_type: "target_exists" as const,
+              target: newName,
+              conflicting: result.conflicting,
+              hint: "use merge-tags to combine the tags instead",
+            },
+          );
+        }
+        return result;
+      },
+    },
+
+    // =====================================================================
+    // 7b. merge-tags — same machinery, N sources → one target
+    // =====================================================================
+    {
+      name: "merge-tags",
+      requiredVerb: "write",
+      description:
+        "Atomically merge one or more source tags into a target tag: every note carrying any source is retagged with the target, then the source tags (and their identity rows — description/fields/relationships/parent_names) are dropped. target is created if it doesn't exist yet; target's own schema is preserved (sources' schemas are consumed, not merged field-by-field). Sources that don't exist are reported at count 0. Refused with error_type \"tag_in_use_by_tokens\" if a source is referenced by a tag-scoped token — revoke or re-mint it first.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sources: { type: "array", items: { type: "string" }, description: "Tag names to merge away into target." },
+          target: { type: "string", description: "The tag that survives; sources are retagged onto it and dropped." },
+        },
+        required: ["sources", "target"],
+      },
+      execute: async (params) => {
+        const sources = params.sources;
+        const target = params.target;
+        if (!Array.isArray(sources) || sources.length === 0 || !sources.every((s) => typeof s === "string" && s.length > 0)) {
+          throw structuredError("merge-tags: sources must be a non-empty array of strings", {
+            error_type: "invalid_request",
+            field: "sources",
+          });
+        }
+        if (typeof target !== "string" || target.length === 0) {
+          throw structuredError("merge-tags: target must be a non-empty string", {
+            error_type: "invalid_request",
+            field: "target",
+          });
+        }
+        return await store.mergeTags(sources as string[], target);
       },
     },
 
@@ -1819,6 +1922,22 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             ? `pruned ${dropped.length} orphaned field(s); trimmed dead declarers on ${trimmed.length} co-declared field(s)`
             : `would prune ${dropped.length} orphaned field(s); would trim dead declarers on ${trimmed.length} co-declared field(s) — pass apply:true to execute`,
         };
+      },
+    },
+
+    // =====================================================================
+    // 11. doctor — read-only taxonomy/metadata integrity scan (vault#552)
+    // =====================================================================
+    {
+      name: "doctor",
+      // `admin` — same tier as prune-schema: a diagnostic over the WHOLE
+      // vault's taxonomy, not scoped to any one tag's write authority.
+      requiredVerb: "admin",
+      description:
+        "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Reports, per finding, {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
+      inputSchema: { type: "object", properties: {} },
+      execute: async () => {
+        return await store.doctor();
       },
     },
 

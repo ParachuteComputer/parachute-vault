@@ -484,7 +484,7 @@ describe("deeper link queries", async () => {
 describe("MCP tools", async () => {
   test("generates the consolidated tool set", () => {
     const tools = generateMcpTools(store);
-    expect(tools.length).toBe(10);
+    expect(tools.length).toBe(13);
 
     const names = tools.map((t) => t.name);
     expect(names).toContain("query-notes");
@@ -498,6 +498,12 @@ describe("MCP tools", async () => {
     expect(names).toContain("vault-info");
     // prune-schema (admin) — drops orphaned indexed-field columns.
     expect(names).toContain("prune-schema");
+    // rename-tag / merge-tags (vault#552) — MCP parity with the pre-existing
+    // REST engine.
+    expect(names).toContain("rename-tag");
+    expect(names).toContain("merge-tags");
+    // doctor (admin, vault#552) — read-only taxonomy/metadata integrity scan.
+    expect(names).toContain("doctor");
     // Six note-schema MCP tools (list/update/delete-note-schema +
     // list/set/delete-schema-mapping) retired in v17 — vault#267.
     expect(names).not.toContain("list-note-schemas");
@@ -5414,8 +5420,11 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).not.toContain("delete-note");
     expect(toolNames).not.toContain("update-tag");
     expect(toolNames).not.toContain("delete-tag");
+    expect(toolNames).not.toContain("rename-tag");
+    expect(toolNames).not.toContain("merge-tags");
     // Admin tools (vault#376) are hidden too
     expect(toolNames).not.toContain("manage-token");
+    expect(toolNames).not.toContain("doctor");
     // Read tier is exactly 4 tools.
     expect(toolNames.length).toBe(4);
 
@@ -5658,7 +5667,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names.length).toBe(4);
   });
 
-  test("vault:read + vault:write sees the 9 read+write tools", async () => {
+  test("vault:read + vault:write sees the 11 read+write tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(new Set(names)).toEqual(
       new Set([
@@ -5671,24 +5680,31 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
         "delete-note",
         "update-tag",
         "delete-tag",
+        // vault#552: MCP parity with the pre-existing REST rename/merge engine.
+        "rename-tag",
+        "merge-tags",
       ]),
     );
-    expect(names.length).toBe(9);
+    expect(names.length).toBe(11);
     expect(names).not.toContain("manage-token");
+    expect(names).not.toContain("doctor");
     // Aaron 2026-05-27: delete-* are write-tier (same destructive verb as
-    // update). Only manage-token is admin-gated.
+    // update). Only manage-token/prune-schema/doctor are admin-gated.
     expect(names).toContain("delete-note");
     expect(names).toContain("delete-tag");
   });
 
-  test("vault:admin sees all 11 tools including manage-token + prune-schema", async () => {
+  test("vault:admin sees all 14 tools including manage-token + prune-schema + doctor", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
-    expect(names.length).toBe(11);
+    expect(names).toContain("doctor");
+    expect(names).toContain("rename-tag");
+    expect(names).toContain("merge-tags");
+    expect(names.length).toBe(14);
   });
 
-  test("legacy-derived full token sees all 11 tools (back-compat)", async () => {
+  test("legacy-derived full token sees all 14 tools (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -5721,9 +5737,10 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(11);
+    expect(names.length).toBe(14);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
+    expect(names).toContain("doctor");
     closeAllStores();
   });
 
