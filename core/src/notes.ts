@@ -22,7 +22,12 @@ import {
 import { getIndexedField, releaseField } from "./indexed-fields.js";
 import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
-import { buildLiteralSearchQuery, type SearchMode } from "./search-query.js";
+import {
+  buildLiteralSearchQuery,
+  SEARCH_WEIGHT_PATH,
+  SEARCH_WEIGHT_CONTENT,
+  type SearchMode,
+} from "./search-query.js";
 
 let idCounter = 0;
 
@@ -1336,12 +1341,41 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
  *     invariant is ever broken it still surfaces as an honest error, not a
  *     500. Signals a vault bug worth reporting.
  */
+/**
+ * FTS5's own error text for a syntax mistake is written for someone who
+ * already knows FTS5's grammar — "no such column: espresso" for a bare
+ * leading `-espresso` (NOT with no left-hand term — FTS5's `-`/`NOT` is a
+ * BINARY operator, so a lone `-token` with nothing before it gets
+ * misparsed as `column:term` filter syntax and fails looking for a column
+ * named after the token) is confusing/leaky rather than actionable: it
+ * reads as if a column literally named "espresso" was expected, which
+ * exposes FTS5-internal parsing behavior instead of explaining the actual
+ * mistake (vault#551 WS2B item 4 — interim harness finding). Detected
+ * generically off the FTS5 error text (`/no such column:/i`) rather than
+ * re-parsing the query ourselves, since the SAME message also covers the
+ * other real cause (an explicit `column:term` filter naming a column that
+ * isn't one of `notes_fts`'s declared columns, `path`/`content`) — the hint
+ * below covers both without claiming to know which one happened.
+ */
+function advancedModeColumnHint(causeMessage: string): string | null {
+  if (!/no such column:/i.test(causeMessage)) return null;
+  return (
+    `FTS5 read part of this query as column-filter syntax ("column:term") or as a ` +
+    `leading "-" with no term to its left — NOT/"-" is a BINARY operator in FTS5 ` +
+    `("good -bad", not "-bad" alone). Indexed columns are "path" and "content". ` +
+    `Add a preceding positive term before a NOT, quote the phrase to search it ` +
+    `literally, or use search_mode:"literal" (the default) to skip advanced syntax entirely.`
+  );
+}
+
 function searchSyntaxError(rawQuery: string, err: unknown, mode: SearchMode): QueryError {
   const causeMessage = err instanceof Error ? err.message : String(err);
+  const columnHint = mode === "advanced" ? advancedModeColumnHint(causeMessage) : null;
   const hint =
-    mode === "advanced"
+    columnHint ??
+    (mode === "advanced"
       ? `FTS5 rejected this as advanced query syntax (${causeMessage}). Fix the syntax, or omit search_mode:"advanced" for literal (punctuation-safe) search.`
-      : `FTS5 rejected the escaped literal query (${causeMessage}) — this should be impossible after literal-mode escaping + control-char sanitization; please report it as a vault bug.`;
+      : `FTS5 rejected the escaped literal query (${causeMessage}) — this should be impossible after literal-mode escaping + control-char sanitization; please report it as a vault bug.`);
   return new QueryError(`invalid search syntax: ${causeMessage}`, "INVALID_QUERY", {
     error_type: "invalid_search_syntax",
     field: "search",
@@ -1377,20 +1411,33 @@ export function searchNotes(
     ftsQuery = query;
   }
 
+  // Weighted bm25 relevance expression (vault#551 WS2C, schema v25):
+  // `notes_fts` now indexes `path` (title, column 0) then `content` (body,
+  // column 1) — SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT bias ranking so a
+  // title match outranks a passing body mention. Raw SQLite bm25 is
+  // negative-is-better; `-1.0 * bm25(...)` flips it so bigger is more
+  // relevant (see `Note.score`'s doc comment for the external contract).
+  // The weights are our own numeric constants (not user input) interpolated
+  // directly — bm25()'s weight arguments are positional per-column
+  // multipliers, not general SQL expressions callers can influence.
+  const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT}))`;
+
   // `sort` honored under search (vault#551 WS2A item 3): default stays FTS5
-  // relevance (`rank`, unchanged); an EXPLICIT `sort: "asc"|"desc"` switches
-  // to `created_at` ordering. Checked against the literal string values (not
-  // truthiness) so an absent `sort` can never accidentally match a branch.
-  // `n.id ${direction}` is appended as a deterministic tiebreaker — same
-  // rationale as `queryNotes` (two notes at the same created_at millisecond
-  // would otherwise return in arbitrary/unstable order). `rank` needs no
-  // tiebreaker (bm25 score is effectively unique per row).
+  // relevance (the weighted `score` expression); an EXPLICIT
+  // `sort: "asc"|"desc"` switches to `created_at` ordering. Checked against
+  // the literal string values (not truthiness) so an absent `sort` can
+  // never accidentally match a branch. `n.id ${direction}` is appended as a
+  // deterministic tiebreaker in every branch — two notes at the same
+  // created_at millisecond (structured-sort branches) OR with an
+  // identical weighted score (relevance branch — much more likely than
+  // with unweighted `rank`, since many notes share "zero path matches")
+  // would otherwise return in arbitrary/unstable order.
   const orderBy =
     opts?.sort === "asc"
       ? "n.created_at ASC, n.id ASC"
       : opts?.sort === "desc"
         ? "n.created_at DESC, n.id DESC"
-        : "rank";
+        : "score DESC, n.id ASC";
 
   if (opts?.tags && opts.tags.length > 0) {
     // Canonical-bare-tag guard backstop (vault#XXX) for direct-core callers.
@@ -1406,14 +1453,14 @@ export function searchNotes(
       // DISTINCT over full rows. The FTS join itself is 1:1 on rowid.
       const tagPlaceholders = searchTags.map(() => "?").join(", ");
       const rows = db.prepare(`
-        SELECT n.* FROM notes n
+        SELECT n.*, ${scoreExpr} AS score FROM notes n
         JOIN notes_fts fts ON fts.rowid = n.rowid
         WHERE notes_fts MATCH ?
           AND n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${tagPlaceholders}))
         ORDER BY ${orderBy}
         LIMIT ?
-      `).all(ftsQuery, ...searchTags, limit) as NoteRow[];
-      return notesWithTags(db, rows);
+      `).all(ftsQuery, ...searchTags, limit) as (NoteRow & { score: number })[];
+      return notesWithTags(db, rows, scoresById(rows));
     } catch (err) {
       // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
       // advanced mode expects it (the caller passed raw syntax); literal
@@ -1429,25 +1476,42 @@ export function searchNotes(
 
   try {
     const rows = db.prepare(`
-      SELECT n.* FROM notes n
+      SELECT n.*, ${scoreExpr} AS score FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
       ORDER BY ${orderBy}
       LIMIT ?
-    `).all(ftsQuery, limit) as NoteRow[];
-    return notesWithTags(db, rows);
+    `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
+    return notesWithTags(db, rows, scoresById(rows));
   } catch (err) {
     if (err instanceof QueryError) throw err;
     throw searchSyntaxError(query, err, mode);
   }
 }
 
-/** Map rows → Notes with tags hydrated in one batched query. */
-function notesWithTags(db: Database, rows: NoteRow[]): Note[] {
+/**
+ * Map rows → Notes with tags hydrated in one batched query. `scores`
+ * (vault#551 WS2C) is an optional id → weighted-bm25-score map, attached
+ * onto each returned `Note.score` when present — ONLY `searchNotes`'s two
+ * callers pass it; every other caller (plain `queryNotes`, `getNotesByIds`,
+ * ...) omits it and gets byte-identical output to before `score` existed.
+ */
+function notesWithTags(db: Database, rows: NoteRow[], scores?: Map<string, number>): Note[] {
   const notes = rows.map(rowToNote);
   const tagsById = getNoteTagsForNotes(db, notes.map((n) => n.id));
-  for (const note of notes) note.tags = tagsById.get(note.id) ?? [];
+  for (const note of notes) {
+    note.tags = tagsById.get(note.id) ?? [];
+    if (scores) {
+      const s = scores.get(note.id);
+      if (s !== undefined) note.score = s;
+    }
+  }
   return notes;
+}
+
+/** Build an id → score map from search result rows carrying a `score` column. */
+function scoresById(rows: (NoteRow & { score: number })[]): Map<string, number> {
+  return new Map(rows.map((r) => [r.id, r.score]));
 }
 
 // ---- Tag Operations ----
@@ -2120,6 +2184,7 @@ export function toNoteIndex(note: Note): NoteIndex {
     metadata: note.metadata,
     byteSize,
     preview,
+    ...(note.score !== undefined ? { score: note.score } : {}),
   };
 }
 

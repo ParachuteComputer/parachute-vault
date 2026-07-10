@@ -166,6 +166,7 @@ with a structured envelope:
   updatedAt?: string;
   tags?: string[];
   validation_status?: ValidationStatus;  // present when any tag declares fields
+  score?: number;  // vault#551 — search results ONLY; higher = more relevant, see "Full-text search" below
 }
 ```
 
@@ -185,6 +186,7 @@ collapsed).
   metadata?: Record<string, unknown>;
   byteSize: number;  // UTF-8 bytes of the full content
   preview: string;   // first ~120 chars, single line
+  score?: number;    // vault#551 — search results ONLY, carried onto the lean shape too (search's default response IS NoteIndex[])
 }
 ```
 
@@ -355,6 +357,11 @@ Warning codes today:
   `search=` (the mode only shapes how `search` text becomes an FTS5 query).
   Carries `param`. Structured-query only (by construction — this fires
   precisely because `search=` was absent).
+- `search_did_you_mean` (vault#551 WS2B, schema v25) — `search=` returned
+  ZERO results and a spelling suggestion cleared the similarity bar
+  (edit-distance against the FTS5 vocabulary + tag names). Carries `query`
+  and `did_you_mean`. `search=` only, only on a zero-result query, and only
+  for UNSCOPED sessions (the suggestion is computed vault-wide — see below).
 
 **Surfacing differs by response shape** (compat-preserving — this is why
 it's additive, not a breaking wire-shape change):
@@ -372,10 +379,11 @@ it's additive, not a breaking wire-shape change):
   `{nodes, edges}` for `?format=graph`) carry `warnings` INLINE in the body
   when non-empty, in addition to the same header.
 
-Tag-scoped tokens never see `unknown_tag`/`did_you_mean` — both are
-computed against the full vault-wide tag catalog, and surfacing them to a
-scoped session would leak an out-of-scope tag's name/existence across the
-scope boundary (this codebase's standing "no leak" stance — see
+Tag-scoped tokens never see `unknown_tag`/`did_you_mean` or
+`search_did_you_mean` — all are computed against the full vault-wide tag
+catalog / FTS5 vocabulary, and surfacing them to a scoped session would
+leak an out-of-scope tag's or note's name/existence across the scope
+boundary (this codebase's standing "no leak" stance — see
 [`docs/contracts/tag-scoped-tokens.md`](./contracts/tag-scoped-tokens.md)).
 `removed_param` carries no tag information and is unaffected by scope.
 
@@ -431,6 +439,25 @@ caller-fixable outcome:
   "field": "search",
   "got": "18.6",
   "hint": "FTS5 rejected this as advanced query syntax (fts5: syntax error near \".\"). Fix the syntax, or omit search_mode:\"advanced\" for literal (punctuation-safe) search."
+}
+```
+
+**Wrapped column-filter hint (vault#551 WS2B item 4).** A bare leading
+`-token` in advanced mode (e.g. `search_mode=advanced&search=-espresso`)
+misparses — FTS5's `NOT`/`-` is a BINARY operator, so a lone `-token` with
+nothing to its left gets read as `column:term` filter syntax and fails
+looking for a column literally named after your token. The raw FTS5
+message (`no such column: espresso`) is confusing on its own — the `hint`
+is rewritten for this specific pattern instead of forwarding it verbatim:
+
+```json
+{
+  "error": "invalid search syntax: no such column: espresso",
+  "code": "INVALID_QUERY",
+  "error_type": "invalid_search_syntax",
+  "field": "search",
+  "got": "-espresso",
+  "hint": "FTS5 read part of this query as column-filter syntax (\"column:term\") or as a leading \"-\" with no term to its left — NOT/\"-\" is a BINARY operator in FTS5 (\"good -bad\", not \"-bad\" alone). Indexed columns are \"path\" and \"content\". Add a preceding positive term before a NOT, quote the phrase to search it literally, or use search_mode:\"literal\" (the default) to skip advanced syntax entirely."
 }
 ```
 
@@ -801,6 +828,81 @@ Query params:
     short-circuits to `[]` with an `empty_search` warning instead of
     risking an FTS5 syntax error on a degenerate escaped phrase. See the
     warnings channel above.
+
+- **Recall + ranking legibility** (vault#551 WS2B/C, schema v25 — Wave 7 of
+  the Reliability & Usability Program; the title/path-indexing fix and the
+  `did_you_mean` finding below both came out of the program's interim
+  ground-truth-verified harness round, not the original 32-probe scorecard)
+  - **Title (`path`) is now indexed, alongside `content`.** Before v25,
+    `search=` only matched a note's BODY — a note's title/path was
+    completely unsearchable, which was both a plain recall gap (users
+    naturally expect a title match to be findable) and made "bias ranking
+    toward title" impossible (there was nothing to bias). `search=` now
+    matches a term appearing in EITHER the path or the content.
+  - **Title matches rank far above body-only mentions.** The two indexed
+    columns carry different bm25 weights (10:1, path:content) — a
+    dedicated note whose title contains the search term outranks another
+    note that merely references it once in passing body text. This is the
+    fix for a repeatedly-observed harness finding: a clearly-on-topic
+    dedicated note buried at position #3–4 behind incidental mentions.
+  - **`score` field.** Every search result (`Note` or `NoteIndex` — carried
+    onto the lean shape too, since search's default response IS
+    `NoteIndex[]`) now carries a `score: number`. Higher is more relevant;
+    the number is only meaningful as a RELATIVE comparison within one
+    result set (different queries have no shared scale). Absent on every
+    non-search response.
+  - **Porter stemming.** The FTS5 tokenizer is now `porter unicode61`
+    (previously bare `unicode61`) — regular English affixes match across
+    forms: `search=firefighter` finds "firefighters", `search=microbe`
+    finds "microbes". This does NOT cover irregular plurals with a
+    consonant change (`wolf`/`wolves`, `knife`/`knives` — Porter is a
+    suffix-stripping algorithm, not a dictionary) or synonyms
+    (microbes/bacteria) — both out of scope for this wave; a genuinely
+    irregular or synonymous term needs to be searched for directly.
+  - **`search_did_you_mean` warning.** A search that returns ZERO results
+    computes a cheap spelling suggestion (edit-distance against the FTS5
+    index's own vocabulary, plus the vault's tag names) and, when one
+    clears the similarity bar, returns a `search_did_you_mean` warning
+    (`{code, message, query, did_you_mean}`) alongside the honest `[]` —
+    e.g. `search=Vasqez` → `did_you_mean: "vasquez"`. Mirrors the tag
+    `did_you_mean` above. Only computed on the already-rare zero-result
+    path (never on the hot "found something" path), and only for UNSCOPED
+    sessions — the suggestion is computed against the whole vault's
+    vocabulary regardless of any tag-scoped token's allowlist, so
+    surfacing it to a scoped caller would leak an out-of-scope note's
+    content across the scope boundary (same "no leak" stance as
+    `unknown_tag`/`did_you_mean` above). A suggestion occasionally reads as
+    a STEMMED form (`propoli` rather than `propolis`) rather than the
+    original dictionary word — the FTS5 vocabulary is the post-stemming
+    index, not a separate dictionary; an accepted tradeoff rather than
+    maintaining a second unstemmed index just for spelling suggestions.
+  - **Known tokenizer limitations (documented, not fixed — not worth
+    fighting FTS5's tokenizer for):**
+    - A fused decimal+unit token like `3.14mm` is ONE token to the
+      tokenizer — `search=3.14` will NOT find content containing
+      `3.14mm`. Search for the fused form itself, or a word boundary
+      around it, instead.
+    - Emoji and other non-alphanumeric symbol characters are dropped by
+      the tokenizer entirely — they're not indexed and can't be searched
+      for.
+  - **Advanced-mode column-filter errors are wrapped.** `search_mode:
+    "advanced"` raw FTS5 syntax can misparse a leading bare `-token` (NOT
+    is a BINARY operator in FTS5 — `x -y`, not `-y` alone) as
+    column-filter syntax (`column:term`), producing a raw
+    `no such column: <token>` error that reads as if a column named after
+    your search term was expected. The `invalid_search_syntax` `hint` now
+    detects this pattern and explains the actual two likely causes (a
+    leading `-` with no left-hand term, or a literal `column:` filter
+    naming something other than `path`/`content`) instead of surfacing the
+    bare FTS5 internals.
+  - **Startup migration (schema v25).** Existing vaults get a one-time,
+    idempotent startup pass (`migrateToV25`) that rebuilds `notes_fts` from
+    its pre-v25 single-column (`content` only) shape into the two-column
+    `path`+`content` shape with porter stemming, then repopulates it from
+    every existing note. A fresh vault (created at v25+) gets the new shape
+    directly from schema creation and never runs the rebuild. No note data
+    is touched — this only rebuilds a derived search index, not `notes`
+    itself.
 
 - **Cursor pagination** (see [Cursor pagination](#cursor-pagination--the-since-last-checked-pattern))
   - `cursor=<opaque>` — switches response to `{notes, next_cursor}`.

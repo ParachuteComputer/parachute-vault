@@ -13,7 +13,14 @@
 
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
-import { collectUnknownTagWarnings, emptySearchWarning, ignoredParamWarning, type QueryWarning } from "../core/src/query-warnings.ts";
+import {
+  collectUnknownTagWarnings,
+  emptySearchWarning,
+  ignoredParamWarning,
+  computeSearchDidYouMean,
+  searchDidYouMeanWarning,
+  type QueryWarning,
+} from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
@@ -1102,6 +1109,22 @@ async function handleNotesInner(
               );
             }
             throw e;
+          }
+          // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
+          // FTS5-vocabulary scan) and ONLY computed on the already-rare
+          // empty-result path, mirroring `unknown_tag`'s did_you_mean.
+          // Gated on `tagScope.allowed === null` (unscoped) — same stance
+          // as `collectUnknownTagWarnings` below: the FTS5 vocabulary spans
+          // the whole vault regardless of scope, so surfacing a suggestion
+          // to a scoped token would leak out-of-scope content's existence
+          // across the scope boundary. Unlike the MCP path, REST enforces
+          // tag-scope inline (no post-hoc wrapper to strip it for us), so
+          // the gate has to live here explicitly.
+          if (rawResults.length === 0 && tagScope.allowed === null) {
+            const suggestion = computeSearchDidYouMean(db, search);
+            if (suggestion) {
+              searchWarnings.push(searchDidYouMeanWarning(search, suggestion));
+            }
           }
         }
         // Tag-scope: drop any result the token isn't permitted to see. Filter

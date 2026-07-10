@@ -5,7 +5,14 @@ import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
-import { collectUnknownTagWarnings, emptySearchWarning, ignoredParamWarning, type QueryWarning } from "./query-warnings.js";
+import {
+  collectUnknownTagWarnings,
+  emptySearchWarning,
+  ignoredParamWarning,
+  computeSearchDidYouMean,
+  searchDidYouMeanWarning,
+  type QueryWarning,
+} from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
@@ -265,7 +272,9 @@ Response shape (vault#550 — three variants, pick by what you passed):
 - Cursor mode (\`cursor\` param present — including \`cursor: ""\` to bootstrap): \`{notes: [...], next_cursor}\`. See \`cursor\` below for the bootstrap flow.
 - Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.
 
-\`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.`,
+\`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.
+
+\`search\` indexes BOTH a note's title (\`path\`) and its \`content\` (vault#551 WS2C, schema v25) — a title match is weighted far above a passing body mention, so a dedicated note on a topic outranks another note that merely references it. Every result carries a \`score\` field (higher = more relevant; only meaningful as a RELATIVE comparison within one result set). Word matching also stems regular English affixes ("firefighter" matches "firefighters", "microbe" matches "microbes") — irregular plurals with a consonant change ("wolf"/"wolves") aren't covered by stemming. A search that returns ZERO results may carry a \`search_did_you_mean\` warning suggesting the closest indexed term when one looks like a likely typo (only unscoped sessions — tag-scoped tokens never see it, since the suggestion is computed vault-wide).`,
       inputSchema: {
         type: "object",
         properties: {
@@ -322,7 +331,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
           search: {
             type: "string",
             description:
-              'Full-text search query. Literal-by-default (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under search (see below) — default is relevance ranking.',
+              'Full-text search query, matched against BOTH a note\'s title (path) and its content — a title match ranks far above a passing body mention. Literal-by-default (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under search (see below) — default is relevance ranking. Matching stems regular affixes ("firefighter"/"firefighters") but not irregular plurals ("wolf"/"wolves"). Results carry a `score` field (higher = more relevant, relative within this result set only). A zero-result search may carry a `search_did_you_mean` warning (unscoped sessions only).',
           },
           search_mode: {
             type: "string",
@@ -603,6 +612,20 @@ Response shape (vault#550 — three variants, pick by what you passed):
               mode,
               sort: params.sort as "asc" | "desc" | undefined,
             });
+            // Zero-result `did_you_mean` (vault#551 WS2B) — cheap (a bounded
+            // FTS5-vocabulary scan) and ONLY computed on the already-rare
+            // empty-result path, mirroring `unknown_tag`'s did_you_mean.
+            // Scope-unaware by construction (same as `collectUnknownTagWarnings`
+            // above) — safe here because `applyTagScopeWrappers`'s
+            // `query-notes` wrapper (`src/mcp-tools.ts`) strips the ENTIRE
+            // `warnings` array for a tag-scoped session before it reaches the
+            // caller, so this never leaks out-of-scope vocabulary to one.
+            if (results.length === 0) {
+              const suggestion = computeSearchDidYouMean(db, params.search as string);
+              if (suggestion) {
+                queryWarnings.push(searchDidYouMeanWarning(params.search as string, suggestion));
+              }
+            }
           }
         } else {
           // --- Structured query ---

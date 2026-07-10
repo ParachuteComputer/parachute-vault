@@ -57,6 +57,21 @@ export interface Note {
    * for the exact degree semantics (self-loop = 2 under `both`).
    */
   linkCount?: number;
+  /**
+   * Full-text search relevance score (vault#551 WS2C — ranking legibility).
+   * ONLY present on results from `search=`/`query-notes{search}` — every
+   * other read path (structured `queryNotes`, `getNoteById`, ...) leaves
+   * this `undefined`. Higher is more relevant — the sign-flipped weighted
+   * `bm25(notes_fts, SEARCH_WEIGHT_PATH, SEARCH_WEIGHT_CONTENT)` value (raw
+   * SQLite bm25 is negative-is-better; flipped here so external callers get
+   * the more intuitive "bigger number wins" convention). Meaningful only
+   * for RELATIVE comparison within one result set — the absolute magnitude
+   * has no fixed scale and isn't comparable across different queries. When
+   * an explicit `sort: "asc"|"desc"` overrides relevance ordering, `score`
+   * is still computed and returned (for legibility) even though it no
+   * longer determines the result order.
+   */
+  score?: number;
 }
 
 // ---- Link ----
@@ -248,6 +263,11 @@ export interface NoteIndex {
   preview: string;
   /** Opt-in link degree (see `Note.linkCount`). */
   linkCount?: number;
+  /** Full-text search relevance score (see `Note.score`). Carried onto the
+   *  lean shape too — search's default response IS the lean `NoteIndex[]`
+   *  (`include_content` is opt-in), so `score` would be invisible in the
+   *  common case if it only lived on the full `Note` shape. */
+  score?: number;
 }
 
 /** Link with hydrated note summaries. */

@@ -316,6 +316,111 @@ describe("contract: search — escaping edge cases, tag-scope, warnings (#551)",
   });
 });
 
+describe("contract: search — recall + ranking legibility (WS2B/C, #551, schema v25)", () => {
+  it("a note's TITLE (path) is now searchable — a term appearing ONLY in path, not content", async () => {
+    await store.createNote("nothing in this body matches the query term", {
+      path: "quarterly-budget-review",
+    });
+    const res = await search("search=budget&include_content=true");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body.some((n: any) => n.path === "quarterly-budget-review")).toBe(true);
+  });
+
+  it("a title match outranks a passing body-only mention — legible via the score field", async () => {
+    await store.createNote("only a passing mention of espresso here, nothing more", {
+      path: "coffee-notes",
+    });
+    await store.createNote("everything about espresso — brewing, grinding, tasting", {
+      path: "espresso",
+    });
+    const res = await search("search=espresso&include_content=true");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    const titleMatchIdx = body.findIndex((n: any) => n.path === "espresso");
+    const bodyMatchIdx = body.findIndex((n: any) => n.path === "coffee-notes");
+    expect(titleMatchIdx).toBeGreaterThanOrEqual(0);
+    expect(bodyMatchIdx).toBeGreaterThanOrEqual(0);
+    expect(titleMatchIdx).toBeLessThan(bodyMatchIdx);
+    for (const n of body) expect(typeof n.score).toBe("number");
+    const scoreOf = (path: string) => body.find((n: any) => n.path === path).score;
+    expect(scoreOf("espresso")).toBeGreaterThan(scoreOf("coffee-notes"));
+  });
+
+  it("score is present on the LEAN (default, no include_content) shape too", async () => {
+    await store.createNote(NOTES.bothWords);
+    const res = await search("search=widgets");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body.length).toBeGreaterThan(0);
+    for (const n of body) expect(typeof n.score).toBe("number");
+  });
+
+  it("porter stemming: singular query matches a plural-only body word", async () => {
+    await store.createNote("the firefighters responded quickly to the call");
+    const res = await search("search=firefighter&include_content=true");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body.some((n: any) => n.content.includes("firefighters"))).toBe(true);
+  });
+
+  it("a zero-result search with a nearby indexed term surfaces a search_did_you_mean warning", async () => {
+    await store.createNote("a note that discusses Vasquez and the incident report");
+    const res = await search("search=Vasqez");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body).toEqual([]);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings).not.toBeNull();
+    const w = warnings!.find((x: any) => x.code === "search_did_you_mean");
+    expect(w).toBeDefined();
+    expect(w.did_you_mean).toBe("vasquez");
+  });
+
+  it("a genuinely zero-result search with NO close vocabulary match carries no did_you_mean warning", async () => {
+    await store.createNote(NOTES.bothWords);
+    const res = await search("search=zzzznonexistentword");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body).toEqual([]);
+    const warnings = decodeWarningsHeader(res);
+    if (warnings) {
+      expect(warnings.some((w: any) => w.code === "search_did_you_mean")).toBe(false);
+    }
+  });
+
+  it("did_you_mean is suppressed for a tag-scoped session (no leak of vault-wide vocabulary)", async () => {
+    // Out-of-scope note carries the near-match term; the scoped token's
+    // own allowlist ("health") sees nothing else. The did_you_mean
+    // suggestion is computed against the WHOLE vault's FTS5 vocabulary
+    // regardless of scope, so a scoped caller must never see it — same
+    // "no leak" stance as `unknown_tag`'s did_you_mean.
+    await store.createNote("a note that discusses Vasquez and the incident report", { tags: ["work"] });
+    const scopedReq = new Request(`${BASE}/notes?search=Vasqez`, { method: "GET" });
+    const res = await handleNotes(scopedReq, store, "", undefined, {
+      allowed: new Set(["health"]),
+      raw: ["health"],
+    });
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body).toEqual([]);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings?.some((w: any) => w.code === "search_did_you_mean")).toBeFalsy();
+  });
+
+  it('search_mode:"advanced" — a lone leading hyphen gets a caller-actionable hint, not raw "no such column" text', async () => {
+    await store.createNote("espresso and coffee content");
+    const res = await search(`search=${encodeURIComponent("-espresso")}&search_mode=advanced`);
+    expect(res.status).toBe(400);
+    const body = await bodyOf(res);
+    expect(body.code).toBe("INVALID_QUERY");
+    expect(body.error_type).toBe("invalid_search_syntax");
+    expect(typeof body.hint).toBe("string");
+    expect(body.hint).toMatch(/BINARY operator/i);
+    expect(body.hint).not.toMatch(/^no such column/i);
+  });
+});
+
 describe("contract: search — MCP parity (#551)", () => {
   it("query-notes: literal-by-default finds punctuation content the same as REST", async () => {
     const tools = generateMcpTools(store);
@@ -355,5 +460,68 @@ describe("contract: search — MCP parity (#551)", () => {
     expect(asc.map((n: any) => n.content)).toEqual(["mcpsortprobe alpha", "mcpsortprobe beta"]);
     const desc = (await query.execute({ search: "mcpsortprobe", sort: "desc", include_content: true })) as any[];
     expect(desc.map((n: any) => n.content)).toEqual(["mcpsortprobe beta", "mcpsortprobe alpha"]);
+  });
+
+  it("query-notes: title match outranks a body-only mention, and results carry a score (parity with REST)", async () => {
+    await store.createNote("only a passing mention of espresso here, nothing more", { path: "coffee-notes" });
+    await store.createNote("everything about espresso — brewing, grinding, tasting", { path: "espresso" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ search: "espresso" })) as any[];
+    const titleIdx = result.findIndex((n: any) => n.path === "espresso");
+    const bodyIdx = result.findIndex((n: any) => n.path === "coffee-notes");
+    expect(titleIdx).toBeGreaterThanOrEqual(0);
+    expect(bodyIdx).toBeGreaterThanOrEqual(0);
+    expect(titleIdx).toBeLessThan(bodyIdx);
+    for (const n of result) expect(typeof n.score).toBe("number");
+  });
+
+  it("query-notes: a note's title (path) is searchable (parity with REST)", async () => {
+    await store.createNote("nothing in this body matches the query term", { path: "quarterly-budget-review" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ search: "budget" })) as any[];
+    expect(result.some((n: any) => n.path === "quarterly-budget-review")).toBe(true);
+  });
+
+  it("query-notes: porter stemming matches a plural-only body word (parity with REST)", async () => {
+    await store.createNote("the firefighters responded quickly to the call");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ search: "firefighter", include_content: true })) as any[];
+    expect(result.some((n: any) => n.content.includes("firefighters"))).toBe(true);
+  });
+
+  it("query-notes: zero-result search with a nearby indexed term surfaces search_did_you_mean", async () => {
+    await store.createNote("a note that discusses Vasquez and the incident report");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ search: "Vasqez" })) as any;
+    // Zero notes + a non-empty warnings array — per the response-shape
+    // contract (vault#550) that's the `{notes, warnings}` envelope, not a
+    // bare array (a bare array can't carry `warnings` at all).
+    expect(Array.isArray(result)).toBe(false);
+    expect(result.notes).toEqual([]);
+    expect(result.warnings).toBeDefined();
+    const w = result.warnings.find((x: any) => x.code === "search_did_you_mean");
+    expect(w).toBeDefined();
+    expect(w.did_you_mean).toBe("vasquez");
+  });
+
+  it('query-notes: search_mode:"advanced" — a lone leading hyphen gets a caller-actionable hint, not raw "no such column" text', async () => {
+    await store.createNote("espresso and coffee content");
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    let err: any;
+    try {
+      await query.execute({ search: "-espresso", search_mode: "advanced" });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.error_type).toBe("invalid_search_syntax");
+    expect(typeof err.hint).toBe("string");
+    expect(err.hint).toMatch(/BINARY operator/i);
+    expect(err.hint).not.toMatch(/^no such column/i);
   });
 });
