@@ -437,6 +437,98 @@ caller-fixable outcome:
 The MCP `query-notes` tool call surfaces the identical `error_type` (via a
 structured JSON-RPC error, `src/mcp-http.ts`).
 
+## Error taxonomy — `error_type` contract table (vault#554, Wave 4)
+
+Every error body an agent or client can receive — REST 4xx/5xx JSON and MCP
+JSON-RPC error `data` — carries a stable `error_type` string, additive to
+whatever transport-specific fields already existed (`error`, `code`, HTTP
+status). Structured fields beyond `error_type` follow one vocabulary:
+`field` (which input), `expected`/`got` (what was wrong), `hint` (how to
+fix it), plus error-specific extras (`violations`, `candidates`, ...).
+**Agents branch on `error_type` alone** — the prose in `error`/`message` is
+for humans and may be reworded across releases; `error_type` strings and
+HTTP statuses are wire contract and do not change without a migration.
+
+On MCP, every error below arrives as a JSON-RPC error whose `data` field
+carries the same shape (`src/mcp-http.ts`'s domain-error mapping); on REST,
+as the JSON response body at the listed HTTP status. Where a row lists two
+statuses, REST and MCP intentionally differ only in HTTP-status framing —
+the `error_type` and fields are identical.
+
+### Write-path conflicts (optimistic concurrency, path, schema)
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `conflict` | 409 | `note_id`, `path`, `current_updated_at`, `your_updated_at` | `if_updated_at` didn't match the note's current `updated_at` — someone else wrote first. Re-read and retry, or `force: true`. |
+| `transition_conflict` | 409 | `note_id`, `path`, `field`, `expected_from`, `to`, `current` | `state_transition`'s compare-and-set: the field's CURRENT value didn't equal `from`. Distinct vocabulary from `conflict` — a value mismatch, not a stale `updated_at` token. |
+| `path_conflict` | 409 | `path` | The requested `path` is already taken by another note (UNIQUE constraint). |
+| `ambiguous_path` | 409 | `path`, `candidates` | The `{idOrPath}` (or a `source`/`target`/note reference) matched more than one note sharing a path but differing extension. Pass `extension` to disambiguate, or use the candidate's ID. |
+| `schema_validation` | 422 | `violations[]` (`{field, reason, message}`) | One or more `strict: true` field constraints were violated. Carries EVERY violation in one response — nothing was written. |
+| `precondition_required` | 428 | `note_id`, `path` | A mutating update needs `if_updated_at` or `force: true` and got neither. Append/prepend-only and transition-only updates are exempt. |
+| `batch_too_large` | 413 | `limit`, `got` | A batch `create-note`/`update-note`/`POST /notes` exceeded the 500-item cap. |
+| `invalid_extension` | 400 | `extension`, `reason` | The `extension` field failed validation (empty, uppercase, contains `.`/`/`, reserved `parachute` prefix, ...). |
+
+### Content-edit branch (`content`/`append`/`content_edit` on update-note)
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `mutually_exclusive` | 400 | `hint` | More than one of `content`, `append`/`prepend`, `content_edit` was passed — pick exactly one content-update mode. |
+| `invalid_content_edit` | 400 | `field: "content_edit"` | `content_edit` isn't `{old_text: string, new_text: string}`. |
+| `content_edit_not_found` | 422 | `field: "content_edit.old_text"` | `old_text` doesn't occur in the note's current content — it may have been edited since you last read it. |
+| `content_edit_ambiguous` | 409 | `field: "content_edit.old_text"` | `old_text` matches more than once — add surrounding context so it matches exactly once. |
+| `invalid_state_transition` | 400 | `field: "state_transition.field"` | `state_transition.field` must be a non-empty string. |
+
+### Tag schema (`update-tag` / `PUT /api/tags/{name}`)
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message}`) | One or more fields in this call conflict with another tag's declaration — `type` or `indexed` disagree across declarers. Carries EVERY conflicting field in one response (vault#553) and states explicitly that **no changes were applied**. `reason` is `type_conflict` or `indexed_flag_conflict`. |
+| `invalid_indexed_field` | 400 | (message only) | A field this call is declaring `indexed: true` has an unsupported type (only string/integer/boolean are indexable) or an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`). Solo, single-tag issue — distinct from `tag_field_conflict`'s cross-tag scope; kept as the pre-existing single-violation shape (vault#478). |
+| `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
+| `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
+| `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
+| `tag_in_use_by_tokens` | 409 | `tag`, `referenced_by[]` | Deleting or merging away this tag would orphan a tag-scoped token's allowlist. Revoke or re-mint the token(s) first. |
+| `target_exists` | 409 | `target`, `conflicting` | `POST /tags/{name}/rename`'s `new_name` (or a sub-tag of it) already exists — use `POST /tags/merge` instead. |
+
+### Query / search validation
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `invalid_query` | 400 | `field`, `got`, `hint`, `code` | A structured-query or bracket-filter param is malformed: bad `limit`/`offset`, an unparseable date, an unknown `expand`/`search_mode` value, an incompatible `cursor`+`search`/`near` combo, a bracket-filter shape error, an unindexed field in an operator query, and other `QueryError` throws. `code` carries the finer-grained legacy vocabulary (`INVALID_QUERY`, `FIELD_NOT_INDEXED`, `UNKNOWN_OPERATOR`, `INVALID_OPERATOR_VALUE`, ...) for callers that already keyed on it. |
+| `invalid_search_syntax` | 400 | `field: "search"`, `got`, `hint` | `search_mode: "advanced"` raw FTS5 syntax that FTS5 itself rejected. Distinct from `invalid_query` — literal mode (the default) cannot produce this, since the query is escaped before FTS5 ever sees it. |
+| `cursor_invalid` | 400 | (message only) | The `cursor` string is malformed, not base64url, not JSON, or fails schema validation. Restart iteration with a fresh (empty) cursor. |
+| `cursor_query_mismatch` | 400 | (message only) | The `cursor` was minted for a different query (its embedded hash doesn't match this call's filters). Drop the cursor and restart. |
+
+### Not found / method / transport
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `not_found` | 404 | `id?`/`note_id?` (varies by endpoint) | Generic resource-not-found: a note, an anchor/source/target note reference, a vault, or (for a tag-scoped session) a note outside the token's allowlist — 404, never 403, so scope boundaries don't leak existence. |
+| `method_not_allowed` | 405 | — | The HTTP method isn't supported on this route. |
+| `invalid_json` | 400 | — | The request body failed to parse as JSON. |
+| `invalid_request` | 400 | `field?`, `hint?` | A required param/field is missing or the wrong shape (e.g. `find-path`'s `source`/`target`, tag-merge's `sources`/`target`). |
+| `missing_required_field` | 400 | `field?`, `hint?` | A specific named field is required and absent (e.g. attachment `path`/`mimeType`, storage upload `file`). |
+| `tag_scope_violation` | 403 (REST) / forbidden (MCP) | `scoped_tags` | A tag-scoped token attempted a write outside its allowlist. |
+| `internal_error` | 500 | — | An invariant the server expected to hold didn't (e.g. a just-created note not found on immediate re-read). Rare; file an issue if seen. |
+
+### Storage upload/serve
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `file_too_large` | 413 | `limit`, `got` | Upload exceeds the 100MB cap. |
+| `blocked_upload_extension` | 400 | `extension` | The extension is on the active-content blocklist (`.html`, `.svg`, `.js`, `.css`, ...) — same-origin XSS surface if served back. |
+| `invalid_path` | 403 | — | The requested storage path resolves outside the vault's assets directory (traversal guard). |
+
+### Transcription retry (`POST /notes/{idOrPath}/retry-transcription`)
+
+| `error_type` | HTTP | Meaning |
+|---|---|---|
+| `not_failed` | 400 | The transcript note's status isn't `"failed"` — only failed transcripts can be retried. |
+| `missing_attachment_id` | 400 | The transcript note has no `transcript_attachment_id` to locate the original audio. |
+| `attachment_missing` | 404 | The original audio attachment row no longer exists. |
+| `audio_missing` | 404 | The original audio file no longer exists on disk (already unlinked, e.g. by retention policy). |
+| `no_failed_attachment` | 400 | (legacy in-body memo) The note has no audio attachment with a failed transcription to retry. |
+
 ## Content range — bounded reads for large notes
 
 MCP responses are size-limited: a 100KB transcript can't come back from one
@@ -847,6 +939,17 @@ still applies — `if_updated_at` wins and a mismatch returns `409 conflict`.
 override one you actually passed. To update unconditionally, omit
 `if_updated_at` and send `force: true` alone.
 
+**Batch `force`/`if_updated_at` defaults (MCP `update-note` only, vault#554).**
+REST `PATCH` is single-note; the MCP `update-note` tool additionally accepts
+a top-level `notes` array for batch updates. A top-level `force` and/or
+`if_updated_at` alongside `notes` applies as the DEFAULT for every item that
+doesn't set its own — e.g. `{force: true, notes: [{id: "a", content: "..."},
+{id: "b", content: "...", if_updated_at: "..."}]}` forces item "a" but item
+"b"'s own `if_updated_at` still applies (and wins). Before this fix the
+top-level fields were silently ignored in a batch call — every item without
+its OWN `force`/`if_updated_at` threw `428 precondition_required` regardless
+of a top-level `force: true`.
+
 **`if_missing: "create"` (vault#309 — shipped 0.4.5).** When the target
 note doesn't exist, treat the PATCH body as a create. Useful for sync
 loops that want one endpoint for both branches; the response carries
@@ -861,15 +964,17 @@ is ignored.
 `include_content: false` returns the lean `NoteIndex` shape with the same
 attached fields.
 
-Error shapes:
+Error shapes (`error_type` — see the "Error taxonomy" section above for the full field contract):
 
 - `409 conflict` — `if_updated_at` mismatched. Body carries
-  `current_updated_at`, `your_updated_at`, `path`, `note_id`.
+  `current_updated_at`, `your_updated_at`, `path`, `note_id`, `hint`.
 - `409 path_conflict` — UNIQUE(path) tripped on a rename.
 - `409 ambiguous_path` — `{idOrPath}` matched multiple notes.
-- `409 ambiguous` — `content_edit.old_text` matched twice.
-- `422 unprocessable_content` — `content_edit.old_text` not found.
+- `409 content_edit_ambiguous` — `content_edit.old_text` matched twice.
+- `422 content_edit_not_found` — `content_edit.old_text` not found.
 - `400 mutually_exclusive` — caller passed more than one content mode.
+- `400 invalid_content_edit` — `content_edit` isn't `{old_text, new_text}`.
+- `400 invalid_state_transition` — `state_transition.field` isn't a non-empty string.
 - `400 invalid_extension` — extension validation failed.
 
 #### `DELETE /vault/{name}/api/notes/{idOrPath}` — `vault:write`
@@ -1156,6 +1261,22 @@ has an empty-string key, or is not JSON-serializable. Explicit `null`
 **clears** the field (it is not rejected). Inner values — including ones
 missing `target_tag` or `cardinality`, or with a `cardinality` outside the
 old vocabulary — are **no longer** rejected; they persist verbatim.
+
+**`fields` cross-tag validation (vault#553/#554).** `type` and `indexed`
+must agree across every tag that declares the same field. Declaring one or
+more fields that conflict with another tag's declaration in the SAME call
+is **rejected with `422` and `error_type: "tag_field_conflict"`**, carrying
+EVERY conflicting field in one response — not just the first — plus a
+`violations: [{field, reason, message}]` array (`reason` is `type_conflict`
+or `indexed_flag_conflict`) and a `message` stating explicitly that no
+changes were applied. Nothing is persisted before this check runs, so the
+tag's existing fields are always left exactly as they were on rejection.
+This is distinct from the SOLO, single-tag `400 invalid_indexed_field`
+error (an unsupported type for indexing, or an invalid field identifier —
+vault#478, unchanged) — that stays a single-violation 400 since it isn't a
+cross-tag disagreement. The MCP `update-tag` tool reports the same
+`tag_field_conflict` shape (plus the two solo checks folded in) via a
+structured JSON-RPC error.
 
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
 Removes the tag, its identity row, and untags every note. Returns the

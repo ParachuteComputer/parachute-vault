@@ -151,4 +151,40 @@ describe("MCP list-tags single-tag path — tag-scope enforcement (vault#550 fol
     expect(names).toContain("health");
     expect(names).not.toContain("work");
   });
+
+  // vault#554 carry-forward: the wrapper's SECOND scrub branch (the one
+  // AFTER the early out-of-scope short-circuit above) fires when the queried
+  // tag itself IS in the allowlist but core still reports tag_not_found —
+  // the hollow-tag case (vault#550: no identity row, no notes directly
+  // carrying it) reached ONLY via a child's `parent_names`. Core computes
+  // `did_you_mean` vault-wide (scope-unaware by architecture), so it can
+  // name an out-of-scope tag; the wrapper must strip that suggestion even
+  // though the queried tag itself passed the allowlist gate. This branch was
+  // execution-verified in a prior review; this test commits it.
+  test("scoped token + in-scope HOLLOW tag (reachable only via a child's parent_names) scrubs an out-of-scope did_you_mean", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+
+    // "health" itself has NO identity row and NO note directly carrying it —
+    // it's in the allowlist expansion ONLY because "kale" declares it as a
+    // parent. "kale" is deliberately NOT lexically close to "health" (the
+    // mission's "non-close child") so it can't win did_you_mean and mask
+    // the bug this test targets.
+    await store.upsertTagRecord("kale", { parent_names: ["health"] });
+    await store.createNote("k", { tags: ["kale"] });
+
+    // Out-of-scope decoy, lexically close to "health" (prefix match) — this
+    // is what core's vault-wide suggestSimilarTag would pick if nothing
+    // scrubbed it.
+    await store.createNote("hy", { tags: ["healthy"] });
+
+    const tool = await listTagsTool("journal", ["health"]);
+    const result = (await tool.execute({ tag: "health" })) as any;
+
+    expect(result.error_type).toBe("tag_not_found");
+    expect(result.tag).toBe("health");
+    // The scrub: did_you_mean must NOT leak the out-of-scope "healthy",
+    // even though "health" (the query) itself passed the allowlist gate.
+    expect(result.did_you_mean).toBeUndefined();
+  });
 });

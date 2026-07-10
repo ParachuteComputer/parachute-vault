@@ -344,7 +344,7 @@ function applyTagScopeWrappers(
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
         ? scrubNoteLinks(result)
-        : { error: "Note not found", id: (result as any).id };
+        : { error: "Note not found", error_type: "not_found", id: (result as any).id };
     }
     return result;
   });
@@ -470,7 +470,7 @@ function applyTagScopeWrappers(
       if (!id) continue;
       const existing = await store.getNote(id as string);
       if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
-        return { error: "Note not found", id };
+        return { error: "Note not found", error_type: "not_found", id };
       }
       const removed = new Set<string>((item as any).tags?.remove ?? []);
       const projected = new Set<string>((existing.tags ?? []).filter((t) => !removed.has(t)));
@@ -489,7 +489,7 @@ function applyTagScopeWrappers(
     if (id) {
       const existing = await store.getNote(id as string);
       if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
-        return { error: "Note not found", id };
+        return { error: "Note not found", error_type: "not_found", id };
       }
     }
     return await orig(params);
@@ -542,6 +542,16 @@ function overrideVaultInfo(
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
+    // NOTE (vault#554): these two throws are deliberately left as plain,
+    // unstructured `Error`s — NOT given `error_type` — even though the rest
+    // of this file's sweep attaches one everywhere else. Attaching one here
+    // routes the throw through mcp-http.ts's structured-error mapping, which
+    // surfaces it as a JSON-RPC protocol-level error (`response.error`)
+    // instead of the in-band tool result the existing contract test asserts
+    // (`response.result.isError === true`, `response.result.content[0].text`
+    // containing the scope name) — see "tools/call of vault-info with
+    // description arg and vault:read scope is refused" in src/vault.test.ts.
+    // Changing that transport shape is out of scope for this wave.
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
 

@@ -14,6 +14,7 @@ import {
   validateFieldName,
 } from "./indexed-fields.js";
 import { buildVaultProjection } from "./vault-projection.js";
+import { TagFieldConflictError } from "./tag-schemas.js";
 
 let db: Database;
 let store: SqliteStore;
@@ -209,12 +210,28 @@ describe("update-tag: indexed flag", () => {
   });
 
   it("invalid field name for indexing throws", async () => {
-    expect(() =>
-      findTool("update-tag").execute({
+    // vault#553/#554: update-tag's cross-tag field validation now collects
+    // EVERY violation into one `TagFieldConflictError` (carrying a
+    // `violations` array) instead of throwing the first `IndexedFieldError`
+    // it hits — see core/src/tag-schemas.ts `collectTagFieldViolations`.
+    // The underlying reason ("invalid_field_name") and message text are
+    // unchanged; only the thrown class + the "collect everything" framing
+    // are new.
+    let caught: unknown;
+    try {
+      await findTool("update-tag").execute({
         tag: "project",
         fields: { "bad-name": { type: "string", indexed: true } },
-      }),
-    ).toThrow(IndexedFieldError);
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(TagFieldConflictError);
+    const err = caught as TagFieldConflictError;
+    expect(err.violations).toHaveLength(1);
+    expect(err.violations[0]!.field).toBe("bad-name");
+    expect(err.violations[0]!.reason).toBe("invalid_field_name");
+    expect(err.message).toContain("no changes were applied");
   });
 
   it("rejects non-atomic indexed-flag change while other declarers hold it true", async () => {

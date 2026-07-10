@@ -10,7 +10,6 @@ import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMo
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
-import * as indexedFieldOps from "./indexed-fields.js";
 import {
   SchemaValidationError,
   strictViolations,
@@ -54,6 +53,22 @@ export interface McpToolDef {
 // ---------------------------------------------------------------------------
 
 /**
+ * Build a plain `Error` carrying a stable `error_type` (+ optional `field`/
+ * `hint`) as duck-typed extra properties — the same pattern `QueryError`
+ * uses for its optional structured fields. For validation leaves that don't
+ * warrant a dedicated exported class (one caller-facing shape, not a reusable
+ * domain error), this is what lets the generic domain-error mapping in
+ * `src/mcp-http.ts` surface `data.error_type` instead of falling through to
+ * the unstructured `isError: true` text fallback (vault#554).
+ */
+function structuredError(
+  message: string,
+  fields: { error_type: string; field?: string; hint?: string },
+): Error {
+  return Object.assign(new Error(message), fields);
+}
+
+/**
  * Resolve a note identifier — tries ID first, then case-insensitive
  * path match. Works everywhere a note reference is accepted.
  *
@@ -86,7 +101,9 @@ function resolveNote(db: Database, idOrPath: string): Note | null {
 
 function requireNote(db: Database, idOrPath: string): Note {
   const note = resolveNote(db, idOrPath);
-  if (!note) throw new Error(`Note not found: "${idOrPath}"`);
+  if (!note) {
+    throw structuredError(`Note not found: "${idOrPath}"`, { error_type: "not_found", field: "id" });
+  }
   return note;
 }
 
@@ -423,7 +440,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // --- Single note by ID/path ---
         if (params.id) {
           const note = resolveNote(db, params.id as string);
-          if (!note) return { error: "Note not found", id: params.id };
+          if (!note) return { error: "Note not found", error_type: "not_found", id: params.id };
           const includeContent = params.include_content !== false; // default true for single
           // Range params are meaningless on a content-less shape — error
           // rather than silently ignore (same loud-validation policy as
@@ -471,7 +488,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
         if (params.near) {
           const near = params.near as { note_id: string; depth?: number; relationship?: string };
           const anchor = resolveNote(db, near.note_id);
-          if (!anchor) return { error: "Anchor note not found", note_id: near.note_id };
+          if (!anchor) return { error: "Anchor note not found", error_type: "not_found", note_id: near.note_id };
           const depth = Math.min(near.depth ?? 2, 5);
           const traversed = linkOps.traverseLinks(db, anchor.id, {
             max_depth: depth,
@@ -914,7 +931,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
 - \`links: { add: [{ target, relationship }], remove: [{ target, relationship }] }\` — add/remove links
 - When removing a wikilink-type link, \`[[brackets]]\` are also removed from content.
 - For batch: pass a \`notes\` array, each with an \`id\` field.
-- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`force\` only waives the *requirement to supply* \`if_updated_at\` — if you pass both, the precondition you supplied still applies and a mismatch returns a conflict error. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design).
+- **Optimistic concurrency is required by default.** Pass \`if_updated_at\` with the \`updated_at\` value you last read — the update is rejected with a conflict error if the note has changed since. Re-read, reconcile, and retry. To skip the safety check (e.g. bulk migration), pass \`force: true\` instead; the update then runs unconditionally. \`force\` only waives the *requirement to supply* \`if_updated_at\` — if you pass both, the precondition you supplied still applies and a mismatch returns a conflict error. \`append\` / \`prepend\` only updates are exempt from the precondition (no-conflict-by-design). **Batch default (vault#554):** a top-level \`force\` and/or \`if_updated_at\` alongside a \`notes\` array applies as the DEFAULT for every item that doesn't set its own — e.g. \`{force: true, notes: [{id: "a", content: "..."}, {id: "b", content: "...", if_updated_at: "..."}]}\` forces item "a" but still enforces the precondition on item "b" (its own \`if_updated_at\` wins). Per-item values always take precedence over the top-level default.
 - **Idempotent upsert via \`if_missing: "create"\`** — when the note doesn't exist, create it from this same payload (content/path/tags/metadata become the create fields; OC precondition skipped — nothing to conflict with). Response carries \`created: true\`. Useful for nightly sync loops that don't know ahead of time whether the note exists. Default \`"fail"\` (current behavior — missing note errors). See vault#309.
 - \`include_content\` (default \`true\`) — set \`false\` to receive a lean index shape (\`id\`, \`path\`, \`createdAt\`, \`updatedAt\`, \`createdBy\`, \`createdVia\`, \`lastUpdatedBy\`, \`lastUpdatedVia\`, \`tags\`, \`metadata\`, \`byteSize\`, \`preview\`) instead of full content. Useful for agents making frequent small edits to large notes (e.g. via \`append\` or \`content_edit\`) where re-receiving the body is the dominant cost. \`validation_status\` is preserved on the lean shape when present.
 
@@ -1043,7 +1060,23 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       },
       execute: async (params) => {
         const batch = params.notes as any[] | undefined;
-        const items = batch ?? [params];
+        // vault#554: top-level `force` / `if_updated_at` apply as per-item
+        // DEFAULTS in a batch call — item-level values win when both are
+        // present. Before this fix `items = batch ?? [params]` never merged
+        // the top-level fields into batch items at all, so a caller passing
+        // `{force: true, notes: [...]}` had it silently ignored: every item
+        // without its OWN `force`/`if_updated_at` still threw
+        // `PreconditionRequiredError` (a gardener-reported round-trip cost).
+        // The single-item form (`items = [params]`) already behaved this
+        // way implicitly (params IS the item), so only the batch branch
+        // needs the merge.
+        const items = batch
+          ? batch.map((item: any) => ({
+              ...(params.force !== undefined ? { force: params.force } : {}),
+              ...(params.if_updated_at !== undefined ? { if_updated_at: params.if_updated_at } : {}),
+              ...item,
+            }))
+          : [params];
 
         if (items.length > MAX_BATCH_SIZE) {
           throw new BatchTooLargeError(items.length);
@@ -1175,7 +1208,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               // Fallthrough: not-found + no if_missing → existing error
               // contract. Match `requireNote`'s message shape so existing
               // callers see no behavior change.
-              throw new Error(`Note not found: "${item.id}"`);
+              throw structuredError(`Note not found: "${item.id}"`, { error_type: "not_found", field: "id" });
             }
             const note = resolved;
 
@@ -1185,8 +1218,9 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             const hasContentEdit = item.content_edit !== undefined;
             const contentModes = (hasContent ? 1 : 0) + (hasAppendPrepend ? 1 : 0) + (hasContentEdit ? 1 : 0);
             if (contentModes > 1) {
-              throw new Error(
+              throw structuredError(
                 `update-note: \`content\`, \`append\`/\`prepend\`, and \`content_edit\` are mutually exclusive — pick one mode of content update for note "${note.id}".`,
+                { error_type: "mutually_exclusive", hint: "pass exactly one of `content`, `append`/`prepend`, or `content_edit`" },
               );
             }
 
@@ -1237,20 +1271,23 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             if (hasContentEdit) {
               const ce = item.content_edit as { old_text: string; new_text: string };
               if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
-                throw new Error(
+                throw structuredError(
                   "update-note: `content_edit` requires { old_text: string, new_text: string }.",
+                  { error_type: "invalid_content_edit", field: "content_edit", hint: "pass { old_text: string, new_text: string }" },
                 );
               }
               const idx = note.content.indexOf(ce.old_text);
               if (idx < 0) {
-                throw new Error(
+                throw structuredError(
                   `update-note content_edit: \`old_text\` not found in note "${note.id}". The note may have been edited — re-read and retry.`,
+                  { error_type: "content_edit_not_found", field: "content_edit.old_text", hint: "re-read the note's current content and retry with an old_text that occurs exactly once" },
                 );
               }
               const second = note.content.indexOf(ce.old_text, idx + 1);
               if (second >= 0) {
-                throw new Error(
+                throw structuredError(
                   `update-note content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context to disambiguate.`,
+                  { error_type: "content_edit_ambiguous", field: "content_edit.old_text", hint: "add surrounding context to old_text so it matches exactly once" },
                 );
               }
               contentOverride = note.content.slice(0, idx) + ce.new_text + note.content.slice(idx + ce.old_text.length);
@@ -1315,8 +1352,9 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             const stItem = item.state_transition as { field?: unknown; from?: unknown; to?: unknown } | undefined;
             if (stItem !== undefined) {
               if (typeof stItem.field !== "string" || stItem.field.length === 0) {
-                throw new Error(
+                throw structuredError(
                   `update-note: \`state_transition.field\` must be a non-empty string (note "${note.id}").`,
+                  { error_type: "invalid_state_transition", field: "state_transition.field", hint: "pass a non-empty string naming the metadata field to transition" },
                 );
               }
               updates.state_transition = { field: stItem.field, from: stItem.from, to: stItem.to };
@@ -1605,34 +1643,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
 
         // Validate cross-tag consistency on fields being (re)declared in this
         // call. `type` and `indexed` are global — all declarers must agree.
-        const otherSchemas = tagSchemaOps
-          .listTagSchemas(db)
-          .filter((s) => s.tag !== tag);
-        for (const [fieldName, spec] of Object.entries(incomingFields)) {
-          const incomingIndexed = spec.indexed === true;
-          for (const other of otherSchemas) {
-            const otherSpec = other.fields?.[fieldName];
-            if (!otherSpec) continue;
-            if (otherSpec.type !== spec.type) {
-              throw new Error(
-                `field "${fieldName}" type conflict: tag "${tag}" declares "${spec.type}"; tag "${other.tag}" declares "${otherSpec.type}". Types must agree across all declarers.`,
-              );
-            }
-            if ((otherSpec.indexed === true) !== incomingIndexed) {
-              throw new Error(
-                `field "${fieldName}" indexed-flag conflict: tag "${tag}" sets indexed=${incomingIndexed}; tag "${other.tag}" sets indexed=${otherSpec.indexed === true}. Must match across all declarers — change them atomically or not at all.`,
-              );
-            }
-          }
-          if (incomingIndexed) {
-            const mapped = indexedFieldOps.mapFieldType(spec.type);
-            if (!mapped) {
-              throw new Error(
-                `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
-              );
-            }
-            indexedFieldOps.validateFieldName(fieldName);
-          }
+        // vault#553/#554: collects EVERY violation instead of throwing on the
+        // first — a caller declaring two bad fields sees both in one
+        // response, and the thrown error states explicitly that no changes
+        // were applied (nothing is persisted before this check runs).
+        const fieldViolations = tagSchemaOps.collectTagFieldViolations(db, tag, incomingFields);
+        if (fieldViolations.length > 0) {
+          throw new tagSchemaOps.TagFieldConflictError(tag, fieldViolations);
         }
 
         // ---- relationships: replace wholesale when provided. `relationships`
@@ -1655,7 +1672,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           parentNamesPatch = null;
         } else if (params.parent_names !== undefined) {
           if (!Array.isArray(params.parent_names)) {
-            throw new Error("parent_names must be an array of tag names");
+            throw structuredError("parent_names must be an array of tag names", {
+              error_type: "invalid_parent_names",
+              field: "parent_names",
+              hint: "pass an array of tag name strings, or null to clear",
+            });
           }
           const cleaned = (params.parent_names as unknown[])
             .filter((p): p is string => typeof p === "string" && p.length > 0);
@@ -1762,7 +1783,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       execute: () => {
         // This is a placeholder — vault-info needs access to vault config,
         // which is only available in the server layer (mcp-tools.ts).
-        return { error: "vault-info must be configured by the server layer" };
+        return { error: "vault-info must be configured by the server layer", error_type: "not_configured" };
       },
     },
 
@@ -1994,6 +2015,9 @@ export class PreconditionRequiredError extends Error {
  */
 export class BatchTooLargeError extends Error {
   code = "BATCH_TOO_LARGE" as const;
+  // Stable error_type (vault#554) — additive; matches the string REST has
+  // hardcoded in its json response since #213.
+  error_type = "batch_too_large" as const;
   limit: number;
   got: number;
 

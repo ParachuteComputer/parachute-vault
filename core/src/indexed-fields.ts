@@ -45,6 +45,10 @@ interface IndexedFieldRow {
 
 export class IndexedFieldError extends Error {
   override name = "IndexedFieldError";
+  // Stable error_type (vault#554) — additive; matches the string REST has
+  // hardcoded in its json response since vault#478. Lets the generic MCP
+  // domain-error mapping (src/mcp-http.ts) pick this class up.
+  error_type = "invalid_indexed_field" as const;
 }
 
 // Restrict field names to safe SQL identifiers. This also bounds the

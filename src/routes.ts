@@ -242,7 +242,13 @@ function parseContentRangeQuery(
     // is fragile across bundling boundaries (same note as the QueryError
     // handling in the structured-query path below).
     if (e && e.name === "QueryError") {
-      return { range: null, error: json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400) };
+      return {
+        range: null,
+        error: json(
+          { error: e.message, code: e.code ?? "INVALID_QUERY", error_type: e.error_type ?? "invalid_query" },
+          400,
+        ),
+      };
     }
     throw e;
   }
@@ -402,6 +408,9 @@ function parseMetaBrackets(url: URL): {
       {
         error: `bracket-meta filter: cannot mix shorthand and operator forms for the same field — \`meta[${field}]=…\` and \`meta[${field}][<op>]=…\` are mutually exclusive in one request. Pick one form.`,
         code: "INVALID_QUERY",
+        error_type: "invalid_query",
+        field,
+        hint: `pick either \`meta[${field}]=value\` or \`meta[${field}][<op>]=value\`, not both`,
       },
       400,
     );
@@ -431,6 +440,9 @@ function parseMetaBrackets(url: URL): {
             {
               error: `bracket-date filter on \`${field}\` requires an operator: meta[${field}][gte]=… (lower bound) or meta[${field}][lt]=… (upper bound, exclusive).`,
               code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              hint: `pass meta[${field}][gte]=… and/or meta[${field}][lt]=…`,
             },
             400,
           ),
@@ -442,6 +454,10 @@ function parseMetaBrackets(url: URL): {
             {
               error: `bracket-date filter on \`${field}\` supports only \`gte\` (inclusive lower bound) and \`lt\` (exclusive upper bound). Got: \`${op}\`. The dateFilter contract is half-open by design.`,
               code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              got: op,
+              hint: `use \`gte\` or \`lt\` — meta[${field}][gte]=… / meta[${field}][lt]=…`,
             },
             400,
           ),
@@ -456,6 +472,9 @@ function parseMetaBrackets(url: URL): {
             {
               error: `bracket-date filter cannot span both \`created_at\` and \`updated_at\` in one request — issue two queries or use one column per request.`,
               code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field,
+              hint: "issue two queries, or filter one date column per request",
             },
             400,
           ),
@@ -496,6 +515,10 @@ function parseMetaBrackets(url: URL): {
           {
             error: `bracket-meta filter: array form \`meta[${field}][${op}][]=…\` is only valid for \`in\` and \`not_in\`. \`${op}\` takes a single value — use \`meta[${field}][${op}]=value\` instead.`,
             code: "INVALID_OPERATOR_VALUE",
+            error_type: "invalid_query",
+            field,
+            got: op,
+            hint: `use \`meta[${field}][${op}]=value\` (no \`[]\`) — array form is only for \`in\`/\`not_in\``,
           },
           400,
         ),
@@ -536,6 +559,10 @@ function parseMetaBrackets(url: URL): {
             {
               error: `bracket-meta filter: \`exists\` on \`${field}\` requires "true" or "false", got "${value}"`,
               code: "INVALID_OPERATOR_VALUE",
+              error_type: "invalid_query",
+              field,
+              got: value,
+              hint: `pass meta[${field}][exists]=true or meta[${field}][exists]=false`,
             },
             400,
           ),
@@ -614,6 +641,9 @@ function parseMetadataJsonAlias(url: URL): {
       {
         error: `metadata query param must be a JSON object of the form {"field":{"op":value}} — ${detail}`,
         code: "INVALID_QUERY",
+        error_type: "invalid_query",
+        field: "metadata",
+        hint: 'pass a JSON object, e.g. ?metadata={"status":{"eq":"active"}}',
       },
       400,
     );
@@ -653,6 +683,10 @@ export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Re
         {
           error: `invalid \`expand\` value "${expandParam}" — must be one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("subtypes": parent_names descendants).`,
           code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "expand",
+          got: expandParam,
+          hint: `pass one of ${TAG_EXPAND_MODES.map((m) => `"${m}"`).join(", ")}, or omit for the default`,
         },
         400,
       ),
@@ -736,6 +770,8 @@ export function parseNotesQueryOpts(url: URL): {
         {
           error: "pass metadata filters as either the JSON `metadata=` param or bracket `meta[field][op]=` form, not both.",
           code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          hint: "pick one metadata-filter form: `metadata=` or `meta[field][op]=`, not both",
         },
         400,
       ),
@@ -937,12 +973,12 @@ async function handleNotesInner(
       // Single note by id/path
       if (id) {
         const note = await resolveNote(store, id);
-        if (!note) return json({ error: "Note not found", id }, 404);
+        if (!note) return json({ error: "Note not found", error_type: "not_found", id }, 404);
         // Tag-scope: a token can't see what its allowlist excludes. Surface
         // as 404 (not 403) — the existence of the note is itself information
         // we shouldn't leak across the scope boundary.
         if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Note not found", id }, 404);
+          return json({ error: "Note not found", error_type: "not_found", id }, 404);
         }
         const includeContent = parseBool(parseQuery(url, "include_content"), true);
         const contentRange = parseContentRangeQuery(url, includeContent);
@@ -992,6 +1028,9 @@ async function handleNotesInner(
           {
             error: "cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.",
             code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "cursor",
+            hint: "drop `cursor` when using `search`, or drop `search` and use `meta[updated_at][gte]=…` for since-last-checked polling",
           },
           400,
         );
@@ -1044,7 +1083,12 @@ async function handleNotesInner(
                 {
                   error: e.message,
                   code: e.code ?? "INVALID_QUERY",
-                  ...(e.error_type !== undefined ? { error_type: e.error_type } : {}),
+                  // vault#554: default error_type to "invalid_query" for the
+                  // long-standing QueryError call sites that predate the
+                  // vault#550/#551 convention (FIELD_NOT_INDEXED,
+                  // UNKNOWN_OPERATOR, ...) — every QueryError now carries a
+                  // stable error_type, not just the newer ones that set it.
+                  error_type: e.error_type ?? "invalid_query",
                   ...(e.field !== undefined ? { field: e.field } : {}),
                   ...(e.got !== undefined ? { got: e.got } : {}),
                   ...(e.hint !== undefined ? { hint: e.hint } : {}),
@@ -1144,6 +1188,9 @@ async function handleNotesInner(
           {
             error: "cursor is incompatible with near (graph neighborhood). Resolve the neighborhood first, then iterate with cursor over the resulting note set.",
             code: "INVALID_QUERY",
+            error_type: "invalid_query",
+            field: "cursor",
+            hint: "resolve the `near` neighborhood first, then paginate the resulting note set with `cursor`",
           },
           400,
         );
@@ -1188,15 +1235,16 @@ async function handleNotesInner(
         // here. Duck-type on `name` + `code` — core is a separate module, so
         // `instanceof` is fragile across bundling boundaries. The newer
         // vault#550 call sites (limit/offset/date validation in
-        // core/src/notes.ts) additionally set `error_type`/`field`/`got`/
-        // `hint` — merged in when present; long-standing QueryError throws
-        // that don't set them keep their existing `{error, code}` shape.
+        // core/src/notes.ts) additionally set `field`/`got`/`hint` — merged
+        // in when present. vault#554: every QueryError now carries a stable
+        // `error_type` (defaults to "invalid_query" for the long-standing
+        // call sites that predate that convention), not just the newer ones.
         if (e && e.name === "QueryError") {
           return json(
             {
               error: e.message,
               code: e.code ?? "INVALID_QUERY",
-              ...(e.error_type !== undefined ? { error_type: e.error_type } : {}),
+              error_type: e.error_type ?? "invalid_query",
               ...(e.field !== undefined ? { field: e.field } : {}),
               ...(e.got !== undefined ? { got: e.got } : {}),
               ...(e.hint !== undefined ? { hint: e.hint } : {}),
@@ -1208,9 +1256,11 @@ async function handleNotesInner(
         // cursor_query_mismatch) so the agent loop can distinguish a
         // malformed cursor from a hash-mismatch and react appropriately
         // (the latter typically means the agent changed its filter and
-        // should drop the cursor + restart from scratch).
+        // should drop the cursor + restart from scratch). vault#554: `code`
+        // IS the `error_type` vocabulary here — surfaced explicitly so a
+        // caller can branch on `error_type` alone like every other error.
         if (e && e.name === "CursorError") {
-          return json({ error: e.message, code: e.code ?? "cursor_invalid" }, 400);
+          return json({ error: e.message, code: e.code ?? "cursor_invalid", error_type: e.code ?? "cursor_invalid" }, 400);
         }
         throw e;
       }
@@ -1219,10 +1269,10 @@ async function handleNotesInner(
       const nearNoteId = parseQuery(url, "near[note_id]");
       if (nearNoteId) {
         const anchor = await resolveNote(store, nearNoteId);
-        if (!anchor) return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
+        if (!anchor) return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
         // Tag-scope: anchor must itself be visible to this token.
         if (!noteWithinTagScope(anchor, tagScope.allowed, tagScope.raw)) {
-          return json({ error: "Anchor note not found", note_id: nearNoteId }, 404);
+          return json({ error: "Anchor note not found", error_type: "not_found", note_id: nearNoteId }, 404);
         }
         const depth = Math.min(parseInt10(parseQuery(url, "near[depth]")) ?? 2, 5);
         const relationship = parseQuery(url, "near[relationship]") ?? undefined;
@@ -1449,14 +1499,26 @@ async function handleNotesInner(
         // Duck-type for module-boundary robustness (matches the PATCH branch).
         if (e && e.code === "PATH_CONFLICT") {
           return json(
-            { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
+            {
+              error_type: "path_conflict",
+              error: "path_conflict",
+              path: e.path,
+              message: e.message,
+              hint: "pass a different `path`, or omit it to let the vault assign one",
+            },
             409,
           );
         }
         // Strict-schema rejection (vault#299 Part A) on create — 422.
         if (e && e.code === "SCHEMA_VALIDATION") {
           return json(
-            { error_type: "schema_validation", error: "schema_validation", violations: e.violations ?? [], message: e.message },
+            {
+              error_type: "schema_validation",
+              error: "schema_validation",
+              violations: e.violations ?? [],
+              message: e.message,
+              hint: "fix every field listed in `violations` and retry — none of this write was applied",
+            },
             422,
           );
         }
@@ -1499,12 +1561,12 @@ async function handleNotesInner(
       return json(body.notes ? final : final[0], 201);
     }
 
-    return json({ error: "Method not allowed" }, 405);
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }
 
   // ---- Note-level routes (/notes/:idOrPath[/attachments]) ----
   const idMatch = subpath.match(/^\/([^/]+)(\/.*)?$/);
-  if (!idMatch) return json({ error: "Not found" }, 404);
+  if (!idMatch) return json({ error: "Not found", error_type: "not_found" }, 404);
 
   const idOrPath = decodeURIComponent(idMatch[1]!);
   const sub = idMatch[2] ?? "";
@@ -1513,12 +1575,17 @@ async function handleNotesInner(
   if (sub === "/attachments") {
     if (method === "POST") {
       const note = await resolveNote(store, idOrPath);
-      if (!note) return json({ error: "Not found" }, 404);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-        return json({ error: "Not found" }, 404);
+        return json({ error: "Not found", error_type: "not_found" }, 404);
       }
       const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
-      if (!body.path || !body.mimeType) return json({ error: "path and mimeType are required" }, 400);
+      if (!body.path || !body.mimeType) {
+        return json(
+          { error: "path and mimeType are required", error_type: "missing_required_field", hint: "pass both `path` and `mimeType`" },
+          400,
+        );
+      }
 
       // Decide whether to enqueue this attachment for transcription. Two paths:
       //
@@ -1567,13 +1634,13 @@ async function handleNotesInner(
     }
     if (method === "GET") {
       const note = await resolveNote(store, idOrPath);
-      if (!note) return json({ error: "Not found" }, 404);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-        return json({ error: "Not found" }, 404);
+        return json({ error: "Not found", error_type: "not_found" }, 404);
       }
       return json(await store.getAttachments(note.id));
     }
-    return json({ error: "Method not allowed" }, 405);
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }
 
   const attMatch = sub.match(/^\/attachments\/([^/]+)$/);
@@ -1581,12 +1648,12 @@ async function handleNotesInner(
     const attId = decodeURIComponent(attMatch[1]!);
     if (method === "DELETE") {
       const note = await resolveNote(store, idOrPath);
-      if (!note) return json({ error: "Not found" }, 404);
+      if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-        return json({ error: "Not found" }, 404);
+        return json({ error: "Not found", error_type: "not_found" }, 404);
       }
       const result = await store.deleteAttachment(note.id, attId);
-      if (!result.deleted) return json({ error: "Not found" }, 404);
+      if (!result.deleted) return json({ error: "Not found", error_type: "not_found" }, 404);
       // Unlink the storage file only if no other attachment still references
       // the same path. Best-effort: the row is already gone, so a missing
       // file or unlink error should not flip the DELETE to an error.
@@ -1599,7 +1666,7 @@ async function handleNotesInner(
       }
       return new Response(null, { status: 204 });
     }
-    return json({ error: "Method not allowed" }, 405);
+    return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
   }
 
   // POST /notes/:idOrPath/retry-transcription — vault#353 design Q5 + finding F.
@@ -1623,24 +1690,24 @@ async function handleNotesInner(
   //      404 attachment_missing      (auto-flow: transcript_attachment_id row deleted)
   //      404 audio_missing           (audio file unlinked from disk)
   if (sub === "/retry-transcription") {
-    if (method !== "POST") return json({ error: "Method not allowed" }, 405);
-    if (!vault) return json({ error: "Vault context required" }, 400);
+    if (method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
+    if (!vault) return json({ error: "Vault context required", error_type: "invalid_request" }, 400);
     const note = await resolveNote(store, idOrPath);
-    if (!note) return json({ error: "Not found" }, 404);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     return handleRetryTranscription(store, note, vault);
   }
 
-  if (sub !== "") return json({ error: "Not found" }, 404);
+  if (sub !== "") return json({ error: "Not found", error_type: "not_found" }, 404);
 
   // GET /notes/:idOrPath — single note
   if (method === "GET") {
     const note = await resolveNote(store, idOrPath);
-    if (!note) return json({ error: "Not found" }, 404);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     const includeContent = parseBool(parseQuery(url, "include_content"), true);
     const contentRange = parseContentRangeQuery(url, includeContent);
@@ -1748,7 +1815,7 @@ async function handleNotesInner(
             }
           }
           const final = await store.getNote(created.id);
-          if (!final) return json({ error: "Note disappeared" }, 500);
+          if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
           const validated = attachValidationStatus(store, db, final);
           const includeContentResp = body.include_content !== false;
           if (includeContentResp) return json({ ...validated, created: true });
@@ -1788,7 +1855,9 @@ async function handleNotesInner(
         return json(
           {
             error: "mutually_exclusive",
+            error_type: "mutually_exclusive",
             message: "`content`, `append`/`prepend`, and `content_edit` are mutually exclusive — pick one mode of content update.",
+            hint: "pass exactly one of `content`, `append`/`prepend`, or `content_edit`",
           },
           400,
         );
@@ -1833,6 +1902,7 @@ async function handleNotesInner(
               "update requires `if_updated_at` (the note's last-seen updated_at) or `force: true`.",
             note_id: note.id,
             path: note.path ?? null,
+            hint: "re-read the note, pass its `updated_at` as `if_updated_at`, or pass `force: true` to skip the check",
           },
           428,
         );
@@ -1844,7 +1914,13 @@ async function handleNotesInner(
         const ce = body.content_edit as { old_text?: unknown; new_text?: unknown };
         if (typeof ce?.old_text !== "string" || typeof ce?.new_text !== "string") {
           return json(
-            { error: "bad_request", message: "`content_edit` requires { old_text: string, new_text: string }." },
+            {
+              error: "bad_request",
+              error_type: "invalid_content_edit",
+              field: "content_edit",
+              message: "`content_edit` requires { old_text: string, new_text: string }.",
+              hint: "pass { old_text: string, new_text: string }",
+            },
             400,
           );
         }
@@ -1855,14 +1931,26 @@ async function handleNotesInner(
           // current content. Returning 404 implied "note doesn't exist" and
           // confused operators chasing a missing record (#202).
           return json(
-            { error: "unprocessable_content", message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.` },
+            {
+              error: "unprocessable_content",
+              error_type: "content_edit_not_found",
+              field: "content_edit.old_text",
+              message: `content_edit: \`old_text\` not found in note "${note.id}". Re-read and retry.`,
+              hint: "re-read the note's current content and retry with an old_text that occurs exactly once",
+            },
             422,
           );
         }
         const second = note.content.indexOf(ce.old_text, idx + 1);
         if (second >= 0) {
           return json(
-            { error: "ambiguous", message: `content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context.` },
+            {
+              error: "ambiguous",
+              error_type: "content_edit_ambiguous",
+              field: "content_edit.old_text",
+              message: `content_edit: \`old_text\` matches multiple times in note "${note.id}" — must match exactly once. Add surrounding context.`,
+              hint: "add surrounding context to old_text so it matches exactly once",
+            },
             409,
           );
         }
@@ -1925,7 +2013,13 @@ async function handleNotesInner(
       if (stBody !== undefined) {
         if (typeof stBody.field !== "string" || stBody.field.length === 0) {
           return json(
-            { error: "bad_request", message: "`state_transition.field` must be a non-empty string." },
+            {
+              error: "bad_request",
+              error_type: "invalid_state_transition",
+              field: "state_transition.field",
+              message: "`state_transition.field` must be a non-empty string.",
+              hint: "pass a non-empty string naming the metadata field to transition",
+            },
             400,
           );
         }
@@ -1986,7 +2080,7 @@ async function handleNotesInner(
       // Note first, then carry the field across the lean conversion (since
       // `toNoteIndex` drops unknown fields).
       const updatedNote = await store.getNote(note.id);
-      if (updatedNote === null) return json({ error: "Note disappeared" }, 404);
+      if (updatedNote === null) return json({ error: "Note disappeared", error_type: "not_found" }, 404);
       const validated: any = attachValidationStatus(store, db, updatedNote);
       // Echo hydrated links when a link mutation was part of this request,
       // OR the caller explicitly asked for them via `?include_links=true`
@@ -2023,7 +2117,7 @@ async function handleNotesInner(
       lean.created = false;
       return json(lean);
     } catch (e: any) {
-      if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+      if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
       // Duck-type on `code` rather than `instanceof ConflictError`: this
       // error originates in the core package and survives any future
       // bundling / module-boundary split more robustly than a prototype check.
@@ -2037,6 +2131,7 @@ async function handleNotesInner(
             path: e.note_path ?? null,
             note_id: e.note_id,
             message: e.message,
+            hint: "re-read the note (GET) and re-apply your change against its current `updated_at`, or pass `force: true` to overwrite",
             // Legacy fields — kept for the lens VaultConflictError shim and
             // any other pre-launch callers. Safe to drop post-launch.
             error: "conflict",
@@ -2060,6 +2155,7 @@ async function handleNotesInner(
             to: e.to,
             current: e.current ?? null,
             message: e.message,
+            hint: "re-read the note's current value for this field and retry the transition from its actual current state",
           },
           409,
         );
@@ -2074,6 +2170,7 @@ async function handleNotesInner(
             error: "schema_validation",
             violations: e.violations ?? [],
             message: e.message,
+            hint: "fix every field listed in `violations` and retry — none of this write was applied",
           },
           422,
         );
@@ -2081,7 +2178,13 @@ async function handleNotesInner(
       // Path-rename collision — schema's UNIQUE(path) tripped. Issue #126.
       if (e && e.code === "PATH_CONFLICT") {
         return json(
-          { error_type: "path_conflict", error: "path_conflict", path: e.path, message: e.message },
+          {
+            error_type: "path_conflict",
+            error: "path_conflict",
+            path: e.path,
+            message: e.message,
+            hint: "pass a different `path`, or omit it to leave the existing path unchanged",
+          },
           409,
         );
       }
@@ -2098,17 +2201,17 @@ async function handleNotesInner(
   // DELETE /notes/:idOrPath — vault:write (no admin gate; consistent with verbForMethod)
   if (method === "DELETE") {
     const note = await resolveNote(store, idOrPath);
-    if (!note) return json({ error: "Not found" }, 404);
+    if (!note) return json({ error: "Not found", error_type: "not_found" }, 404);
     // Tag-scope: can't delete what you can't read. 404 (not 403) for the
     // same no-leak reason as the read paths.
     if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", error_type: "not_found" }, 404);
     }
     await store.deleteNote(note.id);
     return json({ deleted: true, id: note.id });
   }
 
-  return json({ error: "Method not allowed" }, 405);
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 }
 
 // ---------------------------------------------------------------------------
@@ -2203,18 +2306,18 @@ export async function handleTags(
   // POST /tags/merge — atomic multi-source merge into a target tag.
   // Must come before the /:name matcher so "merge" isn't read as a tag name.
   if (subpath === "/merge") {
-    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const body = (await req.json().catch(() => null)) as
       | { sources?: unknown; target?: unknown }
       | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
     const sources = body.sources;
     const target = body.target;
     if (!Array.isArray(sources) || !sources.every((s) => typeof s === "string" && s.length > 0)) {
-      return json({ error: "sources must be a non-empty array of strings" }, 400);
+      return json({ error: "sources must be a non-empty array of strings", error_type: "invalid_request", field: "sources" }, 400);
     }
     if (typeof target !== "string" || target.length === 0) {
-      return json({ error: "target must be a non-empty string" }, 400);
+      return json({ error: "target must be a non-empty string", error_type: "invalid_request", field: "target" }, 400);
     }
     // Tag-scope: every source AND the target must be inside the allowlist.
     // A merge that pulls notes out of a token's scope (or pushes notes into
@@ -2254,13 +2357,13 @@ export async function handleTags(
   // POST /tags/:name/rename — atomic rename across tags + note_tags + schema
   const renameMatch = subpath.match(/^\/([^/]+)\/rename$/);
   if (renameMatch) {
-    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const oldName = decodeURIComponent(renameMatch[1]!);
     const body = (await req.json().catch(() => null)) as { new_name?: unknown } | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
     const newName = body.new_name;
     if (typeof newName !== "string" || newName.length === 0) {
-      return json({ error: "new_name must be a non-empty string" }, 400);
+      return json({ error: "new_name must be a non-empty string", error_type: "invalid_request", field: "new_name" }, 400);
     }
     if (tagScope.allowed && (!tagScope.allowed.has(oldName) || !tagScope.allowed.has(newName))) {
       return tagScopeForbidden(tagScope.raw ?? []);
@@ -2271,14 +2374,18 @@ export async function handleTags(
     // notes.ts:renameTag for the surfaces touched.
     const result = await store.renameTag(oldName, newName);
     if ("error" in result) {
-      if (result.error === "not_found") return json({ error: "not_found", tag: oldName }, 404);
+      if (result.error === "not_found") {
+        return json({ error: "not_found", error_type: "tag_not_found", tag: oldName }, 404);
+      }
       if (result.error === "target_exists") {
         return json(
           {
             error: "target_exists",
+            error_type: "target_exists",
             target: newName,
             conflicting: result.conflicting,
             message: "Target tag (or one of its sub-tags) already exists; use POST /api/tags/merge to combine them.",
+            hint: "use POST /api/tags/merge to combine the tags instead",
           },
           409,
         );
@@ -2293,15 +2400,15 @@ export async function handleTags(
   // /:name matcher so "conformance" isn't read as a tag name.
   const conformanceMatch = subpath.match(/^\/([^/]+)\/conformance$/);
   if (conformanceMatch) {
-    if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "POST") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const cTag = decodeURIComponent(conformanceMatch[1]!);
     if (tagScope.allowed && !tagScope.allowed.has(cTag)) {
-      return json({ error: "Tag not found", tag: cTag }, 404);
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: cTag }, 404);
     }
     const body = (await req.json().catch(() => null)) as
       | { fields?: Record<string, unknown> | null }
       | null;
-    if (!body) return json({ error: "Invalid JSON body" }, 400);
+    if (!body) return json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400);
     // The proposed fields the operator intends to save. Sanitized through the
     // same parse the resolver uses (drop non-object specs). Empty/absent →
     // nothing to enforce → zero violations.
@@ -2323,10 +2430,10 @@ export async function handleTags(
   // Schema editor (vault#283). Must precede the /:name matcher.
   const effectiveMatch = subpath.match(/^\/([^/]+)\/effective$/);
   if (effectiveMatch) {
-    if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    if (req.method !== "GET") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
     const eTag = decodeURIComponent(effectiveMatch[1]!);
     if (tagScope.allowed && !tagScope.allowed.has(eTag)) {
-      return json({ error: "Tag not found", tag: eTag }, 404);
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: eTag }, 404);
     }
     const projection = buildVaultProjection(store.db);
     const record = await store.getTagRecord(eTag);
@@ -2347,7 +2454,7 @@ export async function handleTags(
 
   // Routes with tag name
   const nameMatch = subpath.match(/^\/([^/]+)$/);
-  if (!nameMatch) return json({ error: "Not found" }, 404);
+  if (!nameMatch) return json({ error: "Not found", error_type: "not_found" }, 404);
   const tagName = decodeURIComponent(nameMatch[1]!);
 
   // GET /tags/:name — single tag detail (full record)
@@ -2450,7 +2557,15 @@ export async function handleTags(
       parentNamesPatch = null;
     } else if (body.parent_names !== undefined) {
       if (!Array.isArray(body.parent_names)) {
-        return json({ error: "parent_names must be an array of tag names" }, 400);
+        return json(
+          {
+            error: "parent_names must be an array of tag names",
+            error_type: "invalid_parent_names",
+            field: "parent_names",
+            hint: "pass an array of tag name strings, or null to clear",
+          },
+          400,
+        );
       }
       const cleaned = (body.parent_names as unknown[]).filter(
         (p): p is string => typeof p === "string" && p.length > 0,
@@ -2480,6 +2595,39 @@ export async function handleTags(
           ...(body.fields as Record<string, tagSchemaOps.TagFieldSchema>),
         };
         fieldsPatch = Object.keys(merged).length > 0 ? merged : null;
+      }
+    }
+
+    // Cross-tag field validation (vault#553/#554) — validate the fields THIS
+    // call is declaring (`body.fields`, not the merged `fieldsPatch`) against
+    // every other tag's schema BEFORE any write: type + indexed-flag must
+    // agree across all declarers. Mirrors the MCP update-tag tool's
+    // cross-tag checks so REST and MCP report identically for this class:
+    // EVERY conflicting field in one response (not just the first), and the
+    // message states explicitly that no changes were applied — nothing is
+    // persisted before this check runs. Deliberately narrower than MCP's
+    // `collectTagFieldViolations` — the own-field checks (unsupported type,
+    // invalid name) are NOT included here; they keep going through
+    // `store.upsertTagRecord`'s existing single-violation `IndexedFieldError`
+    // → 400 `invalid_indexed_field` path below (vault#478, tested, unchanged
+    // status/error_type). See `collectCrossTagFieldViolations`'s doc comment.
+    if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      const fieldViolations = tagSchemaOps.collectCrossTagFieldViolations(
+        store.db,
+        putTagName,
+        body.fields as Record<string, tagSchemaOps.TagFieldSchema>,
+      );
+      if (fieldViolations.length > 0) {
+        return json(
+          {
+            error: "tag_field_conflict",
+            error_type: "tag_field_conflict",
+            tag: putTagName,
+            violations: fieldViolations,
+            message: `${fieldViolations.length} field violation(s) for tag "${putTagName}" — no changes were applied.`,
+          },
+          422,
+        );
       }
     }
 
@@ -2532,7 +2680,7 @@ export async function handleTags(
     return json(await store.deleteTag(tagName));
   }
 
-  return json({ error: "Method not allowed" }, 405);
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 }
 
 // ---------------------------------------------------------------------------
@@ -2544,24 +2692,29 @@ export async function handleFindPath(
   store: Store,
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
-  if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  if (req.method !== "GET") return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 
   const url = new URL(req.url);
   const source = parseQuery(url, "source");
   const target = parseQuery(url, "target");
-  if (!source || !target) return json({ error: "source and target parameters are required" }, 400);
+  if (!source || !target) {
+    return json(
+      { error: "source and target parameters are required", error_type: "invalid_request", hint: "pass both ?source= and ?target=" },
+      400,
+    );
+  }
 
   const db = store.db;
   try {
     const sourceNote = await resolveNote(store, source);
-    if (!sourceNote) return json({ error: `Note not found: "${source}"` }, 404);
+    if (!sourceNote) return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
     if (!noteWithinTagScope(sourceNote, tagScope.allowed, tagScope.raw)) {
-      return json({ error: `Note not found: "${source}"` }, 404);
+      return json({ error: `Note not found: "${source}"`, error_type: "not_found", note_id: source }, 404);
     }
     const targetNote = await resolveNote(store, target);
-    if (!targetNote) return json({ error: `Note not found: "${target}"` }, 404);
+    if (!targetNote) return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
     if (!noteWithinTagScope(targetNote, tagScope.allowed, tagScope.raw)) {
-      return json({ error: `Note not found: "${target}"` }, 404);
+      return json({ error: `Note not found: "${target}"`, error_type: "not_found", note_id: target }, 404);
     }
     const maxDepth = Math.min(parseInt10(parseQuery(url, "max_depth")) ?? 5, 10);
 
@@ -2579,7 +2732,7 @@ export async function handleFindPath(
     }
     return json(result);
   } catch (e: any) {
-    if (e instanceof NotFoundError) return json({ error: e.message }, 404);
+    if (e instanceof NotFoundError) return json({ error: e.message, error_type: "not_found" }, 404);
     // vault#331 N1 — surface AmbiguousPathError from resolveNote as 409
     // mirroring the handleNotes path. Without this, an ambiguous source/
     // target path on /api/find-path bubbled to a server-level 500.
@@ -2678,7 +2831,11 @@ export async function handleVault(
         return json(
           {
             error: "invalid_audio_retention",
+            error_type: "invalid_audio_retention",
+            field: "config.audio_retention",
+            got: v,
             message: `audio_retention must be one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
+            hint: `pass one of: ${VALID_AUDIO_RETENTION.join(", ")}`,
           },
           400,
         );
@@ -2700,7 +2857,11 @@ export async function handleVault(
         return json(
           {
             error: "invalid_auto_transcribe",
+            error_type: "invalid_auto_transcribe",
+            field: "config.auto_transcribe.enabled",
+            got: enabled,
             message: "auto_transcribe.enabled must be a boolean",
+            hint: "pass true or false",
           },
           400,
         );
@@ -2713,7 +2874,7 @@ export async function handleVault(
     return json(vaultResponse(vaultConfig));
   }
 
-  return json({ error: "Method not allowed" }, 405);
+  return json({ error: "Method not allowed", error_type: "method_not_allowed" }, 405);
 }
 
 // ---------------------------------------------------------------------------
@@ -2981,6 +3142,7 @@ async function handleRetryTranscription(
     return json(
       {
         error: "not_failed",
+        error_type: "not_failed",
         message: `Transcript note status is "${meta.transcript_status}" — only failed transcripts can be retried.`,
         transcript_status: meta.transcript_status,
       },
@@ -2994,6 +3156,7 @@ async function handleRetryTranscription(
     return json(
       {
         error: "missing_attachment_id",
+        error_type: "missing_attachment_id",
         message: "Transcript note has no `transcript_attachment_id` — can't locate the original audio.",
       },
       400,
@@ -3004,6 +3167,7 @@ async function handleRetryTranscription(
     return json(
       {
         error: "attachment_missing",
+        error_type: "attachment_missing",
         message: `Original audio attachment ${attachmentId} no longer exists in the vault.`,
       },
       404,
@@ -3017,6 +3181,7 @@ async function handleRetryTranscription(
     return json(
       {
         error: "audio_missing",
+        error_type: "audio_missing",
         message: `Original audio file at "${attachment.path}" no longer exists on disk.`,
       },
       404,
@@ -3097,6 +3262,7 @@ async function handleRetryLegacyInBody(
     return json(
       {
         error: "no_failed_attachment",
+        error_type: "no_failed_attachment",
         message:
           "Target note is not a transcript note and has no audio attachment with a failed transcription to retry.",
       },
@@ -3112,6 +3278,7 @@ async function handleRetryLegacyInBody(
     return json(
       {
         error: "audio_missing",
+        error_type: "audio_missing",
         message: `Original audio file at "${failed.path}" no longer exists on disk.`,
       },
       404,
@@ -3164,7 +3331,7 @@ async function handleRetryLegacyInBody(
       const fresh = await store.getNote(note.id);
       if (!fresh) {
         return json(
-          { error: "note_missing", message: "Target note disappeared during retry." },
+          { error: "note_missing", error_type: "not_found", message: "Target note disappeared during retry." },
           404,
         );
       }
@@ -3194,6 +3361,7 @@ async function handleRetryLegacyInBody(
           expected_updated_at: err.expected_updated_at,
           message:
             "Note was modified concurrently while arming the retry; re-fetch and try again.",
+          hint: "re-fetch the note and retry the retry-transcription call",
         },
         409,
       );
@@ -3335,10 +3503,18 @@ export async function handleStorage(
     const form = await req.formData();
     const file = form.get("file");
     if (!(file instanceof File)) {
-      return json({ error: "file is required" }, 400);
+      return json({ error: "file is required", error_type: "missing_required_field", field: "file" }, 400);
     }
     if (file.size > MAX_UPLOAD_BYTES) {
-      return json({ error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB` }, 413);
+      return json(
+        {
+          error: `File too large (${Math.round(file.size / 1024 / 1024)}MB). Max: 100MB`,
+          error_type: "file_too_large",
+          limit: MAX_UPLOAD_BYTES,
+          got: file.size,
+        },
+        413,
+      );
     }
     // Strip trailing dots/whitespace before extracting the extension so a
     // `evil.html.` / `evil.svg ` can't slip past the blocklist
@@ -3350,7 +3526,14 @@ export async function handleStorage(
       // served same-origin from /storage/ (see BLOCKED_EXTENSIONS). Everything
       // else (incl. unknown/arbitrary files) is accepted and served as a
       // download (octet-stream + nosniff).
-      return json({ error: `File type ${ext} not allowed (active/executable content)` }, 400);
+      return json(
+        {
+          error: `File type ${ext} not allowed (active/executable content)`,
+          error_type: "blocked_upload_extension",
+          extension: ext,
+        },
+        400,
+      );
     }
 
     const date = new Date().toISOString().split("T")[0]!;
@@ -3396,7 +3579,7 @@ export async function handleStorage(
   try {
     decodedPath = decodeURIComponent(path);
   } catch {
-    return json({ error: "Not found" }, 404);
+    return json({ error: "Not found", error_type: "not_found" }, 404);
   }
 
   const fileMatch = decodedPath.match(/^\/([^/]+)\/(.+)$/);
@@ -3405,10 +3588,10 @@ export async function handleStorage(
     const filePath = normalize(join(assets, reqPath));
 
     if (!filePath.startsWith(normalize(assets))) {
-      return json({ error: "Invalid path" }, 403);
+      return json({ error: "Invalid path", error_type: "invalid_path" }, 403);
     }
     if (!existsSync(filePath)) {
-      return json({ error: "Not found" }, 404);
+      return json({ error: "Not found", error_type: "not_found" }, 404);
     }
 
     // Tag-scope gate (C0 adversarial-audit finding). The note-keyed
@@ -3438,7 +3621,7 @@ export async function handleStorage(
         }
       }
       if (!allowed) {
-        return json({ error: "Not found" }, 404);
+        return json({ error: "Not found", error_type: "not_found" }, 404);
       }
     }
 
@@ -3461,7 +3644,7 @@ export async function handleStorage(
     });
   }
 
-  return json({ error: "Not found" }, 404);
+  return json({ error: "Not found", error_type: "not_found" }, 404);
 }
 
 // ---------------------------------------------------------------------------
