@@ -34,6 +34,73 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.1-rc.1] - 2026-07-10
+
+### Added — the front door: `vault-info`'s structural map + a Map-note convention
+
+A 2026-07-09 UX round on cold-start vaults found a real gap: a fresh reader
+(human or AI) with no prior context has no single cheap call that says "here's
+the shape of this vault" — `vault-info`'s existing catalog covers only
+tags-*with-schemas*, and the deeper `getVaultStats` distribution requires an
+extra `include_stats: true` round trip and returns more than orientation
+needs (monthly histograms, byte counts). Two additive fixes, no breaking
+changes:
+
+- **`vault-info` gains a `map` field — ALWAYS present, no flag required.**
+  `{ total_notes, tags: [{name, count}], path_buckets: [{name, count}],
+  unfiled_notes }`: every tag currently carried by at least one note with its
+  membership count (uncapped, unlike `stats.topTags`'s top-20), every
+  top-level path segment (the text before the first `/`, or the whole path
+  when it has none) among notes that HAVE a path with how many notes live
+  under it, and how many notes carry no path at all (excluded from
+  `path_buckets` — nothing to bucket; `unfiled_notes` + every bucket's count
+  == `total_notes`). Three cheap grouped-`COUNT` SQL queries — no content, no
+  full-table scan into memory — new `getVaultMap` in `core/src/notes.ts`,
+  wired into the shared `buildVaultProjection` (`core/src/vault-projection.ts`)
+  so both the MCP `vault-info` tool (`src/mcp-tools.ts`) and
+  `GET /vault/{name}/api/vault` (`src/routes.ts`, `src/routing.ts`) return the
+  identical shape. `include_stats: true` still adds the deeper `VaultStats`
+  distribution alongside `map`, not instead of it.
+- **Scope-aware.** A tag-scoped token's `map` covers only notes reachable
+  through an in-scope tag — same confidentiality posture as the existing
+  `tags`/`indexed_fields` catalogs. Path-bucket counts can't be reconstructed
+  by post-hoc filtering an unscoped rollup (they need per-note tag
+  membership, not just a tag-name allowlist over a precomputed aggregate), so
+  the scoped path RE-RUNS the grouped-count query restricted to the caller's
+  already-expanded allowlist (`getVaultMap(db, { tagFilter: [...allowed] })`)
+  rather than filtering `vault-info`'s unscoped result — both the MCP wrapper
+  (`applyTagScopeWrappers` in `src/mcp-tools.ts`) and the REST handler
+  (`handleVault`, now threading `TagScopeCtx` like every other read handler)
+  take this path. An allowlist matching zero tags in the vault returns an
+  explicit all-zero map, never silently falls through to the unscoped
+  full-vault query — `getVaultMap`'s `tagFilter` contract distinguishes
+  "key omitted" (compute vault-wide) from "empty array" (nothing is in
+  scope), which the implementation and its tests both pin down explicitly.
+- **Getting Started gains a front-door convention (`core/src/seed-packs.ts`).**
+  Kept tight — three touch-ups, not a rewrite: the tool-list bullet now
+  mentions the always-present `map`; the "if this vault already has content"
+  orientation step now leads with plain `vault-info` (map included) before
+  reaching for `include_stats`; a new "A few shapes worth reusing" bullet
+  recommends maintaining one human-legible "Map" note (once a vault grows
+  past a few dozen notes) as the "why" companion to `vault-info`'s
+  auto-computed "what's there" counts.
+- **`docs/HTTP_API.md`** — new `map` documentation under
+  `GET /vault/{name}/api/vault` (worked example + the bucket/unfiled-notes
+  invariant) and the MCP `vault-info` tool description (`core/src/mcp.ts`)
+  documents the same shape + scope posture.
+
+Tests: 9 new in `core/src/core.test.ts` (`getVaultMap` — empty vault, mixed
+tags/paths/unfiled counts, the bucket+unfiled==total invariant, a
+no-slash top-level path, count-desc/name-asc tag ordering, and the
+`tagFilter` scope-aware path: omitted vs. empty-array vs. populated,
+double-tag no-double-count, scoped `unfiled_notes`), 7 new in
+`src/vault.test.ts` (3 MCP — unscoped map present without `include_stats`,
+scoped map restricted to an in-scope tag, scoped map with a
+zero-match allowlist; 4 REST — `map` always present, `include_stats`
+adds `stats` alongside it not instead, scoped map parity, zero-match
+allowlist parity). Gates: `bun run typecheck` clean; `bun test ./src/`
+2159 pass / 1 skip / 0 fail; `bun test ./core/src/` 1051 pass / 0 fail.
+
 ## [0.7.0] - 2026-07-10
 
 The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the

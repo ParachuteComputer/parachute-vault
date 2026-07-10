@@ -30,7 +30,7 @@ import {
   getUnresolvedLinksForNotes,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, getVaultMap } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -3224,6 +3224,13 @@ export async function handleVault(
    * configured AND available), which is what a surface gates its mic on.
    */
   resolveCapability: () => Promise<TranscriptionCapability> = resolveTranscriptionCapability,
+  /**
+   * Tag-scope allowlist (front-door structural map). Threaded from
+   * routing.ts the same way every other read handler gets it. Unscoped
+   * (`NO_TAG_SCOPE`) by default so every pre-existing call site — none of
+   * which pass this — is unaffected.
+   */
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -3233,6 +3240,16 @@ export async function handleVault(
     // and available. `minutes_remaining` is omitted (cloud/plan concern;
     // self-host is unmetered). This is the field Notes gates the mic on.
     result.transcription = await resolveCapability();
+    // Front-door structural map — ALWAYS included (unlike `stats`, which is
+    // include_stats-gated): three cheap grouped-COUNT queries, so a fresh
+    // reader orients in one call. Scope-aware: a tag-scoped token's map
+    // covers only notes reachable through an in-scope tag (`tagFilter`
+    // restricts the underlying query rather than post-hoc filtering an
+    // unscoped rollup — see `getVaultMap`'s doc comment for why).
+    result.map =
+      tagScope.raw === null
+        ? getVaultMap(store.db)
+        : getVaultMap(store.db, { tagFilter: [...(tagScope.allowed ?? [])] });
     if (parseBool(parseQuery(url, "include_stats"), false)) {
       result.stats = await store.getVaultStats();
     }
