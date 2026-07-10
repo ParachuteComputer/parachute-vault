@@ -224,10 +224,22 @@ export interface GenerateMcpToolsOpts {
 
 /**
  * Generate the consolidated MCP tools for a vault. Surface (13):
- * query-notes, create-note, update-note, delete-note, list-tags, update-tag,
- * delete-tag, rename-tag, merge-tags, find-path, vault-info, prune-schema
- * (admin), doctor (admin). `manage-token` (admin) is appended by the SERVER
- * layer (src/mcp-tools.ts), not here — see that file's doc comment.
+ * query-notes, list-tags, find-path, vault-info, doctor (read); create-note,
+ * update-note, delete-note (write); update-tag, delete-tag, rename-tag,
+ * merge-tags, prune-schema (admin). `manage-token` (admin) is appended by
+ * the SERVER layer (src/mcp-tools.ts), not here — see that file's doc
+ * comment.
+ *
+ * **Re-tier (this PR):** content-authorship (write) is now separate from
+ * structure/taxonomy/schema-curation (admin). `update-tag`/`delete-tag`/
+ * `rename-tag`/`merge-tags` moved write → admin — they define schemas and
+ * restructure the tag graph across ALL notes, not just author content.
+ * `doctor` moved admin → read — it's a read-only, tag-scope-restricted
+ * diagnostic (see `applyTagScopeWrappers` in src/mcp-tools.ts), and
+ * read-scoped monitoring/tending jobs need to be able to run it without an
+ * admin credential. BREAKING: a `vault:write` token that used to
+ * rename/merge/delete/update tags now gets `insufficient_scope`; a
+ * `vault:read` token can now call `doctor`. See CHANGELOG.
  */
 export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): McpToolDef[] {
   const db: Database = store.db;
@@ -1992,7 +2004,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "update-tag",
-      requiredVerb: "write",
+      // `admin` (was `write`) — this PR: update-tag defines a tag's SCHEMA
+      // (description, indexed-field types, relationship vocabulary,
+      // hierarchy parents), which every note carrying the tag inherits.
+      // That's structure/taxonomy curation, not content authorship — the
+      // same distinction that keeps content out of admin and structure out
+      // of write. See the `generateMcpTools` doc comment above for the full
+      // re-tier rationale + BREAKING note.
+      requiredVerb: "admin",
       description: "Create or update a tag's identity row: description, indexed-field schemas, relationship-vocabulary map, and hierarchy parents. If the tag doesn't exist, it's created. Fields are merged (new keys added, existing keys replaced); relationships and parent_names are replaced wholesale when provided. Pass null for fields/relationships/parent_names to clear that column. See parachute-vault/docs/contracts/tag-data-model.md.",
       inputSchema: {
         type: "object",
@@ -2128,10 +2147,15 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "delete-tag",
-      // `write` — Aaron's call 2026-05-27: admin reserved for token
-      // mgmt + future config writes; deletes are write-tier mutations.
-      // See delete-note rationale.
-      requiredVerb: "write",
+      // `admin` (was `write` — Aaron's 2026-05-27 call reserved admin for
+      // token mgmt + future config writes; deletes were write-tier
+      // mutations, see delete-note's rationale). Superseded by this PR:
+      // delete-tag removes a tag's identity row + schema and untags it
+      // vault-wide — that's structure/taxonomy curation, the same class as
+      // update-tag/rename-tag/merge-tags, not content authorship. See the
+      // `generateMcpTools` doc comment above for the full re-tier rationale
+      // + BREAKING note.
+      requiredVerb: "admin",
       description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway. Also refused with error_type \"tag_in_use_by_tokens\" (vault#555 fix — this case existed pre-#555 but was undocumented here; see \"merge-tags\" for the identical guard) when the tag is referenced by a tag-scoped token's allowlist — revoke or re-mint the token(s) first. A no-op on a tag with no identity row and no notes returns {deleted: false, notes_untagged: 0} rather than erroring.",
       inputSchema: {
         type: "object",
@@ -2166,7 +2190,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "rename-tag",
-      requiredVerb: "write",
+      // `admin` (was `write`) — this PR: an atomic cascading rename across
+      // note memberships, other tags' parent_names, tokens' allowlists,
+      // indexed-field declarer lists, and inline #tag mentions is structural
+      // taxonomy surgery, not content authorship. Same tier as
+      // update-tag/delete-tag/merge-tags. See the `generateMcpTools` doc
+      // comment above for the full re-tier rationale + BREAKING note.
+      requiredVerb: "admin",
       description:
         "Atomically rename a tag across EVERY surface that references it: note memberships, OTHER tags' parent_names, tag-scoped tokens' allowlists, indexed-field declarer lists, inline #tag mentions in note bodies, and _tags/<name> config-note paths — all in one transaction. THIS is the fix for the manual retag→delete dance (create the new tag, retag notes, delete the old one): that dance silently orphans parent_names references (the renamed-away tag stays a live query surface via subtype expansion while list-tags reports it at count 0, and the new tag misses every child-tagged note) and leaves stale #tag mentions behind. Sub-tags rename recursively — renaming \"task\" to \"todo\" also renames \"task/work\" to \"todo/work\". Does NOT rewrite metadata values that happen to equal the old tag name (e.g. metadata.epic: \"task\") — that's a distinct drift class the doctor tool's dead_tag_metadata_reference finding flags heuristically; rename-tag's job is structural (tags/note_tags/parent_names/tokens/content), not a blind string search-and-replace over arbitrary metadata.",
       inputSchema: {
@@ -2223,7 +2253,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "merge-tags",
-      requiredVerb: "write",
+      // `admin` (was `write`) — this PR: merging N source tags into a
+      // target (retagging every note, dropping the sources' identity rows)
+      // is structural taxonomy surgery, not content authorship. Same tier
+      // as update-tag/delete-tag/rename-tag. See the `generateMcpTools` doc
+      // comment above for the full re-tier rationale + BREAKING note.
+      requiredVerb: "admin",
       description:
         "Atomically merge one or more source tags into a target tag: every note carrying any source is retagged with the target, then the source tags (and their identity rows — description/fields/relationships/parent_names) are dropped. target is created if it doesn't exist yet; target's own schema is preserved (sources' schemas are consumed, not merged field-by-field). Sources that don't exist are reported at count 0. Refused with error_type \"tag_in_use_by_tokens\" if a source is referenced by a tag-scoped token — revoke or re-mint it first.",
       inputSchema: {
@@ -2284,11 +2319,15 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "vault-info",
       // `read` so vault:read callers can fetch stats. The
-      // description-update branch performs an inner write-check (see
+      // description-update branch performs an inner ADMIN-check (see
       // overrideVaultInfo in src/mcp-tools.ts) — do not promote this to
-      // `write` or read-only callers lose the stats projection.
+      // `admin` or read-only callers lose the stats projection. Was an
+      // inner write-check pre-this-PR; writing the vault's own
+      // description/config is curation, not content, so it moved to the
+      // same admin tier as the other structure-curation tools (update-tag
+      // et al) — see the `generateMcpTools` doc comment above.
       requiredVerb: "read",
-      description: "Get a comprehensive vault projection: name, description, `coordinates` (this vault's own REST/MCP URL templates — `{name, base_url, rest_api, mcp}`, always present), tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, query hints, and (when a seeded onboarding guide exists) a `getting_started` note pointer. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution as a `stats` field. Pass `description` to update the vault description (changes how AI agents behave in future sessions) — requires the `vault:write` scope for this vault even though the tool itself is read-gated (vault#555: a `vault:read`-only caller passing `description` gets a `Forbidden` rejection, not a silent no-op). Call this anytime mid-session to refresh schema context. NOTE (vault#555): the stats `tagCount` counts only tags at least one note currently carries (`COUNT(DISTINCT tag_name)` over note-tag memberships) — `list-tags`'s row count can run higher because it also lists zero-membership tags (an identity row from a declared schema or a since-untagged tag). Neither is wrong; they answer different questions.",
+      description: "Get a comprehensive vault projection: name, description, `coordinates` (this vault's own REST/MCP URL templates — `{name, base_url, rest_api, mcp}`, always present), tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, query hints, and (when a seeded onboarding guide exists) a `getting_started` note pointer. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution as a `stats` field. Pass `description` to update the vault description (changes how AI agents behave in future sessions) — requires the `vault:admin` scope for this vault even though the tool itself is read-gated (vault#555 originally required `vault:write` here; this PR tightened it to `vault:admin` since a description edit is curation, not content — a `vault:read`-or-`vault:write`-only caller passing `description` gets a `Forbidden` rejection, not a silent no-op). Call this anytime mid-session to refresh schema context. NOTE (vault#555): the stats `tagCount` counts only tags at least one note currently carries (`COUNT(DISTINCT tag_name)` over note-tag memberships) — `list-tags`'s row count can run higher because it also lists zero-membership tags (an identity row from a declared schema or a since-untagged tag). Neither is wrong; they answer different questions.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2344,9 +2383,18 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "doctor",
-      // `admin` — same tier as prune-schema: a diagnostic over the WHOLE
-      // vault's taxonomy, not scoped to any one tag's write authority.
-      requiredVerb: "admin",
+      // `read` (was `admin` — the original reasoning: same tier as
+      // prune-schema, a diagnostic over the WHOLE vault's taxonomy, not
+      // scoped to any one tag's write authority). Superseded by this PR:
+      // doctor never mutates and is ALREADY tag-scope-restricted at the MCP
+      // layer (see `applyTagScopeWrappers`'s `doctor` wrapper in
+      // src/mcp-tools.ts, which re-runs the scan against the caller's
+      // allowlist) — it's a read, not a curation op, and read-scoped
+      // monitoring/tending jobs need to be able to run it without an admin
+      // credential. NOTE: the REST `GET /api/doctor` endpoint (routing.ts)
+      // intentionally stays admin-gated — this re-tier is MCP-tool-scoped
+      // only; see CHANGELOG for the resulting REST/MCP tier divergence.
+      requiredVerb: "read",
       description:
         "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
       inputSchema: { type: "object", properties: {} },

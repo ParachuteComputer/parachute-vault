@@ -34,6 +34,78 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.1-rc.1] - 2026-07-10
+
+### Changed — BREAKING: re-tier MCP tools across read/write/admin (content vs. structure/curation)
+
+Deliberate, ratified scope-model change: content-authorship (`write`) is now
+separate from structure/taxonomy/schema-curation (`admin`). No new scope —
+the `read`/`write`/`admin` vocabulary is unchanged, only which tier each
+tool requires moves.
+
+- **`update-tag`, `delete-tag`, `rename-tag`, `merge-tags`: `write` → `admin`.**
+  These tools define a tag's schema (description, indexed-field types,
+  relationship vocabulary, hierarchy parents) or restructure the tag graph
+  across every note carrying it — structure, not content. **BREAKING:** a
+  token holding only `vault:write` (or `vault:<name>:write`) that used to be
+  able to rename/merge/delete/update a tag now gets `insufficient_scope` and
+  needs `vault:admin`. `create-note`/`update-note`/`delete-note` are
+  unaffected — content authorship stays `write`.
+- **`vault-info`'s description-update branch: `write` → `admin`.** The tool's
+  own `requiredVerb` stays `read` (so read-only callers keep the stats
+  projection), but the inner scope check performed when a caller passes
+  `description` (`overrideVaultInfo` in `src/mcp-tools.ts`) now requires
+  `vault:admin` — writing the vault's own description/config is curation,
+  the same tier as the tag-schema tools above, not content. **BREAKING:** a
+  `vault:write`-only caller passing `description` now gets `Forbidden`
+  (previously succeeded).
+- **`doctor`: `admin` → `read`.** It's a read-only, tag-scope-restricted
+  diagnostic (already re-run against the caller's tag allowlist at the MCP
+  layer, `applyTagScopeWrappers` in `src/mcp-tools.ts`) — read-scoped
+  monitoring/tending jobs need to be able to run it without an admin
+  credential. A `vault:read` token can now call `doctor` (previously
+  `Forbidden`).
+- **`prune-schema` and `manage-token` are unchanged** — both stay `admin`
+  (destructive schema maintenance / token minting, operator-only).
+- **Known divergence, left as-is (out of scope for this PR):** the REST
+  `GET /vault/{name}/api/doctor` endpoint (`src/routing.ts`) is a SEPARATE
+  enforcement point from the MCP `doctor` tool and was NOT changed here — it
+  stays `vault:admin`-gated. Post this release, the same underlying scan is
+  `vault:read` over MCP and `vault:admin` over REST. Filed for a follow-up
+  to reconcile (either lower the REST gate to `read` to match, or document
+  the split as intentional).
+
+Updated: MCP tool descriptions + inline scope comments (`core/src/mcp.ts`,
+`src/mcp-tools.ts`), `docs/auth-model.md` (scope vocabulary + the
+`tools/list` visibility list + the per-vault endpoint table), and
+`docs/HTTP_API.md` (new MCP tool → verb table under "MCP" summarizing the
+tiers + the REST/MCP `doctor` divergence called out explicitly).
+
+Tests: 7 new scope-enforcement tests in `src/vault.test.ts`'s MCP
+`tools/list`/`tools/call` scope-tier suite, proving the new tiering at the
+enforcement layer (not just unit-testing `requiredVerb` values) — a
+`vault:write` session can `create-note` but is denied `rename-tag` /
+`merge-tags` / `delete-tag` / `update-tag` (each now needs `admin`); a
+`vault:read` session can run `doctor`; a `vault:write` session is denied the
+`vault-info` description write; `vault:admin` can do all of the above.
+Existing tool-tier tests in the same suite updated in place for the new
+counts (read tier gains `doctor`: 4 → 5 tools; write tier loses the 4
+tag-schema tools: 11 → 8 cumulative tools; admin tier stays 14 total — same
+tools, different distribution across tiers) and the two `vault-info`
+description-scope tests (`vault:read` refused / `vault:write` allowed) —
+the write-allowed case is now write-refused/admin-allowed. Gates: `bun run
+typecheck` clean; `bun test ./src/` and `bun test ./core/src/` 0 fail (see
+PR for exact counts).
+
+**Versioning note:** this PR was dispatched with instructions to bump to
+`0.7.0-rc.10`, written before `0.7.0` promoted to stable (`origin/main` at
+dispatch time was mid-train at rc.9). By the time this branch was cut,
+`0.7.0` had already shipped stable (commit `264576d`, PR #571) — continuing
+the `0.7.0-rc.*` chain under an already-released stable would sort BELOW it
+in semver and break the `@rc`/`@latest` dist-tag ordering. Re-baselined to
+`0.7.1-rc.1` per the standing convention ("stables bump y by default...
+re-baseline stale `@rc` lazily").
+
 ## [0.7.0] - 2026-07-10
 
 The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the
