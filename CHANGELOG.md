@@ -227,6 +227,35 @@ Tests: `core/src/aggregate.test.ts`, `src/aggregate-routes.test.ts`,
 field, count vs. sum, null-group collection, tag-scope note-level AND
 group-name scrubbing, malformed-spec error codes).
 
+### Added
+
+- **Typed reference field — indexed value + auto-link.** A new tag-schema
+  field type, `type: "reference"`, collapses a pattern builders were
+  hand-syncing: an indexed string value AND a structured `links` edge to the
+  same target, kept in agreement by hand. Declaring a field
+  `type: "reference"` makes it dual-write: the value is stored + validated
+  exactly like `string` (an id/path/title), and `create-note`/`update-note`
+  (both MCP and REST — the shared `core/src/store.ts` write-path chokepoint)
+  additionally resolve that value to a note and maintain a graph `links`
+  edge from this note to it, `relationship` = the field name — reusing the
+  same id/path/title resolution and lazy forward-ref queueing that
+  structured `links` entries use (`resolveOrQueueLink`, vault#555). Changing
+  the field's value re-points the link; clearing it drops the link; an
+  unchanged value is left untouched (no DB churn on unrelated writes).
+  Declare `indexed: true` alongside `type: "reference"` for a B-tree index
+  over the raw value (operator queries `eq`/`in`/...); a plain
+  metadata-equality filter already works on any field regardless of
+  `indexed`. Scalar values only in this release — see
+  `docs/design/typed-reference-field.md` for the full design and known gaps
+  (no inline `unresolved_link` warning yet on the create/update response
+  itself, `cardinality: "many"` reference arrays don't link, no retroactive
+  backfill when a tag gains the declaration).
+
+Tests: `core/src/core.test.ts`'s reference-field suite, `core/src/indexed-fields.test.ts`,
+`core/src/contract-typed-index.test.ts`, `src/contract-errors.test.ts`
+(dual-write on create/update, re-point on change, drop on clear, unchanged-value
+no-op, lazy forward-ref queueing + backfill, `indexed: true` B-tree index).
+
 ## [0.7.0] - 2026-07-10
 
 The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the

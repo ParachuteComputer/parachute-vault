@@ -10,7 +10,12 @@ import {
   reconcileDeclaredIndexes,
   type PrunedField,
 } from "./indexed-fields.js";
-import { syncWikilinks, resolveUnresolvedWikilinks } from "./wikilinks.js";
+import {
+  syncWikilinks,
+  resolveUnresolvedWikilinks,
+  resolveOrQueueLink,
+  clearQueuedLink,
+} from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { transaction } from "./txn.js";
 import { HookRegistry } from "./hooks.js";
@@ -27,6 +32,7 @@ import {
 import {
   loadSchemaConfig,
   validateNote as runValidateNote,
+  resolveNoteSchemas,
   type ResolvedSchemas,
   type ValidationStatus,
 } from "./schema-defaults.js";
@@ -105,6 +111,89 @@ export class BunSqliteStore implements Store {
   }
 
   /**
+   * Auto-link sync for `type: "reference"` schema fields
+   * (vault#typed-reference-field — see `docs/design/typed-reference-field.md`
+   * for the full design + known gaps).
+   *
+   * A `reference`-typed field is BOTH an indexed value (handled by the
+   * ordinary metadata write — no special casing needed there, see
+   * `tag-schemas.ts`'s `VALID_FIELD_TYPES`) AND a graph link. This method
+   * maintains the second half: for every field the note's EFFECTIVE schema
+   * (its own tags + ancestors, same resolution `validateNoteAgainstSchemas`
+   * uses) declares `type: "reference"`, resolve the field's current metadata
+   * value to a note (reusing the SAME `resolveOrQueueLink` machinery
+   * structured `links` entries use — id, then path/title, with lazy
+   * forward-ref queueing on a miss) and maintain a `links` edge from this
+   * note to that target, `relationship` = the field name.
+   *
+   * Called from `createNote`/`updateNote`/`createNotes` — the single
+   * chokepoint both MCP and REST funnel through — AFTER the note row itself
+   * is written, so `note.tags`/`note.metadata` reflect the final state.
+   *
+   * `priorMetadata` is the note's metadata BEFORE this write (`undefined` on
+   * create). For each reference field, if its value is unchanged from
+   * `priorMetadata`, nothing is touched — the existing link (if any) already
+   * reflects it, and re-running the resolve/queue machinery on every
+   * unrelated write (e.g. a content-only edit) would be wasted work. When
+   * the value DID change (set, changed, or removed), every existing link +
+   * queued forward-ref under that field's relationship name is cleared
+   * first, then re-established from the new value — this makes the field's
+   * current value the single source of truth for "this field's link"
+   * without needing to track the specific prior target.
+   *
+   * Known gaps (see the design doc): only scalar (`cardinality: "one"`,
+   * the default) reference values are linked — an array value is left as a
+   * validated-like-string-per-item... actually an array value simply isn't
+   * a string, so no link is created for it (the write still succeeds; a
+   * `type_mismatch`/`cardinality_mismatch` warning surfaces via the normal
+   * `validation_status` path). A tag gaining a `reference` field declaration
+   * does NOT retroactively link notes that already carry a matching value —
+   * only writes that actually touch the field (going forward) sync.
+   */
+  private syncReferenceFieldLinks(
+    note: Note,
+    priorMetadata: Record<string, unknown> | undefined,
+  ): void {
+    const resolution = resolveNoteSchemas(this.getSchemaConfig(), { tags: note.tags ?? [] });
+    if (resolution.mergedFields.size === 0) return;
+
+    const metadata = note.metadata ?? {};
+    const prior = priorMetadata ?? {};
+
+    for (const [fieldName, { spec }] of resolution.mergedFields) {
+      if (spec.type !== "reference") continue;
+
+      const nextValue = metadata[fieldName];
+      const priorValue = prior[fieldName];
+      if (nextValue === priorValue) continue; // unchanged — link (if any) already reflects it
+
+      // Re-establish this field's link from scratch: drop whatever it
+      // previously pointed at (a resolved link, and/or a queued forward-ref)
+      // before applying the new value. See this method's doc comment for why
+      // "clear then recreate" is safe and simpler than tracking the prior
+      // resolved target.
+      linkOps.deleteLinksBySourceRelationship(this.db, note.id, fieldName);
+      clearQueuedLink(this.db, note.id, fieldName);
+
+      if (typeof nextValue === "string" && nextValue.trim() !== "") {
+        // Resolves now, or queues a lazy forward-ref on a miss — same
+        // contract as a structured `links` entry (core/src/mcp.ts,
+        // src/routes.ts). A queued forward-ref backfills automatically via
+        // `resolveUnresolvedWikilinks` the moment a matching note is
+        // created, and surfaces to callers today via the existing
+        // `has_broken_links`/`broken_links` query-notes filters (both read
+        // the same `unresolved_wikilinks` table this queues into) — see the
+        // design doc for the follow-up to also surface an inline
+        // `unresolved_link` warning on the create/update response itself.
+        const targetId = resolveOrQueueLink(this.db, note.id, nextValue, fieldName);
+        if (targetId) {
+          linkOps.createLink(this.db, note.id, targetId, fieldName);
+        }
+      }
+    }
+  }
+
+  /**
    * Drop the tag-hierarchy cache if the mutated path is in the `_tags/*`
    * namespace. Called from create/update/delete — old path is passed
    * alongside new for rename cases (a note moved out of `_tags/` should
@@ -134,6 +223,11 @@ export class BunSqliteStore implements Store {
     if (note.path) {
       resolveUnresolvedWikilinks(this.db, note.path, note.id);
     }
+
+    // Reference-field auto-link (vault#typed-reference-field) — no prior
+    // metadata on a fresh create. Cheap no-op when nothing on the note's
+    // effective schema declares `type: "reference"`.
+    this.syncReferenceFieldLinks(note, undefined);
 
     this.invalidateConfigCachesForPath(note.path);
     this.hooks.dispatch("created", note, this);
@@ -171,9 +265,17 @@ export class BunSqliteStore implements Store {
     },
   ): Promise<Note> {
     let oldPath: string | undefined;
-    if (updates.path !== undefined) {
+    // Reference-field auto-link sync (vault#typed-reference-field) needs the
+    // PRE-write metadata to detect which reference fields actually changed —
+    // read it now, before `noteOps.updateNote` overwrites the row. Only
+    // needed when this call touches `metadata` at all (a content/tags/path-
+    // only update can't have changed a reference field's value, so this read
+    // is skipped on the common non-metadata-touching path).
+    let priorMetadataForRefs: Record<string, unknown> | undefined;
+    if (updates.path !== undefined || updates.metadata !== undefined) {
       const existing = noteOps.getNote(this.db, id);
-      oldPath = existing?.path;
+      if (updates.path !== undefined) oldPath = existing?.path;
+      if (updates.metadata !== undefined) priorMetadataForRefs = existing?.metadata;
     }
 
     const note = noteOps.updateNote(this.db, id, updates);
@@ -190,6 +292,13 @@ export class BunSqliteStore implements Store {
         this.cascadeRename(oldPath, note.path);
       }
       resolveUnresolvedWikilinks(this.db, note.path, id);
+    }
+
+    // Reference-field auto-link sync (vault#typed-reference-field). Only
+    // when this call actually touched `metadata` — see the read above for
+    // why a content/tags/path-only update is skipped.
+    if (updates.metadata !== undefined) {
+      this.syncReferenceFieldLinks(note, priorMetadataForRefs);
     }
 
     // Invalidate before the hook dispatch so any handler that re-queries
@@ -561,6 +670,9 @@ export class BunSqliteStore implements Store {
       // would leave the hierarchy cache stale until the next singleton
       // write happened to bust it.
       this.invalidateConfigCachesForPath(note.path);
+      // Same reference-field auto-link sync as singleton createNote
+      // (vault#typed-reference-field) — no prior metadata on a fresh create.
+      this.syncReferenceFieldLinks(note, undefined);
       this.hooks.dispatch("created", note, this);
     }
     return notes;
@@ -742,7 +854,7 @@ export class BunSqliteStore implements Store {
         const mapped = indexedFieldOps.mapFieldType(spec.type);
         if (!mapped) {
           throw new indexedFieldOps.IndexedFieldError(
-            `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
+            `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean, reference)`,
           );
         }
         // Throws IndexedFieldError on an invalid identifier (e.g. kebab-case).

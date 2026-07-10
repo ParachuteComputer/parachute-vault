@@ -23,12 +23,17 @@ import { Database } from "bun:sqlite";
 // ---------------------------------------------------------------------------
 
 export type SqliteType = "TEXT" | "INTEGER";
-export type FieldType = "string" | "integer" | "boolean";
+// `reference` (vault#typed-reference-field) is stored as TEXT — same as
+// `string` — because the metadata VALUE (an id/path/title) is what's
+// indexed here; the resolved graph link is a separate concern maintained by
+// `core/src/store.ts`'s write path. See tag-schemas.ts's `VALID_FIELD_TYPES`.
+export type FieldType = "string" | "integer" | "boolean" | "reference";
 
 export const TYPE_MAP: Record<FieldType, SqliteType> = {
   string: "TEXT",
   integer: "INTEGER",
   boolean: "INTEGER",
+  reference: "TEXT",
 };
 
 export interface IndexedField {
