@@ -174,6 +174,20 @@ export function generateScopedMcpTools(
         )
     : undefined;
 
+  // Tag-scope guard for `create-note` `if_exists` (vault#555 auth-review
+  // must-fix): the core `if_exists` upsert resolves the target path VAULT-WIDE
+  // and returns/updates/replaces the found note, so a scoped caller could
+  // read/overwrite an out-of-scope note by naming its path. Inject a
+  // visibility predicate the core `applyExistingNote` consults on the RESOLVED
+  // existing note — covering BOTH the proactive check AND the concurrent-INSERT
+  // race backstop (a wrapper-only pre-check misses the latter). Reads from the
+  // SAME shared `allowedHolder` the create-note wrapper's `getAllowed()`
+  // populates before core's execute runs. Unscoped sessions install no
+  // predicate (unchanged). Same closure as `expandVisibility`.
+  const ifExistsVisible = scoped
+    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    : undefined;
+
   // Write-attribution (vault#298). Every write through an MCP session arrives
   // on the `mcp` channel — so we REFINE the auth's base `via` (the generic
   // credential class) to `mcp` here, where the path/channel is known. The
@@ -197,10 +211,11 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(
     store,
-    expandVisibility || nearTraversable || writeContext || strictBypass
+    expandVisibility || nearTraversable || ifExistsVisible || writeContext || strictBypass
       ? {
           ...(expandVisibility ? { expandVisibility } : {}),
           ...(nearTraversable ? { nearTraversable } : {}),
+          ...(ifExistsVisible ? { ifExistsVisible } : {}),
           ...(writeContext ? { writeContext } : {}),
           ...(strictBypass ? { strictBypass } : {}),
           ...(onStrictBypass ? { onStrictBypass } : {}),
@@ -498,6 +513,13 @@ function applyTagScopeWrappers(
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
       }
     }
+    // `if_exists` scope enforcement (vault#555 auth-review must-fix) is NOT
+    // done here as a wrapper pre-check — that would miss core's concurrent-
+    // INSERT race backstop. Instead the `ifExistsVisible` predicate wired into
+    // generateMcpTools above fires INSIDE core's `applyExistingNote`, covering
+    // both the proactive site and the race-backstop site with one guard. The
+    // `await getAllowed()` at the top of this wrapper populates the shared
+    // `allowedHolder` the predicate reads, before core's execute runs.
     return await orig(params);
   });
 
@@ -825,8 +847,8 @@ function buildManageTokenTool(
       ":admin'. List + revoke are scoped to tokens this session minted; " +
       "CLI/REST-minted tokens are not surfaced here.\n\n" +
       "Actions (discriminator: `action`):\n" +
-      "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at }\n" +
-      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean }\n" +
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
+      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
       "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
     inputSchema: {
       type: "object",

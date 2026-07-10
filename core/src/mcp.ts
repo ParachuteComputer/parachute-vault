@@ -3,6 +3,7 @@ import type { Store, Note } from "./types.js";
 import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
+import { normalizePath } from "./paths.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
 import {
@@ -15,7 +16,12 @@ import {
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
 import * as linkOps from "./links.js";
-import { resolveOrQueueLink, resolveStructuredLinkNote } from "./wikilinks.js";
+import {
+  resolveOrQueueLink,
+  resolveStructuredLinkNote,
+  getUnresolvedLinksForNote,
+  getUnresolvedLinksForNotes,
+} from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
 import {
@@ -195,6 +201,25 @@ export interface GenerateMcpToolsOpts {
    * Omitted (unscoped / internal callers) → the full graph is walked.
    */
   nearTraversable?: (noteId: string) => boolean;
+  /**
+   * `ifExistsVisible` (vault#555 auth-review must-fix) is an OPTIONAL per-note
+   * predicate gating the `create-note` `if_exists` upsert. `if_exists` resolves
+   * the target `path` VAULT-WIDE (`getNoteByPath`) and then returns (ignore) /
+   * updates / replaces the found note — so without a scope gate a tag-scoped
+   * caller could READ or OVERWRITE an out-of-scope note just by naming its
+   * path. When provided, `applyExistingNote` calls this predicate on the
+   * RESOLVED existing note and, if it returns false, throws `PathConflictError`
+   * instead (the path is taken but invisible to this caller — no content
+   * exposed, nothing mutated). It's applied INSIDE `applyExistingNote`, which
+   * BOTH the proactive-check site AND the concurrent-INSERT race-backstop site
+   * funnel through — so a TOCTOU race (both existence checks miss, the real
+   * INSERT then loses to a concurrent writer's out-of-scope note) can't slip a
+   * note past it. Core stays scope-unaware: it receives a plain
+   * `(note) => boolean` closure and never imports the server's tag-scope
+   * module. Omitted (unscoped / internal callers) → `if_exists` resolves
+   * against the full vault exactly as before.
+   */
+  ifExistsVisible?: (note: Note) => boolean;
 }
 
 /**
@@ -208,6 +233,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const db: Database = store.db;
   const expandVisibility = opts?.expandVisibility;
   const nearTraversable = opts?.nearTraversable;
+  const ifExistsVisible = opts?.ifExistsVisible;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -270,6 +296,8 @@ Large notes: pass \`content_offset\` / \`content_length\` (UTF-8 bytes) for a bo
 
 Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.
 
+Broken links (vault#555): a \`[[wikilink]]\` or structured \`links\` target that never resolved to a note used to be invisible — silently dropped from the response with no signal it existed. Pass \`has_broken_links: true\`/\`false\` to filter notes by whether they have any dangling outbound link, and/or \`include_broken_links: true\` to attach each note's pending targets as \`broken_links: [{target, relationship}]\` (empty array when none). Both read the vault's pending-resolution table — the same source \`create-note\`/\`update-note\`'s \`unresolved_link\` warning draws from; a target created later (this session or any future one) backfills the edge automatically and the note drops out of \`has_broken_links: true\`.
+
 Response shape (vault#550 — three variants, pick by what you passed):
 - Default (no \`cursor\`, no warnings): a bare array of notes.
 - Cursor mode (\`cursor\` param present — including \`cursor: ""\` to bootstrap): \`{notes: [...], next_cursor}\`. See \`cursor\` below for the bootstrap flow.
@@ -322,6 +350,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
           },
           has_tags: { type: "boolean", description: "Presence filter: true = only notes with at least one tag; false = only untagged notes. Ignored when `tag` is set." },
           has_links: { type: "boolean", description: "Presence filter: true = only notes with at least one inbound or outbound link; false = only orphaned notes (no links in either direction)." },
+          has_broken_links: { type: "boolean", description: "Presence filter (vault#555): true = only notes with at least one dangling outbound link — a [[wikilink]] or structured `links` target that never resolved to a note; false = only notes with none. Backed by the unresolved_wikilinks table (same data `doctor`/list-unresolved surfaces); safe on a vault where no link has ever gone unresolved (true matches nothing, false is a no-op)." },
           path: { type: "string", description: "Exact path match (case-insensitive)" },
           path_prefix: { type: "string", description: "Path prefix match (e.g., 'Projects/')" },
           extension: {
@@ -404,6 +433,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
             description: "Control metadata in response: true (all, default), false (none), or array of field names to include",
           },
           include_links: { type: "boolean", description: "Include inbound + outbound links per note (default: false)" },
+          include_broken_links: { type: "boolean", description: "Include each note's dangling outbound links as `broken_links: [{target, relationship}]` (default: false; vault#555). `target` is the unresolved path/title the [[wikilink]] or structured `links` entry named; `relationship` is \"wikilink\" for content-parsed links or the caller's own relationship string for a structured link. Empty array when the note has none. One batched query per request regardless of page size — mirrors `has_broken_links` (same backing table) and `include_links`." },
           include_link_count: {
             type: "boolean",
             description:
@@ -491,6 +521,9 @@ Response shape (vault#550 — three variants, pick by what you passed):
           result = filterMetadata(result, params.include_metadata as boolean | string[] | undefined);
           if (params.include_links) {
             result.links = linkOps.getLinksHydrated(db, note.id);
+          }
+          if (params.include_broken_links) {
+            result.broken_links = getUnresolvedLinksForNote(db, note.id);
           }
           if (params.include_attachments) {
             result.attachments = await store.getAttachments(note.id);
@@ -682,6 +715,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
             excludeTags,
             hasTags: params.has_tags as boolean | undefined,
             hasLinks: params.has_links as boolean | undefined,
+            hasBrokenLinks: params.has_broken_links as boolean | undefined,
             path: params.path as string | undefined,
             pathPrefix: params.path_prefix as string | undefined,
             extension: params.extension as string | string[] | undefined,
@@ -800,8 +834,8 @@ Response shape (vault#550 — three variants, pick by what you passed):
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
 
-        // --- Hydrate links/attachments per note if requested ---
-        if (params.include_links || params.include_attachments) {
+        // --- Hydrate links/attachments/broken-links per note if requested ---
+        if (params.include_links || params.include_attachments || params.include_broken_links) {
           // Links hydrate for the WHOLE page in a constant number of
           // queries (see getLinksHydratedForNotes) — the per-note variant
           // cost (1 link query + 1 summary query + N tag queries) × page
@@ -809,10 +843,15 @@ Response shape (vault#550 — three variants, pick by what you passed):
           const linksByNote = params.include_links
             ? linkOps.getLinksHydratedForNotes(db, (output as any[]).map((n: any) => n.id))
             : null;
+          // Same one-batched-query-for-the-page shape as links (vault#555).
+          const brokenLinksByNote = params.include_broken_links
+            ? getUnresolvedLinksForNotes(db, (output as any[]).map((n: any) => n.id))
+            : null;
           const enrichedOut: any[] = [];
           for (const n of output as any[]) {
             const enriched: any = { ...n };
             if (linksByNote) enriched.links = linksByNote.get(n.id) ?? [];
+            if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
             if (params.include_attachments) enriched.attachments = await store.getAttachments(n.id);
             enrichedOut.push(enriched);
           }
@@ -850,7 +889,17 @@ Response shape (vault#550 — three variants, pick by what you passed):
     {
       name: "create-note",
       requiredVerb: "write",
-      description: `Create one or more notes. Pass a single note's fields directly, or pass a \`notes\` array for batch creation. Each note accepts content, path, metadata, tags, links, and created_at.`,
+      description: `Create one or more notes. Pass a single note's fields directly, or pass a \`notes\` array for batch creation. Each note accepts content, path, metadata, tags, links, and created_at.
+
+**Path-conflict handling** — \`if_exists: "error"|"ignore"|"update"|"replace"\` (vault#555, default \`"error"\`): what to do when the note's \`path\` already names an existing note.
+- \`"error"\` (DEFAULT — unchanged behavior): the write is rejected with a \`path_conflict\` error (409); nothing is mutated.
+- \`"ignore"\`: return the existing note UNCHANGED — no error and no mutation of any kind (content/metadata/tags/links untouched; no schema-default backfill runs either). Response carries \`existed: true\`. The idempotent-retry primitive: a crash-replay or the losing side of a create-race gets back the same note a first-time caller would have created, safely, any number of times.
+- \`"update"\`: merge this payload into the existing note — \`content\` (if provided) fully replaces the existing content, exactly like \`update-note\`'s \`content\` field (omit to leave it untouched); \`metadata\` (if provided) is RFC-7386 merged — existing keys preserved, incoming keys overwrite, an incoming \`null\` value deletes a key — same semantics as \`update-note\`; \`tags\`/\`links\` (if provided) are ADDED to the existing set (union — nothing already there is removed). Response carries \`existed: true\`.
+- \`"replace"\`: overwrite \`content\` and \`metadata\` WHOLESALE — \`content\` becomes exactly the incoming value (or \`""\` if omitted) and \`metadata\` becomes exactly the incoming object (or \`{}\` if omitted), NOT merged, so a prior metadata key absent from this payload is dropped. \`tags\`/\`links\` stay additive (same union behavior as \`"update"\`) — a replace targets the free-form fields, not the taxonomy/graph, so it can't silently orphan links or detach tags the caller didn't mention. The note's \`id\` and \`created_at\` are preserved either way.
+
+A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` was one of \`"ignore"\`/\`"update"\`/\`"replace"\` — \`true\` when the collision branch fired, \`false\` when a normal fresh insert happened instead (including when \`path\` was never set, so there was nothing to conflict with — \`if_exists\` is a no-op without a \`path\`, but still reports \`existed: false\`). Absent entirely under the default \`"error"\` mode — a plain create-note call's response shape is byte-identical to before this feature. Batch-aware, per-item (like \`if_missing\` on \`update-note\`): set \`if_exists\` inside each \`notes[]\` entry — a top-level \`if_exists\` alongside a \`notes\` array is NOT inherited by items that omit their own (it only takes effect on the single-note form, where \`params\` IS the one item).
+
+**Batch summary** — pass \`summary: true\` (batch/\`notes\` calls only; ignored on a single-note call) to receive a compact \`{created, ids, failed}\` shape instead of N full note objects: \`created\` counts items that resulted in a BRAND-NEW insert (excludes \`if_exists\` collisions); \`ids\` lists every resulting note id in item order (fresh creates AND \`existed\` hits alike); \`failed\` is reserved for future partial-batch-failure reporting — today a batch create is all-or-nothing (any thrown error aborts and rolls back the WHOLE call, same with or without \`summary\`), so it's always \`[]\`.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -873,21 +922,30 @@ Response shape (vault#550 — three variants, pick by what you passed):
             description: "Links to create from this note. `target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title. A target created LATER in the same `notes` batch, or by a future call, resolves automatically (queued + backfilled) — the response carries an `unresolved_link` warning naming the target in the meantime; never silently dropped.",
           },
           created_at: { type: "string", description: "ISO timestamp (defaults to now)" },
+          if_exists: {
+            type: "string",
+            enum: ["error", "ignore", "update", "replace"],
+            description: "What to do when `path` already names an existing note (vault#555). See the tool description for the full contract of each mode. Default \"error\" — unchanged path_conflict behavior.",
+          },
+          summary: {
+            type: "boolean",
+            description: "Batch calls only (a `notes` array): return a compact `{created, ids, failed}` shape instead of N full note objects. See the tool description. Ignored on a single-note call.",
+          },
           // Batch
           notes: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                content: { type: "string" },
+                content: { type: "string", description: "Optional — defaults to \"\" (vault#555 fix: this item's schema previously marked it `required`, but it was never enforced; an empty-content batch item has always succeeded)." },
                 path: { type: "string" },
                 extension: { type: "string", description: "File extension (vault#328). See top-level docs." },
                 metadata: { type: "object" },
                 tags: { type: "array", items: { type: "string" } },
                 links: { type: "array" },
                 created_at: { type: "string" },
+                if_exists: { type: "string", enum: ["error", "ignore", "update", "replace"], description: "Per-item: see top-level `if_exists` docs. Each batch item carries its own setting." },
               },
-              required: ["content"],
             },
             description: "Array of notes for batch creation",
           },
@@ -909,19 +967,145 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // moment item 0's links were processed. Deferring makes
         // within-batch forward-refs resolve exactly like a same-content
         // [[wikilink]] already does. `pendingLinks` carries the SOURCE
-        // note id (known immediately — createNote assigns it synchronously)
-        // alongside each item's raw `links` array.
+        // note id (known immediately — createNote assigns it synchronously,
+        // and so does the `if_exists` existing-note branch below) alongside
+        // each item's raw `links` array.
         const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
         // Per-note `unresolved_link` warnings (vault#555 — "never silent").
         // Populated in the second pass; folded into each note's response
         // below, same pattern as `validation_status`.
         const linkWarningsByNote = new Map<string, QueryWarning[]>();
+        // `if_exists` bookkeeping (vault#555). `existedMap` is set ONLY for
+        // items whose `if_exists` engaged (ignore/update/replace) — absent
+        // means the default "error" path ran, so a plain create-note call
+        // sees zero response-shape change. `true` = the path already named
+        // a note and that branch fired; `false` = if_exists was set but no
+        // conflict occurred (a normal fresh insert). `noMutateIds` marks
+        // "ignore" hits so the schema-defaults pass below skips them
+        // entirely — "ignore" promises NO mutation, including backfill.
+        const existedMap = new Map<string, boolean>();
+        const noMutateIds = new Set<string>();
+        /** Record an `if_exists` collision outcome — shared by both call sites below. */
+        const recordExistedBranch = (resultNote: Note, noMutate: boolean): void => {
+          existedMap.set(resultNote.id, true);
+          if (noMutate) noMutateIds.add(resultNote.id);
+          created.push(resultNote);
+        };
+
+        /**
+         * Handle an `if_exists` collision against an already-resolved
+         * `existingNote` — shared by the proactive pre-check (the common,
+         * non-racing path) and the insert-time PathConflictError catch
+         * (the race-closing backstop: a concurrent writer's INSERT
+         * committed between our check and ours). Returns the note to put
+         * in the response and whether it must be excluded from the
+         * schema-defaults mutation pass ("ignore" — genuinely untouched).
+         */
+        const applyExistingNote = async (
+          item: any,
+          existingNote: Note,
+          mode: "ignore" | "update" | "replace",
+        ): Promise<{ note: Note; noMutate: boolean }> => {
+          // CRITICAL scope guard (vault#555 auth-review must-fix). `existingNote`
+          // was resolved VAULT-WIDE by path (getNoteByPath) at whichever call
+          // site reached here — the proactive check OR the concurrent-INSERT
+          // race backstop. A tag-scoped MCP session injects `ifExistsVisible`
+          // (see GenerateMcpToolsOpts); when the resolved note fails it, the
+          // caller must not read (ignore) / update / replace an out-of-scope
+          // note it named only by path — throw PathConflictError (path taken,
+          // invisible to this caller) BEFORE any read or mutation, so no
+          // content leaks and nothing is written. Placing it HERE — not only in
+          // the server-layer wrapper's pre-check — is what closes the
+          // race-backstop TOCTOU: the pre-check + core's proactive check can
+          // BOTH miss a note a concurrent writer then INSERTs, and the backstop
+          // re-resolves it into this exact call. Core stays scope-unaware: it
+          // only invokes the injected closure. Unscoped/internal callers pass no
+          // predicate → unchanged behavior.
+          if (ifExistsVisible && !ifExistsVisible(existingNote)) {
+            throw new noteOps.PathConflictError(existingNote.path ?? "");
+          }
+          if (mode === "ignore") {
+            // No error, no mutation of any kind — not even schema-default
+            // backfill. Return the existing note exactly as stored.
+            return { note: existingNote, noMutate: true };
+          }
+
+          // "update" / "replace" both apply tags/links additively (union) —
+          // they differ only in how content/metadata combine with the
+          // existing values. See the tool description for the full contract.
+          const updates: { content?: string; metadata?: Record<string, unknown> } = {};
+          if (mode === "update") {
+            if (item.content !== undefined) updates.content = item.content as string;
+            if (item.metadata !== undefined) {
+              updates.metadata = noteOps.mergeMetadata(
+                existingNote.metadata as Record<string, unknown> | null | undefined,
+                item.metadata as Record<string, unknown>,
+              );
+            }
+          } else {
+            // "replace" — PUT semantics: content/metadata become exactly
+            // this payload (empty default when omitted), never merged.
+            updates.content = (item.content as string | undefined) ?? "";
+            updates.metadata = (item.metadata as Record<string, unknown> | undefined) ?? {};
+          }
+
+          const incomingTags = (item.tags as string[] | undefined) ?? [];
+          const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
+          const projectedMetadata =
+            updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
+          // Strict-schema gate (vault#299) against the PROJECTED final shape
+          // (existing ∪ incoming), not the raw incoming item — a caller
+          // updating one field of an already-conforming note shouldn't have
+          // to re-supply every `required` field just to pass validation.
+          enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+
+          // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): a
+          // tags-only or links-only "update" leaves `updates` empty, so
+          // gating store.updateNote on `updates` ALONE would skip it — and
+          // then a genuine tag/link mutation (store.tagNote below) would never
+          // bump `updated_at`, breaking cursor polling (`ORDER BY updated_at`)
+          // and any since-last-check sync. Gate on the tag/link mutation too,
+          // mirroring the update-note/PATCH path's hasTagMutation||hasLinkMutation.
+          // store.updateNote with empty core fields still issues a real UPDATE
+          // that bumps updated_at (+ last_updated_by/via). "replace" always
+          // sets content+metadata, so it was never affected.
+          const hasLinkMutation = item.links !== undefined;
+          let result: Note = existingNote;
+          if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
+            result = await store.updateNote(existingNote.id, {
+              ...updates,
+              actor: writeActor,
+              via: writeVia,
+            });
+          }
+
+          if (incomingTags.length > 0) {
+            await store.tagNote(result.id, incomingTags);
+            // Note: applySchemaDefaults also runs in the outer batch loop for
+            // this note (it's not in `noMutateIds` — only "ignore" hits are),
+            // so this inline call is redundant. Harmless (idempotent — fills
+            // only still-missing fields), kept so the update/replace branch is
+            // self-contained; left un-gated to avoid coupling to the outer loop.
+            await applySchemaDefaults(store, db, [result.id], incomingTags);
+          }
+
+          if (item.links) {
+            pendingLinks.push({ sourceId: result.id, links: item.links as { target: string; relationship: string }[] });
+          }
+
+          return { note: noteOps.getNote(db, result.id) ?? result, noMutate: false };
+        };
+
         // Wrap multi-item batches in a SQLite transaction so a mid-batch
         // failure rolls back every prior insert — see #236. This guards
         // anything thrown from store.createNote / createLink (path
         // conflict, etc.). Single-item calls skip the wrap to avoid
         // colliding with concurrent callers on the shared bun:sqlite
-        // connection.
+        // connection. Catching a PathConflictError INSIDE this callback
+        // (the if_exists race backstop below) does NOT roll back the
+        // transaction — only a throw that escapes `runBatch` does (see
+        // core/src/txn.ts) — so the fallback-to-existing-note path commits
+        // normally alongside every other item in the batch.
         const batched = items.length > 1;
         const runBatch = async (): Promise<void> => {
           for (const item of items) {
@@ -931,6 +1115,28 @@ Response shape (vault#550 — three variants, pick by what you passed):
             const extension = item.extension !== undefined
               ? validateExtension(item.extension)
               : undefined;
+            const effectiveExtension = extension ?? "md";
+            const ifExists = (item.if_exists as string | undefined) ?? "error";
+            const upsertMode = ifExists === "ignore" || ifExists === "update" || ifExists === "replace";
+
+            // Proactive existence check (vault#555) — only possible when a
+            // path is set (a pathless create can never conflict). Handles
+            // the common, non-racing case cleanly: skip the raw-item strict
+            // gate entirely (it would validate the wrong shape — see
+            // `applyExistingNote`) and go straight to the ignore/update/
+            // replace branch. The insert-time catch below is the backstop
+            // for the rare true race.
+            let existingNote: Note | null = null;
+            if (upsertMode && item.path) {
+              const normalized = normalizePath(item.path as string);
+              existingNote = normalized ? noteOps.getNoteByPath(db, normalized, effectiveExtension) : null;
+            }
+            if (existingNote) {
+              const { note: resultNote, noMutate } = await applyExistingNote(item, existingNote, ifExists as "ignore" | "update" | "replace");
+              recordExistedBranch(resultNote, noMutate);
+              continue;
+            }
+
             // Strict-schema gate (vault#299) — reject before any write so a
             // mid-batch violation rolls back the batch transaction.
             enforceStrict({
@@ -938,17 +1144,38 @@ Response shape (vault#550 — three variants, pick by what you passed):
               tags: item.tags as string[] | undefined,
               metadata: item.metadata as Record<string, unknown> | undefined,
             });
-            const note = await store.createNote(item.content as string ?? "", {
-              path: item.path as string | undefined,
-              tags: item.tags as string[] | undefined,
-              metadata: item.metadata as Record<string, unknown> | undefined,
-              created_at: item.created_at as string | undefined,
-              ...(extension !== undefined ? { extension } : {}),
-              // Write-attribution (vault#298) — same actor/via for every item
-              // in a batch (the whole call came from one authenticated session).
-              actor: writeActor,
-              via: writeVia,
-            });
+            let note: Note;
+            try {
+              note = await store.createNote(item.content as string ?? "", {
+                path: item.path as string | undefined,
+                tags: item.tags as string[] | undefined,
+                metadata: item.metadata as Record<string, unknown> | undefined,
+                created_at: item.created_at as string | undefined,
+                ...(extension !== undefined ? { extension } : {}),
+                // Write-attribution (vault#298) — same actor/via for every item
+                // in a batch (the whole call came from one authenticated session).
+                actor: writeActor,
+                via: writeVia,
+              });
+            } catch (err) {
+              // Race backstop (vault#555): a concurrent writer's INSERT
+              // committed between our proactive check (skipped or missed
+              // above) and this one. Re-resolve the now-existing row and
+              // fall through to the SAME branch a proactive hit would have
+              // taken — closes the create-race gap even under true
+              // concurrency, not just the sequential common case.
+              if (upsertMode && err instanceof noteOps.PathConflictError) {
+                const winner = noteOps.getNoteByPath(db, err.path, effectiveExtension);
+                if (winner) {
+                  const { note: resultNote, noMutate } = await applyExistingNote(item, winner, ifExists as "ignore" | "update" | "replace");
+                  recordExistedBranch(resultNote, noMutate);
+                  continue;
+                }
+              }
+              throw err;
+            }
+
+            if (upsertMode) existedMap.set(note.id, false);
 
             if (item.links) {
               pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
@@ -991,9 +1218,12 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // update-note path, which already re-reads post-defaults. The re-read
         // is batched (`getNotes` = one `WHERE id IN (...)`) and skipped
         // entirely when no defaults were applied, so the common no-defaults
-        // path adds zero extra reads.
+        // path adds zero extra reads. `noMutateIds` ("ignore" hits) are
+        // skipped entirely — "ignore" promises zero mutation, including
+        // backfill of a since-added default the existing note predates.
         const mutatedIds = new Set<string>();
         for (const note of created) {
+          if (noMutateIds.has(note.id)) continue;
           if (note.tags && note.tags.length > 0) {
             for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
               mutatedIds.add(id);
@@ -1014,14 +1244,33 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // applies to this note, against the post-defaults state. Fold in any
         // `unresolved_link` warnings collected above (vault#555) — additive,
         // present only when this note's `links` had a target that didn't
-        // resolve.
+        // resolve. `existed` (vault#555) is attached ONLY for items whose
+        // `if_exists` actually engaged — the default "error" path's response
+        // shape is untouched.
         const final = refreshed.map((n) => {
           const validated = attachValidationStatus(store, db, n);
           const warnings = linkWarningsByNote.get(n.id);
-          return warnings && warnings.length > 0
-            ? ({ ...validated, warnings } as Note & { warnings: QueryWarning[] })
-            : validated;
+          const existed = existedMap.get(n.id);
+          let out: Note & { warnings?: QueryWarning[]; existed?: boolean } = validated;
+          if (warnings && warnings.length > 0) out = { ...out, warnings };
+          if (existed !== undefined) out = { ...out, existed };
+          return out;
         });
+
+        // Batch summary (vault#555) — compact shape instead of N full note
+        // objects. Batch-only (a `notes` array); `summary` is ignored on a
+        // single-note call, matching `if_exists`'s per-item batch scoping.
+        if (batch && params.summary === true) {
+          return {
+            created: final.filter((n: any) => n.existed !== true).length,
+            ids: final.map((n) => n.id),
+            // Reserved for future partial-batch-failure reporting — a batch
+            // create is all-or-nothing today (see the tool description), so
+            // this is always empty.
+            failed: [] as unknown[],
+          };
+        }
+
         return batch ? final : final[0];
       },
     },
@@ -1668,7 +1917,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "list-tags",
       requiredVerb: "read",
-      description: `List tags with usage counts. Each row carries \`count\` (notes carrying the EXACT tag) and \`expanded_count\` (vault#550 — distinct notes matching the tag OR any transitive descendant under the default subtypes expansion; use this to see a parent tag's true rollup when its notes are actually tagged with a more specific child). Pass \`tag\` to get a single tag's full record (description, fields, relationships, parent_names, timestamps) — errors with \`error_type: "tag_not_found"\` (plus a \`did_you_mean\` hint when a close match exists) if the tag has no identity row and no notes. Pass \`include_schema: true\` to include the full record for every tag.`,
+      description: `List tags with usage counts. Each row carries \`count\` (notes carrying the EXACT tag) and \`expanded_count\` (vault#550 — distinct notes matching the tag OR any transitive descendant under the default subtypes expansion; use this to see a parent tag's true rollup when its notes are actually tagged with a more specific child). Pass \`tag\` to get a single tag's full record (description, fields, relationships, parent_names, timestamps) — errors with \`error_type: "tag_not_found"\` (plus a \`did_you_mean\` hint when a close match exists) if the tag has no identity row and no notes. Pass \`include_schema: true\` to include the full record for every tag. NOTE (vault#555): this list includes zero-membership tags (\`count: 0\` — a declared schema never yet applied, or a tag every note was since untagged from), so its length can run higher than \`vault-info\`'s stats \`tagCount\`, which counts only tags at least one note currently carries.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1883,7 +2132,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // mgmt + future config writes; deletes are write-tier mutations.
       // See delete-note rationale.
       requiredVerb: "write",
-      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway.",
+      description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway. Also refused with error_type \"tag_in_use_by_tokens\" (vault#555 fix — this case existed pre-#555 but was undocumented here; see \"merge-tags\" for the identical guard) when the tag is referenced by a tag-scoped token's allowlist — revoke or re-mint the token(s) first. A no-op on a tag with no identity row and no notes returns {deleted: false, notes_untagged: 0} rather than erroring.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2039,7 +2288,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // overrideVaultInfo in src/mcp-tools.ts) — do not promote this to
       // `write` or read-only callers lose the stats projection.
       requiredVerb: "read",
-      description: "Get a comprehensive vault projection: name, description, tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, and query hints. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution. Pass `description` to update the vault description (changes how AI agents behave in future sessions). Call this anytime mid-session to refresh schema context.",
+      description: "Get a comprehensive vault projection: name, description, `coordinates` (this vault's own REST/MCP URL templates — `{name, base_url, rest_api, mcp}`, always present), tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, query hints, and (when a seeded onboarding guide exists) a `getting_started` note pointer. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution as a `stats` field. Pass `description` to update the vault description (changes how AI agents behave in future sessions) — requires the `vault:write` scope for this vault even though the tool itself is read-gated (vault#555: a `vault:read`-only caller passing `description` gets a `Forbidden` rejection, not a silent no-op). Call this anytime mid-session to refresh schema context. NOTE (vault#555): the stats `tagCount` counts only tags at least one note currently carries (`COUNT(DISTINCT tag_name)` over note-tag memberships) — `list-tags`'s row count can run higher because it also lists zero-membership tags (an identity row from a declared schema or a since-untagged tag). Neither is wrong; they answer different questions.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2099,7 +2348,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // vault's taxonomy, not scoped to any one tag's write authority.
       requiredVerb: "admin",
       description:
-        "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Reports, per finding, {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
+        "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
       inputSchema: { type: "object", properties: {} },
       execute: async () => {
         return await store.doctor();

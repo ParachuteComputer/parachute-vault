@@ -141,6 +141,15 @@ export interface QueryOpts {
   // `hasLinks` checks both directions — inbound or outbound counts as "has links".
   hasTags?: boolean;
   hasLinks?: boolean;
+  /**
+   * Presence filter on the `unresolved_wikilinks` table (vault#555):
+   * `true` → only notes with at least one dangling outbound link (a
+   * `[[wikilink]]` or structured `links` target that never resolved to a
+   * note); `false` → only notes with none. Safe on a vault where the
+   * `unresolved_wikilinks` table has never been created (no note has ever
+   * had a broken link) — `true` matches nothing, `false` is a no-op.
+   */
+  hasBrokenLinks?: boolean;
   path?: string;        // exact path match (case-insensitive)
   pathPrefix?: string;  // e.g., "Projects/Parachute" matches "Projects/Parachute/README"
   /**

@@ -3376,6 +3376,93 @@ describe("MCP tools", async () => {
     expect(result.map((n) => n.content)).toEqual(["Orphan"]);
   });
 
+  // ---- has_broken_links / include_broken_links (vault#555) ----
+
+  it("query-notes has_broken_links=true surfaces only notes with a dangling wikilink", async () => {
+    await store.createNote("[[Nonexistent Target]]", { id: "mq-broken", path: "mq-broken" });
+    await store.createNote("no links here", { id: "mq-clean", path: "mq-clean" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_broken_links: true, include_content: true }) as any[];
+    expect(result.map((n) => n.path)).toEqual(["mq-broken"]);
+  });
+
+  it("query-notes has_broken_links=false excludes notes with a dangling link", async () => {
+    await store.createNote("[[Nonexistent Target]]", { id: "mq-broken2", path: "mq-broken2" });
+    await store.createNote("no links here", { id: "mq-clean2", path: "mq-clean2" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ has_broken_links: false, include_content: true }) as any[];
+    expect(result.map((n) => n.path).sort()).toEqual(["mq-clean2"]);
+  });
+
+  it("query-notes has_broken_links is safe on a vault where no link has ever gone unresolved", async () => {
+    // Fresh store, beforeEach — the unresolved_wikilinks table has never
+    // been created. true should match nothing (not throw); false should
+    // be a no-op (matches everything).
+    await store.createNote("plain note", { id: "mq-nolinks", path: "mq-nolinks" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const truthy = await query.execute({ has_broken_links: true, include_content: true }) as any[];
+    expect(truthy).toEqual([]);
+    const falsy = await query.execute({ has_broken_links: false, include_content: true }) as any[];
+    expect(falsy.map((n) => n.path)).toEqual(["mq-nolinks"]);
+  });
+
+  it("a target created later resolves the wikilink and the note drops out of has_broken_links:true", async () => {
+    await store.createNote("[[Later Target]]", { id: "mq-fixable", path: "mq-fixable" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    expect((await query.execute({ has_broken_links: true }) as any[]).length).toBe(1);
+
+    await store.createNote("here now", { path: "Later Target" });
+    expect((await query.execute({ has_broken_links: true }) as any[]).length).toBe(0);
+  });
+
+  it("query-notes include_broken_links surfaces {target, relationship} for a single note", async () => {
+    await store.createNote("[[Missing Note]]", { id: "mq-single-broken", path: "mq-single-broken" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-single-broken", include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Missing Note", relationship: "wikilink" }]);
+  });
+
+  it("query-notes include_broken_links surfaces a structured link's unresolved_link entry too", async () => {
+    const created = await generateMcpTools(store).find((t) => t.name === "create-note")!.execute({
+      content: "body",
+      path: "mq-structured-broken",
+      links: [{ target: "Does Not Exist", relationship: "depends-on" }],
+    }) as any;
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: created.id, include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([{ target: "Does Not Exist", relationship: "depends-on" }]);
+  });
+
+  it("query-notes include_broken_links is [] for a note with no dangling links", async () => {
+    await store.createNote("clean", { id: "mq-clean-single", path: "mq-clean-single" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "mq-clean-single", include_broken_links: true }) as any;
+    expect(result.broken_links).toEqual([]);
+  });
+
+  it("query-notes include_broken_links works in list mode, batched across the page", async () => {
+    await store.createNote("[[Ghost A]]", { id: "mq-list-a", path: "mq-list-a" });
+    await store.createNote("[[Ghost B]]", { id: "mq-list-b", path: "mq-list-b" });
+    await store.createNote("clean", { id: "mq-list-c", path: "mq-list-c" });
+
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ include_broken_links: true, include_content: true }) as any[];
+    const byId = new Map(result.map((n: any) => [n.id, n.broken_links]));
+    expect(byId.get("mq-list-a")).toEqual([{ target: "Ghost A", relationship: "wikilink" }]);
+    expect(byId.get("mq-list-b")).toEqual([{ target: "Ghost B", relationship: "wikilink" }]);
+    expect(byId.get("mq-list-c")).toEqual([]);
+  });
+
   it("query-notes metadata operator query routes through the indexed column", async () => {
     const { declareField } = await import("./indexed-fields.js");
     declareField(db, "priority", "INTEGER", "project");
@@ -5185,6 +5272,401 @@ describe("update-note if_missing=create (vault#309)", async () => {
     expect(respondsTo).toBeDefined();
     expect(respondsTo!.targetId).toBe("t-mcp-b-321");
     expect(respondsTo!.metadata).toEqual({ weight: 5 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-note `if_exists` — idempotent upsert on a path conflict (vault#555)
+// ---------------------------------------------------------------------------
+
+describe("create-note if_exists (vault#555)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("default (no if_exists) still throws path_conflict — back-compat", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "first", path: "Inbox/dup" });
+    await expect(create.execute({ content: "second", path: "Inbox/dup" }))
+      .rejects.toThrow(/path_conflict/);
+  });
+
+  it('if_exists:"error" behaves identically to omitting it', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "first", path: "Inbox/dup-explicit" });
+    await expect(create.execute({ content: "second", path: "Inbox/dup-explicit", if_exists: "error" }))
+      .rejects.toThrow(/path_conflict/);
+  });
+
+  it('if_exists:"ignore" returns the existing note untouched, no mutation', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({
+      content: "original",
+      path: "Inbox/ignore-me",
+      tags: ["daily"],
+      metadata: { v: 1 },
+    }) as any;
+
+    const second = await create.execute({
+      content: "attempted overwrite",
+      path: "Inbox/ignore-me",
+      tags: ["other"],
+      metadata: { v: 2 },
+      if_exists: "ignore",
+    }) as any;
+
+    expect(second.existed).toBe(true);
+    expect(second.id).toBe(first.id);
+    expect(second.content).toBe("original"); // untouched
+    expect(second.metadata?.v).toBe(1); // untouched
+    expect(second.tags).toEqual(["daily"]); // "other" was never applied
+
+    // Confirm on disk too — no side effects at all.
+    const onDisk = await store.getNoteByPath("Inbox/ignore-me");
+    expect(onDisk!.content).toBe("original");
+    expect(onDisk!.tags).toEqual(["daily"]);
+  });
+
+  it('if_exists:"ignore" does not run schema-default backfill (genuinely zero mutation)', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    // Create the note BEFORE the schema declares a default, so the
+    // existing row is missing the field the schema would now backfill.
+    const first = await create.execute({ content: "x", path: "Inbox/predates-schema", tags: ["task"] }) as any;
+    expect(first.metadata?.priority).toBeUndefined();
+
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
+    });
+
+    const second = await create.execute({
+      content: "y",
+      path: "Inbox/predates-schema",
+      tags: ["task"],
+      if_exists: "ignore",
+    }) as any;
+    expect(second.existed).toBe(true);
+    expect(second.metadata?.priority).toBeUndefined(); // no backfill — zero mutation promise
+  });
+
+  it('if_exists:"update" full-replaces content, RFC-7386-merges metadata, and unions tags/links', async () => {
+    await store.createNote("target body", { id: "t-upd-target", path: "Targets/upd" });
+
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({
+      content: "v1",
+      path: "Inbox/update-me",
+      tags: ["daily"],
+      metadata: { a: 1, b: 2 },
+    }) as any;
+
+    const second = await create.execute({
+      content: "v2",
+      path: "Inbox/update-me",
+      tags: ["extra"],
+      metadata: { b: null, c: 3 }, // b deleted (RFC 7386), c added, a untouched
+      links: [{ target: "t-upd-target", relationship: "relates-to" }],
+      if_exists: "update",
+    }) as any;
+
+    expect(second.existed).toBe(true);
+    expect(second.id).toBe(first.id);
+    expect(second.content).toBe("v2"); // full replace
+    expect(second.metadata).toEqual({ a: 1, c: 3 }); // merged, b deleted
+    expect(second.tags?.sort()).toEqual(["daily", "extra"]); // union, nothing removed
+
+    const links = await store.getLinks(second.id, { direction: "outbound" });
+    expect(links.find((l) => l.relationship === "relates-to")?.targetId).toBe("t-upd-target");
+  });
+
+  it('if_exists:"update" with an omitted field leaves it untouched', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/partial-update", metadata: { keep: "me" } });
+
+    const second = await create.execute({
+      path: "Inbox/partial-update", // no `content` — should stay "v1"
+      metadata: { added: true },
+      if_exists: "update",
+    }) as any;
+    expect(second.content).toBe("v1");
+    expect(second.metadata).toEqual({ keep: "me", added: true });
+  });
+
+  it('if_exists:"replace" wholesale-overwrites content + metadata but keeps id/createdAt and unions tags', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({
+      content: "v1",
+      path: "Inbox/replace-me",
+      tags: ["daily"],
+      metadata: { a: 1, b: 2 },
+    }) as any;
+
+    const second = await create.execute({
+      content: "v2",
+      path: "Inbox/replace-me",
+      tags: ["extra"],
+      metadata: { c: 3 }, // a and b are NOT merged in — wholesale replace
+      if_exists: "replace",
+    }) as any;
+
+    expect(second.existed).toBe(true);
+    expect(second.id).toBe(first.id);
+    expect(second.createdAt).toBe(first.createdAt);
+    expect(second.content).toBe("v2");
+    expect(second.metadata).toEqual({ c: 3 }); // a/b dropped, not merged
+    expect(second.tags?.sort()).toEqual(["daily", "extra"]); // tags stay additive
+  });
+
+  it('if_exists:"replace" with omitted content/metadata clears them to empty defaults', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/replace-blank", metadata: { a: 1 } });
+
+    const second = await create.execute({
+      path: "Inbox/replace-blank",
+      if_exists: "replace",
+    }) as any;
+    expect(second.content).toBe("");
+    // An empty `{}` metadata collapses to `undefined` on read — the same
+    // convention every note with no metadata follows (rowToNote), not
+    // something special about `replace`.
+    expect(second.metadata).toBeUndefined();
+  });
+
+  it("if_exists is a no-op without a path — a pathless create can never conflict", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const a = await create.execute({ content: "one", if_exists: "ignore" }) as any;
+    const b = await create.execute({ content: "two", if_exists: "ignore" }) as any;
+    expect(a.id).not.toBe(b.id);
+    // `if_exists` was still passed, so `existed` is attached (there was
+    // simply nothing to conflict with) — `false`, not absent.
+    expect(a.existed).toBe(false);
+    expect(b.existed).toBe(false);
+  });
+
+  it("plain create-note calls (no if_exists) see zero response-shape change", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "plain" }) as any;
+    expect("existed" in result).toBe(false);
+  });
+
+  it("existed:false when if_exists is set but no conflict occurs (fresh insert)", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "fresh", path: "Inbox/fresh-one", if_exists: "update" }) as any;
+    expect(result.existed).toBe(false);
+  });
+
+  it("respects a per-item extension when disambiguating the conflict (vault#328)", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    // Two notes at the same path, different extensions — legal per vault#328.
+    await create.execute({ content: "csv body", path: "Reports/q1", extension: "csv" });
+    await create.execute({ content: "md body", path: "Reports/q1", extension: "md" });
+
+    // ignore against the CSV one specifically.
+    const result = await create.execute({
+      content: "attempted",
+      path: "Reports/q1",
+      extension: "csv",
+      if_exists: "ignore",
+    }) as any;
+    expect(result.existed).toBe(true);
+    expect(result.content).toBe("csv body");
+    expect(result.extension).toBe("csv");
+  });
+
+  it("batch: if_exists is per-item, not inherited from a top-level default", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "existing", path: "Inbox/batch-conflict" });
+
+    // Top-level if_exists is NOT merged into batch items (matches
+    // if_missing's contract on update-note) — the batch item below has no
+    // if_exists of its own, so it hits the default "error" path and the
+    // WHOLE batch rolls back, even though a top-level if_exists was passed.
+    await expect(create.execute({
+      if_exists: "ignore",
+      notes: [{ content: "conflict", path: "Inbox/batch-conflict" }],
+    })).rejects.toThrow(/path_conflict/);
+  });
+
+  it("batch: mixes fresh creates and if_exists hits in the same call, in order", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "pre-existing", path: "Inbox/batch-b" });
+
+    const result = await create.execute({
+      notes: [
+        { content: "a", path: "Inbox/batch-a", if_exists: "ignore" },
+        { content: "b-new", path: "Inbox/batch-b", if_exists: "ignore" },
+        { content: "c", path: "Inbox/batch-c", if_exists: "ignore" },
+      ],
+    }) as any[];
+
+    expect(result).toHaveLength(3);
+    expect(result[0].existed).toBe(false);
+    expect(result[1].existed).toBe(true);
+    expect(result[1].content).toBe("pre-existing"); // untouched
+    expect(result[2].existed).toBe(false);
+  });
+
+  it("a genuine schema violation on if_exists:update still rejects and mutates nothing", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { status: { type: "string", enum: ["open", "done"], strict: true, required: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/strict-target", tags: ["task"], metadata: { status: "open" } });
+
+    await expect(create.execute({
+      content: "v2",
+      path: "Inbox/strict-target",
+      metadata: { status: "NOT-A-VALID-ENUM" },
+      if_exists: "update",
+    })).rejects.toThrow();
+
+    const onDisk = await store.getNoteByPath("Inbox/strict-target");
+    expect(onDisk!.content).toBe("v1"); // untouched — rejected before any write
+  });
+
+  it("if_exists:update re-validates against the CURRENT schema without re-supplying satisfied required fields", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { status: { type: "string", enum: ["open", "done"], strict: true, required: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "v1", path: "Inbox/status-set", tags: ["task"], metadata: { status: "open" } });
+
+    // Only touching content — `status` is already satisfied by the
+    // EXISTING note, so re-validating the merged/projected shape (not the
+    // raw incoming item) must NOT demand it again.
+    const result = await create.execute({
+      content: "v2",
+      path: "Inbox/status-set",
+      if_exists: "update",
+    }) as any;
+    expect(result.content).toBe("v2");
+    expect(result.metadata?.status).toBe("open");
+  });
+
+  // vault#555 CRITICAL 2 (W8 fix-2 bug class): a tags-ONLY if_exists:"update"
+  // (no content/metadata) must still bump updated_at — store.tagNote genuinely
+  // mutates the note, and a frozen updated_at breaks cursor polling + sync.
+  it('if_exists:"update" with ONLY tags added still advances updated_at', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({ content: "body", path: "Inbox/tagonly", tags: ["alpha"] }) as any;
+    const before = (await store.getNoteByPath("Inbox/tagonly"))!.updatedAt!;
+
+    // Ensure a strictly-later wall-clock so the bump is observable even if the
+    // two writes land in the same millisecond.
+    await new Promise((r) => setTimeout(r, 5));
+
+    const second = await create.execute({
+      path: "Inbox/tagonly",
+      tags: ["beta"], // ONLY a tag change — no content, no metadata
+      if_exists: "update",
+    }) as any;
+    expect(second.existed).toBe(true);
+    expect(second.tags?.sort()).toEqual(["alpha", "beta"]); // tag actually added
+    const after = (await store.getNoteByPath("Inbox/tagonly"))!.updatedAt!;
+    expect(after > before).toBe(true); // updated_at advanced
+    expect(second.id).toBe(first.id);
+  });
+
+  it('if_exists:"update" with ONLY links added still advances updated_at', async () => {
+    await store.createNote("target", { id: "tgt-linkonly", path: "Targets/linkonly" });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "body", path: "Inbox/linkonly", tags: ["alpha"] });
+    const before = (await store.getNoteByPath("Inbox/linkonly"))!.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await create.execute({
+      path: "Inbox/linkonly",
+      links: [{ target: "tgt-linkonly", relationship: "relates-to" }],
+      if_exists: "update",
+    });
+    const after = (await store.getNoteByPath("Inbox/linkonly"))!.updatedAt!;
+    expect(after > before).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-note `summary` — compact batch response shape (vault#555)
+// ---------------------------------------------------------------------------
+
+describe("create-note summary (vault#555)", async () => {
+  let store: SqliteStore;
+  beforeEach(() => {
+    store = new SqliteStore(new Database(":memory:"));
+  });
+
+  it("summary:true returns {created, ids, failed} instead of N full note objects", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      summary: true,
+      notes: [
+        { content: "a", path: "Inbox/sum-a" },
+        { content: "b", path: "Inbox/sum-b" },
+        { content: "c", path: "Inbox/sum-c" },
+      ],
+    }) as any;
+    expect(result.created).toBe(3);
+    expect(result.ids).toHaveLength(3);
+    expect(result.failed).toEqual([]);
+    // Not the full-object shape.
+    expect(result.notes).toBeUndefined();
+    expect(Array.isArray(result)).toBe(false);
+
+    // The ids really do resolve to the notes just created.
+    const onDisk = await store.getNoteByPath("Inbox/sum-a");
+    expect(result.ids).toContain(onDisk!.id);
+  });
+
+  it("summary:true `created` excludes if_exists hits — only counts brand-new inserts", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "pre-existing", path: "Inbox/sum-existing" });
+
+    const result = await create.execute({
+      summary: true,
+      notes: [
+        { content: "fresh", path: "Inbox/sum-fresh", if_exists: "ignore" },
+        { content: "ignored", path: "Inbox/sum-existing", if_exists: "ignore" },
+      ],
+    }) as any;
+    expect(result.created).toBe(1); // only the fresh one
+    expect(result.ids).toHaveLength(2); // both ids are still reported
+  });
+
+  it("summary is ignored on a single-note (non-batch) call", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "solo", summary: true }) as any;
+    expect(result.content).toBe("solo"); // full note object, not a summary
+    expect(result.created).toBeUndefined();
+  });
+
+  it("without summary, batch still returns full note objects (back-compat)", async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      notes: [{ content: "a", path: "Inbox/sum-nosummary" }],
+    }) as any[];
+    expect(Array.isArray(result)).toBe(true);
+    expect(result[0].content).toBe("a");
   });
 });
 

@@ -306,6 +306,50 @@ export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved:
   return { unresolved, count: total };
 }
 
+/** One note's dangling outbound link, as surfaced on a note read (vault#555). */
+export interface BrokenLink {
+  target: string;
+  relationship: string;
+}
+
+/**
+ * Batch-fetch each note's pending `unresolved_wikilinks` rows — the
+ * `include_broken_links` surfacing on `query-notes` / `GET /notes`. ONE
+ * query for the whole page (mirrors `getLinksHydratedForNotes`'s batching),
+ * not one per note. Returns a map with an entry (possibly `[]`) for every
+ * requested id whenever the table exists; when the table has never been
+ * created (no note in this vault has ever had a broken link) every id maps
+ * to `[]` without a query attempt.
+ */
+export function getUnresolvedLinksForNotes(db: Database, noteIds: string[]): Map<string, BrokenLink[]> {
+  const result = new Map<string, BrokenLink[]>(noteIds.map((id) => [id, []]));
+  if (noteIds.length === 0) return result;
+
+  const rows: { source_id: string; target_path: string; relationship: string }[] = [];
+  try {
+    ensureRelationshipColumn(db);
+    for (const chunk of chunkForInClause(noteIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      rows.push(...db.prepare(
+        `SELECT source_id, target_path, relationship FROM unresolved_wikilinks WHERE source_id IN (${placeholders})`,
+      ).all(...chunk) as typeof rows);
+    }
+  } catch {
+    // Table doesn't exist — every id already maps to [] above.
+    return result;
+  }
+
+  for (const row of rows) {
+    result.get(row.source_id)?.push({ target: row.target_path, relationship: row.relationship || WIKILINK_REL });
+  }
+  return result;
+}
+
+/** Single-note convenience wrapper around {@link getUnresolvedLinksForNotes}. */
+export function getUnresolvedLinksForNote(db: Database, noteId: string): BrokenLink[] {
+  return getUnresolvedLinksForNotes(db, [noteId]).get(noteId) ?? [];
+}
+
 // ---------------------------------------------------------------------------
 // Sync — maintain wikilink-based links for a note
 // ---------------------------------------------------------------------------

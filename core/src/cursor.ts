@@ -173,6 +173,7 @@ export interface QueryHashInputs {
   excludeTags?: string[];
   hasTags?: boolean;
   hasLinks?: boolean;
+  hasBrokenLinks?: boolean;
   path?: string;
   pathPrefix?: string;
   extension?: string | string[];

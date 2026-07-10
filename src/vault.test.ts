@@ -1815,6 +1815,155 @@ describe("scoped MCP wrapper", async () => {
 
     closeAllStores();
   });
+
+  // vault#555 auth-review CRITICAL: `if_exists` must NOT let a scoped MCP
+  // session read/update/replace an out-of-scope note by naming its path.
+  // The create-note wrapper pre-resolves the path and throws path_conflict on
+  // an out-of-scope hit (byte-identical to a genuine conflict). Each assertion
+  // MUST fail without the wrapper guard.
+  test('scoped create-note if_exists:"ignore" does NOT return an out-of-scope note (throws path_conflict)', async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-ifexists-ignore-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("SECRET MCP PAYLOAD", { path: "Secret", tags: ["personal"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+    // in-scope incoming tag passes the item-tag pre-check; the OUT-OF-SCOPE
+    // existing note at this path must still be blocked.
+    await expect(
+      create.execute({ content: "attempted read", path: "Secret", tags: ["work"], if_exists: "ignore" }),
+    ).rejects.toThrow(/path_conflict/);
+
+    closeAllStores();
+  });
+
+  test('scoped create-note if_exists:"update"/"replace" does NOT mutate an out-of-scope note', async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-ifexists-mutate-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const secret = await store.createNote("ORIGINAL SECRET", { path: "Secret", tags: ["personal"], metadata: { keep: "me" } });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+
+    await expect(
+      create.execute({ content: "OVERWRITE", path: "Secret", tags: ["work"], metadata: { injected: true }, if_exists: "update" }),
+    ).rejects.toThrow(/path_conflict/);
+    await expect(
+      create.execute({ content: "REPLACE", path: "Secret", tags: ["work"], if_exists: "replace" }),
+    ).rejects.toThrow(/path_conflict/);
+
+    // Ground truth: the out-of-scope note is untouched by both attempts.
+    const onDisk = (await store.getNote(secret.id))!;
+    expect(onDisk.content).toBe("ORIGINAL SECRET");
+    expect(onDisk.metadata).toEqual({ keep: "me" });
+    expect(onDisk.tags).toEqual(["personal"]);
+
+    closeAllStores();
+  });
+
+  test("scoped create-note if_exists against an IN-scope note works normally (guard doesn't over-block)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-ifexists-inscope-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const existing = await store.createNote("WORK BODY", { path: "MyWork", tags: ["work"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "x", path: "MyWork", tags: ["work"], if_exists: "ignore" }) as any;
+    expect(result.existed).toBe(true);
+    expect(result.id).toBe(existing.id);
+    expect(result.content).toBe("WORK BODY");
+
+    closeAllStores();
+  });
+
+  // vault#555 auth-review CRITICAL (RACE PATH — the incomplete-first-fix gap).
+  // The wrapper pre-check + core's proactive getNoteByPath can BOTH miss a note
+  // that a concurrent writer INSERTs, after which core's race backstop
+  // re-resolves the (now-existing, out-of-scope) winner and calls
+  // applyExistingNote on it. Without the in-core `ifExistsVisible` guard the
+  // out-of-scope content leaks / the note is mutated. We reproduce the exact
+  // TOCTOU by monkeypatching store.createNote to (a) create the out-of-scope
+  // note itself (simulating the concurrent winner) and (b) throw
+  // PathConflictError — driving execution straight into the backstop. Both
+  // assertions MUST fail without the in-core guard.
+  async function raceVault(mode: "ignore" | "update" | "replace") {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+    const { PathConflictError } = await import("../core/src/notes.ts");
+
+    const vaultName = `tagscope-ifexists-race-${mode}-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+
+    // Monkeypatch createNote so the target path is created by a "concurrent
+    // writer" with an OUT-OF-SCOPE tag, then the real INSERT loses the race.
+    const origCreate = store.createNote.bind(store);
+    let raced = false;
+    (store as any).createNote = async (content: string, opts: any) => {
+      if (opts?.path === "Secret" && !raced) {
+        raced = true;
+        await origCreate("TOP SECRET RACE PAYLOAD", { path: "Secret", tags: ["personal"] });
+        throw new PathConflictError("Secret");
+      }
+      return origCreate(content, opts);
+    };
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+    return { store, create, closeAllStores };
+  }
+
+  test('scoped create-note if_exists:"ignore" RACE backstop does NOT leak out-of-scope content', async () => {
+    const { store, create, closeAllStores } = await raceVault("ignore");
+    await expect(
+      create.execute({ content: "attempted", path: "Secret", tags: ["work"], if_exists: "ignore" }),
+    ).rejects.toThrow(/path_conflict/);
+    // The concurrently-created out-of-scope note is byte-unchanged and its
+    // payload never reached the caller (the throw carries only the path).
+    const onDisk = (await store.getNoteByPath("Secret"))!;
+    expect(onDisk.content).toBe("TOP SECRET RACE PAYLOAD");
+    expect(onDisk.tags).toEqual(["personal"]);
+    closeAllStores();
+  });
+
+  test('scoped create-note if_exists:"update" RACE backstop does NOT mutate the out-of-scope note', async () => {
+    const { store, create, closeAllStores } = await raceVault("update");
+    await expect(
+      create.execute({ content: "OVERWRITE", path: "Secret", tags: ["work"], metadata: { injected: true }, if_exists: "update" }),
+    ).rejects.toThrow(/path_conflict/);
+    const onDisk = (await store.getNoteByPath("Secret"))!;
+    expect(onDisk.content).toBe("TOP SECRET RACE PAYLOAD"); // unmutated
+    expect(onDisk.metadata ?? {}).toEqual({});
+    expect(onDisk.tags).toEqual(["personal"]);
+    closeAllStores();
+  });
+
+  test('scoped create-note if_exists:"replace" RACE backstop does NOT mutate the out-of-scope note', async () => {
+    const { store, create, closeAllStores } = await raceVault("replace");
+    await expect(
+      create.execute({ content: "REPLACE", path: "Secret", tags: ["work"], if_exists: "replace" }),
+    ).rejects.toThrow(/path_conflict/);
+    const onDisk = (await store.getNoteByPath("Secret"))!;
+    expect(onDisk.content).toBe("TOP SECRET RACE PAYLOAD"); // unmutated
+    expect(onDisk.tags).toEqual(["personal"]);
+    closeAllStores();
+  });
 });
 
 describe("auth permissions", () => {
@@ -3988,6 +4137,111 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
     expect(targets).toContain("NoSuchPersonal");
   });
 
+  // vault#555 auth-review CRITICAL: `if_exists` must NOT become a tag-scope
+  // bypass. A scoped token naming an out-of-scope note's PATH must not read
+  // (ignore), update, or replace it — treat it as a path_conflict (path taken,
+  // invisible to this caller). Each assertion MUST fail without the guard in
+  // applyExistingNote.
+  test('if_exists:"ignore" does NOT return an out-of-scope note by path (POST /notes)', async () => {
+    await store.createNote("SECRET WORK PAYLOAD", { path: "Secret", tags: ["personal"] });
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "attempted read",
+        path: "Secret",
+        tags: ["work"], // in-scope incoming tag — passes the item-tag pre-check
+        if_exists: "ignore",
+      }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    // Path is taken but invisible to this caller → 409 path_conflict, and the
+    // secret content appears NOWHERE in the response.
+    expect(res.status).toBe(409);
+    const text = await res.text();
+    expect(text).not.toContain("SECRET WORK PAYLOAD");
+    expect(JSON.parse(text).error_type).toBe("path_conflict");
+  });
+
+  test('if_exists:"update" does NOT mutate an out-of-scope note by path (POST /notes)', async () => {
+    const secret = await store.createNote("ORIGINAL SECRET", { path: "Secret", tags: ["personal"], metadata: { keep: "me" } });
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "OVERWRITE ATTEMPT",
+        path: "Secret",
+        tags: ["work"],
+        metadata: { injected: true },
+        if_exists: "update",
+      }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect(res.status).toBe(409);
+    // Ground truth: the out-of-scope note is byte-for-byte unchanged.
+    const onDisk = (await store.getNote(secret.id))!;
+    expect(onDisk.content).toBe("ORIGINAL SECRET");
+    expect(onDisk.metadata).toEqual({ keep: "me" });
+    expect(onDisk.tags).toEqual(["personal"]); // "work" never applied
+  });
+
+  test('if_exists:"replace" does NOT mutate an out-of-scope note by path (POST /notes)', async () => {
+    const secret = await store.createNote("ORIGINAL SECRET", { path: "Secret", tags: ["personal"], metadata: { a: 1 } });
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "REPLACE ATTEMPT",
+        path: "Secret",
+        tags: ["work"],
+        if_exists: "replace",
+      }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect(res.status).toBe(409);
+    const onDisk = (await store.getNote(secret.id))!;
+    expect(onDisk.content).toBe("ORIGINAL SECRET");
+    expect(onDisk.metadata).toEqual({ a: 1 });
+  });
+
+  test("UNSCOPED if_exists:ignore still returns the existing note (regression — guard is scope-gated)", async () => {
+    const existing = await store.createNote("PLAIN BODY", { path: "Plain", tags: ["work"] });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", path: "Plain", if_exists: "ignore" }),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(existing.id);
+    expect(body.content).toBe("PLAIN BODY");
+  });
+
+  test("in-scope if_exists:ignore against an in-scope note works normally (guard doesn't over-block)", async () => {
+    const existing = await store.createNote("WORK BODY", { path: "MyWork", tags: ["work"] });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", path: "MyWork", tags: ["work"], if_exists: "ignore" }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(existing.id);
+    expect(body.content).toBe("WORK BODY");
+  });
+
 });
 
 describe("HTTP /notes include_link_count + order_by=link_count (vault feedback #4)", async () => {
@@ -4961,6 +5215,206 @@ describe("HTTP POST /notes — validation_status attachment (vault#287)", async 
     const body = await res.json() as any;
     expect(body.id).toBeTruthy();
     expect(body.validation_status).toBeUndefined();
+  });
+});
+
+// vault#555 — HTTP POST /notes with if_exists: idempotent upsert on a path
+// conflict. Mirrors the MCP create-note tool's if_exists contract exactly
+// (independent REST-layer reimplementation, same core primitives).
+describe("HTTP POST /notes — if_exists (vault#555)", async () => {
+  test("default (no if_exists) still 409s — back-compat", async () => {
+    await store.createNote("first", { path: "Inbox/rest-dup" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "second", path: "Inbox/rest-dup" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("path_conflict");
+  });
+
+  test('if_exists:"ignore" returns 201 with the existing note untouched + existed:true', async () => {
+    const first = await store.createNote("original", { path: "Inbox/rest-ignore", metadata: { v: 1 } });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "attempted overwrite",
+        path: "Inbox/rest-ignore",
+        metadata: { v: 2 },
+        if_exists: "ignore",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(first.id);
+    expect(body.content).toBe("original");
+    expect(body.metadata?.v).toBe(1);
+  });
+
+  test('if_exists:"update" full-replaces content and RFC-7386-merges metadata', async () => {
+    await store.createNote("v1", { path: "Inbox/rest-update", metadata: { a: 1, b: 2 } });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "v2",
+        path: "Inbox/rest-update",
+        metadata: { b: null, c: 3 },
+        if_exists: "update",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.content).toBe("v2");
+    expect(body.metadata).toEqual({ a: 1, c: 3 });
+  });
+
+  test('if_exists:"replace" wholesale-overwrites content + metadata, keeps id/createdAt', async () => {
+    const first = await store.createNote("v1", { path: "Inbox/rest-replace", metadata: { a: 1, b: 2 } });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "v2",
+        path: "Inbox/rest-replace",
+        metadata: { c: 3 },
+        if_exists: "replace",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(first.id);
+    expect(body.createdAt).toBe(first.createdAt);
+    expect(body.content).toBe("v2");
+    expect(body.metadata).toEqual({ c: 3 });
+  });
+
+  test("plain POST (no if_exists) sees zero response-shape change", async () => {
+    const res = await handleNotes(mkReq("POST", "/notes", { content: "plain" }), store, "");
+    const body = await res.json() as any;
+    expect("existed" in body).toBe(false);
+  });
+
+  test("batch: if_exists is per-item — a top-level default is NOT inherited", async () => {
+    await store.createNote("existing", { path: "Inbox/rest-batch-conflict" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        if_exists: "ignore",
+        notes: [{ content: "conflict", path: "Inbox/rest-batch-conflict" }],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(409);
+  });
+
+  test("summary:true returns {created, ids, failed} for a batch", async () => {
+    await store.createNote("pre-existing", { path: "Inbox/rest-sum-existing" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        summary: true,
+        notes: [
+          { content: "fresh", path: "Inbox/rest-sum-fresh", if_exists: "ignore" },
+          { content: "ignored", path: "Inbox/rest-sum-existing", if_exists: "ignore" },
+        ],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.created).toBe(1);
+    expect(body.ids).toHaveLength(2);
+    expect(body.failed).toEqual([]);
+  });
+
+  test("summary is ignored on a single-note POST", async () => {
+    const res = await handleNotes(mkReq("POST", "/notes", { content: "solo", summary: true }), store, "");
+    const body = await res.json() as any;
+    expect(body.content).toBe("solo");
+    expect(body.created).toBeUndefined();
+  });
+
+  // vault#555 CRITICAL 2 (REST tripwire — the generalist-flagged coverage gap:
+  // the core-side tests didn't guard the REST gate, so reverting routes.ts's
+  // gate alone left all tests green). REST parity of the two core tests.
+  test('if_exists:"update" with ONLY tags added still advances updated_at (POST /notes)', async () => {
+    const first = await store.createNote("body", { path: "rest-tagonly", tags: ["alpha"] });
+    const before = first.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { path: "rest-tagonly", tags: ["beta"], if_exists: "update" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.tags?.sort()).toEqual(["alpha", "beta"]);
+    const after = (await store.getNote(first.id))!.updatedAt!;
+    expect(after > before).toBe(true);
+  });
+
+  test('if_exists:"update" with ONLY links added still advances updated_at (POST /notes)', async () => {
+    await store.createNote("target", { id: "rest-tgt-linkonly", path: "Targets/rest-linkonly" });
+    const first = await store.createNote("body", { path: "rest-linkonly", tags: ["alpha"] });
+    const before = first.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        path: "rest-linkonly",
+        links: [{ target: "rest-tgt-linkonly", relationship: "relates-to" }],
+        if_exists: "update",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const after = (await store.getNote(first.id))!.updatedAt!;
+    expect(after > before).toBe(true);
+  });
+});
+
+// vault#555 — has_broken_links / include_broken_links on GET /notes.
+describe("HTTP GET /notes — has_broken_links / include_broken_links (vault#555)", async () => {
+  test("has_broken_links=true filters to notes with a dangling wikilink", async () => {
+    await store.createNote("[[Nowhere]]", { path: "rest-broken" });
+    await store.createNote("clean", { path: "rest-clean" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_broken_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-broken"]);
+  });
+
+  test("has_broken_links=false excludes them", async () => {
+    await store.createNote("[[Nowhere]]", { path: "rest-broken2" });
+    await store.createNote("clean", { path: "rest-clean2" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_broken_links=false&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-clean2"]);
+  });
+
+  test("include_broken_links on a single note surfaces {target, relationship}", async () => {
+    await store.createNote("[[Ghost]]", { path: "rest-single-broken" });
+    const res = await handleNotes(mkReq("GET", "/notes?id=rest-single-broken&include_broken_links=true"), store, "");
+    const body = await res.json() as any;
+    expect(body.broken_links).toEqual([{ target: "Ghost", relationship: "wikilink" }]);
+  });
+
+  test("include_broken_links in list mode is batched per note", async () => {
+    await store.createNote("[[Ghost A]]", { path: "rest-list-a" });
+    await store.createNote("clean", { path: "rest-list-b" });
+    const res = await handleNotes(mkReq("GET", "/notes?include_broken_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    const byPath = new Map(body.map((n: any) => [n.path, n.broken_links]));
+    expect(byPath.get("rest-list-a")).toEqual([{ target: "Ghost A", relationship: "wikilink" }]);
+    expect(byPath.get("rest-list-b")).toEqual([]);
   });
 });
 

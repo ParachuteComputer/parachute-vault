@@ -481,6 +481,29 @@ support operator queries (\`metadata: { held_on: { gte: "..." } }\`) and
 \`order_by\`; all tags declaring the same field must agree on its \`type\` and
 \`indexed\` flag.
 
+## A few shapes worth reusing
+
+Testers of this vault independently reinvented these — start from them instead:
+
+- **Journaling.** One tag (\`#journal\`) with an indexed \`entry_date\`
+  (\`{ type: "string", indexed: true }\`, ISO date) and a \`mood\` enum
+  (\`{ type: "string", enum: [...] }\`). Indexing \`entry_date\` (see "Only
+  \`indexed: true\` fields support operator queries" above) is what makes
+  date-range queries (\`metadata: { entry_date: { gte: "2026-01-01" } }\`) and
+  \`order_by: "entry_date"\` work.
+- **Agent memory (thread + messages, crash-replay-safe).** Model a
+  conversation as one \`#thread\` note (metadata: \`status\`, \`cursor\`) plus many
+  \`#message\` notes linked to it (\`relationship: "in-thread"\`), each carrying
+  its own \`status\`. If your write loop can crash and replay the same message,
+  give it a stable \`path\` (e.g. \`Threads/<thread-id>/msg-<n>\`) and create it
+  with \`if_exists: "ignore"\` — a retry after a crash safely returns the
+  already-written message instead of creating a duplicate, no
+  query-before-write round trip needed.
+- **Search.** \`query-notes { search: "..." }\` is literal by default — your
+  text is escaped, not parsed as FTS5 syntax, so punctuation like "didn't" or
+  "18.6" just works. Pass \`search_mode: "advanced"\` only when you actually
+  want FTS5 boolean/phrase/prefix syntax.
+
 ## Write gotchas
 
 A few behaviors worth knowing before you write at scale:
