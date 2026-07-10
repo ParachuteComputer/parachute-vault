@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage } from "./types.js";
+import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow } from "./types.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
@@ -309,6 +309,13 @@ export class BunSqliteStore implements Store {
     // queryNotesPaged) so a `#tag`-form page-1 and a bare `tag`-form follow-up
     // resolve to the same cursor query_hash.
     return noteOps.queryNotesPaged(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
+  }
+
+  async aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]> {
+    // Same bare-tag normalization + hierarchy expansion `queryNotes` gets —
+    // `opts.tags`/`excludeTags` filter the aggregate's input set the same
+    // way they'd filter a normal query's result list.
+    return noteOps.aggregateNotes(this.db, this.expandQueryTags(this.normalizeQueryTags(opts)));
   }
 
   /**

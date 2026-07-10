@@ -34,6 +34,35 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.1-rc.1] - 2026-07-10
+
+### Added
+
+- **Aggregation / rollup queries — group_by + count/sum** (top new-feature
+  ask from a UX round). `query-notes`'s `aggregate: {group_by, op, field?}`
+  (MCP) and `GET /notes?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…`
+  (REST) apply every OTHER filter (tag, metadata, date range,
+  write-attribution, ...) exactly as a normal query would, then group the
+  matching notes and return `[{group, value}]` instead of note rows.
+  `group_by` is either the special value `"tag"` (group by tag membership —
+  a note carrying N of the matched tags contributes to N groups) or an
+  indexed metadata field — same `FIELD_NOT_INDEXED` contract `meta[field][op]=`
+  operators and `order_by` use. `op: "sum"` requires a second indexed
+  NUMERIC field (`type: "integer"`/`"boolean"`; a bare `type: "number"`
+  field is never indexed and can't be summed). A note missing the
+  `group_by` value collects into one `{group: null, ...}` row rather than
+  being silently dropped. Mutually exclusive with `search`/`near`/`cursor`.
+  Tag-scoped tokens see the rollup computed only over notes they can see —
+  AND, under `group_by: "tag"`, group NAMES are scrubbed to the allowlist
+  too, closing a leak class the naive note-level narrowing alone would have
+  missed: a note visible via one tag but also carrying an out-of-scope
+  co-tag can't surface that co-tag as a group. Core (`core/src/notes.ts`)
+  computes the rollup via SQL `GROUP BY` over the shared filter-condition
+  builder extracted from `queryNotes`; server-layer scope enforcement
+  mirrors the `expandVisibility`/`nearTraversable` predicate-injection
+  pattern (MCP) and the existing `filterNotesByTagScope` post-query filter
+  (REST). See `docs/HTTP_API.md`'s "Aggregation / rollup" section.
+
 ## [0.7.0] - 2026-07-10
 
 The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the

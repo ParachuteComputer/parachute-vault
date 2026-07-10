@@ -1,5 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats } from "./types.js";
+import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, AggregateSpec, AggregateRow } from "./types.js";
 import { normalizePath } from "./paths.js";
 import { transaction } from "./txn.js";
 import {
@@ -769,8 +769,20 @@ function validateIsoDateValue(field: string, value: string): void {
   }
 }
 
-export function queryNotes(db: Database, opts: QueryOpts): Note[] {
-  validateLimitOffset(opts);
+/**
+ * Build the shared WHERE-clause conditions + bound params for the filter
+ * surface both `queryNotes` and `aggregateNotes` apply: tag membership
+ * (include/exclude/presence), link/broken-link presence, id-set scoping,
+ * exact path / path-prefix / extension, write-attribution, metadata
+ * (operator + plain-equality), and date range. Does NOT include the
+ * cursor-keyset predicate, ORDER BY, or LIMIT/OFFSET — those are
+ * query-shape concerns specific to `queryNotes`'s paginated-list contract
+ * and don't apply to an aggregate rollup (which spans every matching row,
+ * not a page of them). Extracted so aggregation reuses the EXACT filter
+ * semantics a normal query applies, rather than risking the two drifting
+ * apart.
+ */
+function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: string[]; params: SQLQueryBindings[] } {
   const conditions: string[] = [];
   const params: SQLQueryBindings[] = [];
 
@@ -1054,6 +1066,13 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
+  return { conditions, params };
+}
+
+export function queryNotes(db: Database, opts: QueryOpts): Note[] {
+  validateLimitOffset(opts);
+  const { conditions, params } = buildFilterConditions(db, opts);
+
   // ---- Cursor predicate (vault#313) ----
   //
   // Cursor mode is keyed on PRESENCE of `opts.cursor`, not truthiness
@@ -1200,6 +1219,133 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
 
   const idRows = db.prepare(idSql).all(...params) as { id: string }[];
   return fetchNotesByIdsOrdered(db, idRows.map((r) => r.id));
+}
+
+/**
+ * Aggregation / rollup query (top new-feature ask from a UX round — see
+ * `QueryOpts.aggregate` / `AggregateSpec` in types.ts). Applies the SAME
+ * filter surface `queryNotes` does — via the shared `buildFilterConditions`:
+ * tags, exclude-tags, presence filters, `ids`, path/extension, write-
+ * attribution, metadata, date range — BEFORE grouping, so aggregating over a
+ * filtered query rolls up exactly the notes that query would have listed.
+ *
+ * Tag-scope is NOT enforced here — core stays scope-unaware, same division
+ * every other core query surface keeps. A tag-scoped caller narrows via
+ * `opts.ids` to a pre-computed visible-note-id set (see `src/mcp-tools.ts`'s
+ * `aggregateVisibility` wiring for MCP and `src/routes.ts`'s REST aggregate
+ * branch — both filter to visible notes FIRST, then pass the resulting ids
+ * in here, exactly like a normal query's `near` neighborhood scoping does).
+ *
+ * `group_by: "tag"` groups by tag MEMBERSHIP, not partition: implemented as
+ * a JOIN against `note_tags`, so a note carrying N of the tags present in
+ * the filtered result set contributes to N separate group rows (the
+ * existing filter conditions, which reference `n.*`, compose unchanged
+ * against the join). Any other `group_by` value must be a declared
+ * `indexed: true` metadata field — reuses `requireIndexedField`, the same
+ * FIELD_NOT_INDEXED contract `metadata` operator queries and `order_by`
+ * use — and groups by its generated `meta_<field>` column.
+ *
+ * `op: "sum"` requires `field` — another indexed field whose declared
+ * storage type is `INTEGER` (the only indexable numeric shape; a bare
+ * `type: "number"` schema field is never indexed — see
+ * `indexed-fields.ts`'s `TYPE_MAP` — and a `TEXT`-backed field can't be
+ * summed). `op: "count"` ignores `field`.
+ *
+ * A note whose group_by value is absent/null collects into one
+ * `{group: null, ...}` row — standard SQL `GROUP BY` behavior, not silently
+ * dropped.
+ */
+export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
+  const spec = opts.aggregate;
+  if (!spec) {
+    throw new QueryError(
+      `aggregateNotes requires opts.aggregate`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate",
+        hint: `pass { group_by, op } — group_by is an indexed metadata field or "tag"; op is "count" or "sum"`,
+      },
+    );
+  }
+  if (typeof spec.group_by !== "string" || spec.group_by.length === 0) {
+    throw new QueryError(
+      `aggregate.group_by is required — an indexed metadata field name, or "tag"`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate.group_by",
+        got: spec.group_by,
+        hint: `pass an indexed metadata field name, or "tag"`,
+      },
+    );
+  }
+  if (spec.op !== "count" && spec.op !== "sum") {
+    throw new QueryError(
+      `invalid aggregate.op: ${JSON.stringify(spec.op)} — must be "count" or "sum"`,
+      "INVALID_QUERY",
+      { error_type: "invalid_query", field: "aggregate.op", got: spec.op, hint: `pass "count" or "sum"` },
+    );
+  }
+  if (spec.op === "sum" && (typeof spec.field !== "string" || spec.field.length === 0)) {
+    throw new QueryError(
+      `aggregate.field is required when aggregate.op is "sum"`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate.field",
+        hint: "pass the indexed numeric metadata field to sum",
+      },
+    );
+  }
+
+  const { conditions, params } = buildFilterConditions(db, opts);
+
+  const groupByTag = spec.group_by === "tag";
+  let groupExpr: string;
+  let fromClause: string;
+  if (groupByTag) {
+    groupExpr = "nt.tag_name";
+    fromClause = "FROM notes n JOIN note_tags nt ON nt.note_id = n.id";
+  } else {
+    // `group_by` came from indexed_fields (validated via FIELD_NAME_RE at
+    // declaration time), so interpolating the column name is safe — same
+    // justification `orderBy`/`buildOperatorClause` use.
+    requireIndexedField(db, spec.group_by);
+    groupExpr = `"meta_${spec.group_by}"`;
+    fromClause = "FROM notes n";
+  }
+
+  let valueExpr: string;
+  if (spec.op === "count") {
+    valueExpr = "COUNT(*)";
+  } else {
+    const fieldInfo = requireIndexedField(db, spec.field!);
+    if (fieldInfo.sqliteType !== "INTEGER") {
+      throw new QueryError(
+        `aggregate.field "${spec.field}" is not numeric (declared sqlite type ${fieldInfo.sqliteType}) — "sum" requires a field declared type: "integer" or "boolean" in its tag schema`,
+        "INVALID_QUERY",
+        {
+          error_type: "invalid_query",
+          field: "aggregate.field",
+          got: spec.field,
+          hint: `sum requires a numeric indexed field (type: "integer"/"boolean"); "${spec.field}" is declared a non-numeric type`,
+        },
+      );
+    }
+    valueExpr = `SUM("meta_${spec.field}")`;
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const sql = `
+    SELECT ${groupExpr} AS group_key, ${valueExpr} AS value
+    ${fromClause}
+    ${whereClause}
+    GROUP BY ${groupExpr}
+    ORDER BY ${groupExpr}
+  `;
+  const rows = db.prepare(sql).all(...params) as { group_key: string | number | null; value: number | null }[];
+  return rows.map((r) => ({ group: r.group_key, value: r.value ?? 0 }));
 }
 
 /**
