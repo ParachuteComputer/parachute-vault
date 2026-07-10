@@ -84,6 +84,66 @@ export function filterNotesByTagScope<T extends Note>(
 }
 
 /**
+ * Is a SINGLE tag name visible to this token? The per-tag core of
+ * `noteWithinTagScope` — exact allowlist membership OR string-form root
+ * match — pulled out so the `validation_status` scrub below (which reasons
+ * about a warning's `schema`/`loser_schema` tag NAMES, not a note's whole
+ * tag set) uses the identical visibility rule. `rawRoots === null` (unscoped)
+ * → always visible.
+ */
+function tagVisibleInScope(
+  tag: string,
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): boolean {
+  if (rawRoots === null) return true;
+  if (allowed && allowed.has(tag)) return true;
+  const root = tag.split("/")[0];
+  return !!root && rawRoots.includes(root);
+}
+
+/**
+ * Scrub a note's `validation_status` so a tag-scoped caller can't learn the
+ * SCHEMA SHAPE (field name, type, enum values) of an OUT-OF-SCOPE tag that
+ * happens to co-tag a note it can otherwise see (vault#555 auth review;
+ * the #560 leak class). Repro: a scoped caller reading a note tagged both
+ * `mine` (in scope) and `project-manhattan` (out of scope) received
+ * `validation_status.warnings: [{ schema: "project-manhattan", message:
+ * "'codeword' must be one of [fizzbuzz] ...", ... }]` and
+ * `schemas: ["project-manhattan"]` — leaking that tag's field/enum.
+ *
+ * Core produces the FULL status (scope-unaware by architecture, same as
+ * every other core surface); this server-layer scrub — mirroring
+ * `scrubTagFieldViolationsByScope` — drops any warning whose declaring
+ * tag (`schema`, and for a `schema_conflict` the overridden `loser_schema`)
+ * is out of scope, and filters the `schemas` array to visible tags. When
+ * nothing in-scope remains (the note's only schema-declaring tag was
+ * out-of-scope), returns `undefined` so the caller omits `validation_status`
+ * entirely — byte-identical to a note with no applicable schema. Unscoped
+ * callers (`rawRoots === null`) get the status untouched.
+ *
+ * Applied at every point a scoped caller receives `validation_status`: the
+ * MCP `query-notes` wrapper and the REST `GET /notes[/{id}]` read paths.
+ */
+export function scrubValidationStatusByScope<
+  S extends { schemas: string[]; warnings: Array<{ schema: string; loser_schema?: string }> },
+>(
+  status: S | null | undefined,
+  allowed: Set<string> | null,
+  rawRoots: string[] | null,
+): S | undefined {
+  if (!status || rawRoots === null) return status ?? undefined;
+  const schemas = status.schemas.filter((s) => tagVisibleInScope(s, allowed, rawRoots));
+  const warnings = status.warnings.filter(
+    (w) =>
+      tagVisibleInScope(w.schema, allowed, rawRoots) &&
+      (w.loser_schema === undefined || tagVisibleInScope(w.loser_schema, allowed, rawRoots)),
+  );
+  if (schemas.length === 0 && warnings.length === 0) return undefined;
+  return { ...status, schemas, warnings };
+}
+
+/**
  * For write paths: a note being created/updated must end up carrying at
  * least one tag inside the allowlist. `tags` is the post-write tag set
  * (already including any tag updates). The string-form fallback in

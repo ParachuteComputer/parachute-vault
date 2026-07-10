@@ -22,7 +22,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
-import { listUnresolvedWikilinks, resolveOrQueueLink, resolveLinkTarget } from "../core/src/wikilinks.ts";
+import { listUnresolvedWikilinks, resolveOrQueueLink, resolveStructuredLinkNote } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import {
@@ -52,6 +52,7 @@ import {
   scrubParentCycleError,
   scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
+  scrubValidationStatusByScope,
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
@@ -914,20 +915,6 @@ async function requireNote(store: Store, idOrPath: string): Promise<Note> {
   return note;
 }
 
-/**
- * Resolve a structured-link `target` (POST/PATCH `links`) to its full
- * `Note` — same ID-or-path/title semantics as [[wikilinks]] (vault#555;
- * see `resolveLinkTarget` in core/wikilinks.ts). Used for `links.remove`,
- * where the bracket-cleanup step needs the target's `path`, not just its
- * ID. `links.add` resolution goes through `resolveOrQueueLink` instead (it
- * also queues a forward-ref on miss) — mirrors `core/src/mcp.ts`'s split
- * exactly so the two surfaces can't drift.
- */
-function resolveStructuredLinkNote(db: Store["db"], target: string): Note | null {
-  const id = resolveLinkTarget(db, target);
-  return id ? getNote(db, id) : null;
-}
-
 class NotFoundError extends Error {
   constructor(message: string) {
     super(message);
@@ -1369,16 +1356,24 @@ async function handleNotesInner(
       // vault#555 fix 3 — attach validation_status on reads too (mirrors
       // MCP query-notes). Additive, present only when a tag declares
       // `fields`. Runs BEFORE metadata filtering so it sees full metadata
-      // regardless of `include_metadata`.
+      // regardless of `include_metadata`. Scrubbed for a tag-scoped caller
+      // (vault#555 auth review) so an out-of-scope co-tag's schema shape
+      // doesn't leak — `results` here is already scope-filtered, but a
+      // surviving note may carry an out-of-scope co-tag whose schema would
+      // otherwise appear in its validation_status. No-op when unscoped.
       {
         const statusById = new Map(
           results.map((n) => [
             n.id,
-            store.validateNoteAgainstSchemas({
-              path: n.path,
-              tags: n.tags,
-              metadata: n.metadata as Record<string, unknown> | undefined,
-            }),
+            scrubValidationStatusByScope(
+              store.validateNoteAgainstSchemas({
+                path: n.path,
+                tags: n.tags,
+                metadata: n.metadata as Record<string, unknown> | undefined,
+              }),
+              tagScope.allowed,
+              tagScope.raw,
+            ),
           ]),
         );
         for (const n of output as any[]) {
@@ -1812,13 +1807,19 @@ async function handleNotesInner(
     // vault#555 fix 3 — mirror the MCP query-notes fix: attach
     // validation_status on reads too, not just on the one-time create/update
     // write response. See core/src/mcp.ts's query-notes handler for the
-    // full rationale.
+    // full rationale. Scrubbed for a tag-scoped caller (vault#555 auth
+    // review) so an out-of-scope co-tag's schema shape doesn't leak — no-op
+    // for unscoped callers (tagScope.raw === null).
     {
-      const status = store.validateNoteAgainstSchemas({
-        path: note.path,
-        tags: note.tags,
-        metadata: note.metadata as Record<string, unknown> | undefined,
-      });
+      const status = scrubValidationStatusByScope(
+        store.validateNoteAgainstSchemas({
+          path: note.path,
+          tags: note.tags,
+          metadata: note.metadata as Record<string, unknown> | undefined,
+        }),
+        tagScope.allowed,
+        tagScope.raw,
+      );
       if (status) result.validation_status = status;
     }
     const expand = parseExpandParams(url, db, tagScope);

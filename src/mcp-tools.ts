@@ -26,6 +26,7 @@ import {
   scrubParentCycleError,
   scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
+  scrubValidationStatusByScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
 import { TagFieldConflictError, ParentCycleError } from "../core/src/tag-schemas.ts";
@@ -331,6 +332,16 @@ function applyTagScopeWrappers(
   const scrubNoteLinks = (n: any): any => {
     if (n && Array.isArray(n.links)) {
       n.links = filterHydratedLinksByTagScope(n.links, allowedHolder?.value ?? null, rawTags);
+    }
+    // vault#555 auth review — a note the caller can see may ALSO carry an
+    // out-of-scope co-tag whose schema `validation_status` would otherwise
+    // leak (field name / type / enum values, the #560 class). Scrub it with
+    // the same allowlist the link scrub uses. Reads the resolved holder for
+    // the same reason (see the ordering-invariant note above scrubNoteLinks).
+    if (n && n.validation_status) {
+      const scrubbed = scrubValidationStatusByScope(n.validation_status, allowedHolder?.value ?? null, rawTags);
+      if (scrubbed === undefined) delete n.validation_status;
+      else n.validation_status = scrubbed;
     }
     return n;
   };

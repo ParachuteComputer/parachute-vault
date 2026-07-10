@@ -15,7 +15,7 @@ import {
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
 import * as linkOps from "./links.js";
-import { resolveOrQueueLink, resolveLinkTarget } from "./wikilinks.js";
+import { resolveOrQueueLink, resolveStructuredLinkNote } from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
 import {
@@ -105,19 +105,6 @@ function resolveNote(db: Database, idOrPath: string): Note | null {
     if (explicit) return explicit;
   }
   return noteOps.getNoteByPath(db, idOrPath);
-}
-
-/**
- * Resolve a structured-link `target` (create-note/update-note `links`) to
- * its full `Note` — same ID-or-path/title semantics as [[wikilinks]]
- * (vault#555; see `resolveLinkTarget` in wikilinks.ts). Used for
- * `links.remove`, where the bracket-cleanup step needs the target's `path`,
- * not just its ID. `links.add` resolution goes through
- * `resolveOrQueueLink` instead (it also queues a forward-ref on miss).
- */
-function resolveStructuredLinkNote(db: Database, target: string): Note | null {
-  const id = resolveLinkTarget(db, target);
-  return id ? noteOps.getNote(db, id) : null;
 }
 
 function requireNote(db: Database, idOrPath: string): Note {

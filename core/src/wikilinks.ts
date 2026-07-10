@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
+import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
+import { getNote } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
+import { transaction } from "./txn.js";
 
 // ---------------------------------------------------------------------------
 // Parser — extract [[wikilinks]] from markdown content
@@ -412,20 +415,51 @@ function ensureRelationshipColumn(db: Database): void {
   if (cols.length === 0) return; // table doesn't exist — nothing to heal
   if (cols.some((c) => c.name === "relationship")) return; // already migrated
 
-  db.exec("ALTER TABLE unresolved_wikilinks RENAME TO unresolved_wikilinks_pre_v555");
-  db.exec(`
-    CREATE TABLE unresolved_wikilinks (
-      source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-      target_path TEXT NOT NULL COLLATE NOCASE,
-      relationship TEXT NOT NULL DEFAULT '${WIKILINK_REL}',
-      PRIMARY KEY (source_id, target_path, relationship)
-    )
-  `);
-  db.exec(`
-    INSERT INTO unresolved_wikilinks (source_id, target_path, relationship)
-    SELECT source_id, target_path, '${WIKILINK_REL}' FROM unresolved_wikilinks_pre_v555
-  `);
-  db.exec("DROP TABLE unresolved_wikilinks_pre_v555");
+  // The rebuild is a 4-statement DDL sequence (RENAME → CREATE → INSERT…
+  // SELECT → DROP) that MUST be atomic (wire + generalist review, vault#555
+  // — same class as W7's migrateToV25 must-fix). A crash between RENAME and
+  // CREATE would leave NO `unresolved_wikilinks` table at all (breaking every
+  // subsequent wikilink/structured-link write); a crash between CREATE and
+  // INSERT would strand every pending forward-ref row in the orphaned
+  // `_pre_v555` table permanently — silent data loss — because the guard
+  // above (`relationship` column present) flips true the moment CREATE
+  // commits, so a retry would skip the backfill.
+  const migrate = (): void => {
+    db.exec("ALTER TABLE unresolved_wikilinks RENAME TO unresolved_wikilinks_pre_v555");
+    db.exec(`
+      CREATE TABLE unresolved_wikilinks (
+        source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        target_path TEXT NOT NULL COLLATE NOCASE,
+        relationship TEXT NOT NULL DEFAULT '${WIKILINK_REL}',
+        PRIMARY KEY (source_id, target_path, relationship)
+      )
+    `);
+    db.exec(`
+      INSERT INTO unresolved_wikilinks (source_id, target_path, relationship)
+      SELECT source_id, target_path, '${WIKILINK_REL}' FROM unresolved_wikilinks_pre_v555
+    `);
+    db.exec("DROP TABLE unresolved_wikilinks_pre_v555");
+  };
+
+  // Nesting guard: this heal runs from `ensureUnresolvedTable` /
+  // `resolveUnresolvedWikilinks`, which are themselves reached from
+  // `store.createNote`/`updateNote` — and a BATCH create/update wraps those
+  // in `transactionAsync` (an already-open transaction). The txn seam is
+  // single-level by design (see core/src/txn.ts — a nested `BEGIN IMMEDIATE`
+  // throws "cannot start a transaction within a transaction"), so when a
+  // transaction is already active the DDL is ALREADY covered by that
+  // transaction's atomicity and we run it directly; only when idle do we open
+  // our own. `db.inTransaction` is bun:sqlite's active-transaction flag; a
+  // backend that doesn't expose it (a DO-SQLite Store) reads `undefined`
+  // (falsy) and takes the `transaction()` path — which for that backend
+  // delegates to its native `transactionSync`. (Immaterial in practice: a
+  // fresh DO deployment is created with the v555 schema directly, so this
+  // legacy heal never fires there.)
+  if (db.inTransaction) {
+    migrate();
+  } else {
+    transaction(db, migrate);
+  }
 }
 
 /**
@@ -546,6 +580,21 @@ export function resolveLinkTarget(db: Database, idOrPath: string): string | null
   const byId = db.prepare("SELECT id FROM notes WHERE id = ?").get(idOrPath) as { id: string } | null;
   if (byId) return byId.id;
   return resolveWikilink(db, idOrPath);
+}
+
+/**
+ * Resolve a structured-link `target` (create-note/update-note `links`) to
+ * its full {@link Note} — same ID-or-path/title semantics as `[[wikilinks]]`
+ * via {@link resolveLinkTarget}. Used for `links.remove`, where the
+ * bracket-cleanup step needs the target's `path`, not just its ID.
+ * `links.add` resolution goes through {@link resolveOrQueueLink} instead
+ * (it also queues a forward-ref on a miss). Single home for both the MCP
+ * tool layer (core/src/mcp.ts) and the REST handler layer (src/routes.ts) —
+ * vault#555 generalist review, was duplicated verbatim in both.
+ */
+export function resolveStructuredLinkNote(db: Database, target: string): Note | null {
+  const id = resolveLinkTarget(db, target);
+  return id ? getNote(db, id) : null;
 }
 
 /** Queue a structured-link forward-ref for lazy resolution. */

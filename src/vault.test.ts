@@ -1554,7 +1554,16 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
-  test("update-note tags.add auto-populate does not bump updatedAt", async () => {
+  // vault#555 fix 2 REVISED this test's contract. Pre-fix-2 a tags-only
+  // `update-note` (here, adding a tag that ALSO triggers a schema-default
+  // backfill) did NOT bump `updated_at` — this test asserted that. Fix 2
+  // makes ANY tag mutation bump `updated_at` (so cursor/sync loops see it);
+  // the separate defaults backfill still rides `skipUpdatedAt: true` and
+  // doesn't itself bump. Net: the tag add bumps updatedAt exactly once, and
+  // the default still lands. (The old assertion passed only by
+  // create+update landing in the same millisecond — a latent flake fix 2
+  // turned into a real contradiction; caught on a review re-run.)
+  test("update-note tags.add bumps updatedAt AND still applies the schema default (vault#555 fix 2)", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
@@ -1568,8 +1577,7 @@ describe("scoped MCP wrapper", async () => {
 
     const vaultStore = getVaultStore(vaultName);
     // vault#553 Decision B: backfill is explicit-`default`-only — declare
-    // one so this test still exercises an actual defaults-write (and can
-    // assert it lands without bumping updatedAt).
+    // one so this still exercises an actual defaults-write.
     await vaultStore.upsertTagSchema("person", {
       description: "A person",
       fields: { name: { type: "string", default: "unknown" } },
@@ -1582,9 +1590,13 @@ describe("scoped MCP wrapper", async () => {
 
     const note = await createNote.execute({ content: "Test" }) as any;
     const originalUpdatedAt = note.updatedAt;
+    await new Promise((r) => setTimeout(r, 5)); // deterministic ms gap
     await updateNote.execute({ id: note.id, tags: { add: ["person"] }, force: true });
     const after = await queryNotes.execute({ id: note.id }) as any;
-    expect(after.updatedAt).toBe(originalUpdatedAt);
+    // Fix 2: the tag mutation bumped updatedAt.
+    expect(after.updatedAt).not.toBe(originalUpdatedAt);
+    expect(new Date(after.updatedAt) > new Date(originalUpdatedAt)).toBe(true);
+    // The schema default still backfilled.
     expect(after.metadata.name).toBe("unknown");
 
     close();
@@ -1723,6 +1735,83 @@ describe("scoped MCP wrapper", async () => {
     const links = (result.links ?? []) as any[];
     expect(links.length).toBe(1);
     expect(JSON.stringify(links)).toContain(secret.id);
+
+    closeAllStores();
+  });
+
+  // vault#555 auth review — validation_status must not leak an out-of-scope
+  // co-tag's schema shape (field name / type / enum) to a scoped caller
+  // (the #560 leak class). A note the caller CAN see (in-scope tag) may also
+  // carry an out-of-scope tag whose schema it violates.
+  test("MCP query-notes scrubs out-of-scope tag schema from validation_status; only the in-scope tag's warning survives", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vs-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    // In-scope tag "work" declares a field the note violates; out-of-scope
+    // "project-manhattan" declares a SECRET field/enum the note also violates.
+    await store.upsertTagSchema("work", { fields: { priority: { type: "string", enum: ["hi", "lo"] } } });
+    await store.upsertTagSchema("project-manhattan", { fields: { codeword: { type: "string", enum: ["fizzbuzz"] } } });
+    const note = await store.createNote("co-tagged", {
+      path: "CoTagged",
+      tags: ["work", "project-manhattan"],
+      metadata: { priority: "URGENT", codeword: "leaked" },
+    });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: note.id }) as any;
+
+    // The out-of-scope tag's SCHEMA SHAPE — the leak fix 3 introduced and
+    // this scrub closes — must appear nowhere in the whole response.
+    // `fizzbuzz` (its enum value) exists ONLY in project-manhattan's schema,
+    // so its total absence proves no schema-shape leak. (`codeword` is also
+    // a key in the note's OWN metadata, visible to anyone who can read the
+    // note, so it's not a schema-shape indicator.)
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("fizzbuzz");
+    // The tag NAME must be gone from validation_status specifically. NOTE:
+    // it still appears in the note's `.tags` array — that's PRE-EXISTING
+    // scoped-read behavior (noteWithinTagScope has never scrubbed a returned
+    // note's tag set), independent of fix 3, and out of scope for this fix.
+    expect(JSON.stringify(result.validation_status)).not.toContain("project-manhattan");
+
+    // The in-scope tag's own warning DOES survive.
+    const vs = result.validation_status;
+    expect(vs).toBeTruthy();
+    expect(vs.schemas).toEqual(["work"]);
+    expect(vs.warnings).toHaveLength(1);
+    expect(vs.warnings[0].schema).toBe("work");
+    expect(vs.warnings[0].field).toBe("priority");
+
+    closeAllStores();
+  });
+
+  test("UNSCOPED query-notes still surfaces BOTH co-tags' validation_status (regression)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vs-unscoped-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.upsertTagSchema("work", { fields: { priority: { type: "string", enum: ["hi", "lo"] } } });
+    await store.upsertTagSchema("project-manhattan", { fields: { codeword: { type: "string", enum: ["fizzbuzz"] } } });
+    const note = await store.createNote("co-tagged", {
+      path: "CoTagged",
+      tags: ["work", "project-manhattan"],
+      metadata: { priority: "URGENT", codeword: "leaked" },
+    });
+
+    const tools = generateScopedMcpTools(vaultName); // unscoped
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: note.id }) as any;
+    const vs = result.validation_status;
+    expect(vs.schemas.sort()).toEqual(["project-manhattan", "work"]);
+    expect(vs.warnings).toHaveLength(2);
 
     closeAllStores();
   });
@@ -4779,6 +4868,40 @@ describe("HTTP GET /notes — validation_status on reads (vault#555)", async () 
     const list = await handleNotes(mkReq("GET", "/notes?tag=plain555"), store, "");
     const listBody = await list.json() as any[];
     expect(listBody[0].validation_status).toBeUndefined();
+  });
+
+  // vault#555 auth review — REST parity for the validation_status scope
+  // scrub (the #560 leak class). A scoped caller reading a note co-tagged
+  // with an out-of-scope tag must not learn that tag's schema shape.
+  test("GET /notes/:id and list scrub out-of-scope co-tag schema from validation_status for a scoped caller", async () => {
+    await store.upsertTagSchema("workrs", { fields: { priority: { type: "string", enum: ["hi", "lo"] } } });
+    await store.upsertTagSchema("manhattanrs", { fields: { codeword: { type: "string", enum: ["fizzbuzz"] } } });
+    const note = await store.createNote("co-tagged", {
+      path: "CoTaggedRS",
+      tags: ["workrs", "manhattanrs"],
+      metadata: { priority: "URGENT", codeword: "leaked" },
+    });
+    const scope = { allowed: new Set(["workrs"]), raw: ["workrs"] };
+
+    // Single GET — `fizzbuzz` (the out-of-scope enum value) exists only in
+    // manhattanrs's schema, so its absence proves no schema-shape leak. The
+    // tag name is scrubbed from validation_status (still in `.tags` —
+    // pre-existing, out of scope; see the MCP counterpart test).
+    const single = await handleNotes(mkReq("GET", `/notes/${note.id}`), store, `/${note.id}`, undefined, scope);
+    const singleBody = await single.json() as any;
+    expect(JSON.stringify(singleBody)).not.toContain("fizzbuzz");
+    expect(JSON.stringify(singleBody.validation_status)).not.toContain("manhattanrs");
+    expect(singleBody.validation_status.schemas).toEqual(["workrs"]);
+    expect(singleBody.validation_status.warnings).toHaveLength(1);
+    expect(singleBody.validation_status.warnings[0].field).toBe("priority");
+
+    // List GET
+    const list = await handleNotes(mkReq("GET", "/notes?tag=workrs&include_content=true"), store, "", undefined, scope);
+    const listBody = await list.json() as any[];
+    expect(JSON.stringify(listBody)).not.toContain("fizzbuzz");
+    const target = listBody.find((n) => n.id === note.id);
+    expect(JSON.stringify(target.validation_status)).not.toContain("manhattanrs");
+    expect(target.validation_status.schemas).toEqual(["workrs"]);
   });
 });
 

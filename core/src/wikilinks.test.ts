@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { parseWikilinks, syncWikilinks, resolveWikilink, resolveUnresolvedWikilinks } from "./wikilinks.js";
+import { parseWikilinks, syncWikilinks, resolveWikilink, resolveUnresolvedWikilinks, listUnresolvedWikilinks } from "./wikilinks.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -273,5 +273,117 @@ describe("path-based resolution", async () => {
     const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].targetId).toBe(target.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unresolved_wikilinks relationship-column migration — atomicity (vault#555
+// wire+generalist must-fix; W7's migrateToV25-interruption lesson applied).
+// ---------------------------------------------------------------------------
+
+describe("ensureRelationshipColumn — crash-safe rebuild", () => {
+  /**
+   * Build a legacy (pre-vault#555) 2-column `unresolved_wikilinks` table with
+   * pending rows, on a store whose other tables already exist. Returns the
+   * source note's id (a real row so the FK is satisfiable when
+   * foreign_keys is on).
+   */
+  async function seedLegacyTable(): Promise<string> {
+    // A plain note (no wikilinks) doesn't create the v555 table.
+    const src = await store.createNote("plain body, no wikilinks", { path: "src-note" });
+    const tgt = await store.createNote("plain target", { path: "Target A" });
+    // Hand-build the pre-v555 shape (2-column PK, no `relationship`).
+    db.exec(`
+      CREATE TABLE unresolved_wikilinks (
+        source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        target_path TEXT NOT NULL COLLATE NOCASE,
+        PRIMARY KEY (source_id, target_path)
+      )
+    `);
+    db.prepare("INSERT INTO unresolved_wikilinks (source_id, target_path) VALUES (?, ?)")
+      .run(src.id, "Target B");
+    db.prepare("INSERT INTO unresolved_wikilinks (source_id, target_path) VALUES (?, ?)")
+      .run(src.id, "Target A"); // this one resolves to tgt after the migration
+    return src.id;
+  }
+
+  function hasRelationshipColumn(): boolean {
+    const cols = db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as { name: string }[];
+    return cols.some((c) => c.name === "relationship");
+  }
+
+  function tableExists(name: string): boolean {
+    const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name);
+    return row !== null;
+  }
+
+  it("a crash mid-rebuild (between RENAME and CREATE) rolls back — original table + pending rows intact, no orphan _pre_v555", async () => {
+    await seedLegacyTable();
+    expect(hasRelationshipColumn()).toBe(false); // legacy shape confirmed
+    const rowsBefore = (db.prepare("SELECT COUNT(*) AS c FROM unresolved_wikilinks").get() as { c: number }).c;
+    expect(rowsBefore).toBe(2);
+
+    // Monkey-patch db.exec to throw on the migration's CREATE — i.e. AFTER
+    // the RENAME has moved the table to _pre_v555 but BEFORE the new table
+    // exists. This is the exact interruption window the transaction wrapper
+    // must survive. BEGIN/RENAME/ROLLBACK all pass through untouched.
+    const origExec = db.exec.bind(db);
+    let crashed = false;
+    (db as unknown as { exec: (sql: string) => unknown }).exec = (sql: string) => {
+      if (!crashed && /CREATE TABLE unresolved_wikilinks \(/.test(sql)) {
+        crashed = true;
+        throw new Error("simulated crash between RENAME and CREATE");
+      }
+      return origExec(sql);
+    };
+
+    let thrown: unknown;
+    try {
+      // resolveUnresolvedWikilinks calls ensureRelationshipColumn first —
+      // the REAL heal path, not a hand-rolled copy.
+      resolveUnresolvedWikilinks(db, "Target A", "irrelevant-id");
+    } catch (e) {
+      thrown = e;
+    } finally {
+      (db as unknown as { exec: (sql: string) => unknown }).exec = origExec;
+    }
+
+    // The crash propagated (not swallowed).
+    expect(crashed).toBe(true);
+    expect((thrown as Error)?.message).toContain("simulated crash");
+
+    // ROLLBACK restored the ORIGINAL table exactly:
+    expect(tableExists("unresolved_wikilinks")).toBe(true); // NOT renamed away
+    expect(tableExists("unresolved_wikilinks_pre_v555")).toBe(false); // no orphan
+    expect(hasRelationshipColumn()).toBe(false); // still the legacy 2-col shape
+    const rowsAfter = (db.prepare("SELECT COUNT(*) AS c FROM unresolved_wikilinks").get() as { c: number }).c;
+    expect(rowsAfter).toBe(2); // pending rows NOT lost
+
+    // And a clean retry (no crash) fully recovers: migration runs, column
+    // added, rows preserved and backfilled as "wikilink".
+    resolveUnresolvedWikilinks(db, "nothing-matches-here", "irrelevant-id-2");
+    expect(hasRelationshipColumn()).toBe(true);
+    expect(tableExists("unresolved_wikilinks_pre_v555")).toBe(false);
+    const migratedRows = db.prepare("SELECT relationship FROM unresolved_wikilinks").all() as { relationship: string }[];
+    expect(migratedRows).toHaveLength(2);
+    expect(migratedRows.every((r) => r.relationship === "wikilink")).toBe(true);
+  });
+
+  it("a successful (uninterrupted) rebuild migrates + backfills as wikilink, and a pending forward-ref then resolves", async () => {
+    const srcId = await seedLegacyTable();
+
+    // Drive the heal through the real read path.
+    const before = listUnresolvedWikilinks(db);
+    expect(before.count).toBe(2);
+    expect(hasRelationshipColumn()).toBe(true); // listUnresolvedWikilinks healed it
+    expect(before.unresolved.every((u) => u.relationship === "wikilink")).toBe(true);
+
+    // "Target A" already exists (seedLegacyTable created it) — resolving now
+    // backfills the edge from the migrated pending row.
+    const targetA = await store.getNoteByPath("Target A");
+    const resolved = resolveUnresolvedWikilinks(db, "Target A", targetA!.id);
+    expect(resolved).toBe(1);
+    const links = await store.getLinks(srcId, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === targetA!.id && l.relationship === "wikilink")).toBe(true);
   });
 });
