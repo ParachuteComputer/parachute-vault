@@ -34,7 +34,7 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
-## [0.7.1-rc.1] - 2026-07-10
+## [0.7.1] - 2026-07-10
 
 **Launch integration** of eight feature branches (#572–#579) into one
 release — ULIDs, MCP scope re-tier + REST-door completion, search/doctor

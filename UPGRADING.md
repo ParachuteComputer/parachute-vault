@@ -4,17 +4,23 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
-## 0.6.x → 0.7.0 — the Reliability & Usability Program (umbrella #556)
+## 0.6.x → 0.7.1 — the Reliability & Usability Program + the 0.7.1 launch
 
-`0.7.0` consolidates the `0.7.0-rc.1`–`rc.9` chain: a program that started
-from a nine-persona deep test against a live vault (2026-07-09, 9 sandboxed
-agents, 8 fresh vaults, ~230 notes) and closed every finding — mostly at the
-query/taxonomy/error boundaries, since the storage/concurrency core already
-tested trustworthy (zero corruption, zero lost writes). Full per-fix detail
-is in [CHANGELOG.md](./CHANGELOG.md)'s consolidated `[0.7.0]` entry and the
-`rc.1`–`rc.9` entries beneath it; this section is the operator's action list.
+`0.7.1` is one launch covering two bodies of work: (1) the reliability
+program (`0.7.0-rc.1`–`rc.9`) — a nine-persona deep test against a live vault
+(2026-07-09, 9 sandboxed agents, 8 fresh vaults, ~230 notes) that closed
+every finding at the query/taxonomy/error boundaries (the storage/concurrency
+core already tested trustworthy — zero corruption, zero lost writes); and (2)
+the 0.7.1 feature launch — aggregation rollups, a typed `reference` field,
+title-fallback link/id resolution, honest unresolved/ambiguous link warnings,
+a `vault-info` structural map, ULIDs for new note IDs, and a permissions
+re-tier. Both were hardened by further agent-driven test rounds (including
+backward-compat + mixed-ID runs against old vaults). `0.7.0` was never
+published to npm — `0.6.5` promotes straight to `0.7.1`. Full per-fix detail
+is in [CHANGELOG.md](./CHANGELOG.md); this section is the operator's action
+list.
 
-### Migrations run automatically on first 0.7.0 boot
+### Migrations run automatically on first 0.7.1 boot
 
 No manual steps — every migration below is **automatic, transactional, and
 idempotent**, run once on first boot after upgrade. As with any upgrade,
@@ -119,6 +125,18 @@ unknown).
   that deliberately sent an empty-string cursor and parsed a flat array must
   now read the `{notes, next_cursor}` envelope. An OMITTED `cursor` still
   returns a flat array, unchanged.
+- **Permissions re-tier — taxonomy/schema tools now require `admin`, not
+  `write` (0.7.1).** `write` now means "author notes" (`create-note` /
+  `update-note` / `delete-note`); reorganizing the taxonomy or editing schemas
+  — `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`,
+  and `vault-info`'s description-write — now requires `admin`. Enforced
+  identically on **both doors** (MCP tool tiers + REST). The upside: you can
+  safely mint a tag-scoped `write` token that adds content without letting it
+  restructure your vault (protection against a careless agent as much as a
+  malicious one). Two consequences: (a) a `write` token that previously
+  renamed/merged/deleted/updated tags now needs `admin` — re-mint it; (b)
+  `doctor` moved the OTHER way (admin → `read`), so read-only monitoring /
+  tending jobs can now run the integrity scan without an admin credential.
 
 ### Behavior changes cursor / sync consumers should know
 
@@ -137,6 +155,22 @@ unknown).
 
 ### New capabilities (brief pointers — full docs in [docs/HTTP_API.md](./docs/HTTP_API.md))
 
+- **New in 0.7.1** — **aggregation rollups** (`aggregate: {group_by, op:
+  count|sum, field?}` on `query-notes` — count/sum grouped by an indexed field
+  or `tag`, server-side); a **typed `reference` field** (a schema field that
+  is BOTH a filterable indexed value AND an auto-maintained graph link, from
+  one declaration — scalar/one-to-one today); **title-fallback resolution**
+  (`id: "<a note's H1 title>"` and `[[wikilinks]]` resolve by title when path
+  misses); a **`vault-info` structural `map`** (tags + path buckets + counts
+  for one-call orientation); **honest `unresolved_link`/`ambiguous_link`
+  warnings** on writes.
+- **ULIDs for new note IDs (0.7.1).** New notes get opaque, collision-resistant,
+  time-sortable ULIDs instead of the old `YYYY-MM-DD-HH-MM-SS-ffffff` timestamp
+  format. **Existing IDs are unchanged** — old and new coexist (mixed-format
+  links, lookups, and cursor pagination all work; verified against real old
+  vaults). No migration. One thing to check: if any of your own tooling
+  **parses a note ID to derive a creation time**, switch it to the `created_at`
+  field — IDs are now opaque and must not be parsed for time.
 - **Honest-query warnings channel** (#550) — `unknown_tag`/`did_you_mean`,
   `removed_param`, `empty_search`, `search_did_you_mean`, `ignored_param` on
   `query-notes`/`GET /notes`, via REST envelope/`X-Parachute-Warnings` header
