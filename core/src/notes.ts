@@ -1,5 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats } from "./types.js";
+import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap } from "./types.js";
 import { normalizePath } from "./paths.js";
 import { transaction } from "./txn.js";
 import {
@@ -2360,6 +2360,122 @@ export function getVaultStats(
     attachmentCount,
     linkCount,
     contentBytes,
+  };
+}
+
+// ---- Vault map (front-door structural orientation) ----
+
+/** Shared bucket-expression for the top-level path segment: the text before
+ *  the first `/`, or the whole path when it has none. Applied to whichever
+ *  `path` column reference the caller substitutes in (`path` or `n.path`). */
+function pathBucketExpr(pathCol: string): string {
+  return `CASE WHEN instr(${pathCol}, '/') > 0 THEN substr(${pathCol}, 1, instr(${pathCol}, '/') - 1) ELSE ${pathCol} END`;
+}
+
+/**
+ * Compute the compact structural map `vault-info` surfaces for one-call
+ * orientation: total note count, every tag currently carried by at least one
+ * note with its membership count, and every top-level path "bucket" (the
+ * first `/`-delimited segment of `path`) with its note count — plus a count
+ * of notes with no path at all (excluded from `path_buckets`, nothing to
+ * bucket). Counts only, no content; three grouped-COUNT queries, safe on
+ * large vaults.
+ *
+ * `opts.tagFilter`, when the KEY IS PRESENT, restricts every count to notes
+ * reachable through that exact tag-name set (an `IN`-clause join through
+ * `note_tags`) — the scope-aware path a tag-scoped caller's already-expanded
+ * allowlist takes (server layer; core stays scope-unaware, it just filters
+ * by the plain tag-name list it's given). An empty array is a valid,
+ * meaningful filter — "nothing is in scope" — and short-circuits to an
+ * all-zero map WITHOUT falling through to the unfiltered/full-vault query;
+ * only OMITTING `tagFilter` entirely computes the vault-wide map.
+ */
+export function getVaultMap(
+  db: Database,
+  opts?: { tagFilter?: string[] },
+): VaultMap {
+  const hasFilter = opts !== undefined && opts.tagFilter !== undefined;
+  const tagFilter = opts?.tagFilter ?? [];
+
+  if (hasFilter && tagFilter.length === 0) {
+    return { total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 };
+  }
+
+  if (hasFilter) {
+    const placeholders = tagFilter.map(() => "?").join(",");
+
+    const totalRow = db
+      .prepare(`SELECT COUNT(DISTINCT note_id) as c FROM note_tags WHERE tag_name IN (${placeholders})`)
+      .get(...tagFilter) as { c: number };
+
+    const tagRows = db
+      .prepare(
+        `SELECT tag_name AS name, COUNT(*) AS count
+         FROM note_tags
+         WHERE tag_name IN (${placeholders})
+         GROUP BY tag_name
+         ORDER BY count DESC, name ASC`,
+      )
+      .all(...tagFilter) as { name: string; count: number }[];
+
+    const bucketRows = db
+      .prepare(
+        `SELECT ${pathBucketExpr("n.path")} AS name, COUNT(DISTINCT n.id) AS count
+         FROM notes n
+         JOIN note_tags nt ON nt.note_id = n.id
+         WHERE nt.tag_name IN (${placeholders}) AND n.path IS NOT NULL
+         GROUP BY name
+         ORDER BY count DESC, name ASC`,
+      )
+      .all(...tagFilter) as { name: string; count: number }[];
+
+    const unfiledRow = db
+      .prepare(
+        `SELECT COUNT(DISTINCT n.id) as c
+         FROM notes n
+         JOIN note_tags nt ON nt.note_id = n.id
+         WHERE nt.tag_name IN (${placeholders}) AND n.path IS NULL`,
+      )
+      .get(...tagFilter) as { c: number };
+
+    return {
+      total_notes: totalRow.c,
+      tags: tagRows,
+      path_buckets: bucketRows,
+      unfiled_notes: unfiledRow.c,
+    };
+  }
+
+  const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
+
+  const tagRows = db
+    .prepare(
+      `SELECT tag_name AS name, COUNT(*) AS count
+       FROM note_tags
+       GROUP BY tag_name
+       ORDER BY count DESC, name ASC`,
+    )
+    .all() as { name: string; count: number }[];
+
+  const bucketRows = db
+    .prepare(
+      `SELECT ${pathBucketExpr("path")} AS name, COUNT(*) AS count
+       FROM notes
+       WHERE path IS NOT NULL
+       GROUP BY name
+       ORDER BY count DESC, name ASC`,
+    )
+    .all() as { name: string; count: number }[];
+
+  const unfiledRow = db
+    .prepare("SELECT COUNT(*) as c FROM notes WHERE path IS NULL")
+    .get() as { c: number };
+
+  return {
+    total_notes: totalRow.c,
+    tags: tagRows,
+    path_buckets: bucketRows,
+    unfiled_notes: unfiledRow.c,
   };
 }
 

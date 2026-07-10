@@ -118,6 +118,35 @@ export interface VaultStats {
   contentBytes: number;
 }
 
+// ---- Vault Map (front-door structural orientation) ----
+
+/** One counted bucket in a `VaultMap` — a tag name or a top-level path segment. */
+export interface VaultMapEntry {
+  name: string;
+  count: number;
+}
+
+/**
+ * Compact structural map of a vault: counts only, no content. Designed so a
+ * fresh reader (human or AI) orients in ONE `vault-info` call without also
+ * needing `include_stats: true` — see `getVaultMap` (core/src/notes.ts) for
+ * the SQL and the scope-aware `tagFilter` contract.
+ */
+export interface VaultMap {
+  /** Total notes in scope (all notes when unfiltered). */
+  total_notes: number;
+  /** Every tag currently carried by at least one in-scope note, with its membership count. Sorted by count desc, then name. */
+  tags: VaultMapEntry[];
+  /**
+   * Every top-level path segment (the text before the first `/`, or the
+   * whole path when it has none) among in-scope notes that HAVE a path, with
+   * its note count. Sorted by count desc, then name.
+   */
+  path_buckets: VaultMapEntry[];
+  /** In-scope notes with no `path` set — excluded from `path_buckets` (nothing to bucket). */
+  unfiled_notes: number;
+}
+
 // ---- Query Options ----
 
 export interface QueryOpts {

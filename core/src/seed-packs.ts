@@ -392,10 +392,14 @@ description) so the next one picks up where you left off.
 ### If this vault already has content
 
 Some vaults arrive full — an import, a restore, months of use. Then your first
-job is to **learn it, not seed it**: \`vault-info { include_stats: true }\`,
-\`list-tags\`, read a sample (\`query-notes { search: "..." }\`), then reflect the
-shape back to the person and ask what's missing or wrong. Propose structure
-only once you can describe what's already there.
+job is to **learn it, not seed it**: \`vault-info\` — a single call now returns
+a compact \`map\` (every tag's note count, every top-level path's note count,
+total notes) alongside the schema catalog, so you get the shape of a strange
+vault in one round trip; add \`include_stats: true\` only if you also want the
+deeper monthly distribution. Then \`list-tags\` and read a sample
+(\`query-notes { search: "..." }\`), and reflect the shape back to the person
+and ask what's missing or wrong. Propose structure only once you can describe
+what's already there.
 
 ### Close the loop: describe the vault
 
@@ -424,7 +428,9 @@ Core moves you already have as MCP tools:
 - \`query-notes\` — by id/path, by tag, full-text \`search\`, or graph \`near\` a note.
 - \`list-tags\` / \`update-tag\` / \`delete-tag\` — manage the tag vocabulary + schemas.
 - \`find-path\` — shortest link path between two notes.
-- \`vault-info\` — refresh the live schema/stats projection any time.
+- \`vault-info\` — refresh the live schema projection any time; the base call
+  includes a compact \`map\` (tag counts, top-level path-bucket counts, total
+  notes) so you can orient in this one call — no flag needed.
 
 \`[[wikilinks]]\` in note content auto-link to the note at that path — use them
 freely; they resolve even if the target is created later.
@@ -503,6 +509,14 @@ Testers of this vault independently reinvented these — start from them instead
   text is escaped, not parsed as FTS5 syntax, so punctuation like "didn't" or
   "18.6" just works. Pass \`search_mode: "advanced"\` only when you actually
   want FTS5 boolean/phrase/prefix syntax.
+- **A front-door "Map" note.** Once a vault grows past a few dozen notes,
+  keep one note (path \`Map\`, or whatever fits) as a human-legible index —
+  the tags and top-level paths that matter and what each means, with
+  wikilinks into anchor notes. It's the "why" companion to \`vault-info\`'s
+  auto-computed \`map\` (tag/path-bucket counts, the "what's there"): the
+  counts tell a fresh AI the shape of the vault in one call, this note tells
+  it what that shape MEANS. Update it when the vault's structure shifts;
+  link to it from the vault description so it's easy to find.
 
 ## Write gotchas
 

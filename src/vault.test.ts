@@ -675,6 +675,34 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  test("vault-info includes a compact structural map WITHOUT include_stats (front-door)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `map-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const vaultStore = getVaultStore(vaultName);
+    await vaultStore.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await vaultStore.createNote("b", { tags: ["person"] }); // no path
+
+    const tools = generateScopedMcpTools(vaultName);
+    const vaultInfo = tools.find((t) => t.name === "vault-info")!;
+
+    // No `include_stats` flag — the map must still be present (that's the
+    // whole point: orient in ONE call, no flag needed).
+    const result = await vaultInfo.execute({}) as any;
+    expect(result.stats).toBeUndefined();
+    expect(result.map).toBeTruthy();
+    expect(result.map.total_notes).toBe(2);
+    expect(result.map.tags).toEqual([{ name: "person", count: 2 }]);
+    expect(result.map.path_buckets).toEqual([{ name: "People", count: 1 }]);
+    expect(result.map.unfiled_notes).toBe(1);
+
+    closeAllStores();
+  });
+
   test("getServerInstruction renders projection markdown for a populated vault (vault#271)", async () => {
     const { getServerInstruction } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
@@ -1263,6 +1291,51 @@ describe("scoped MCP wrapper", async () => {
     expect(tagNames.sort()).toEqual(["project", "task"]);
     const status = (result.indexed_fields as { name: string; tags: string[] }[]).find((f) => f.name === "status")!;
     expect(status.tags.sort()).toEqual(["project", "task"]);
+
+    closeAllStores();
+  });
+
+  test("scoped vault-info's map covers only notes reachable through an in-scope tag (front-door)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vault-info-map-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const store0 = getVaultStore(vaultName);
+    await store0.createNote("a", { tags: ["work"], path: "Work/One" });
+    await store0.createNote("b", { tags: ["work"] }); // no path
+    await store0.createNote("c", { tags: ["personal"], path: "Personal/Two" });
+
+    // Scoped to `work` only.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const result = await tools.find((t) => t.name === "vault-info")!.execute({}) as any;
+
+    expect(result.map.total_notes).toBe(2); // a, b — "c" (personal) excluded
+    expect(result.map.tags).toEqual([{ name: "work", count: 2 }]);
+    expect(result.map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+    expect(result.map.unfiled_notes).toBe(1);
+
+    closeAllStores();
+  });
+
+  test("scoped vault-info with an allowlist matching nothing returns an all-zero map, not the full vault", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vault-info-map-empty-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const store0 = getVaultStore(vaultName);
+    await store0.createNote("a", { tags: ["work"], path: "Work/One" });
+
+    // Scoped to a tag that doesn't exist in this vault at all.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["nonexistent"]) as any);
+    const result = await tools.find((t) => t.name === "vault-info")!.execute({}) as any;
+
+    expect(result.map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
 
     closeAllStores();
   });
@@ -7506,6 +7579,60 @@ describe("handleVault: transcription capability (scribe-fold Phase 1)", async ()
     const body = await res.json() as any;
     expect(body.config.auto_transcribe.enabled).toBe(true);
     expect(body.transcription.enabled).toBe(false);
+  });
+});
+
+describe("handleVault: front-door structural map", async () => {
+  test("GET always includes `map` — no ?include_stats needed", async () => {
+    await store.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await store.createNote("b", { tags: ["person"] }); // no path
+
+    const cfg = { name: "default" } as { name: string };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.stats).toBeUndefined();
+    expect(body.map).toBeTruthy();
+    expect(body.map.total_notes).toBe(2);
+    expect(body.map.tags).toEqual([{ name: "person", count: 2 }]);
+    expect(body.map.path_buckets).toEqual([{ name: "People", count: 1 }]);
+    expect(body.map.unfiled_notes).toBe(1);
+  });
+
+  test("?include_stats=true adds stats ALONGSIDE map, not instead of it", async () => {
+    await store.createNote("a", { tags: ["person"] });
+    const cfg = { name: "default" } as { name: string };
+    const res = await handleVault(mkReq("GET", "/vault?include_stats=true"), store, cfg as any);
+    const body = await res.json() as any;
+    expect(body.stats).toBeTruthy();
+    expect(body.map).toBeTruthy();
+  });
+
+  test("a tag-scoped caller's map covers only notes reachable through an in-scope tag", async () => {
+    await store.createNote("a", { tags: ["work"], path: "Work/One" });
+    await store.createNote("b", { tags: ["work"] }); // no path
+    await store.createNote("c", { tags: ["personal"], path: "Personal/Two" });
+
+    const cfg = { name: "default" } as { name: string };
+    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["work"]), raw: ["work"] };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any, undefined, undefined, scope);
+    const body = await res.json() as any;
+
+    expect(body.map.total_notes).toBe(2); // a, b — "c" (personal) excluded
+    expect(body.map.tags).toEqual([{ name: "work", count: 2 }]);
+    expect(body.map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+    expect(body.map.unfiled_notes).toBe(1);
+  });
+
+  test("a tag-scoped caller whose allowlist matches nothing gets an all-zero map, not the full vault", async () => {
+    await store.createNote("a", { tags: ["work"], path: "Work/One" });
+
+    const cfg = { name: "default" } as { name: string };
+    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["nonexistent"]), raw: ["nonexistent"] };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any, undefined, undefined, scope);
+    const body = await res.json() as any;
+
+    expect(body.map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
   });
 });
 

@@ -1825,7 +1825,8 @@ counts never reflect out-of-scope activity.
 
 #### `GET /vault/{name}/api/vault` — `vault:read`
 Returns the vault's identity plus a nested `config` block for mutable
-settings.
+settings, and a `map` — a compact, counts-only structural rollup meant to
+orient a fresh reader in this ONE call, no `?include_stats=true` needed:
 
 ```json
 {
@@ -1833,12 +1834,37 @@ settings.
   "description": "My knowledge graph",
   "config": {
     "audio_retention": "keep"
+  },
+  "map": {
+    "total_notes": 42,
+    "tags": [
+      { "name": "meeting", "count": 18 },
+      { "name": "person", "count": 9 }
+    ],
+    "path_buckets": [
+      { "name": "Projects", "count": 12 },
+      { "name": "Decisions", "count": 4 }
+    ],
+    "unfiled_notes": 6
   }
 }
 ```
 
+`map.tags` lists every tag currently carried by at least one note, with its
+membership count (sorted by count desc, then name — uncapped, unlike the
+`stats.topTags` list below). `map.path_buckets` lists every top-level path
+segment (the text before the first `/`, or the whole path when it has none)
+among notes that HAVE a path, with how many notes live under it.
+`unfiled_notes` counts notes with no `path` at all — excluded from
+`path_buckets` (nothing to bucket); `unfiled_notes` plus the sum of every
+`path_buckets[].count` equals `map.total_notes`. A tag-scoped token's `map`
+covers only notes reachable through an in-scope tag — same confidentiality
+posture as `GET /tags` and `GET /vault/{name}/api/find-path`.
+
 `?include_stats=true` folds the same `VaultStats` shape into the response
-under `stats`.
+under `stats` — the deeper aggregate (monthly distribution, earliest/latest
+note, content bytes, top 20 tags). `map` is always present and cheaper;
+reach for `include_stats` only when you need those extras.
 
 #### `PATCH /vault/{name}/api/vault` — `vault:write`
 Update the description and/or nested `config` fields. Only the fields you

@@ -7,7 +7,7 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNoteTags } from "../core/src/notes.ts";
+import { getNoteTags, getVaultMap } from "../core/src/notes.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -482,10 +482,22 @@ function applyTagScopeWrappers(
       tags: Array.isArray(r.tags) ? r.tags : [],
       indexed_fields: Array.isArray(r.indexed_fields) ? r.indexed_fields : [],
       query_hints: Array.isArray(r.query_hints) ? r.query_hints : [],
+      // Unused by filterProjectionByScope (map is handled separately below,
+      // via a live recompute) — a placeholder to satisfy VaultProjection's
+      // shape.
+      map: { total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 },
     };
     const filtered = filterProjectionByScope(partial, allowed);
     r.tags = filtered.tags;
     r.indexed_fields = filtered.indexed_fields;
+    // `map` (front-door structural rollup): post-hoc filtering the unscoped
+    // aggregate isn't possible for path-bucket counts (they need per-note
+    // tag membership, not just a tag-name allowlist over a precomputed
+    // rollup) — so re-run the cheap grouped-count query restricted to the
+    // resolved allowlist instead of filtering `orig`'s unscoped result.
+    if (r.map) {
+      r.map = getVaultMap(store.db, { tagFilter: [...allowed] });
+    }
     return r;
   });
 
@@ -755,6 +767,7 @@ function overrideVaultInfo(
       tags: projection.tags,
       indexed_fields: projection.indexed_fields,
       query_hints: projection.query_hints,
+      map: projection.map,
     };
 
     // A2: surface a pointer (path, not body) to the seeded onboarding guide so

@@ -8,6 +8,7 @@ import { traverseLinks } from "./links.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import { resolveLinkTarget } from "./wikilinks.js";
 import { generateUlid, ULID_REGEX } from "./ulid.js";
+import { getVaultMap } from "./notes.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -1125,6 +1126,116 @@ describe("vault stats", async () => {
 
     const result = await store.getVaultStats();
     expect(result.attachmentCount).toBe(3);
+  });
+});
+
+// ---- Vault Map (front-door structural orientation) ----
+
+describe("vault map", async () => {
+  it("handles an empty vault gracefully", async () => {
+    const map = getVaultMap(db);
+    expect(map.total_notes).toBe(0);
+    expect(map.tags).toEqual([]);
+    expect(map.path_buckets).toEqual([]);
+    expect(map.unfiled_notes).toBe(0);
+  });
+
+  it("counts total notes, tag membership, and top-level path buckets", async () => {
+    await store.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await store.createNote("b", { tags: ["person"], path: "People/Bob" });
+    await store.createNote("c", { tags: ["project"], path: "Projects/Acme" });
+    await store.createNote("d", { tags: ["project", "person"] }); // no path
+
+    const map = getVaultMap(db);
+    expect(map.total_notes).toBe(4);
+
+    const tagByName = Object.fromEntries(map.tags.map((t) => [t.name, t.count]));
+    expect(tagByName.person).toBe(3);
+    expect(tagByName.project).toBe(2);
+
+    const bucketByName = Object.fromEntries(map.path_buckets.map((b) => [b.name, b.count]));
+    expect(bucketByName.People).toBe(2);
+    expect(bucketByName.Projects).toBe(1);
+
+    expect(map.unfiled_notes).toBe(1);
+    // Invariant: unfiled + every bucket's count == total_notes (a note has at
+    // most one path, so buckets + unfiled partition the vault exactly).
+    const bucketSum = map.path_buckets.reduce((sum, b) => sum + b.count, 0);
+    expect(bucketSum + map.unfiled_notes).toBe(map.total_notes);
+  });
+
+  it("buckets a top-level (no-slash) path under its own full name", async () => {
+    await store.createNote("solo", { path: "Welcome" });
+    const map = getVaultMap(db);
+    expect(map.path_buckets).toEqual([{ name: "Welcome", count: 1 }]);
+    expect(map.unfiled_notes).toBe(0);
+  });
+
+  it("tags are sorted by count desc, then name asc", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`m-${i}`, { tags: ["popular"] });
+    await store.createNote("z", { tags: ["zzz-rare"] });
+    await store.createNote("a", { tags: ["aaa-rare"] });
+
+    const map = getVaultMap(db);
+    expect(map.tags).toEqual([
+      { name: "popular", count: 3 },
+      { name: "aaa-rare", count: 1 },
+      { name: "zzz-rare", count: 1 },
+    ]);
+  });
+
+  describe("tagFilter (scope-aware path)", () => {
+    it("omitting tagFilter computes the vault-wide map (unchanged default)", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+      await store.createNote("b", { tags: ["personal"], path: "Personal/Two" });
+
+      const map = getVaultMap(db);
+      expect(map.total_notes).toBe(2);
+      expect(map.tags.map((t) => t.name).sort()).toEqual(["personal", "work"]);
+      expect(map.path_buckets.map((b) => b.name).sort()).toEqual(["Personal", "Work"]);
+    });
+
+    it("an empty tagFilter array means nothing is in scope — all-zero map, NOT the full vault", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+
+      const map = getVaultMap(db, { tagFilter: [] });
+      expect(map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
+    });
+
+    it("a non-empty tagFilter restricts every count to notes reachable through that tag set", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+      await store.createNote("b", { tags: ["work", "urgent"], path: "Work/Two" });
+      await store.createNote("c", { tags: ["personal"], path: "Personal/Three" });
+      await store.createNote("d", { tags: ["personal"] }); // no path
+
+      const map = getVaultMap(db, { tagFilter: ["work", "urgent"] });
+      expect(map.total_notes).toBe(2); // a, b — "personal" notes excluded
+      expect(map.tags).toEqual([
+        { name: "work", count: 2 },
+        { name: "urgent", count: 1 },
+      ]);
+      expect(map.path_buckets).toEqual([{ name: "Work", count: 2 }]);
+      expect(map.unfiled_notes).toBe(0);
+    });
+
+    it("a note carrying both an in-scope and out-of-scope tag is counted once, not double", async () => {
+      await store.createNote("a", { tags: ["work", "personal"], path: "Work/One" });
+
+      const map = getVaultMap(db, { tagFilter: ["work"] });
+      expect(map.total_notes).toBe(1);
+      expect(map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+      // "personal" is out of scope — must not leak into the tags list.
+      expect(map.tags.map((t) => t.name)).not.toContain("personal");
+    });
+
+    it("scoped unfiled_notes counts only in-scope path-less notes", async () => {
+      await store.createNote("a", { tags: ["work"] }); // no path, in scope
+      await store.createNote("b", { tags: ["personal"] }); // no path, out of scope
+
+      const map = getVaultMap(db, { tagFilter: ["work"] });
+      expect(map.unfiled_notes).toBe(1);
+      expect(map.total_notes).toBe(1);
+    });
   });
 });
 

@@ -931,9 +931,16 @@ export async function route(
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
-    return handleVault(req, store, vaultConfig, () => {
-      writeVaultConfig(vaultConfig);
-    });
+    return handleVault(
+      req,
+      store,
+      vaultConfig,
+      () => {
+        writeVaultConfig(vaultConfig);
+      },
+      undefined, // resolveCapability — keep the production default
+      tagScope,
+    );
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);
   if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);
