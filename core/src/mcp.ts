@@ -2603,9 +2603,8 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // src/mcp-tools.ts, which re-runs the scan against the caller's
       // allowlist) — it's a read, not a curation op, and read-scoped
       // monitoring/tending jobs need to be able to run it without an admin
-      // credential. NOTE: the REST `GET /api/doctor` endpoint (routing.ts)
-      // intentionally stays admin-gated — this re-tier is MCP-tool-scoped
-      // only; see CHANGELOG for the resulting REST/MCP tier divergence.
+      // credential. The REST `GET /api/doctor` endpoint (routing.ts) is
+      // re-tiered to `read` too, so both doors agree — no MCP/REST divergence.
       requiredVerb: "read",
       description:
         "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
