@@ -213,6 +213,49 @@ describe('contract: search — literal-by-default (#551, flipped from todo)', ()
     expect(Array.isArray(body)).toBe(true);
     expect(body).toEqual([]);
   });
+
+  // Review fold: a NUL byte inside a literal-mode token used to crash FTS5's
+  // C-string parser (`SQLiteError: unterminated string`) → raw rethrow →
+  // unstructured 500. Sanitization (control chars → separators) makes it a
+  // normal search. `%00` is the URL-encoding of a NUL byte.
+  it("search=hello%00world (NUL byte in a token) does NOT 500 — literal mode cannot throw", async () => {
+    await store.createNote("hello world reachable across the NUL split", { tags: ["nul"] });
+    const res = await search("search=hello%00world&include_content=true");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(Array.isArray(body)).toBe(true);
+    // The NUL split the token into "hello" AND "world" — both searchable —
+    // so the planted note (containing both words) is found.
+    expect(body.some((n: any) => n.content.includes("hello world reachable"))).toBe(true);
+  });
+
+  it("a NUL-only search short-circuits to [] with an empty_search warning, no 500", async () => {
+    const res = await search("search=%00");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body).toEqual([]);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings).not.toBeNull();
+    expect(warnings!.some((w: any) => w.code === "empty_search")).toBe(true);
+  });
+
+  it("sort under search is STABLE at identical created_at (deterministic n.id tiebreaker, both directions)", async () => {
+    // Two notes at the SAME millisecond — without the id tiebreaker their
+    // relative order would be arbitrary/unstable (review nit).
+    const ts = "2023-03-03T03:03:03.030Z";
+    await store.createNote("tiebreak content one", { id: "tie-aaa", created_at: ts });
+    await store.createNote("tiebreak content two", { id: "tie-bbb", created_at: ts });
+
+    const asc = await bodyOf(await search("search=tiebreak&sort=asc&include_content=true"));
+    const ascIds = asc.map((n: any) => n.id);
+    // ASC id tiebreaker → tie-aaa before tie-bbb.
+    expect(ascIds).toEqual(["tie-aaa", "tie-bbb"]);
+
+    const desc = await bodyOf(await search("search=tiebreak&sort=desc&include_content=true"));
+    const descIds = desc.map((n: any) => n.id);
+    // DESC id tiebreaker → tie-bbb before tie-aaa (the exact reverse).
+    expect(descIds).toEqual(["tie-bbb", "tie-aaa"]);
+  });
 });
 
 describe("contract: search — escaping edge cases, tag-scope, warnings (#551)", () => {

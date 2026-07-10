@@ -1312,22 +1312,33 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
 
 /**
  * Turn a thrown FTS5 MATCH error into the structured `invalid_search_syntax`
- * shape (vault#551, WS2A item 2) — advanced mode no longer swallows a
- * syntax error into a silent `[]`; it surfaces it so the caller can fix the
- * query or drop back to literal mode.
+ * shape (vault#551, WS2A item 2). ALWAYS structured, never a raw rethrow —
+ * a raw `SQLiteError` escaping to the transport is an unstructured 500
+ * (REST) / generic `isError` text (MCP), which is exactly the swallowed-
+ * failure class this wave is closing.
+ *
+ * The two modes carry different hints:
+ *   - advanced: the caller passed raw FTS5 syntax that FTS5 rejected — tell
+ *     them to fix it or drop back to literal.
+ *   - literal: escaping + control-char sanitization
+ *     (`buildLiteralSearchQuery`) make every input syntactically valid
+ *     FTS5, so this is unreachable by construction — the belt-and-suspenders
+ *     structured error (rather than a raw rethrow) means that IF the
+ *     invariant is ever broken it still surfaces as an honest error, not a
+ *     500. Signals a vault bug worth reporting.
  */
-function searchSyntaxError(rawQuery: string, err: unknown): QueryError {
+function searchSyntaxError(rawQuery: string, err: unknown, mode: SearchMode): QueryError {
   const causeMessage = err instanceof Error ? err.message : String(err);
-  return new QueryError(
-    `invalid search syntax: ${causeMessage}`,
-    "INVALID_QUERY",
-    {
-      error_type: "invalid_search_syntax",
-      field: "search",
-      got: rawQuery,
-      hint: `FTS5 rejected this as advanced query syntax (${causeMessage}). Fix the syntax, or omit search_mode:"advanced" for literal (punctuation-safe) search.`,
-    },
-  );
+  const hint =
+    mode === "advanced"
+      ? `FTS5 rejected this as advanced query syntax (${causeMessage}). Fix the syntax, or omit search_mode:"advanced" for literal (punctuation-safe) search.`
+      : `FTS5 rejected the escaped literal query (${causeMessage}) — this should be impossible after literal-mode escaping + control-char sanitization; please report it as a vault bug.`;
+  return new QueryError(`invalid search syntax: ${causeMessage}`, "INVALID_QUERY", {
+    error_type: "invalid_search_syntax",
+    field: "search",
+    got: rawQuery,
+    hint,
+  });
 }
 
 export function searchNotes(
@@ -1361,8 +1372,16 @@ export function searchNotes(
   // relevance (`rank`, unchanged); an EXPLICIT `sort: "asc"|"desc"` switches
   // to `created_at` ordering. Checked against the literal string values (not
   // truthiness) so an absent `sort` can never accidentally match a branch.
+  // `n.id ${direction}` is appended as a deterministic tiebreaker — same
+  // rationale as `queryNotes` (two notes at the same created_at millisecond
+  // would otherwise return in arbitrary/unstable order). `rank` needs no
+  // tiebreaker (bm25 score is effectively unique per row).
   const orderBy =
-    opts?.sort === "asc" ? "n.created_at ASC" : opts?.sort === "desc" ? "n.created_at DESC" : "rank";
+    opts?.sort === "asc"
+      ? "n.created_at ASC, n.id ASC"
+      : opts?.sort === "desc"
+        ? "n.created_at DESC, n.id DESC"
+        : "rank";
 
   if (opts?.tags && opts.tags.length > 0) {
     // Canonical-bare-tag guard backstop (vault#XXX) for direct-core callers.
@@ -1387,13 +1406,14 @@ export function searchNotes(
       `).all(ftsQuery, ...searchTags, limit) as NoteRow[];
       return notesWithTags(db, rows);
     } catch (err) {
-      // Advanced mode: a raw FTS5 syntax error is surfaced structured, not
-      // swallowed (vault#551). Literal mode: escaping makes every input
-      // syntactically valid FTS5 — a throw here means the escaping itself
-      // has a bug, so it's rethrown untouched rather than hidden behind a
-      // silent `[]` (the very bug this wave fixes).
-      if (mode === "advanced") throw searchSyntaxError(query, err);
-      throw err;
+      // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
+      // advanced mode expects it (the caller passed raw syntax); literal
+      // mode should never reach it (escaping + control-char sanitization
+      // make the query valid) but if the invariant breaks we still want an
+      // honest error, not an unstructured 500. A QueryError we threw
+      // ourselves (empty-limit validation, etc.) is re-raised untouched.
+      if (err instanceof QueryError) throw err;
+      throw searchSyntaxError(query, err, mode);
     }
     }
   }
@@ -1408,8 +1428,8 @@ export function searchNotes(
     `).all(ftsQuery, limit) as NoteRow[];
     return notesWithTags(db, rows);
   } catch (err) {
-    if (mode === "advanced") throw searchSyntaxError(query, err);
-    throw err;
+    if (err instanceof QueryError) throw err;
+    throw searchSyntaxError(query, err, mode);
   }
 }
 

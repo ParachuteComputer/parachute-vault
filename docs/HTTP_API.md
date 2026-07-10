@@ -346,10 +346,10 @@ Warning codes today:
   entry per removed param present. Structured-query only.
 - `empty_search` (vault#551) — `search=` carried no literal content: blank/
   whitespace-only, or (in the default literal `search_mode`, where a
-  manually-typed `"` is ordinary content rather than syntax) nothing but
-  quote characters. The query short-circuits to `[]` without ever calling
-  FTS5, rather than risking a syntax error on a degenerate escaped phrase.
-  `search=` only.
+  manually-typed `"` is ordinary content and control bytes are separators)
+  nothing but quote/whitespace/control characters. The query short-circuits
+  to `[]` without ever calling FTS5, rather than risking a syntax error on a
+  degenerate escaped phrase. `search=` only.
 - `ignored_param` (vault#551) — a param was passed that has no effect given
   the rest of the request. Today's only case: `search_mode=` without
   `search=` (the mode only shapes how `search` text becomes an FTS5 query).
@@ -414,10 +414,14 @@ A DISTINCT `error_type` from `invalid_query` above — this one is specifically
 about `search_mode: "advanced"` raw FTS5 syntax that FTS5 itself rejected
 (an unbalanced quote, a dangling boolean operator, ...). Before vault#551
 every FTS5 syntax error — in EITHER search mode — was silently swallowed
-into `[]`; that swallowing is now literal-mode-only (see
-[Full-text search](#endpoints) below), where it should be unreachable
-(escaping makes every input syntactically valid FTS5) rather than a real
-possibility to hide:
+into `[]`. **Literal mode (the default) cannot produce this error:** the
+query text is escaped, phrase-quoted, and control-character-sanitized
+(NUL and other C0/DEL bytes become token separators) *before* FTS5 ever
+sees it, so no user input can reach the FTS5 parser as syntax. As a
+belt-and-suspenders guarantee, if a literal-mode query somehow still made
+FTS5 throw (a vault bug), it surfaces as this same structured error — never
+a raw `SQLiteError` 500. Advanced mode is where a syntax error is a normal,
+caller-fixable outcome:
 
 ```json
 {
@@ -654,13 +658,17 @@ Query params:
     lean/full-shape default as the structured-query path). Optional `tag=`
     filters compose. `limit` defaults to 50. Incompatible with `cursor`.
   - **Literal by default.** Your query text is escaped and phrase-quoted
-    before it reaches FTS5: split on whitespace, each token wrapped in
-    `"..."` with internal `"` doubled, joined with spaces (implicit AND).
-    This is the fix for ordinary punctuation silently returning `[]` —
-    `search=didn't`, `search=eleven-day capping delay`, and `search=18.6`
-    all now find their matches; before vault#551 the bare hyphen was parsed
-    as an FTS5 NOT-operator and the apostrophe/decimal point broke the FTS5
-    parse outright.
+    before it reaches FTS5: control bytes (NUL and other C0/DEL characters)
+    are sanitized to token separators, then split on whitespace, each token
+    wrapped in `"..."` with internal `"` doubled, joined with spaces
+    (implicit AND). This is the fix for ordinary punctuation silently
+    returning `[]` — `search=didn't`, `search=eleven-day capping delay`,
+    and `search=18.6` all now find their matches; before vault#551 the bare
+    hyphen was parsed as an FTS5 NOT-operator and the apostrophe/decimal
+    point broke the FTS5 parse outright. Because every input is sanitized +
+    escaped before FTS5 sees it, literal mode can never surface an FTS5
+    syntax error (a residual parser error would surface *structured*, never
+    a 500 — see [`invalid_search_syntax`](#honest-queries--warnings-channel--structured-invalids-vault550) above).
   - `search_mode=advanced` opts back into RAW FTS5 query syntax — the
     pre-vault#551 behavior, unchanged: boolean operators (`AND`/`OR`/`NOT`),
     manual phrase quoting (`"exact phrase"`), and prefix matching
@@ -687,9 +695,10 @@ Query params:
     `search=` (the REST doc used to claim "FTS owns its own ordering";
     that's now honored, not assumed).
   - **`empty_search` warning.** A query that's blank, whitespace-only, or
-    (in literal mode) nothing but quote characters short-circuits to `[]`
-    with an `empty_search` warning instead of risking an FTS5 syntax error
-    on a degenerate escaped phrase. See the warnings channel above.
+    (in literal mode) nothing but quote/whitespace/control characters
+    short-circuits to `[]` with an `empty_search` warning instead of
+    risking an FTS5 syntax error on a degenerate escaped phrase. See the
+    warnings channel above.
 
 - **Cursor pagination** (see [Cursor pagination](#cursor-pagination--the-since-last-checked-pattern))
   - `cursor=<opaque>` — switches response to `{notes, next_cursor}`.

@@ -93,6 +93,37 @@ describe("buildLiteralSearchQuery", () => {
     expect(r.isEmpty).toBe(true);
     expect(r.query).toBe("");
   });
+
+  // Control-character sanitization (vault#551 review fold) — a NUL byte
+  // (or any C0/DEL control) inside a token would otherwise crash FTS5's
+  // C-string parser with a raw `unterminated string` error, breaking the
+  // "literal mode cannot throw" guarantee.
+  it("splits a token on an embedded NUL byte — both halves stay searchable", () => {
+    const r = buildLiteralSearchQuery("hello\x00world");
+    expect(r.isEmpty).toBe(false);
+    expect(r.query).toBe(`"hello" "world"`);
+  });
+
+  it("treats a NUL-only string as empty (short-circuits, never reaches FTS5)", () => {
+    const r = buildLiteralSearchQuery("\x00");
+    expect(r.isEmpty).toBe(true);
+    expect(r.query).toBe("");
+  });
+
+  it("collapses a run of NUL/control bytes between tokens like whitespace", () => {
+    const r = buildLiteralSearchQuery("hello\x00\x00world");
+    expect(r.query).toBe(`"hello" "world"`);
+  });
+
+  it("sanitizes the other C0 controls and DEL (0x01-0x1F, 0x7F) as separators too", () => {
+    expect(buildLiteralSearchQuery("a\x01\x02b").query).toBe(`"a" "b"`);
+    expect(buildLiteralSearchQuery("a\x1fb").query).toBe(`"a" "b"`);
+    expect(buildLiteralSearchQuery("a\x7fb").query).toBe(`"a" "b"`);
+  });
+
+  it("a control byte adjacent to a real token still yields the clean token", () => {
+    expect(buildLiteralSearchQuery("\x00hello\x00").query).toBe(`"hello"`);
+  });
 });
 
 describe("isValidSearchMode / SEARCH_MODES", () => {
