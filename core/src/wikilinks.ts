@@ -655,6 +655,28 @@ export function queueUnresolvedLink(
 }
 
 /**
+ * Drop any pending forward-ref queued for `sourceId` under `relationship`,
+ * regardless of the (stale) `target_path` it names. Used by the
+ * `reference`-field auto-link sync (core/src/store.ts's
+ * `syncReferenceFieldLinks`, vault#typed-reference-field) before re-resolving
+ * a changed field value — without this, a field that used to point at an
+ * unresolved target and is then changed to a different (or removed) value
+ * would leave the OLD forward-ref queued forever, since
+ * {@link queueUnresolvedLink}'s primary key includes `target_path` and a
+ * changed value queues under a NEW key rather than replacing the old row.
+ * Safe no-op when the table doesn't exist yet.
+ */
+export function clearQueuedLink(db: Database, sourceId: string, relationship: string): void {
+  try {
+    db.prepare(
+      "DELETE FROM unresolved_wikilinks WHERE source_id = ? AND relationship = ?",
+    ).run(sourceId, relationship);
+  } catch {
+    // Table may not exist yet — nothing to clear.
+  }
+}
+
+/**
  * Resolve a structured link NOW, or queue it for lazy resolution when the
  * target doesn't exist yet — mirroring the wikilink forward-ref contract
  * (a target created later, in this same batch or a future call, backfills

@@ -315,7 +315,7 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
     expect(record?.fields ?? null).toBeFalsy();
   });
 
-  // Positive control — every one of the six recognized types (indexable or
+  // Positive control — every one of the seven recognized types (indexable or
   // not) is accepted without complaint.
   it("REST PUT /api/tags/:name accepts every recognized field type", async () => {
     const req = new Request("http://localhost/api/tags/widget", {
@@ -328,6 +328,7 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
           d: { type: "boolean" },
           e: { type: "array" },
           f: { type: "object" },
+          g: { type: "reference" },
         },
       }),
     });

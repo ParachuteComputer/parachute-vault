@@ -3875,10 +3875,205 @@ describe("MCP tools", async () => {
         d: { type: "boolean" },
         e: { type: "array" },
         f: { type: "object" },
+        g: { type: "reference" },
       },
     }) as any;
     expect(result.fields.a.type).toBe("string");
     expect(result.fields.f.type).toBe("object");
+    expect(result.fields.g.type).toBe("reference");
+  });
+
+  // ---- Typed reference field: indexed value + auto-link (vault#typed-reference-field) ----
+
+  describe("typed reference field", () => {
+    it("create-note with a reference-typed field indexes the value AND creates the link", async () => {
+      const target = await store.createNote("Alice", { path: "People/Alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "People/Alice" },
+      }) as any;
+
+      // (a) the value half — stored + readable like a string field.
+      expect(result.metadata.assignee).toBe("People/Alice");
+
+      // (b) the link half — a graph edge to the resolved target, relationship = field name.
+      const links = await store.getLinks(result.id, { direction: "outbound" });
+      const assigneeLink = links.find((l) => l.relationship === "assignee");
+      expect(assigneeLink).toBeDefined();
+      expect(assigneeLink!.targetId).toBe(target.id);
+    });
+
+    it("resolves a reference field by note ID as well as path/title", async () => {
+      const target = await store.createNote("Bob", { id: "bob-id" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "bob-id" },
+      }) as any;
+
+      const links = await store.getLinks(result.id, { direction: "outbound" });
+      expect(links.find((l) => l.relationship === "assignee")?.targetId).toBe(target.id);
+    });
+
+    it("querying by a reference field's value works (plain metadata filter and, when indexed, the eq operator)", async () => {
+      await store.createNote("Alice", { path: "People/Alice", id: "alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "task",
+        fields: { assignee: { type: "reference", indexed: true } },
+      });
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const created = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const plain = await queryNotes.execute({ tags: ["task"], metadata: { assignee: "alice" } }) as any[];
+      expect(plain.map((n: any) => n.id)).toContain(created.id);
+
+      const viaOperator = await queryNotes.execute({
+        tags: ["task"],
+        metadata: { assignee: { eq: "alice" } },
+      }) as any[];
+      expect(viaOperator.map((n: any) => n.id)).toContain(created.id);
+    });
+
+    it("update-note changing a reference field's value moves the link (old edge dropped, new edge created)", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      const bob = await store.createNote("Bob", { id: "bob" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.filter((l) => l.relationship === "assignee").map((l) => l.targetId)).toEqual([alice.id]);
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      await updateNote.execute({ id: note.id, metadata: { assignee: "bob" }, force: true });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      const assigneeLinks = links.filter((l) => l.relationship === "assignee");
+      expect(assigneeLinks).toHaveLength(1);
+      expect(assigneeLinks[0]!.targetId).toBe(bob.id);
+
+      const fresh = await store.getNote(note.id);
+      expect(fresh!.metadata!.assignee).toBe("bob");
+    });
+
+    it("update-note clearing a reference field drops the link", async () => {
+      await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(true);
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      // RFC 7386 tombstone — null deletes the key.
+      await updateNote.execute({ id: note.id, metadata: { assignee: null }, force: true });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(false);
+
+      const fresh = await store.getNote(note.id);
+      expect(fresh!.metadata).not.toHaveProperty("assignee");
+    });
+
+    it("re-writing a reference field with the SAME value is a no-op (link untouched)", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const before = await store.getLinks(note.id, { direction: "outbound" });
+      const beforeLink = before.find((l) => l.relationship === "assignee");
+      expect(beforeLink).toBeDefined();
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      await updateNote.execute({ id: note.id, metadata: { assignee: "alice" }, force: true });
+
+      const after = await store.getLinks(note.id, { direction: "outbound" });
+      const afterLinks = after.filter((l) => l.relationship === "assignee");
+      expect(afterLinks).toHaveLength(1);
+      expect(afterLinks[0]!.targetId).toBe(alice.id);
+      // Same createdAt — proves the edge was never dropped and recreated.
+      expect(afterLinks[0]!.createdAt).toBe(beforeLink!.createdAt);
+    });
+
+    it("a reference field's unresolved target queues and backfills when the target note is created later", async () => {
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "Not Yet Created" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(false);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).toContain(note.id);
+
+      const target = await store.createNote("here now", { path: "Not Yet Created" });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      const assigneeLink = links.find((l) => l.relationship === "assignee");
+      expect(assigneeLink).toBeDefined();
+      expect(assigneeLink!.targetId).toBe(target.id);
+    });
+
+    it("a content-only or tags-only update does not touch a note's reference-field link", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const before = await store.getLinks(note.id, { direction: "outbound" });
+      const beforeLink = before.find((l) => l.relationship === "assignee");
+
+      // Content-only update — no `metadata` key in the call at all.
+      await store.updateNote(note.id, { content: "Ship it faster" });
+
+      const after = await store.getLinks(note.id, { direction: "outbound" });
+      const afterLink = after.find((l) => l.relationship === "assignee");
+      expect(afterLink).toBeDefined();
+      expect(afterLink!.targetId).toBe(alice.id);
+      expect(afterLink!.createdAt).toBe(beforeLink!.createdAt);
+    });
   });
 
   it("find-path works with ID/path resolution", async () => {
