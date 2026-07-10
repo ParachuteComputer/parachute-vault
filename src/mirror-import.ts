@@ -518,6 +518,11 @@ function importResultFromStats(
       `Orphaned sidecar ${ss.sidecar_id} (path=${ss.expected_path ?? "—"}): ${ss.reason}`,
     );
   }
+  for (const sp of stats.skipped_schema_parents) {
+    warnings.push(
+      `Dropped parent_names on tag "${sp.tag}": ${sp.reason}`,
+    );
+  }
   const result: ImportResult = {
     notes_imported: stats.notes_created + stats.notes_updated,
     tags_imported: stats.schemas_restored,

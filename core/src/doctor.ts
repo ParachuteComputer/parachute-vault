@@ -88,6 +88,28 @@ export interface DoctorScanOpts {
 /** Cap on exemplar note IDs embedded in a finding's `detail` (vault#552 — keep report bodies bounded). */
 const MAX_EXEMPLARS = 5;
 
+/**
+ * Build a per-note in-scope predicate for a tag-scoped doctor run (vault#552
+ * auth fold). A note is in-scope iff at least one of its tags is in
+ * `allowedTags`; an unscoped run (`allowedTags === null`) treats every note
+ * as in-scope. Caches each note's tag lookup so repeated checks across scans
+ * cost one query per note. Shared by the mixed-type-indexed-field and
+ * dead-tag-metadata scans, both of which query notes vault-wide and must NOT
+ * surface an out-of-scope note id (or count, or exemplar) to a scoped caller.
+ */
+function makeNoteInScope(db: Database, allowedTags: Set<string> | null): (id: string) => boolean {
+  if (!allowedTags) return () => true;
+  const cache = new Map<string, boolean>();
+  return (id: string): boolean => {
+    const cached = cache.get(id);
+    if (cached !== undefined) return cached;
+    const tags = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
+    const inScope = tags.some((t) => allowedTags.has(t));
+    cache.set(id, inScope);
+    return inScope;
+  };
+}
+
 export function runDoctorScan(db: Database, opts?: DoctorScanOpts): DoctorReport {
   const allowedTags = opts?.allowedTags ?? null;
   const findings: DoctorFinding[] = [
@@ -176,6 +198,7 @@ const EXPECTED_JSON_TYPES: Record<string, Set<string>> = {
 
 function scanMixedTypeIndexedFields(db: Database, allowedTags: Set<string> | null): DoctorFinding[] {
   const findings: DoctorFinding[] = [];
+  const noteInScope = makeNoteInScope(db, allowedTags);
   for (const f of listIndexedFields(db)) {
     if (allowedTags && !f.declarerTags.some((t) => allowedTags.has(t))) continue;
     const expected = EXPECTED_JSON_TYPES[f.sqliteType];
@@ -190,15 +213,25 @@ function scanMixedTypeIndexedFields(db: Database, allowedTags: Set<string> | nul
         `SELECT id, json_type(metadata, ?) as jt FROM notes WHERE metadata IS NOT NULL AND metadata != '' AND json_valid(metadata)`,
       )
       .all(path) as { id: string; jt: string | null }[];
-    const mismatches = rows.filter((r) => r.jt !== null && !expected.has(r.jt));
+    // Tag-scope (vault#552 auth fold): the note query above is vault-wide —
+    // filter mismatches to IN-SCOPE notes so a scoped caller never sees an
+    // out-of-scope note id (nor a count/exemplar reflecting one). If every
+    // mismatch is on an out-of-scope note, the finding is dropped entirely.
+    const mismatches = rows.filter((r) => r.jt !== null && !expected.has(r.jt) && noteInScope(r.id));
     if (mismatches.length === 0) continue;
 
+    // Also generalize the "Declared by" list to in-scope declarers only —
+    // the field can be co-declared by an out-of-scope tag whose name must
+    // not leak (the caller sees this field only via its in-scope declarer).
+    const visibleDeclarers = allowedTags
+      ? f.declarerTags.filter((t) => allowedTags.has(t))
+      : f.declarerTags;
     const exemplars = mismatches.slice(0, MAX_EXEMPLARS).map((r) => `${r.id} (${r.jt})`);
     findings.push({
       type: "mixed_type_indexed_field",
       severity: "error",
       subject: f.field,
-      detail: `field "${f.field}" is indexed as ${f.sqliteType} but ${mismatches.length} note(s) carry a metadata."${f.field}" value of a disagreeing JSON type — the generated column's affinity coercion makes ordering/filtering across these rows inconsistent. Declared by: ${f.declarerTags.join(", ") || "(no live declarer)"}. Example note(s): ${exemplars.join(", ")}${mismatches.length > exemplars.length ? ", …" : ""}`,
+      detail: `field "${f.field}" is indexed as ${f.sqliteType} but ${mismatches.length} note(s) carry a metadata."${f.field}" value of a disagreeing JSON type — the generated column's affinity coercion makes ordering/filtering across these rows inconsistent. Declared by: ${visibleDeclarers.join(", ") || "(no live declarer)"}. Example note(s): ${exemplars.join(", ")}${mismatches.length > exemplars.length ? ", …" : ""}`,
       remedy: `backfill each listed note's metadata."${f.field}" to a value matching the declared type, or relax the field's declared type (update-tag) if the mixed values are intentional`,
     });
   }
@@ -261,26 +294,22 @@ function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | 
     }
   }
 
-  // Tag-scope: a note is in-scope iff at least one of its tags is in
-  // `allowedTags`. Resolved lazily/once per note id encountered below.
-  const noteTagsCache = new Map<string, string[]>();
-  const noteTags = (id: string): string[] => {
-    let cached = noteTagsCache.get(id);
-    if (!cached) {
-      cached = (db.prepare("SELECT tag_name FROM note_tags WHERE note_id = ?").all(id) as { tag_name: string }[]).map((r) => r.tag_name);
-      noteTagsCache.set(id, cached);
-    }
-    return cached;
-  };
-  const noteInScope = (id: string): boolean =>
-    !allowedTags || noteTags(id).some((t) => allowedTags.has(t));
+  // Tag-scope (vault#552 auth fold): a note is in-scope iff at least one of
+  // its tags is in `allowedTags` (unscoped → every note in-scope).
+  const noteInScope = makeNoteInScope(db, allowedTags);
 
   const findings: DoctorFinding[] = [];
   for (const [key, valueMap] of byKey) {
-    // Signal: does this metadata key hold tag-shaped values ANYWHERE in the
-    // vault? Only flag mismatches under a key that demonstrably does.
-    const liveValues = [...valueMap.keys()].filter((v) => liveTags.has(v));
-    if (liveValues.length === 0) continue;
+    // Signal: does this metadata key hold tag-shaped values on IN-SCOPE
+    // notes? Computed over in-scope notes ONLY (not vault-wide) so the
+    // example live value quoted in `detail` can never leak an out-of-scope
+    // tag name — a scoped caller must not learn a tag exists just because a
+    // note it can't see uses it as a metadata value. Only flag mismatches
+    // under a key that demonstrably holds tag-shaped values in-scope.
+    const liveValuesInScope = [...valueMap.entries()]
+      .filter(([v, ids]) => liveTags.has(v) && ids.some(noteInScope))
+      .map(([v]) => v);
+    if (liveValuesInScope.length === 0) continue;
 
     for (const [value, noteIds] of valueMap) {
       if (liveTags.has(value)) continue;
@@ -291,7 +320,7 @@ function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | 
         type: "dead_tag_metadata_reference",
         severity: "info",
         subject: `metadata.${key}`,
-        detail: `${inScopeIds.length} note(s) carry metadata.${key} = "${value}", which matches no current tag — other notes' metadata.${key} values ARE live tags (e.g. "${liveValues[0]}"), suggesting "${value}" may be a stale reference to a tag that was renamed, merged, or deleted. Example note(s): ${exemplars.join(", ")}${inScopeIds.length > exemplars.length ? ", …" : ""}`,
+        detail: `${inScopeIds.length} note(s) carry metadata.${key} = "${value}", which matches no current tag — other notes' metadata.${key} values ARE live tags (e.g. "${liveValuesInScope[0]}"), suggesting "${value}" may be a stale reference to a tag that was renamed, merged, or deleted. Example note(s): ${exemplars.join(", ")}${inScopeIds.length > exemplars.length ? ", …" : ""}`,
         remedy: `if "${value}" was renamed/merged/deleted, update these notes' metadata.${key} to the current tag name; if "${value}" was never a tag, ignore this finding`,
         heuristic: true,
       });

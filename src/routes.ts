@@ -2671,14 +2671,22 @@ export async function handleTags(
       if (err instanceof ParentCycleError) {
         // vault#552: parent_names would close a cycle. Nothing was
         // persisted. Scope-scrub the cycle path for a tag-scoped caller —
-        // the write stays rejected either way.
+        // the write stays rejected either way. `error` is a SHORT code and
+        // `message` the human sentence — the same split every sibling 409 in
+        // this file uses (target_exists, tag_in_use_by_tokens,
+        // tag_referenced_as_parent). parachute-surface's shared VaultClient
+        // 409 handler reads `body.message` (falling back to a hardcoded
+        // "Note was edited elsewhere"), so the message key is load-bearing:
+        // without it the Tags parent_names editor would show the wrong
+        // conflict text.
         const scrubbed = scrubParentCycleError(err, tagScope.allowed);
         return json(
           {
-            error: scrubbed.message,
+            error: "ParentCycle",
             error_type: "parent_cycle",
             tag: scrubbed.tag,
             cycle: scrubbed.cycle,
+            message: scrubbed.message,
           },
           409,
         );

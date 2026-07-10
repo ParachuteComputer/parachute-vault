@@ -1441,6 +1441,113 @@ describe("portable-md non-markdown round-trip (vault#328)", async () => {
     // No sidecar → no DB row.
     expect(stats.notes_created).toBe(0);
   });
+
+  // -------------------------------------------------------------------------
+  // vault#552 — the write-time parent_names cycle guard must NOT abort an
+  // import of an OLD export that carries a mutual-cycle fixture (accepted
+  // before the guard shipped). The offending parent_names is dropped +
+  // warned, the tags + notes still land. On a blow-away replace this is
+  // load-bearing: the vault was already wiped, so an uncaught throw here
+  // would leave it EMPTY with no rollback.
+  // -------------------------------------------------------------------------
+
+  /** Hand-build a portable-md export whose two tag schemas form an A↔B
+   *  parent_names cycle, plus one note tagged with `a`. */
+  function writeCyclicSchemaExport(dir: string): void {
+    mkdirSync(join(dir, SIDECAR_DIR, "schemas"), { recursive: true });
+    writeFileSync(
+      join(dir, SIDECAR_DIR, "vault.yaml"),
+      "export_format_version: 1\nexported_at: '2026-07-09T00:00:00.000Z'\n",
+    );
+    writeFileSync(
+      join(dir, SIDECAR_DIR, "schemas", "a.yaml"),
+      "name: a\ndescription: tag a\nparent_names:\n  - b\n",
+    );
+    writeFileSync(
+      join(dir, SIDECAR_DIR, "schemas", "b.yaml"),
+      "name: b\ndescription: tag b\nparent_names:\n  - a\n",
+    );
+    writeFileSync(
+      join(dir, "note1.md"),
+      "---\nid: note1\npath: note1\ntags:\n  - a\ncreated_at: '2026-07-09T00:00:00.000Z'\nupdated_at: '2026-07-09T00:00:00.000Z'\n---\nhello from note1\n",
+    );
+  }
+
+  it("imports an export carrying a parent_names cycle — the cycle is dropped + warned, not fatal (vault#552 MUST-FIX 1)", async () => {
+    const outDir = join(tmpBase, "cyclic-schemas");
+    writeCyclicSchemaExport(outDir);
+
+    const restored = new SqliteStore(new Database(":memory:"));
+    // MUST complete, not throw.
+    const stats = await importPortableVault(restored, { inDir: outDir });
+
+    // Both schemas + the note landed.
+    expect(stats.schemas_restored).toBe(2);
+    expect(stats.notes_created).toBe(1);
+    expect((await restored.getNote("note1"))!.content.trimEnd()).toBe("hello from note1");
+    expect(await restored.getTagRecord("a")).not.toBeNull();
+    expect(await restored.getTagRecord("b")).not.toBeNull();
+
+    // Exactly one of the two had its parent_names dropped (whichever the
+    // filesystem walk restored SECOND closes the cycle) and is recorded.
+    expect(stats.skipped_schema_parents).toHaveLength(1);
+    const skipped = stats.skipped_schema_parents[0]!;
+    expect(["a", "b"]).toContain(skipped.tag);
+    expect(skipped.reason).toMatch(/cycle/i);
+
+    // The surviving hierarchy is acyclic: at most one of a/b still carries
+    // parent_names (the other was dropped). Never both.
+    const aParents = (await restored.getTagRecord("a"))!.parent_names ?? null;
+    const bParents = (await restored.getTagRecord("b"))!.parent_names ?? null;
+    expect(Boolean(aParents) && Boolean(bParents)).toBe(false);
+  });
+
+  it("blow-away import of a cyclic-schema export leaves the vault populated, NOT empty (vault#552 MUST-FIX 1 — destructive path)", async () => {
+    const outDir = join(tmpBase, "cyclic-blowaway");
+    writeCyclicSchemaExport(outDir);
+
+    // Seed the target with a throwaway note so blow-away has something to
+    // wipe — proving the wipe ran AND that the uncaught-throw regression
+    // (wipe-then-abort → empty vault) is gone.
+    const restored = new SqliteStore(new Database(":memory:"));
+    await restored.createNote("doomed pre-existing note", { id: "old1", path: "old1" });
+
+    const stats = await importPortableVault(restored, { inDir: outDir, blowAway: true });
+
+    expect(stats.notes_wiped).toBe(1); // the pre-existing note was wiped
+    expect(await restored.getNote("old1")).toBeNull(); // gone
+    // Vault is NOT left empty — the fixture note landed despite the cycle.
+    expect((await restored.getNote("note1"))!.content.trimEnd()).toBe("hello from note1");
+    expect(stats.skipped_schema_parents).toHaveLength(1);
+  });
+
+  it("blow-away wipes a parent-before-child hierarchy with NO stale tag rows left (vault#552 MUST-FIX 2)", async () => {
+    // The bug: blow-away's tag sweep called store.deleteTag(tag) with no
+    // flag and ignored the return. listTagRecords is ORDER BY name, so the
+    // namespace parent "task" is visited BEFORE its child "task/work" —
+    // while the child's parent_names still references it — and deleteTag now
+    // RETURNS {error:"tag_referenced_as_parent"} instead of throwing, so the
+    // parent's row silently survived the "clean slate." Fixed by passing
+    // {cascade:true} in the sweep.
+    const target = new SqliteStore(new Database(":memory:"));
+    await target.upsertTagRecord("task", { description: "parent" });
+    await target.upsertTagRecord("task/work", { parent_names: ["task"], description: "child" });
+    await target.createNote("stale note", { id: "stale1", path: "stale1", tags: ["task/work"] });
+
+    // Build a minimal UNRELATED export from a fresh store to replay.
+    const sourceStore = new SqliteStore(new Database(":memory:"));
+    await sourceStore.createNote("fresh body", { id: "fresh1", path: "fresh1", tags: ["fresh"] });
+    const outDir = join(tmpBase, "blowaway-hierarchy-source");
+    await exportVaultToDir(sourceStore, { outDir, exportedAt: "2026-07-09T00:00:00.000Z" });
+
+    await importPortableVault(target, { inDir: outDir, blowAway: true });
+
+    // After a full wipe, NEITHER old hierarchy tag row survives.
+    const remaining = (await target.listTagRecords()).map((t) => t.tag);
+    expect(remaining).not.toContain("task");
+    expect(remaining).not.toContain("task/work");
+    expect(await target.getNote("stale1")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

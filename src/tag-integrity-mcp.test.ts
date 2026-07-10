@@ -242,6 +242,15 @@ describe("parent_cycle — REST PUT /api/tags/:name surfaces the 409 (vault#552)
     expect(body.tag).toBe("b");
     expect(body.cycle).toContain("a");
     expect(body.cycle).toContain("b");
+    // MUST-FIX 5 (wire review): a `message` key is load-bearing — the shared
+    // parachute-surface VaultClient 409 handler reads `body.message` (else it
+    // shows a hardcoded "Note was edited elsewhere"). `error` is the short
+    // code, `message` the human sentence — same split every sibling 409 uses.
+    expect(typeof body.message).toBe("string");
+    expect(body.message.length).toBeGreaterThan(0);
+    expect(body.message).toMatch(/cycle/i);
+    expect(body.error).toBe("ParentCycle");
+    expect(body.error).not.toContain(" "); // short code, not the full sentence
 
     // Nothing persisted.
     expect((await store.getTagRecord("b"))?.parent_names ?? null).toBeFalsy();
@@ -260,6 +269,11 @@ describe("tag_referenced_as_parent — REST DELETE /api/tags/:name surfaces the 
     const refusedBody: any = await refusedRes.json();
     expect(refusedBody.error_type).toBe("tag_referenced_as_parent");
     expect(refusedBody.referencing_tags).toEqual(["child"]);
+    // Same short-code-`error` + human-`message` split as every sibling 409
+    // (wire consistency — parachute-surface reads `body.message`).
+    expect(refusedBody.error).toBe("TagReferencedAsParent");
+    expect(typeof refusedBody.message).toBe("string");
+    expect(refusedBody.message.length).toBeGreaterThan(0);
 
     const cascadedRes = await handleTags(
       new Request("http://localhost/api/tags/root?cascade=true", { method: "DELETE" }),
