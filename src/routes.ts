@@ -11,7 +11,7 @@
  * and the Request, and returns a Response.
  */
 
-import type { Store, Note, QueryOpts } from "../core/src/types.ts";
+import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
   collectUnknownTagWarnings,
@@ -62,6 +62,7 @@ import {
   scrubValidationStatusByScope,
   tagScopeForbidden,
   tagsWithinScope,
+  tagVisibleInScope,
 } from "./tag-scope.ts";
 import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
 import { findTokensReferencingTag } from "./token-store.ts";
@@ -851,6 +852,58 @@ export function parseNotesQueryOpts(url: URL): {
 }
 
 /**
+ * Parse the `?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…`
+ * aggregation params (bracket-style, consistent with `meta[field][op]=`
+ * above) into an `AggregateSpec`. Absent entirely (none of the three keys
+ * present) → `{}` — no aggregate intent, the caller falls through to a
+ * normal query. `group_by` + `op` are required together when ANY of the
+ * three is present; `field` is optional at the parser level (its
+ * requiredness depends on `op`, enforced by `aggregateNotes` itself). Value
+ * validity beyond shape (indexed field, numeric type, sum-requires-field)
+ * is ALSO enforced by `aggregateNotes` — same FIELD_NOT_INDEXED /
+ * INVALID_QUERY contract every other query surface uses.
+ *
+ * Returns `{ aggregate? }` or `{ error }` (a 400 Response) on a malformed
+ * shape (missing `group_by`/`op`, or an unrecognized `op`).
+ */
+function parseAggregateParam(url: URL): { aggregate?: AggregateSpec; error?: Response } {
+  const groupBy = parseQuery(url, "aggregate[group_by]");
+  const op = parseQuery(url, "aggregate[op]");
+  const field = parseQuery(url, "aggregate[field]");
+  if (groupBy === null && op === null && field === null) return {};
+  if (groupBy === null || op === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate requires both aggregate[group_by] and aggregate[op] — group_by is an indexed metadata field or "tag"; op is "count" or "sum".`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate",
+          hint: `pass ?aggregate[group_by]=<field|tag>&aggregate[op]=<count|sum>[&aggregate[field]=<numeric field>]`,
+        },
+        400,
+      ),
+    };
+  }
+  if (op !== "count" && op !== "sum") {
+    return {
+      error: json(
+        {
+          error: `invalid aggregate[op]: "${op}" — must be "count" or "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.op",
+          got: op,
+          hint: `pass "count" or "sum"`,
+        },
+        400,
+      ),
+    };
+  }
+  return { aggregate: { group_by: groupBy, op, field: field ?? undefined } };
+}
+
+/**
  * Parse include_metadata query param.
  * - absent/null → undefined (all metadata, default)
  * - "true"/"1" → true (all metadata)
@@ -1241,6 +1294,87 @@ async function handleNotesInner(
           400,
         );
       }
+
+      // Aggregation / rollup mode (top new-feature ask from a UX round).
+      // Mutually exclusive with cursor/near — a rollup returns one row per
+      // group, not a paginated/graph-scoped note list — so reject those
+      // combos loudly before touching the DB, then short-circuit: none of
+      // the normal-query output machinery below (expand, include_links,
+      // metadata filtering, ...) applies to rollup rows.
+      const aggregateParsed = parseAggregateParam(url);
+      if (aggregateParsed.error) return aggregateParsed.error;
+      if (aggregateParsed.aggregate) {
+        if (cursorMode) {
+          return json(
+            {
+              error: "aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `cursor` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        if (nearNoteIdEarly) {
+          return json(
+            {
+              error: "aggregate is incompatible with near (graph neighborhood).",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `near` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        try {
+          let rows;
+          if (tagScope.raw === null) {
+            rows = await store.aggregateNotes({ ...queryOpts, aggregate: aggregateParsed.aggregate });
+          } else {
+            // Tag-scoped: filter to visible notes FIRST — fetch every note
+            // the OTHER filters match (unpaginated, same `limit: 1000000`
+            // "get everything" convention core's `syncAllWikilinks` uses),
+            // narrow via the SAME `filterNotesByTagScope` every other read
+            // path applies, THEN aggregate over just that visible id set
+            // (reusing the `ids` filter `near` already pushes into SQL).
+            const allMatches = await store.queryNotes({ ...queryOpts, limit: 1000000, offset: 0 });
+            const visible = filterNotesByTagScope(allMatches, tagScope.allowed, tagScope.raw);
+            rows = visible.length === 0
+              ? []
+              : await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
+            // That note-level narrowing isn't sufficient on its own under
+            // `group_by: "tag"`: a note can be in scope via one tag while
+            // ALSO carrying an out-of-scope co-tag, and a tag rollup's
+            // `group` values ARE tag names — the co-tag would otherwise
+            // surface directly as a group. Scrub group NAMES too, mirroring
+            // the MCP wrapper's identical fix (src/mcp-tools.ts).
+            if (aggregateParsed.aggregate.group_by === "tag") {
+              rows = rows.filter(
+                (r: any) => typeof r?.group === "string" && tagVisibleInScope(r.group, tagScope.allowed, tagScope.raw),
+              );
+            }
+          }
+          return json(rows);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              400,
+            );
+          }
+          throw e;
+        }
+      }
+
       // Warnings channel (vault#550). `unknown_tag` stays structured-query
       // only (skipped entirely for a tag-scoped session:
       // `collectUnknownTagWarnings` resolves `did_you_mean` against the

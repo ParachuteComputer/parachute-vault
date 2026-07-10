@@ -253,6 +253,54 @@ export interface QueryOpts {
    * treat the string as opaque.
    */
   cursor?: string;
+  /**
+   * Aggregation / rollup mode (top new-feature ask from a UX round). When
+   * present, `aggregateNotes` applies every OTHER filter on this `QueryOpts`
+   * (tags, metadata, date range, write-attribution, ids, ...) exactly as
+   * `queryNotes` would, then groups the matching notes and returns
+   * `[{group, value}]` instead of note rows. `cursor` / `orderBy` / `sort` /
+   * `limit` / `offset` are ignored in aggregate mode — a rollup returns one
+   * row per group, not a paginated note list.
+   */
+  aggregate?: AggregateSpec;
+}
+
+/**
+ * Aggregation / rollup spec — `QueryOpts.aggregate`. Mirrored by the
+ * `query-notes` MCP tool's `aggregate` param and the REST
+ * `?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…` params.
+ */
+export interface AggregateSpec {
+  /**
+   * What to group by: an indexed metadata field name (declared
+   * `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract
+   * `metadata` operator queries and `order_by` use), or the special value
+   * `"tag"` to group by tag membership. Under `"tag"`, a note carrying N of
+   * the tags in the (filtered) result set contributes to N separate groups
+   * — this is a membership rollup, not a partition.
+   */
+  group_by: string;
+  /** `"count"` — number of matching notes per group. `"sum"` — sum of `field` per group. */
+  op: "count" | "sum";
+  /**
+   * Required when `op` is `"sum"`; ignored for `"count"`. Must be an
+   * indexed metadata field with SQLite storage type `INTEGER` (i.e. declared
+   * `type: "integer"` or `type: "boolean"` — the only indexable numeric
+   * shapes; a plain `type: "number"` field is never indexable, see
+   * `mapFieldType`, and a `TEXT`-backed field can't be summed).
+   */
+  field?: string;
+}
+
+/**
+ * One rollup row from `aggregateNotes`. `group` is the group_by value (the
+ * tag name under `group_by: "tag"`, or the indexed field's stored value) —
+ * `null` collects notes where the group_by field is absent/unset (SQL NULL
+ * groups together, standard GROUP BY behavior). `value` is the count/sum.
+ */
+export interface AggregateRow {
+  group: string | number | boolean | null;
+  value: number;
 }
 
 /**
@@ -375,6 +423,18 @@ export interface Store {
    * agent loop can persist a single watermark and keep polling.
    */
   queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
+  /**
+   * Aggregation / rollup query. Applies every OTHER filter in `opts` (tags,
+   * metadata, date range, write-attribution, `ids`, ...) exactly as
+   * `queryNotes` would, then groups by `opts.aggregate.group_by` ("tag" or
+   * an indexed metadata field) and returns `[{group, value}]` — one row per
+   * group, count or sum per `opts.aggregate.op`. `cursor`/`orderBy`/`sort`/
+   * `limit`/`offset` on `opts` are ignored. Throws `QueryError` (code
+   * `FIELD_NOT_INDEXED`) when `group_by`/`field` isn't a declared indexed
+   * field, or `INVALID_QUERY` for a malformed `aggregate` spec (missing
+   * `field` on a `"sum"`, a non-numeric `field`, ...).
+   */
+  aggregateNotes(opts: QueryOpts): Promise<AggregateRow[]>;
   /**
    * `mode` (vault#551 — literal-by-default): "literal" (default) escapes +
    * phrase-quotes the query so FTS5 punctuation syntax (hyphen = NOT, an

@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Store, Note } from "./types.js";
+import type { Store, Note, QueryOpts } from "./types.js";
 import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
@@ -220,6 +220,19 @@ export interface GenerateMcpToolsOpts {
    * against the full vault exactly as before.
    */
   ifExistsVisible?: (note: Note) => boolean;
+  /**
+   * `aggregateVisibility` is an OPTIONAL per-note visibility predicate for
+   * `query-notes`'s `aggregate` mode. When provided, the aggregate is
+   * computed by first fetching every note the OTHER filters match
+   * (unpaginated), narrowing to the notes the predicate accepts, and THEN
+   * aggregating over just that visible id set — rather than the (faster)
+   * direct SQL GROUP BY the unscoped path takes. This mirrors
+   * `expandVisibility`/`nearTraversable`: core stays scope-unaware, it only
+   * invokes a plain `(note) => boolean` closure the server injects. Omitted
+   * (unscoped / internal callers) → the aggregate runs the fast direct-SQL
+   * path with no extra fetch.
+   */
+  aggregateVisibility?: (note: Note) => boolean;
 }
 
 /**
@@ -246,6 +259,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const expandVisibility = opts?.expandVisibility;
   const nearTraversable = opts?.nearTraversable;
   const ifExistsVisible = opts?.ifExistsVisible;
+  const aggregateVisibility = opts?.aggregateVisibility;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -314,6 +328,9 @@ Response shape (vault#550 — three variants, pick by what you passed):
 - Default (no \`cursor\`, no warnings): a bare array of notes.
 - Cursor mode (\`cursor\` param present — including \`cursor: ""\` to bootstrap): \`{notes: [...], next_cursor}\`. See \`cursor\` below for the bootstrap flow.
 - Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.
+- \`aggregate\` mode: \`[{group, value}]\` — a rollup row per group, NOT notes. See \`aggregate\` below.
+
+\`aggregate\` (group_by + count/sum): pass \`aggregate: {group_by, op, field?}\` to get counts/sums instead of note rows — e.g. "how many notes per status" (\`{group_by: "status", op: "count"}\`) or "total amount per category" (\`{group_by: "category", op: "sum", field: "amount"}\`). Every other filter (\`tag\`, \`metadata\`, date range, ...) narrows the input set FIRST, exactly like a normal query. \`group_by\` is either \"tag\" (group by tag membership) or an indexed metadata field; \`op: "sum"\` additionally requires \`field\` to be an indexed NUMERIC field. Mutually exclusive with \`search\`/\`near\`/\`cursor\`.
 
 \`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.
 
@@ -402,6 +419,16 @@ Response shape (vault#550 — three variants, pick by what you passed):
               to: { type: "string", description: "Exclusive upper bound (ISO date)." },
             },
             description: "Generalized date-range filter. Use this when the date that matters is the *content* date (e.g. an email's received date, a meeting's scheduled date) rather than the vault ingestion time, or when paging by `updated_at` for incremental rebuilds. Mutually exclusive with the top-level `date_from` / `date_to` shorthand.",
+          },
+          aggregate: {
+            type: "object",
+            properties: {
+              group_by: { type: "string", description: "What to group by: an indexed metadata field name (declared `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract as `metadata` operator queries / `order_by`), or the special value \"tag\" to group by tag membership. Under \"tag\", a note carrying N of the tags present in the filtered result set contributes to N separate groups (a membership rollup, not a partition)." },
+              op: { type: "string", enum: ["count", "sum"], description: "\"count\": number of matching notes per group. \"sum\": sum of `field` per group." },
+              field: { type: "string", description: "Required when `op` is \"sum\"; ignored for \"count\". Must be an indexed metadata field with a numeric storage type (declared `type: \"integer\"` or `type: \"boolean\"` — the only indexable numeric shapes; a bare `type: \"number\"` field is never indexed and a TEXT-backed field can't be summed)." },
+            },
+            required: ["group_by", "op"],
+            description: "Aggregation / rollup mode. Every OTHER filter above (tag, metadata, date range, write-attribution, ...) is applied FIRST, exactly as a normal query would; the matching notes are then grouped and the response becomes `[{group, value}]` instead of note rows — one row per group, `value` is the count/sum. A note whose group_by value is absent collects into one `{group: null, value: ...}` row rather than being dropped. Mutually exclusive with `search`, `near`, and `cursor` (a rollup has no pagination/ranking/graph-neighborhood shape). Tag-scoped sessions see the SAME visibility enforcement as every other read — the rollup is computed only over notes the token can see.",
           },
           near: {
             type: "object",
@@ -612,6 +639,89 @@ Response shape (vault#550 — three variants, pick by what you passed):
             );
           }
           expand = params.expand as TagExpandMode;
+        }
+
+        // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
+        // Mutually exclusive with `search`/`near`/`cursor` — a rollup returns
+        // one row per group, not a paginated / graph-scoped / ranked note
+        // list — so reject those combos loudly before touching the DB.
+        if (params.aggregate) {
+          if (params.search) {
+            throw new QueryError(
+              `aggregate is incompatible with full-text search — pick one.`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `search` when using `aggregate`" },
+            );
+          }
+          if (params.near) {
+            throw new QueryError(
+              `aggregate is incompatible with near (graph neighborhood).`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `near` when using `aggregate`" },
+            );
+          }
+          if (typeof params.cursor === "string") {
+            throw new QueryError(
+              `aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `cursor` when using `aggregate`" },
+            );
+          }
+          const aggRaw = params.aggregate as Record<string, unknown>;
+          if (typeof aggRaw !== "object" || aggRaw === null || Array.isArray(aggRaw)) {
+            throw new QueryError(
+              `aggregate must be an object: {group_by, op, field?}`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", got: aggRaw },
+            );
+          }
+          // Shape coercion only — `group_by`/`op`/`field` validity (indexed
+          // field, numeric type, sum requires field, ...) is enforced by
+          // `aggregateNotes` itself, reusing the exact FIELD_NOT_INDEXED /
+          // INVALID_QUERY contract every other query surface uses.
+          const aggregateSpec = {
+            group_by: aggRaw.group_by as string,
+            op: aggRaw.op as "count" | "sum",
+            field: aggRaw.field as string | undefined,
+          };
+          const aggTags = normalizeTags(params.tag);
+          const aggExcludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
+          const aggExcludeTags = normalizeTags(aggExcludeTagsRaw);
+          const aggFilterOpts: QueryOpts = {
+            tags: aggTags,
+            tagMatch: (params.tag_match as "all" | "any") ?? (aggTags && aggTags.length > 1 ? "any" : undefined),
+            expand,
+            excludeTags: aggExcludeTags,
+            hasTags: params.has_tags as boolean | undefined,
+            hasLinks: params.has_links as boolean | undefined,
+            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            path: params.path as string | undefined,
+            pathPrefix: params.path_prefix as string | undefined,
+            extension: params.extension as string | string[] | undefined,
+            metadata: params.metadata as Record<string, unknown> | undefined,
+            createdBy: params.created_by as string | undefined,
+            lastUpdatedBy: params.last_updated_by as string | undefined,
+            createdVia: params.created_via as string | undefined,
+            lastUpdatedVia: params.last_updated_via as string | undefined,
+            dateFrom: params.date_from as string | undefined,
+            dateTo: params.date_to as string | undefined,
+            dateFilter: params.date_filter as
+              | { field?: string; from?: string; to?: string }
+              | undefined,
+          };
+          if (!aggregateVisibility) {
+            return await store.aggregateNotes({ ...aggFilterOpts, aggregate: aggregateSpec });
+          }
+          // Tag-scoped: filter to visible notes FIRST — fetch every note the
+          // OTHER filters match (unpaginated, same `limit: 1000000` "get
+          // everything" convention `syncAllWikilinks` uses), narrow to what
+          // the injected predicate accepts, THEN aggregate over just that id
+          // set (reusing the `ids` semijoin `near` already pushes into SQL).
+          // Core stays scope-unaware — it only invokes the plain closure.
+          const aggAllMatches = await store.queryNotes({ ...aggFilterOpts, limit: 1000000 });
+          const aggVisibleIds = aggAllMatches.filter(aggregateVisibility).map((n) => n.id);
+          if (aggVisibleIds.length === 0) return [];
+          return await store.aggregateNotes({ ids: aggVisibleIds, aggregate: aggregateSpec });
         }
 
         // `search_mode` (vault#551) — validate loudly (same policy as

@@ -28,6 +28,7 @@ import {
   scrubTagFieldViolationsByScope,
   scrubValidationStatusByScope,
   tagsWithinScope,
+  tagVisibleInScope,
 } from "./tag-scope.ts";
 import { TagFieldConflictError, ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
@@ -160,6 +161,19 @@ export function generateScopedMcpTools(
     ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
     : undefined;
 
+  // Tag-scope for `query-notes`'s `aggregate` mode (top new-feature ask
+  // from a UX round): a rollup has no per-note shape to post-filter (the
+  // response is `[{group, value}]`, not notes), so scope has to be applied
+  // BEFORE core aggregates, not after. Same shared `allowedHolder` /
+  // `getAllowed()`-before-`orig()` ordering invariant as `expandVisibility`
+  // above — reads the resolved allowlist safely because the query-notes
+  // wrapper always awaits `getAllowed()` before invoking core's (synchronous
+  // use of this) execute. Unscoped sessions install no predicate → the
+  // aggregate runs core's fast direct-SQL path.
+  const aggregateVisibility = scoped
+    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    : undefined;
+
   // Tag-scope hop-guard for `near[]` (vault#439): a per-note predicate the
   // core BFS consults so it refuses to traverse THROUGH out-of-scope notes —
   // symmetric with find-path. Reads from the SAME shared `allowedHolder` the
@@ -213,11 +227,12 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(
     store,
-    expandVisibility || nearTraversable || ifExistsVisible || writeContext || strictBypass
+    expandVisibility || nearTraversable || ifExistsVisible || aggregateVisibility || writeContext || strictBypass
       ? {
           ...(expandVisibility ? { expandVisibility } : {}),
           ...(nearTraversable ? { nearTraversable } : {}),
           ...(ifExistsVisible ? { ifExistsVisible } : {}),
+          ...(aggregateVisibility ? { aggregateVisibility } : {}),
           ...(writeContext ? { writeContext } : {}),
           ...(strictBypass ? { strictBypass } : {}),
           ...(onStrictBypass ? { onStrictBypass } : {}),
@@ -369,6 +384,29 @@ function applyTagScopeWrappers(
     const allowed = await getAllowed();
     const result = await orig(params);
     if (!allowed) return result;
+    // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`
+    // to post-filter (and `noteWithinTagScope` would wrongly drop every
+    // row, since an absent `.tags` reads as "out of scope"). WHICH NOTES
+    // count was already narrowed INSIDE core via the `aggregateVisibility`
+    // predicate (see `generateScopedMcpTools`): fetch the full filtered
+    // set, keep only allowlisted notes, THEN aggregate.
+    //
+    // That note-level narrowing is NOT sufficient on its own under
+    // `group_by: "tag"`, though: a note can be in scope via one tag while
+    // ALSO carrying an out-of-scope co-tag (the same class of leak
+    // `scrubValidationStatusByScope` closes for `validation_status`), and a
+    // tag rollup's `group` values ARE tag names — the co-tag would surface
+    // directly as a group. Scrub group NAMES here, the same way every other
+    // tag-shaped output on this wrapper is scrubbed.
+    if ((params as any).aggregate) {
+      const groupBy = (params as any).aggregate?.group_by;
+      if (groupBy === "tag" && Array.isArray(result)) {
+        return result.filter(
+          (r: any) => typeof r?.group === "string" && tagVisibleInScope(r.group, allowed, rawTags),
+        );
+      }
+      return result;
+    }
     // Possible response shapes (vault#550 added the `warnings` variants):
     //   - Array (legacy list, no cursor, no warnings)
     //   - `{notes, next_cursor}` (cursor mode, vault#313)
