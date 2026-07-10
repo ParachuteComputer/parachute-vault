@@ -8,7 +8,7 @@ import { traverseLinks } from "./links.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import { resolveLinkTarget } from "./wikilinks.js";
 import { generateUlid, ULID_REGEX } from "./ulid.js";
-import { getVaultMap } from "./notes.js";
+import { getVaultMap, extractH1Title, findNotesByTitle, getNoteByTitle } from "./notes.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -461,6 +461,66 @@ describe("notes.extension (vault#328)", async () => {
   it("getNoteByPath returns null for unknown path (vault#330 S1 back-compat)", async () => {
     const note = await store.getNoteByPath("DoesNotExist");
     expect(note).toBeNull();
+  });
+});
+
+// ---- Title fallback (extractH1Title / findNotesByTitle / getNoteByTitle) ----
+
+describe("extractH1Title", () => {
+  it("extracts the first level-1 heading", () => {
+    expect(extractH1Title("# My Title\n\nBody text.")).toBe("My Title");
+  });
+
+  it("finds the H1 even when it isn't the first line", () => {
+    expect(extractH1Title("---\nid: x\n---\n\n# My Title\n\nBody.")).toBe("My Title");
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(extractH1Title("#   Spaced Out   \nBody.")).toBe("Spaced Out");
+  });
+
+  it("does not match a level-2+ heading", () => {
+    expect(extractH1Title("## Not H1\n\nBody.")).toBeNull();
+  });
+
+  it("returns null when there is no heading", () => {
+    expect(extractH1Title("Just a paragraph, no heading.")).toBeNull();
+  });
+
+  it("returns null when the heading marker has no space", () => {
+    expect(extractH1Title("#NoSpace\n\nBody.")).toBeNull();
+  });
+
+  it("returns null for a blank heading", () => {
+    expect(extractH1Title("#   \nBody.")).toBeNull();
+  });
+});
+
+describe("findNotesByTitle / getNoteByTitle", async () => {
+  it("finds a single note by its H1 title", async () => {
+    const note = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/a1" });
+    const matches = findNotesByTitle(db, "Weekly Review");
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.id).toBe(note.id);
+
+    const found = getNoteByTitle(db, "Weekly Review");
+    expect(found?.id).toBe(note.id);
+  });
+
+  it("matches case-insensitively", async () => {
+    const note = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/a2" });
+    expect(getNoteByTitle(db, "weekly review")?.id).toBe(note.id);
+  });
+
+  it("returns no match (not throw) when 2+ notes share a title — ambiguous", async () => {
+    await store.createNote("# Shared\n\nA.", { path: "Inbox/b1" });
+    await store.createNote("# Shared\n\nB.", { path: "Inbox/b2" });
+    expect(findNotesByTitle(db, "Shared")).toHaveLength(2);
+    expect(getNoteByTitle(db, "Shared")).toBeNull();
+  });
+
+  it("returns null for an unknown title", async () => {
+    expect(getNoteByTitle(db, "Nothing Like This")).toBeNull();
   });
 });
 
@@ -3562,6 +3622,36 @@ describe("MCP tools", async () => {
     const query = tools.find((t) => t.name === "query-notes")!;
     const result = await query.execute({ id: "Projects/README" }) as any;
     expect(result.content).toBe("By Path");
+  });
+
+  // ---- Title-fallback id resolution (additive — vault "title-fallback link + id resolution") ----
+
+  it("query-notes single note by H1 title when id AND path both miss", async () => {
+    await store.createNote("# My Great Note\n\nBody.", { path: "Inbox/2026-07-10-xyz" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "My Great Note" }) as any;
+    expect(result.content).toBe("# My Great Note\n\nBody.");
+    expect(result.path).toBe("Inbox/2026-07-10-xyz");
+  });
+
+  it("query-notes exact path still wins over a same-named title on another note", async () => {
+    const byPath = await store.createNote("Path note", { path: "My Great Note" });
+    await store.createNote("# My Great Note\n\nOther body.", { path: "Inbox/other" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "My Great Note" }) as any;
+    expect(result.id).toBe(byPath.id);
+    expect(result.content).toBe("Path note");
+  });
+
+  it("query-notes stays unresolved (not_found) when 2+ notes share the same H1 title", async () => {
+    await store.createNote("# Dup Note\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Note\n\nB.", { path: "Inbox/dup-b" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "Dup Note" }) as any;
+    expect(result.error_type).toBe("not_found");
   });
 
   it("query-notes by tag", async () => {

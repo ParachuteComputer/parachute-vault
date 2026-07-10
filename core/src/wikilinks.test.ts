@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { parseWikilinks, syncWikilinks, resolveWikilink, resolveUnresolvedWikilinks, listUnresolvedWikilinks } from "./wikilinks.js";
+import { parseWikilinks, syncWikilinks, resolveWikilink, resolveWikilinkDetailed, resolveUnresolvedWikilinks, listUnresolvedWikilinks } from "./wikilinks.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -143,6 +143,81 @@ describe("resolveWikilink", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Title fallback (additive — id/path/basename still win first)
+// ---------------------------------------------------------------------------
+
+describe("resolveWikilink — title fallback", async () => {
+  it("resolves via H1 title when path/basename both miss", async () => {
+    const note = await store.createNote("# My Real Title\n\nSome body text.", { path: "Inbox/2026-07-10-abc123" });
+    const id = resolveWikilink(db, "My Real Title");
+    expect(id).toBe(note.id);
+  });
+
+  it("matches the H1 title case-insensitively", async () => {
+    const note = await store.createNote("# My Real Title\n\nBody.", { path: "Inbox/xyz" });
+    const id = resolveWikilink(db, "my real title");
+    expect(id).toBe(note.id);
+  });
+
+  it("exact path match wins over a title match on a DIFFERENT note", async () => {
+    // A note literally path-named "My Real Title" ...
+    const byPath = await store.createNote("Path note body", { path: "My Real Title" });
+    // ... and an unrelated note whose H1 happens to be the same string.
+    await store.createNote("# My Real Title\n\nOther body.", { path: "Inbox/other" });
+    const id = resolveWikilink(db, "My Real Title");
+    expect(id).toBe(byPath.id);
+  });
+
+  it("basename match wins over title fallback", async () => {
+    const byBasename = await store.createNote("Body", { path: "Projects/Parachute/README" });
+    await store.createNote("# README\n\nOther body.", { path: "Inbox/other-readme" });
+    const id = resolveWikilink(db, "README");
+    expect(id).toBe(byBasename.id);
+  });
+
+  it("stays unresolved when two notes share the same H1 title (ambiguous)", async () => {
+    await store.createNote("# Shared Title\n\nA.", { path: "Inbox/a" });
+    await store.createNote("# Shared Title\n\nB.", { path: "Inbox/b" });
+    const id = resolveWikilink(db, "Shared Title");
+    expect(id).toBeNull();
+  });
+
+  it("does not fall through to title when basename is itself ambiguous", async () => {
+    // Two notes share basename "README" (ambiguous at step 3) AND a third
+    // note has an H1 title of "README" too — the ambiguous basename step
+    // must not be rescued by the title step.
+    await store.createNote("A", { path: "Folder1/README" });
+    await store.createNote("B", { path: "Folder2/README" });
+    await store.createNote("# README\n\nC.", { path: "Inbox/c" });
+    const id = resolveWikilink(db, "README");
+    expect(id).toBeNull();
+  });
+
+  it("ignores H2+ headings — only a literal single-# line counts", async () => {
+    await store.createNote("## Not An H1\n\nBody.", { path: "Inbox/h2" });
+    const id = resolveWikilink(db, "Not An H1");
+    expect(id).toBeNull();
+  });
+
+  it("resolveWikilinkDetailed reports the title match as resolved", async () => {
+    const note = await store.createNote("# Detailed Title\n\nBody.", { path: "Inbox/detail" });
+    const result = resolveWikilinkDetailed(db, "Detailed Title");
+    expect(result.resolved).toBe(true);
+    expect(result.note_id).toBe(note.id);
+    expect(result.path).toBe("Inbox/detail");
+  });
+
+  it("resolveWikilinkDetailed reports an ambiguous title match", async () => {
+    await store.createNote("# Dup Title\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Title\n\nB.", { path: "Inbox/dup-b" });
+    const result = resolveWikilinkDetailed(db, "Dup Title");
+    expect(result.resolved).toBe(false);
+    expect(result.ambiguous).toBe(true);
+    expect(result.candidates).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
@@ -150,6 +225,16 @@ describe("syncWikilinks", async () => {
   it("creates links for resolved wikilinks", async () => {
     const target = await store.createNote("Target", { path: "Target Note" });
     const source = await store.createNote("See [[Target Note]]");
+
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0].targetId).toBe(target.id);
+    expect(links[0].relationship).toBe("wikilink");
+  });
+
+  it("creates a link via the title fallback when path/basename miss", async () => {
+    const target = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/2026-07-10-abc123" });
+    const source = await store.createNote("See [[Weekly Review]]");
 
     const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);

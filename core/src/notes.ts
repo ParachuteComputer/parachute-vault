@@ -187,6 +187,66 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
   );
 }
 
+/**
+ * Extract a note's "H1 title" — the first line in `content` that starts
+ * with a literal `"# "` (a level-1 Markdown heading; `"## "`+ don't match
+ * because `^#[ \t]` fails at that line's start once a second `#` follows
+ * the first). Returns null when no such line exists, or the text after
+ * the marker is blank once trimmed.
+ */
+export function extractH1Title(content: string): string | null {
+  const match = content.match(/^#[ \t]+(.+)$/m);
+  if (!match) return null;
+  const title = match[1]!.trim();
+  return title.length > 0 ? title : null;
+}
+
+/**
+ * Find every note whose H1 title (see {@link extractH1Title}) equals
+ * `title`, case-insensitively (matches the COLLATE NOCASE policy every
+ * other path/basename lookup in this file uses). Used as the title-fallback
+ * step for wikilink/id/path resolution — a target that misses on
+ * id/path/basename gets one more chance against notes whose displayed
+ * title differs from their path.
+ *
+ * This is a full-content scan: no index exists on "first heading line," so
+ * every note's content is read once and matched in JS. Acceptable because
+ * every call site reaches this ONLY after the cheap indexed lookups (id,
+ * path, basename) have already missed — a rare fallback path, not the hot
+ * resolution route.
+ */
+export function findNotesByTitle(db: Database, title: string): { id: string; path: string | null }[] {
+  const needle = title.trim().toLowerCase();
+  if (!needle) return [];
+  const rows = db.prepare("SELECT id, path, content FROM notes").all() as {
+    id: string;
+    path: string | null;
+    content: string;
+  }[];
+  const matches: { id: string; path: string | null }[] = [];
+  for (const row of rows) {
+    const h1 = extractH1Title(row.content);
+    if (h1 && h1.toLowerCase() === needle) {
+      matches.push({ id: row.id, path: row.path });
+    }
+  }
+  return matches;
+}
+
+/**
+ * Title-fallback lookup: resolve `title` to a note ONLY when exactly one
+ * note in the vault carries that H1 title (see {@link findNotesByTitle}).
+ * Zero matches or 2+ matches (ambiguous) both return null — "don't guess"
+ * mirrors the existing basename-ambiguity policy (vault#328). Callers use
+ * this as the LAST resort after id and path/basename resolution have
+ * already missed; exact id/path matches always win first.
+ */
+export function getNoteByTitle(db: Database, title: string): Note | null {
+  const matches = findNotesByTitle(db, title);
+  if (matches.length !== 1) return null;
+  return getNote(db, matches[0]!.id);
+}
+
 export function getNotes(db: Database, ids: string[]): Note[] {
   if (ids.length === 0) return [];
   // Dedupe before chunking: a duplicate id straddling two chunk boundaries

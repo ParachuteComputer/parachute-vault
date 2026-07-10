@@ -1168,13 +1168,23 @@ Error shapes:
 - `400 invalid_extension` — extension validation failed (vault#328); body
   carries `extension`, `reason`.
 
-**Structured `links` resolution (vault#555).** A `links` entry's `target`
-resolves with the SAME semantics as a `[[wikilink]]` — ID match first, then
-exact path, then basename/title (e.g. `target: "Alice"` resolves a note
-filed at `People/Alice`) — NOT path-only as before. The `relationship` you
-pass is preserved verbatim (wikilinks always use `"wikilink"`; a structured
-link carries whatever you named). Two forward-ref cases are handled without
-dropping the edge:
+**Structured `links` resolution (vault#555, title-fallback additive).** A
+`links` entry's `target` resolves with the SAME semantics as a `[[wikilink]]`
+— ID match first, then exact path, then basename (e.g. `target: "Alice"`
+resolves a note filed at `People/Alice`), then — only on a CLEAN miss (zero
+candidates, not an ambiguous one) — a fallback match against the note whose
+H1 title (its first `# Heading` content line) equals `target`,
+case-insensitively. The title fallback resolves ONLY when exactly one note
+in the vault carries that title; two-or-more stays unresolved rather than
+guessing (same "don't guess" policy the basename step already has). This
+rescues a link into a note whose displayed title differs from its
+path/basename — e.g. a daily-note-style path (`Inbox/2026-07-10-abc123`)
+whose content opens with `# Weekly Review` is now reachable via
+`target: "Weekly Review"`, not just its path. Exact id/path/basename
+resolution is unchanged and always wins first. This is NOT path-only as
+before. The `relationship` you pass is preserved verbatim (wikilinks always
+use `"wikilink"`; a structured link carries whatever you named). Two
+forward-ref cases are handled without dropping the edge:
 
 - **Same batch.** A `links` entry pointing at a note created LATER in the
   same `notes` array (POST) resolves once every note in the batch exists —
@@ -1261,6 +1271,18 @@ attachment rule as the structured-query list below.
 > path must be percent-encoded as `%2F` (e.g.
 > `GET .../api/notes/Projects%2FFoo`) so it isn't parsed as a route separator.
 > The same applies to path-valued query params like `?path=Projects%2FFoo`.
+
+> **Title fallback (additive).** `{idOrPath}` resolution order is: exact ID,
+> then exact path (or `path.ext` to disambiguate a path shared by two
+> extensions — see `ambiguous_path` below), then — only when id and path
+> BOTH miss cleanly — a fallback match against the note whose H1 title (its
+> first `# Heading` content line) equals `{idOrPath}`, case-insensitively.
+> Resolves only when exactly one note carries that title; two-or-more stays
+> a `404 not_found` rather than guessing. Exact id/path resolution is
+> unchanged and always wins first — this only rescues the case where a
+> note's displayed title differs from its path/basename (the same
+> resolution `find-path`'s `source`/`target`, `update-note`/`delete-note`
+> `id`, and `[[wikilink]]`/structured-`links` targets already use).
 
 Folding options:
 
