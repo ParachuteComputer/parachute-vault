@@ -131,7 +131,9 @@ function resolveVaultCoordinates(): { hubOrigin: string; hubOriginKnown: boolean
  * `auth` is the resolved token for the caller and is captured by vault-info's
  * execute closure so the description-update branch can perform a secondary
  * scope check: the tool itself is gated at vault:read (so read-only callers
- * can fetch stats), but writing a new description requires vault:write.
+ * can fetch stats), but writing a new description requires vault:admin
+ * (tightened from vault:write by the write/admin re-tier — description is
+ * vault curation, not content).
  *
  * When omitted (internal callers that only inspect the tool list — no execute
  * path exercised), the description-update branch is disabled entirely.
@@ -301,9 +303,11 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
  *   - vault-info:  filter projection.tags + projection.indexed_fields
  *                  to entries an in-scope tag contributes to
  *
- * Write-tool gating happens in handleScopedMcp at the verb-scope layer
- * AND inside each tool's wrapper here (so a tag-scoped `vault:write`
- * token can't write outside its allowlist). See applyTagScopeWriteGuards.
+ * Mutating-tool gating happens in handleScopedMcp at the verb-scope layer
+ * (`vault:write` for create/update/delete-note, `vault:admin` for the
+ * tag-schema/taxonomy tools since the write/admin re-tier) AND inside each
+ * tool's wrapper here, so a tag-scoped token — whatever verb it holds —
+ * can't mutate outside its allowlist. See applyTagScopeWriteGuards.
  */
 function applyTagScopeWrappers(
   tools: McpToolDef[],
@@ -487,11 +491,13 @@ function applyTagScopeWrappers(
 
   // ---- Write-side guards ----
   //
-  // The verb-scope check (`vault:write`) is enforced at the dispatch layer
-  // in handleScopedMcp. These wrappers add the second axis: a scoped
-  // `vault:write` token can only mutate within its tag-allowlist, never
-  // outside it. Tag operations (`update-tag`, `delete-tag`) gate on the
-  // tag name itself; note operations gate on the prospective tag set.
+  // The verb-scope check (`vault:write` for note ops, `vault:admin` for the
+  // tag-schema/taxonomy ops post-re-tier) is enforced at the dispatch layer
+  // in handleScopedMcp. These wrappers add the second axis: a scoped token
+  // can only mutate within its tag-allowlist, never outside it. Tag
+  // operations (`update-tag`, `delete-tag`, `rename-tag`, `merge-tags`) gate
+  // on the tag name(s) themselves; note operations gate on the prospective
+  // tag set.
 
   const forbidden = (msg: string): unknown => ({
     error: "Forbidden",
@@ -709,13 +715,15 @@ function overrideVaultInfo(
 
     if (params.description !== undefined) {
       // Secondary scope check: vault-info is read-gated so read-only callers
-      // can fetch stats, but mutating the vault description requires write
-      // for THIS vault. Without this, a vault:read token could bypass the
-      // outer gate by passing `description` to a tool the outer gate
-      // considers read-only.
-      if (!auth || !hasScopeForVault(auth.scopes, vaultName, "write")) {
+      // can fetch stats, but mutating the vault description requires admin
+      // for THIS vault (was `write` — tightened by the write/admin re-tier:
+      // writing the vault's own description/config is curation, same class
+      // as update-tag et al, not content authorship). Without this, a
+      // vault:read OR vault:write token could bypass the outer gate by
+      // passing `description` to a tool the outer gate considers read-only.
+      if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
-          `Forbidden: updating the vault description requires the 'vault:write' scope (or 'vault:${vaultName}:write'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
+          `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
         );
       }
       config.description = params.description as string;

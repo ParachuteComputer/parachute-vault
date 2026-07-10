@@ -1991,7 +1991,27 @@ tokens keep the path-only behavior.
 `GET|POST /vault/{name}/mcp[/*]` — Streaming HTTP transport. Auth is by
 the same credentials as REST (Bearer / X-API-Key). Per-tool scope is
 enforced inside the MCP layer; the same `vault:read` / `vault:write` /
-`vault:admin` shape applies. See `core/src/mcp.ts` for the tool surface.
+`vault:admin` shape applies. `requiredVerb` on each tool in
+`core/src/mcp.ts` is the source of truth; as of this PR the tiers are:
+
+| Verb | Tools |
+|---|---|
+| `read` | `query-notes`, `list-tags`, `find-path`, `vault-info` (get/stats), `doctor` |
+| `write` (additive over read) | `create-note`, `update-note`, `delete-note` |
+| `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
+
+**BREAKING (this PR):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
+moved `write` → `admin` (schema/taxonomy curation is a distinct tier from
+content authorship); `vault-info`'s description-update branch moved
+`write` → `admin` for the same reason. `doctor` moved `admin` → `read` (it's
+a read-only, tag-scope-restricted diagnostic). A token that used to hold
+`vault:write` and rename/merge/delete/update tags now gets
+`insufficient_scope` and needs `vault:admin`; a `vault:read` token can now
+run `doctor`. The REST `GET /vault/{name}/api/doctor` endpoint above is
+**unaffected** — it stays `vault:admin`-gated (a separate enforcement point
+in `src/routing.ts`), so the MCP `doctor` tool and the REST `/api/doctor`
+endpoint now sit at different tiers for the same underlying scan; see
+CHANGELOG.
 
 ## See also
 

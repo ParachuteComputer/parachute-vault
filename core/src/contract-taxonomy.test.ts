@@ -115,7 +115,8 @@ describe("contract: taxonomy — #552 (flipped from test.todo)", () => {
     const tools = generateMcpTools(store);
     const renameTag = tools.find((t) => t.name === "rename-tag");
     expect(renameTag).toBeDefined();
-    expect(renameTag!.requiredVerb).toBe("write");
+    // Re-tier: rename-tag is taxonomy curation, not content — write → admin.
+    expect(renameTag!.requiredVerb).toBe("admin");
 
     const result = await renameTag!.execute({ old_name: "proj", new_name: "initiative" }) as any;
     expect("error" in result).toBe(false);
@@ -166,7 +167,8 @@ describe("contract: taxonomy — #552 (flipped from test.todo)", () => {
     const tools = generateMcpTools(store);
     const mergeTags = tools.find((t) => t.name === "merge-tags");
     expect(mergeTags).toBeDefined();
-    expect(mergeTags!.requiredVerb).toBe("write");
+    // Re-tier: merge-tags is taxonomy curation, not content — write → admin.
+    expect(mergeTags!.requiredVerb).toBe("admin");
 
     const result = await mergeTags!.execute({ sources: ["draft", "wip"], target: "active" }) as any;
     expect(result.target).toBe("active");

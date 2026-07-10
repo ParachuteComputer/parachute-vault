@@ -6161,19 +6161,24 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).toContain("list-tags");
     expect(toolNames).toContain("find-path");
     expect(toolNames).toContain("vault-info");
+    // `doctor` moved admin → read (re-tier): a read-only, tag-scope-
+    // restricted diagnostic, visible to a plain vault:read session.
+    expect(toolNames).toContain("doctor");
     // Mutation tools are hidden — filter applied before advertising
     expect(toolNames).not.toContain("create-note");
     expect(toolNames).not.toContain("update-note");
     expect(toolNames).not.toContain("delete-note");
+    // Tag-schema/taxonomy tools moved write → admin (re-tier): hidden from
+    // a vault:read (and, per the next describe block, a plain vault:write)
+    // session — they now need vault:admin.
     expect(toolNames).not.toContain("update-tag");
     expect(toolNames).not.toContain("delete-tag");
     expect(toolNames).not.toContain("rename-tag");
     expect(toolNames).not.toContain("merge-tags");
     // Admin tools (vault#376) are hidden too
     expect(toolNames).not.toContain("manage-token");
-    expect(toolNames).not.toContain("doctor");
-    // Read tier is exactly 4 tools.
-    expect(toolNames.length).toBe(4);
+    // Read tier is exactly 5 tools (doctor added by the re-tier).
+    expect(toolNames.length).toBe(5);
 
     closeAllStores();
   });
@@ -6221,7 +6226,7 @@ describe("stateless MCP transport", async () => {
     // the required scope — the inner guard fired even though the outer tool
     // gate allowed read-only callers through for stats.
     expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("vault:write");
+    expect(body.result.content[0].text).toContain("vault:admin");
 
     // And critically: the vault description must NOT have been mutated.
     const cfg = readVaultConfig(vaultName);
@@ -6230,7 +6235,7 @@ describe("stateless MCP transport", async () => {
     closeAllStores();
   });
 
-  test("tools/call of vault-info with description arg and vault:write scope is allowed", async () => {
+  test("tools/call of vault-info with description arg and vault:write scope is refused (re-tier: description-write now needs admin)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -6269,8 +6274,56 @@ describe("stateless MCP transport", async () => {
 
     expect(res.status).toBe(200);
     const body = await res.json() as any;
+    // Was `isError: false` pre-re-tier — a plain vault:write session could
+    // update the vault's own description. Now needs vault:admin.
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("vault:admin");
+    expect(readVaultConfig(vaultName)?.description).toBe("original");
+
+    closeAllStores();
+  });
+
+  test("tools/call of vault-info with description arg and vault:admin scope is allowed", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-vault-info-admin-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "original",
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "vault-info",
+          arguments: { description: "updated via admin scope" },
+        },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+      scoped_tags: null,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
     expect(body.result.isError).toBeFalsy();
-    expect(readVaultConfig(vaultName)?.description).toBe("updated via write scope");
+    expect(readVaultConfig(vaultName)?.description).toBe("updated via admin scope");
 
     closeAllStores();
   });
@@ -6406,15 +6459,15 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     return names;
   }
 
-  test("vault:read sees exactly the 4 read tools", async () => {
+  test("vault:read sees exactly the 5 read tools (doctor moved admin → read)", async () => {
     const names = await listToolNames(["vault:read"]);
     expect(new Set(names)).toEqual(
-      new Set(["query-notes", "list-tags", "find-path", "vault-info"]),
+      new Set(["query-notes", "list-tags", "find-path", "vault-info", "doctor"]),
     );
-    expect(names.length).toBe(4);
+    expect(names.length).toBe(5);
   });
 
-  test("vault:read + vault:write sees the 11 read+write tools", async () => {
+  test("vault:read + vault:write sees the 8 read+write tools (tag-schema tools moved write → admin)", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(new Set(names)).toEqual(
       new Set([
@@ -6422,30 +6475,31 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
         "list-tags",
         "find-path",
         "vault-info",
+        "doctor",
         "create-note",
         "update-note",
         "delete-note",
-        "update-tag",
-        "delete-tag",
-        // vault#552: MCP parity with the pre-existing REST rename/merge engine.
-        "rename-tag",
-        "merge-tags",
       ]),
     );
-    expect(names.length).toBe(11);
+    expect(names.length).toBe(8);
     expect(names).not.toContain("manage-token");
-    expect(names).not.toContain("doctor");
-    // Aaron 2026-05-27: delete-* are write-tier (same destructive verb as
-    // update). Only manage-token/prune-schema/doctor are admin-gated.
+    // Re-tier (this PR): update-tag/delete-tag/rename-tag/merge-tags are now
+    // admin-tier — structure/taxonomy curation, not content authorship.
+    // Only delete-note (content) stays write-tier.
+    expect(names).not.toContain("update-tag");
+    expect(names).not.toContain("delete-tag");
+    expect(names).not.toContain("rename-tag");
+    expect(names).not.toContain("merge-tags");
     expect(names).toContain("delete-note");
-    expect(names).toContain("delete-tag");
   });
 
-  test("vault:admin sees all 14 tools including manage-token + prune-schema + doctor", async () => {
+  test("vault:admin sees all 14 tools including manage-token + prune-schema + the tag-schema tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
     expect(names).toContain("doctor");
+    expect(names).toContain("update-tag");
+    expect(names).toContain("delete-tag");
     expect(names).toContain("rename-tag");
     expect(names).toContain("merge-tags");
     expect(names.length).toBe(14);
@@ -6531,6 +6585,144 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(body.result.content[0].text).toContain("Unknown tool");
     expect(body.result.content[0].text).toContain("manage-token");
     expect(body.result.content[0].text).not.toContain("vault:admin");
+    closeAllStores();
+  });
+});
+
+// ===========================================================================
+// Write/admin re-tier — schema/taxonomy-curation tools moved write → admin,
+// doctor moved admin → read. Content-authorship (write) is now separate from
+// structure/taxonomy/schema-curation (admin). No new scope — same
+// read/write/admin vocabulary, only which tier each tool requires moves.
+// ===========================================================================
+
+describe("MCP write/admin re-tier — scope enforcement at the tools/call layer", () => {
+  async function callTool(
+    vaultName: string,
+    scopes: string[],
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<any> {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: scopes.includes("vault:write") || scopes.includes("vault:admin") ? "full" : "read",
+      scopes,
+      legacyDerived: false,
+      scoped_tags: null,
+    } as any);
+    return res.json();
+  }
+
+  test("vault:write CAN create-note but is DENIED rename-tag/merge-tags/delete-tag/update-tag (now admin-tier)", async () => {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-write-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("seed", { tags: ["mine"] });
+
+    const WRITE = ["vault:read", "vault:write"];
+
+    // Allowed: content authorship.
+    const create = await callTool(vaultName, WRITE, "create-note", { content: "hello", tags: ["mine"] });
+    expect(create.result?.isError).toBeFalsy();
+
+    // Denied: each now requires vault:admin, not vault:write.
+    const rename = await callTool(vaultName, WRITE, "rename-tag", { old_name: "mine", new_name: "mine2" });
+    expect(rename.result?.isError).toBe(true);
+    expect(rename.result.content[0].text).toContain("Unknown tool");
+
+    const merge = await callTool(vaultName, WRITE, "merge-tags", { sources: ["mine"], target: "mine2" });
+    expect(merge.result?.isError).toBe(true);
+    expect(merge.result.content[0].text).toContain("Unknown tool");
+
+    const del = await callTool(vaultName, WRITE, "delete-tag", { tag: "mine" });
+    expect(del.result?.isError).toBe(true);
+    expect(del.result.content[0].text).toContain("Unknown tool");
+
+    const upd = await callTool(vaultName, WRITE, "update-tag", { tag: "mine", description: "hijacked" });
+    expect(upd.result?.isError).toBe(true);
+    expect(upd.result.content[0].text).toContain("Unknown tool");
+
+    // Untouched — the denied calls above never reached core. "mine" already
+    // has a bare identity row (auto-inserted when the seed note was tagged),
+    // but its description is still unset — update-tag never ran.
+    expect((await store.getTagRecord("mine"))?.description ?? null).toBeNull();
+    const stillThere = await store.listTags();
+    expect(stillThere.some((t) => t.name === "mine")).toBe(true);
+
+    closeAllStores();
+  });
+
+  test("vault:read CAN run doctor (now read-tier)", async () => {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-read-doctor-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const result = await callTool(vaultName, ["vault:read"], "doctor", {});
+    expect(result.result?.isError).toBeFalsy();
+    const report = JSON.parse(result.result.content[0].text);
+    expect(report.findings).toBeDefined();
+    expect(report.summary).toBeDefined();
+
+    closeAllStores();
+  });
+
+  test("vault:write is DENIED the vault-info description write (now admin-tier)", async () => {
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-write-vaultinfo-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString(), description: "orig" });
+
+    const result = await callTool(vaultName, ["vault:read", "vault:write"], "vault-info", { description: "nope" });
+    expect(result.result?.isError).toBe(true);
+    expect(result.result.content[0].text).toContain("vault:admin");
+    expect(readVaultConfig(vaultName)?.description).toBe("orig");
+
+    closeAllStores();
+  });
+
+  test("vault:admin CAN do all of the above — create-note, rename/merge/delete/update-tag, doctor, and the vault-info description write", async () => {
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-admin-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString(), description: "orig" });
+    const store = getVaultStore(vaultName);
+    await store.upsertTagRecord("a", {});
+    await store.upsertTagRecord("b", {});
+    await store.createNote("seed", { tags: ["a"] });
+
+    const ADMIN = ["vault:read", "vault:write", "vault:admin"];
+
+    const create = await callTool(vaultName, ADMIN, "create-note", { content: "hello", tags: ["a"] });
+    expect(create.result?.isError).toBeFalsy();
+
+    const upd = await callTool(vaultName, ADMIN, "update-tag", { tag: "a", description: "updated" });
+    expect(upd.result?.isError).toBeFalsy();
+
+    const doctor = await callTool(vaultName, ADMIN, "doctor", {});
+    expect(doctor.result?.isError).toBeFalsy();
+
+    const vinfo = await callTool(vaultName, ADMIN, "vault-info", { description: "updated via admin" });
+    expect(vinfo.result?.isError).toBeFalsy();
+    expect(readVaultConfig(vaultName)?.description).toBe("updated via admin");
+
+    const merge = await callTool(vaultName, ADMIN, "merge-tags", { sources: ["b"], target: "a" });
+    expect(merge.result?.isError).toBeFalsy();
+
+    const del = await callTool(vaultName, ADMIN, "delete-tag", { tag: "a" });
+    expect(del.result?.isError).toBeFalsy();
+
     closeAllStores();
   });
 });
