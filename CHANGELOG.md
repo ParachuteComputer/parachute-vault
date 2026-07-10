@@ -34,6 +34,135 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.0] - 2026-07-10
+
+The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the
+**Reliability & Usability Program** (umbrella #556, issues #550–#555). Origin:
+a 2026-07-09 nine-persona deep test (9 sandboxed agents, 8 fresh vaults, ~230
+notes, every claim independently reproduced against the REST API). Verdict:
+the storage/concurrency core was already trustworthy — zero server errors,
+zero corruption, zero lost writes — while the failure modes concentrated at
+the query/taxonomy/error boundaries. Ten waves (rc.1 tests-first, rc.2–rc.9
+fixes) closed every finding; a second interim persona-harness round against
+the live rc.7 build (rc.8) and an ergonomics/contract-truth pass (rc.9) round
+out the train. This entry summarizes by theme; full per-fix detail (code
+paths, review folds, exact test counts) lives in the `rc.1`–`rc.9` entries
+below — nothing here supersedes them.
+
+### Added
+
+- **Honest query boundary (#550).** A `warnings` channel on `query-notes` /
+  `GET /notes` (`unknown_tag` + `did_you_mean`, `removed_param`,
+  `empty_search`, `search_did_you_mean`, `ignored_param`, `warnings_truncated`)
+  surfaced via REST envelope/`X-Parachute-Warnings` header and MCP's wrapped
+  response; structured `invalid_query` errors for bad `limit`/`offset`/date
+  filters; cursor bootstrap on an empty-string `cursor` (was previously
+  unreachable); `expanded_count` on `list-tags`; `find-path` `nodes`/`edges`
+  hydration.
+- **Taxonomy integrity (#552).** `rename-tag`/`merge-tags` exposed as MCP
+  tools (REST parity); `delete-tag` referential-integrity guard
+  (`tag_referenced_as_parent`, with `cascade`/`detach` opt-outs); a
+  write-time parent-cycle guard (`parent_cycle`) on `update-tag`; a new
+  read-only `vault doctor` scan (MCP tool + `GET /api/doctor`) reporting
+  dangling parent references, hierarchy cycles, mixed-type indexed fields,
+  orphaned indexed-field declarers, and heuristic dead tag-metadata
+  references.
+- **Structured error taxonomy (#554).** `error_type` added to ~60 previously
+  bare REST error bodies (404s, 405s, malformed JSON, content-edit branch,
+  query/cursor/tag validation, and more); full MCP domain-error mapping so
+  only genuinely-unknown errors fall through to the unstructured text
+  fallback; `update-tag` now collects and reports every invalid field in one
+  call instead of failing fast on the first; batch `update-note` honors a
+  top-level `force`/`if_updated_at` as a per-item default.
+- **Typed indexes (#553).** `migrateToV24` (schema v23→24) losslessly coerces
+  existing typed-index poison (a clean numeric string → its number, `"true"`/
+  `"false"` → the boolean, etc.) and leaves genuinely non-coercible values in
+  place for `doctor` to surface — never deletes or nulls note data.
+- **Search recall + ranking (#551).** `migrateToV25` (schema v24→25) rebuilds
+  `notes_fts` to index `path` (title) alongside `content`, adds Porter
+  stemming, and repopulates from every existing note — all inside one
+  transaction (crash-safe, idempotent). bm25 title-weighted `score` on every
+  search result; `search_did_you_mean` on a zero-result search.
+- **Ergonomics (#555).** `create-note`/`POST /notes` gains `if_exists:
+  "error"|"ignore"|"update"|"replace"` for idempotent upsert-on-path-conflict
+  (race-closed, not just sequential-safe); `has_broken_links`/
+  `include_broken_links` surface dangling wikilink/structured-link targets
+  via the `unresolved_wikilinks` table; batch `create-note`/`POST /notes`
+  gains a compact `summary: true` response shape; structured `links` now
+  resolve exactly like `[[wikilinks]]` (basename/title match + lazy
+  forward-ref queueing, same-batch forward-refs included).
+- **Contract test suite (rc.1).** Six new test files encode every
+  nine-persona finding as an executable contract before any production code
+  changed — correct-today behavior locked in as a passing test, broken
+  behavior as a `test.todo` naming the tracking issue. All flipped to real
+  assertions across rc.2–rc.9.
+
+### Changed
+
+- `updated_at` now bumps on every real mutation, including tags-only /
+  links-only `update-note`/`PATCH` calls (previously left frozen when the
+  content/metadata `updates` object was empty), `renameTag`'s inline
+  content/path rewrites, and `if_exists:"update"` with only tags/links
+  changed — closes a class of cursor-polling / `updated_at`-sync gaps.
+  `validation_status` now surfaces on reads (`query-notes`, `GET /notes`),
+  not just writes.
+- MCP tool descriptions (all 13 core-generated tools + `manage-token`) and
+  the corresponding `docs/HTTP_API.md` REST sections audited line-by-line
+  against actual behavior; several description-only drifts fixed (no
+  behavior changes) — see the rc.9 entry for the full list.
+- `docs/HTTP_API.md` gained a "Guarantees" section documenting verified
+  strong contracts (commit-order under concurrent writers, compare-and-set
+  `state_transition`, RFC 7386 metadata merge, never-silent-overwrite create
+  races).
+
+### Breaking
+
+- **Search is literal-by-default (#551, rc.3).** `search=` no longer parses
+  as raw FTS5 syntax — ordinary punctuation (`didn't`, `18.6`, a bare
+  hyphen) now matches as content instead of being misparsed as query syntax.
+  A caller relying on raw FTS5 syntax (manual phrase quoting for adjacency,
+  boolean operators, prefix `*`) must add `search_mode: "advanced"` to keep
+  that exact behavior.
+- **Indexed fields reject type-mismatched writes (#553, rc.6).** A write
+  whose value's type contradicts an `indexed: true` field's declared type is
+  now rejected outright (`422 schema_validation`), independent of the
+  field's own `strict` flag — previously only an advisory `type_mismatch`
+  warning, and the poisoned value could silently corrupt range queries via
+  SQLite's type-affinity sort order. `migrateToV24` (below) cleans up
+  existing poison on upgrade.
+- **Enum/default backfill is explicit-`default:`-only (#553, rc.6).** The
+  old implicit "first enum value / type zero-value" backfill on schema
+  application is retired. Only a declared `fields.<field>.default` backfills
+  an unset field now — so `metadata: { field: { exists: false } }` is
+  finally trustworthy ("never set" vs. "explicitly set to the default" are
+  now distinguishable). Future writes only; notes already backfilled under
+  the old behavior keep their values.
+- **`PUT /api/tags/:name` single-bad-default now 422, was 400 (#553/#555,
+  rc.8).** A single invalid `default:` used to fail fast with `400
+  invalid_field_default`, silently dropping any other violation in the same
+  call. It's now bundled into the collect-all `422 tag_field_conflict`
+  response (`violations: [{field, reason: "invalid_default", message}]`),
+  matching MCP's already-bundled reporting. Re-key on the 422 + `violations[]`.
+- **`GET /api/tags/{name}` on a nonexistent tag now 404, was 200 (#550,
+  rc.2).** Previously synthesized an all-null 200 body for a tag with no
+  identity row and no notes; now returns a structured `tag_not_found` 404
+  (`did_you_mean` when a close match exists).
+
+See [UPGRADING.md](./UPGRADING.md) for the full 0.6.x → 0.7.0 operator
+migration guide, including the automatic schema migrations
+(`migrateToV24`/`migrateToV25`) and the `unresolved_wikilinks` lazy
+self-heal.
+
+### Known limitations / follow-ups
+
+- **0.7.x polish backlog:** tracked at issue #570.
+- **@latest-promotion gate:** the hosted door's DO-SQLite backend must run
+  the FTS5 v25 spike (parachute-cloud#114) — confirming
+  `tokenize='porter unicode61'` and the two-column external-content FTS5
+  shape behave identically on Cloudflare's SQLite build — before the hosted
+  door pulls this core. Self-hosted (hub/bun) deploys are unaffected; this
+  gate is cloud-only and does not block this stable tag.
+
 ## [0.7.0-rc.9] - 2026-07-10
 
 ### Added — Ergonomics + contract truth (Wave 8b of the Reliability & Usability Program, WS6, #555, umbrella #556)
