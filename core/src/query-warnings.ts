@@ -182,3 +182,38 @@ export function collectUnknownTagWarnings(
   }
   return warnings;
 }
+
+/**
+ * `empty_search` warning (vault#551) — the `search` string carried no
+ * literal content: blank/whitespace-only, or (in literal mode, where a
+ * manually-typed `"` is ordinary content rather than syntax) nothing but
+ * quote characters. Rather than let this degenerate into an FTS5 syntax
+ * error or a confusing always-empty-but-syntactically-valid query, the
+ * search path short-circuits BEFORE ever calling FTS5 and reports this
+ * warning alongside an honest `[]`. See `core/src/search-query.ts`
+ * `buildLiteralSearchQuery`, which is the choke point that detects this.
+ */
+export function emptySearchWarning(): QueryWarning {
+  return {
+    code: "empty_search",
+    message:
+      "the search query has no literal content (blank, or only whitespace/quote characters) — returning no results without querying FTS5.",
+  };
+}
+
+/**
+ * `ignored_param` warning (vault#551) — a query-shaping param was passed
+ * but has no effect given the rest of the request. First (and so far only)
+ * case: `search_mode` without `search` — the mode only shapes how `search`
+ * text is turned into an FTS5 query, so passing it alone almost always
+ * means the caller meant to pass `search` too. Generic over `param` /
+ * `reason` so a future ignored-param case can reuse the same shape instead
+ * of inventing a new warning code.
+ */
+export function ignoredParamWarning(param: string, reason: string): QueryWarning {
+  return {
+    code: "ignored_param",
+    message: `\`${param}\` has no effect: ${reason}`,
+    param,
+  };
+}

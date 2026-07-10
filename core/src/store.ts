@@ -34,6 +34,7 @@ import {
   countConformanceViolations,
   type ConformanceReport,
 } from "./conformance.js";
+import type { SearchMode } from "./search-query.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -375,7 +376,7 @@ export class BunSqliteStore implements Store {
     return { ...opts, _tagsExpanded: expanded } as QueryOpts;
   }
 
-  async searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode }): Promise<Note[]> {
+  async searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode; mode?: SearchMode; sort?: "asc" | "desc" }): Promise<Note[]> {
     // Canonical-bare-tag guard (vault#XXX): strip leading `#` from search tag
     // filters before expansion, so `#manual` and `manual` resolve identically.
     if (opts?.tags && opts.tags.length > 0) {

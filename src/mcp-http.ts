@@ -176,6 +176,19 @@ async function handleMcp(
           hint: e.hint,
         });
       }
+      // Advanced-mode full-text search syntax error (vault#551) — a
+      // raw-passthrough FTS5 query that FTS5 itself rejected. Same shape as
+      // `invalid_query` (field/got/hint) but a DISTINCT `error_type` so a
+      // caller can tell "your search_mode:\"advanced\" syntax is malformed"
+      // apart from "your query PARAMS are malformed."
+      if (e?.error_type === "invalid_search_syntax") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: "invalid_search_syntax",
+          field: e.field,
+          got: e.got,
+          hint: e.hint,
+        });
+      }
       if (e?.code === "CONFLICT") {
         throw new McpError(ErrorCode.InvalidRequest, message, {
           error_type: "conflict",
