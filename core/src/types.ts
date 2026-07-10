@@ -1,16 +1,18 @@
 import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
-import type { TagExpandMode } from "./tag-hierarchy.js";
+import type { TagExpandMode, TagHierarchy } from "./tag-hierarchy.js";
 import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
+import type { FindPathResult } from "./links.js";
 
 // ---- Re-exports ----
 
 export type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 export type { PrunedField } from "./indexed-fields.js";
-export type { TagExpandMode } from "./tag-hierarchy.js";
+export type { TagExpandMode, TagHierarchy } from "./tag-hierarchy.js";
 export type { ConformanceReport } from "./conformance.js";
+export type { FindPathResult } from "./links.js";
 
 // ---- Note ----
 
@@ -336,7 +338,20 @@ export interface Store {
    * IDENTICAL expansion the snapshot query engine uses for the same `expand`.
    */
   expandTags(tags: string[], mode?: TagExpandMode): Promise<Set<string>>;
-  listTags(): Promise<{ name: string; count: number }[]>;
+  /**
+   * The store's cached tag hierarchy (invalidated on tag/parent_names
+   * writes). Sync, like `db` and `transaction`. Exposed (vault#550 fold)
+   * so per-query consumers — the `unknown_tag` warning collector — reuse
+   * the cache instead of re-scanning the `tags` table per request. Treat
+   * the returned object as READ-ONLY shared state.
+   */
+  getTagHierarchy(): TagHierarchy;
+  /**
+   * `expanded_count` (vault#550): distinct notes matching the tag OR any
+   * transitive descendant under the DEFAULT (subtypes) expansion axis,
+   * alongside the literal `count`. See `core/src/tag-hierarchy.ts:computeExpandedTagCounts`.
+   */
+  listTags(): Promise<{ name: string; count: number; expanded_count: number }[]>;
   deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }>;
   renameTag(
     oldName: string,
@@ -375,7 +390,7 @@ export interface Store {
 
   // Deeper link queries
   traverseLinks(noteId: string, opts?: { max_depth?: number; relationship?: string }): Promise<{ noteId: string; depth: number; relationship: string; direction: "outbound" | "inbound" }[]>;
-  findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): Promise<{ path: string[]; relationships: string[] } | null>;
+  findPath(sourceId: string, targetId: string, opts?: { max_depth?: number }): Promise<FindPathResult | null>;
 
   // Tag schemas — schema-only facade (description + fields). Back-compat
   // surface for v13-and-earlier callers; reads/writes route through the

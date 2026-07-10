@@ -250,6 +250,119 @@ export function getTagExpansion(
 }
 
 /**
+ * Suggest the closest EXISTING tag name to an unmatched input — the
+ * `did_you_mean` hint on `unknown_tag` warnings (vault#550) and
+ * `tag_not_found` errors. Candidates are scored, lower is better:
+ *
+ *   0. case-only difference (`Voice` vs `voice`)
+ *   1. a prefix relationship either direction (`voice` / `voice-memo` —
+ *      catches plural/singular drift and namespace-child typos)
+ *   2+dist. Levenshtein edit distance, when within a length-scaled budget
+ *
+ * Returns the single best match, or `undefined` when nothing is close
+ * enough to be worth suggesting — a genuinely novel tag name shouldn't get
+ * a noisy "did you mean" pointing at an unrelated tag.
+ */
+export function suggestSimilarTag(
+  candidates: Iterable<string>,
+  input: string,
+): string | undefined {
+  const lower = input.toLowerCase();
+  let best: string | undefined;
+  let bestScore = Infinity;
+  for (const candidate of candidates) {
+    if (candidate === input) continue;
+    const candLower = candidate.toLowerCase();
+    let score: number | null = null;
+    if (candLower === lower) {
+      score = 0;
+    } else if (lower.length >= 2 && candLower.length >= 2 && (candLower.startsWith(lower) || lower.startsWith(candLower))) {
+      score = 1;
+    } else {
+      const dist = levenshtein(lower, candLower);
+      const budget = Math.max(2, Math.ceil(Math.min(lower.length, candLower.length) * 0.34));
+      if (dist <= budget) score = 2 + dist;
+    }
+    if (score !== null && score < bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/** Classic Levenshtein edit distance, O(m·n) time / O(n) space. */
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array<number>(n + 1);
+  let curr = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j]! + 1, curr[j - 1]! + 1, prev[j - 1]! + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n]!;
+}
+
+/**
+ * Compute, for every declared tag, the number of DISTINCT notes matching
+ * that tag OR any transitive descendant under the subtypes axis (vault#550
+ * `expanded_count` — the rollup a parent tag whose notes are all tagged
+ * with a CHILD tag needs to report a non-zero count).
+ *
+ * One query fetches every `(tag_name, note_id)` pairing from `note_tags`;
+ * the fan-out to ancestors is pure in-memory set work over the (memoized)
+ * hierarchy — not one query per tag, so this stays cheap regardless of how
+ * many tags the vault declares. `getTagDescendants` is memoized per tag on
+ * `h`, so the ancestor-closure build below reuses that cache instead of
+ * re-walking the graph per candidate.
+ */
+export function computeExpandedTagCounts(
+  db: Database,
+  h: TagHierarchy,
+): Map<string, number> {
+  const rows = db.prepare(`SELECT tag_name, note_id FROM note_tags`).all() as
+    { tag_name: string; note_id: string }[];
+
+  const expandedNotes = new Map<string, Set<string>>();
+  const ancestorsCache = new Map<string, string[]>();
+
+  function ancestorsOrSelf(x: string): string[] {
+    const cached = ancestorsCache.get(x);
+    if (cached) return cached;
+    const result: string[] = [];
+    for (const t of h.allTags) {
+      if (getTagDescendants(h, t).has(x)) result.push(t);
+    }
+    if (!result.includes(x)) result.push(x);
+    ancestorsCache.set(x, result);
+    return result;
+  }
+
+  for (const row of rows) {
+    for (const ancestor of ancestorsOrSelf(row.tag_name)) {
+      let set = expandedNotes.get(ancestor);
+      if (!set) {
+        set = new Set();
+        expandedNotes.set(ancestor, set);
+      }
+      set.add(row.note_id);
+    }
+  }
+
+  const counts = new Map<string, number>();
+  for (const [tag, set] of expandedNotes) counts.set(tag, set.size);
+  return counts;
+}
+
+/**
  * Detect cycles in the declared hierarchy. Returns the list of tags
  * reachable from themselves via parent declarations. Used by
  * `update-tag` write paths to surface a warning to the caller without

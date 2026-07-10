@@ -4,7 +4,8 @@ import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
-import { TAG_EXPAND_MODES, stripTagHash, type TagExpandMode } from "./tag-hierarchy.js";
+import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
+import { collectUnknownTagWarnings, type QueryWarning } from "./query-warnings.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -237,7 +238,12 @@ Defaults: include_content=true for single note, false for lists. include_links=f
 
 Large notes: pass \`content_offset\` / \`content_length\` (UTF-8 bytes) for a bounded read of note content — the response carries the slice plus \`content_total_length\` and \`content_next_offset\` (null when complete). Loop, feeding \`content_next_offset\` back as \`content_offset\`, to read a note too large for one response.
 
-Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.`,
+Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.
+
+Response shape (vault#550 — three variants, pick by what you passed):
+- Default (no \`cursor\`, no warnings): a bare array of notes.
+- Cursor mode (\`cursor\` param present — including \`cursor: ""\` to bootstrap): \`{notes: [...], next_cursor}\`. See \`cursor\` below for the bootstrap flow.
+- Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -328,7 +334,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           cursor: {
             type: "string",
             description:
-              "Opaque cursor for 'since last checked' agent loops (vault#313). First call: omit. The response will include `next_cursor` — pass it on the subsequent call to receive only notes created or updated since the prior page. The cursor binds to the query's filters (tag, path, metadata, etc.); changing them between calls returns a structured `cursor_query_mismatch` error. Pagination via cursor orders results by `updated_at ASC` and is mutually exclusive with `order_by` and `sort: \"desc\"`. The response shape switches to `{notes, next_cursor}` when this parameter is present.",
+              "Opaque cursor for 'since last checked' agent loops (vault#313). Bootstrap flow (vault#550): FIRST call passes `cursor: \"\"` (empty string) — this opts into cursor mode with no watermark yet and the response comes back as `{notes, next_cursor}`. Persist `next_cursor` and pass it back verbatim as `cursor` on every SUBSEQUENT call to receive only notes created or updated since the prior page. Omitting `cursor` entirely (not passing the key at all) is a DIFFERENT thing — a plain one-shot list with no cursor envelope and no way to resume; use that when you don't want pagination at all. The cursor binds to the query's filters (tag, path, metadata, etc.); changing them between calls returns a structured `cursor_query_mismatch` error, and a malformed/expired cursor returns `cursor_invalid` naming the bootstrap flow again. Pagination via cursor orders results by `updated_at ASC` and is mutually exclusive with `order_by` and `sort: \"desc\"`.",
           },
           include_content: { type: "boolean", description: "Include note content (default: true for single, false for list)" },
           content_offset: {
@@ -466,7 +472,11 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // neighborhood every call to be cursor-stable; we punt for now).
         // Both surface as INVALID_QUERY rather than silently returning
         // wrong rows.
-        const cursorMode = typeof params.cursor === "string" && params.cursor.length > 0;
+        // Presence, not truthiness (vault#550 bootstrap fix) — `cursor: ""`
+        // is the bootstrap call ("I want to paginate, no watermark yet") and
+        // must still engage cursor mode. Before this fix `"".length > 0` was
+        // false, so the very first call could never obtain a `next_cursor`.
+        const cursorMode = typeof params.cursor === "string";
         if (cursorMode && params.search) {
           throw new QueryError(
             `cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.`,
@@ -495,6 +505,14 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
         // --- Full-text search ---
         let results: Note[];
         let nextCursor: string | null = null;
+        // Warnings channel (vault#550) — structured-query only for this
+        // wave; `search=` is out of scope (see #551). Scope-unaware by
+        // design (see `core/src/query-warnings.ts` doc comment) — a
+        // tag-scoped MCP session gets these stripped by the
+        // `applyTagScopeWrappers` query-notes wrapper in `src/mcp-tools.ts`
+        // before the result reaches the caller, so an out-of-scope tag name
+        // never leaks via `did_you_mean`.
+        let queryWarnings: QueryWarning[] = [];
         if (params.search) {
           // Normalize tag param
           const tags = normalizeTags(params.tag);
@@ -556,6 +574,7 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
             offset: params.offset as number | undefined,
             cursor: cursorMode ? (params.cursor as string) : undefined,
           };
+          queryWarnings = collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy());
           if (cursorMode) {
             const page = await store.queryNotesPaged(queryOpts);
             results = page.notes;
@@ -637,13 +656,29 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
           }
           // Cursor mode wraps the list in `{notes, next_cursor}` so callers can
           // chain calls without tracking a watermark client-side. Legacy
-          // callers (no `cursor` param) still get the flat array.
-          if (cursorMode) return { notes: enrichedOut, next_cursor: nextCursor };
-          return enrichedOut;
+          // callers (no `cursor` param, no warnings) still get the flat
+          // array (vault#550 — warnings channel is additive, never forces
+          // the envelope on its own outside cursor mode... except when
+          // there ARE warnings, in which case the envelope is the only way
+          // to attach them).
+          if (cursorMode) {
+            return {
+              notes: enrichedOut,
+              next_cursor: nextCursor,
+              ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}),
+            };
+          }
+          return queryWarnings.length > 0 ? { notes: enrichedOut, warnings: queryWarnings } : enrichedOut;
         }
 
-        if (cursorMode) return { notes: output, next_cursor: nextCursor };
-        return output;
+        if (cursorMode) {
+          return {
+            notes: output,
+            next_cursor: nextCursor,
+            ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}),
+          };
+        }
+        return queryWarnings.length > 0 ? { notes: output, warnings: queryWarnings } : output;
       },
     },
 
@@ -1353,7 +1388,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "list-tags",
       requiredVerb: "read",
-      description: `List tags with usage counts. Pass \`tag\` to get a single tag's full record (description, fields, relationships, parent_names, timestamps). Pass \`include_schema: true\` to include the full record for every tag.`,
+      description: `List tags with usage counts. Each row carries \`count\` (notes carrying the EXACT tag) and \`expanded_count\` (vault#550 — distinct notes matching the tag OR any transitive descendant under the default subtypes expansion; use this to see a parent tag's true rollup when its notes are actually tagged with a more specific child). Pass \`tag\` to get a single tag's full record (description, fields, relationships, parent_names, timestamps) — errors with \`error_type: "tag_not_found"\` (plus a \`did_you_mean\` hint when a close match exists) if the tag has no identity row and no notes. Pass \`include_schema: true\` to include the full record for every tag.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1368,9 +1403,30 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           const allTags = noteOps.listTags(db);
           const found = allTags.find((t) => t.name === singleTag);
           const record = tagSchemaOps.getTagRecord(db, singleTag);
+          // vault#550 — a tag with no identity row AND no note carrying it
+          // isn't a legitimate (if empty) tag, it's a typo or a tag from a
+          // different vault. Return a structured miss instead of a
+          // synthesized all-null 200. `did_you_mean` searches the full
+          // vault-wide tag catalog — core is scope-unaware by architecture.
+          // Tag-scope enforcement lives in the server layer's list-tags
+          // wrapper (src/mcp-tools.ts:applyTagScopeWrappers): a scoped
+          // session's out-of-scope `tag` param short-circuits to
+          // tag_not_found BEFORE this executes, and an in-scope miss gets
+          // its `did_you_mean` dropped unless the suggestion is also
+          // in-scope.
+          if (!found && !record) {
+            const suggestion = suggestSimilarTag(allTags.map((t) => t.name), singleTag);
+            return {
+              error: "Tag not found",
+              error_type: "tag_not_found",
+              tag: singleTag,
+              ...(suggestion ? { did_you_mean: suggestion } : {}),
+            };
+          }
           return {
             name: singleTag,
             count: found?.count ?? 0,
+            expanded_count: found?.expanded_count ?? 0,
             description: record?.description ?? null,
             fields: record?.fields ?? null,
             relationships: record?.relationships ?? null,
@@ -1589,7 +1645,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "find-path",
       requiredVerb: "read",
-      description: "Find the shortest path between two notes in the link graph. Accepts IDs or paths. Returns the chain of note IDs and relationships, or null if no path exists.",
+      description: "Find the shortest path between two notes in the link graph. Accepts IDs or paths. Returns null if no path exists, else `{path, relationships, nodes, edges}`: `path` (note IDs, source→target) and `relationships` (relationships[i] connects path[i] to path[i+1]) are the original id-only shape; `nodes` (vault#550, additive) hydrates each id in `path` with the note's own `path` field — `[{id, path}]` in the same order; `edges` (additive) is the self-contained hop list — `[{source, target, relationship, sourcePath, targetPath}]` — for rendering the chain without cross-referencing `nodes`.",
       inputSchema: {
         type: "object",
         properties: {

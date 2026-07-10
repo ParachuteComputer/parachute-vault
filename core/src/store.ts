@@ -70,8 +70,15 @@ export class BunSqliteStore implements Store {
    * boot or after an invalidation does the scan; subsequent calls hit the
    * cache. Returns the same object until invalidated, so callers can rely
    * on identity for memoizing per-tag descendant sets.
+   *
+   * Public (vault#550 fold): the query-warnings collector
+   * (`core/src/query-warnings.ts:collectUnknownTagWarnings`) runs on every
+   * tag-filtered structured query — threading this cached hierarchy in
+   * (instead of a fresh `loadTagHierarchy` per request) keeps the
+   * common all-tags-known case at ~zero extra cost. Treat the returned
+   * object as READ-ONLY — it's the shared cache, invalidated by writers.
    */
-  private getTagHierarchy(): TagHierarchy {
+  getTagHierarchy(): TagHierarchy {
     if (!this._tagHierarchy) this._tagHierarchy = loadTagHierarchy(this.db);
     return this._tagHierarchy;
   }
@@ -445,7 +452,7 @@ export class BunSqliteStore implements Store {
     return expanded;
   }
 
-  async listTags(): Promise<{ name: string; count: number }[]> {
+  async listTags(): Promise<{ name: string; count: number; expanded_count: number }[]> {
     return noteOps.listTags(this.db);
   }
 

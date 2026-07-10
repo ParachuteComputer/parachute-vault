@@ -12,7 +12,8 @@
  */
 
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
-import { TAG_EXPAND_MODES, stripTagHash, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
+import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
+import { collectUnknownTagWarnings, type QueryWarning } from "../core/src/query-warnings.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
@@ -128,6 +129,56 @@ function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
 }
 
+/**
+ * `json(...)` plus the `X-Parachute-Warnings` response header (vault#550) —
+ * `encodeURIComponent(JSON.stringify(warnings))`, set only when `warnings`
+ * is non-empty. Percent-encoded because HTTP header VALUES are
+ * Latin1/ASCII-only (the Fetch spec's ByteString requirement) while warning
+ * `message` text uses this codebase's normal house style (em dashes,
+ * curly-free but occasionally non-ASCII punctuation) — a raw
+ * `JSON.stringify` throws `TypeError: invalid header value` the first time
+ * a message isn't 7-bit-clean. Decode with `decodeURIComponent` then
+ * `JSON.parse`. Exists so bare-array responses (`GET /notes` without a
+ * cursor) can carry warnings WITHOUT changing their wire shape — a code
+ * consumer doing `for (const note of await res.json())` keeps working
+ * unmodified, while a consumer that cares can read the header. Envelope
+ * shapes (`{notes, next_cursor}`, `{nodes, edges}`) get the header too for
+ * uniform discoverability; callers that want warnings INLINE in an
+ * envelope should also spread them into the response body before calling
+ * this (see the cursor-envelope call sites in `handleNotesInner`).
+ */
+function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status = 200): Response {
+  const res = json(data, status);
+  if (warnings.length > 0) {
+    res.headers.set("X-Parachute-Warnings", encodeURIComponent(JSON.stringify(warnings)));
+  }
+  return res;
+}
+
+/**
+ * REST-only `removed_param` warning (vault#550) — the flat `date_field` /
+ * `date_from` / `date_to` query-string params were removed at 0.6.4
+ * (vault#288) and have been silently ignored ever since (routes.ts:633-ish
+ * comment). A request that passes any of them now gets a warning naming
+ * the ignored param and the bracket-style replacement, instead of quietly
+ * coming back unfiltered. One warning per param present (a caller passing
+ * all three gets three entries — precise, not lossy-summarized).
+ */
+function collectRemovedParamWarnings(url: URL): QueryWarning[] {
+  const REMOVED_DATE_PARAMS = ["date_field", "date_from", "date_to"] as const;
+  const warnings: QueryWarning[] = [];
+  for (const param of REMOVED_DATE_PARAMS) {
+    if (url.searchParams.has(param)) {
+      warnings.push({
+        code: "removed_param",
+        message: `\`${param}\` was removed in 0.6.4 (vault#288) and is silently ignored — use bracket-style date filters instead: \`meta[created_at][gte]=…\` / \`meta[created_at][lt]=…\` (or \`meta[updated_at][...]\`).`,
+        param,
+      });
+    }
+  }
+  return warnings;
+}
+
 function parseBool(val: string | null, defaultVal: boolean): boolean {
   if (val === null) return defaultVal;
   return val === "true" || val === "1";
@@ -219,6 +270,59 @@ function parseInt10(val: string | null): number | undefined {
   if (!val) return undefined;
   const n = parseInt(val, 10);
   return isNaN(n) ? undefined : n;
+}
+
+/**
+ * Parse + validate `?limit=` / `?offset=` for the structured-query path
+ * (vault#550). Before this, `parseInt10(...) ?? 50` silently swallowed a
+ * non-numeric value into the default (a caller's typo `?limit=fifty` just
+ * became `limit=50` with no signal), and any negative value that DID parse
+ * flowed straight through to SQLite, whose `LIMIT -1` means "no limit" —
+ * silently returning EVERYTHING instead of erroring. Returns `{value}`
+ * (undefined when the param is absent — the caller applies its own
+ * default) or `{error}` (400 `invalid_query`) when present-but-malformed.
+ * `got` echoes the ORIGINAL raw string so the error is legible even though
+ * the coerced value (e.g. `NaN`) wouldn't be.
+ */
+function parseNonNegativeIntParam(
+  url: URL,
+  key: "limit" | "offset",
+): { value?: number; error?: Response } {
+  const raw = parseQuery(url, key);
+  if (raw === null || raw === "") return {};
+  const trimmed = raw.trim();
+  if (!/^-?\d+$/.test(trimmed)) {
+    return {
+      error: json(
+        {
+          error: `\`${key}\` must be an integer, got ${JSON.stringify(raw)}`,
+          error_type: "invalid_query",
+          code: "INVALID_QUERY",
+          field: key,
+          got: raw,
+          hint: `pass a non-negative integer (e.g. ?${key}=${key === "limit" ? "50" : "0"}), or omit for the default`,
+        },
+        400,
+      ),
+    };
+  }
+  const n = parseInt(trimmed, 10);
+  if (n < 0) {
+    return {
+      error: json(
+        {
+          error: `\`${key}\` must be zero or greater, got ${n}${key === "limit" ? " — a negative limit used to silently mean \"unlimited\" (SQLite semantics leaking through)" : ""}`,
+          error_type: "invalid_query",
+          code: "INVALID_QUERY",
+          field: key,
+          got: raw,
+          hint: "pass a non-negative integer, or omit for the default",
+        },
+        400,
+      ),
+    };
+  }
+  return { value: n };
 }
 
 /**
@@ -612,6 +716,12 @@ export function parseNotesQueryOpts(url: URL): {
   if (expandParsed.error) return { hasSearch, hasNear, hasCursor, error: expandParsed.error };
   const expand = expandParsed.expand;
 
+  // limit/offset validation (vault#550) — see parseNonNegativeIntParam.
+  const limitParsed = parseNonNegativeIntParam(url, "limit");
+  if (limitParsed.error) return { hasSearch, hasNear, hasCursor, error: limitParsed.error };
+  const offsetParsed = parseNonNegativeIntParam(url, "offset");
+  if (offsetParsed.error) return { hasSearch, hasNear, hasCursor, error: offsetParsed.error };
+
   const queryOpts: QueryOpts = {
     tags,
     tagMatch: (parseQuery(url, "tag_match") as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
@@ -639,8 +749,8 @@ export function parseNotesQueryOpts(url: URL): {
     ...(bracket.dateFilter ? { dateFilter: bracket.dateFilter } : {}),
     sort: (parseQuery(url, "sort") as "asc" | "desc") ?? undefined,
     orderBy: parseQuery(url, "order_by") ?? undefined,
-    limit: parseInt10(parseQuery(url, "limit")) ?? 50,
-    offset: parseInt10(parseQuery(url, "offset")),
+    limit: limitParsed.value ?? 50,
+    offset: offsetParsed.value,
     cursor: cursorParam ?? undefined,
   };
 
@@ -839,8 +949,11 @@ async function handleNotesInner(
       // FTS owns its own ordering (relevance, not updated_at), so a cursor
       // would skip rows. MCP rejects this combo at `core/src/mcp.ts`; REST
       // would otherwise route into the `if (search)` branch below and
-      // silently drop the cursor. Reject here for surface parity.
-      if (search && parseQuery(url, "cursor")) {
+      // silently drop the cursor. Reject here for surface parity. Presence
+      // check (`!== null`), not truthiness (vault#550) — a bootstrap
+      // `?cursor=` attempt against a search query is still cursor intent
+      // and must still be rejected, not silently treated as "no cursor."
+      if (search && parseQuery(url, "cursor") !== null) {
         return json(
           {
             error: "cursor is incompatible with full-text search — FTS has its own ordering. Use date_filter on updated_at for since-last-checked search.",
@@ -934,11 +1047,22 @@ async function handleNotesInner(
       if (parsed.error) return parsed.error;
       const queryOpts = parsed.queryOpts!;
       const cursorParam = parseQuery(url, "cursor");
+      // Cursor mode is keyed on PRESENCE (`!== null`), not truthiness
+      // (vault#550 bootstrap fix). `?cursor=` (present, empty) is the
+      // bootstrap call — "I want to paginate, no watermark yet" — and must
+      // still engage the `{notes, next_cursor}` envelope. Before this fix
+      // `if (cursorParam)` treated an empty string exactly like an absent
+      // param, so the FIRST call could never obtain a cursor even though
+      // `core/src/mcp.ts` documented that flow — the cursor bootstrap gap
+      // this wave closes. Omitting `cursor` entirely (`cursorParam ===
+      // null`) is the only way to opt OUT — that keeps today's bare-array
+      // compat shape.
+      const cursorMode = cursorParam !== null;
       // Opaque cursor for "since last checked" agent loops (vault#313) is
       // mutually exclusive with the `near` graph-neighborhood scope (rebuilding
       // the neighborhood per page isn't stable).
       const nearNoteIdEarly = parseQuery(url, "near[note_id]");
-      if (cursorParam && nearNoteIdEarly) {
+      if (cursorMode && nearNoteIdEarly) {
         return json(
           {
             error: "cursor is incompatible with near (graph neighborhood). Resolve the neighborhood first, then iterate with cursor over the resulting note set.",
@@ -947,10 +1071,25 @@ async function handleNotesInner(
           400,
         );
       }
+      // Warnings channel (vault#550) — structured-query only for this wave
+      // (search= is out of scope, see #551). Skipped entirely for a
+      // tag-scoped session: `collectUnknownTagWarnings` resolves
+      // `did_you_mean` against the FULL vault-wide tag catalog, which would
+      // leak an out-of-scope tag's existence/name across the scope boundary
+      // — the same "no leak" stance this codebase takes everywhere else
+      // (docs/contracts/tag-scoped-tokens.md). `removed_param` warnings
+      // (below, at the response-shaping stage) carry no tag information and
+      // fire regardless of scope.
+      const queryWarnings: QueryWarning[] = [
+        ...collectRemovedParamWarnings(url),
+        ...(tagScope.allowed === null
+          ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
+          : []),
+      ];
       let results: Note[];
       let nextCursor: string | null = null;
       try {
-        if (cursorParam) {
+        if (cursorMode) {
           const page = await store.queryNotesPaged(queryOpts);
           results = page.notes;
           nextCursor = page.next_cursor;
@@ -960,9 +1099,23 @@ async function handleNotesInner(
       } catch (e: any) {
         // QueryError (non-indexed order_by, unknown operator, ...) surfaces
         // here. Duck-type on `name` + `code` — core is a separate module, so
-        // `instanceof` is fragile across bundling boundaries.
+        // `instanceof` is fragile across bundling boundaries. The newer
+        // vault#550 call sites (limit/offset/date validation in
+        // core/src/notes.ts) additionally set `error_type`/`field`/`got`/
+        // `hint` — merged in when present; long-standing QueryError throws
+        // that don't set them keep their existing `{error, code}` shape.
         if (e && e.name === "QueryError") {
-          return json({ error: e.message, code: e.code ?? "INVALID_QUERY" }, 400);
+          return json(
+            {
+              error: e.message,
+              code: e.code ?? "INVALID_QUERY",
+              ...(e.error_type !== undefined ? { error_type: e.error_type } : {}),
+              ...(e.field !== undefined ? { field: e.field } : {}),
+              ...(e.got !== undefined ? { got: e.got } : {}),
+              ...(e.hint !== undefined ? { hint: e.hint } : {}),
+            },
+            400,
+          );
         }
         // CursorError carries a structured code (cursor_invalid /
         // cursor_query_mismatch) so the agent loop can distinguish a
@@ -1072,7 +1225,12 @@ async function handleNotesInner(
             }
           }
         }
-        return json({ nodes, edges });
+        // Envelope shape → warnings inline (same policy as the cursor
+        // envelope below), plus the header via jsonWithWarnings.
+        return jsonWithWarnings(
+          { nodes, edges, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+          queryWarnings,
+        );
       }
 
       if (includeLinks || includeAttachments) {
@@ -1099,12 +1257,24 @@ async function handleNotesInner(
         // Cursor mode wraps the list in {notes, next_cursor} so an agent
         // loop can chain calls without tracking a watermark client-side.
         // Legacy callers (no `cursor` param) still get the flat array.
-        if (cursorParam) return json({ notes: enrichedOut, next_cursor: nextCursor });
-        return json(enrichedOut);
+        // Warnings (vault#550): inline on the envelope, header either way
+        // (see jsonWithWarnings).
+        if (cursorMode) {
+          return jsonWithWarnings(
+            { notes: enrichedOut, next_cursor: nextCursor, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+            queryWarnings,
+          );
+        }
+        return jsonWithWarnings(enrichedOut, queryWarnings);
       }
 
-      if (cursorParam) return json({ notes: output, next_cursor: nextCursor });
-      return json(output);
+      if (cursorMode) {
+        return jsonWithWarnings(
+          { notes: output, next_cursor: nextCursor, ...(queryWarnings.length > 0 ? { warnings: queryWarnings } : {}) },
+          queryWarnings,
+        );
+      }
+      return jsonWithWarnings(output, queryWarnings);
     }
 
     // POST /notes — create (single or batch)
@@ -1874,16 +2044,42 @@ export async function handleTags(
     if (singleTag) {
       // Tag-scope: a tag-scoped token can only see tags reachable from its
       // allowlist (root + descendants per the parent_names hierarchy).
-      // Anything else 404s — same "no leak" stance as note reads.
+      // Anything else 404s — same "no leak" stance as note reads. This
+      // early-return means the vault#550 unknown-tag 404 below never even
+      // runs for a scope-excluded name — `did_you_mean` (which searches
+      // vault-wide) can't fire and leak an out-of-scope tag's existence.
       if (tagScope.allowed && !tagScope.allowed.has(singleTag)) {
-        return json({ error: "Tag not found", tag: singleTag }, 404);
+        return json({ error: "Tag not found", error_type: "tag_not_found", tag: singleTag }, 404);
       }
       const allTags = await store.listTags();
       const found = allTags.find((t) => t.name === singleTag);
       const record = await store.getTagRecord(singleTag);
+      // vault#550 — a tag with no identity row AND no notes carrying it
+      // isn't a legitimate (if empty) tag; it's a typo or a tag from a
+      // different vault. Return a structured 404 instead of synthesizing
+      // an all-null 200. `did_you_mean` candidates are restricted to the
+      // caller's allowlist when scoped (defense in depth — this branch is
+      // normally unreachable for a scoped session per the early-return
+      // above, but stays scope-safe if that ever changes).
+      if (!found && !record) {
+        const candidates = tagScope.allowed
+          ? allTags.filter((t) => tagScope.allowed!.has(t.name)).map((t) => t.name)
+          : allTags.map((t) => t.name);
+        const suggestion = suggestSimilarTag(candidates, singleTag);
+        return json(
+          {
+            error: "Tag not found",
+            error_type: "tag_not_found",
+            tag: singleTag,
+            ...(suggestion ? { did_you_mean: suggestion } : {}),
+          },
+          404,
+        );
+      }
       return json({
         name: singleTag,
         count: found?.count ?? 0,
+        expanded_count: found?.expanded_count ?? 0,
         description: record?.description ?? null,
         fields: record?.fields ?? null,
         relationships: record?.relationships ?? null,
@@ -2069,15 +2265,36 @@ export async function handleTags(
 
   // GET /tags/:name — single tag detail (full record)
   if (req.method === "GET") {
+    // Same "no leak" early-return as the `?tag=` form above — a
+    // scope-excluded name 404s before `did_you_mean` (vault-wide) can run.
     if (tagScope.allowed && !tagScope.allowed.has(tagName)) {
-      return json({ error: "Tag not found", tag: tagName }, 404);
+      return json({ error: "Tag not found", error_type: "tag_not_found", tag: tagName }, 404);
     }
     const allTags = await store.listTags();
     const found = allTags.find((t) => t.name === tagName);
     const record = await store.getTagRecord(tagName);
+    // vault#550 — see the `?tag=` form above for the rationale (no
+    // identity row + no memberships = not a real tag, not a legitimate
+    // empty one).
+    if (!found && !record) {
+      const candidates = tagScope.allowed
+        ? allTags.filter((t) => tagScope.allowed!.has(t.name)).map((t) => t.name)
+        : allTags.map((t) => t.name);
+      const suggestion = suggestSimilarTag(candidates, tagName);
+      return json(
+        {
+          error: "Tag not found",
+          error_type: "tag_not_found",
+          tag: tagName,
+          ...(suggestion ? { did_you_mean: suggestion } : {}),
+        },
+        404,
+      );
+    }
     return json({
       name: tagName,
       count: found?.count ?? 0,
+      expanded_count: found?.expanded_count ?? 0,
       description: record?.description ?? null,
       fields: record?.fields ?? null,
       relationships: record?.relationships ?? null,

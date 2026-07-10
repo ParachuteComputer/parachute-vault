@@ -20,7 +20,7 @@ import {
   type QueryHashInputs,
 } from "./cursor.js";
 import { getIndexedField, releaseField } from "./indexed-fields.js";
-import { stripTagHash } from "./tag-hierarchy.js";
+import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 
 let idCounter = 0;
@@ -684,7 +684,78 @@ export function deleteNote(db: Database, id: string): void {
   db.prepare("DELETE FROM notes WHERE id = ?").run(id);
 }
 
+/**
+ * Validate `limit`/`offset` before any query work (vault#550). A negative
+ * `limit` used to leak SQLite's "negative LIMIT means unlimited" semantics
+ * straight through to the caller — silently returning EVERYTHING when the
+ * caller almost certainly meant "no limit I typed by mistake." A
+ * non-numeric value (a bad MCP param type, or a REST caller that slipped
+ * past `parseNotesQueryOpts`'s own stricter check) used to silently fall
+ * back to the default via `typeof opts.limit === "number" ? opts.limit :
+ * 100` below — also silent-wrong. This is the single choke point BOTH
+ * transports funnel through (`store.queryNotes` / `store.queryNotesPaged`
+ * call this via `queryNotes`), so REST and MCP get identical validation
+ * for free.
+ */
+function validateLimitOffset(opts: QueryOpts): void {
+  if (opts.limit !== undefined) {
+    if (typeof opts.limit !== "number" || !Number.isFinite(opts.limit) || !Number.isInteger(opts.limit) || opts.limit < 0) {
+      throw new QueryError(
+        `invalid limit: ${JSON.stringify(opts.limit)} — must be a non-negative integer (a negative LIMIT silently means "unlimited" in SQLite semantics, which is almost never what was intended). Omit for the default of 50.`,
+        "INVALID_QUERY",
+        {
+          error_type: "invalid_query",
+          field: "limit",
+          got: opts.limit,
+          hint: "pass a non-negative integer, or omit for the default",
+        },
+      );
+    }
+  }
+  if (opts.offset !== undefined) {
+    if (typeof opts.offset !== "number" || !Number.isFinite(opts.offset) || !Number.isInteger(opts.offset) || opts.offset < 0) {
+      throw new QueryError(
+        `invalid offset: ${JSON.stringify(opts.offset)} — must be a non-negative integer.`,
+        "INVALID_QUERY",
+        {
+          error_type: "invalid_query",
+          field: "offset",
+          got: opts.offset,
+          hint: "pass a non-negative integer, or omit for the default of 0",
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Validate an ISO-8601 date-filter value before it's bound into a SQL
+ * comparison (vault#550). `n.created_at` / `n.updated_at` are TEXT columns
+ * compared lexicographically; an unparseable value used to bind straight
+ * through and silently match "nothing" or "everything" depending on how it
+ * happened to sort against real ISO strings, rather than erroring. Applies
+ * uniformly to BOTH `dateFilter` (bracket-style REST / MCP `date_filter`)
+ * and the legacy `dateFrom`/`dateTo` shorthand (MCP `date_from`/`date_to`,
+ * still supported) — both flow through this same function, so both get the
+ * same loud validation from one place.
+ */
+function validateIsoDateValue(field: string, value: string): void {
+  if (Number.isNaN(Date.parse(value))) {
+    throw new QueryError(
+      `invalid date value for "${field}": ${JSON.stringify(value)} — must be an ISO-8601 date/timestamp (e.g. "2026-07-09" or "2026-07-09T00:00:00.000Z").`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field,
+        got: value,
+        hint: "pass an ISO-8601 date or timestamp",
+      },
+    );
+  }
+}
+
 export function queryNotes(db: Database, opts: QueryOpts): Note[] {
+  validateLimitOffset(opts);
   const conditions: string[] = [];
   const params: SQLQueryBindings[] = [];
 
@@ -920,19 +991,23 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
       column = `"meta_${field}"`;
     }
     if (filter.from !== undefined) {
+      validateIsoDateValue(field === "created_at" ? "date_filter.from" : `date_filter.from (${field})`, filter.from);
       conditions.push(`${column} >= ?`);
       params.push(filter.from);
     }
     if (filter.to !== undefined) {
+      validateIsoDateValue(field === "created_at" ? "date_filter.to" : `date_filter.to (${field})`, filter.to);
       conditions.push(`${column} < ?`);
       params.push(filter.to);
     }
   } else if (hasLegacyDate) {
     if (opts.dateFrom) {
+      validateIsoDateValue("date_from", opts.dateFrom);
       conditions.push("n.created_at >= ?");
       params.push(opts.dateFrom);
     }
     if (opts.dateTo) {
+      validateIsoDateValue("date_to", opts.dateTo);
       conditions.push("n.created_at < ?");
       params.push(opts.dateTo);
     }
@@ -940,8 +1015,22 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
 
   // ---- Cursor predicate (vault#313) ----
   //
-  // When a cursor is present, decode it, verify its query_hash matches the
-  // current query, and add a keyset predicate of the form:
+  // Cursor mode is keyed on PRESENCE of `opts.cursor`, not truthiness
+  // (vault#550 bootstrap fix). `cursor: ""` is the bootstrap call — "I want
+  // to paginate, I don't have a watermark yet" — and must still force the
+  // keyset ORDER BY below so the FIRST page is taken in the same order
+  // subsequent pages will be. `opts.cursor === undefined` is the only way
+  // to opt OUT of cursor mode entirely (the legacy flat-array shape).
+  // Before this fix, `if (opts.cursor)` treated an empty string exactly
+  // like "no cursor" — the caller's bootstrap intent silently vanished and
+  // the first page came back in `created_at` order instead of the
+  // `updated_at` keyset order the SECOND page (a real cursor) would use,
+  // so naive "did I see this note already" comparisons could skip or
+  // duplicate rows across the boundary.
+  //
+  // When a REAL (non-empty) cursor is present, decode it, verify its
+  // query_hash matches the current query, and add a keyset predicate of
+  // the form:
   //
   //   (updated_at > last_updated_at)
   //     OR (updated_at = last_updated_at AND id > last_id)
@@ -953,8 +1042,9 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // exclusive with cursor mode (a "since last checked" loop wants
   // ascending updated_at, full stop); we reject with INVALID_QUERY so
   // callers don't silently get a broken iteration.
+  const cursorMode = opts.cursor !== undefined;
   let cursorPayload: CursorPayload | null = null;
-  if (opts.cursor) {
+  if (cursorMode) {
     if (opts.orderBy) {
       throw new QueryError(
         `cursor and order_by are mutually exclusive — cursor pagination forces order by updated_at`,
@@ -967,33 +1057,39 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
         "INVALID_QUERY",
       );
     }
-    cursorPayload = decodeCursor(opts.cursor);
-    const expectedHash = computeQueryHash(toQueryHashInputs(opts));
-    if (cursorPayload.query_hash !== expectedHash) {
-      throw new CursorError(
-        `cursor was minted for a different query — drop the cursor and restart iteration`,
-        "cursor_query_mismatch",
+    if (opts.cursor !== "") {
+      cursorPayload = decodeCursor(opts.cursor!);
+      const expectedHash = computeQueryHash(toQueryHashInputs(opts));
+      if (cursorPayload.query_hash !== expectedHash) {
+        throw new CursorError(
+          `cursor was minted for a different query — drop the cursor and restart iteration`,
+          "cursor_query_mismatch",
+        );
+      }
+      // Translate the millis watermark back to an ISO string for the SQL
+      // comparison. SQLite's `n.updated_at` is TEXT in canonical ISO form
+      // (the store's `toISOString()` output), and ISO timestamps sort
+      // lexicographically in the same order as their millisecond epochs
+      // when they all use the same canonical form — which every timestamp
+      // vault mints does. Cursors minted on heterogeneous timestamps
+      // (e.g. an import that preserved unusual formatting) are still
+      // safe: we round-trip the cursor's millis through `new Date()`'s
+      // canonical ISO so the comparison is apples-to-apples.
+      const cursorIso = millisToIso(cursorPayload.last_updated_at);
+      conditions.push(
+        "(n.updated_at > ? OR (n.updated_at = ? AND n.id > ?))",
       );
+      params.push(cursorIso, cursorIso, cursorPayload.last_id);
     }
-    // Translate the millis watermark back to an ISO string for the SQL
-    // comparison. SQLite's `n.updated_at` is TEXT in canonical ISO form
-    // (the store's `toISOString()` output), and ISO timestamps sort
-    // lexicographically in the same order as their millisecond epochs
-    // when they all use the same canonical form — which every timestamp
-    // vault mints does. Cursors minted on heterogeneous timestamps
-    // (e.g. an import that preserved unusual formatting) are still
-    // safe: we round-trip the cursor's millis through `new Date()`'s
-    // canonical ISO so the comparison is apples-to-apples.
-    const cursorIso = millisToIso(cursorPayload.last_updated_at);
-    conditions.push(
-      "(n.updated_at > ? OR (n.updated_at = ? AND n.id > ?))",
-    );
-    params.push(cursorIso, cursorIso, cursorPayload.last_id);
+    // else: bootstrap call (`cursor === ""`) — no watermark yet, no
+    // predicate to add, but the ORDER BY below still switches to the
+    // keyset order so this first page is consistent with every page after
+    // it.
   }
 
   const direction = opts.sort === "desc" ? "DESC" : "ASC";
   let orderBy: string;
-  if (opts.cursor) {
+  if (cursorMode) {
     // Cursor mode forces a deterministic keyset order. `id` is the
     // tiebreaker — without it, two notes sharing an `updated_at` would
     // be at the mercy of SQLite's row order and the next page could
@@ -1177,7 +1273,11 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
   // cursor's watermark — see the JSDoc rationale above.
   let lastUpdatedAt = 0;
   let lastId = "";
-  if (opts.cursor) {
+  // `opts.cursor === ""` is the bootstrap call (vault#550) — there's no
+  // prior watermark to decode, so it takes the same 0/"" sentinel path as
+  // `opts.cursor === undefined`. Only a REAL (non-empty) cursor gets
+  // re-decoded here.
+  if (opts.cursor !== undefined && opts.cursor !== "") {
     // Re-decode (we already validated in queryNotes); this is cheap.
     const prior = decodeCursor(opts.cursor);
     lastUpdatedAt = prior.last_updated_at;
@@ -1303,7 +1403,18 @@ export function getNoteTags(db: Database, noteId: string): string[] {
   return rows.map((r) => r.tag_name);
 }
 
-export function listTags(db: Database): { name: string; count: number }[] {
+/**
+ * List every declared tag with its literal `count` (notes carrying that
+ * EXACT tag name) and its `expanded_count` (vault#550) — distinct notes
+ * matching the tag OR any transitive descendant under the DEFAULT
+ * (subtypes) expansion axis. `expanded_count` is what surfaces a parent
+ * tag as non-empty even when every one of its notes is actually tagged
+ * with a more specific child tag — `count` alone reports 0 for that
+ * parent, which reads as "this tag is dead" when it's really just a
+ * rollup label. See `computeExpandedTagCounts` for the single-pass
+ * (no N+1) computation.
+ */
+export function listTags(db: Database): { name: string; count: number; expanded_count: number }[] {
   const rows = db.prepare(`
     SELECT t.name, COUNT(nt.note_id) as count
     FROM tags t
@@ -1311,7 +1422,10 @@ export function listTags(db: Database): { name: string; count: number }[] {
     GROUP BY t.name
     ORDER BY t.name
   `).all() as { name: string; count: number }[];
-  return rows;
+
+  const h = loadTagHierarchy(db);
+  const expandedCounts = computeExpandedTagCounts(db, h);
+  return rows.map((r) => ({ ...r, expanded_count: expandedCounts.get(r.name) ?? 0 }));
 }
 
 export function deleteTag(db: Database, name: string): { deleted: boolean; notes_untagged: number } {

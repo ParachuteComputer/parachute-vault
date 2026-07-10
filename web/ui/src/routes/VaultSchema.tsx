@@ -299,7 +299,23 @@ function TagEditor({
     Promise.all([getTagRecord(vaultName, tag), getEffectiveSchema(vaultName, tag)])
       .then(([record, effective]) => {
         if (cancelled) return;
-        setState({ kind: "ok", record, effective });
+        // getTagRecord returns null on 404 (vault#550 — the server now
+        // answers tag_not_found instead of synthesizing an all-null 200).
+        // Reachable via TOCTOU (tag deleted between the list load and this
+        // click) — degrade to the empty-record editor exactly as the old
+        // all-null server response did, not the generic error banner.
+        const effectiveRecord =
+          record ?? {
+            name: tag,
+            count: 0,
+            description: null,
+            fields: null,
+            relationships: null,
+            parent_names: null,
+            created_at: null,
+            updated_at: null,
+          };
+        setState({ kind: "ok", record: effectiveRecord, effective });
       })
       .catch((err) => {
         if (cancelled) return;

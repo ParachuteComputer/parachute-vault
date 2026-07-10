@@ -196,3 +196,20 @@ describe("live-match — predicate parity with the query engine", () => {
     await assertParity({ tags: ["t"], metadata: { kind: "note" } });
   });
 });
+
+describe("live-match — unsupportedSubscriptionReason cursor guard (vault#550)", () => {
+  it("rejects a bootstrap empty-string cursor (presence, not truthiness)", async () => {
+    const { unsupportedSubscriptionReason } = await import("./live-match.ts");
+    // `cursor: ""` is cursor INTENT (the vault#550 bootstrap call) — a live
+    // subscription can't paginate, so it must be rejected the same as a
+    // real cursor, not silently treated as "no cursor requested."
+    expect(unsupportedSubscriptionReason({ cursor: "" } as QueryOpts)).toContain("cursor");
+    expect(unsupportedSubscriptionReason({ cursor: "eyJxaC" } as QueryOpts)).toContain("cursor");
+  });
+
+  it("an omitted/undefined cursor does not reject", async () => {
+    const { unsupportedSubscriptionReason } = await import("./live-match.ts");
+    expect(unsupportedSubscriptionReason({ cursor: undefined } as QueryOpts)).toBeNull();
+    expect(unsupportedSubscriptionReason({} as QueryOpts)).toBeNull();
+  });
+});
