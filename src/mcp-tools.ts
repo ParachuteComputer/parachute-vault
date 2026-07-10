@@ -7,8 +7,7 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNoteTags, PathConflictError } from "../core/src/notes.ts";
-import { normalizePath } from "../core/src/paths.ts";
+import { getNoteTags } from "../core/src/notes.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -175,6 +174,20 @@ export function generateScopedMcpTools(
         )
     : undefined;
 
+  // Tag-scope guard for `create-note` `if_exists` (vault#555 auth-review
+  // must-fix): the core `if_exists` upsert resolves the target path VAULT-WIDE
+  // and returns/updates/replaces the found note, so a scoped caller could
+  // read/overwrite an out-of-scope note by naming its path. Inject a
+  // visibility predicate the core `applyExistingNote` consults on the RESOLVED
+  // existing note — covering BOTH the proactive check AND the concurrent-INSERT
+  // race backstop (a wrapper-only pre-check misses the latter). Reads from the
+  // SAME shared `allowedHolder` the create-note wrapper's `getAllowed()`
+  // populates before core's execute runs. Unscoped sessions install no
+  // predicate (unchanged). Same closure as `expandVisibility`.
+  const ifExistsVisible = scoped
+    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    : undefined;
+
   // Write-attribution (vault#298). Every write through an MCP session arrives
   // on the `mcp` channel — so we REFINE the auth's base `via` (the generic
   // credential class) to `mcp` here, where the path/channel is known. The
@@ -198,10 +211,11 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(
     store,
-    expandVisibility || nearTraversable || writeContext || strictBypass
+    expandVisibility || nearTraversable || ifExistsVisible || writeContext || strictBypass
       ? {
           ...(expandVisibility ? { expandVisibility } : {}),
           ...(nearTraversable ? { nearTraversable } : {}),
+          ...(ifExistsVisible ? { ifExistsVisible } : {}),
           ...(writeContext ? { writeContext } : {}),
           ...(strictBypass ? { strictBypass } : {}),
           ...(onStrictBypass ? { onStrictBypass } : {}),
@@ -498,38 +512,14 @@ function applyTagScopeWrappers(
       if (!tagsWithinScope(itemTags, allowed, rawTags)) {
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
       }
-      // CRITICAL scope guard (vault#555 auth-review must-fix): `if_exists`
-      // resolves the target `path` VAULT-WIDE inside scope-unaware core
-      // (`store.getNoteByPath`), then returns (ignore) / updates / replaces
-      // whatever it finds. The `tagsWithinScope` check above guards only the
-      // item's OWN incoming tags — NOT the resolved existing note — so without
-      // this a token scoped to `public` could READ (ignore) or OVERWRITE
-      // (update/replace) a note that carries only an out-of-scope tag `secret`
-      // just by naming its path. Core stays scope-unaware by design, so we
-      // pre-resolve HERE (the scope-aware server layer) and treat an
-      // out-of-scope hit as a path conflict — the path is taken, but invisible
-      // to this caller — never exposing the note's content or mutating it. We
-      // THROW `PathConflictError` (not an in-band object) so the wire result is
-      // byte-identical to a genuine `path_conflict`, leaking nothing about
-      // WHY (taken-by-out-of-scope vs. simply taken). Holds for ignore,
-      // update, AND replace.
-      const ifExists = (item as any).if_exists;
-      const path = (item as any).path;
-      if (
-        (ifExists === "ignore" || ifExists === "update" || ifExists === "replace") &&
-        typeof path === "string" &&
-        path.length > 0
-      ) {
-        const normalized = normalizePath(path);
-        if (normalized) {
-          const ext = typeof (item as any).extension === "string" ? (item as any).extension : "md";
-          const existing = await store.getNoteByPath(normalized, ext);
-          if (existing && !noteWithinTagScope(existing, allowed, rawTags)) {
-            throw new PathConflictError(normalized);
-          }
-        }
-      }
     }
+    // `if_exists` scope enforcement (vault#555 auth-review must-fix) is NOT
+    // done here as a wrapper pre-check — that would miss core's concurrent-
+    // INSERT race backstop. Instead the `ifExistsVisible` predicate wired into
+    // generateMcpTools above fires INSIDE core's `applyExistingNote`, covering
+    // both the proactive site and the race-backstop site with one guard. The
+    // `await getAllowed()` at the top of this wrapper populates the shared
+    // `allowedHolder` the predicate reads, before core's execute runs.
     return await orig(params);
   });
 

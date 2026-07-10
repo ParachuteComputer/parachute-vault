@@ -201,6 +201,25 @@ export interface GenerateMcpToolsOpts {
    * Omitted (unscoped / internal callers) → the full graph is walked.
    */
   nearTraversable?: (noteId: string) => boolean;
+  /**
+   * `ifExistsVisible` (vault#555 auth-review must-fix) is an OPTIONAL per-note
+   * predicate gating the `create-note` `if_exists` upsert. `if_exists` resolves
+   * the target `path` VAULT-WIDE (`getNoteByPath`) and then returns (ignore) /
+   * updates / replaces the found note — so without a scope gate a tag-scoped
+   * caller could READ or OVERWRITE an out-of-scope note just by naming its
+   * path. When provided, `applyExistingNote` calls this predicate on the
+   * RESOLVED existing note and, if it returns false, throws `PathConflictError`
+   * instead (the path is taken but invisible to this caller — no content
+   * exposed, nothing mutated). It's applied INSIDE `applyExistingNote`, which
+   * BOTH the proactive-check site AND the concurrent-INSERT race-backstop site
+   * funnel through — so a TOCTOU race (both existence checks miss, the real
+   * INSERT then loses to a concurrent writer's out-of-scope note) can't slip a
+   * note past it. Core stays scope-unaware: it receives a plain
+   * `(note) => boolean` closure and never imports the server's tag-scope
+   * module. Omitted (unscoped / internal callers) → `if_exists` resolves
+   * against the full vault exactly as before.
+   */
+  ifExistsVisible?: (note: Note) => boolean;
 }
 
 /**
@@ -214,6 +233,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
   const db: Database = store.db;
   const expandVisibility = opts?.expandVisibility;
   const nearTraversable = opts?.nearTraversable;
+  const ifExistsVisible = opts?.ifExistsVisible;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -986,6 +1006,24 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
           existingNote: Note,
           mode: "ignore" | "update" | "replace",
         ): Promise<{ note: Note; noMutate: boolean }> => {
+          // CRITICAL scope guard (vault#555 auth-review must-fix). `existingNote`
+          // was resolved VAULT-WIDE by path (getNoteByPath) at whichever call
+          // site reached here — the proactive check OR the concurrent-INSERT
+          // race backstop. A tag-scoped MCP session injects `ifExistsVisible`
+          // (see GenerateMcpToolsOpts); when the resolved note fails it, the
+          // caller must not read (ignore) / update / replace an out-of-scope
+          // note it named only by path — throw PathConflictError (path taken,
+          // invisible to this caller) BEFORE any read or mutation, so no
+          // content leaks and nothing is written. Placing it HERE — not only in
+          // the server-layer wrapper's pre-check — is what closes the
+          // race-backstop TOCTOU: the pre-check + core's proactive check can
+          // BOTH miss a note a concurrent writer then INSERTs, and the backstop
+          // re-resolves it into this exact call. Core stays scope-unaware: it
+          // only invokes the injected closure. Unscoped/internal callers pass no
+          // predicate → unchanged behavior.
+          if (ifExistsVisible && !ifExistsVisible(existingNote)) {
+            throw new noteOps.PathConflictError(existingNote.path ?? "");
+          }
           if (mode === "ignore") {
             // No error, no mutation of any kind — not even schema-default
             // backfill. Return the existing note exactly as stored.

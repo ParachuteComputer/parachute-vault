@@ -1890,6 +1890,80 @@ describe("scoped MCP wrapper", async () => {
 
     closeAllStores();
   });
+
+  // vault#555 auth-review CRITICAL (RACE PATH — the incomplete-first-fix gap).
+  // The wrapper pre-check + core's proactive getNoteByPath can BOTH miss a note
+  // that a concurrent writer INSERTs, after which core's race backstop
+  // re-resolves the (now-existing, out-of-scope) winner and calls
+  // applyExistingNote on it. Without the in-core `ifExistsVisible` guard the
+  // out-of-scope content leaks / the note is mutated. We reproduce the exact
+  // TOCTOU by monkeypatching store.createNote to (a) create the out-of-scope
+  // note itself (simulating the concurrent winner) and (b) throw
+  // PathConflictError — driving execution straight into the backstop. Both
+  // assertions MUST fail without the in-core guard.
+  async function raceVault(mode: "ignore" | "update" | "replace") {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+    const { PathConflictError } = await import("../core/src/notes.ts");
+
+    const vaultName = `tagscope-ifexists-race-${mode}-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+
+    // Monkeypatch createNote so the target path is created by a "concurrent
+    // writer" with an OUT-OF-SCOPE tag, then the real INSERT loses the race.
+    const origCreate = store.createNote.bind(store);
+    let raced = false;
+    (store as any).createNote = async (content: string, opts: any) => {
+      if (opts?.path === "Secret" && !raced) {
+        raced = true;
+        await origCreate("TOP SECRET RACE PAYLOAD", { path: "Secret", tags: ["personal"] });
+        throw new PathConflictError("Secret");
+      }
+      return origCreate(content, opts);
+    };
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+    return { store, create, closeAllStores };
+  }
+
+  test('scoped create-note if_exists:"ignore" RACE backstop does NOT leak out-of-scope content', async () => {
+    const { store, create, closeAllStores } = await raceVault("ignore");
+    await expect(
+      create.execute({ content: "attempted", path: "Secret", tags: ["work"], if_exists: "ignore" }),
+    ).rejects.toThrow(/path_conflict/);
+    // The concurrently-created out-of-scope note is byte-unchanged and its
+    // payload never reached the caller (the throw carries only the path).
+    const onDisk = (await store.getNoteByPath("Secret"))!;
+    expect(onDisk.content).toBe("TOP SECRET RACE PAYLOAD");
+    expect(onDisk.tags).toEqual(["personal"]);
+    closeAllStores();
+  });
+
+  test('scoped create-note if_exists:"update" RACE backstop does NOT mutate the out-of-scope note', async () => {
+    const { store, create, closeAllStores } = await raceVault("update");
+    await expect(
+      create.execute({ content: "OVERWRITE", path: "Secret", tags: ["work"], metadata: { injected: true }, if_exists: "update" }),
+    ).rejects.toThrow(/path_conflict/);
+    const onDisk = (await store.getNoteByPath("Secret"))!;
+    expect(onDisk.content).toBe("TOP SECRET RACE PAYLOAD"); // unmutated
+    expect(onDisk.metadata ?? {}).toEqual({});
+    expect(onDisk.tags).toEqual(["personal"]);
+    closeAllStores();
+  });
+
+  test('scoped create-note if_exists:"replace" RACE backstop does NOT mutate the out-of-scope note', async () => {
+    const { store, create, closeAllStores } = await raceVault("replace");
+    await expect(
+      create.execute({ content: "REPLACE", path: "Secret", tags: ["work"], if_exists: "replace" }),
+    ).rejects.toThrow(/path_conflict/);
+    const onDisk = (await store.getNoteByPath("Secret"))!;
+    expect(onDisk.content).toBe("TOP SECRET RACE PAYLOAD"); // unmutated
+    expect(onDisk.tags).toEqual(["personal"]);
+    closeAllStores();
+  });
 });
 
 describe("auth permissions", () => {
@@ -5264,6 +5338,47 @@ describe("HTTP POST /notes — if_exists (vault#555)", async () => {
     const body = await res.json() as any;
     expect(body.content).toBe("solo");
     expect(body.created).toBeUndefined();
+  });
+
+  // vault#555 CRITICAL 2 (REST tripwire — the generalist-flagged coverage gap:
+  // the core-side tests didn't guard the REST gate, so reverting routes.ts's
+  // gate alone left all tests green). REST parity of the two core tests.
+  test('if_exists:"update" with ONLY tags added still advances updated_at (POST /notes)', async () => {
+    const first = await store.createNote("body", { path: "rest-tagonly", tags: ["alpha"] });
+    const before = first.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { path: "rest-tagonly", tags: ["beta"], if_exists: "update" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.tags?.sort()).toEqual(["alpha", "beta"]);
+    const after = (await store.getNote(first.id))!.updatedAt!;
+    expect(after > before).toBe(true);
+  });
+
+  test('if_exists:"update" with ONLY links added still advances updated_at (POST /notes)', async () => {
+    await store.createNote("target", { id: "rest-tgt-linkonly", path: "Targets/rest-linkonly" });
+    const first = await store.createNote("body", { path: "rest-linkonly", tags: ["alpha"] });
+    const before = first.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        path: "rest-linkonly",
+        links: [{ target: "rest-tgt-linkonly", relationship: "relates-to" }],
+        if_exists: "update",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const after = (await store.getNote(first.id))!.updatedAt!;
+    expect(after > before).toBe(true);
   });
 });
 
