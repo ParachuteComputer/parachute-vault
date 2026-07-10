@@ -54,10 +54,12 @@ to `@latest`.
   append/if_updated_at/state_transition concurrency guarantees). Behavior
   that is confirmed broken gets a `test.todo("#NNN: …")` entry naming the
   target behavior and the tracking issue, so later waves flip each one to
-  a real passing test against an already-red baseline: `src/contract-
-  search.test.ts` (#551), `src/contract-honest-queries.test.ts` (#550),
-  `src/contract-errors.test.ts` (#554), `core/src/contract-taxonomy.
-  test.ts` (#552), `core/src/contract-typed-index.test.ts` (#553),
+  a real passing test against an already-red baseline:
+  `src/contract-search.test.ts` (#551),
+  `src/contract-honest-queries.test.ts` (#550),
+  `src/contract-errors.test.ts` (#554),
+  `core/src/contract-taxonomy.test.ts` (#552),
+  `core/src/contract-typed-index.test.ts` (#553),
   `core/src/contract-concurrency.test.ts` (no todos — pure lock-in of
   verified strengths, #555). No production source changed in this PR.
 
