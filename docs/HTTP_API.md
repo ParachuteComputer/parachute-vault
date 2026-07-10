@@ -362,6 +362,11 @@ Warning codes today:
   (edit-distance against the FTS5 vocabulary + tag names). Carries `query`
   and `did_you_mean`. `search=` only, only on a zero-result query, and only
   for UNSCOPED sessions (the suggestion is computed vault-wide — see below).
+- `unresolved_link` (vault#555) — a structured `links` entry on
+  `POST /notes` or `PATCH /notes/{id}` (mirrored by MCP `create-note` /
+  `update-note`) didn't resolve to any note. Carries `target` and
+  `relationship`. **Write path, not the query path above** — see "Structured
+  `links` resolution" below for where this attaches on the response.
 
 **Surfacing differs by response shape** (compat-preserving — this is why
 it's additive, not a breaking wire-shape change):
@@ -989,6 +994,30 @@ Error shapes:
 - `409 path_conflict` — UNIQUE(path) tripped; body carries `path`.
 - `400 invalid_extension` — extension validation failed (vault#328); body
   carries `extension`, `reason`.
+
+**Structured `links` resolution (vault#555).** A `links` entry's `target`
+resolves with the SAME semantics as a `[[wikilink]]` — ID match first, then
+exact path, then basename/title (e.g. `target: "Alice"` resolves a note
+filed at `People/Alice`) — NOT path-only as before. The `relationship` you
+pass is preserved verbatim (wikilinks always use `"wikilink"`; a structured
+link carries whatever you named). Two forward-ref cases are handled without
+dropping the edge:
+
+- **Same batch.** A `links` entry pointing at a note created LATER in the
+  same `notes` array (POST) resolves once every note in the batch exists —
+  order doesn't matter.
+- **Later call.** A target that doesn't exist yet anywhere is queued (same
+  `unresolved_wikilinks` machinery `[[wikilinks]]` already use) and
+  backfills automatically the moment a matching note is created, in this
+  vault, by any client. The response carries an `unresolved_link` warning
+  (see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
+  above) naming the `target` and `relationship` so the caller knows the edge
+  isn't live yet — it's never silently dropped.
+- **Genuinely unresolvable** (typo, or a target that will never exist)
+  looks identical to the "later call" case on the wire — the write still
+  queues it. Use `GET /vault/{name}/api/unresolved-wikilinks` to audit what's
+  pending across the vault (rows now carry a `relationship` field alongside
+  `source_id`/`target_path`).
 
 #### `GET /vault/{name}/api/notes/{idOrPath}` — `vault:read`
 Returns the full `Note` (defaults to `include_content=true` for point
@@ -1682,8 +1711,12 @@ contract.
 ### Maintenance
 
 #### `GET /vault/{name}/api/unresolved-wikilinks` — `vault:read`
-List `[[wikilink]]`s in note content that don't currently resolve to any
-note. `?limit=N` (default 50).
+List `[[wikilink]]`s AND pending structured `links` forward-refs (vault#555)
+that don't currently resolve to any note. `?limit=N` (default 50). Each row
+carries `source_id`, `source_path`, `target_path`, and `relationship`
+(`"wikilink"` for content-parsed `[[targets]]`; the caller's own
+relationship string for a structured-link forward-ref queued by
+`create-note`/`update-note`/`POST /notes`/`PATCH /notes/{id}`).
 
 #### `GET /vault/{name}/api/health` — `vault:read`
 Per-vault liveness ping. `{status: "ok", vault: "<name>"}`.

@@ -22,7 +22,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
-import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
+import { listUnresolvedWikilinks, resolveOrQueueLink, resolveLinkTarget } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import {
@@ -914,6 +914,20 @@ async function requireNote(store: Store, idOrPath: string): Promise<Note> {
   return note;
 }
 
+/**
+ * Resolve a structured-link `target` (POST/PATCH `links`) to its full
+ * `Note` — same ID-or-path/title semantics as [[wikilinks]] (vault#555;
+ * see `resolveLinkTarget` in core/wikilinks.ts). Used for `links.remove`,
+ * where the bracket-cleanup step needs the target's `path`, not just its
+ * ID. `links.add` resolution goes through `resolveOrQueueLink` instead (it
+ * also queues a forward-ref on miss) — mirrors `core/src/mcp.ts`'s split
+ * exactly so the two surfaces can't drift.
+ */
+function resolveStructuredLinkNote(db: Store["db"], target: string): Note | null {
+  const id = resolveLinkTarget(db, target);
+  return id ? getNote(db, id) : null;
+}
+
 class NotFoundError extends Error {
   constructor(message: string) {
     super(message);
@@ -1475,6 +1489,14 @@ async function handleNotesInner(
       }
 
       const created: Note[] = [];
+      // Structured `links` are resolved in a second pass, after every note
+      // in this batch has been created (vault#555) — resolving inline (the
+      // old behavior) meant a link from item 0 to item 1's path silently
+      // dropped, since item 1 didn't exist yet at the moment item 0's links
+      // were processed. Mirrors the MCP create-note fix exactly (both
+      // layers share `resolveOrQueueLink` from core/wikilinks.ts).
+      const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
+      const linkWarningsByNote = new Map<string, QueryWarning[]>();
       // Wrap multi-item batches in a SQLite transaction so a mid-batch
       // failure (path conflict, etc.) rolls back every prior insert. Without
       // this, callers got half-applied batches where the prefix landed and
@@ -1510,15 +1532,35 @@ async function handleNotesInner(
             via: writeCtx.via,
           });
 
-          // Create explicit links
           if (item.links) {
-            for (const link of item.links as { target: string; relationship: string }[]) {
-              const target = await resolveNote(store, link.target);
-              if (target) await store.createLink(note.id, target.id, link.relationship);
-            }
+            pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
           }
 
           created.push((await store.getNote(note.id)) ?? note);
+        }
+
+        // --- Resolve structured links (vault#555) ---
+        // Same semantics as [[wikilinks]]: ID or path/title match, tried now
+        // that every sibling note in this batch exists. A target that still
+        // doesn't resolve is queued for lazy resolution (backfills
+        // automatically when a matching note is created later) and surfaces
+        // an `unresolved_link` warning naming the target — never silent.
+        for (const { sourceId, links } of pendingLinks) {
+          for (const link of links) {
+            const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            if (targetId) {
+              await store.createLink(sourceId, targetId, link.relationship);
+            } else {
+              const list = linkWarningsByNote.get(sourceId) ?? [];
+              list.push({
+                code: "unresolved_link",
+                message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+                target: link.target,
+                relationship: link.relationship,
+              });
+              linkWarningsByNote.set(sourceId, list);
+            }
+          }
         }
       };
       try {
@@ -1584,8 +1626,14 @@ async function handleNotesInner(
       // Attach `validation_status` so HTTP create-note matches the MCP
       // surface (vault#287). `attachValidationStatus` returns the note
       // unchanged when no tag declares fields, so vaults without any tag
-      // schemas see no behavior change.
-      const final = refreshed.map((n) => attachValidationStatus(store, db, n));
+      // schemas see no behavior change. Fold in any `unresolved_link`
+      // warnings (vault#555) — additive, present only when this note's
+      // `links` had a target that didn't resolve.
+      const final = refreshed.map((n) => {
+        const validated = attachValidationStatus(store, db, n);
+        const warnings = linkWarningsByNote.get(n.id);
+        return warnings && warnings.length > 0 ? { ...validated, warnings } : validated;
+      });
       return json(body.notes ? final : final[0], 201);
     }
 
@@ -1834,22 +1882,35 @@ async function handleNotesInner(
           //     fresh note).
           //   - Missing target notes skip silently (mirrors MCP).
           const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+          // `unresolved_link` warnings (vault#555) — a target that doesn't
+          // resolve is queued for lazy resolution (backfills automatically
+          // when a matching note is created later), never silently dropped.
+          const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const target = await resolveNote(store, link.target);
-              if (target) {
-                await store.createLink(created.id, target.id, link.relationship, link.metadata);
+              const targetId = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              if (targetId) {
+                await store.createLink(created.id, targetId, link.relationship, link.metadata);
+              } else {
+                createWarnings.push({
+                  code: "unresolved_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                });
               }
             }
           }
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
-          const validated = attachValidationStatus(store, db, final);
+          const validated: any = attachValidationStatus(store, db, final);
+          if (createWarnings.length > 0) validated.warnings = createWarnings;
           const includeContentResp = body.include_content !== false;
           if (includeContentResp) return json({ ...validated, created: true });
           const lean: any = toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
+          if (createWarnings.length > 0) lean.warnings = createWarnings;
           lean.created = true;
           return json(lean);
         }
@@ -1992,7 +2053,7 @@ async function handleNotesInner(
       const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
       if (linksRemove) {
         for (const link of linksRemove) {
-          const target = await resolveNote(store, link.target);
+          const target = resolveStructuredLinkNote(db, link.target);
           if (!target) continue;
           resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
           if (link.relationship === "wikilink" && target.path) {
@@ -2091,11 +2152,24 @@ async function handleNotesInner(
         await store.untagNote(note.id, body.tags.remove);
       }
 
-      // Add links
+      // Add links. `unresolved_link` warnings (vault#555) — a target that
+      // doesn't resolve is queued for lazy resolution (backfills
+      // automatically when a matching note is created later), never
+      // silently dropped.
+      const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const target = await resolveNote(store, link.target);
-          if (target) await store.createLink(note.id, target.id, link.relationship, link.metadata);
+          const targetId = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          if (targetId) {
+            await store.createLink(note.id, targetId, link.relationship, link.metadata);
+          } else {
+            linkWarnings.push({
+              code: "unresolved_link",
+              message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+              target: link.target,
+              relationship: link.relationship,
+            });
+          }
         }
       }
 
@@ -2130,6 +2204,7 @@ async function handleNotesInner(
           tagScope.raw,
         );
       }
+      if (linkWarnings.length > 0) validated.warnings = linkWarnings;
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
       // sync-loop callers using `if_missing: "create"` can distinguish
@@ -2142,6 +2217,7 @@ async function handleNotesInner(
       // Carry the link echo across the lean conversion — `toNoteIndex`
       // drops unknown fields, same as the `validation_status` recipe above.
       if (validated.links !== undefined) lean.links = validated.links;
+      if (linkWarnings.length > 0) lean.warnings = linkWarnings;
       lean.created = false;
       return json(lean);
     } catch (e: any) {

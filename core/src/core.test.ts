@@ -2253,6 +2253,92 @@ describe("MCP tools", async () => {
     expect(links.some((l) => l.relationship === "mentions")).toBe(true);
   });
 
+  // vault#555 — structured `links` used to resolve by exact path only (no
+  // basename/title fallback, unlike [[wikilinks]]). "Bare Title" against a
+  // note filed at "People/Alice" is a basename match, same as `[[Alice]]`.
+  it("create-note with links resolves targets by BASENAME (title), same as [[wikilinks]]", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    await store.createNote("Target", { path: "People/Alice" });
+    const result = await createNote.execute({
+      content: "Links to Alice by bare title",
+      links: [{ target: "Alice", relationship: "knows" }],
+    }) as any;
+    const links = await store.getLinks(result.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
+  // vault#555 — a link to a note created LATER in the same create-note
+  // batch used to silently drop (item 0 resolved before item 1 existed).
+  // The equivalent forward-ref via a [[wikilink]] already resolved; this
+  // makes structured `links` match.
+  it("create-note batch: a link to a note created LATER in the same batch resolves (forward-ref)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { path: "A", content: "links to B", links: [{ target: "B", relationship: "knows" }] },
+        { path: "B", content: "the target" },
+      ],
+    }) as any[];
+    const a = result.find((n: any) => n.path === "A");
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+    // No warning — it resolved within the batch.
+    expect(a.warnings).toBeUndefined();
+  });
+
+  // vault#555 — a target that genuinely can't resolve now must surface an
+  // `unresolved_link` warning (never silent), AND lazily backfill the edge
+  // the moment a matching note is created later — mirroring the
+  // `unresolved_wikilinks` forward-ref contract.
+  it("create-note with an unresolvable link target: warns now, backfills the edge when the target is created later", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "links to a note that doesn't exist yet",
+      links: [{ target: "Nonexistent Target", relationship: "knows" }],
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("unresolved_link");
+    expect(source.warnings[0].target).toBe("Nonexistent Target");
+    expect(source.warnings[0].relationship).toBe("knows");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Creating the target note later backfills the edge automatically.
+    const target = await store.createNote("here now", { path: "Nonexistent Target" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
+  // vault#555 — structured-link forward-refs (any relationship) must
+  // coexist with pending [[wikilink]] forward-refs on the SAME note without
+  // one clobbering the other when the note's content is re-synced.
+  it("pending structured-link forward-ref survives a wikilink content re-sync on the same note", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const source = await createNote.execute({
+      content: "no wikilinks yet",
+      links: [{ target: "Future Note", relationship: "knows" }],
+    }) as any;
+    expect(source.warnings?.[0]?.code).toBe("unresolved_link");
+
+    // Editing content (which re-syncs [[wikilink]]-kind unresolved entries)
+    // must not wipe the pending structured-link entry.
+    await updateNote.execute({ id: source.id, content: "now with a [[Some Other Unresolved Note]]", force: true });
+
+    const target = await store.createNote("arrived", { path: "Future Note" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "knows")).toBe(true);
+  });
+
   it("update-note tool updates created_at", async () => {
     const note = await store.createNote("Test");
     const tools = generateMcpTools(store);
@@ -2300,6 +2386,38 @@ describe("MCP tools", async () => {
     // Remove link
     await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
     expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#555 — update-note's links.add gets the same basename/title
+  // resolution + lazy forward-ref queueing as create-note's.
+  it("update-note links.add resolves by BASENAME and warns+queues when unresolvable", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("Target", { path: "People/Bob" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Basename match
+    const byTitle = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "Bob", relationship: "knows" }] },
+      force: true,
+    }) as any;
+    expect(byTitle.warnings).toBeUndefined();
+    expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
+
+    // Unresolvable target: warns, queues, backfills later.
+    const unresolved = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "Not Yet Real", relationship: "wants" }] },
+      force: true,
+    }) as any;
+    expect(unresolved.warnings).toBeDefined();
+    expect(unresolved.warnings[0].code).toBe("unresolved_link");
+    expect(unresolved.warnings[0].target).toBe("Not Yet Real");
+
+    const target = await store.createNote("arrived", { path: "Not Yet Real" });
+    const links = await store.getLinks("a", { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "wants")).toBe(true);
   });
 
   // vault feedback #8 — echo hydrated links on the update response when the

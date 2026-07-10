@@ -4248,6 +4248,59 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.links[0].targetId).toBe("c");
   });
 
+  // vault#555 — REST PATCH links.add gets the same basename/title
+  // resolution + lazy forward-ref queueing as the MCP update-note tool
+  // (both surfaces share core/wikilinks.ts's resolveOrQueueLink).
+  test("PATCH links.add resolves by BASENAME and warns+queues when unresolvable", async () => {
+    await store.createNote("a", { id: "a" });
+    await store.createNote("Bob's note", { path: "People/Bob" });
+    const byTitle = await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "Bob", relationship: "knows" }] }, force: true }),
+      store,
+      "/a",
+    );
+    expect(byTitle.status).toBe(200);
+    const byTitleBody = await byTitle.json() as any;
+    expect(byTitleBody.warnings).toBeUndefined();
+    expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
+
+    const unresolved = await handleNotes(
+      mkReq("PATCH", "/notes/a", { links: { add: [{ target: "Not Yet Real", relationship: "wants" }] }, force: true }),
+      store,
+      "/a",
+    );
+    const unresolvedBody = await unresolved.json() as any;
+    expect(unresolvedBody.warnings).toBeDefined();
+    expect(unresolvedBody.warnings[0].code).toBe("unresolved_link");
+    expect(unresolvedBody.warnings[0].target).toBe("Not Yet Real");
+
+    const target = await store.createNote("arrived", { path: "Not Yet Real" });
+    const links = await store.getLinks("a", { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "wants")).toBe(true);
+  });
+
+  // vault#555 — POST /notes batch: a link to a note created LATER in the
+  // same batch must resolve (forward-ref), matching MCP create-note.
+  test("POST /notes batch: a link to a note created LATER in the same batch resolves (forward-ref)", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        notes: [
+          { path: "RestA", content: "links to RestB", links: [{ target: "RestB", relationship: "knows" }] },
+          { path: "RestB", content: "the target" },
+        ],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any[];
+    const a = body.find((n: any) => n.path === "RestA");
+    expect(a.warnings).toBeUndefined();
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
   test("PATCH without a link mutation or flag does NOT include links", async () => {
     await store.createNote("a", { id: "a" });
     await store.createNote("b", { id: "b" });
