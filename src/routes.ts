@@ -13,7 +13,8 @@
 
 import type { Store, Note, QueryOpts } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
-import { collectUnknownTagWarnings, type QueryWarning } from "../core/src/query-warnings.ts";
+import { collectUnknownTagWarnings, emptySearchWarning, ignoredParamWarning, type QueryWarning } from "../core/src/query-warnings.ts";
+import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
 import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
@@ -661,6 +662,39 @@ export function parseExpandParam(url: URL): { expand?: TagExpandMode; error?: Re
 }
 
 /**
+ * Parse + validate `?search_mode=` (vault#551) — how `search` text is
+ * turned into an FTS5 query. "literal" (default, omit or pass explicitly):
+ * escape + phrase-quote so punctuation is literal content, not FTS5
+ * syntax. "advanced": raw FTS5 passthrough (pre-#551 behavior) for
+ * boolean/phrase/prefix operators. Same validation shape as
+ * `parseExpandParam` — loud 400 on an unknown value rather than a silent
+ * fallback to the default.
+ *
+ * Returns `{ mode }` (undefined when absent/empty → search branch defaults
+ * to "literal") or `{ error }` (a 400 Response) on an unknown value.
+ */
+function parseSearchModeParam(url: URL): { mode?: SearchMode; error?: Response } {
+  const raw = parseQuery(url, "search_mode");
+  if (raw === null || raw === "") return {};
+  if (!isValidSearchMode(raw)) {
+    return {
+      error: json(
+        {
+          error: `invalid \`search_mode\` value "${raw}" — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("literal").`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "search_mode",
+          got: raw,
+          hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+        },
+        400,
+      ),
+    };
+  }
+  return { mode: raw };
+}
+
+/**
  * Parse the shared notes-query parameters (tags / excludeTags / path /
  * pathPrefix / extension / metadata filters / date filters / sort / paging /
  * cursor) into a `QueryOpts`, plus flags for the query shapes that the live
@@ -973,11 +1007,54 @@ async function handleNotesInner(
         // value. The validated mode is threaded into the search tag-narrowing.
         const tagExpand = parseExpandParam(url);
         if (tagExpand.error) return tagExpand.error;
-        const rawResults = await store.searchNotes(search, {
-          tags: searchTags,
-          limit,
-          expand: tagExpand.expand,
-        });
+        // `search_mode` (vault#551) — same loud-validation policy as
+        // `expand` above; also bypasses `parseNotesQueryOpts` so it needs
+        // its own check here.
+        const searchModeParsed = parseSearchModeParam(url);
+        if (searchModeParsed.error) return searchModeParsed.error;
+        const mode: SearchMode = searchModeParsed.mode ?? "literal";
+        // `sort` under search (vault#551 item 3): omit for FTS5 relevance
+        // (default, unchanged); explicit asc/desc switches to created_at.
+        const sort = (parseQuery(url, "sort") as "asc" | "desc" | null) ?? undefined;
+
+        const searchWarnings: QueryWarning[] = [];
+        let rawResults: Note[];
+        // "Only whitespace/quotes" (vault#551 edge case) — short-circuit
+        // BEFORE ever calling FTS5 rather than risk a syntax error (or a
+        // meaningless always-empty query) on a degenerate escaped phrase.
+        if (mode === "literal" && buildLiteralSearchQuery(search).isEmpty) {
+          rawResults = [];
+          searchWarnings.push(emptySearchWarning());
+        } else {
+          try {
+            // A malformed `search_mode: "advanced"` query throws here
+            // (structured `invalid_search_syntax`, vault#551) instead of
+            // the pre-#551 silent `[]` — caught below and formatted the
+            // same way the structured-query path formats a `QueryError`.
+            rawResults = await store.searchNotes(search, {
+              tags: searchTags,
+              limit,
+              expand: tagExpand.expand,
+              mode,
+              sort,
+            });
+          } catch (e: any) {
+            if (e && e.name === "QueryError") {
+              return json(
+                {
+                  error: e.message,
+                  code: e.code ?? "INVALID_QUERY",
+                  ...(e.error_type !== undefined ? { error_type: e.error_type } : {}),
+                  ...(e.field !== undefined ? { field: e.field } : {}),
+                  ...(e.got !== undefined ? { got: e.got } : {}),
+                  ...(e.hint !== undefined ? { hint: e.hint } : {}),
+                },
+                400,
+              );
+            }
+            throw e;
+          }
+        }
         // Tag-scope: drop any result the token isn't permitted to see. Filter
         // happens after the store query so an empty post-filter list still
         // returns 200 [] (consistent with "no matches"), not 403.
@@ -1015,7 +1092,7 @@ async function handleNotesInner(
           );
           for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
         }
-        return json(output);
+        return jsonWithWarnings(output, searchWarnings);
       }
 
       // Structured query
@@ -1071,17 +1148,27 @@ async function handleNotesInner(
           400,
         );
       }
-      // Warnings channel (vault#550) — structured-query only for this wave
-      // (search= is out of scope, see #551). Skipped entirely for a
-      // tag-scoped session: `collectUnknownTagWarnings` resolves
-      // `did_you_mean` against the FULL vault-wide tag catalog, which would
-      // leak an out-of-scope tag's existence/name across the scope boundary
-      // — the same "no leak" stance this codebase takes everywhere else
-      // (docs/contracts/tag-scoped-tokens.md). `removed_param` warnings
-      // (below, at the response-shaping stage) carry no tag information and
-      // fire regardless of scope.
+      // Warnings channel (vault#550). `unknown_tag` stays structured-query
+      // only (skipped entirely for a tag-scoped session:
+      // `collectUnknownTagWarnings` resolves `did_you_mean` against the
+      // FULL vault-wide tag catalog, which would leak an out-of-scope tag's
+      // existence/name across the scope boundary — the same "no leak"
+      // stance this codebase takes everywhere else
+      // (docs/contracts/tag-scoped-tokens.md)). `removed_param` warnings
+      // carry no tag information and fire regardless of scope. `search_mode`
+      // without `search` (vault#551) also carries no tag information — this
+      // IS the structured-query path precisely because `search` was absent
+      // or empty, so a `search_mode` param here is always a no-op.
       const queryWarnings: QueryWarning[] = [
         ...collectRemovedParamWarnings(url),
+        ...(parseQuery(url, "search_mode")
+          ? [
+              ignoredParamWarning(
+                "search_mode",
+                "no `search` was provided — search_mode only affects full-text search query parsing",
+              ),
+            ]
+          : []),
         ...(tagScope.allowed === null
           ? collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy())
           : []),

@@ -440,6 +440,20 @@ describe("WS live-query — bad query + cap", () => {
     expect((await res.json()).code).toBe("UNSUPPORTED_SUBSCRIPTION_QUERY");
   });
 
+  // vault#551 — literal-by-default search + `search_mode` are a
+  // snapshot/REST-only concept (escaping happens in `core/src/notes.ts`
+  // `searchNotes`, which the live matcher never calls). `search` itself
+  // stays categorically unsupported for live subscriptions regardless of
+  // mode — confirms `search_mode` doesn't accidentally open a bypass.
+  it("rejects an unsupported query with search_mode present too — search_mode doesn't bypass the search rejection", async () => {
+    const { server } = makeServer();
+    const res = await fetch(`http://localhost:${server.port}/vault/${VAULT}/api/subscribe?search=hi&search_mode=advanced`, {
+      headers: { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "x", "Sec-WebSocket-Version": "13" },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).code).toBe("UNSUPPORTED_SUBSCRIPTION_QUERY");
+  });
+
   it("refuses over the per-vault cap (503) and self-heals when a socket closes", async () => {
     const { binding } = makeServer({ maxSubscriptions: 2 });
     const fakeWs = (): { data: SubscribeWsData; close(): void; send(): void } => ({

@@ -268,7 +268,10 @@ query returns `400 cursor_query_mismatch` rather than silently wrong rows.
 
 - `sort=desc` — descending iteration would skip newly-written rows.
 - `order_by=<other>` — incompatible with the updated_at keyset.
-- `search=` (full-text) — FTS owns its own ordering (relevance).
+- `search=` (full-text) — cursor pagination needs a stable keyset; FTS5
+  ranking (or, under an explicit `sort`, `created_at` ordering — see
+  [Full-text search](#endpoints) below) isn't cursor-stable the way
+  `(updated_at, id)` is.
 - `near[note_id]=` (graph neighborhood) — neighborhoods aren't
   cursor-stable.
 
@@ -323,10 +326,11 @@ Ratified principle: if the vault can still answer the question asked,
 answer it and attach a warning; if it would answer a DIFFERENT question,
 return a structured named error. Silence is never the third option.
 
-**Warnings channel (additive).** `GET /vault/{name}/api/notes` (structured
-query only — not `search=`) can return `warnings: [{code, message, ...}]`
-when something about the request looks like a mistake but the query still
-ran and the result is still meaningful. Two warning codes today:
+**Warnings channel (additive).** `GET /vault/{name}/api/notes` — both the
+structured-query path and (as of vault#551) `search=` — can return
+`warnings: [{code, message, ...}]` when something about the request looks
+like a mistake but the query still ran and the result is still meaningful.
+Warning codes today:
 
 - `unknown_tag` — a `tag=` filter names a tag with no identity row, no
   notes carrying it, and (given the request's `expand` axis) no expansion
@@ -336,20 +340,34 @@ ran and the result is still meaningful. Two warning codes today:
   query** — past the cap a single `warnings_truncated` entry (carrying
   `suppressed` + `limit`) reports how many were dropped, so a garbage
   `tags` array can't inflate the response or the header unboundedly.
+  Structured-query only.
 - `removed_param` — the flat `date_field` / `date_from` / `date_to` query
   params (removed at 0.6.4, see below) are present. Carries `param`. One
-  entry per removed param present.
+  entry per removed param present. Structured-query only.
+- `empty_search` (vault#551) — `search=` carried no literal content: blank/
+  whitespace-only, or (in the default literal `search_mode`, where a
+  manually-typed `"` is ordinary content rather than syntax) nothing but
+  quote characters. The query short-circuits to `[]` without ever calling
+  FTS5, rather than risking a syntax error on a degenerate escaped phrase.
+  `search=` only.
+- `ignored_param` (vault#551) — a param was passed that has no effect given
+  the rest of the request. Today's only case: `search_mode=` without
+  `search=` (the mode only shapes how `search` text becomes an FTS5 query).
+  Carries `param`. Structured-query only (by construction — this fires
+  precisely because `search=` was absent).
 
 **Surfacing differs by response shape** (compat-preserving — this is why
 it's additive, not a breaking wire-shape change):
 
 - **Bare-array responses** (no `cursor` param, e.g. the plain
-  `GET /notes?tag=...` list) keep the bare-array body — a code consumer
-  doing `for (const note of await res.json())` is unaffected — but gain a
-  response header, `X-Parachute-Warnings`, set only when there's something
-  to say: `encodeURIComponent(JSON.stringify(warnings))`. Percent-encoded
-  because header VALUES are ASCII/Latin1-only while warning `message` text
-  may not be; decode with `decodeURIComponent` then `JSON.parse`.
+  `GET /notes?tag=...` list — this includes `search=`, which is always a
+  bare `Note[]`, never an envelope) keep the bare-array body — a code
+  consumer doing `for (const note of await res.json())` is unaffected —
+  but gain a response header, `X-Parachute-Warnings`, set only when
+  there's something to say: `encodeURIComponent(JSON.stringify(warnings))`.
+  Percent-encoded because header VALUES are ASCII/Latin1-only while warning
+  `message` text may not be; decode with `decodeURIComponent` then
+  `JSON.parse`.
 - **Envelope responses** (cursor mode, `{notes, next_cursor}`; also
   `{nodes, edges}` for `?format=graph`) carry `warnings` INLINE in the body
   when non-empty, in addition to the same header.
@@ -374,6 +392,7 @@ the existing `error`/`code`:
   lexicographic string comparison against real ISO timestamps and quietly
   match nothing, or everything, depending on how the garbage happened to
   sort.
+- `search_mode` set to anything other than `literal` / `advanced`.
 
 ```json
 {
@@ -387,8 +406,32 @@ the existing `error`/`code`:
 ```
 
 The MCP `query-notes` tool call surfaces the identical `error_type` (via a
-structured JSON-RPC error) for the same three cases — see the tool
-description for `limit`/`offset`/`date_filter`.
+structured JSON-RPC error) for the same cases — see the tool description
+for `limit`/`offset`/`date_filter`/`search_mode`.
+
+**Structured invalids (400, `error_type: "invalid_search_syntax"`, vault#551).**
+A DISTINCT `error_type` from `invalid_query` above — this one is specifically
+about `search_mode: "advanced"` raw FTS5 syntax that FTS5 itself rejected
+(an unbalanced quote, a dangling boolean operator, ...). Before vault#551
+every FTS5 syntax error — in EITHER search mode — was silently swallowed
+into `[]`; that swallowing is now literal-mode-only (see
+[Full-text search](#endpoints) below), where it should be unreachable
+(escaping makes every input syntactically valid FTS5) rather than a real
+possibility to hide:
+
+```json
+{
+  "error": "invalid search syntax: fts5: syntax error near \".\"",
+  "code": "INVALID_QUERY",
+  "error_type": "invalid_search_syntax",
+  "field": "search",
+  "got": "18.6",
+  "hint": "FTS5 rejected this as advanced query syntax (fts5: syntax error near \".\"). Fix the syntax, or omit search_mode:\"advanced\" for literal (punctuation-safe) search."
+}
+```
+
+The MCP `query-notes` tool call surfaces the identical `error_type` (via a
+structured JSON-RPC error, `src/mcp-http.ts`).
 
 ## Content range — bounded reads for large notes
 
@@ -605,10 +648,48 @@ Query params:
     alias does compose with bracket *date* filters (`meta[created_at][gte]=…`),
     which are a separate axis.
 
-- **Full-text search**
-  - `search=query` — switches to FTS mode. Returns `Note[]` (full shape),
-    not `NoteIndex[]`. Optional `tag=` filters compose. `limit` defaults to
-    50. Incompatible with `cursor`.
+- **Full-text search** (vault#551 — literal-by-default)
+  - `search=query` — switches to FTS mode. Returns a bare array (lean
+    `NoteIndex[]` by default, `Note[]` with `include_content=true` — same
+    lean/full-shape default as the structured-query path). Optional `tag=`
+    filters compose. `limit` defaults to 50. Incompatible with `cursor`.
+  - **Literal by default.** Your query text is escaped and phrase-quoted
+    before it reaches FTS5: split on whitespace, each token wrapped in
+    `"..."` with internal `"` doubled, joined with spaces (implicit AND).
+    This is the fix for ordinary punctuation silently returning `[]` —
+    `search=didn't`, `search=eleven-day capping delay`, and `search=18.6`
+    all now find their matches; before vault#551 the bare hyphen was parsed
+    as an FTS5 NOT-operator and the apostrophe/decimal point broke the FTS5
+    parse outright.
+  - `search_mode=advanced` opts back into RAW FTS5 query syntax — the
+    pre-vault#551 behavior, unchanged: boolean operators (`AND`/`OR`/`NOT`),
+    manual phrase quoting (`"exact phrase"`), and prefix matching
+    (`term*`) are honored as syntax. A malformed advanced query now throws
+    a structured `400 invalid_search_syntax` (see above) instead of
+    silently returning `[]`. `search_mode` values other than
+    `literal`/`advanced` are `400 invalid_query`; passing `search_mode`
+    without `search` is a no-op that surfaces an `ignored_param` warning.
+  - **Breaking change / migration.** A caller who relied on raw FTS5 syntax
+    working under the DEFAULT `search=` (no `search_mode`) — e.g. manual
+    phrase quoting to force an exact match, boolean operators, prefix `*`
+    — must add `search_mode=advanced` to keep that exact behavior. A
+    manually-quoted phrase like `search="exact phrase"` still finds the
+    same content under the new literal default (the embedded quote
+    characters get escaped as content, and FTS5's tokenizer strips
+    punctuation from BOTH the query and the indexed content the same way,
+    so the match usually survives) — but is no longer being honored as
+    phrase SYNTAX, which matters if you were relying on the phrase
+    boundary specifically (e.g. `word1 word2*` prefix matching only inside
+    the phrase).
+  - **`sort` under search.** Default stays FTS5 relevance ranking
+    (unchanged). An EXPLICIT `sort=asc` or `sort=desc` switches ordering to
+    `created_at` instead — previously `sort` was silently ignored under
+    `search=` (the REST doc used to claim "FTS owns its own ordering";
+    that's now honored, not assumed).
+  - **`empty_search` warning.** A query that's blank, whitespace-only, or
+    (in literal mode) nothing but quote characters short-circuits to `[]`
+    with an `empty_search` warning instead of risking an FTS5 syntax error
+    on a degenerate escaped phrase. See the warnings channel above.
 
 - **Cursor pagination** (see [Cursor pagination](#cursor-pagination--the-since-last-checked-pattern))
   - `cursor=<opaque>` — switches response to `{notes, next_cursor}`.
@@ -640,9 +721,13 @@ Error shapes notable to callers:
   non-object value), or supplying both the `metadata=` alias and bracket
   `meta[...]` forms, etc.
 - `400 invalid_query` (vault#550) — negative/non-numeric `limit` or `offset`,
-  or an unparseable date value in a bracket date filter. Carries
-  `{error_type, field, got, hint}` — see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
+  an unparseable date value in a bracket date filter, or (vault#551) an
+  unrecognized `search_mode` value. Carries `{error_type, field, got, hint}`
+  — see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
   section.
+- `400 invalid_search_syntax` (vault#551) — `search_mode=advanced` raw FTS5
+  syntax that FTS5 itself rejected. Same `{error_type, field, got, hint}`
+  shape, distinct `error_type` from `invalid_query` above.
 - `400 cursor_invalid` / `400 cursor_query_mismatch` — see cursor section.
 - `409 ambiguous_path` — `id=<path>` resolved to more than one note. Body
   carries `path` + `candidates: NoteIndex[]`. Re-issue with the exact id of

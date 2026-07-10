@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import type { TagFieldSchema, TagRelationship, TagRelationshipMap, TagRecord } from "./tag-schemas.js";
 import type { PrunedField } from "./indexed-fields.js";
 import type { TagExpandMode, TagHierarchy } from "./tag-hierarchy.js";
+import type { SearchMode } from "./search-query.js";
 import type { ValidationStatus } from "./schema-defaults.js";
 import type { ConformanceReport } from "./conformance.js";
 import type { FindPathResult } from "./links.js";
@@ -314,7 +315,18 @@ export interface Store {
    * agent loop can persist a single watermark and keep polling.
    */
   queryNotesPaged(opts: QueryOpts): Promise<QueryNotesPage>;
-  searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode }): Promise<Note[]>;
+  /**
+   * `mode` (vault#551 — literal-by-default): "literal" (default) escapes +
+   * phrase-quotes the query so FTS5 punctuation syntax (hyphen = NOT, an
+   * apostrophe/period breaking the parse, ...) is treated as ordinary
+   * content. "advanced" passes `query` through to FTS5 raw (pre-#551
+   * behavior) for callers who want boolean/phrase/prefix operators — a
+   * syntax error in that mode throws (`error_type: "invalid_search_syntax"`)
+   * rather than silently returning `[]`. `sort` (vault#551): omitted stays
+   * FTS5 relevance ranking (default); an explicit "asc"/"desc" switches to
+   * `created_at` ordering. See `core/src/search-query.ts`.
+   */
+  searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode; mode?: SearchMode; sort?: "asc" | "desc" }): Promise<Note[]>;
 
   // Tags
   tagNote(noteId: string, tags: string[]): Promise<void>;

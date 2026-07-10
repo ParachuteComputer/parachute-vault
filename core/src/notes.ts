@@ -22,6 +22,7 @@ import {
 import { getIndexedField, releaseField } from "./indexed-fields.js";
 import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-hierarchy.js";
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
+import { buildLiteralSearchQuery, type SearchMode } from "./search-query.js";
 
 let idCounter = 0;
 
@@ -1309,12 +1310,59 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
   return { notes, next_cursor };
 }
 
+/**
+ * Turn a thrown FTS5 MATCH error into the structured `invalid_search_syntax`
+ * shape (vault#551, WS2A item 2) — advanced mode no longer swallows a
+ * syntax error into a silent `[]`; it surfaces it so the caller can fix the
+ * query or drop back to literal mode.
+ */
+function searchSyntaxError(rawQuery: string, err: unknown): QueryError {
+  const causeMessage = err instanceof Error ? err.message : String(err);
+  return new QueryError(
+    `invalid search syntax: ${causeMessage}`,
+    "INVALID_QUERY",
+    {
+      error_type: "invalid_search_syntax",
+      field: "search",
+      got: rawQuery,
+      hint: `FTS5 rejected this as advanced query syntax (${causeMessage}). Fix the syntax, or omit search_mode:"advanced" for literal (punctuation-safe) search.`,
+    },
+  );
+}
+
 export function searchNotes(
   db: Database,
   query: string,
-  opts?: { tags?: string[]; limit?: number },
+  opts?: { tags?: string[]; limit?: number; mode?: SearchMode; sort?: "asc" | "desc" },
 ): Note[] {
   const limit = typeof opts?.limit === "number" ? opts.limit : 50;
+  // Literal-by-default (vault#551): escape the caller's text so FTS5's own
+  // query syntax (hyphen = NOT, apostrophe/period = tokenizer breakage,
+  // etc.) is treated as ordinary content, not syntax. `search_mode:
+  // "advanced"` opts back into raw FTS5 query syntax — today's pre-#551
+  // behavior, unchanged — for callers who want boolean/phrase/prefix
+  // operators.
+  const mode: SearchMode = opts?.mode ?? "literal";
+  let ftsQuery: string;
+  if (mode === "literal") {
+    const built = buildLiteralSearchQuery(query);
+    // "Only whitespace/quotes" (vault#551 edge case): the caller (store.ts /
+    // the REST + MCP entry points) is expected to short-circuit this case
+    // itself (with an `empty_search` warning) before ever reaching here —
+    // this is a defensive fallback for any direct-core caller that skips
+    // that check.
+    if (built.isEmpty) return [];
+    ftsQuery = built.query;
+  } else {
+    ftsQuery = query;
+  }
+
+  // `sort` honored under search (vault#551 WS2A item 3): default stays FTS5
+  // relevance (`rank`, unchanged); an EXPLICIT `sort: "asc"|"desc"` switches
+  // to `created_at` ordering. Checked against the literal string values (not
+  // truthiness) so an absent `sort` can never accidentally match a branch.
+  const orderBy =
+    opts?.sort === "asc" ? "n.created_at ASC" : opts?.sort === "desc" ? "n.created_at DESC" : "rank";
 
   if (opts?.tags && opts.tags.length > 0) {
     // Canonical-bare-tag guard backstop (vault#XXX) for direct-core callers.
@@ -1334,12 +1382,18 @@ export function searchNotes(
         JOIN notes_fts fts ON fts.rowid = n.rowid
         WHERE notes_fts MATCH ?
           AND n.id IN (SELECT note_id FROM note_tags WHERE tag_name IN (${tagPlaceholders}))
-        ORDER BY rank
+        ORDER BY ${orderBy}
         LIMIT ?
-      `).all(query, ...searchTags, limit) as NoteRow[];
+      `).all(ftsQuery, ...searchTags, limit) as NoteRow[];
       return notesWithTags(db, rows);
-    } catch {
-      return [];
+    } catch (err) {
+      // Advanced mode: a raw FTS5 syntax error is surfaced structured, not
+      // swallowed (vault#551). Literal mode: escaping makes every input
+      // syntactically valid FTS5 — a throw here means the escaping itself
+      // has a bug, so it's rethrown untouched rather than hidden behind a
+      // silent `[]` (the very bug this wave fixes).
+      if (mode === "advanced") throw searchSyntaxError(query, err);
+      throw err;
     }
     }
   }
@@ -1349,12 +1403,13 @@ export function searchNotes(
       SELECT n.* FROM notes n
       JOIN notes_fts fts ON fts.rowid = n.rowid
       WHERE notes_fts MATCH ?
-      ORDER BY rank
+      ORDER BY ${orderBy}
       LIMIT ?
-    `).all(query, limit) as NoteRow[];
+    `).all(ftsQuery, limit) as NoteRow[];
     return notesWithTags(db, rows);
-  } catch {
-    return [];
+  } catch (err) {
+    if (mode === "advanced") throw searchSyntaxError(query, err);
+    throw err;
   }
 }
 

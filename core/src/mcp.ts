@@ -5,7 +5,8 @@ import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
-import { collectUnknownTagWarnings, type QueryWarning } from "./query-warnings.js";
+import { collectUnknownTagWarnings, emptySearchWarning, ignoredParamWarning, type QueryWarning } from "./query-warnings.js";
+import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
 import * as linkOps from "./links.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -243,7 +244,9 @@ Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returne
 Response shape (vault#550 — three variants, pick by what you passed):
 - Default (no \`cursor\`, no warnings): a bare array of notes.
 - Cursor mode (\`cursor\` param present — including \`cursor: ""\` to bootstrap): \`{notes: [...], next_cursor}\`. See \`cursor\` below for the bootstrap flow.
-- Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.`,
+- Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.
+
+\`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -297,7 +300,17 @@ Response shape (vault#550 — three variants, pick by what you passed):
             ],
             description: "Filter by file extension (vault#328). Pass a single extension (e.g. \"csv\") or an array (e.g. [\"csv\", \"yaml\", \"json\"]). Notes default to \"md\"; case-insensitive match.",
           },
-          search: { type: "string", description: "Full-text search query" },
+          search: {
+            type: "string",
+            description:
+              'Full-text search query. Literal-by-default (vault#551): your text is escaped and phrase-quoted before reaching FTS5, so punctuation ("didn\'t", "eleven-day", "18.6") is matched as literal content rather than parsed as FTS5 query syntax. Pass `search_mode: "advanced"` for raw FTS5 syntax (boolean/phrase/prefix operators). `sort` is honored under search (see below) — default is relevance ranking.',
+          },
+          search_mode: {
+            type: "string",
+            enum: [...SEARCH_MODES],
+            description:
+              'How `search` text is turned into an FTS5 query (vault#551). "literal" (DEFAULT): escape + phrase-quote the text so punctuation is literal content, not FTS5 syntax — the fix for `search: "didn\'t"` / "eleven-day" / "18.6" silently returning `[]`. "advanced": pass the text through to FTS5 raw, for callers who want boolean (AND/OR/NOT), manual phrase quoting, or prefix (`*`) syntax — a malformed advanced query throws a structured error (`error_type: "invalid_search_syntax"`) instead of silently returning `[]`. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default ("literal").',
+          },
           metadata: {
             type: "object",
             description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
@@ -328,7 +341,12 @@ Response shape (vault#550 — three variants, pick by what you passed):
             required: ["note_id"],
             description: "Scope results to notes within N hops of an anchor note",
           },
-          sort: { type: "string", enum: ["asc", "desc"], description: "Sort by created_at" },
+          sort: {
+            type: "string",
+            enum: ["asc", "desc"],
+            description:
+              'Sort by created_at. Under a structured query this is the only ordering (default "asc"). Under `search` (vault#551): omit for FTS5 relevance ranking (default, unchanged) — pass "asc"/"desc" to EXPLICITLY switch to created_at ordering instead of relevance.',
+          },
           limit: { type: "number", description: "Max results (default 50)" },
           offset: { type: "number", description: "Pagination offset (default 0)" },
           cursor: {
@@ -502,13 +520,37 @@ Response shape (vault#550 — three variants, pick by what you passed):
           expand = params.expand as TagExpandMode;
         }
 
+        // `search_mode` (vault#551) — validate loudly (same policy as
+        // `expand` above) so a typo'd value doesn't silently fall back to
+        // the default. Resolved here (before the search/structured branch)
+        // because BOTH branches need to know whether it was passed: the
+        // search branch to select escaping behavior, the structured branch
+        // to warn that it's being ignored.
+        let searchMode: SearchMode | undefined;
+        if (params.search_mode !== undefined && params.search_mode !== null) {
+          if (typeof params.search_mode !== "string" || !isValidSearchMode(params.search_mode)) {
+            throw new QueryError(
+              `invalid \`search_mode\` value ${JSON.stringify(params.search_mode)} — must be one of ${SEARCH_MODES.map((m) => `"${m}"`).join(", ")}. Omit for the default ("literal").`,
+              "INVALID_QUERY",
+              {
+                error_type: "invalid_query",
+                field: "search_mode",
+                got: params.search_mode,
+                hint: `pass "literal" or "advanced", or omit for the default ("literal")`,
+              },
+            );
+          }
+          searchMode = params.search_mode;
+        }
+
         // --- Full-text search ---
         let results: Note[];
         let nextCursor: string | null = null;
-        // Warnings channel (vault#550) — structured-query only for this
-        // wave; `search=` is out of scope (see #551). Scope-unaware by
-        // design (see `core/src/query-warnings.ts` doc comment) — a
-        // tag-scoped MCP session gets these stripped by the
+        // Warnings channel (vault#550). `search=` warnings (`empty_search`,
+        // `ignored_param` for a stray `search_mode`) joined the channel at
+        // #551 — the rest (`unknown_tag`) stays structured-query only.
+        // Scope-unaware by design (see `core/src/query-warnings.ts` doc
+        // comment) — a tag-scoped MCP session gets these stripped by the
         // `applyTagScopeWrappers` query-notes wrapper in `src/mcp-tools.ts`
         // before the result reaches the caller, so an out-of-scope tag name
         // never leaks via `did_you_mean`.
@@ -516,18 +558,47 @@ Response shape (vault#550 — three variants, pick by what you passed):
         if (params.search) {
           // Normalize tag param
           const tags = normalizeTags(params.tag);
-          // Route through `store.searchNotes` (not `noteOps.searchNotes`) so
-          // tag-hierarchy expansion fires for MCP callers the same as for
-          // HTTP REST callers — `tag: "manual"` matches descendants declared
-          // via `_tags/*` config notes. Mirrors the structured-query fix
-          // from #214; same class of bypass bug (tracked as #227).
-          results = await store.searchNotes(params.search as string, {
-            tags,
-            limit: (params.limit as number) ?? 50,
-            expand,
-          });
+          const mode: SearchMode = searchMode ?? "literal";
+          // "Only whitespace/quotes" (vault#551 edge case): short-circuit
+          // BEFORE ever calling FTS5 — an empty/all-punctuation phrase can
+          // be a syntax error (or a meaningless always-empty query)
+          // depending on exactly how it degenerates, so this is checked
+          // here rather than left to the DB layer to (maybe) reject.
+          if (mode === "literal" && buildLiteralSearchQuery(params.search as string).isEmpty) {
+            results = [];
+            queryWarnings.push(emptySearchWarning());
+          } else {
+            // Route through `store.searchNotes` (not `noteOps.searchNotes`) so
+            // tag-hierarchy expansion fires for MCP callers the same as for
+            // HTTP REST callers — `tag: "manual"` matches descendants declared
+            // via `_tags/*` config notes. Mirrors the structured-query fix
+            // from #214; same class of bypass bug (tracked as #227). A
+            // malformed advanced-mode query throws here (structured
+            // `invalid_search_syntax`, vault#551) — uncaught on purpose, it
+            // propagates to `src/mcp-http.ts`, which maps it to a JSON-RPC
+            // error the same way it maps `invalid_query`.
+            results = await store.searchNotes(params.search as string, {
+              tags,
+              limit: (params.limit as number) ?? 50,
+              expand,
+              mode,
+              sort: params.sort as "asc" | "desc" | undefined,
+            });
+          }
         } else {
           // --- Structured query ---
+          // `search_mode` only shapes how `search` text becomes an FTS5
+          // query — passing it without `search` is almost always a mistake
+          // (meant to pass `search` too), so flag it rather than silently
+          // doing nothing with it.
+          if (searchMode !== undefined) {
+            queryWarnings.push(
+              ignoredParamWarning(
+                "search_mode",
+                "no `search` was provided — search_mode only affects full-text search query parsing",
+              ),
+            );
+          }
           const tags = normalizeTags(params.tag);
           // Accept canonical `exclude_tags` plus camelCase / singular aliases.
           // LLM callers frequently pick the wrong name (training-data drift
@@ -574,7 +645,12 @@ Response shape (vault#550 — three variants, pick by what you passed):
             offset: params.offset as number | undefined,
             cursor: cursorMode ? (params.cursor as string) : undefined,
           };
-          queryWarnings = collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy());
+          // Concatenate (not overwrite) — `queryWarnings` may already carry
+          // the `ignored_param` warning for a stray `search_mode` pushed
+          // above (vault#551).
+          queryWarnings = queryWarnings.concat(
+            collectUnknownTagWarnings(db, queryOpts.tags, queryOpts.expand, store.getTagHierarchy()),
+          );
           if (cursorMode) {
             const page = await store.queryNotesPaged(queryOpts);
             results = page.notes;
