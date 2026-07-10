@@ -170,6 +170,8 @@ async function handleMcp(
         reason?: string;
         limit?: number;
         tag?: string;
+        cycle?: unknown;
+        referencing_tags?: unknown;
       };
       // Honest-queries validation errors (vault#550) — `limit`/`offset`/date
       // values that are structurally invalid rather than merely "no
@@ -311,6 +313,17 @@ async function handleMcp(
           error_type: "tag_field_conflict",
           tag: e.tag,
           violations: e.violations ?? [],
+        });
+      }
+      // parent_names cycle guard (vault#552) — `update-tag`'s write would
+      // close a cycle. Mirrors REST's 409 `parent_cycle` shape; the tool
+      // wrapper (src/mcp-tools.ts) scope-scrubs `cycle` before this throw
+      // for a tag-scoped caller, same as TAG_FIELD_CONFLICT above.
+      if (e?.code === "PARENT_CYCLE") {
+        throw new McpError(ErrorCode.InvalidRequest, message, {
+          error_type: "parent_cycle",
+          tag: e.tag,
+          cycle: e.cycle ?? [],
         });
       }
       // Generic catch-all (vault#554): any remaining error that carries a

@@ -388,3 +388,69 @@ export function findHierarchyCycles(h: TagHierarchy): string[] {
   }
   return cycles;
 }
+
+/**
+ * Cycle guard for a PROSPECTIVE `parent_names` write (vault#552). Setting
+ * `tag`'s parents to include `p` adds the edge `childrenOf[p] += tag` (tag
+ * becomes a child of `p`). That closes a cycle iff `tag` can ALREADY reach
+ * `p` via the existing hierarchy — i.e. `p` is already in `tag`'s descendant
+ * set — because the new edge would then let `p` reach back to itself through
+ * `tag`. Self-parent (`parentNames` containing `tag` itself) is caught by the
+ * same check: `getTagDescendants` always includes `tag` in its own result.
+ *
+ * Returns the offending cycle path (`[tag, ...existing chain down to p, p,
+ * tag]`, closing the loop) for the FIRST conflicting parent found, or `null`
+ * when no cycle would result. `h` must reflect the hierarchy BEFORE this
+ * write — the check only depends on OTHER tags' parent_names (edges pointing
+ * away from `tag`), never `tag`'s own current parent_names, so passing the
+ * pre-write hierarchy is always correct regardless of write ordering.
+ */
+export function findParentCycle(
+  h: TagHierarchy,
+  tag: string,
+  parentNames: string[],
+): string[] | null {
+  const descendants = getTagDescendants(h, tag);
+  for (const p of parentNames) {
+    if (descendants.has(p)) {
+      return [...findChildPath(h, tag, p), tag];
+    }
+  }
+  return null;
+}
+
+/**
+ * BFS shortest path from `from` to `to` following `childrenOf` edges
+ * (parent → child). Used only to render a human-legible cycle path for
+ * {@link findParentCycle}'s error — the existence of a path is already
+ * established by the caller (`to` is a known member of `from`'s descendant
+ * set) before this runs, so the fallback return is unreachable in practice
+ * and exists only to keep the function total.
+ */
+function findChildPath(h: TagHierarchy, from: string, to: string): string[] {
+  if (from === to) return [from];
+  const queue: string[] = [from];
+  const cameFrom = new Map<string, string>();
+  const visited = new Set<string>([from]);
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const children = h.childrenOf.get(current);
+    if (!children) continue;
+    for (const child of children) {
+      if (visited.has(child)) continue;
+      visited.add(child);
+      cameFrom.set(child, current);
+      if (child === to) {
+        const path = [to];
+        let node = to;
+        while (cameFrom.has(node)) {
+          node = cameFrom.get(node)!;
+          path.unshift(node);
+        }
+        return path;
+      }
+      queue.push(child);
+    }
+  }
+  return [from, to];
+}

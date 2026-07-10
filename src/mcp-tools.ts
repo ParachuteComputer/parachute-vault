@@ -23,11 +23,14 @@ import {
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
   scrubIndexedFieldConflictError,
+  scrubParentCycleError,
+  scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
-import { TagFieldConflictError } from "../core/src/tag-schemas.ts";
+import { TagFieldConflictError, ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
+import { runDoctorScan } from "../core/src/doctor.ts";
 import {
   findTokensReferencingTag,
   recordMcpMintLedger,
@@ -219,11 +222,12 @@ export function generateScopedMcpTools(
 }
 
 /**
- * Tag-delete and (future) tag-merge always check for tag-scoped tokens
- * referencing the doomed tag — regardless of whether the *deleter* is
- * itself tag-scoped. A successful delete that orphans an allowlist would
+ * Tag-delete and tag-merge always check for tag-scoped tokens referencing
+ * the doomed tag(s) — regardless of whether the CALLER is itself
+ * tag-scoped. A successful delete/merge that orphans an allowlist would
  * silently widen surface area downstream. Mirrors the REST 409
- * `tag_in_use_by_tokens` envelope.
+ * `tag_in_use_by_tokens` envelope (routes.ts's DELETE /tags/:name and
+ * POST /tags/merge run the identical check).
  */
 function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void {
   const store = getVaultStore(vaultName);
@@ -240,6 +244,29 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
           referenced_by,
         };
       }
+    }
+    return await orig(params);
+  });
+  // vault#552: merging consumes every source tag (same identity-drop as
+  // delete), so a source referenced by a tag-scoped token would orphan that
+  // token's allowlist exactly like a bare delete would. Aggregate matches
+  // across all sources into one 409-equivalent envelope, same shape REST's
+  // POST /tags/merge returns.
+  wrapReadTool(tools, "merge-tags", async (orig, params) => {
+    const sources = Array.isArray((params as any).sources) ? ((params as any).sources as unknown[]) : [];
+    const referenced: { source: string; tokens: { id: string; label: string }[] }[] = [];
+    for (const src of sources) {
+      if (typeof src !== "string") continue;
+      const tokens = findTokensReferencingTag(store.db, src);
+      if (tokens.length > 0) referenced.push({ source: src, tokens });
+    }
+    if (referenced.length > 0) {
+      return {
+        error: "TagInUseByTokens",
+        error_type: "tag_in_use_by_tokens",
+        message: `Cannot merge: ${referenced.length} source tag(s) referenced by tag-scoped token(s); revoke or re-mint them first.`,
+        referenced_by: referenced,
+      };
     }
     return await orig(params);
   });
@@ -535,6 +562,14 @@ function applyTagScopeWrappers(
       if (err instanceof IndexedFieldError) {
         throw scrubIndexedFieldConflictError(err, allowed);
       }
+      // parent_names cycle guard (vault#552) — the hierarchy `upsertTagRecord`
+      // validates against is vault-wide (scope-unaware by architecture), so
+      // the cycle path can name an out-of-scope tag. Same "write stays
+      // rejected, path gets generalized" posture as the field-conflict scrub
+      // above.
+      if (err instanceof ParentCycleError) {
+        throw scrubParentCycleError(err, allowed);
+      }
       throw err;
     }
   });
@@ -546,9 +581,59 @@ function applyTagScopeWrappers(
     if (typeof tag === "string" && !allowed.has(tag)) {
       return forbidden(`delete-tag: tag "${tag}" is outside the token's allowlist`);
     }
+    const result = await orig(params);
+    // Referential-integrity refusal (vault#552) — scrub out-of-scope
+    // referencing tag names before returning. The delete stays refused
+    // either way; only the response's tag-name visibility changes.
+    if (result && typeof result === "object" && (result as any).error_type === "tag_referenced_as_parent") {
+      return {
+        ...(result as Record<string, unknown>),
+        referencing_tags: scrubReferencingTagsByScope((result as any).referencing_tags ?? [], allowed),
+      };
+    }
+    return result;
+  });
+
+  // rename-tag / merge-tags (vault#552 — MCP parity with the pre-existing
+  // REST engine). Same tag-scope posture as update-tag/delete-tag: every
+  // tag NAMED in the request (source(s) + target, or old/new name) must be
+  // inside the caller's allowlist — a rename/merge that pulls a tag out of
+  // scope (or in) is a privilege-boundary move, refuse the whole op before
+  // it reaches core.
+  wrapReadTool(tools, "rename-tag", async (orig, params) => {
+    const allowed = await getAllowed();
+    if (!allowed) return await orig(params);
+    const oldName = (params as any).old_name ?? (params as any).from ?? (params as any).tag;
+    const newName = (params as any).new_name ?? (params as any).to;
+    for (const t of [oldName, newName]) {
+      if (typeof t === "string" && !allowed.has(t)) {
+        return forbidden(`rename-tag: tag "${t}" is outside the token's allowlist`);
+      }
+    }
     return await orig(params);
   });
 
+  wrapReadTool(tools, "merge-tags", async (orig, params) => {
+    const allowed = await getAllowed();
+    if (!allowed) return await orig(params);
+    const sources = Array.isArray((params as any).sources) ? ((params as any).sources as unknown[]) : [];
+    const target = (params as any).target;
+    for (const t of [...sources, target]) {
+      if (typeof t === "string" && !allowed.has(t)) {
+        return forbidden(`merge-tags: tag "${t}" is outside the token's allowlist`);
+      }
+    }
+    return await orig(params);
+  });
+
+  // doctor (vault#552) — the scan itself is re-run with the caller's
+  // expanded allowlist rather than post-filtering the unscoped result, so
+  // aggregate counts (findings summary) never reflect out-of-scope data.
+  wrapReadTool(tools, "doctor", async (orig, params) => {
+    const allowed = await getAllowed();
+    if (!allowed) return await orig(params);
+    return runDoctorScan(store.db, { allowedTags: allowed });
+  });
 }
 
 function wrapReadTool(

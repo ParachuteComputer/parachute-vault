@@ -70,6 +70,7 @@ import {
   handleUnresolvedWikilinks,
   handleStorage,
   handleViewNote,
+  handleDoctor,
   type TagScopeCtx,
   type WriteCtx,
 } from "./routes.ts";
@@ -823,6 +824,34 @@ export async function route(
     if (triggersPath === "/triggers" || triggersPath.startsWith("/triggers/")) {
       return handleTriggers(req, store, triggersPath.slice("/triggers".length), vaultName, auth);
     }
+  }
+
+  // /api/doctor — read-only taxonomy/metadata integrity scan (vault#552).
+  // Same "dispatch before the generic read/write gate" shape as /triggers
+  // above, because this is ADMIN-tier regardless of method (GET-only, but
+  // admin — not read — since it's a whole-vault diagnostic, same tier as
+  // the MCP `doctor` tool and `prune-schema`).
+  if (apiMatch[1] === "/doctor") {
+    if (req.method !== "GET") {
+      return Response.json({ error: "Method not allowed", error_type: "method_not_allowed" }, { status: 405 });
+    }
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    const doctorTagScope: TagScopeCtx = {
+      allowed: await expandTokenTagScope(store, auth.scoped_tags),
+      raw: auth.scoped_tags,
+    };
+    return handleDoctor(req, store, doctorTagScope);
   }
 
   // REST API — scope gate. GET/HEAD/OPTIONS → vault:read,

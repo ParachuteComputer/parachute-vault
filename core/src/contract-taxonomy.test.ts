@@ -9,9 +9,12 @@
  * flipped to real assertions in a later wave. See #552 for the full write-up.
  */
 
-import { describe, it, test, expect, beforeEach } from "bun:test";
+import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
+import { generateMcpTools } from "./mcp.js";
+import { ParentCycleError } from "./tag-schemas.js";
+import { declareField } from "./indexed-fields.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -100,20 +103,193 @@ describe("contract: taxonomy — passing (lock in current behavior)", () => {
   });
 });
 
-describe("contract: taxonomy — todo (#552)", () => {
-  test.todo(
-    "#552: deleting a tag still referenced in another tag's parent_names errors unless cascade/detach is passed (today: store.deleteTag succeeds unconditionally and leaves the referencing tag's parent_names pointing at a now-nonexistent tag name — verified with a fresh parent/child fixture)",
-  );
-  test.todo(
-    "#552: a parent_names cycle (A declares parent B, then B declares parent A) is rejected at write time (today: store.upsertTagRecord accepts both writes with no cycle check — traversal elsewhere is cycle-safe, but the write itself is not honest about creating one)",
-  );
-  test.todo(
-    "#552: rename-tag is exposed as an MCP tool, not just a REST endpoint (today: POST /api/tags/:name/rename exists and store.renameTag is wired, but generateMcpTools has no rename-tag tool — an MCP-only agent cannot rename a tag)",
-  );
-  test.todo(
-    "#552: merge-tags is exposed as an MCP tool, not just a REST endpoint (today: POST /api/tags/merge exists and store.mergeTags is wired, but generateMcpTools has no merge-tags tool)",
-  );
-  test.todo(
-    "#552: a `vault doctor` integrity scan reports dangling parent_names references (today: no doctor/scan surface inspects parent_names for referential integrity — the delete-tag gap above goes undetected)",
-  );
+describe("contract: taxonomy — #552 (flipped from test.todo)", () => {
+  it("rename-tag is exposed as an MCP tool and cascades parent_names — the gardener's exact bug no longer happens", async () => {
+    // Root tag, a child that declares it as a parent (the parent_names
+    // surface the gardener's rename left orphaned), and a note tagged with
+    // the CHILD only (proves subtype expansion still finds it post-rename).
+    await store.upsertTagRecord("proj", { description: "root project tag" });
+    await store.upsertTagRecord("special", { parent_names: ["proj"] });
+    const childTagged = await store.createNote("filed under the child tag", { tags: ["special"] });
+
+    const tools = generateMcpTools(store);
+    const renameTag = tools.find((t) => t.name === "rename-tag");
+    expect(renameTag).toBeDefined();
+    expect(renameTag!.requiredVerb).toBe("write");
+
+    const result = await renameTag!.execute({ old_name: "proj", new_name: "initiative" }) as any;
+    expect("error" in result).toBe(false);
+    expect(result.parent_refs_updated).toBeGreaterThanOrEqual(1);
+
+    // The exact gardener's bug: "special"'s parent_names must follow the
+    // rename, not keep pointing at the now-dead "proj".
+    const special = await store.getTagRecord("special");
+    expect(special?.parent_names).toEqual(["initiative"]);
+
+    // The renamed-away tag is NOT a live query surface anymore.
+    const projRecord = await store.getTagRecord("proj");
+    expect(projRecord).toBeNull();
+
+    // The NEW tag doesn't silently miss child-tagged notes (the gardener's
+    // second symptom): subtype expansion of "initiative" still reaches the
+    // note tagged only with the child "special".
+    const viaExpansion = await store.queryNotes({ tags: ["initiative"] });
+    expect(viaExpansion.map((n) => n.id)).toContain(childTagged.id);
+  });
+
+  it("rename-tag MCP tool reports target_exists (not a silent overwrite) and tag_not_found for a missing source", async () => {
+    await store.upsertTagRecord("a", {});
+    await store.upsertTagRecord("b", {});
+    const tools = generateMcpTools(store);
+    const renameTag = tools.find((t) => t.name === "rename-tag")!;
+
+    let caught: any;
+    try {
+      await renameTag.execute({ old_name: "a", new_name: "b" });
+    } catch (e) { caught = e; }
+    expect(caught?.error_type).toBe("target_exists");
+    expect(caught?.conflicting).toContain("b");
+
+    caught = undefined;
+    try {
+      await renameTag.execute({ old_name: "nonexistent", new_name: "whatever" });
+    } catch (e) { caught = e; }
+    expect(caught?.error_type).toBe("tag_not_found");
+  });
+
+  it("merge-tags is exposed as an MCP tool and merges N sources into one target", async () => {
+    await store.upsertTagRecord("draft", {});
+    await store.upsertTagRecord("wip", {});
+    const draftNote = await store.createNote("draft note", { tags: ["draft"] });
+    const wipNote = await store.createNote("wip note", { tags: ["wip"] });
+
+    const tools = generateMcpTools(store);
+    const mergeTags = tools.find((t) => t.name === "merge-tags");
+    expect(mergeTags).toBeDefined();
+    expect(mergeTags!.requiredVerb).toBe("write");
+
+    const result = await mergeTags!.execute({ sources: ["draft", "wip"], target: "active" }) as any;
+    expect(result.target).toBe("active");
+    expect(result.merged.draft).toBe(1);
+    expect(result.merged.wip).toBe(1);
+
+    const draftAfter = await store.getNote(draftNote.id);
+    const wipAfter = await store.getNote(wipNote.id);
+    expect(draftAfter!.tags).toEqual(["active"]);
+    expect(wipAfter!.tags).toEqual(["active"]);
+    expect(await store.getTagRecord("draft")).toBeNull();
+    expect(await store.getTagRecord("wip")).toBeNull();
+  });
+
+  it("delete-tag refuses a tag still referenced in another tag's parent_names, then cascade/detach both proceed and strip the reference", async () => {
+    await store.upsertTagRecord("proj", { description: "root" });
+    await store.upsertTagRecord("child", { parent_names: ["proj"] });
+
+    const tools = generateMcpTools(store);
+    const deleteTag = tools.find((t) => t.name === "delete-tag")!;
+
+    // Default (no flag): refused, nothing mutated.
+    const refused = await deleteTag.execute({ tag: "proj" }) as any;
+    expect(refused.error).toBe("tag_referenced_as_parent");
+    expect(refused.referencing_tags).toEqual(["child"]);
+    expect(await store.getTagRecord("proj")).not.toBeNull();
+    expect((await store.getTagRecord("child"))?.parent_names).toEqual(["proj"]);
+
+    // cascade: true proceeds and strips the stale reference.
+    const cascaded = await deleteTag.execute({ tag: "proj", cascade: true }) as any;
+    expect(cascaded.deleted).toBe(true);
+    expect(cascaded.parent_refs_detached).toBe(1);
+    expect(await store.getTagRecord("proj")).toBeNull();
+    expect((await store.getTagRecord("child"))?.parent_names ?? null).toBeFalsy();
+
+    // detach is a synonym — same repair, exercised on a second fixture.
+    await store.upsertTagRecord("proj2", { description: "root2" });
+    await store.upsertTagRecord("child2", { parent_names: ["proj2"] });
+    const detached = await deleteTag.execute({ tag: "proj2", detach: true }) as any;
+    expect(detached.deleted).toBe(true);
+    expect(detached.parent_refs_detached).toBe(1);
+    expect((await store.getTagRecord("child2"))?.parent_names ?? null).toBeFalsy();
+  });
+
+  it("a parent_names cycle (direct A→B→A, and bare self-parent) is rejected at write time with error_type parent_cycle", async () => {
+    await store.upsertTagRecord("B", {});
+    await store.upsertTagRecord("A", { parent_names: ["B"] });
+
+    let caught: unknown;
+    try {
+      await store.upsertTagRecord("B", { parent_names: ["A"] });
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(ParentCycleError);
+    const cycleErr = caught as ParentCycleError;
+    expect(cycleErr.error_type).toBe("parent_cycle");
+    expect(cycleErr.tag).toBe("B");
+    expect(cycleErr.cycle).toContain("A");
+    expect(cycleErr.cycle).toContain("B");
+    // Nothing persisted — B's parent_names is untouched by the rejected write.
+    expect((await store.getTagRecord("B"))?.parent_names ?? null).toBeFalsy();
+
+    // Bare self-parent: also caught (getTagDescendants always includes the
+    // tag itself).
+    let selfCaught: unknown;
+    try {
+      await store.upsertTagRecord("C", { parent_names: ["C"] });
+    } catch (e) { selfCaught = e; }
+    expect(selfCaught).toBeInstanceOf(ParentCycleError);
+    expect((selfCaught as ParentCycleError).cycle).toEqual(["C", "C"]);
+  });
+
+  it("doctor reports each finding type on a seeded-broken fixture, and stays clean on a healthy one", async () => {
+    // 1. dangling_parent_name — "ghost-parent" is never created as a tag row.
+    await store.upsertTagRecord("orphan-child", { parent_names: ["ghost-parent"] });
+
+    // 2. parent_names_cycle — the write-time guard blocks NEW cycles, so
+    // simulate pre-existing/pre-guard cyclic data with a direct DB write
+    // (same technique core.test.ts's cycle-tolerance tests use).
+    await store.upsertTagRecord("cyc-a", {});
+    await store.upsertTagRecord("cyc-b", { parent_names: ["cyc-a"] });
+    db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?").run(JSON.stringify(["cyc-b"]), "cyc-a");
+
+    // 3. mixed_type_indexed_field — "n" is indexed INTEGER, but this note's
+    // metadata.n is a JSON string. Not `strict`, so the write succeeds with
+    // just an advisory warning — landing exactly the mismatched value.
+    await store.upsertTagRecord("metric", { fields: { n: { type: "integer", indexed: true } } });
+    await store.createNote("bad metric", { tags: ["metric"], metadata: { n: "not-a-number" } });
+
+    // 4. orphaned_indexed_field_declarer — declare directly via the
+    // indexed-fields API, then drop the tag row WITHOUT releasing (the
+    // pre-fix gitcoin state prune-schema's own tests seed identically).
+    declareField(db, "legacy_status", "TEXT", "ghost-declarer");
+
+    // 5. dead_tag_metadata_reference (heuristic) — "epic" holds tag-shaped
+    // values elsewhere (a live tag), so a value that ISN'T a live tag is
+    // the drift signal.
+    await store.upsertTagRecord("launch-v2", {});
+    await store.createNote("current epic", { tags: ["launch-v2"], metadata: { epic: "launch-v2" } });
+    await store.createNote("stale epic reference", { tags: ["launch-v2"], metadata: { epic: "launch-v1" } });
+
+    const report = await store.doctor();
+    const byType = new Map(report.findings.map((f) => [f.type, f]));
+
+    expect(byType.get("dangling_parent_name")?.subject).toBe("orphan-child");
+    expect(byType.get("parent_names_cycle")).toBeDefined();
+    expect(byType.get("mixed_type_indexed_field")?.subject).toBe("n");
+    expect(byType.get("mixed_type_indexed_field")?.severity).toBe("error");
+    expect(byType.get("orphaned_indexed_field_declarer")?.subject).toBe("legacy_status");
+    const driftFinding = byType.get("dead_tag_metadata_reference");
+    expect(driftFinding?.subject).toBe("metadata.epic");
+    expect(driftFinding?.heuristic).toBe(true);
+    expect(driftFinding?.detail).toContain("launch-v1");
+
+    // Every finding type from the fixture is present — five distinct types.
+    expect(byType.size).toBe(5);
+
+    // A fresh, healthy vault reports clean.
+    const cleanDb = new Database(":memory:");
+    const cleanStore = new SqliteStore(cleanDb);
+    await cleanStore.upsertTagRecord("healthy", { description: "nothing wrong here" });
+    await cleanStore.createNote("fine", { tags: ["healthy"] });
+    const cleanReport = await cleanStore.doctor();
+    expect(cleanReport.findings).toEqual([]);
+    expect(cleanReport.summary).toContain("clean");
+  });
 });

@@ -17,6 +17,7 @@
 
 import { Database } from "bun:sqlite";
 import { mapFieldType, validateFieldName } from "./indexed-fields.js";
+import { loadTagHierarchy, findParentCycle } from "./tag-hierarchy.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -133,9 +134,47 @@ export function getTagRecord(db: Database, tag: string): TagRecord | null {
 }
 
 /**
+ * Thrown by `upsertTagRecord` (and therefore by both `PUT /api/tags/:name`
+ * and the MCP `update-tag` tool — this is the single chokepoint both share,
+ * see `core/src/store.ts:upsertTagRecord`) when the incoming `parent_names`
+ * would create a cycle in the hierarchy (vault#552). Traversal elsewhere
+ * (`getTagDescendants`) is already cycle-safe — a visited-set stops it from
+ * looping forever — but the WRITE itself was dishonest about creating one:
+ * an adversarial or accidental `A→B` then `B→A` (or a bare self-parent)
+ * silently succeeded pre-#552. `cycle` is the offending path, e.g.
+ * `["A", "B", "A"]` for a direct A↔B cycle, or the longer chain for a
+ * transitive one; the SERVER layer scope-scrubs out-of-scope names in it
+ * for a tag-scoped caller (`scrubParentCycleError` in src/tag-scope.ts),
+ * same posture as `TagFieldConflictError`.
+ */
+export class ParentCycleError extends Error {
+  code = "PARENT_CYCLE" as const;
+  error_type = "parent_cycle" as const;
+  tag: string;
+  cycle: string[];
+
+  constructor(tag: string, cycle: string[]) {
+    super(
+      `parent_cycle: setting "${tag}"'s parent_names would create a cycle: ${cycle.join(" → ")}`,
+    );
+    this.name = "ParentCycleError";
+    this.tag = tag;
+    this.cycle = cycle;
+  }
+}
+
+/**
  * Upsert a tag record — partial update. Any field left `undefined` is
  * preserved. Pass `null` explicitly to clear a column. Always touches
  * `updated_at`; sets `created_at` on first insert.
+ *
+ * Cycle guard (vault#552): when `patch.parent_names` is a non-empty array,
+ * validate it against the CURRENT hierarchy (loaded fresh — this function is
+ * the shared chokepoint for both REST and MCP, so it can't rely on a
+ * possibly-stale caller cache) before touching any row. A conflicting parent
+ * throws {@link ParentCycleError} and nothing is persisted — same
+ * fail-closed-before-any-write posture as the cross-tag field-conflict
+ * checks in this module.
  */
 export function upsertTagRecord(
   db: Database,
@@ -147,6 +186,12 @@ export function upsertTagRecord(
     parent_names?: string[] | null;
   },
 ): TagRecord {
+  if (patch.parent_names != null && patch.parent_names.length > 0) {
+    const hierarchy = loadTagHierarchy(db);
+    const cycle = findParentCycle(hierarchy, tag, patch.parent_names);
+    if (cycle) throw new ParentCycleError(tag, cycle);
+  }
+
   const now = new Date().toISOString();
   db.prepare(
     "INSERT OR IGNORE INTO tags (name, created_at, updated_at) VALUES (?, ?, ?)",

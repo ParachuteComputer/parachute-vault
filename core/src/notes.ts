@@ -1512,40 +1512,114 @@ export function listTags(db: Database): { name: string; count: number; expanded_
   return rows.map((r) => ({ ...r, expanded_count: expandedCounts.get(r.name) ?? 0 }));
 }
 
-export function deleteTag(db: Database, name: string): { deleted: boolean; notes_untagged: number } {
+/** Options accepted by {@link deleteTag} (vault#552). */
+export interface DeleteTagOpts {
+  /**
+   * Proceed with the delete even though another tag's `parent_names`
+   * references this one — strip the reference from every referencing tag's
+   * `parent_names` array as part of the same transaction. Accepted as a
+   * synonym of `detach` (both name the identical repair: remove the stale
+   * reference, never delete the referencing tag itself); offered as two
+   * flags because operators reach for either word depending on whether
+   * they're thinking "cascade the delete" or "detach the children."
+   */
+  cascade?: boolean;
+  /** Synonym of `cascade` — see above. */
+  detach?: boolean;
+}
+
+export type DeleteTagResult =
+  | { deleted: boolean; notes_untagged: number; parent_refs_detached?: number }
+  | { error: "tag_referenced_as_parent"; referencing_tags: string[] };
+
+/**
+ * Delete a tag: drop its identity row, untag every note carrying it, and
+ * release any indexed fields it exclusively declared. Notes themselves are
+ * NEVER deleted — only untagged.
+ *
+ * Referential integrity (vault#552): if another tag's `parent_names` array
+ * names `name`, deleting it would silently orphan that reference — the
+ * child tag's hierarchy edge would point at a name with no identity row
+ * (the exact "renamed-away tag remains a live query surface" class of bug
+ * the gardener found, one hop over from rename). Refuse by default with
+ * `{ error: "tag_referenced_as_parent", referencing_tags }`; pass
+ * `opts.cascade` or `opts.detach` (either — see {@link DeleteTagOpts}) to
+ * proceed, stripping `name` from every referencing tag's `parent_names` in
+ * the same transaction as the delete.
+ */
+export function deleteTag(db: Database, name: string, opts?: DeleteTagOpts): DeleteTagResult {
   const row = db.prepare("SELECT fields FROM tags WHERE name = ?").get(name) as
     | { fields: string | null }
     | null;
   if (!row) return { deleted: false, notes_untagged: 0 };
 
-  const countRow = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?").get(name) as { c: number };
-  const notesUntagged = countRow.c;
-
-  // Release any indexed fields this tag declared BEFORE the row drops.
-  // `releaseField` only drops the generated column + index when this tag is
-  // the last live declarer (co-declaration guard) — a field co-declared by
-  // another live tag keeps its column and just loses this tag from the set.
-  // This lives in the store-level delete (not the MCP layer) so every caller
-  // — MCP delete-tag, the REST DELETE /tags/:name route, the import
-  // blow-away sweep — releases consistently. See the gitcoin orphaned-fields
-  // bug report.
-  if (row.fields) {
-    try {
-      const fields = JSON.parse(row.fields) as Record<string, { indexed?: boolean }>;
-      for (const [fieldName, spec] of Object.entries(fields)) {
-        if (spec?.indexed === true) {
-          releaseField(db, fieldName, name);
-        }
-      }
-    } catch {
-      // Malformed fields JSON — nothing to release; proceed with the delete.
-    }
+  // Referential-integrity guard: who names `name` as a parent? Reuses the
+  // SAME parent_names parsing loadTagHierarchy uses everywhere else in the
+  // hierarchy (rather than a bespoke LIKE scan) so "who references this
+  // tag" answers identically here as it does for query expansion.
+  const hierarchy = loadTagHierarchy(db);
+  const referencing = Array.from(hierarchy.childrenOf.get(name) ?? []);
+  if (referencing.length > 0 && !opts?.cascade && !opts?.detach) {
+    return { error: "tag_referenced_as_parent", referencing_tags: referencing.sort() };
   }
 
-  db.prepare("DELETE FROM note_tags WHERE tag_name = ?").run(name);
-  db.prepare("DELETE FROM tags WHERE name = ?").run(name);
+  return transaction(db, (): DeleteTagResult => {
+    // Strip the stale reference from every referencing tag's parent_names
+    // BEFORE dropping this tag's own row — order doesn't matter for
+    // correctness (different rows), but doing the repair first means a
+    // mid-transaction failure never leaves the identity row gone with
+    // dangling references still pointing at it.
+    let parentRefsDetached = 0;
+    if (referencing.length > 0) {
+      const readStmt = db.prepare("SELECT parent_names FROM tags WHERE name = ?");
+      const updateStmt = db.prepare("UPDATE tags SET parent_names = ?, updated_at = ? WHERE name = ?");
+      const now = new Date().toISOString();
+      for (const refTag of referencing) {
+        const r = readStmt.get(refTag) as { parent_names: string | null } | null;
+        if (!r?.parent_names) continue;
+        let parsed: unknown;
+        try { parsed = JSON.parse(r.parent_names); } catch { continue; }
+        if (!Array.isArray(parsed)) continue;
+        const next = (parsed as unknown[]).filter((p) => p !== name);
+        if (next.length === parsed.length) continue;
+        updateStmt.run(next.length > 0 ? JSON.stringify(next) : null, now, refTag);
+        parentRefsDetached++;
+      }
+    }
 
-  return { deleted: true, notes_untagged: notesUntagged };
+    const countRow = db.prepare("SELECT COUNT(*) as c FROM note_tags WHERE tag_name = ?").get(name) as { c: number };
+    const notesUntagged = countRow.c;
+
+    // Release any indexed fields this tag declared BEFORE the row drops.
+    // `releaseField` only drops the generated column + index when this tag is
+    // the last live declarer (co-declaration guard) — a field co-declared by
+    // another live tag keeps its column and just loses this tag from the set.
+    // This lives in the store-level delete (not the MCP layer) so every caller
+    // — MCP delete-tag, the REST DELETE /tags/:name route, the import
+    // blow-away sweep — releases consistently. See the gitcoin orphaned-fields
+    // bug report.
+    if (row.fields) {
+      try {
+        const fields = JSON.parse(row.fields) as Record<string, { indexed?: boolean }>;
+        for (const [fieldName, spec] of Object.entries(fields)) {
+          if (spec?.indexed === true) {
+            releaseField(db, fieldName, name);
+          }
+        }
+      } catch {
+        // Malformed fields JSON — nothing to release; proceed with the delete.
+      }
+    }
+
+    db.prepare("DELETE FROM note_tags WHERE tag_name = ?").run(name);
+    db.prepare("DELETE FROM tags WHERE name = ?").run(name);
+
+    return {
+      deleted: true,
+      notes_untagged: notesUntagged,
+      ...(parentRefsDetached > 0 ? { parent_refs_detached: parentRefsDetached } : {}),
+    };
+  });
 }
 
 // The UNIQUE PRIMARY KEY on tags.name means rename-to-existing is ambiguous:

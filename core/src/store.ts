@@ -35,6 +35,7 @@ import {
   type ConformanceReport,
 } from "./conformance.js";
 import type { SearchMode } from "./search-query.js";
+import { runDoctorScan, type DoctorReport, type DoctorScanOpts } from "./doctor.js";
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -457,10 +458,15 @@ export class BunSqliteStore implements Store {
     return noteOps.listTags(this.db);
   }
 
-  async deleteTag(name: string): Promise<{ deleted: boolean; notes_untagged: number }> {
-    const result = noteOps.deleteTag(this.db, name);
+  async deleteTag(name: string, opts?: noteOps.DeleteTagOpts): Promise<noteOps.DeleteTagResult> {
+    const result = noteOps.deleteTag(this.db, name, opts);
+    // Referential-integrity refusal (vault#552) — nothing was written;
+    // caches and hooks are untouched.
+    if ("error" in result) return result;
     // The deleted tag may have been a parent or child in the hierarchy
-    // and may have declared `fields` powering schema validation.
+    // and may have declared `fields` powering schema validation. A
+    // cascade/detach repair also rewrites OTHER tags' parent_names, so
+    // busting the hierarchy cache covers both cases.
     this._tagHierarchy = null;
     this._schemaConfig = null;
     // Fire "deleted" only when SOMETHING happened (the underlying
@@ -642,6 +648,14 @@ export class BunSqliteStore implements Store {
     const count = reconcileDeclaredIndexes(this.db, schemas);
     if (count > 0) this._schemaConfig = null;
     return count;
+  }
+
+  /**
+   * Read-only taxonomy/metadata integrity scan (vault#552). Pure read — no
+   * cache invalidation needed since nothing is written.
+   */
+  async doctor(opts?: DoctorScanOpts): Promise<DoctorReport> {
+    return runDoctorScan(this.db, opts);
   }
 
   // ---- Tag Records (post-v14: full identity row) ----

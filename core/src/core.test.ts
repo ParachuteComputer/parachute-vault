@@ -2030,6 +2030,12 @@ describe("MCP tools", async () => {
     // prune-schema (admin) — drops orphaned indexed-field columns whose
     // declaring tags are gone. The gitcoin orphaned-fields fix.
     expect(names).toContain("prune-schema");
+    // rename-tag / merge-tags (vault#552) — MCP parity with the
+    // pre-existing REST rename/merge engine. doctor (admin, vault#552) —
+    // read-only taxonomy/metadata integrity scan.
+    expect(names).toContain("rename-tag");
+    expect(names).toContain("merge-tags");
+    expect(names).toContain("doctor");
     // Six note-schema tools (list/update/delete-note-schema +
     // list/set/delete-schema-mapping) retired in v17 — the standalone
     // note_schemas + schema_mappings subsystem was a parallel path to
@@ -2043,7 +2049,7 @@ describe("MCP tools", async () => {
     // synthesize-notes retired in v17 — replicable with query-notes(near=) +
     // find-path + agent-side aggregation. See vault#268.
     expect(names).not.toContain("synthesize-notes");
-    expect(tools).toHaveLength(10);
+    expect(tools).toHaveLength(13);
   });
 
   it("create-note tool works", async () => {
@@ -4170,7 +4176,17 @@ describe("tag hierarchy (tags.parent_names)", async () => {
 
   it("tolerates a cycle without infinite-looping", async () => {
     await store.upsertTagRecord("a", { parent_names: ["b"] });
-    await store.upsertTagRecord("b", { parent_names: ["a"] });
+    await store.upsertTagRecord("b", {}); // bare row, no parent yet
+    // vault#552: upsertTagRecord now REJECTS a parent_names write that would
+    // close a cycle, so the second leg of the cycle can no longer be built
+    // via the public API — simulate pre-existing cyclic data (written
+    // before the guard shipped, or via any path that bypasses it) with a
+    // direct DB write, same technique as "malformed parent_names JSON is
+    // ignored silently" below. Traversal must stay cycle-safe regardless of
+    // how the cycle got there.
+    (store as any).db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?")
+      .run(JSON.stringify(["a"]), "b");
+    (store as any)._tagHierarchy = null;
     await store.createNote("note-a", { tags: ["a"] });
 
     // Both a and b should resolve without hanging; both reach the same set {a, b}.
@@ -4803,14 +4819,21 @@ describe("schema inheritance via parent_names (vault#270)", async () => {
   });
 
   it("cycle: A→B, B→A — no infinite loop, both fields visible", async () => {
+    await store.upsertTagRecord("B", {
+      fields: { b_field: { type: "string" } },
+    });
     await store.upsertTagRecord("A", {
       parent_names: ["B"],
       fields: { a_field: { type: "string" } },
     });
-    await store.upsertTagRecord("B", {
-      parent_names: ["A"],
-      fields: { b_field: { type: "string" } },
-    });
+    // vault#552: upsertTagRecord now REJECTS the write that would close this
+    // cycle (B declaring A as parent, when A already declares B) — simulate
+    // pre-existing cyclic data with a direct DB write, same technique as the
+    // "tolerates a cycle without infinite-looping" test above.
+    (store as any).db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?")
+      .run(JSON.stringify(["A"]), "B");
+    (store as any)._tagHierarchy = null;
+    (store as any)._schemaConfig = null;
 
     const tools = generateMcpTools(store);
     const create = tools.find((t) => t.name === "create-note")!;

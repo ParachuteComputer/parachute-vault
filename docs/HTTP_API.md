@@ -489,6 +489,8 @@ the `error_type` and fields are identical.
 | `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
 | `tag_in_use_by_tokens` | 409 | `tag`, `referenced_by[]` | Deleting or merging away this tag would orphan a tag-scoped token's allowlist. Revoke or re-mint the token(s) first. |
 | `target_exists` | 409 | `target`, `conflicting` | `POST /tags/{name}/rename`'s `new_name` (or a sub-tag of it) already exists — use `POST /tags/merge` instead. |
+| `tag_referenced_as_parent` | 409 | `tag`, `referencing_tags[]` | vault#552: `DELETE /tags/{name}` refused because another tag's `parent_names` still names this one — deleting would silently orphan that reference. Pass `?cascade=true` or `?detach=true` (synonyms — either strips the stale reference from every referencing tag's `parent_names`; neither deletes the referencing tags) to proceed. **Tag-scope generalization:** `referencing_tags` entries outside the caller's allowlist are replaced with a generic label — the delete stays refused either way (referential integrity is scope-independent). |
+| `parent_cycle` | 409 | `tag`, `cycle[]` | vault#552: `PUT /tags/{name}`'s `parent_names` would create a cycle in the hierarchy (a direct A↔B, a longer transitive chain, or a bare self-parent). `cycle` is the offending path (e.g. `["A", "B", "A"]`). Nothing is persisted. **Tag-scope generalization:** a hop in `cycle` outside the caller's allowlist is replaced with a generic label; the caller's own tag (`tag`) is always in-scope and never redacted. |
 
 ### Query / search validation
 
@@ -1300,18 +1302,46 @@ tag name, no declared type/flag, `other_tag` omitted), and the
 when any declarer is out of scope. In-scope declarers keep full detail;
 unscoped callers always see full detail.
 
+**`parent_names` cycle guard (vault#552).** A `parent_names` write that
+would create a cycle (a direct A↔B, a longer transitive chain, or a bare
+self-parent) is **rejected with `409` and `error_type: "parent_cycle"`**,
+carrying `{ tag, cycle: [...] }` (the offending path). Traversal elsewhere
+(`getTagDescendants`) was already cycle-safe — a visited-set stops it
+looping forever — but the write itself was previously dishonest about
+creating one; this closes that gap. Nothing is persisted on rejection. The
+MCP `update-tag` tool reports the same shape via a structured JSON-RPC
+error. See the error taxonomy table above for the full field contract,
+including the tag-scope generalization.
+
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
 Removes the tag, its identity row, and untags every note. Returns the
-delete result. Refused with `409 tag_in_use_by_tokens` if any tag-scoped
-token references this tag — revoke or re-mint the tokens first.
+delete result — `{ deleted: true, notes_untagged: number, parent_refs_detached?: number }`.
+Refused with `409 tag_in_use_by_tokens` if any tag-scoped token references
+this tag — revoke or re-mint the tokens first.
+
+**Referential integrity (vault#552).** Also refused — with `409` and
+`error_type: "tag_referenced_as_parent"`, carrying `{ tag, referencing_tags: [...] }`
+— when another tag's `parent_names` still names this one; deleting would
+silently orphan that reference (the exact class of bug a manual
+retag→delete dance produces — see `rename-tag` below). Pass
+`?cascade=true` or `?detach=true` (query params — **synonyms**: either one
+strips the stale reference from every referencing tag's `parent_names` in
+the same transaction as the delete; neither deletes the referencing tags
+themselves) to proceed anyway. Default (neither flag) is refuse. See the
+error taxonomy table above for the tag-scope generalization on
+`referencing_tags`.
 
 #### `POST /vault/{name}/api/tags/{name}/rename` — `vault:write`
-Body: `{ "new_name": string }`. Atomically renames the tag across the
-`tags`, `note_tags`, and `tag_schemas` tables in a single transaction; the
-rename also cascades into tag-scoped tokens' allowlists.
+Body: `{ "new_name": string }`. Atomically renames the tag across EVERY
+surface that references it in a single transaction: the `tags` row,
+`note_tags`, OTHER tags' `parent_names`, tag-scoped tokens' allowlists,
+indexed-field declarer lists, inline `#tag` mentions in note bodies, and
+`_tags/<name>` config-note paths. Sub-tags rename recursively (`task` →
+`todo` also renames `task/work` → `todo/work`).
 
-Returns `{ "renamed": number }` — the number of `note_tags` rows
-rewritten.
+Returns the full cascade report: `{ renamed, sub_tags_renamed, parent_refs_updated, tokens_updated, indexed_field_declarers_updated, notes_rewritten, paths_renamed }`
+(`renamed` is the `note_tags` rows rewritten, cumulative across the root +
+every sub-tag).
 
 Errors:
 
@@ -1320,11 +1350,26 @@ Errors:
   tag. Caller should `POST /tags/merge` instead if combining the two tags
   is the intent.
 
+**Does NOT rewrite metadata.** A metadata value that happens to equal the
+old tag name (e.g. `metadata.epic: "task"`) is left untouched — rename's
+cascade is structural (tags/note_tags/parent_names/tokens/content), not a
+blind string search-and-replace over arbitrary metadata values. The
+`doctor` scan's `dead_tag_metadata_reference` finding flags this drift
+class heuristically after the fact.
+
+**MCP parity (vault#552).** Exposed as the `rename-tag` MCP tool —
+`{ old_name (aliases: from, tag), new_name (alias: to) }` — delegating to
+the SAME `store.renameTag` this endpoint calls; same cascade, same error
+shapes (`tag_not_found` / `target_exists` as structured JSON-RPC errors).
+Tag-scoped callers: both `old_name` and `new_name` must be in the caller's
+allowlist.
+
 #### `POST /vault/{name}/api/tags/merge` — `vault:write`
 Body: `{ "sources": string[], "target": string }`. Retags every note
 carrying any of the `sources` tags with `target`, then drops the source
-tags (and their schemas) in a single transaction. `target`'s own schema is
-preserved.
+tags (and their identity rows — description/fields/relationships/parent_names)
+in a single transaction. `target`'s own schema is preserved (sources'
+schemas are consumed, not merged field-by-field).
 
 `target` is created if it doesn't exist yet. Sources that don't exist are
 recorded with count `0`. Duplicate sources are deduped; `target` appearing
@@ -1334,6 +1379,46 @@ Returns `{ "merged": { [source]: count }, "target": string }`.
 
 Refused with `409 tag_in_use_by_tokens` if any source tag is referenced by
 a tag-scoped token.
+
+**MCP parity (vault#552).** Exposed as the `merge-tags` MCP tool —
+`{ sources: string[], target: string }` — delegating to the SAME
+`store.mergeTags` this endpoint calls, including the same token-reference
+guard. Tag-scoped callers: every source AND the target must be in the
+caller's allowlist.
+
+#### `GET /vault/{name}/api/doctor` — `vault:admin`
+Read-only integrity scan across the tag/metadata taxonomy (vault#552) —
+run after any bulk tag reorg (rename/merge/delete/subtree move) to confirm
+nothing leaked. Admin-tier regardless of method (this is a whole-vault
+diagnostic, same tier as the MCP `doctor` tool and `prune-schema`), gated
+BEFORE the generic read/write scope check — same dispatch shape as
+`/api/triggers`.
+
+Never mutates. Returns `{ findings: [...], summary: string, scanned_at: string }`,
+where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
+
+- `dangling_parent_name` (`warning`) — a `parent_names` entry naming a tag
+  with no identity row.
+- `parent_names_cycle` (`error`) — a tag reaching itself through its
+  declared ancestor chain (surfaces pre-existing/pre-guard cyclic data;
+  see the `parent_cycle` write-time guard above).
+- `mixed_type_indexed_field` (`error`) — a note's `metadata.<field>` value
+  has a JSON type disagreeing with the field's declared indexed sqlite
+  type — the WS4 typed-index migration's pre-flight check; the finding
+  shape is intentionally reusable there.
+- `orphaned_indexed_field_declarer` (`warning`/`info`) — an indexed field
+  naming a dead declarer tag; overlaps `prune-schema`, which is the
+  suggested remedy.
+- `dead_tag_metadata_reference` (`info`, always carries `heuristic: true`)
+  — a metadata value that looks like a stale reference to a
+  renamed/merged/deleted tag, inferred from sibling notes using the same
+  metadata key with values that ARE live tags. Never certain — vault keeps
+  no tag-rename history.
+
+**Tag-scope.** A tag-scoped admin token's scan covers only in-scope
+tags/fields/notes — the report is re-run with the caller's expanded
+allowlist rather than filtered after the fact, so aggregate `summary`
+counts never reflect out-of-scope activity.
 
 ### Vault config
 
