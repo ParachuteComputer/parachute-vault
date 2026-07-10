@@ -597,6 +597,22 @@ describe("renameTag cascade (vault#240 + #247)", async () => {
     expect(fresh!.content).toContain("#other"); // untouched
   });
 
+  // vault#555 fix 2 — a rename cascade's inline content rewrite is a real
+  // persisted-state change; `updated_at` must move or a cursor/sync-poll
+  // loop never sees the rewritten note.
+  it("1b. content rewrite bumps updated_at (vault#555)", async () => {
+    const note = await store.createNote("Today's #task is important.", { tags: ["task"] });
+    const before = note.updatedAt;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await store.renameTag("task", "todo");
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.content).toContain("#todo");
+    expect(fresh!.updatedAt).not.toBe(before);
+    expect(new Date(fresh!.updatedAt) > new Date(before)).toBe(true);
+  });
+
   it("2. cascades sub-tags recursively (task → todo, task/work → todo/work, task/work/client → todo/work/client)", async () => {
     await store.createNote("a", { tags: ["task"] });
     await store.createNote("b", { tags: ["task/work"] });
@@ -2371,6 +2387,47 @@ describe("MCP tools", async () => {
     await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] }, force: true });
     expect((await store.getNote(note.id))!.tags).not.toContain("pinned");
     expect((await store.getNote(note.id))!.tags).toContain("daily");
+  });
+
+  // vault#555 fix 2 — a tag-only (or links-only) update-note call with
+  // `force: true` (no `if_updated_at`) used to leave `updated_at` frozen:
+  // the mcp.ts `updates` object had no core fields, so `store.updateNote`
+  // was never even called. Breaks cursor polling (ORDER BY updated_at) and
+  // any updated_at-based sync filter.
+  it("update-note tags-only mutation with force:true bumps updated_at", async () => {
+    const note = await store.createNote("Test");
+    const before = note.updatedAt;
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await updateNote.execute({ id: note.id, tags: { add: ["pinned"] }, force: true });
+    const after1 = (await store.getNote(note.id))!.updatedAt;
+    expect(after1).not.toBe(before);
+    expect(new Date(after1) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] }, force: true });
+    const after2 = (await store.getNote(note.id))!.updatedAt;
+    expect(new Date(after2) > new Date(after1)).toBe(true);
+  });
+
+  it("update-note links-only mutation with force:true bumps updated_at", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    const before = (await store.getNote("a"))!.updatedAt;
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true });
+    const after1 = (await store.getNote("a"))!.updatedAt;
+    expect(new Date(after1) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
+    const after2 = (await store.getNote("a"))!.updatedAt;
+    expect(new Date(after2) > new Date(after1)).toBe(true);
   });
 
   it("update-note links add/remove works", async () => {

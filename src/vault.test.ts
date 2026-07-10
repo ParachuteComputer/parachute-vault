@@ -4185,6 +4185,34 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(body.tags).not.toContain("old");
   });
 
+  // vault#555 fix 2 — a tags-only (or links-only) PATCH with `force: true`
+  // (no `if_updated_at`) used to leave `updated_at` frozen: `updates` had no
+  // core fields, so `store.updateNote` was never called at all.
+  test("PATCH tags-only/links-only with force:true bumps updated_at", async () => {
+    await store.createNote("x", { id: "x", tags: ["old"] });
+    await store.createNote("y", { id: "y" });
+    const before = (await store.getNote("x"))!.updatedAt;
+    await new Promise((r) => setTimeout(r, 5));
+
+    const tagsRes = await handleNotes(
+      mkReq("PATCH", "/notes/x", { tags: { add: ["new"] }, force: true }),
+      store,
+      "/x",
+    );
+    const tagsBody = await tagsRes.json() as any;
+    expect(tagsBody.updatedAt).not.toBe(before);
+    expect(new Date(tagsBody.updatedAt) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    const linksRes = await handleNotes(
+      mkReq("PATCH", "/notes/x", { links: { add: [{ target: "y", relationship: "mentions" }] }, force: true }),
+      store,
+      "/x",
+    );
+    const linksBody = await linksRes.json() as any;
+    expect(new Date(linksBody.updatedAt) > new Date(tagsBody.updatedAt)).toBe(true);
+  });
+
   test("PATCH adds/removes links", async () => {
     await store.createNote("a", { id: "a" });
     await store.createNote("b", { id: "b" });

@@ -1462,8 +1462,25 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta });
             }
 
+            // vault#555 fix 2 — tag and link mutations must bump `updated_at`
+            // too, not just core-field (content/path/metadata) changes. Before
+            // this, a tags-only or links-only call with `force: true` (no
+            // `if_updated_at`) left `updates` completely empty — the branch
+            // below skipped `store.updateNote` ENTIRELY, so `updated_at` never
+            // moved even though tags/note_tags or links genuinely changed.
+            // (A tags-only call that happened to pass `if_updated_at` already
+            // worked by accident — it populated `updates.if_updated_at` — which
+            // is why this was easy to miss in ad hoc testing.) This breaks
+            // cursor polling (`ORDER BY updated_at`) and any `updated_at`-based
+            // sync filter: the mutation is real but invisible to a
+            // since-last-check loop.
+            const hasTagMutation = ((item.tags as any)?.add?.length ?? 0) > 0
+              || ((item.tags as any)?.remove?.length ?? 0) > 0;
+            const hasLinkMutation = (item.links as any)?.add !== undefined
+              || (item.links as any)?.remove !== undefined;
+
             let result: Note;
-            if (Object.keys(updates).length > 0) {
+            if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
               // Write-attribution (vault#298): stamp the most-recent-write
               // columns on the same UPDATE that bumps `updated_at`. Only set when
               // there's a real change to write (the empty-updates branch below
@@ -1474,7 +1491,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               // store.updateNote routes through noteOps.updateNote, which runs
               // the UPDATE (with optional `AND updated_at IS ?`) atomically and
               // throws ConflictError on mismatch. No mutations have happened
-              // yet, so a throw here leaves the note untouched.
+              // yet, so a throw here leaves the note untouched. `updates` may
+              // carry no core fields at all (a pure tag/link mutation) — that's
+              // fine: `noteOps.updateNote` unconditionally SETs
+              // `updated_at`/`last_updated_by`/`last_updated_via` whenever
+              // `skipUpdatedAt` isn't set, so this still issues a real UPDATE
+              // (not the true no-op/precondition-only branch, which only fires
+              // when the caller passes ZERO fields AND no mutation is pending).
               result = await store.updateNote(note.id, updates);
             } else {
               result = note;

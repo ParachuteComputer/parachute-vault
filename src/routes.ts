@@ -2130,9 +2130,21 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
       }
 
-      if (Object.keys(updates).length > 0) {
+      // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
+      // not just core-field (content/path/metadata) changes. Mirrors the MCP
+      // `update-note` fix exactly: a tags-only or links-only PATCH with
+      // `force: true` (no `if_updated_at`) left `updates` empty, so
+      // `store.updateNote` was never even called and `updated_at` never
+      // moved despite a real tags/note_tags or links change.
+      const hasTagMutation = (body.tags?.add?.length ?? 0) > 0 || (body.tags?.remove?.length ?? 0) > 0;
+      const hasLinkMutation = body.links?.add !== undefined || body.links?.remove !== undefined;
+      if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         // Write-attribution (vault#298) — REST update. Stamp the most-recent-
-        // write columns on the same UPDATE that bumps updated_at.
+        // write columns on the same UPDATE that bumps updated_at. `updates`
+        // may carry no core fields at all (a pure tag/link mutation) — that's
+        // fine: `noteOps.updateNote` unconditionally SETs
+        // `updated_at`/`last_updated_by`/`last_updated_via` whenever
+        // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
         await store.updateNote(note.id, updates);

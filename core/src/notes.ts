@@ -1926,11 +1926,17 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       const candidates = db
         .prepare(`SELECT id, content FROM notes WHERE content IS NOT NULL AND content != '' AND (${orClauses})`)
         .all(...params) as { id: string; content: string }[];
-      const updateStmt = db.prepare("UPDATE notes SET content = ? WHERE id = ?");
+      // vault#555 fix 2 — this content rewrite is a real persisted-state
+      // change (the note's `#oldtag` references literally became
+      // `#newtag`) and must bump `updated_at` like any other content
+      // write, or a cursor/sync-poll loop never sees it. Shares the one
+      // `now` timestamp for the whole cascade (same convention as the
+      // tag-row rename pass above).
+      const updateStmt = db.prepare("UPDATE notes SET content = ?, updated_at = ? WHERE id = ?");
       for (const row of candidates) {
         const next = rewriteNoteBody(row.content, renames);
         if (next === row.content) continue;
-        updateStmt.run(next, row.id);
+        updateStmt.run(next, now, row.id);
         notesRewritten++;
       }
     }
@@ -1945,11 +1951,13 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       const candidates = db
         .prepare(`SELECT id, path FROM notes WHERE path IS NOT NULL AND (${orClauses})`)
         .all(...params) as { id: string; path: string }[];
-      const updateStmt = db.prepare("UPDATE notes SET path = ? WHERE id = ?");
+      // vault#555 fix 2 — same reasoning as the content rewrite above: a
+      // path rewrite is a real persisted-state change.
+      const updateStmt = db.prepare("UPDATE notes SET path = ?, updated_at = ? WHERE id = ?");
       for (const row of candidates) {
         const next = rewriteTagConfigPath(row.path, renames);
         if (next === row.path) continue;
-        updateStmt.run(next, row.id);
+        updateStmt.run(next, now, row.id);
         pathsRenamed++;
       }
     }

@@ -1080,6 +1080,16 @@ still applies — `if_updated_at` wins and a mismatch returns `409 conflict`.
 override one you actually passed. To update unconditionally, omit
 `if_updated_at` and send `force: true` alone.
 
+**`updated_at` bumps on every real mutation (vault#555).** A `tags`-only or
+`links`-only update bumps `updated_at` exactly like a `content`/`path`/
+`metadata` change does — this held true when the request carried
+`if_updated_at` even before this fix, but a `force: true` tags/links-only
+update used to skip the underlying `UPDATE notes` entirely and leave
+`updated_at` frozen, making the mutation invisible to cursor pagination
+(which orders by `updated_at`) and any `updated_at`-based sync filter. Tag
+rename/merge cascades that rewrite note `content` (`#oldtag` → `#newtag`
+references) bump the rewritten notes' `updated_at` too, for the same reason.
+
 **Batch `force`/`if_updated_at` defaults (MCP `update-note` only, vault#554).**
 REST `PATCH` is single-note; the MCP `update-note` tool additionally accepts
 a top-level `notes` array for batch updates. A top-level `force` and/or
