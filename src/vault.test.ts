@@ -4517,6 +4517,42 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect((await store.getNote("x"))!.content).toBe("hi hi");
   });
 
+  // vault#555 fix 7 (INVESTIGATE) — a tester reported "old_text not found"
+  // failing 7/8 for batch/parallel content_edit calls sharing the same
+  // old_text. Not reproducible against DIFFERENT notes (see
+  // core/src/core.test.ts's matching investigation for the full writeup
+  // and the "SAME note" control that DOES reproduce "1 succeeds, 7 fail" —
+  // correct behavior, likely what the original report actually hit). REST
+  // parity check here: N parallel PATCH requests, same old_text, different
+  // notes, all succeed.
+  test("PATCH parallel: N concurrent content_edit calls with the SAME old_text on DIFFERENT notes all succeed", async () => {
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `rest-ce-${i}` }));
+    }
+
+    const results = await Promise.all(
+      notes.map((n) =>
+        handleNotes(
+          mkReq("PATCH", `/notes/${n.id}`, {
+            content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+            force: true,
+          }),
+          store,
+          `/${n.id}`,
+        ),
+      ),
+    );
+    for (const res of results) {
+      expect(res.status).toBe(200);
+    }
+    for (let i = 0; i < N; i++) {
+      const fresh = await store.getNote(notes[i]!.id);
+      expect(fresh!.content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
   test("PATCH rejects content + append combination with 400", async () => {
     await store.createNote("seed", { id: "x" });
 

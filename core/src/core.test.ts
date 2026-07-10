@@ -3205,6 +3205,126 @@ describe("MCP tools", async () => {
     expect(err?.code).toBe("CONFLICT");
   });
 
+  // vault#555 fix 7 (INVESTIGATE) — a tester reported update-note batch
+  // AND parallel singles failing 7/8 with "old_text not found" when
+  // multiple items share the SAME content_edit.old_text, though each
+  // succeeded standalone. The orchestrator could NOT reproduce live (repro
+  // hit shell artifacts). Investigated here with proper in-memory tests:
+  //
+  //   - Batch AND parallel-singles, N items EACH TARGETING A DIFFERENT
+  //     note, all sharing the same old_text: every item succeeds. Each
+  //     item resolves its OWN note's content fresh (there's no shared
+  //     mutable state across items/calls — `resolveNote` reads straight
+  //     off the DB per item, and the content_edit search+replace is pure
+  //     synchronous JS with no `await` between the read and the write, so
+  //     two "parallel" async calls can't interleave mid-computation
+  //     either). Re-run 20x below with zero failures.
+  //   - The one scenario that DOES reproduce "1 succeeds, 7 fail
+  //     content_edit_not_found" is N calls sharing the same old_text
+  //     against the SAME note — and that's CORRECT behavior (the first
+  //     call consumes the only occurrence; the rest correctly report it's
+  //     gone), not a bug. This is the most plausible explanation for what
+  //     was actually observed: a test harness that accidentally pointed
+  //     every call at one note (a variable/loop bug — "shell artifacts")
+  //     rather than N distinct notes.
+  //
+  // VERDICT: not reproducible as a real bug against different notes. No
+  // fix applied — these tests document the correct behavior.
+  it("update-note BATCH: N items with the SAME content_edit.old_text on DIFFERENT notes all succeed", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `batch-ce-${i}` }));
+    }
+
+    const result = await updateNote.execute({
+      notes: notes.map((n) => ({
+        id: n.id,
+        content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+        force: true,
+      })),
+    }) as any[];
+
+    expect(result).toHaveLength(N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i].content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
+  it("update-note PARALLEL SINGLES: N concurrent calls with the SAME content_edit.old_text on DIFFERENT notes all succeed", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `parallel-ce-${i}` }));
+    }
+
+    const results = await Promise.all(
+      notes.map((n) =>
+        updateNote.execute({
+          id: n.id,
+          content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+          force: true,
+        }),
+      ),
+    ) as any[];
+
+    for (let i = 0; i < N; i++) {
+      expect(results[i].content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
+  it("update-note PARALLEL SINGLES with shared old_text: 20 repeated trials, zero failures (flake hunt)", async () => {
+    for (let trial = 0; trial < 20; trial++) {
+      const trialDb = new Database(":memory:");
+      const trialStore = new SqliteStore(trialDb);
+      const tools = generateMcpTools(trialStore);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const N = 8;
+      const notes = [];
+      for (let i = 0; i < N; i++) {
+        notes.push(await trialStore.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `flake-${i}` }));
+      }
+      const outcomes = await Promise.allSettled(
+        notes.map((n) =>
+          updateNote.execute({
+            id: n.id,
+            content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+            force: true,
+          }),
+        ),
+      );
+      const failures = outcomes.filter((o) => o.status === "rejected");
+      expect(failures.length).toBe(0);
+    }
+  });
+
+  it("update-note with shared old_text against the SAME note: 1 succeeds, 7 correctly fail (documents the LIKELY source of the original report — not a bug)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const note = await store.createNote("prefix TARGET_TEXT suffix", { path: "shared-ce" });
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 8 }, () =>
+        updateNote.execute({
+          id: note.id,
+          content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+          force: true,
+        }),
+      ),
+    );
+    const succeeded = outcomes.filter((o) => o.status === "fulfilled").length;
+    const failed = outcomes.filter((o) => o.status === "rejected");
+    expect(succeeded).toBe(1);
+    expect(failed).toHaveLength(7);
+    for (const f of failed) {
+      expect((f as PromiseRejectedResult).reason.error_type).toBe("content_edit_not_found");
+    }
+  });
+
   it("query-notes single note by id", async () => {
     const note = await store.createNote("Hello", { path: "test/note" });
     const tools = generateMcpTools(store);
