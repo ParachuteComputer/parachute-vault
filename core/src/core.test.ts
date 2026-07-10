@@ -1875,13 +1875,22 @@ describe("queryNotes", async () => {
 
       // Paginate with a small limit to force several pages across the
       // format boundary and confirm no note is skipped or repeated.
+      //
+      // The first call MUST pass `cursor: ""` (the documented bootstrap
+      // value — see queryNotes's cursor-mode doc comment in
+      // core/src/notes.ts), NOT omit `cursor` entirely. Omitting it opts
+      // OUT of cursor/keyset mode altogether, which orders the first page
+      // by `created_at` (insertion order) instead of `updated_at` — a
+      // DIFFERENT order than every subsequent (real-cursor) page uses. That
+      // mismatch produces a watermark from a page in the wrong order, which
+      // can then skip rows once keyset mode takes over on page 2 — exactly
+      // the bug this test exists to catch, so the harness itself must use
+      // the correct bootstrap contract or it can flake based on whether
+      // `created_at` happens to tie across the fixture's notes.
       const seen: string[] = [];
-      let cursor: string | undefined;
+      let cursor = "";
       for (let page = 0; page < 10; page++) {
-        const result: Awaited<ReturnType<typeof store.queryNotesPaged>> =
-          cursor === undefined
-            ? await store.queryNotesPaged({ limit: 2 })
-            : await store.queryNotesPaged({ limit: 2, cursor });
+        const result = await store.queryNotesPaged({ limit: 2, cursor });
         if (result.notes.length === 0) break;
         seen.push(...result.notes.map((n) => n.id));
         cursor = result.next_cursor;

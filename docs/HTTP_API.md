@@ -1659,7 +1659,7 @@ leak for existing out-of-scope tags, vault#560).
 #### `GET /vault/{name}/api/tags/{name}` — `vault:read`
 Same as the `?tag=` query — single-tag detail by path, same 404 shape.
 
-#### `PUT /vault/{name}/api/tags/{name}` — `vault:write`
+#### `PUT /vault/{name}/api/tags/{name}` — `vault:admin`
 Upsert a tag's identity row. Body accepts any combination of:
 
 ```json
@@ -1824,7 +1824,7 @@ MCP `update-tag` tool reports the same shape via a structured JSON-RPC
 error. See the error taxonomy table above for the full field contract,
 including the tag-scope generalization.
 
-#### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
+#### `DELETE /vault/{name}/api/tags/{name}` — `vault:admin`
 Removes the tag, its identity row, and untags every note. Returns the
 delete result — `{ deleted: true, notes_untagged: number, parent_refs_detached?: number }`.
 Refused with `409 tag_in_use_by_tokens` if any tag-scoped token references
@@ -1842,7 +1842,7 @@ themselves) to proceed anyway. Default (neither flag) is refuse. See the
 error taxonomy table above for the tag-scope generalization on
 `referencing_tags`.
 
-#### `POST /vault/{name}/api/tags/{name}/rename` — `vault:write`
+#### `POST /vault/{name}/api/tags/{name}/rename` — `vault:admin`
 Body: `{ "new_name": string }`. Atomically renames the tag across EVERY
 surface that references it in a single transaction: the `tags` row,
 `note_tags`, OTHER tags' `parent_names`, tag-scoped tokens' allowlists,
@@ -1875,7 +1875,7 @@ shapes (`tag_not_found` / `target_exists` as structured JSON-RPC errors).
 Tag-scoped callers: both `old_name` and `new_name` must be in the caller's
 allowlist.
 
-#### `POST /vault/{name}/api/tags/merge` — `vault:write`
+#### `POST /vault/{name}/api/tags/merge` — `vault:admin`
 Body: `{ "sources": string[], "target": string }`. Retags every note
 carrying any of the `sources` tags with `target`, then drops the source
 tags (and their identity rows — description/fields/relationships/parent_names)
@@ -1897,13 +1897,14 @@ a tag-scoped token.
 guard. Tag-scoped callers: every source AND the target must be in the
 caller's allowlist.
 
-#### `GET /vault/{name}/api/doctor` — `vault:admin`
+#### `GET /vault/{name}/api/doctor` — `vault:read`
 Read-only integrity scan across the tag/metadata taxonomy (vault#552) —
 run after any bulk tag reorg (rename/merge/delete/subtree move) to confirm
-nothing leaked. Admin-tier regardless of method (this is a whole-vault
-diagnostic, same tier as the MCP `doctor` tool and `prune-schema`), gated
-BEFORE the generic read/write scope check — same dispatch shape as
-`/api/triggers`.
+nothing leaked. `read`-tier (was `admin` — re-tiered to match the MCP
+`doctor` tool's own admin→read move: doctor never mutates and is already
+tag-scope-restricted, so a read-scoped monitoring/tending caller doesn't
+need an admin credential over either door), gated BEFORE the generic
+read/write scope check — same dispatch shape as `/api/triggers`.
 
 Never mutates. Returns `{ findings: [...], summary: string, scanned_at: string }`,
 where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
@@ -2144,18 +2145,23 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
 | `write` (additive over read) | `create-note`, `update-note`, `delete-note` |
 | `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
 
-**BREAKING (this PR):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
+**BREAKING (this release):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
 moved `write` → `admin` (schema/taxonomy curation is a distinct tier from
 content authorship); `vault-info`'s description-update branch moved
 `write` → `admin` for the same reason. `doctor` moved `admin` → `read` (it's
 a read-only, tag-scope-restricted diagnostic). A token that used to hold
 `vault:write` and rename/merge/delete/update tags now gets
 `insufficient_scope` and needs `vault:admin`; a `vault:read` token can now
-run `doctor`. The REST `GET /vault/{name}/api/doctor` endpoint above is
-**unaffected** — it stays `vault:admin`-gated (a separate enforcement point
-in `src/routing.ts`), so the MCP `doctor` tool and the REST `/api/doctor`
-endpoint now sit at different tiers for the same underlying scan; see
-CHANGELOG.
+run `doctor`.
+
+**Both doors agree.** The REST surface mirrors every one of these moves:
+`PUT`/`DELETE /vault/{name}/api/tags/{name}`, `POST /vault/{name}/api/tags/merge`,
+and `POST /vault/{name}/api/tags/{name}/rename` now require `vault:admin`
+(was `vault:write` — the generic method→verb default every other mutating
+REST verb still gets); `GET /vault/{name}/api/doctor` (above) now requires
+only `vault:read` (was hardcoded `vault:admin`). A `vault:write` token is
+denied tag rename/merge/delete/update over BOTH MCP and REST; a `vault:read`
+token can run `doctor` over BOTH. See CHANGELOG.
 
 ## See also
 

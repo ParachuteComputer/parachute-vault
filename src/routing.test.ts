@@ -2168,6 +2168,173 @@ describe("scope enforcement on /api/*", () => {
     );
     expect(writeRes.status).toBe(403);
   });
+
+  // ----- REST scope-tier completion (vault#570-adjacent) -------------------
+  //
+  // The MCP door re-tiered update-tag/delete-tag/rename-tag/merge-tags
+  // write → admin, and doctor admin → read (core/src/mcp.ts). The REST door
+  // originally only enforced the generic method→verb default (GET→read,
+  // everything else→write) here, and hardcoded `/api/doctor` to admin
+  // regardless — a gap between doors: a `vault:write` token could mutate
+  // tag schemas over REST while MCP already refused it, and a `vault:read`
+  // token could run the equivalent scan over MCP but not REST. These tests
+  // pin BOTH doors now agreeing, mirroring the MCP suite in
+  // `src/vault.test.ts`'s "MCP write/admin re-tier — scope enforcement at
+  // the tools/call layer" describe block.
+
+  test("vault:write token: POST /api/notes succeeds but PUT/DELETE /api/tags/:name, POST /api/tags/merge, POST /api/tags/:name/rename are DENIED (now admin-tier — REST/MCP parity)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("seed", { tags: ["mine"] });
+    const token = await mintToken("journal", { permission: "full", scopes: ["vault:write"] });
+
+    // Allowed: content authorship.
+    const notesPath = "/vault/journal/api/notes";
+    const createRes = await route(
+      new Request(`http://localhost:1940${notesPath}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: "hello", tags: ["mine"] }),
+      }),
+      notesPath,
+    );
+    expect(createRes.status).toBeLessThan(400);
+
+    // Denied: each now requires vault:admin, not vault:write.
+    const putPath = "/vault/journal/api/tags/mine";
+    const putRes = await route(
+      new Request(`http://localhost:1940${putPath}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: "hijacked" }),
+      }),
+      putPath,
+    );
+    expect(putRes.status).toBe(403);
+    const putBody = (await putRes.json()) as { error_type?: string; required_scope?: string };
+    expect(putBody.error_type).toBe("insufficient_scope");
+    expect(putBody.required_scope).toBe("vault:admin");
+
+    const deletePath = "/vault/journal/api/tags/mine";
+    const deleteRes = await route(authed(token, "DELETE", deletePath), deletePath);
+    expect(deleteRes.status).toBe(403);
+    expect(((await deleteRes.json()) as { required_scope?: string }).required_scope).toBe("vault:admin");
+
+    const mergePath = "/vault/journal/api/tags/merge";
+    const mergeRes = await route(
+      new Request(`http://localhost:1940${mergePath}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ sources: ["mine"], target: "mine2" }),
+      }),
+      mergePath,
+    );
+    expect(mergeRes.status).toBe(403);
+    expect(((await mergeRes.json()) as { required_scope?: string }).required_scope).toBe("vault:admin");
+
+    const renamePath = "/vault/journal/api/tags/mine/rename";
+    const renameRes = await route(
+      new Request(`http://localhost:1940${renamePath}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ new_name: "mine2" }),
+      }),
+      renamePath,
+    );
+    expect(renameRes.status).toBe(403);
+    expect(((await renameRes.json()) as { required_scope?: string }).required_scope).toBe("vault:admin");
+
+    // Untouched — none of the denied calls above ever reached the store.
+    const tags = await store.listTags();
+    expect(tags.some((t) => t.name === "mine")).toBe(true);
+    expect(tags.some((t) => t.name === "mine2")).toBe(false);
+  });
+
+  test("vault:read token: GET /api/doctor succeeds (now read-tier — REST/MCP parity)", async () => {
+    createVault("journal");
+    const token = await mintToken("journal", { permission: "read", scopes: ["vault:read"] });
+    const path = "/vault/journal/api/doctor";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { findings?: unknown[]; summary?: unknown };
+    expect(body.findings).toBeDefined();
+    expect(body.summary).toBeDefined();
+  });
+
+  test("vault:admin token: CAN PUT/DELETE /api/tags/:name, POST /api/tags/merge, POST /api/tags/:name/rename, and GET /api/doctor", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.upsertTagRecord("a", {});
+    await store.upsertTagRecord("b", {});
+    await store.createNote("seed", { tags: ["a"] });
+    const token = await mintToken("journal", { permission: "full", scopes: ["vault:admin"] });
+
+    const putPath = "/vault/journal/api/tags/a";
+    const putRes = await route(
+      new Request(`http://localhost:1940${putPath}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: "updated" }),
+      }),
+      putPath,
+    );
+    expect(putRes.status).toBe(200);
+
+    const doctorPath = "/vault/journal/api/doctor";
+    const doctorRes = await route(authed(token, "GET", doctorPath), doctorPath);
+    expect(doctorRes.status).toBe(200);
+
+    const mergePath = "/vault/journal/api/tags/merge";
+    const mergeRes = await route(
+      new Request(`http://localhost:1940${mergePath}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ sources: ["b"], target: "a" }),
+      }),
+      mergePath,
+    );
+    expect(mergeRes.status).toBe(200);
+
+    const renamePath = "/vault/journal/api/tags/a/rename";
+    const renameRes = await route(
+      new Request(`http://localhost:1940${renamePath}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ new_name: "a2" }),
+      }),
+      renamePath,
+    );
+    expect(renameRes.status).toBe(200);
+
+    const deletePath = "/vault/journal/api/tags/a2";
+    const deleteRes = await route(authed(token, "DELETE", deletePath), deletePath);
+    expect(deleteRes.status).toBe(200);
+  });
+
+  test("vault:write token: GET /api/doctor still succeeds (write ⊇ read inheritance, unaffected by the re-tier)", async () => {
+    createVault("journal");
+    const token = await mintToken("journal", { permission: "full", scopes: ["vault:write"] });
+    const path = "/vault/journal/api/doctor";
+    const res = await route(authed(token, "GET", path), path);
+    expect(res.status).toBe(200);
+  });
+
+  test("vault:read token: PUT /api/tags/:name is DENIED (read does not imply admin)", async () => {
+    createVault("journal");
+    getVaultStore("journal").upsertTagRecord("mine", {});
+    const token = await mintToken("journal", { permission: "read", scopes: ["vault:read"] });
+    const path = "/vault/journal/api/tags/mine";
+    const res = await route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: "denied" }),
+      }),
+      path,
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { required_scope?: string }).required_scope).toBe("vault:admin");
+  });
 });
 
 // ---------------------------------------------------------------------------

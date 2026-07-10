@@ -88,9 +88,11 @@ tokens list` / `revoke` exist only to clean those rows up.)
 - `vault:admin` — `GET /.parachute/config`; the schema/taxonomy-curation MCP
   tools (`update-tag`, `delete-tag`, `rename-tag`, `merge-tags`,
   `prune-schema`, `manage-token`) and `vault-info`'s description-update
-  branch — structure/taxonomy/vault-config curation is a distinct tier from
-  content authorship, moved here from `write` (BREAKING — see CHANGELOG);
-  inherits read + write
+  branch, AND their REST-door equivalents — `PUT`/`DELETE
+  /api/tags/<name>`, `POST /api/tags/merge`, `POST /api/tags/<name>/rename`
+  — structure/taxonomy/vault-config curation is a distinct tier from
+  content authorship, moved here from `write` on BOTH doors (BREAKING —
+  see CHANGELOG); inherits read + write
 
   MCP tool → verb reference: `read` = `query-notes`, `list-tags`,
   `find-path`, `vault-info` (stats), `doctor`. `write` (additive) =
@@ -196,10 +198,14 @@ the hub's OAuth endpoints.
 | `/vault/<name>/api/notes[/…]` | GET/HEAD | Bearer with `vault:read` | `401` | `403 {error:"Forbidden", error_type:"insufficient_scope", required_scope:"vault:read", granted_scopes:[…]}` |
 | `/vault/<name>/api/notes[/…]` | POST/PATCH/DELETE | Bearer with `vault:write` | `401` | `403` with `required_scope:"vault:write"` |
 | `/vault/<name>/api/tags[/…]` | GET | Bearer with `vault:read` | `401` | `403` |
-| `/vault/<name>/api/tags[/…]` | POST/PUT/DELETE | Bearer with `vault:write` | `401` | `403` |
+| `/vault/<name>/api/tags/<name>/conformance` | POST | Bearer with `vault:read` (read-only carve-out — counts violating notes, mutates nothing) | `401` | `403` |
+| `/vault/<name>/api/tags/<name>` | PUT/DELETE | Bearer with `vault:admin` (schema/taxonomy curation — re-tiered from `vault:write`, mirrors the MCP `update-tag`/`delete-tag` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
+| `/vault/<name>/api/tags/merge` | POST | Bearer with `vault:admin` (mirrors the MCP `merge-tags` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
+| `/vault/<name>/api/tags/<name>/rename` | POST | Bearer with `vault:admin` (mirrors the MCP `rename-tag` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
 | `/vault/<name>/api/find-path` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/vault` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/vault` | PATCH | Bearer with `vault:write` | `401` | `403` |
+| `/vault/<name>/api/doctor` | GET | Bearer with `vault:read` (re-tiered from `vault:admin` — mirrors the MCP `doctor` re-tier; never mutates, already tag-scope-restricted) | `401` | `403 {…required_scope:"vault:read"…}` |
 | `/vault/<name>/api/unresolved-wikilinks` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/storage/upload` | POST | Bearer with `vault:write` | `401` | `403` |
 | `/vault/<name>/api/storage/<path>` | GET | Bearer with `vault:read` | `401` | `403` |
