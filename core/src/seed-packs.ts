@@ -50,7 +50,7 @@ import type { Store, TagFieldSchema } from "./types.ts";
  * here — a description is vault metadata, not a pack note.
  */
 export const DEFAULT_VAULT_DESCRIPTION =
-  'This is a brand-new personal vault — just its starter guides so far; the person it belongs to is probably new to Parachute. Before helping them set it up, read the "Getting Started" note — it\'s your onboarding brief. Short version: start with a conversation, not a filing system; learn how they want to use this and where their notes live today; do one small real thing first. When the vault has real structure, replace this description (vault-info { description: "..." }) with a current picture of what lives here and how to work it — so every future session, yours or another AI\'s, starts oriented.';
+  'This is a brand-new personal vault — just its starter guides so far; the person it belongs to is probably new to Parachute. Before helping them set it up, read the "Getting Started" note — it\'s your onboarding brief. Short version: start with a conversation, not a filing system; learn how they want to use this and where their notes live today; do one small real thing first. When the vault has real structure, replace this description (vault-info { description: "..." } — an admin-scope action) with a current picture of what lives here and how to work it — so every future session, yours or another AI\'s, starts oriented.';
 
 /**
  * The `vault-info` description a vault gets when it was **imported/restored** —
@@ -59,7 +59,7 @@ export const DEFAULT_VAULT_DESCRIPTION =
  * text with a current picture.
  */
 export const IMPORTED_VAULT_DESCRIPTION =
-  'This vault was imported — it arrived with its own notes, tags, and history. Orient before you write: vault-info { include_stats: true }, list-tags, read a sample, and read "Getting Started" if present. Your first job is to learn the shape that\'s already here and reflect it back to the person — not to propose new structure cold. When you understand it, replace this description (vault-info { description: "..." }) with a current picture.';
+  'This vault was imported — it arrived with its own notes, tags, and history. Orient before you write: vault-info { include_stats: true }, list-tags, read a sample, and read "Getting Started" if present. Your first job is to learn the shape that\'s already here and reflect it back to the person — not to propose new structure cold. When you understand it, replace this description (vault-info { description: "..." } — an admin-scope action) with a current picture.';
 
 // ---------------------------------------------------------------------------
 // Pack shape
@@ -404,8 +404,8 @@ what's already there.
 ### Close the loop: describe the vault
 
 When the first real structure lands, update the vault description —
-\`vault-info { description: "..." }\` — so every future session (yours or another
-AI's) starts oriented: what this vault is for, its main tags, its conventions.
+\`vault-info { description: "..." }\`, an \`admin\`-scope action — so every future
+session (yours or another AI's) starts oriented: what this vault is for, its main tags, its conventions.
 The default description says "brand-new vault"; once that stops being true,
 replace it. Keep it a few sentences (the projection carries the schema detail,
 and this note carries the richer conventions — see "Adapt this note"). Bringing
@@ -423,17 +423,41 @@ small welcome web and the \`capture\` tag the Notes surface uses; no other
 predefined tags or schema. You and the operator design the structure that fits
 *their* life and work. The vault is the engine; the meaning is yours to bring.
 
-Core moves you already have as MCP tools:
-- \`create-note\` / \`update-note\` / \`delete-note\` — write notes (single or batch).
-- \`query-notes\` — by id/path, by tag, full-text \`search\`, or graph \`near\` a note.
-- \`list-tags\` / \`update-tag\` / \`delete-tag\` — manage the tag vocabulary + schemas.
-- \`find-path\` — shortest link path between two notes.
-- \`vault-info\` — refresh the live schema projection any time; the base call
-  includes a compact \`map\` (tag counts, top-level path-bucket counts, total
-  notes) so you can orient in this one call — no flag needed.
+Core moves, grouped by the scope each needs — \`tools/list\` shows exactly the
+ones your token can call (see "What your scope allows" below):
+- **Read:** \`query-notes\` (by id/path, by tag, full-text \`search\`, or graph
+  \`near\` a note), \`list-tags\`, \`find-path\` (shortest link path between two
+  notes), \`vault-info\` (the live schema projection + a compact \`map\` — tag
+  counts, top-level path-bucket counts, total notes — so you orient in one
+  call), \`doctor\` (read-only integrity scan).
+- **Write:** \`create-note\` / \`update-note\` / \`delete-note\` — author notes,
+  single or batch.
+- **Admin:** \`update-tag\` / \`delete-tag\` / \`rename-tag\` / \`merge-tags\` /
+  \`prune-schema\` (the tag vocabulary + schemas), \`vault-info { description }\`
+  (the vault's own description), \`manage-token\` (mint scoped child tokens).
 
 \`[[wikilinks]]\` in note content auto-link to the note at that path — use them
 freely; they resolve even if the target is created later.
+
+## What your scope allows
+
+Your connection carries one of three scopes, and it shapes what you can do here
+— by design, so the person can grant exactly as much authority as they mean to:
+
+- **\`read\`** — explore and answer: query notes, read tags, traverse the graph,
+  run \`doctor\`. You can't change anything.
+- **\`write\`** — everything read can do, plus author content: create, update,
+  and delete notes. You can capture and edit freely, but you *can't* reshape the
+  vault's structure — renaming/merging/deleting tags, editing schemas, and
+  rewriting the vault description all need admin.
+- **\`admin\`** — everything, including that restructuring, plus minting scoped
+  child tokens.
+
+If a tool this guide mentions fails with "Unknown tool," that's your scope, not
+a bug — the tool sits above your tier. Don't fight it: tell the person plainly
+what you'd do with more access ("I can add notes, but reorganizing your tags
+needs admin — want to grant it?") and let them decide. Most people connect with
+admin, so usually you'll have the whole set.
 
 ## Tags vs paths vs schemas — the design vocabulary
 
@@ -453,7 +477,7 @@ These three axes are the heart of vault design. Use the right one for the job:
   path, tags, or both.
 
 - **Schemas = typed metadata fields.** Attach a schema to a tag (via
-  \`update-tag\`) to declare typed metadata fields — e.g. \`#meeting\` with a
+  \`update-tag\`, an \`admin\`-scope move) to declare typed metadata fields — e.g. \`#meeting\` with a
   \`held_on\` date, \`#person\` with an \`email\`. Each field can **optionally** be
   marked \`indexed: true\` to make it **queryable with operators** (\`query-notes
   { tag: "meeting", metadata: { held_on: { gte: "2026-01-01" } } }\`); indexing

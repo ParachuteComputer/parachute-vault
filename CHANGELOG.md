@@ -34,6 +34,32 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.1] - 2026-07-10
+
+**Scope-honest onboarding.** The seeded "Getting Started" guide and the
+default vault description (`core/src/seed-packs.ts`) were written before the
+0.7.1 permissions re-tier and still told a connecting AI it could `update-tag`,
+`delete-tag`, and rewrite the vault description under `write` scope — all now
+`admin`. A `write`-scoped agent (the "author content, don't restructure" grant
+0.7.1 exists to make meaningful) would follow the guide and hit opaque
+`Unknown tool` walls. This corrects the facts and makes the guide
+scope-aware:
+
+- The "Core moves" tool list is now grouped by the scope each tool needs
+  (read / write / admin), so the guide no longer misrepresents what a
+  non-admin token can call.
+- A new **"What your scope allows"** section names the three tiers and tells
+  the agent what to do when a tool is above its tier — surface the gap to the
+  person ("I can add notes, but reorganizing your tags needs admin") instead
+  of failing silently. Turns the tool-catalog's no-leak filtering from a dead
+  end into a graceful elevation prompt.
+- The schema-declaration and "close the loop: describe the vault" steps, and
+  both default descriptions, now flag their `admin`-scope requirement inline.
+
+Seed content only — create-time and idempotent, so existing vaults are
+unaffected (their already-seeded guide is agent-editable). No schema or wire
+change.
+
 ## [0.7.1] - 2026-07-10
 
 **Launch integration** of eight feature branches (#572–#579) into one
