@@ -1,0 +1,106 @@
+/**
+ * Contract suite — typed indexes (Wave 1 of the Reliability & Usability
+ * Program, umbrella #556). Encodes the 2026-07-09 nine-persona deep test's
+ * WS4 findings (#553) as executable tests: PASSING tests lock in behavior
+ * that is correct today (well-typed integer-indexed range queries, the
+ * merge-patch metadata contract, and the state_transition compare-and-set
+ * conflict); `test.todo` entries describe the target behavior for
+ * confirmed-broken cases, to be flipped to real assertions in a later wave.
+ * See #553 for the full write-up.
+ *
+ * The TEXT-poisoning todo below was reproduced live before writing: declaring
+ * an indexed integer field and writing `metadata.n = "four"` succeeds with
+ * only an advisory `type_mismatch` warning, and the resulting row's generated
+ * column carries the raw TEXT value under SQLite's INTEGER-affinity
+ * coercion — which then sorts ABOVE every real integer (SQLite type
+ * ordering: NULL < INTEGER/REAL < TEXT < BLOB), so `{n: {gt: 100}}`
+ * incorrectly matches the poisoned row alongside genuine matches.
+ */
+
+import { describe, it, test, expect, beforeEach } from "bun:test";
+import { Database } from "bun:sqlite";
+import { SqliteStore } from "./store.js";
+import { generateMcpTools } from "./mcp.js";
+import { TransitionConflictError } from "./notes.js";
+
+let store: SqliteStore;
+let db: Database;
+
+beforeEach(() => {
+  db = new Database(":memory:");
+  store = new SqliteStore(db);
+});
+
+describe("contract: typed indexes — passing (lock in current behavior)", () => {
+  it("an integer-indexed field with well-typed integer values answers gte/lt correctly", async () => {
+    await store.upsertTagRecord("metric", { fields: { n: { type: "integer", indexed: true } } });
+    const low = await store.createNote("n=5", { tags: ["metric"], metadata: { n: 5 } });
+    const mid = await store.createNote("n=50", { tags: ["metric"], metadata: { n: 50 } });
+    const high = await store.createNote("n=200", { tags: ["metric"], metadata: { n: 200 } });
+
+    const gte50 = await store.queryNotes({ tags: ["metric"], metadata: { n: { gte: 50 } } });
+    expect(new Set(gte50.map((n) => n.id))).toEqual(new Set([mid.id, high.id]));
+
+    const lt50 = await store.queryNotes({ tags: ["metric"], metadata: { n: { lt: 50 } } });
+    expect(new Set(lt50.map((n) => n.id))).toEqual(new Set([low.id]));
+  });
+
+  it("merge-patch metadata preserves untouched fields, updates named fields, and RFC-7386-deletes null fields", async () => {
+    const note = await store.createNote("has metadata", {
+      metadata: { a: 1, b: 2, c: 3 },
+    });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result: any = await updateNote.execute({
+      id: note.id,
+      metadata: { b: 20, c: null },
+      force: true,
+    });
+
+    expect(result.metadata).toEqual({ a: 1, b: 20 });
+  });
+
+  it("a state_transition compare-and-set conflicts when the note has already transitioned away from `from`", async () => {
+    const note = await store.createNote("workflow item", { metadata: { status: "draft" } });
+
+    const first = await store.updateNote(note.id, {
+      state_transition: { field: "status", from: "draft", to: "published" },
+    });
+    expect((first.metadata as any).status).toBe("published");
+
+    let err: any;
+    try {
+      // Same `from: "draft"` precondition — but the note is now "published",
+      // so this must conflict rather than silently no-op or overwrite.
+      await store.updateNote(note.id, {
+        state_transition: { field: "status", from: "draft", to: "archived" },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(TransitionConflictError);
+    expect(err.field).toBe("status");
+    expect(err.expected_from).toBe("draft");
+    expect(err.current).toBe("published");
+
+    // The note's status is untouched by the rejected transition.
+    const after = await store.getNote(note.id);
+    expect((after!.metadata as any).status).toBe("published");
+  });
+});
+
+describe("contract: typed indexes — todo (#553)", () => {
+  test.todo(
+    `#553: a write of a TEXT value to an indexed integer field is REJECTED (today: it is accepted with only an advisory type_mismatch warning, and the poisoned row then silently matches {gt: 100}-style range queries via SQLite's TEXT-sorts-above-INTEGER type-affinity ordering — reproduced live: metadata.n = "four" on an indexed integer field succeeds, and query {n: {gt: 100}} incorrectly returns it)`,
+  );
+  test.todo(
+    `#553: an unset enum field stays ABSENT — no first-value backfill — so exists:false correctly matches a note that never set the field (today: applySchemaDefaults in core/src/mcp.ts backfills the schema's first enum value onto every note that gains the tag, so "never set" is indistinguishable from "explicitly set to the default" and exists:false never matches)`,
+  );
+  test.todo(
+    `#553: update-tag reports ALL invalid fields in one call AND states explicitly that no changes were applied (today: the cross-tag type/indexed-flag validation loop in core/src/mcp.ts throws on the FIRST offending field and never reports the rest, and the thrown Error's message doesn't say whether the tag's other, valid fields were partially applied — reproduced live: declaring two invalid fields in one update-tag call surfaces only the first field's error)`,
+  );
+  test.todo(
+    `#553: the indexed-field type list is honest about what's actually indexable (core/src/mcp.ts's update-tag field-type description advertises "string, boolean, integer, number, array, object" but indexed-fields.ts's TYPE_MAP only supports string/integer/boolean — "number" and the container types are accepted as declared but silently un-indexable)`,
+  );
+});
