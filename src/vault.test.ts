@@ -4964,6 +4964,165 @@ describe("HTTP POST /notes — validation_status attachment (vault#287)", async 
   });
 });
 
+// vault#555 — HTTP POST /notes with if_exists: idempotent upsert on a path
+// conflict. Mirrors the MCP create-note tool's if_exists contract exactly
+// (independent REST-layer reimplementation, same core primitives).
+describe("HTTP POST /notes — if_exists (vault#555)", async () => {
+  test("default (no if_exists) still 409s — back-compat", async () => {
+    await store.createNote("first", { path: "Inbox/rest-dup" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "second", path: "Inbox/rest-dup" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(409);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("path_conflict");
+  });
+
+  test('if_exists:"ignore" returns 201 with the existing note untouched + existed:true', async () => {
+    const first = await store.createNote("original", { path: "Inbox/rest-ignore", metadata: { v: 1 } });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "attempted overwrite",
+        path: "Inbox/rest-ignore",
+        metadata: { v: 2 },
+        if_exists: "ignore",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(first.id);
+    expect(body.content).toBe("original");
+    expect(body.metadata?.v).toBe(1);
+  });
+
+  test('if_exists:"update" full-replaces content and RFC-7386-merges metadata', async () => {
+    await store.createNote("v1", { path: "Inbox/rest-update", metadata: { a: 1, b: 2 } });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "v2",
+        path: "Inbox/rest-update",
+        metadata: { b: null, c: 3 },
+        if_exists: "update",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.content).toBe("v2");
+    expect(body.metadata).toEqual({ a: 1, c: 3 });
+  });
+
+  test('if_exists:"replace" wholesale-overwrites content + metadata, keeps id/createdAt', async () => {
+    const first = await store.createNote("v1", { path: "Inbox/rest-replace", metadata: { a: 1, b: 2 } });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "v2",
+        path: "Inbox/rest-replace",
+        metadata: { c: 3 },
+        if_exists: "replace",
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(first.id);
+    expect(body.createdAt).toBe(first.createdAt);
+    expect(body.content).toBe("v2");
+    expect(body.metadata).toEqual({ c: 3 });
+  });
+
+  test("plain POST (no if_exists) sees zero response-shape change", async () => {
+    const res = await handleNotes(mkReq("POST", "/notes", { content: "plain" }), store, "");
+    const body = await res.json() as any;
+    expect("existed" in body).toBe(false);
+  });
+
+  test("batch: if_exists is per-item — a top-level default is NOT inherited", async () => {
+    await store.createNote("existing", { path: "Inbox/rest-batch-conflict" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        if_exists: "ignore",
+        notes: [{ content: "conflict", path: "Inbox/rest-batch-conflict" }],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(409);
+  });
+
+  test("summary:true returns {created, ids, failed} for a batch", async () => {
+    await store.createNote("pre-existing", { path: "Inbox/rest-sum-existing" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        summary: true,
+        notes: [
+          { content: "fresh", path: "Inbox/rest-sum-fresh", if_exists: "ignore" },
+          { content: "ignored", path: "Inbox/rest-sum-existing", if_exists: "ignore" },
+        ],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.created).toBe(1);
+    expect(body.ids).toHaveLength(2);
+    expect(body.failed).toEqual([]);
+  });
+
+  test("summary is ignored on a single-note POST", async () => {
+    const res = await handleNotes(mkReq("POST", "/notes", { content: "solo", summary: true }), store, "");
+    const body = await res.json() as any;
+    expect(body.content).toBe("solo");
+    expect(body.created).toBeUndefined();
+  });
+});
+
+// vault#555 — has_broken_links / include_broken_links on GET /notes.
+describe("HTTP GET /notes — has_broken_links / include_broken_links (vault#555)", async () => {
+  test("has_broken_links=true filters to notes with a dangling wikilink", async () => {
+    await store.createNote("[[Nowhere]]", { path: "rest-broken" });
+    await store.createNote("clean", { path: "rest-clean" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_broken_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-broken"]);
+  });
+
+  test("has_broken_links=false excludes them", async () => {
+    await store.createNote("[[Nowhere]]", { path: "rest-broken2" });
+    await store.createNote("clean", { path: "rest-clean2" });
+    const res = await handleNotes(mkReq("GET", "/notes?has_broken_links=false&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    expect(body.map((n) => n.path)).toEqual(["rest-clean2"]);
+  });
+
+  test("include_broken_links on a single note surfaces {target, relationship}", async () => {
+    await store.createNote("[[Ghost]]", { path: "rest-single-broken" });
+    const res = await handleNotes(mkReq("GET", "/notes?id=rest-single-broken&include_broken_links=true"), store, "");
+    const body = await res.json() as any;
+    expect(body.broken_links).toEqual([{ target: "Ghost", relationship: "wikilink" }]);
+  });
+
+  test("include_broken_links in list mode is batched per note", async () => {
+    await store.createNote("[[Ghost A]]", { path: "rest-list-a" });
+    await store.createNote("clean", { path: "rest-list-b" });
+    const res = await handleNotes(mkReq("GET", "/notes?include_broken_links=true&include_content=true"), store, "");
+    const body = await res.json() as any[];
+    const byPath = new Map(body.map((n: any) => [n.path, n.broken_links]));
+    expect(byPath.get("rest-list-a")).toEqual([{ target: "Ghost A", relationship: "wikilink" }]);
+    expect(byPath.get("rest-list-b")).toEqual([]);
+  });
+});
+
 // vault#309 — HTTP PATCH /notes/:id with if_missing: "create" mirrors
 // the MCP update-note path. Sync loops (Gitcoin Brain et al) use this
 // for idempotent upsert without a separate query-first round trip.

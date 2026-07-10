@@ -825,8 +825,8 @@ function buildManageTokenTool(
       ":admin'. List + revoke are scoped to tokens this session minted; " +
       "CLI/REST-minted tokens are not surfaced here.\n\n" +
       "Actions (discriminator: `action`):\n" +
-      "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at }\n" +
-      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean }\n" +
+      "- `mint` — { scope: string|string[], ttl_seconds?: number, description?: string } → { action: \"mint\", token, jti, expires_at, scopes, scoped_tags, vault_name } (vault#555: scopes/scoped_tags/vault_name were previously undocumented here)\n" +
+      "- `revoke` — { jti: string } → { action: \"revoke\", ok: boolean, already_revoked?: boolean } — idempotent; a jti not in this session's ledger, or already revoked, still returns ok:true. A genuine failure additionally carries error/message (and, for a hub-side rejection, hub_status).\n" +
       "- `list` — (no inputs) → { action: \"list\", tokens: [...] }",
     inputSchema: {
       type: "object",

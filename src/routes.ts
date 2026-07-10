@@ -22,9 +22,16 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
-import { listUnresolvedWikilinks, resolveOrQueueLink, resolveStructuredLinkNote } from "../core/src/wikilinks.ts";
+import {
+  listUnresolvedWikilinks,
+  resolveOrQueueLink,
+  resolveStructuredLinkNote,
+  getUnresolvedLinksForNote,
+  getUnresolvedLinksForNotes,
+} from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
   applyContentRange,
@@ -812,6 +819,9 @@ export function parseNotesQueryOpts(url: URL): {
     excludeTags: parseQueryList(url, "exclude_tag"),
     hasTags: parseBoolOrUndef(parseQuery(url, "has_tags")),
     hasLinks: parseBoolOrUndef(parseQuery(url, "has_links")),
+    // Presence filter on dangling outbound wikilinks/structured links
+    // (vault#555) — see core/src/types.ts QueryOpts.hasBrokenLinks.
+    hasBrokenLinks: parseBoolOrUndef(parseQuery(url, "has_broken_links")),
     path: parseQuery(url, "path") ?? undefined,
     pathPrefix: parseQuery(url, "path_prefix") ?? undefined,
     extension: parseExtensionFilter(url),
@@ -1016,6 +1026,13 @@ async function handleNotesInner(
             tagScope.allowed,
             tagScope.raw,
           );
+        }
+        if (parseBool(parseQuery(url, "include_broken_links"), false)) {
+          // No tag-scope filtering needed (unlike include_links above): a
+          // broken-link `target` never resolved to a note, so there's no
+          // neighbor identity/content to leak — just the string this note's
+          // own [[wikilink]]/structured link already named.
+          result.broken_links = getUnresolvedLinksForNote(db, note.id);
         }
         if (parseBool(parseQuery(url, "include_attachments"), false)) {
           result.attachments = await store.getAttachments(note.id);
@@ -1336,6 +1353,7 @@ async function handleNotesInner(
       const contentRange = parseContentRangeQuery(url, includeContent);
       if (contentRange.error) return contentRange.error;
       const includeLinks = parseBool(parseQuery(url, "include_links"), false);
+      const includeBrokenLinks = parseBool(parseQuery(url, "include_broken_links"), false);
       const includeAttachments = parseBool(parseQuery(url, "include_attachments"), false);
       const includeLinkCount = parseBool(parseQuery(url, "include_link_count"), false);
       const inclMeta = parseIncludeMetadata(url);
@@ -1427,12 +1445,18 @@ async function handleNotesInner(
         );
       }
 
-      if (includeLinks || includeAttachments) {
+      if (includeLinks || includeBrokenLinks || includeAttachments) {
         // Whole-page link hydration in a constant number of queries — the
         // per-note variant cost (1 link query + 1 summary query + N tag
         // queries) × page size. 2026-06-10 perf measurements.
         const linksByNote = includeLinks
           ? linkOps.getLinksHydratedForNotes(db, output.map((n: any) => n.id))
+          : null;
+        // Same batched-per-page shape as links (vault#555). No tag-scope
+        // filtering needed — a broken-link `target` never resolved to a
+        // note, so there's no neighbor identity to leak.
+        const brokenLinksByNote = includeBrokenLinks
+          ? getUnresolvedLinksForNotes(db, output.map((n: any) => n.id))
           : null;
         const enrichedOut: any[] = [];
         for (const n of output) {
@@ -1445,6 +1469,7 @@ async function handleNotesInner(
               tagScope.raw,
             );
           }
+          if (brokenLinksByNote) enriched.broken_links = brokenLinksByNote.get(n.id) ?? [];
           if (includeAttachments) enriched.attachments = await store.getAttachments(n.id);
           enrichedOut.push(enriched);
         }
@@ -1512,13 +1537,76 @@ async function handleNotesInner(
       // layers share `resolveOrQueueLink` from core/wikilinks.ts).
       const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
       const linkWarningsByNote = new Map<string, QueryWarning[]>();
+      // `if_exists` bookkeeping (vault#555) — mirrors core/src/mcp.ts's
+      // create-note tool exactly (same contract, independent REST-layer
+      // reimplementation sharing the same core primitives). See that file's
+      // doc comments for the full rationale.
+      const existedMap = new Map<string, boolean>();
+      const noMutateIds = new Set<string>();
+      const recordExistedBranch = (resultNote: Note, noMutate: boolean): void => {
+        existedMap.set(resultNote.id, true);
+        if (noMutate) noMutateIds.add(resultNote.id);
+        created.push(resultNote);
+      };
+      const applyExistingNote = async (
+        item: any,
+        existingNote: Note,
+        mode: "ignore" | "update" | "replace",
+      ): Promise<{ note: Note; noMutate: boolean }> => {
+        if (mode === "ignore") {
+          return { note: existingNote, noMutate: true };
+        }
+        const updates: { content?: string; metadata?: Record<string, unknown> } = {};
+        if (mode === "update") {
+          if (item.content !== undefined) updates.content = item.content;
+          if (item.metadata !== undefined) {
+            updates.metadata = mergeMetadata(
+              existingNote.metadata as Record<string, unknown> | null | undefined,
+              item.metadata,
+            );
+          }
+        } else {
+          // "replace" — PUT semantics: content/metadata become exactly this
+          // payload (empty default when omitted), never merged.
+          updates.content = item.content ?? "";
+          updates.metadata = item.metadata ?? {};
+        }
+
+        const incomingTags: string[] = item.tags ?? [];
+        const projectedTags = new Set<string>([...(existingNote.tags ?? []), ...incomingTags]);
+        const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
+        gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
+
+        let result: Note = existingNote;
+        if (Object.keys(updates).length > 0) {
+          result = await store.updateNote(existingNote.id, {
+            ...updates,
+            actor: writeCtx.actor,
+            via: writeCtx.via,
+          });
+        }
+
+        if (incomingTags.length > 0) {
+          await store.tagNote(result.id, incomingTags);
+          await applySchemaDefaults(store, db, [result.id], incomingTags);
+        }
+
+        if (item.links) {
+          pendingLinks.push({ sourceId: result.id, links: item.links as { target: string; relationship: string }[] });
+        }
+
+        return { note: (await store.getNote(result.id)) ?? result, noMutate: false };
+      };
+
       // Wrap multi-item batches in a SQLite transaction so a mid-batch
       // failure (path conflict, etc.) rolls back every prior insert. Without
       // this, callers got half-applied batches where the prefix landed and
       // the offending entry surfaced the 409 — see #236. Single-item posts
       // are already atomic at the store layer and skip the wrap so they
       // don't collide with concurrent single-item callers on the shared
-      // bun:sqlite connection.
+      // bun:sqlite connection. A caught PATH_CONFLICT (the if_exists race
+      // backstop below) does NOT roll back the transaction — only a throw
+      // that escapes `runBatch` does (see core/src/txn.ts).
       const batched = items.length > 1;
       const runBatch = async (): Promise<void> => {
         for (const item of items) {
@@ -1528,6 +1616,26 @@ async function handleNotesInner(
           const extension = item.extension !== undefined
             ? validateExtension(item.extension)
             : undefined;
+          const effectiveExtension = extension ?? "md";
+          const ifExists: string = item.if_exists ?? "error";
+          const upsertMode = ifExists === "ignore" || ifExists === "update" || ifExists === "replace";
+
+          // Proactive existence check (vault#555) — only possible with a
+          // path. Handles the common, non-racing case cleanly: skips the
+          // raw-item strict gate below (it would validate the wrong shape —
+          // see `applyExistingNote`) and goes straight to the collision
+          // branch. The catch below is the backstop for a true race.
+          let existingNote: Note | null = null;
+          if (upsertMode && item.path) {
+            const normalized = normalizePath(item.path);
+            existingNote = normalized ? await store.getNoteByPath(normalized, effectiveExtension) : null;
+          }
+          if (existingNote) {
+            const { note: resultNote, noMutate } = await applyExistingNote(item, existingNote, ifExists as "ignore" | "update" | "replace");
+            recordExistedBranch(resultNote, noMutate);
+            continue;
+          }
+
           // Strict-schema gate (vault#299) — reject before any write so a
           // mid-batch violation rolls back the batch transaction.
           gateStrictWrite(store, writeCtx, {
@@ -1535,17 +1643,36 @@ async function handleNotesInner(
             tags: item.tags,
             metadata: item.metadata,
           });
-          const note = await store.createNote(item.content ?? "", {
-            id: item.id,
-            path: item.path,
-            tags: item.tags,
-            metadata: item.metadata,
-            created_at: item.createdAt ?? item.created_at,
-            ...(extension !== undefined ? { extension } : {}),
-            // Write-attribution (vault#298) — REST batch create.
-            actor: writeCtx.actor,
-            via: writeCtx.via,
-          });
+          let note: Note;
+          try {
+            note = await store.createNote(item.content ?? "", {
+              id: item.id,
+              path: item.path,
+              tags: item.tags,
+              metadata: item.metadata,
+              created_at: item.createdAt ?? item.created_at,
+              ...(extension !== undefined ? { extension } : {}),
+              // Write-attribution (vault#298) — REST batch create.
+              actor: writeCtx.actor,
+              via: writeCtx.via,
+            });
+          } catch (err: any) {
+            // Race backstop (vault#555): a concurrent writer's INSERT
+            // committed between our proactive check and this one.
+            // Re-resolve the now-existing row and fall through to the SAME
+            // branch a proactive hit would have taken.
+            if (upsertMode && err?.code === "PATH_CONFLICT") {
+              const winner = await store.getNoteByPath(err.path, effectiveExtension);
+              if (winner) {
+                const { note: resultNote, noMutate } = await applyExistingNote(item, winner, ifExists as "ignore" | "update" | "replace");
+                recordExistedBranch(resultNote, noMutate);
+                continue;
+              }
+            }
+            throw err;
+          }
+
+          if (upsertMode) existedMap.set(note.id, false);
 
           if (item.links) {
             pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
@@ -1624,6 +1751,10 @@ async function handleNotesInner(
       // applied so the common no-defaults path adds zero extra reads.
       const mutatedIds = new Set<string>();
       for (const note of created) {
+        // "ignore" hits (vault#555) promise ZERO mutation, including
+        // schema-default backfill of a since-added default the existing
+        // note predates — skip them entirely.
+        if (noMutateIds.has(note.id)) continue;
         if (note.tags?.length) {
           for (const id of await applySchemaDefaults(store, db, [note.id], note.tags)) {
             mutatedIds.add(id);
@@ -1643,12 +1774,35 @@ async function handleNotesInner(
       // unchanged when no tag declares fields, so vaults without any tag
       // schemas see no behavior change. Fold in any `unresolved_link`
       // warnings (vault#555) — additive, present only when this note's
-      // `links` had a target that didn't resolve.
+      // `links` had a target that didn't resolve. `existed` (vault#555) is
+      // attached ONLY for items whose `if_exists` actually engaged — the
+      // default "error" path's response shape is untouched.
       const final = refreshed.map((n) => {
         const validated = attachValidationStatus(store, db, n);
         const warnings = linkWarningsByNote.get(n.id);
-        return warnings && warnings.length > 0 ? { ...validated, warnings } : validated;
+        const existed = existedMap.get(n.id);
+        let out: any = validated;
+        if (warnings && warnings.length > 0) out = { ...out, warnings };
+        if (existed !== undefined) out = { ...out, existed };
+        return out;
       });
+
+      // Batch summary (vault#555) — compact shape instead of N full note
+      // objects. Batch-only (a `notes` array); `summary` is ignored on a
+      // single-note POST. Mirrors the MCP create-note tool exactly.
+      if (body.notes && body.summary === true) {
+        return json(
+          {
+            created: final.filter((n: any) => n.existed !== true).length,
+            ids: final.map((n: any) => n.id),
+            // Reserved for future partial-batch-failure reporting — a batch
+            // create is all-or-nothing today, so this is always empty.
+            failed: [] as unknown[],
+          },
+          201,
+        );
+      }
+
       return json(body.notes ? final : final[0], 201);
     }
 

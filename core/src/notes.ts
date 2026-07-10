@@ -851,6 +851,32 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     );
   }
 
+  // Presence: has_broken_links (vault#555) — a dangling outbound wikilink or
+  // structured `links` target that never resolved. The `unresolved_wikilinks`
+  // table is created lazily (see wikilinks.ts:ensureUnresolvedTable) only when
+  // a link actually goes unresolved — a vault where nothing ever has won't
+  // have the table at all. Check existence first rather than reference it
+  // unconditionally: a read-only query filter shouldn't have the side effect
+  // of creating a table, and a bare `EXISTS`/`NOT EXISTS` against a missing
+  // table would throw "no such table" instead of the correct empty answer.
+  if (opts.hasBrokenLinks !== undefined) {
+    const unresolvedTableExists = db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'unresolved_wikilinks'",
+    ).get() !== null;
+    if (!unresolvedTableExists) {
+      // No table yet means no note has ever had a broken link:
+      // hasBrokenLinks:true matches nothing; hasBrokenLinks:false is a
+      // no-op (every note already qualifies) — add no condition at all.
+      if (opts.hasBrokenLinks) conditions.push("0 = 1");
+    } else {
+      conditions.push(
+        opts.hasBrokenLinks
+          ? `EXISTS (SELECT 1 FROM unresolved_wikilinks ubl WHERE ubl.source_id = n.id)`
+          : `NOT EXISTS (SELECT 1 FROM unresolved_wikilinks ubl WHERE ubl.source_id = n.id)`,
+      );
+    }
+  }
+
   // ID set filter — used by `near` to push neighborhood scoping into SQL so
   // that LIMIT applies to the neighborhood, not the whole notes table.
   if (opts.ids !== undefined) {
@@ -1238,6 +1264,7 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
     excludeTags: opts.excludeTags,
     hasTags: opts.hasTags,
     hasLinks: opts.hasLinks,
+    hasBrokenLinks: opts.hasBrokenLinks,
     path: opts.path,
     pathPrefix: opts.pathPrefix,
     extension: opts.extension,

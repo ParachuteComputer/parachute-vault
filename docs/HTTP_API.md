@@ -167,6 +167,8 @@ with a structured envelope:
   tags?: string[];
   validation_status?: ValidationStatus;  // present when any tag declares fields
   score?: number;  // vault#551 — search results ONLY; higher = more relevant, see "Full-text search" below
+  existed?: boolean;  // vault#555 — POST /notes ONLY, and only when that item's if_exists was ignore/update/replace; see "if_exists" above
+  broken_links?: { target: string; relationship: string }[];  // vault#555 — only when include_broken_links=true was passed
 }
 ```
 
@@ -187,6 +189,7 @@ collapsed).
   byteSize: number;  // UTF-8 bytes of the full content
   preview: string;   // first ~120 chars, single line
   score?: number;    // vault#551 — search results ONLY, carried onto the lean shape too (search's default response IS NoteIndex[])
+  broken_links?: { target: string; relationship: string }[];  // vault#555 — only when include_broken_links=true was passed
 }
 ```
 
@@ -227,6 +230,18 @@ collapsed).
   tagCount:     number;
 }
 ```
+
+**`tagCount` vs `GET /tags`'s row count (vault#555).** These answer two
+different questions and can legitimately disagree — `tagCount` here is
+`COUNT(DISTINCT tag_name)` over `note_tags`, i.e. "how many tags does the
+vault ACTUALLY use right now" (a tag with zero notes currently carrying it
+doesn't count). `GET /vault/{name}/api/tags` (and the MCP `list-tags` tool)
+instead enumerates every row in the `tags` IDENTITY table via a `LEFT JOIN`,
+so it INCLUDES zero-membership tags — a tag whose schema was declared via
+`PUT /api/tags/{name}` but never applied to a note yet, or one every note
+was later untagged/deleted from, still shows up there with `count: 0`. If
+`vault-info`'s `tagCount` reads lower than the length of `GET /tags`'s
+array, that gap IS the zero-membership tags — not a bug in either endpoint.
 
 ## Defaults: lean lists, fat point reads
 
@@ -639,6 +654,60 @@ bytes are skipped; the effective start is echoed back as `content_offset`.
 The MCP face is identical: `query-notes` takes `content_offset` /
 `content_length` as tool params and returns the same response fields.
 
+## Guarantees
+
+Contracts verified by the 2026-07-09 nine-persona deep test (ground-truth
+reproduced against a live REST API, not just unit-tested) but previously
+undocumented — real properties of this vault, not aspirational ones. Every
+item below has a companion regression test: append/prepend order, the
+`if_updated_at` conflict, `path_conflict` on a create race, and the metadata
+merge all live in `core/src/contract-concurrency.test.ts`; the
+`state_transition` compare-and-set (a second write whose `from` no longer
+matches gets rejected, unchanged) lives in `core/src/enforced-writes.test.ts`.
+
+- **`append`/`prepend` preserve commit order under concurrent writers —
+  atomically, with no precondition.** `content = content || ?` (or the
+  frontmatter-aware prepend variant) runs as ONE SQL `UPDATE` under the
+  write lock — two callers appending to the SAME note never overwrite each
+  other, and every append/prepend lands in the order its call actually
+  committed in, never reordered and never dropped. This is why
+  `append`/`prepend`-only updates are EXEMPT from the `if_updated_at`
+  precondition (see the `precondition_required` row above) — there's no
+  lost-write window to guard against.
+- **`state_transition` is a real compare-and-set, not read-then-write.**
+  `update-note`'s `state_transition: {field, from, to}` rides the SAME
+  conditional `UPDATE` as `if_updated_at` — `... WHERE
+  json_extract(metadata,'$.field') IS ?` — so the check and the write are
+  one atomic statement. Two callers racing to transition the same field can
+  never both observe `from` and both commit; exactly one succeeds, the
+  other gets `transition_conflict` (409) naming the `current` value that
+  beat it. Safe to use as a state machine's advance-step primitive without
+  a separate read-check-write round trip.
+- **Metadata updates MERGE — they never clobber untouched fields.**
+  `PATCH .../notes/{idOrPath}` and MCP `update-note`'s `metadata` field
+  follow RFC 7386 merge-patch: keys you pass overwrite, keys you omit are
+  left exactly as they were, and an explicit `null` value DELETES that key
+  (the only way to remove a metadata field — see the `Note` shape notes
+  above). A partial `metadata: {"status": "done"}` patch on a note with
+  five other metadata fields leaves all five untouched. (`create-note`'s
+  `if_exists: "replace"` mode is the deliberate exception — it's an
+  explicit wholesale-overwrite opt-in, not the default merge behavior; see
+  its docs above.)
+- **`path_conflict` on a create race — never a silent overwrite.** Two
+  callers creating a note at the SAME `path` at the same time: exactly one
+  INSERT wins (the `idx_notes_path_unique` partial index is enforced at the
+  SQLite layer, not application-checked-then-written), the other gets `409
+  path_conflict` — never a silently-overwritten note, never two notes
+  sharing a path. `create-note`'s `if_exists: "ignore"/"update"/"replace"`
+  (vault#555, see above) turns this same race into a clean idempotent
+  upsert instead of an error the caller has to retry by hand.
+- **`if_updated_at` conflict shape is a full diagnostic, not a bare 409.**
+  A losing optimistic-concurrency write gets `409 conflict` carrying
+  `note_id`, `path`, `current_updated_at` (what's actually on disk right
+  now), and `your_updated_at` (the stale token you sent) — enough to decide
+  programmatically whether to re-read-and-retry or surface a merge conflict
+  to a human, without a follow-up GET just to find out what changed.
+
 ## Endpoints
 
 The rest of this section documents every endpoint reachable on the REST
@@ -739,8 +808,14 @@ Query params:
     has no content to slice). See "Content range — bounded reads for large
     notes" above for units, alignment, and the response fields
     (`content_total_length`, `content_next_offset`).
-  - `include_links=true` — fold each note's outbound links into the result
-    rows.
+  - `include_links=true` — fold each note's links (BOTH directions — inbound
+    and outbound; vault#555 fix, this previously said "outbound" only) into
+    the result rows.
+  - `include_broken_links=true` — fold each note's DANGLING outbound links
+    (a `[[wikilink]]` or structured `links` target that never resolved to a
+    note) into a `broken_links: [{target, relationship}]` field, `[]` when
+    none (vault#555). One batched query for the whole page, same shape as
+    `include_links`.
   - `include_attachments=true` — fold each note's attachments into the
     result rows.
   - `include_metadata=...` — comma-separated allowlist of metadata keys;
@@ -761,6 +836,15 @@ Query params:
     is supplied without an explicit `tag_match`).
   - `exclude_tag=foo` — exclude notes carrying this tag.
   - `has_tags=true|false`, `has_links=true|false`.
+  - `has_broken_links=true|false` — presence filter on dangling outbound
+    links (vault#555): `true` returns only notes with at least one
+    unresolved `[[wikilink]]` or structured `links` target; `false` returns
+    only notes with none. Backed by the same `unresolved_wikilinks` table
+    `GET /vault/{name}/api/unresolved-wikilinks` enumerates; a target
+    created later backfills the edge automatically and the note drops out
+    of `has_broken_links=true` on the next call. Safe on a vault where no
+    link has ever gone unresolved — `true` matches nothing, `false` is a
+    no-op — rather than erroring on a table that was never created.
   - `path=foo/bar` — exact path match.
   - `path_prefix=foo/` — startswith.
   - `extension=md&extension=csv` — filter by file extension (vault#328).
@@ -791,6 +875,17 @@ Query params:
   | `meta[field][not_in]=...` | set non-membership |
 
   Mixing shorthand and operator form on the same field is rejected.
+
+  **Every operator, including `exists`, requires the field to be declared
+  `indexed: true`** in a tag schema (`PUT /api/tags/{name}`) — operators route
+  through the generated column backing the index, so an undeclared field
+  errors loudly (`400 INVALID_QUERY`) rather than scanning every row's JSON.
+  This applies to `exists` too, even though "does this field exist anywhere"
+  reads like it ought to work on any field: `exists` is answered from the
+  SAME generated column every other operator uses, so it needs the field
+  indexed just like `eq`/`gt`/`in`/etc. The plain shorthand
+  (`meta[field]=value`, equivalent to `eq`) is the ONLY form that falls back
+  to a `json_extract` scan and works on a non-indexed field.
 
 - **Metadata filters (JSON alias)**
   - `metadata=<json>` — the JSON-object form of the same filter, e.g.
@@ -939,8 +1034,17 @@ Query params:
   - `near[relationship]=cites` — restrict the walked edges.
 
 - **Sort + paging**
-  - `sort=asc|desc` — by `updated_at`. Default `asc`.
-  - `order_by=created_at|updated_at|...` — explicit column.
+  - `sort=asc|desc` — by `created_at`. Default `asc`. (vault#555 fix — this
+    previously said "by `updated_at`"; that's only true in cursor mode,
+    which forces `updated_at ASC` keyset ordering and rejects `sort=desc`
+    outright. Outside cursor mode, `sort` orders by `created_at`.)
+  - `order_by=<indexed metadata field>` — sort by a metadata field instead
+    of `created_at`; the field must be declared `indexed: true` in a tag
+    schema or the request 400s `invalid_query` / `FIELD_NOT_INDEXED` (vault#555
+    fix — this previously listed `created_at`/`updated_at` as example valid
+    values; neither is a metadata field, so both actually error). The special
+    value `link_count` sorts by link DEGREE and needs no declaration — see
+    `include_link_count` below.
   - `limit=N` — default 50. Must be a non-negative integer; `limit=-1` or a
     non-numeric value is a `400 invalid_query` (vault#550) — a negative
     limit used to silently mean "unlimited" (SQLite semantics leaking
@@ -1039,6 +1143,61 @@ dropping the edge:
   pending across the vault (rows now carry a `relationship` field alongside
   `source_id`/`target_path`).
 
+**`if_exists` — idempotent upsert on a path conflict (vault#555).** Pass
+`if_exists: "error"|"ignore"|"update"|"replace"` (default `"error"` —
+unchanged `path_conflict` behavior) on any item whose `path` might already
+name an existing note:
+
+- `"error"` (default): unchanged — `409 path_conflict`, nothing written.
+- `"ignore"`: return the existing note UNCHANGED — no error, no mutation of
+  any kind (content/metadata/tags/links untouched, no schema-default
+  backfill). Response carries `existed: true`. The idempotent-retry
+  primitive: a crash-replay or the losing side of a create-race gets back
+  the same note a first-time caller would have created, safely, any number
+  of times.
+- `"update"`: merge this payload into the existing note — `content` (if
+  provided) fully replaces the existing content (omit to leave it
+  untouched); `metadata` (if provided) is RFC-7386 merged — existing keys
+  preserved, incoming keys overwrite, an incoming `null` deletes a key —
+  same semantics as `PATCH .../notes/{idOrPath}`; `tags`/`links` (if
+  provided) are ADDED to the existing set (union — nothing already there is
+  removed). Response carries `existed: true`.
+- `"replace"`: overwrite `content` and `metadata` WHOLESALE — `content`
+  becomes exactly the incoming value (or `""` if omitted) and `metadata`
+  becomes exactly the incoming object (or `{}` if omitted), NOT merged, so a
+  prior metadata key absent from this payload is dropped. `tags`/`links`
+  stay additive (same union behavior as `"update"`) — a replace targets the
+  free-form fields, not the taxonomy/graph, so it can't silently orphan
+  links or detach tags the caller didn't mention. The note's `id` and
+  `createdAt` are preserved either way.
+
+Only meaningful when `path` is set — a pathless create can never conflict.
+A note's response carries `existed` (`true`/`false`) whenever ITS
+`if_exists` was one of `"ignore"`/`"update"`/`"replace"` — `false` means a
+normal fresh insert happened (including a pathless create, which reports
+`existed: false` since there was nothing to conflict with). Absent entirely
+under the default `"error"` mode, so a plain `POST /notes` response is
+byte-identical to before this feature. Batch-aware, per-item: set
+`if_exists` on each entry inside `notes` — a top-level `if_exists` alongside
+a `notes` array is NOT inherited by items that omit their own (matches
+`if_missing` on `PATCH .../notes/{idOrPath}`; it only takes effect on a
+single-note POST, where the body IS the one item).
+
+**`summary` — compact batch response (vault#555).** Pass `summary: true` on
+a batch (`notes` array) POST to receive a compact shape instead of N full
+note objects:
+
+```json
+{ "created": 2, "ids": ["id-a", "id-b", "id-c"], "failed": [] }
+```
+
+`created` counts items that resulted in a BRAND-NEW insert (excludes
+`if_exists` collisions); `ids` lists every resulting note id in item order
+(fresh creates AND `existed` hits alike); `failed` is reserved for future
+partial-batch-failure reporting — today a batch create is all-or-nothing
+(any thrown error aborts and rolls back the WHOLE call, same with or without
+`summary`), so it's always `[]`. Ignored on a single-note POST.
+
 #### `GET /vault/{name}/api/notes/{idOrPath}` — `vault:read`
 Returns the full `Note` (defaults to `include_content=true` for point
 reads). `?include_content=false` returns a `NoteIndex`. Carries
@@ -1056,7 +1215,11 @@ attachment rule as the structured-query list below.
 
 Folding options:
 
-- `include_links=true` — append outbound links as a `links` field.
+- `include_links=true` — append links (both directions — inbound and
+  outbound; vault#555 fix) as a `links` field.
+- `include_broken_links=true` — append dangling outbound links as
+  `broken_links: [{target, relationship}]` (vault#555). See `has_broken_links`
+  above.
 - `include_attachments=true` — append attachments as an `attachments` field.
 - `include_metadata=...` — same allowlist as the list endpoint.
 - `expand=true&depth=N` — inline `[[wikilink]]` targets.
@@ -1296,7 +1459,8 @@ are derived projections of the notes endpoint:
   Filter parameters (`tag=`, `path_prefix=`, `near[...]`, etc.) all apply
   before the graph is shaped.
 - **`?include_links=true` on `GET /api/notes` or `GET /api/notes/{id}`**
-  folds outbound `Link[]` (hydrated) into each result row.
+  folds `Link[]` (hydrated, BOTH directions — inbound and outbound;
+  vault#555 fix) into each result row.
 - **Link mutations** go through `PATCH /api/notes/{id}` with `links.add` /
   `links.remove`.
 
@@ -1343,7 +1507,12 @@ relationships, parent_names, created_at, updated_at) into the response.
 distinct notes matching the tag OR any transitive descendant under the
 default (subtypes) expansion — the number that makes a parent tag whose
 notes are all tagged with a more specific child read as non-empty instead
-of reporting `count: 0`.
+of reporting `count: 0`. This list INCLUDES zero-membership tags
+(`count: 0` — a schema declared via `PUT .../tags/{name}` but never yet
+applied to a note, or a tag every note was since untagged from), so its
+length can run higher than `GET /vault/{name}/api/vault`'s stats `tagCount`
+(vault#555 — see the `VaultStats` shape above), which counts only tags at
+least one note currently carries.
 
 #### `GET /vault/{name}/api/tags?tag=<name>` — `vault:read`
 Single-tag detail (full identity record).
