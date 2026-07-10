@@ -445,7 +445,7 @@ export class BunSqliteStore implements Store {
     return expanded;
   }
 
-  async listTags(): Promise<{ name: string; count: number }[]> {
+  async listTags(): Promise<{ name: string; count: number; expanded_count: number }[]> {
     return noteOps.listTags(this.db);
   }
 

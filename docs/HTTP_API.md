@@ -247,6 +247,17 @@ new since my last call" patterns. Wall-clock watermarks (passing back a
 prior `updated_at` as `meta[updated_at][gte]`) miss or double-count at the
 millisecond boundary; cursors eliminate the bookkeeping.
 
+**Bootstrap (vault#550).** `cursor` is keyed on PRESENCE, not on having a
+real value yet — pass `?cursor=` (present, empty) on the FIRST call to
+opt into the envelope with no watermark. `?cursor=` and an omitted `cursor`
+param are different things: omitting `cursor` entirely stays a plain flat
+array with no pagination and no way to resume (today's non-cursor
+behavior, unchanged); `?cursor=` is "I want to paginate, starting now."
+(Before 0.7.0-rc.2 the first call could never obtain a cursor at all — the
+route only wrapped the response in `{notes, next_cursor}` when a cursor
+param was ALREADY present, so there was no way to get the first one. This
+is the fix.)
+
 **Format.** Opaque. Treat as a black box — base64url over an internal
 shape, self-contained, survives process restarts. Cursors bind to the query
 that produced them (sha256 over the result-set-affecting filters: tags,
@@ -266,8 +277,8 @@ All four return `400` with `code: "INVALID_QUERY"`.
 **Cycle.**
 
 ```
-# First call — no cursor yet
-GET /vault/default/api/notes?limit=50
+# First call — bootstrap with an EMPTY cursor, not an omitted one
+GET /vault/default/api/notes?cursor=&limit=50
 → 200 {
     "notes": [...],
     "next_cursor": "eyJxaCI6IjU3OS4uLiIsInUiOiIyMDI2LTA1LTIxVDA4OjAwOjAwLjAwMFoiLCJpIjoibm90ZS00MiJ9"
@@ -298,13 +309,83 @@ single string and keep calling without special-casing the empty case.
 **Error shapes.**
 
 ```json
-{ "error": "...", "code": "cursor_invalid" }          // malformed / bad hash
+{ "error": "...", "code": "cursor_invalid" }          // malformed / bad hash — message now states the bootstrap flow (vault#550)
 { "error": "...", "code": "cursor_query_mismatch" }   // filters changed; drop cursor + restart
 ```
 
 `dateFilter` remains the lower-level primitive for absolute date ranges —
 cursors and date filters coexist (cursor = "since last checked", dateFilter
 = "between X and Y").
+
+## Honest queries — warnings channel + structured invalids (vault#550)
+
+Ratified principle: if the vault can still answer the question asked,
+answer it and attach a warning; if it would answer a DIFFERENT question,
+return a structured named error. Silence is never the third option.
+
+**Warnings channel (additive).** `GET /vault/{name}/api/notes` (structured
+query only — not `search=`) can return `warnings: [{code, message, ...}]`
+when something about the request looks like a mistake but the query still
+ran and the result is still meaningful. Two warning codes today:
+
+- `unknown_tag` — a `tag=` filter names a tag with no identity row, no
+  notes carrying it, and (given the request's `expand` axis) no expansion
+  members either. Carries `tag` and, when a close match exists,
+  `did_you_mean` (case variant, prefix relationship, or small edit
+  distance against the vault's real tag catalog).
+- `removed_param` — the flat `date_field` / `date_from` / `date_to` query
+  params (removed at 0.6.4, see below) are present. Carries `param`. One
+  entry per removed param present.
+
+**Surfacing differs by response shape** (compat-preserving — this is why
+it's additive, not a breaking wire-shape change):
+
+- **Bare-array responses** (no `cursor` param, e.g. the plain
+  `GET /notes?tag=...` list) keep the bare-array body — a code consumer
+  doing `for (const note of await res.json())` is unaffected — but gain a
+  response header, `X-Parachute-Warnings`, set only when there's something
+  to say: `encodeURIComponent(JSON.stringify(warnings))`. Percent-encoded
+  because header VALUES are ASCII/Latin1-only while warning `message` text
+  may not be; decode with `decodeURIComponent` then `JSON.parse`.
+- **Envelope responses** (cursor mode, `{notes, next_cursor}`; also
+  `{nodes, edges}` for `?format=graph`) carry `warnings` INLINE in the body
+  when non-empty, in addition to the same header.
+
+Tag-scoped tokens never see `unknown_tag`/`did_you_mean` — both are
+computed against the full vault-wide tag catalog, and surfacing them to a
+scoped session would leak an out-of-scope tag's name/existence across the
+scope boundary (this codebase's standing "no leak" stance — see
+[`docs/contracts/tag-scoped-tokens.md`](./contracts/tag-scoped-tokens.md)).
+`removed_param` carries no tag information and is unaffected by scope.
+
+**Structured invalids (400, `error_type: "invalid_query"`).** Three cases
+that used to silently mean something OTHER than what was typed now error
+loudly instead, each carrying `{error_type, field, got, hint}` alongside
+the existing `error`/`code`:
+
+- `limit` negative or non-numeric — SQLite treats a negative `LIMIT` as
+  "no limit," so `?limit=-1` used to silently return EVERYTHING.
+- `offset` negative or non-numeric.
+- an unparseable value in a bracket date filter
+  (`?meta[created_at][gte]=not-a-date`) — used to bind straight into a
+  lexicographic string comparison against real ISO timestamps and quietly
+  match nothing, or everything, depending on how the garbage happened to
+  sort.
+
+```json
+{
+  "error": "invalid limit: -1 — must be a non-negative integer ...",
+  "code": "INVALID_QUERY",
+  "error_type": "invalid_query",
+  "field": "limit",
+  "got": "-1",
+  "hint": "pass a non-negative integer, or omit for the default"
+}
+```
+
+The MCP `query-notes` tool call surfaces the identical `error_type` (via a
+structured JSON-RPC error) for the same three cases — see the tool
+description for `limit`/`offset`/`date_filter`.
 
 ## Content range — bounded reads for large notes
 
@@ -490,7 +571,10 @@ Query params:
     in 0.6.4 and are now silently ignored — a request that passes only flat date
     params comes back unfiltered. Use bracket-style. (The MCP `query-notes`
     `date_from` / `date_to` shorthand is a separate, supported convenience and
-    is unaffected.)
+    is unaffected.) Since vault#550, passing any of them now ALSO surfaces a
+    `removed_param` entry on the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550) — still ignored, no longer silent.
+  - An unparseable value on either bound (`meta[created_at][gte]=not-a-date`)
+    is a `400 invalid_query` (vault#550) — see the warnings-channel section.
 
 - **Metadata filters (bracket-style)**
 
@@ -535,8 +619,11 @@ Query params:
 - **Sort + paging**
   - `sort=asc|desc` — by `updated_at`. Default `asc`.
   - `order_by=created_at|updated_at|...` — explicit column.
-  - `limit=N` — default 50.
-  - `offset=N` — default 0.
+  - `limit=N` — default 50. Must be a non-negative integer; `limit=-1` or a
+    non-numeric value is a `400 invalid_query` (vault#550) — a negative
+    limit used to silently mean "unlimited" (SQLite semantics leaking
+    through).
+  - `offset=N` — default 0. Same non-negative-integer validation.
 
 - **Wikilink expansion**
   - `expand=true&depth=2` — recursively inline `[[wikilink]]` targets into
@@ -549,10 +636,17 @@ Error shapes notable to callers:
   incompatible param, a malformed `metadata=` JSON alias (parse failure, or a
   non-object value), or supplying both the `metadata=` alias and bracket
   `meta[...]` forms, etc.
+- `400 invalid_query` (vault#550) — negative/non-numeric `limit` or `offset`,
+  or an unparseable date value in a bracket date filter. Carries
+  `{error_type, field, got, hint}` — see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
+  section.
 - `400 cursor_invalid` / `400 cursor_query_mismatch` — see cursor section.
 - `409 ambiguous_path` — `id=<path>` resolved to more than one note. Body
   carries `path` + `candidates: NoteIndex[]`. Re-issue with the exact id of
   the intended candidate.
+
+Response may also carry a `warnings` field / `X-Parachute-Warnings` header —
+see [Honest queries](#honest-queries--warnings-channel--structured-invalids-vault550) above.
 
 #### `POST /vault/{name}/api/notes` — `vault:write`
 Create a note, or a batch.
@@ -828,8 +922,27 @@ path). Optional `max_depth=N` (default 5, capped at 10).
 Returns either `null` (no path) or:
 
 ```json
-{ "path": ["note-a", "note-b", "note-c"], "edges": [...] }
+{
+  "path": ["note-a", "note-b", "note-c"],
+  "relationships": ["mentions", "related-to"],
+  "nodes": [
+    { "id": "note-a", "path": "People/Alice" },
+    { "id": "note-b", "path": null },
+    { "id": "note-c", "path": "Projects/X" }
+  ],
+  "edges": [
+    { "source": "note-a", "target": "note-b", "relationship": "mentions", "sourcePath": "People/Alice", "targetPath": null },
+    { "source": "note-b", "target": "note-c", "relationship": "related-to", "sourcePath": null, "targetPath": "Projects/X" }
+  ]
+}
 ```
+
+`path` (note IDs, source → target) and `relationships` (`relationships[i]`
+connects `path[i]` to `path[i+1]`) are the original shape. `nodes` and
+`edges` (vault#550, additive) hydrate each id with the note's own `path`
+field — `nodes` mirrors `path[]` one-for-one; `edges` is a self-contained
+hop list for rendering the chain without cross-referencing `nodes`. The
+MCP `find-path` tool returns the identical shape.
 
 Tag-scoped tokens see `null` when any intermediate hop is outside the
 allowlist — a reachable target via an out-of-scope hop is not a permitted
@@ -838,9 +951,14 @@ answer.
 ### Tags
 
 #### `GET /vault/{name}/api/tags` — `vault:read`
-List all tags. Returns `[{name, count}]` by default; `?include_schema=true`
-folds each tag's identity row (description, fields, relationships,
-parent_names, created_at, updated_at) into the response.
+List all tags. Returns `[{name, count, expanded_count}]` by default;
+`?include_schema=true` folds each tag's identity row (description, fields,
+relationships, parent_names, created_at, updated_at) into the response.
+`count` is notes carrying the EXACT tag; `expanded_count` (vault#550) is
+distinct notes matching the tag OR any transitive descendant under the
+default (subtypes) expansion — the number that makes a parent tag whose
+notes are all tagged with a more specific child read as non-empty instead
+of reporting `count: 0`.
 
 #### `GET /vault/{name}/api/tags?tag=<name>` — `vault:read`
 Single-tag detail (full identity record).
@@ -849,6 +967,7 @@ Single-tag detail (full identity record).
 {
   "name": "project",
   "count": 12,
+  "expanded_count": 19,
   "description": "...",
   "fields": { ... },
   "relationships": { ... },
@@ -858,8 +977,24 @@ Single-tag detail (full identity record).
 }
 ```
 
+**404 `tag_not_found` (vault#550).** When the name has no identity row AND
+no note carries it (directly or via expansion) — a typo, or a tag from a
+different vault — this now 404s instead of synthesizing an all-null 200:
+
+```json
+{ "error": "Tag not found", "error_type": "tag_not_found", "tag": "projcet", "did_you_mean": "project" }
+```
+
+`did_you_mean` is present only when a close match exists (case variant,
+prefix relationship, or small edit distance). A tag with an identity row
+but zero notes is still a legitimate 200 (declaring a tag via `update-tag`
+before using it is fine) — the 404 only fires when NEITHER an identity row
+NOR any membership exists. The MCP `list-tags` tool returns the same
+`{error, error_type: "tag_not_found", tag, did_you_mean?}` shape (as a
+returned object, not a thrown error) for a nonexistent `tag` param.
+
 #### `GET /vault/{name}/api/tags/{name}` — `vault:read`
-Same as the `?tag=` query — single-tag detail by path.
+Same as the `?tag=` query — single-tag detail by path, same 404 shape.
 
 #### `PUT /vault/{name}/api/tags/{name}` — `vault:write`
 Upsert a tag's identity row. Body accepts any combination of:

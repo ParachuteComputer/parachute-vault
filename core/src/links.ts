@@ -404,6 +404,66 @@ export function traverseLinks(
   return results;
 }
 
+/** Hydrated find-path result — see `hydratePathResult` for field semantics. */
+export interface FindPathResult {
+  /** Note IDs, source → target (unchanged shape — back-compat). */
+  path: string[];
+  /** relationships[i] is the edge connecting path[i] to path[i+1] (unchanged shape). */
+  relationships: string[];
+  /**
+   * Hydrated companion to `path[]` (vault#550, additive): one entry per
+   * node, in the same order, carrying the note's `path` field alongside
+   * its `id` — so a caller doesn't have to round-trip each id through a
+   * separate note fetch just to render a human-legible chain.
+   */
+  nodes: { id: string; path: string | null }[];
+  /**
+   * Hydrated companion to `relationships[]` (vault#550, additive): each
+   * hop as a self-contained `{source, target, relationship}` edge plus
+   * both endpoints' note `path`, so a graph-rendering client can draw the
+   * chain without cross-referencing `nodes`.
+   */
+  edges: {
+    source: string;
+    target: string;
+    relationship: string;
+    sourcePath: string | null;
+    targetPath: string | null;
+  }[];
+}
+
+/**
+ * Hydrate a raw BFS result (`path` ids + `relationships`) with each node's
+ * note `path` field, in ONE batched query (not one fetch per hop). `path`
+ * and `relationships` pass through byte-identical to before this existed —
+ * `nodes`/`edges` are pure additions.
+ */
+function hydratePathResult(db: Database, path: string[], relationships: string[]): FindPathResult {
+  const pathById = new Map<string, string | null>();
+  for (const chunk of chunkForInClause(path)) {
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = db.prepare(`SELECT id, path FROM notes WHERE id IN (${placeholders})`).all(...chunk) as
+      { id: string; path: string | null }[];
+    for (const row of rows) pathById.set(row.id, row.path);
+  }
+
+  const nodes = path.map((id) => ({ id, path: pathById.get(id) ?? null }));
+  const edges: FindPathResult["edges"] = [];
+  for (let i = 0; i < path.length - 1; i++) {
+    const source = path[i]!;
+    const target = path[i + 1]!;
+    edges.push({
+      source,
+      target,
+      relationship: relationships[i] ?? "",
+      sourcePath: pathById.get(source) ?? null,
+      targetPath: pathById.get(target) ?? null,
+    });
+  }
+
+  return { path, relationships, nodes, edges };
+}
+
 /**
  * Find a path between two notes in the link graph.
  * Returns the sequence of note IDs from source to target, or null if no path exists.
@@ -413,11 +473,11 @@ export function findPath(
   sourceId: string,
   targetId: string,
   opts?: { max_depth?: number },
-): { path: string[]; relationships: string[] } | null {
+): FindPathResult | null {
   const maxDepth = opts?.max_depth ?? 5;
 
   if (sourceId === targetId) {
-    return { path: [sourceId], relationships: [] };
+    return hydratePathResult(db, [sourceId], []);
   }
 
   // BFS from source
@@ -460,7 +520,7 @@ export function findPath(
             current = entry.parent;
           }
           path.unshift(sourceId);
-          return { path, relationships };
+          return hydratePathResult(db, path, relationships);
         }
       }
     }

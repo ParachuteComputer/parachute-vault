@@ -34,6 +34,71 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.0-rc.2] - 2026-07-09
+
+### Added
+
+- **Honest query boundary — warnings channel, structured invalids, cursor
+  bootstrap, tags 404, expanded_count, find-path hydration (Wave 2 of the
+  Reliability & Usability Program, WS1, #550).** Every #550 finding is now
+  a real fix instead of a `test.todo` — the full list:
+  - **Warnings channel (additive).** Structured-query `GET /notes` (REST)
+    and `query-notes` (MCP) now collect `warnings: [{code, message, ...}]`:
+    `unknown_tag` (a `tag=` filter that matches nothing directly OR via
+    expansion and has no identity row — carries `did_you_mean` when a close
+    match exists) and `removed_param` (the flat `date_field`/`date_from`/
+    `date_to` REST params, silently ignored since 0.6.4, now say so). REST
+    bare-array responses keep their shape and gain an
+    `X-Parachute-Warnings` header (percent-encoded JSON — header values are
+    ASCII-only, warning text isn't); envelope responses (cursor mode,
+    `?format=graph`) carry `warnings` inline too. MCP wraps as
+    `{notes, warnings}` when non-empty, composing with the cursor envelope
+    (`{notes, next_cursor, warnings}`). Tag-scoped sessions never see
+    `unknown_tag`/`did_you_mean` — both resolve against the full vault-wide
+    tag catalog, which would leak an out-of-scope tag's name across the
+    scope boundary otherwise (REST skips the computation when scoped; MCP's
+    tag-scope wrapper strips `warnings` from a scoped response).
+  - **Structured invalids.** `limit`/`offset` negative or non-numeric, and
+    an unparseable date value in a bracket date filter
+    (`meta[created_at][gte]=not-a-date`), now 400 with
+    `error_type: "invalid_query"` + `{field, got, hint}` — REST and MCP
+    both, from one shared validator in `core/src/notes.ts:queryNotes`. A
+    malformed cursor's `cursor_invalid` message now states the bootstrap
+    flow explicitly instead of just "this is broken."
+  - **Cursor bootstrap (the P1).** `cursor` is now keyed on PRESENCE, not
+    truthiness — `?cursor=` / `cursor: ""` engages the `{notes,
+    next_cursor}` envelope on the FIRST call (no watermark yet); an
+    OMITTED `cursor` stays today's plain flat array. Before this fix
+    `if (cursorParam)` (REST) / `params.cursor.length > 0` (MCP) treated an
+    empty string exactly like "no cursor," so a documented bootstrap flow
+    (`core/src/mcp.ts`'s `query-notes` description) was never actually
+    reachable — the first call could never obtain a cursor.
+  - **Tags 404.** `GET /api/tags/{name}` and `GET /api/tags?tag=<name>`
+    (REST) and `list-tags({tag})` (MCP) now return a structured
+    `tag_not_found` (404 for REST; a returned error object for MCP,
+    matching the existing note-not-found convention) instead of
+    synthesizing an all-null 200, when a tag has no identity row AND no
+    notes carry it. `did_you_mean` names a close match when one exists,
+    restricted to the caller's allowlist for a tag-scoped session.
+  - **`expanded_count`.** `list-tags` (REST + MCP) now reports
+    `expanded_count` alongside the literal `count` — distinct notes
+    matching the tag OR any subtypes-axis descendant, computed in one pass
+    over `note_tags` (no N+1 per tag) via
+    `core/src/tag-hierarchy.ts:computeExpandedTagCounts`. Fixes a parent
+    tag whose notes are all tagged with a more specific child reporting
+    `count: 0`.
+  - **find-path hydration (additive).** `find-path` (REST + MCP) gains
+    `nodes: [{id, path}]` (mirrors `path[]`, hydrated) and
+    `edges: [{source, target, relationship, sourcePath, targetPath}]`
+    (self-contained hop list) alongside the original `path`/`relationships`
+    shape, unchanged.
+  - Wire-shape changes are all additive except the cursor-bootstrap
+    behavioral fix (a `?cursor=`/`cursor: ""` call that previously got a
+    flat array now gets an envelope) and the tags 404 (previously 200).
+    Both are called out per the umbrella issue's compat note ("limit/date/
+    cursor errors behavioral; tags 404 breaking-lite — rides the 0.7.0
+    train").
+
 ## [0.7.0-rc.1] - 2026-07-09
 
 ### Added

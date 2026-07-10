@@ -76,7 +76,10 @@ export function unsupportedSubscriptionReason(opts: QueryOpts): string | null {
   // subscribe route detects them from raw query params. These guards catch the
   // remaining shapes that the matcher can't faithfully evaluate against a
   // single in-hand note (so snapshot and live would disagree).
-  if (opts.cursor) {
+  // Presence, not truthiness (vault#550) — a bootstrap `cursor: ""` is
+  // still cursor intent and must still be rejected here, not silently
+  // treated as "no cursor requested."
+  if (opts.cursor !== undefined) {
     return "cursor pagination is not supported for live subscriptions";
   }
   if (opts.hasLinks !== undefined) {

@@ -94,41 +94,59 @@ export function encodeCursor(payload: CursorPayload): string {
   return Buffer.from(json, "utf8").toString("base64url");
 }
 
-/** Decode a cursor string. Throws `CursorError` on any structural problem. */
+/**
+ * Trailing hint appended to every `cursor_invalid` message (vault#550) so a
+ * caller who passed a garbage cursor — or never understood the bootstrap
+ * shape in the first place — gets the actual recovery flow, not just "this
+ * string is broken." The bootstrap flow: an EMPTY string (`cursor: ""` /
+ * `?cursor=`) opts into cursor mode without a watermark yet; the response's
+ * `next_cursor` is what you pass on every call after that.
+ */
+const CURSOR_BOOTSTRAP_HINT =
+  'first call: pass cursor:"" (or omit `cursor` entirely for a plain, non-paginated list); the response carries `next_cursor` — pass that back on each subsequent call to resume from the watermark.';
+
+/**
+ * Decode a cursor string. Throws `CursorError` on any structural problem.
+ * An EMPTY string is deliberately NOT accepted here — callers (queryNotes /
+ * queryNotesPaged) must special-case `opts.cursor === ""` as "cursor mode,
+ * no watermark yet" and skip calling this at all (vault#550 bootstrap fix).
+ * Any caller that reaches this function with an empty string gets the same
+ * loud `cursor_invalid` as any other malformed cursor.
+ */
 export function decodeCursor(cursor: string): CursorPayload {
   if (typeof cursor !== "string" || cursor.length === 0) {
-    throw new CursorError("cursor must be a non-empty string", "cursor_invalid");
+    throw new CursorError(`cursor must be a non-empty string — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   let json: string;
   try {
     json = Buffer.from(cursor, "base64url").toString("utf8");
   } catch {
-    throw new CursorError("cursor is not valid base64url", "cursor_invalid");
+    throw new CursorError(`cursor is not valid base64url — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
   } catch {
-    throw new CursorError("cursor payload is not valid JSON", "cursor_invalid");
+    throw new CursorError(`cursor payload is not valid JSON — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   if (!parsed || typeof parsed !== "object") {
-    throw new CursorError("cursor payload must be an object", "cursor_invalid");
+    throw new CursorError(`cursor payload must be an object — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   const p = parsed as Record<string, unknown>;
   if (typeof p.v !== "number" || p.v !== CURSOR_VERSION) {
     throw new CursorError(
-      `cursor schema version mismatch (expected ${CURSOR_VERSION}, got ${String(p.v)})`,
+      `cursor schema version mismatch (expected ${CURSOR_VERSION}, got ${String(p.v)}) — ${CURSOR_BOOTSTRAP_HINT}`,
       "cursor_invalid",
     );
   }
   if (typeof p.last_updated_at !== "number" || !Number.isFinite(p.last_updated_at)) {
-    throw new CursorError("cursor.last_updated_at must be a finite number", "cursor_invalid");
+    throw new CursorError(`cursor.last_updated_at must be a finite number — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   if (typeof p.last_id !== "string") {
-    throw new CursorError("cursor.last_id must be a string", "cursor_invalid");
+    throw new CursorError(`cursor.last_id must be a string — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   if (typeof p.query_hash !== "string" || p.query_hash.length === 0) {
-    throw new CursorError("cursor.query_hash must be a non-empty string", "cursor_invalid");
+    throw new CursorError(`cursor.query_hash must be a non-empty string — ${CURSOR_BOOTSTRAP_HINT}`, "cursor_invalid");
   }
   return {
     v: p.v,

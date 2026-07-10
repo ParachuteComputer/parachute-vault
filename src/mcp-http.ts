@@ -156,7 +156,26 @@ async function handleMcp(
         to?: unknown;
         current?: unknown;
         violations?: unknown;
+        error_type?: string;
+        got?: unknown;
+        hint?: string;
       };
+      // Honest-queries validation errors (vault#550) — `limit`/`offset`/date
+      // values that are structurally invalid rather than merely "no
+      // results." Gated on `error_type === "invalid_query"` specifically
+      // (not `code === "INVALID_QUERY"` broadly) so long-standing QueryError
+      // throws WITHOUT this field (FIELD_NOT_INDEXED, UNKNOWN_OPERATOR, the
+      // various cursor/near/search incompatibility errors, ...) keep their
+      // existing unstructured `isError: true` fallback — only the NEW #550
+      // call sites that explicitly set `error_type` opt into this shape.
+      if (e?.error_type === "invalid_query") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: "invalid_query",
+          field: e.field,
+          got: e.got,
+          hint: e.hint,
+        });
+      }
       if (e?.code === "CONFLICT") {
         throw new McpError(ErrorCode.InvalidRequest, message, {
           error_type: "conflict",

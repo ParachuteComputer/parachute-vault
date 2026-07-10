@@ -308,9 +308,11 @@ function applyTagScopeWrappers(
     const allowed = await getAllowed();
     const result = await orig(params);
     if (!allowed) return result;
-    // Three possible response shapes:
-    //   - Array (legacy list, no cursor)
+    // Possible response shapes (vault#550 added the `warnings` variants):
+    //   - Array (legacy list, no cursor, no warnings)
     //   - `{notes, next_cursor}` (cursor mode, vault#313)
+    //   - `{notes, warnings}` (warnings present, not in cursor mode)
+    //   - `{notes, next_cursor, warnings}` (both)
     //   - `{...note}` with `id`+`tags` (single-note by id)
     if (Array.isArray(result)) {
       return result
@@ -321,15 +323,22 @@ function applyTagScopeWrappers(
       result &&
       typeof result === "object" &&
       "notes" in result &&
-      Array.isArray((result as any).notes) &&
-      "next_cursor" in result
+      Array.isArray((result as any).notes)
     ) {
-      const r = result as { notes: any[]; next_cursor: string | null };
+      const r = result as { notes: any[]; next_cursor?: string | null; warnings?: unknown };
       return {
         notes: r.notes
           .filter((n: any) => noteWithinTagScope(n, allowed, rawTags))
           .map(scrubNoteLinks),
-        next_cursor: r.next_cursor,
+        ...("next_cursor" in r ? { next_cursor: r.next_cursor } : {}),
+        // `warnings` intentionally DROPPED for a tag-scoped session: core's
+        // `collectUnknownTagWarnings` (core/src/query-warnings.ts) resolves
+        // `did_you_mean` against the FULL vault-wide tag catalog, which
+        // would leak an out-of-scope tag's existence/name to a token that
+        // can't otherwise see it — the same "no leak across the scope
+        // boundary" stance this file takes everywhere else (see
+        // docs/contracts/tag-scoped-tokens.md). Unscoped sessions keep
+        // `warnings` untouched via the `!allowed` early return above.
       };
     }
     if (result && typeof result === "object" && "id" in result && "tags" in result) {

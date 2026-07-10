@@ -37,9 +37,26 @@ const OPS_SET: ReadonlySet<string> = new Set<string>(SUPPORTED_OPS);
 export class QueryError extends Error {
   override name = "QueryError";
   code: string;
-  constructor(message: string, code = "INVALID_QUERY") {
+  /**
+   * Structured `error_type` for the honest-queries validation errors
+   * (vault#550 — `limit`/`offset`/date-value validation). Optional: the
+   * long-standing QueryError call sites (FIELD_NOT_INDEXED,
+   * UNKNOWN_OPERATOR, generic INVALID_QUERY combos) leave this unset and
+   * keep their existing `{error, code}` response shape — only the new #550
+   * call sites opt into the richer `{error_type, field, got, hint}` shape.
+   */
+  error_type?: string;
+  field?: string;
+  got?: unknown;
+  hint?: string;
+  constructor(
+    message: string,
+    code = "INVALID_QUERY",
+    extra?: { error_type?: string; field?: string; got?: unknown; hint?: string },
+  ) {
     super(message);
     this.code = code;
+    if (extra) Object.assign(this, extra);
   }
 }
 
