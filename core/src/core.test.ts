@@ -3608,6 +3608,72 @@ describe("MCP tools", async () => {
     expect(result.fields.age.type).toBe("integer");
   });
 
+  // vault#555 fix 4 — a non-indexed field's `type` was never validated
+  // anywhere; a genuinely unrecognized type string was accepted and
+  // persisted verbatim, no error.
+  it("update-tag rejects an unrecognized field type (invalid_type)", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({ tag: "widget", fields: { weird: { type: "frobnicator" } } });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.error_type).toBe("tag_field_conflict");
+    expect(caught.violations).toHaveLength(1);
+    expect(caught.violations[0].field).toBe("weird");
+    expect(caught.violations[0].reason).toBe("invalid_type");
+
+    // Nothing persisted.
+    const record = await store.getTagRecord("widget");
+    expect(record?.fields ?? null).toBeFalsy();
+  });
+
+  // vault#555 fix 5 — one call declaring TWO bad fields (an unrecognized
+  // type AND a non-conforming default) reports BOTH violations together,
+  // not just the first one encountered.
+  it("update-tag reports an unrecognized type AND a bad default together in one call", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "widget",
+        fields: {
+          weird: { type: "frobnicator" },
+          bad_default: { type: "string", enum: ["a", "b"], default: "zzz" },
+        },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.violations).toHaveLength(2);
+    const byField = new Map(caught.violations.map((v: any) => [v.field, v.reason]));
+    expect(byField.get("weird")).toBe("invalid_type");
+    expect(byField.get("bad_default")).toBe("invalid_default");
+  });
+
+  it("update-tag accepts every recognized field type", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = await updateTag.execute({
+      tag: "widget",
+      fields: {
+        a: { type: "string" },
+        b: { type: "number" },
+        c: { type: "integer" },
+        d: { type: "boolean" },
+        e: { type: "array" },
+        f: { type: "object" },
+      },
+    }) as any;
+    expect(result.fields.a.type).toBe("string");
+    expect(result.fields.f.type).toBe("object");
+  });
+
   it("find-path works with ID/path resolution", async () => {
     await store.createNote("A", { id: "a", path: "People/Alice" });
     await store.createNote("B", { id: "b" });

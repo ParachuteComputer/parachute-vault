@@ -55,7 +55,7 @@ import {
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
-import { ParentCycleError, InvalidFieldDefaultError } from "../core/src/tag-schemas.ts";
+import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
 import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
@@ -2762,11 +2762,22 @@ export async function handleTags(
     // — silent 200s on main — is non-indexed type conflicts and indexed-flag
     // conflicts. See `collectCrossTagFieldViolations`'s doc comment.
     if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      const incomingFields = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
+      // vault#555 fix 5 — fold the own-field `default`/`type` checks into
+      // the SAME bundled report as the cross-tag ones. Before this, a bad
+      // `default` (and, since fix 4 added the check, an unrecognized
+      // `type`) went through `store.upsertTagRecord`'s fail-fast pre-
+      // validate below INSTEAD — a single-violation 400 that silently never
+      // mentioned any OTHER bad field in the same call. `unsupported_
+      // indexed_type`/`invalid_field_name` deliberately stay OUT of this
+      // bundle — REST's established single-violation `400
+      // invalid_indexed_field` contract for those two is unchanged
+      // (vault#478; see `collectCrossTagFieldViolations`'s doc comment).
       const fieldViolations = tagSchemaOps.collectCrossTagFieldViolations(
         store.db,
         putTagName,
-        body.fields as Record<string, tagSchemaOps.TagFieldSchema>,
-      );
+        incomingFields,
+      ).concat(tagSchemaOps.collectOwnFieldDefaultAndTypeViolations(incomingFields));
       if (fieldViolations.length > 0) {
         // Tag-scope scrub (vault#554 auth-and-scope fold): the write is
         // still rejected, but a violation whose conflicting declarer is
@@ -2814,12 +2825,23 @@ export async function handleTags(
       if (err instanceof InvalidFieldDefaultError) {
         // vault#553 Decision B — a declared `default` doesn't conform to its
         // own field's type/enum. Own-field error (no cross-tag data), so no
-        // scrub needed. Mirrors IndexedFieldError's 400 shape/posture — see
-        // store.upsertTagRecord's pre-validate comment for why REST hits
-        // this (fail-fast, single violation) while MCP's update-tag usually
-        // reports it bundled via `TagFieldConflictError` instead.
+        // scrub needed. DEFENSE-IN-DEPTH ONLY as of vault#555 fix 5 — the
+        // pre-check above (`collectOwnFieldDefaultAndTypeViolations`) now
+        // catches every `invalid_default` BEFORE reaching `store.upsertTagRecord`
+        // and reports it bundled via `tag_field_conflict` 422 instead; this
+        // branch only fires for a caller that somehow bypasses that pre-check.
         return json(
           { error: err.message, error_type: "invalid_field_default", field: err.field },
+          400,
+        );
+      }
+      if (err instanceof InvalidFieldTypeError) {
+        // vault#555 fix 4 — a declared `type` isn't one of the six
+        // recognized values. Same defense-in-depth posture as
+        // InvalidFieldDefaultError above — the pre-check catches this in
+        // the normal path and reports it bundled instead.
+        return json(
+          { error: err.message, error_type: "invalid_field_type", field: err.field, type: err.type, valid_types: err.valid_types },
           400,
         );
       }
