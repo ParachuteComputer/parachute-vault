@@ -463,7 +463,7 @@ the `error_type` and fields are identical.
 | `transition_conflict` | 409 | `note_id`, `path`, `field`, `expected_from`, `to`, `current` | `state_transition`'s compare-and-set: the field's CURRENT value didn't equal `from`. Distinct vocabulary from `conflict` — a value mismatch, not a stale `updated_at` token. |
 | `path_conflict` | 409 | `path` | The requested `path` is already taken by another note (UNIQUE constraint). |
 | `ambiguous_path` | 409 | `path`, `candidates` | The `{idOrPath}` (or a `source`/`target`/note reference) matched more than one note sharing a path but differing extension. Pass `extension` to disambiguate, or use the candidate's ID. |
-| `schema_validation` | 422 | `violations[]` (`{field, reason, message}`) | One or more `strict: true` field constraints were violated. Carries EVERY violation in one response — nothing was written. |
+| `schema_validation` | 422 | `violations[]` (`{field, reason, message, strict}`) | One or more `strict: true` field constraints were violated — **or** an `indexed: true` field's TYPE was violated (vault#553 Decision A: an indexed field's type is a query contract, enforced unconditionally, independent of that field's own `strict` flag — a `type_mismatch` violation carries `strict: true` either way). Carries EVERY violation in one response — nothing was written. |
 | `precondition_required` | 428 | `note_id`, `path` | A mutating update needs `if_updated_at` or `force: true` and got neither. Append/prepend-only and transition-only updates are exempt. |
 | `batch_too_large` | 413 | `limit`, `got` | A batch `create-note`/`update-note`/`POST /notes` exceeded the 500-item cap. |
 | `invalid_extension` | 400 | `extension`, `reason` | The `extension` field failed validation (empty, uppercase, contains `.`/`/`, reserved `parachute` prefix, ...). |
@@ -482,8 +482,9 @@ the `error_type` and fields are identical.
 
 | `error_type` | HTTP | Key fields | Meaning |
 |---|---|---|---|
-| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration. Carries EVERY conflicting field in one response (vault#553) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case) or `indexed_flag_conflict`; `other_tag` names the conflicting declarer. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail. |
+| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration, OR a field's declared `default` doesn't conform to its own `type`/`enum` (vault#553 Decision B). Carries EVERY conflicting field in one response (vault#553) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case), `indexed_flag_conflict`, or `invalid_default` (own-field — no `other_tag`); `other_tag` names the conflicting declarer for the cross-tag reasons. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail. |
 | `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
+| `invalid_field_default` | 400 | `field` | vault#553 Decision B: a field's declared `default` doesn't match its own `type` (or isn't one of its own `enum` values). Own-field error — REST's single-violation fail-fast path via `store.upsertTagRecord`'s pre-validate (mirrors `invalid_indexed_field`'s posture); MCP's `update-tag` tool normally reports the SAME defect bundled as `tag_field_conflict`'s `invalid_default` reason instead (its own-field checks run first — see that row). |
 | `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
 | `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
 | `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
@@ -1232,6 +1233,46 @@ Upsert a tag's identity row. Body accepts any combination of:
 Omitted keys are preserved; explicit `null` clears. `fields` merges into
 the existing schema (mirrors MCP `update-tag`).
 
+**Typed indexes — indexed⇒strict, explicit defaults, honest types (vault#553,
+0.7.0).** Two BREAKING changes to `fields.<field>`:
+
+- **`indexed: true` ⇒ the field's TYPE is always enforced.** A write whose
+  value's type contradicts the declared indexed type (e.g. a string into an
+  indexed `integer` field) is now **rejected** with `422 schema_validation`
+  — independent of that field's own `strict` flag. Before 0.7.0 this was
+  only an advisory `validation_status` warning, and the accepted bad value
+  would poison range queries (`gt`/`gte`/`lt`/`lte`) on that field via
+  SQLite's TEXT-sorts-above-INTEGER affinity ordering (the root cause
+  #553 tracks). Every OTHER constraint on an indexed field (enum/required/
+  cardinality) is still governed by `strict` as before.
+- **`default` is now the ONLY way to backfill a field.** `fields.<field>.default`
+  (new, optional, typed per the field's own `type`/`enum` — a non-conforming
+  value is rejected with `invalid_field_default`/`tag_field_conflict`
+  `invalid_default`) is written onto a note that gains this tag without
+  setting the field. A field with NO `default` stays genuinely absent — this
+  is what makes `metadata: { <field>: { exists: false } }` trustworthy.
+  Before 0.7.0, an unset field silently backfilled to the first `enum` value
+  or a type zero-value (`0`/`false`/`""`), making "never set" indistinguishable
+  from "explicitly set to the default." **Blast radius:** this only changes
+  FUTURE writes — notes already backfilled under the old behavior keep their
+  values; no migration touches them.
+- **Honest type list.** `type` accepts all six of `string`/`boolean`/`integer`/
+  `number`/`array`/`object` for storage and advisory validation, but only
+  `string`/`integer`/`boolean` are INDEXABLE — declaring `indexed: true`
+  with `number`/`array`/`object` is rejected (`unsupported_indexed_type` /
+  `invalid_indexed_field`, unchanged behavior from before 0.7.0 — only the
+  DOCUMENTED type list was dishonest, not the enforcement).
+
+**Startup migration (schema v24).** Existing vaults get a one-time,
+idempotent startup pass (`migrateToV24`) that reuses `doctor`'s
+`mixed_type_indexed_field` detector: a poisoned value that can be coerced
+losslessly (a clean numeric string into an integer-indexed field, a
+`"true"`/`"false"` string into a boolean-indexed field, a number into a
+string-indexed field) is rewritten in place; anything else (e.g. `"hello"`
+in an integer field) is LEFT UNTOUCHED — the migration never deletes or
+nulls note data — and continues to surface via `GET /api/doctor`'s
+`mixed_type_indexed_field` finding for deliberate operator cleanup.
+
 **`relationships` shape.** An **opaque vocabulary map** (vault#431): a JSON
 object whose keys are relationship names and whose values are arbitrary
 JSON the declaring app interprets. Vault does **not** enforce any inner
@@ -1404,8 +1445,12 @@ where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
   see the `parent_cycle` write-time guard above).
 - `mixed_type_indexed_field` (`error`) — a note's `metadata.<field>` value
   has a JSON type disagreeing with the field's declared indexed sqlite
-  type — the WS4 typed-index migration's pre-flight check; the finding
-  shape is intentionally reusable there.
+  type. Reuses the SAME detector the `migrateToV24` startup migration runs
+  on every boot (schema v24, vault#553 Decision D) — post-0.7.0 this finding
+  surfaces only the genuinely NON-coercible leftovers (a migration already
+  auto-coerced everything it could losslessly convert on upgrade); a note
+  listed here needs deliberate operator cleanup (backfill the value, or
+  relax the field's declared type via `update-tag`).
 - `orphaned_indexed_field_declarer` (`warning`/`info`) — an indexed field
   naming a dead declarer tag; overlaps `prune-schema`, which is the
   suggested remedy.

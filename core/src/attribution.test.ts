@@ -42,8 +42,12 @@ function rawRow(id: string) {
 }
 
 describe("write-attribution — schema", () => {
-  it("bumped SCHEMA_VERSION to 23", () => {
-    expect(SCHEMA_VERSION).toBe(23);
+  it("bumped SCHEMA_VERSION to at least 23 (write-attribution columns landed)", () => {
+    // Was a literal `toBe(23)` pin — that goes stale every time a later PR
+    // bumps SCHEMA_VERSION further (vault#553 bumped it to 24). This test's
+    // actual claim is "the write-attribution migration landed at/after v23",
+    // not "v23 is still current."
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(23);
   });
 
   it("the four columns exist and are indexed", () => {
@@ -230,7 +234,11 @@ describe("write-attribution — legacy backfill (v23 migration)", () => {
     const ver = (legacy.prepare("SELECT MAX(version) AS v FROM schema_version").get() as {
       v: number;
     }).v;
-    expect(ver).toBe(23);
+    // A v22 vault runs the WHOLE migration chain (v23 write-attribution +
+    // whatever landed after — v24's typed-index poison scan, vault#553),
+    // ending at the current SCHEMA_VERSION rather than a hardcoded literal
+    // that goes stale on every later bump.
+    expect(ver).toBe(SCHEMA_VERSION);
 
     // Legacy row: attribution columns exist now but are NULL (not fabricated).
     const old = legacy

@@ -979,7 +979,7 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
-  test("create-note with schema tag auto-populates defaults", async () => {
+  test("create-note with schema tag applies explicit defaults; undeclared fields stay absent (vault#553 Decision B)", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
@@ -995,8 +995,8 @@ describe("scoped MCP wrapper", async () => {
     await vaultStore.upsertTagSchema("person", {
       description: "A person",
       fields: {
-        first_appeared: { type: "string", description: "When" },
-        relationship: { type: "string", description: "How" },
+        first_appeared: { type: "string", description: "When", default: "unknown" },
+        relationship: { type: "string", description: "How" }, // no default — stays absent
       },
     });
 
@@ -1004,19 +1004,19 @@ describe("scoped MCP wrapper", async () => {
     const createNote = tools.find((t) => t.name === "create-note")!;
     const queryNotes = tools.find((t) => t.name === "query-notes")!;
 
-    // Create a note tagged person with no metadata — defaults auto-populated
+    // Create a note tagged person with no metadata — the EXPLICIT default
+    // auto-populates; the field with no `default` stays absent.
     const result = await createNote.execute({
       content: "Alice",
       tags: ["person"],
     }) as any;
     expect(result.content).toBe("Alice");
 
-    // Verify defaults were written
     const fresh = await queryNotes.execute({ id: result.id }) as any;
-    expect(fresh.metadata.first_appeared).toBe("");
-    expect(fresh.metadata.relationship).toBe("");
+    expect(fresh.metadata.first_appeared).toBe("unknown");
+    expect(fresh.metadata.relationship).toBeUndefined();
 
-    // Create with explicit metadata — preserved
+    // Create with explicit metadata — preserved (overrides the default).
     const result2 = await createNote.execute({
       content: "Bob",
       tags: ["person"],
@@ -1029,7 +1029,7 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
-  test("update-note tags.add with schema auto-populates defaults", async () => {
+  test("update-note tags.add with schema applies explicit defaults; undeclared fields stay absent (vault#553 Decision B)", async () => {
     const { generateScopedMcpTools } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { getVaultStore, closeAllStores: close } = await import("./vault-store.ts");
@@ -1045,16 +1045,16 @@ describe("scoped MCP wrapper", async () => {
     await vaultStore.upsertTagSchema("person", {
       description: "A person",
       fields: {
-        first_appeared: { type: "string", description: "When" },
-        relationship: { type: "string", description: "How" },
+        first_appeared: { type: "string", description: "When", default: "unknown" },
+        relationship: { type: "string", description: "How" }, // no default — stays absent
       },
     });
     await vaultStore.upsertTagSchema("project", {
       description: "A project",
       fields: {
-        status: { type: "string", enum: ["active", "completed", "abandoned"], description: "Status" },
-        active: { type: "boolean", description: "Is active" },
-        priority: { type: "integer", description: "Priority level" },
+        status: { type: "string", enum: ["active", "completed", "abandoned"], description: "Status", default: "active" },
+        active: { type: "boolean", description: "Is active", default: false },
+        priority: { type: "integer", description: "Priority level" }, // no default — stays absent
       },
     });
     const tools = generateScopedMcpTools(vaultName);
@@ -1066,10 +1066,11 @@ describe("scoped MCP wrapper", async () => {
     const note = await createNote.execute({ content: "Alice" }) as any;
     await updateNote.execute({ id: note.id, tags: { add: ["person"] }, force: true });
     const after = await queryNotes.execute({ id: note.id }) as any;
-    expect(after.metadata.first_appeared).toBe("");
-    expect(after.metadata.relationship).toBe("");
+    expect(after.metadata.first_appeared).toBe("unknown");
+    expect(after.metadata.relationship).toBeUndefined();
 
-    // Tag note that already has partial metadata — only missing fields populated
+    // Tag note that already has partial metadata — only missing fields WITH a
+    // declared default get populated; the field with no default stays absent.
     const note2 = await createNote.execute({
       content: "Bob",
       metadata: { first_appeared: "2023-11" },
@@ -1077,22 +1078,22 @@ describe("scoped MCP wrapper", async () => {
     await updateNote.execute({ id: note2.id, tags: { add: ["person"] }, force: true });
     const after2 = await queryNotes.execute({ id: note2.id }) as any;
     expect(after2.metadata.first_appeared).toBe("2023-11"); // preserved
-    expect(after2.metadata.relationship).toBe(""); // added
+    expect(after2.metadata.relationship).toBeUndefined(); // no default — stays absent
 
-    // Tag with #project — enum defaults to first value, boolean to false, integer to 0
+    // Tag with #project — declared defaults land; `priority` (no default) stays absent.
     const note4 = await createNote.execute({ content: "My Project" }) as any;
     await updateNote.execute({ id: note4.id, tags: { add: ["project"] }, force: true });
     const after4 = await queryNotes.execute({ id: note4.id }) as any;
     expect(after4.metadata.status).toBe("active");
     expect(after4.metadata.active).toBe(false);
-    expect(after4.metadata.priority).toBe(0);
+    expect(after4.metadata.priority).toBeUndefined();
 
-    // Multiple schema tags at once — all defaults merged
+    // Multiple schema tags at once — all EXPLICIT defaults merged.
     const note5 = await createNote.execute({ content: "Multi" }) as any;
     await updateNote.execute({ id: note5.id, tags: { add: ["person", "project"] }, force: true });
     const after5 = await queryNotes.execute({ id: note5.id }) as any;
-    expect(after5.metadata.first_appeared).toBe("");
-    expect(after5.metadata.relationship).toBe("");
+    expect(after5.metadata.first_appeared).toBe("unknown");
+    expect(after5.metadata.relationship).toBeUndefined();
     expect(after5.metadata.status).toBe("active");
     expect(after5.metadata.active).toBe(false);
 
@@ -1566,9 +1567,12 @@ describe("scoped MCP wrapper", async () => {
     });
 
     const vaultStore = getVaultStore(vaultName);
+    // vault#553 Decision B: backfill is explicit-`default`-only — declare
+    // one so this test still exercises an actual defaults-write (and can
+    // assert it lands without bumping updatedAt).
     await vaultStore.upsertTagSchema("person", {
       description: "A person",
-      fields: { name: { type: "string" } },
+      fields: { name: { type: "string", default: "unknown" } },
     });
 
     const tools = generateScopedMcpTools(vaultName);
@@ -1581,7 +1585,7 @@ describe("scoped MCP wrapper", async () => {
     await updateNote.execute({ id: note.id, tags: { add: ["person"] }, force: true });
     const after = await queryNotes.execute({ id: note.id }) as any;
     expect(after.updatedAt).toBe(originalUpdatedAt);
-    expect(after.metadata.name).toBe("");
+    expect(after.metadata.name).toBe("unknown");
 
     close();
   });
@@ -2199,8 +2203,10 @@ describe("HTTP /notes", async () => {
   // mapped over the pre-defaults in-memory objects, so default-filled
   // metadata was missing from `POST /api/notes` responses.
   test("POST /notes response reflects post-applySchemaDefaults state (vault#316)", async () => {
+    // vault#553 Decision B: backfill is explicit-`default`-only — declare one
+    // so this test still exercises the post-defaults re-read mechanism.
     await store.upsertTagSchema("task", {
-      fields: { priority: { type: "string", enum: ["high", "low"] } },
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
     });
 
     // Single: default lands in the returned metadata and agrees with disk.
@@ -2211,7 +2217,7 @@ describe("HTTP /notes", async () => {
     );
     expect(single.status).toBe(201);
     const singleBody = await single.json() as any;
-    expect(singleBody.metadata?.priority).toBe("high"); // first enum value
+    expect(singleBody.metadata?.priority).toBe("high"); // explicit schema default
     const onDisk = await store.getNoteByPath("Inbox/task-1");
     expect((onDisk!.metadata as any)?.priority).toBe("high");
 

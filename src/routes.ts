@@ -24,7 +24,7 @@ import {
   contentRangeRequiresContent,
   type ContentRange,
 } from "../core/src/content-range.ts";
-import { attachValidationStatus, enforceStrictWrite } from "../core/src/mcp.ts";
+import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults } from "../core/src/mcp.ts";
 import type { ValidationWarning } from "../core/src/schema-defaults.ts";
 import { logStrictBypass } from "./scopes.ts";
 import * as linkOps from "../core/src/links.ts";
@@ -48,7 +48,7 @@ import {
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
-import { ParentCycleError } from "../core/src/tag-schemas.ts";
+import { ParentCycleError, InvalidFieldDefaultError } from "../core/src/tag-schemas.ts";
 import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
@@ -2668,6 +2668,18 @@ export async function handleTags(
           400,
         );
       }
+      if (err instanceof InvalidFieldDefaultError) {
+        // vault#553 Decision B — a declared `default` doesn't conform to its
+        // own field's type/enum. Own-field error (no cross-tag data), so no
+        // scrub needed. Mirrors IndexedFieldError's 400 shape/posture — see
+        // store.upsertTagRecord's pre-validate comment for why REST hits
+        // this (fail-fast, single violation) while MCP's update-tag usually
+        // reports it bundled via `TagFieldConflictError` instead.
+        return json(
+          { error: err.message, error_type: "invalid_field_default", field: err.field },
+          400,
+        );
+      }
       if (err instanceof ParentCycleError) {
         // vault#552: parent_names would close a cycle. Nothing was
         // persisted. Scope-scrub the cycle path for a tag-scoped caller —
@@ -3735,56 +3747,10 @@ export async function handleStorage(
   return json({ error: "Not found", error_type: "not_found" }, 404);
 }
 
-// ---------------------------------------------------------------------------
-// Tag schema defaults — same logic as core/src/mcp.ts applySchemaDefaults
-// ---------------------------------------------------------------------------
-
-// Returns the IDs of notes whose metadata was actually default-filled, so
-// the caller can re-read ONLY the mutated notes (and skip the re-read when
-// nothing changed). Mirrors the core/src/mcp.ts contract.
-async function applySchemaDefaults(store: Store, db: any, noteIds: string[], tags: string[]): Promise<string[]> {
-  const schemas = tagSchemaOps.getTagSchemaMap(db);
-  if (Object.keys(schemas).length === 0) return [];
-
-  const defaults: Record<string, unknown> = {};
-  for (const tag of tags) {
-    const schema = schemas[tag];
-    if (!schema?.fields) continue;
-    for (const [field, fieldSchema] of Object.entries(schema.fields)) {
-      if (!(field in defaults)) {
-        defaults[field] = defaultForField(fieldSchema);
-      }
-    }
-  }
-  if (Object.keys(defaults).length === 0) return [];
-
-  const mutated: string[] = [];
-  for (const noteId of noteIds) {
-    const note = await store.getNote(noteId);
-    if (!note) continue;
-    const existing = (note.metadata as Record<string, unknown>) ?? {};
-    const missing: Record<string, unknown> = {};
-    for (const [field, value] of Object.entries(defaults)) {
-      if (!(field in existing)) missing[field] = value;
-    }
-    if (Object.keys(missing).length === 0) continue;
-    await store.updateNote(noteId, {
-      metadata: { ...existing, ...missing },
-      skipUpdatedAt: true,
-    });
-    mutated.push(noteId);
-  }
-  return mutated;
-}
-
-function defaultForField(field: { type: string; enum?: string[] }): unknown {
-  if (field.enum && field.enum.length > 0) return field.enum[0];
-  switch (field.type) {
-    case "boolean": return false;
-    case "integer": return 0;
-    default: return "";
-  }
-}
+// applySchemaDefaults lives in core/src/mcp.ts (vault#553) — REST used to
+// carry a byte-identical duplicate; importing it means REST and MCP can
+// never drift on this behavior again, and the cloud runtime (which imports
+// core directly) inherits it without any handler-side code.
 
 function removeWikilinkBrackets(content: string, targetPath: string): string {
   const escaped = targetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

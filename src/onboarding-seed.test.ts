@@ -166,8 +166,11 @@ describe("seedOnboardingNotes — default packs (welcome + getting-started)", ()
     expect(gs!.content).toContain("## Write gotchas");
     expect(gs!.content).toContain("if_updated_at"); // optimistic concurrency
     expect(gs!.content).toContain("force: true");
-    // schema-default back-fill: enum→first value, integer→0.
-    expect(gs!.content).toContain("first listed value");
+    // schema-default back-fill is explicit-`default`-only (vault#553 Decision B).
+    expect(gs!.content).toContain("explicit `default`");
+    expect(gs!.content).toContain("exists: false");
+    // indexed⇒strict type enforcement (vault#553 Decision A).
+    expect(gs!.content).toContain("field's TYPE is always enforced");
   });
 
   test("A3 (reshaped): the welcome ring resolves to real link edges; Getting Started has no dangling Surface Starter link", async () => {

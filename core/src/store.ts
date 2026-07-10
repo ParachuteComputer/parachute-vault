@@ -741,6 +741,24 @@ export class BunSqliteStore implements Store {
         // Throws IndexedFieldError on an invalid identifier (e.g. kebab-case).
         indexedFieldOps.validateFieldName(fieldName);
       }
+      // Default-conformance pre-validate (vault#553 Decision B) — mirrors the
+      // indexed-type/name checks above: fail BEFORE any persistence so a bad
+      // `default` never gets written. Runs over EVERY field in the full
+      // (already-merged) `nextFields` map, not just indexed ones — a default
+      // that doesn't match its own field's type/enum is a tag-schema error
+      // regardless of queryability. This is the REST parity path: MCP's
+      // `update-tag` tool ALSO calls `collectTagFieldViolations` before
+      // reaching here (bundling every violation into one `TagFieldConflictError`
+      // — see that function's doc comment), so a conforming MCP call never
+      // trips this; a non-conforming one throws there first. REST has no such
+      // pre-check, so this is REST's only gate — same asymmetry as the
+      // indexed-type/name checks it sits beside.
+      for (const [fieldName, spec] of Object.entries(nextFields ?? {})) {
+        const violation = tagSchemaOps.validateFieldDefault(fieldName, spec);
+        if (violation) {
+          throw new tagSchemaOps.InvalidFieldDefaultError(fieldName, violation.message);
+        }
+      }
     }
 
     // Persist the record + reconcile the indexed-field lifecycle atomically.

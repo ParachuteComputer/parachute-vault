@@ -1588,15 +1588,16 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           description: { type: "string", description: "Human-readable description of what this tag means" },
           fields: {
             type: "object",
-            description: 'Metadata fields notes with this tag should have. E.g., { "status": { "type": "string", "enum": ["active", "archived"], "strict": true } }. Constraints are ADVISORY by default (violations surface as validation_status warnings; the write still succeeds). Mark a field `strict: true` to ENFORCE all its constraints — type + enum + required + cardinality flip to hard write rejections (vault#299).',
+            description: 'Metadata fields notes with this tag should have. E.g., { "status": { "type": "string", "enum": ["active", "archived"], "strict": true, "default": "active" } }. Constraints are ADVISORY by default (violations surface as validation_status warnings; the write still succeeds). Mark a field `strict: true` to ENFORCE all its constraints — type + enum + required + cardinality flip to hard write rejections (vault#299). Mark a field `indexed: true` to make it queryable — an indexed field\'s TYPE is ALWAYS enforced (a type-mismatched write is REJECTED, independent of `strict`) because a bad-typed value silently poisons range-query ordering (vault#553).',
             additionalProperties: {
               type: "object",
               properties: {
-                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object" },
+                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object — all six are accepted for storage + advisory validation. Only string/integer/boolean are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field)." },
                 description: { type: "string" },
-                enum: { type: "array", items: { type: "string" }, description: "Allowed values (first is default)" },
-                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed." },
-                strict: { type: "boolean", description: "vault#299. Default false (advisory). When true, ALL of this field's declared constraints (type + enum + required + cardinality) are ENFORCED — a violating write is rejected with a schema_validation error, not just warned. All-or-nothing per field; free-form fields on a strict tag simply leave strict off." },
+                enum: { type: "array", items: { type: "string" }, description: "Allowed values. Does NOT auto-backfill — a note that omits this field stays without it unless `default` is also set (vault#553; the pre-0.7.0 behavior of silently defaulting to the first enum value is retired). Set `default` explicitly if you want backfill." },
+                default: { description: "Explicit backfill value (vault#553) applied when a note gains this tag without setting the field. Must conform to this field's own `type` (and `enum`, if declared) — a non-conforming default is rejected (invalid_default / invalid_field_default) rather than silently stored. Omit entirely to leave the field ABSENT (not backfilled) on notes that don't set it — this is what makes `exists:false` a trustworthy \"never set\" query." },
+                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed. Only string/integer/boolean are indexable. Indexed ⇒ a type-mismatched write is HARD-REJECTED (schema_validation), not just warned — vault#553." },
+                strict: { type: "boolean", description: "vault#299. Default false (advisory). When true, ALL of this field's declared constraints (type + enum + required + cardinality) are ENFORCED — a violating write is rejected with a schema_validation error, not just warned. All-or-nothing per field; free-form fields on a strict tag simply leave strict off. Note: `indexed: true` fields enforce their TYPE constraint regardless of this flag (vault#553)." },
                 required: { type: "boolean", description: "vault#299. The field must be present + non-null on a note with this tag. Advisory unless `strict: true`." },
                 cardinality: { type: "string", enum: ["one", "many"], description: "vault#299. 'one' (scalar, default) or 'many' (array). Advisory unless `strict: true`." },
               },
@@ -1953,18 +1954,33 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
  * for any field they omitted. Returns the IDs of the notes whose metadata was
  * actually written — callers use this to re-read ONLY the mutated notes (and
  * to skip the re-read entirely when nothing changed). The common no-schema /
- * no-defaults path returns an empty array.
+ * no-declared-defaults path returns an empty array.
+ *
+ * vault#553 Decision B: backfill is EXPLICIT-`default`-only. A field with no
+ * declared `default` is skipped entirely here — it stays genuinely absent on
+ * the note, not silently filled with the first enum value or a type
+ * zero-value (the pre-0.7.0 behavior, which made "never set" and
+ * "explicitly set to the default" indistinguishable and broke `exists:false`).
+ * Exported so `src/routes.ts` (REST create/PATCH) shares this ONE
+ * implementation instead of carrying its own copy — the two had drifted into
+ * a byte-identical duplicate pre-#553; centralizing here means the cloud
+ * runtime (which imports core directly, not `src/routes.ts`) automatically
+ * inherits this behavior with zero handler-side work.
  *
  * vault#299: this runs AFTER the create write (so AFTER the strict gate) and
  * intentionally does NOT re-run `enforceStrict`. Defaults are always
- * conforming by construction — `defaultForField` returns the first enum value
- * / the type's zero-value, so a default can never violate type/enum. And a
- * `required` strict field is already caught at the pre-write gate, so a note
- * that would need a default to satisfy `required` never reaches this filler
- * (the create was rejected first). Don't add a defaults path that could
- * inject a violating value without re-gating.
+ * conforming by construction — `store.upsertTagRecord` validates a field's
+ * `default` against its own `type`/`enum` BEFORE the schema can be persisted
+ * (`InvalidFieldDefaultError` / `TagFieldConflictError` reason
+ * `invalid_default`), so a default can never violate type/enum at read time
+ * here. And a `required` strict field is already caught at the pre-write
+ * gate, so a note that would need a default to satisfy `required` never
+ * reaches this filler (the create was rejected first) — declaring a
+ * `default` does NOT satisfy `required`; the caller must still set the field
+ * explicitly. Don't add a defaults path that could inject a violating value
+ * without re-gating.
  */
-async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<string[]> {
+export async function applySchemaDefaults(store: Store, db: Database, noteIds: string[], tags: string[]): Promise<string[]> {
   const schemas = tagSchemaOps.getTagSchemaMap(db);
   if (Object.keys(schemas).length === 0) return [];
 
@@ -1973,9 +1989,10 @@ async function applySchemaDefaults(store: Store, db: Database, noteIds: string[]
     const schema = schemas[tag];
     if (!schema?.fields) continue;
     for (const [field, fieldSchema] of Object.entries(schema.fields)) {
-      if (!(field in defaults)) {
-        defaults[field] = defaultForField(fieldSchema);
-      }
+      if (field in defaults) continue; // first tag that declares a REAL default wins
+      const value = defaultForField(fieldSchema);
+      if (value === undefined) continue; // no `default` declared — leave the slot open for a later tag
+      defaults[field] = value;
     }
   }
   if (Object.keys(defaults).length === 0) return [];
@@ -2001,13 +2018,13 @@ async function applySchemaDefaults(store: Store, db: Database, noteIds: string[]
   return mutated;
 }
 
-function defaultForField(field: { type: string; enum?: string[] }): unknown {
-  if (field.enum && field.enum.length > 0) return field.enum[0];
-  switch (field.type) {
-    case "boolean": return false;
-    case "integer": return 0;
-    default: return "";
-  }
+/**
+ * Resolve a field's backfill value — its declared `default` (vault#553
+ * Decision B), or `undefined` when none was declared (the field stays
+ * absent). Exported alongside `applySchemaDefaults` for `src/routes.ts`.
+ */
+export function defaultForField(field: { default?: unknown }): unknown {
+  return field.default;
 }
 
 // ---------------------------------------------------------------------------
