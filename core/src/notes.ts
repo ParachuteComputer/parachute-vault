@@ -28,8 +28,7 @@ import {
   SEARCH_WEIGHT_CONTENT,
   type SearchMode,
 } from "./search-query.js";
-
-let idCounter = 0;
+import { generateUlid } from "./ulid.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -61,20 +60,25 @@ function attrValue(v: string | null | undefined): string | null {
   return t.length === 0 ? null : t;
 }
 
-/** Generate a timestamp-based ID: YYYY-MM-DD-HH-MM-SS-ffffff */
+/**
+ * Generate a new note/attachment ID.
+ *
+ * As of vault#ulid-ids this returns a ULID (see `ulid.ts`) — monotonic,
+ * lexicographically time-sortable, Crockford base32, opaque, and
+ * collision-resistant. Previously this returned a timestamp-format ID
+ * (`YYYY-MM-DD-HH-MM-SS-ffffff`).
+ *
+ * IMPORTANT: existing notes are NOT migrated. Old timestamp-format IDs
+ * stay exactly as they are — only newly-generated IDs use the ULID
+ * format, so a vault's `id` column is (and must remain) a mix of both
+ * shapes indefinitely. Nothing may assume a uniform id format, and
+ * nothing may parse a note's ID to recover its creation time — that's
+ * what the `created_at` column is for. The cursor-pagination tiebreaker
+ * (`cursor.ts`) treats `id` as an opaque, stable string for ordering
+ * ties only, which holds for any id format.
+ */
 export function generateId(): string {
-  const now = new Date();
-  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
-  const micro = now.getMilliseconds() * 1000 + (idCounter++ % 1000);
-  return [
-    now.getFullYear(),
-    pad(now.getMonth() + 1),
-    pad(now.getDate()),
-    pad(now.getHours()),
-    pad(now.getMinutes()),
-    pad(now.getSeconds()),
-    pad(micro, 6),
-  ].join("-");
+  return generateUlid();
 }
 
 export function createNote(

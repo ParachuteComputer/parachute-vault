@@ -6,6 +6,8 @@ import { initSchema } from "./schema.js";
 import { decodeCursor } from "./cursor.js";
 import { traverseLinks } from "./links.js";
 import * as indexedFieldOps from "./indexed-fields.js";
+import { resolveLinkTarget } from "./wikilinks.js";
+import { generateUlid, ULID_REGEX } from "./ulid.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -1612,6 +1614,110 @@ describe("queryNotes", async () => {
       // No new writes since seed → empty page, cursor still advances.
       expect(envelope.notes).toHaveLength(0);
       expect(typeof envelope.next_cursor).toBe("string");
+    });
+  });
+
+  describe("ULID ids for new notes (existing IDs unchanged)", () => {
+    function pinUpdatedAt(id: string, iso: string) {
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+    }
+
+    it("new notes get ULID-format ids (26-char Crockford base32)", async () => {
+      const note = await store.createNote("fresh note");
+      expect(note.id).toHaveLength(26);
+      expect(note.id).toMatch(ULID_REGEX);
+    });
+
+    it("generateUlid() output matches the ULID format directly", () => {
+      const id = generateUlid();
+      expect(id).toHaveLength(26);
+      expect(id).toMatch(ULID_REGEX);
+    });
+
+    it("ULIDs minted in the same millisecond are monotonically increasing", () => {
+      const ids = Array.from({ length: 200 }, () => generateUlid());
+      // No duplicates, and strictly increasing under plain string compare —
+      // this is the monotonic-within-a-ms guarantee, not just uniqueness.
+      const unique = new Set(ids);
+      expect(unique.size).toBe(ids.length);
+      for (let i = 1; i < ids.length; i++) {
+        expect(ids[i]! > ids[i - 1]!).toBe(true);
+      }
+    });
+
+    it("an explicitly-supplied old-format id still round-trips (create/read/link/resolve)", async () => {
+      const oldId = "2020-01-01-00-00-00-000001";
+
+      // create — old-format id passed explicitly via opts.id.
+      const oldNote = await store.createNote("legacy note", { id: oldId, path: "legacy-note" });
+      expect(oldNote.id).toBe(oldId);
+
+      // read — by id and by path.
+      const byId = await store.getNote(oldId);
+      expect(byId?.id).toBe(oldId);
+      expect(byId?.content).toBe("legacy note");
+      const byPath = await store.getNoteByPath("legacy-note");
+      expect(byPath?.id).toBe(oldId);
+
+      // link — a brand-new (ULID) note links to the old-format note, and
+      // vice versa; both directions traverse the graph correctly.
+      const newNote = await store.createNote("modern note");
+      expect(newNote.id).toMatch(ULID_REGEX);
+      await store.createLink(newNote.id, oldId, "references");
+      await store.createLink(oldId, newNote.id, "referenced-by");
+
+      const outbound = await store.getLinks(newNote.id, { direction: "outbound" });
+      expect(outbound.some((l) => l.targetId === oldId)).toBe(true);
+      const inbound = await store.getLinks(newNote.id, { direction: "inbound" });
+      expect(inbound.some((l) => l.sourceId === oldId)).toBe(true);
+
+      // resolve — resolveLinkTarget's id-then-path-then-title chain works
+      // identically for an old-format id as it does for a ULID.
+      expect(resolveLinkTarget(db, oldId)).toBe(oldId);
+      expect(resolveLinkTarget(db, "legacy-note")).toBe(oldId);
+      expect(resolveLinkTarget(db, newNote.id)).toBe(newNote.id);
+    });
+
+    it("mixed-format cursor pagination is stable under a shared updated_at (no miss/dupe)", async () => {
+      const ts = "2026-05-01T00:00:00.000Z";
+      const ids: string[] = [];
+
+      // Two "old" notes with explicit timestamp-format ids...
+      for (const oldId of ["2020-01-01-00-00-00-000001", "2020-06-15-12-30-00-500000"]) {
+        const n = await store.createNote(`old ${oldId}`, { id: oldId });
+        pinUpdatedAt(n.id, ts);
+        ids.push(n.id);
+      }
+      // ...and three "new" notes with auto-generated ULIDs, all sharing the
+      // exact same updated_at — id is the ONLY thing that can order them.
+      for (let i = 0; i < 3; i++) {
+        const n = await store.createNote(`new ${i}`);
+        expect(n.id).toMatch(ULID_REGEX);
+        pinUpdatedAt(n.id, ts);
+        ids.push(n.id);
+      }
+
+      // The expected stable total order is plain string comparison over the
+      // id column — same rule the SQL keyset ORDER BY uses (BINARY/ASCII
+      // collation), which holds regardless of id format.
+      const expectedOrder = [...ids].sort();
+
+      // Paginate with a small limit to force several pages across the
+      // format boundary and confirm no note is skipped or repeated.
+      const seen: string[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 10; page++) {
+        const result: Awaited<ReturnType<typeof store.queryNotesPaged>> =
+          cursor === undefined
+            ? await store.queryNotesPaged({ limit: 2 })
+            : await store.queryNotesPaged({ limit: 2, cursor });
+        if (result.notes.length === 0) break;
+        seen.push(...result.notes.map((n) => n.id));
+        cursor = result.next_cursor;
+      }
+
+      expect(seen).toEqual(expectedOrder);
+      expect(new Set(seen).size).toBe(seen.length);
     });
   });
 
