@@ -707,7 +707,10 @@ Current effective config values, with `writeOnly` fields (`scribeBearer`,
 #### `GET /vault/{name}/api/notes` — `vault:read`
 Query notes. Returns `NoteIndex[]` by default (lean shape). Many filter
 modes coexist; the canonical query body is sketched in the cursor section
-above.
+above. Each result carries `validation_status` when any tag it carries
+declares `fields` (vault#555 — additive, absent entirely for a vault that
+declares no tag schemas; same attachment rule as create/update responses,
+now extended to reads).
 
 Query params:
 
@@ -1021,7 +1024,12 @@ dropping the edge:
 
 #### `GET /vault/{name}/api/notes/{idOrPath}` — `vault:read`
 Returns the full `Note` (defaults to `include_content=true` for point
-reads). `?include_content=false` returns a `NoteIndex`.
+reads). `?include_content=false` returns a `NoteIndex`. Carries
+`validation_status` when any tag on the note declares `fields` (vault#555 —
+previously this signal was visible ONLY on the one-time create/update write
+response; every subsequent read showed nothing even for an advisory
+violation like an out-of-enum value on a non-strict field). Same shape and
+attachment rule as the structured-query list below.
 
 > **Percent-encode slashes in `{idOrPath}`.** This route (and the `PATCH` /
 > `DELETE` siblings below) resolves a note by id-or-path; a literal `/` in a
@@ -1385,7 +1393,13 @@ the existing schema (mirrors MCP `update-tag`).
   would poison range queries (`gt`/`gte`/`lt`/`lte`) on that field via
   SQLite's TEXT-sorts-above-INTEGER affinity ordering (the root cause
   #553 tracks). Every OTHER constraint on an indexed field (enum/required/
-  cardinality) is still governed by `strict` as before.
+  cardinality) is still governed by `strict` as before — **`indexed: true`
+  guarantees TYPE, not enum-domain** (vault#555). An indexed field with an
+  `enum` declared but `strict` unset still accepts an out-of-enum value: it's
+  stored, fully queryable (`eq`/`in`/range operators all work normally — the
+  index doesn't care about enum membership), and surfaces an advisory
+  `enum_mismatch` warning in `validation_status.warnings`. Mark the field
+  `strict: true` too if you want an out-of-enum value hard-rejected instead.
 - **`default` is now the ONLY way to backfill a field.** `fields.<field>.default`
   (new, optional, typed per the field's own `type`/`enum` — a non-conforming
   value is rejected with `invalid_field_default`/`tag_field_conflict`

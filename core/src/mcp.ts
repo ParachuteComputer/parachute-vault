@@ -277,6 +277,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
 
 Defaults: include_content=true for single note, false for lists. include_links=false. tag_match="any".
 
+Each result carries \`validation_status\` when any tag it carries declares \`fields\` (vault#555) — same advisory-warnings shape create-note/update-note attach, now also on reads (an out-of-enum value on a non-strict field is stored and findable, but still surfaces its \`enum_mismatch\` warning here, not just on the write that introduced it). Absent entirely when no tag on the note declares a schema.
+
 Large notes: pass \`content_offset\` / \`content_length\` (UTF-8 bytes) for a bounded read of note content — the response carries the slice plus \`content_total_length\` and \`content_next_offset\` (null when complete). Loop, feeding \`content_next_offset\` back as \`content_offset\`, to read a note too large for one response.
 
 Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.
@@ -472,6 +474,24 @@ Response shape (vault#550 — three variants, pick by what you passed):
           // `expand`).
           if (contentRange && !includeContent) throw contentRangeRequiresContent();
           let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
+          // --- Attach validation_status (vault#555 fix 3) ---
+          // Mirrors create/update-note's `attachValidationStatus` — additive,
+          // present only when at least one tag on the note declares
+          // `fields`. Before this, `validation_status` (including an
+          // `enum_mismatch` on a non-strict indexed field) was surfaced ONLY
+          // on the one-time create/update WRITE response; a caller reading
+          // the note back via `query-notes` (the natural way to re-check a
+          // value after write) saw nothing at all — contradicting the
+          // documented "advisory violations surface as warnings" for every
+          // read after the initial write.
+          {
+            const status = store.validateNoteAgainstSchemas({
+              path: note.path,
+              tags: note.tags,
+              metadata: note.metadata as Record<string, unknown> | undefined,
+            });
+            if (status) result.validation_status = status;
+          }
           if (expandCtx && includeContent && typeof result.content === "string") {
             // Mark the top-level note as already expanded so it can't recursively inline itself.
             expandCtx.expanded.add(note.id);
@@ -750,6 +770,29 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // content_total_length / content_next_offset).
         if (contentRange && includeContent) {
           for (const n of output) applyContentRange(n, contentRange);
+        }
+
+        // --- Attach validation_status (vault#555 fix 3) ---
+        // Same reasoning as the single-note path above — additive, present
+        // only when at least one tag on the note declares `fields`. Runs
+        // BEFORE metadata filtering so it sees the note's full metadata
+        // regardless of `include_metadata`; the `validation_status` key
+        // itself survives `filterMetadata` (which only touches `metadata`).
+        {
+          const statusById = new Map(
+            results.map((n) => [
+              n.id,
+              store.validateNoteAgainstSchemas({
+                path: n.path,
+                tags: n.tags,
+                metadata: n.metadata as Record<string, unknown> | undefined,
+              }),
+            ]),
+          );
+          for (const n of output as any[]) {
+            const status = statusById.get(n.id);
+            if (status) n.validation_status = status;
+          }
         }
 
         // --- Apply metadata filtering ---

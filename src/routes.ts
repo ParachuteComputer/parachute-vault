@@ -1366,6 +1366,26 @@ async function handleNotesInner(
       if (contentRange.range && includeContent) {
         for (const n of output) applyContentRange(n, contentRange.range);
       }
+      // vault#555 fix 3 — attach validation_status on reads too (mirrors
+      // MCP query-notes). Additive, present only when a tag declares
+      // `fields`. Runs BEFORE metadata filtering so it sees full metadata
+      // regardless of `include_metadata`.
+      {
+        const statusById = new Map(
+          results.map((n) => [
+            n.id,
+            store.validateNoteAgainstSchemas({
+              path: n.path,
+              tags: n.tags,
+              metadata: n.metadata as Record<string, unknown> | undefined,
+            }),
+          ]),
+        );
+        for (const n of output as any[]) {
+          const status = statusById.get(n.id);
+          if (status) n.validation_status = status;
+        }
+      }
       if (inclMeta !== undefined && inclMeta !== true) {
         output = output.map((n: any) => filterMetadata(n, inclMeta));
       }
@@ -1789,6 +1809,18 @@ async function handleNotesInner(
     const contentRange = parseContentRangeQuery(url, includeContent);
     if (contentRange.error) return contentRange.error;
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    // vault#555 fix 3 — mirror the MCP query-notes fix: attach
+    // validation_status on reads too, not just on the one-time create/update
+    // write response. See core/src/mcp.ts's query-notes handler for the
+    // full rationale.
+    {
+      const status = store.validateNoteAgainstSchemas({
+        path: note.path,
+        tags: note.tags,
+        metadata: note.metadata as Record<string, unknown> | undefined,
+      });
+      if (status) result.validation_status = status;
+    }
     const expand = parseExpandParams(url, db, tagScope);
     if (expand && includeContent && typeof result.content === "string") {
       expand.ctx.expanded.add(note.id);

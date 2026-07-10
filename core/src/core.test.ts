@@ -4518,6 +4518,58 @@ describe("schema validation (tags.fields)", async () => {
     expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
   });
 
+  // vault#555 fix 3 — an enum-membership violation on an INDEXED
+  // (non-strict) field is stored, findable via `eq` (indexed⇒strict is
+  // TYPE-only, not enum-domain — a ratified policy, not a bug), but the
+  // advisory `enum_mismatch` warning used to be visible ONLY on the
+  // one-time create/update response — a caller reading the note back via
+  // query-notes (the natural way to re-check a stored value) saw nothing,
+  // contradicting "advisory violations surface as warnings."
+  it("query-notes surfaces validation_status (enum_mismatch on an indexed field) — single-id fetch", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await updateTag.execute({
+      tag: "widget",
+      fields: { status: { type: "string", enum: ["a", "b"], indexed: true } },
+    });
+    const created = await create.execute({ content: "x", tags: ["widget"], metadata: { status: "bogus" } }) as any;
+
+    // Findable via eq — indexed⇒strict is TYPE-only, enum stays advisory.
+    const found = await query.execute({ metadata: { status: { eq: "bogus" } }, include_content: true }) as any[];
+    expect(found).toHaveLength(1);
+    expect(found[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+
+    // Single-id fetch also carries it.
+    const single = await query.execute({ id: created.id }) as any;
+    expect(single.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(single.validation_status.warnings[0].field).toBe("status");
+  });
+
+  it("query-notes surfaces validation_status on the default list path (lean NoteIndex shape)", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await create.execute({ content: "x", tags: ["task"], metadata: { priority: "ULTRA" } });
+
+    // Default list mode (include_content omitted → lean NoteIndex).
+    const list = await query.execute({ tag: "task" }) as any[];
+    expect(list).toHaveLength(1);
+    expect(list[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  it("query-notes omits validation_status entirely when no tag declares fields (no behavior change)", async () => {
+    await store.createNote("plain note", { tags: ["untagged-schema"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const list = await query.execute({ tag: "untagged-schema" }) as any[];
+    expect(list[0].validation_status).toBeUndefined();
+  });
+
   it("validation never blocks the write — note exists with warnings attached", async () => {
     await store.upsertTagSchema("task", {
       fields: { priority: { type: "boolean" } },

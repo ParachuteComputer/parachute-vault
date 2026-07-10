@@ -4699,6 +4699,53 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
   });
 });
 
+// vault#555 fix 3 — validation_status used to be visible ONLY on the
+// one-time create/update WRITE response; a caller reading the note back
+// (GET single note, or the structured-query list) saw nothing at all,
+// contradicting "advisory violations surface as warnings" for an
+// enum_mismatch on a non-strict (even indexed) field.
+describe("HTTP GET /notes — validation_status on reads (vault#555)", async () => {
+  test("GET /notes/:id surfaces validation_status (enum_mismatch on an indexed field)", async () => {
+    const res0 = await handleTags(
+      mkReq("PUT", "/tags/widget555", { fields: { status: { type: "string", enum: ["a", "b"], indexed: true } } }),
+      store,
+      "/widget555",
+    );
+    expect(res0.status).toBe(200);
+    const created = await store.createNote("x", { tags: ["widget555"], metadata: { status: "bogus" } });
+
+    const res = await handleNotes(mkReq("GET", `/notes/${created.id}`), store, `/${created.id}`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+    expect(body.validation_status.warnings[0].field).toBe("status");
+  });
+
+  test("GET /notes (structured query list) surfaces validation_status per note", async () => {
+    await store.upsertTagSchema("task555list", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    await store.createNote("x", { tags: ["task555list"], metadata: { priority: "ULTRA" } });
+
+    const res = await handleNotes(mkReq("GET", "/notes?tag=task555list"), store, "");
+    expect(res.status).toBe(200);
+    const body = await res.json() as any[];
+    expect(body).toHaveLength(1);
+    expect(body[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  test("GET /notes/:id and list both omit validation_status when no tag declares fields", async () => {
+    const note = await store.createNote("plain", { tags: ["plain555"] });
+    const single = await handleNotes(mkReq("GET", `/notes/${note.id}`), store, `/${note.id}`);
+    const singleBody = await single.json() as any;
+    expect(singleBody.validation_status).toBeUndefined();
+
+    const list = await handleNotes(mkReq("GET", "/notes?tag=plain555"), store, "");
+    const listBody = await list.json() as any[];
+    expect(listBody[0].validation_status).toBeUndefined();
+  });
+});
+
 describe("HTTP POST /notes — validation_status attachment (vault#287)", async () => {
   // Mirror of the PATCH cases for create. The MCP create-note path
   // attaches validation_status; HTTP POST must match (vault#287).
