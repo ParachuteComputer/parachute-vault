@@ -217,3 +217,113 @@ export function ignoredParamWarning(param: string, reason: string): QueryWarning
     param,
   };
 }
+
+/**
+ * Cheap zero-result search suggestion (vault#551 WS2B — mirrors the tag
+ * `did_you_mean` above via the SAME `suggestSimilarTag` scorer, just over a
+ * different candidate pool). Callers MUST only invoke this AFTER a search
+ * already returned zero rows — it is never on the hot non-empty path, so
+ * the extra vocabulary scan costs nothing in the overwhelmingly common
+ * case where the search actually found something.
+ *
+ * Candidates are drawn from two cheap-to-reach sources, unioned:
+ *
+ *   - the FTS5 vocabulary — a `notes_fts_vocab` `fts5vocab('row')` table
+ *     created here LAZILY and BEST-EFFORT (not part of the schema/
+ *     migration — see the try/catch below) — the terms actually indexed,
+ *     POST-tokenization/stemming (porter). A suggestion therefore
+ *     sometimes reads as a stemmed form ("propoli" rather than "propolis")
+ *     rather than the original dictionary word — an accepted tradeoff
+ *     (documented in docs/HTTP_API.md) rather than maintaining a second,
+ *     unstemmed index just for spelling suggestions.
+ *   - tag names, when the caller passes `tagNames` (already cached by the
+ *     caller's tag hierarchy — free to include).
+ *
+ * `fts5vocab` is registered by the same FTS5 extension init as `notes_fts`
+ * itself (not a separately-enabled module) so it's expected to be
+ * available anywhere search already works — but this is NOT exercised
+ * against Cloudflare DO SQLite (flagged for the wire reviewer). The WHOLE
+ * function is wrapped in try/catch and degrades to "no suggestion" on ANY
+ * failure — including a runtime where `fts5vocab` is unavailable — rather
+ * than ever throwing; a spelling hint is a nicety, never worth risking the
+ * search response itself.
+ *
+ * Per-token length filtering (`length(term) BETWEEN len-2 AND len+2`) keeps
+ * the vocabulary scan bounded on a large vault without a hardcoded row cap
+ * that could silently exclude the very term a caller needs (a `LIMIT`
+ * ORDER-BY-frequency would bias toward common words, which is backwards
+ * for a name/typo lookup — the word you're trying to find is often rare).
+ */
+export function computeSearchDidYouMean(
+  db: Database,
+  rawQuery: string,
+  tagNames?: Iterable<string>,
+): string | undefined {
+  try {
+    const tokens = rawQuery.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return undefined;
+
+    db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_vocab USING fts5vocab(notes_fts, 'row')");
+    const exactStmt = db.prepare("SELECT 1 FROM notes_fts_vocab WHERE term = ? LIMIT 1");
+    const rangeStmt = db.prepare("SELECT term FROM notes_fts_vocab WHERE length(term) BETWEEN ? AND ?");
+
+    let changed = false;
+    const corrected = tokens.map((tok) => {
+      // Strip leading/trailing punctuation for the lookup (the FTS5
+      // vocabulary never contains punctuation) but leave short tokens
+      // (numbers, "a", "of", ...) alone — too little signal to safely
+      // "correct" without a high false-positive rate.
+      const clean = tok.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+      if (clean.length < 3) return tok;
+      const lower = clean.toLowerCase();
+
+      // Already indexed verbatim (post-stemming) — no typo signal.
+      if (exactStmt.get(lower)) return tok;
+
+      const lo = Math.max(1, clean.length - 2);
+      const hi = clean.length + 2;
+      const rows = rangeStmt.all(lo, hi) as { term: string }[];
+      const candidates = new Set<string>(rows.map((r) => r.term));
+      if (tagNames) for (const t of tagNames) candidates.add(t);
+
+      const suggestion = suggestSimilarTag(candidates, lower);
+      if (suggestion && suggestion.toLowerCase() !== lower) {
+        changed = true;
+        return suggestion;
+      }
+      return tok;
+    });
+
+    if (!changed) return undefined;
+    return corrected.join(" ");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `search_did_you_mean` warning (vault#551 WS2B) — wraps
+ * {@link computeSearchDidYouMean}'s suggestion in the standard warning
+ * shape, mirroring `unknown_tag`'s `did_you_mean` field. Returns
+ * `undefined` (nothing to push) when no suggestion clears the bar — a
+ * zero-result search is a perfectly ordinary outcome on its own and does
+ * NOT warrant a warning by itself; only an actual spelling suggestion does.
+ *
+ * Scope-unaware by construction, exactly like `collectUnknownTagWarnings`
+ * (see this file's top-of-file doc comment) — the FTS5 vocabulary spans
+ * the WHOLE vault regardless of any caller's tag scope. Callers on a
+ * tag-scoped session MUST NOT surface this warning directly:
+ * `src/mcp-tools.ts`'s `query-notes` wrapper already strips the entire
+ * `warnings` array for a scoped caller (so MCP is safe with no extra
+ * work); `src/routes.ts` must gate the call itself behind
+ * `tagScope.allowed === null`, same as it already does for
+ * `collectUnknownTagWarnings`.
+ */
+export function searchDidYouMeanWarning(rawQuery: string, suggestion: string): QueryWarning {
+  return {
+    code: "search_did_you_mean",
+    message: `no results for "${rawQuery}" — did you mean "${suggestion}"?`,
+    query: rawQuery,
+    did_you_mean: suggestion,
+  };
+}

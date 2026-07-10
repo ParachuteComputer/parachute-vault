@@ -4,7 +4,7 @@ import { rebuildIndexes, listIndexedFields } from "./indexed-fields.js";
 import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
 
-export const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 25;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -256,25 +256,43 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at TEXT NOT NULL
 );
 
--- Full-text search on note content
+-- Full-text search on note title (path) AND content (v25, vault#551 WS2B/C).
+-- Two columns, declared in this order — bm25(notes_fts, w_path, w_content)
+-- calls in core/src/notes.ts positionally match column 0 = path, column 1 =
+-- content, weighted so a TITLE match outranks a passing body mention (see
+-- SEARCH_WEIGHT_PATH/SEARCH_WEIGHT_CONTENT in core/src/search-query.ts).
+-- Pre-v25, only content was indexed — a note's title/path was completely
+-- unsearchable, which both defeated any title-biased ranking (nothing to
+-- bias) and was a plain recall gap. tokenize='porter unicode61' adds
+-- Porter stemming on top of the v3-era default unicode61 tokenizer so
+-- regular-affix variants (firefighter/firefighters, microbe/microbes) match
+-- each other; irregular plurals with a consonant change (wolf/wolves) are a
+-- known Porter limitation, not fixed by this — see docs/HTTP_API.md.
+-- Existing vaults upgrade via migrateToV25 (rebuild + repopulate); this
+-- CREATE only reaches its new shape directly on a fresh vault.
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+  path,
   content,
   content='notes',
-  content_rowid='rowid'
+  content_rowid='rowid',
+  tokenize='porter unicode61'
 );
 
--- FTS triggers
+-- FTS triggers. UPDATE OF content, path (not content alone, pre-v25) —
+-- either column changing must resync the index now that path is indexed too;
+-- a path-only rename (content untouched) used to be silently invisible to
+-- notes_fts because the trigger's column list didn't include it.
 CREATE TRIGGER IF NOT EXISTS notes_fts_insert AFTER INSERT ON notes BEGIN
-  INSERT INTO notes_fts(rowid, content) VALUES (new.rowid, new.content);
+  INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS notes_fts_delete AFTER DELETE ON notes BEGIN
-  INSERT INTO notes_fts(notes_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+  INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content ON notes BEGIN
-  INSERT INTO notes_fts(notes_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-  INSERT INTO notes_fts(rowid, content) VALUES (new.rowid, new.content);
+CREATE TRIGGER IF NOT EXISTS notes_fts_update AFTER UPDATE OF content, path ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
+  INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
 END;
 
 -- Indexes
@@ -506,6 +524,10 @@ export function initSchema(db: Database): void {
   // Migrate v23 → v24: coerce existing typed-index poison where lossless,
   // leave the rest in place for `doctor` to surface. See vault#553.
   migrateToV24(db);
+
+  // Migrate v24 → v25: rebuild notes_fts with path+content columns +
+  // porter stemming, repopulate from every existing note. See vault#551.
+  migrateToV25(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1330,6 +1352,143 @@ function migrateToV24(db: Database): void {
       `[vault] migrated to schema v24 (vault#553): typed-index poison scan — coerced ${coerced} value(s) to their declared indexed type; left ${left} non-coercible value(s) in place (see \`doctor\`'s mixed_type_indexed_field finding for cleanup).`,
     );
   }
+}
+
+/**
+ * Migrate v24 → v25: rebuild `notes_fts` to index BOTH `path` (title) and
+ * `content` as separate weighted FTS5 columns, with Porter stemming added
+ * to the tokenizer (vault#551 WS2B/C — the Reliability & Usability
+ * Program's interim-harness finding: a note's title/path was completely
+ * unsearchable pre-v25, which both defeated title-biased ranking and was a
+ * plain recall gap on its own).
+ *
+ * `notes_fts` is an EXTERNAL CONTENT table (`content='notes'`) — the FTS5
+ * index is a side structure over `notes`, not a copy of the data itself, so
+ * changing its column shape means DROP + CREATE, not `ALTER`. FTS5 virtual
+ * tables don't support `ALTER TABLE ... ADD COLUMN` the way ordinary tables
+ * do. The three sync triggers are defined ON `notes` (`AFTER INSERT/UPDATE/
+ * DELETE ON notes`), not on `notes_fts` itself, so dropping `notes_fts`
+ * does NOT drop them automatically — they're dropped explicitly FIRST
+ * (referencing the old single-column shape, they'd fail on the very next
+ * note write if left in place against the new table) and recreated
+ * immediately after in the new two-column form. SCHEMA_SQL carries the
+ * identical CREATE VIRTUAL TABLE + trigger definitions for fresh vaults;
+ * this function is the upgrade path for a vault that already has the old
+ * shape.
+ *
+ * External-content tables start EMPTY after a bare CREATE — unlike a normal
+ * table, there's no data to inherit from the old dropped table (FTS5 stores
+ * its own inverted-index structures, not a row-for-row copy). The
+ * repopulation pass below re-derives every row from `notes` directly, so
+ * this migration is self-contained (it does NOT read from the old
+ * `notes_fts` — that data is gone the moment DROP TABLE runs).
+ *
+ * ALL-OR-NOTHING (generalist review, #565): the entire DROP + CREATE +
+ * trigger-recreate + repopulation sequence runs inside a SINGLE
+ * `transaction`, not just the repopulation loop. A crash partway through
+ * with the DDL committed but the index empty would otherwise be
+ * unrecoverable — the recreated table already has the `path` column, so the
+ * `hasColumn(db, "notes_fts", "path")` guard would report "done" and never
+ * retry, leaving search permanently empty. Wrapping the whole sequence means a
+ * rollback restores the pre-v25 single-column shape (no `path`), so the
+ * guard correctly re-detects "not migrated" and the next boot re-runs it —
+ * correct-by-construction rather than dependent on the DDL fully
+ * completing.
+ *
+ * Idempotent via `hasColumn(db, "notes_fts", "path")` (checked first — a
+ * vault already on the v25 shape, including every fresh vault, no-ops
+ * immediately; `PRAGMA table_info` returns `[]` for a nonexistent table and
+ * the declared columns for an FTS5 virtual table, so the shared helper is
+ * correct here without a separate `hasTable` pre-check).
+ * Cross-runtime: DROP/CREATE VIRTUAL TABLE, triggers, and the repopulation
+ * SELECT/INSERT are all standard FTS5 + SQL surface — no bun-only
+ * functions — but `tokenize='porter unicode61'` and the two-column
+ * external-content shape are new usage for this codebase; flagged for the
+ * wire reviewer to confirm against Cloudflare DO SQLite's FTS5 build (the
+ * hosted door's async Store backend is not shipped yet — see `store.ts`'s
+ * `BunSqliteStore` doc comment — so this is unverified-until-that-lands,
+ * not a regression against a working path). Porter is part of the same
+ * FTS5 extension registration as unicode61 (not a separately-enabled
+ * module) and `PRAGMA table_info` on a virtual table is standard SQLite,
+ * so the expected risk surface is narrow, but it hasn't been exercised
+ * against DO SQLite directly.
+ */
+function migrateToV25(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+  if (hasColumn(db, "notes_fts", "path")) return;
+
+  console.log(
+    "[vault] migrating to schema v25 (vault#551): rebuilding notes_fts with path+content columns and porter stemming...",
+  );
+
+  // The ENTIRE sequence — DROP triggers + table, CREATE the new virtual
+  // table, CREATE the three sync triggers, AND repopulate — runs inside ONE
+  // transaction so it's strictly all-or-nothing (generalist review, #565).
+  //
+  // Why this matters: if the DDL ran outside the transaction (only the
+  // repopulation transacted, the pre-review shape), a crash between
+  // "CREATE VIRTUAL TABLE" and the end of repopulation would leave a
+  // recreated-but-EMPTY notes_fts — and the idempotency guard
+  // (`hasColumn(db, "notes_fts", "path")`) would see the new `path` column
+  // and report the migration "done" on the next boot, so search stays
+  // PERMANENTLY empty with no retry. Worse, a crash before the CREATE TRIGGERs would leave
+  // future writes unindexed too. Wrapping the whole thing means a rollback
+  // restores the pre-v25 shape (single `content` column, no `path`), so the
+  // guard correctly reports "not migrated" and the next boot re-runs it
+  // cleanly — the guard becomes correct-by-construction rather than relying
+  // on the DDL having fully completed. The reviewer verified CREATE VIRTUAL
+  // TABLE + CREATE TRIGGER execute fine inside bun's `BEGIN IMMEDIATE …
+  // COMMIT`; a DO backend routes the same block through `transactionSync`
+  // (see core/src/txn.ts) with the identical commit-on-return /
+  // rollback-on-throw contract.
+  let repopulated = 0;
+  transaction(db, () => {
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_delete");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_update");
+    db.exec("DROP TABLE IF EXISTS notes_fts");
+
+    db.exec(`
+      CREATE VIRTUAL TABLE notes_fts USING fts5(
+        path,
+        content,
+        content='notes',
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+      )
+    `);
+    db.exec(`
+      CREATE TRIGGER notes_fts_insert AFTER INSERT ON notes BEGIN
+        INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
+      END
+    `);
+    db.exec(`
+      CREATE TRIGGER notes_fts_delete AFTER DELETE ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
+      END
+    `);
+    db.exec(`
+      CREATE TRIGGER notes_fts_update AFTER UPDATE OF content, path ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
+        INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
+      END
+    `);
+
+    const rows = db.prepare("SELECT rowid, path, content FROM notes").all() as {
+      rowid: number;
+      path: string | null;
+      content: string | null;
+    }[];
+    const insert = db.prepare("INSERT INTO notes_fts(rowid, path, content) VALUES (?, ?, ?)");
+    for (const row of rows) {
+      insert.run(row.rowid, row.path ?? "", row.content ?? "");
+      repopulated++;
+    }
+  });
+
+  console.log(
+    `[vault] migrated to schema v25 (vault#551): notes_fts rebuilt with path+content columns + porter stemming; repopulated ${repopulated} note(s).`,
+  );
 }
 
 function hasTable(db: Database, name: string): boolean {
