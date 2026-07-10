@@ -184,10 +184,15 @@ export class BunSqliteStore implements Store {
         // `has_broken_links`/`broken_links` query-notes filters (both read
         // the same `unresolved_wikilinks` table this queues into) — see the
         // design doc for the follow-up to also surface an inline
-        // `unresolved_link` warning on the create/update response itself.
-        const targetId = resolveOrQueueLink(this.db, note.id, nextValue, fieldName);
-        if (targetId) {
-          linkOps.createLink(this.db, note.id, targetId, fieldName);
+        // `unresolved_link`/`ambiguous_link` warning on the create/update
+        // response itself. An `"ambiguous"` outcome (vault#570 — the field's
+        // value matched ≥2 notes, e.g. two notes sharing an H1 title) is
+        // treated the same as a miss here: no link is created, and nothing
+        // is queued (mirrors `resolveOrQueueLink`'s own "don't guess"
+        // contract for structured links).
+        const outcome = resolveOrQueueLink(this.db, note.id, nextValue, fieldName);
+        if (outcome.status === "resolved") {
+          linkOps.createLink(this.db, note.id, outcome.note_id, fieldName);
         }
       }
     }

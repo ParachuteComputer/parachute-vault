@@ -2632,6 +2632,164 @@ describe("MCP tools", async () => {
     expect(links.some((l) => l.targetId === target.id && l.relationship === "knows")).toBe(true);
   });
 
+  // vault#570 — content-parsed [[wikilinks]] to a missing target used to
+  // fire NO write-time warning at all, even though the equivalent
+  // structured `links` entry (tested above) already did. This closes that
+  // asymmetry: the SAME `unresolved_link` warning shape, sourced from
+  // content instead of `links`.
+  it("create-note with a content [[wikilink]] to a missing target: warns (unresolved_link), same as structured links", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "See [[Missing Note]] for details.",
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("unresolved_link");
+    expect(source.warnings[0].target).toBe("Missing Note");
+    expect(source.warnings[0].relationship).toBe("wikilink");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Backfills automatically, same as the structured-link contract.
+    const target = await store.createNote("here now", { path: "Missing Note" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+  });
+
+  // vault#570 — a target matching ≥2 notes (e.g. two notes sharing a
+  // basename/title) is a factually different situation from "no note
+  // matches" — reporting it as `unresolved_link` ("did not resolve to any
+  // note") would be WRONG (it matched two, not zero). Must surface a
+  // distinct `ambiguous_link` warning instead, and must NOT create an edge
+  // (there's no principled way to pick one of the two candidates).
+  it("create-note with a content [[wikilink]] to an AMBIGUOUS target (2 same-title notes): ambiguous_link, not unresolved_link, no edge", async () => {
+    const a = await store.createNote("A", { path: "Folder1/Shared Title" });
+    const b = await store.createNote("B", { path: "Folder2/Shared Title" });
+
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "See [[Shared Title]] for details.",
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("ambiguous_link");
+    expect(source.warnings[0].target).toBe("Shared Title");
+    expect(source.warnings[0].relationship).toBe("wikilink");
+    expect(source.warnings[0].candidate_count).toBe(2);
+
+    // No edge created to EITHER candidate.
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(0);
+    expect(links.some((l) => l.targetId === a.id || l.targetId === b.id)).toBe(false);
+
+    // Not queued for lazy resolution either — a future note being created
+    // can't retroactively resolve an ambiguity between two EXISTING notes.
+    // The table itself may not even exist yet (nothing else in this test
+    // ever queued anything) — `PRAGMA table_info` on a nonexistent table
+    // returns zero rows rather than throwing, same tolerance the wikilinks
+    // module itself uses.
+    const tableExists = (db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as unknown[]).length > 0;
+    if (tableExists) {
+      const pending = db.prepare(
+        "SELECT * FROM unresolved_wikilinks WHERE source_id = ?",
+      ).all(source.id) as unknown[];
+      expect(pending).toHaveLength(0);
+    }
+  });
+
+  // vault#570 — the same ambiguous-target treatment applies to structured
+  // `links`, not just content [[wikilinks]] (resolveOrQueueLink is the
+  // shared implementation both paths call).
+  it("create-note with a structured link to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/Dup" });
+    await store.createNote("B", { path: "Folder2/Dup" });
+
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "no wikilinks here",
+      links: [{ target: "Dup", relationship: "knows" }],
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("ambiguous_link");
+    expect(source.warnings[0].target).toBe("Dup");
+    expect(source.warnings[0].relationship).toBe("knows");
+    expect(source.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a content [[wikilink]] to a note created LATER in the same
+  // create-note batch must resolve silently (forward-ref), exactly like
+  // structured `links` already do — no spurious `unresolved_link` warning
+  // just because the classification pass runs before this fix would have.
+  it("create-note batch: a content [[wikilink]] to a note created LATER in the same batch resolves without warning", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { path: "WikiA", content: "links to [[WikiB]]" },
+        { path: "WikiB", content: "the target" },
+      ],
+    }) as any[];
+    const a = result.find((n: any) => n.path === "WikiA");
+    expect(a.warnings).toBeUndefined();
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("wikilink");
+  });
+
+  // vault#570 — update-note's content replace path gets the same
+  // unresolved_link/ambiguous_link treatment as create-note.
+  it("update-note content replace with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const note = await store.createNote("plain content", { path: "Updatable" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content: "now references [[Not Yet Real]]",
+      force: true,
+    }) as any;
+
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings[0].code).toBe("unresolved_link");
+    expect(result.warnings[0].target).toBe("Not Yet Real");
+
+    // A tags/links-only update on the SAME note must NOT re-surface the
+    // warning — nothing about content changed on this call.
+    const tagOnly = await updateNote.execute({
+      id: note.id,
+      tags: { add: ["x"] },
+      force: true,
+    }) as any;
+    expect(tagOnly.warnings).toBeUndefined();
+  });
+
+  it("update-note content replace with a [[wikilink]] to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/Both" });
+    await store.createNote("B", { path: "Folder2/Both" });
+    const note = await store.createNote("plain content", { path: "Updatable2" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content: "now references [[Both]]",
+      force: true,
+    }) as any;
+
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings[0].code).toBe("ambiguous_link");
+    expect(result.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(note.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
   it("update-note tool updates created_at", async () => {
     const note = await store.createNote("Test");
     const tools = generateMcpTools(store);
