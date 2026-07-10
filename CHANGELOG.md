@@ -34,6 +34,35 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.0-rc.1] - 2026-07-09
+
+### Added
+
+- **Contract test suite for the Reliability & Usability Program (issues
+  #550–#556).** The 2026-07-09 nine-persona deep test (9 sandboxed agents,
+  8 fresh vaults, ~230 notes, every claim independently reproduced against
+  the REST API) verdict: the storage/concurrency core is trustworthy —
+  zero server errors, zero corruption, zero lost writes — while the
+  failure modes concentrate at the query/taxonomy/error boundaries. This
+  PR is "tests before fixes" (program phase 1): six new test files encode
+  every finding as an executable contract before any production code
+  changes. Behavior that is correct today gets a normal passing test,
+  locking it in as contract (search literal-quoting, the tag `expand`
+  axis, `delete-tag`/`renameTag` cascades, well-typed indexed-field range
+  queries, the merge-patch metadata contract, `path_conflict`/`conflict`/
+  `schema_validation`/`precondition_required` structured errors, and the
+  append/if_updated_at/state_transition concurrency guarantees). Behavior
+  that is confirmed broken gets a `test.todo("#NNN: …")` entry naming the
+  target behavior and the tracking issue, so later waves flip each one to
+  a real passing test against an already-red baseline:
+  `src/contract-search.test.ts` (#551),
+  `src/contract-honest-queries.test.ts` (#550),
+  `src/contract-errors.test.ts` (#554),
+  `core/src/contract-taxonomy.test.ts` (#552),
+  `core/src/contract-typed-index.test.ts` (#553),
+  `core/src/contract-concurrency.test.ts` (no todos — pure lock-in of
+  verified strengths, #555). No production source changed in this PR.
+
 ## [0.6.4-rc.7] - 2026-06-27
 
 ### Removed
