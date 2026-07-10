@@ -109,6 +109,31 @@ unknown).
   structured `404 tag_not_found` (`did_you_mean` populated when a close
   match exists). **Migration:** a client checking for tag existence via
   "did the 200 come back all-null" should check for `404` instead.
+- **Cursor bootstrap wire-shape — an empty-string `cursor` now returns the
+  `{notes, next_cursor}` envelope, was a flat array (#550, rc.2, labeled
+  "breaking-lite" in its own changelog).** `?cursor=` / `cursor: ""` now
+  correctly engages cursor mode on the FIRST call (previously an empty
+  string was treated as "no cursor" and got today's plain flat array — the
+  documented bootstrap flow was unreachable). **Migration:** low practical
+  risk (the old empty-string path was effectively unreachable), but a client
+  that deliberately sent an empty-string cursor and parsed a flat array must
+  now read the `{notes, next_cursor}` envelope. An OMITTED `cursor` still
+  returns a flat array, unchanged.
+
+### Behavior changes cursor / sync consumers should know
+
+- **`updated_at` now bumps on tags-only / links-only mutations (#555, rc.8
+  fix 2 + rc.9).** A tag-only or link-only `update-note`/`PATCH` (and an
+  `if_exists:"update"` that changes only tags/links) used to leave
+  `updated_at` frozen; it now bumps like any other real mutation.
+  **Additive, not strictly breaking** — MORE mutations are now visible to
+  `ORDER BY updated_at` / cursor since-last-check consumers, not fewer — but
+  a cursor-based sync will now **re-deliver** notes on tag/link changes it
+  previously missed. Expect that increased re-delivery rather than being
+  surprised by it. (Deliberately NOT bumped: the bulk `note_tags` repoint
+  inside a `rename-tag`/`merge-tags` — a taxonomy rename doesn't change a
+  note's own content, and flooding cursor consumers with thousands of
+  no-signal bumps was judged worse than the omission.)
 
 ### New capabilities (brief pointers — full docs in [docs/HTTP_API.md](./docs/HTTP_API.md))
 
