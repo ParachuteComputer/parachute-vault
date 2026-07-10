@@ -139,13 +139,18 @@ async function handleMcp(
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };
     } catch (err) {
-      // Domain errors from the core tools (conflict, missing precondition) get
-      // surfaced as JSON-RPC errors with a structured `data` field so an
-      // agent can key off `data.error_type` and the concurrency tokens.
-      // Everything else falls through to an in-band tool error with
-      // `isError: true` — legible but unstructured.
+      // Domain errors from the core tools (conflict, missing precondition,
+      // path collisions, batch caps, cursor/query validation, tag-field
+      // conflicts, ...) get surfaced as JSON-RPC errors with a structured
+      // `data` field so an agent can key off `data.error_type` and any
+      // error-specific fields (concurrency tokens, violations, candidates,
+      // ...). vault#554: every domain error class is mapped below, either by
+      // a dedicated branch (full field fidelity) or the generic `error_type`
+      // catch-all near the end. Only a TRULY unknown error (no `error_type`
+      // anywhere on it) falls through to the in-band `isError: true` text.
       const message = err instanceof Error ? err.message : "Unknown error";
       const e = err as {
+        name?: string;
         code?: string;
         note_id?: string;
         note_path?: string | null;
@@ -159,6 +164,12 @@ async function handleMcp(
         error_type?: string;
         got?: unknown;
         hint?: string;
+        path?: string;
+        candidates?: unknown;
+        extension?: string;
+        reason?: string;
+        limit?: number;
+        tag?: string;
       };
       // Honest-queries validation errors (vault#550) — `limit`/`offset`/date
       // values that are structurally invalid rather than merely "no
@@ -196,6 +207,7 @@ async function handleMcp(
           your_updated_at: e.expected_updated_at,
           path: e.note_path ?? null,
           note_id: e.note_id,
+          hint: "re-read the note (query-notes) and re-apply your change against its current updated_at, or pass force: true to overwrite",
         });
       }
       // State-transition compare-and-set conflict (vault#299 Part B) — a
@@ -210,6 +222,7 @@ async function handleMcp(
           expected_from: e.expected_from,
           to: e.to,
           current: e.current ?? null,
+          hint: "re-read the note's current value for this field and retry the transition from its actual current state",
         });
       }
       // Strict-schema rejection (vault#299 Part A) — one error carrying ALL
@@ -218,6 +231,7 @@ async function handleMcp(
         throw new McpError(ErrorCode.InvalidParams, message, {
           error_type: "schema_validation",
           violations: e.violations ?? [],
+          hint: "fix every field listed in violations and retry — none of this write was applied",
         });
       }
       if (e?.code === "PRECONDITION_REQUIRED") {
@@ -225,6 +239,96 @@ async function handleMcp(
           error_type: "precondition_required",
           note_id: e.note_id,
           path: e.note_path ?? null,
+          hint: "re-read the note, pass its updated_at as if_updated_at, or pass force: true to skip the check",
+        });
+      }
+      // Any other QueryError (vault#554) — FIELD_NOT_INDEXED, UNKNOWN_OPERATOR,
+      // INVALID_OPERATOR_VALUE, and the various cursor/near/search
+      // incompatibility throws that predate the vault#550/#551 `error_type`
+      // convention (which is why they weren't caught by the two branches
+      // above). Falls back to `error_type: "invalid_query"` — the umbrella
+      // REST already uses for this whole error class — so these no longer
+      // fall through to the unstructured `isError: true` text.
+      if (e?.name === "QueryError") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: e.error_type ?? "invalid_query",
+          code: e.code,
+          field: e.field,
+          got: e.got,
+          hint: e.hint,
+        });
+      }
+      // Malformed / stale opaque cursor (vault#313, vault#554) — was
+      // entirely unmapped here before (REST already returns `{error, code}`
+      // — no `error_type` either; both surfaces get one now). `code` is
+      // already the exact `error_type` vocabulary: "cursor_invalid" or
+      // "cursor_query_mismatch".
+      if (e?.name === "CursorError" && typeof e.code === "string") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: e.code,
+        });
+      }
+      // Path-rename/create collision (vault#126, vault#554) — schema's
+      // UNIQUE(path) tripped. Mirrors REST's 409 `path_conflict` shape.
+      if (e?.code === "PATH_CONFLICT") {
+        throw new McpError(ErrorCode.InvalidRequest, message, {
+          error_type: "path_conflict",
+          path: e.path,
+        });
+      }
+      // A path lookup matched more than one note (vault#330 S1, vault#554) —
+      // mirrors REST's 409 `ambiguous_path` shape (candidates = the
+      // disambiguating extensions).
+      if (e?.code === "AMBIGUOUS_PATH") {
+        throw new McpError(ErrorCode.InvalidRequest, message, {
+          error_type: "ambiguous_path",
+          path: e.path,
+          candidates: e.candidates,
+        });
+      }
+      // Bad `extension` value (vault#328, vault#554) — mirrors REST's 400
+      // `invalid_extension` shape.
+      if (e?.code === "INVALID_EXTENSION") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: "invalid_extension",
+          extension: e.extension,
+          reason: e.reason,
+        });
+      }
+      // Batch cap exceeded (#213, vault#554) — mirrors REST's 413
+      // `batch_too_large` shape.
+      if (e?.code === "BATCH_TOO_LARGE") {
+        throw new McpError(ErrorCode.InvalidRequest, message, {
+          error_type: "batch_too_large",
+          limit: e.limit,
+          got: e.got,
+        });
+      }
+      // update-tag cross-tag field conflicts (vault#553/#554) — carries
+      // EVERY violation in one response (see `TagFieldConflictError`).
+      if (e?.code === "TAG_FIELD_CONFLICT") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: "tag_field_conflict",
+          tag: e.tag,
+          violations: e.violations ?? [],
+        });
+      }
+      // Generic catch-all (vault#554): any remaining error that carries a
+      // stable `error_type` — either a domain error class that stamps it as
+      // an instance property (IndexedFieldError, and the classes handled by
+      // dedicated branches above as defense-in-depth) or a validation leaf
+      // built with `structuredError()` in core/src/mcp.ts (mutually_exclusive,
+      // invalid_content_edit, content_edit_not_found, content_edit_ambiguous,
+      // invalid_state_transition, invalid_parent_names, invalid_relationships,
+      // not_found, ...). This is the backstop that makes "nothing falls
+      // through to the unstructured isError text except a TRULY unknown
+      // error" true by construction: only errors nobody tagged with
+      // `error_type` still hit the fallback below.
+      if (typeof e?.error_type === "string") {
+        throw new McpError(ErrorCode.InvalidParams, message, {
+          error_type: e.error_type,
+          field: e.field,
+          hint: e.hint,
         });
       }
       return {

@@ -284,6 +284,11 @@ export class TransitionConflictError extends Error {
  */
 export class PathConflictError extends Error {
   code = "PATH_CONFLICT" as const;
+  // Stable error_type (vault#554) — additive; mirrors the `error_type` REST
+  // has hardcoded in its json response since #126. Lets the generic MCP
+  // domain-error mapping (src/mcp-http.ts) pick this class up without a
+  // bespoke branch, the same way REST's catch already does explicitly.
+  error_type = "path_conflict" as const;
   path: string;
 
   constructor(path: string) {
@@ -306,6 +311,8 @@ export class PathConflictError extends Error {
  */
 export class AmbiguousPathError extends Error {
   code = "AMBIGUOUS_PATH" as const;
+  // Stable error_type (vault#554) — see PathConflictError's comment.
+  error_type = "ambiguous_path" as const;
   path: string;
   candidates: { id: string; extension: string }[];
 
@@ -346,6 +353,8 @@ export const EXTENSION_PATTERN = /^[a-z0-9]{1,16}$/;
 
 export class ExtensionValidationError extends Error {
   code = "INVALID_EXTENSION" as const;
+  // Stable error_type (vault#554) — see PathConflictError's comment.
+  error_type = "invalid_extension" as const;
   extension: string;
   reason: string;
 

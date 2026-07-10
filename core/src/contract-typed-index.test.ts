@@ -22,6 +22,7 @@ import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
 import { TransitionConflictError } from "./notes.js";
+import { TagFieldConflictError } from "./tag-schemas.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -98,9 +99,97 @@ describe("contract: typed indexes — todo (#553)", () => {
     `#553: an unset enum field stays ABSENT — no first-value backfill — so exists:false correctly matches a note that never set the field (today: applySchemaDefaults in core/src/mcp.ts backfills the schema's first enum value onto every note that gains the tag, so "never set" is indistinguishable from "explicitly set to the default" and exists:false never matches)`,
   );
   test.todo(
-    `#553: update-tag reports ALL invalid fields in one call AND states explicitly that no changes were applied (today: the cross-tag type/indexed-flag validation loop in core/src/mcp.ts throws on the FIRST offending field and never reports the rest, and the thrown Error's message doesn't say whether the tag's other, valid fields were partially applied — reproduced live: declaring two invalid fields in one update-tag call surfaces only the first field's error)`,
-  );
-  test.todo(
     `#553: the indexed-field type list is honest about what's actually indexable (core/src/mcp.ts's update-tag field-type description advertises "string, boolean, integer, number, array, object" but indexed-fields.ts's TYPE_MAP only supports string/integer/boolean — "number" and the container types are accepted as declared but silently un-indexable)`,
   );
+});
+
+describe("contract: update-tag messaging — #553/#554 (flipped from todo)", () => {
+  it("update-tag reports ALL invalid fields in one call (not just the first) and states explicitly that no changes were applied", async () => {
+    // Tag "a" declares two fields. Tag "b" then redeclares BOTH with
+    // conflicting specs — a NON-indexed type conflict on "x" AND an
+    // indexed-flag conflict on "y" — in the SAME update-tag call. Pre-#553
+    // the cross-tag validation loop threw on the first offending field
+    // ("x") and never even evaluated "y"; two testers independently assumed
+    // the whole call (including "y") had partially landed. (The
+    // BOTH-indexed type-conflict case is deliberately absent here — it
+    // keeps its pre-existing declareField → IndexedFieldError path; see
+    // `collectCrossTagFieldViolations`'s doc-comment exclusion 2 and the
+    // both-indexed test below.)
+    await store.upsertTagRecord("a", {
+      fields: {
+        x: { type: "string" },
+        y: { type: "boolean", indexed: true },
+      },
+    });
+
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+
+    let caught: unknown;
+    try {
+      await updateTag.execute({
+        tag: "b",
+        fields: {
+          x: { type: "integer" }, // non-indexed type_conflict vs tag "a"
+          y: { type: "boolean", indexed: false }, // indexed_flag_conflict vs tag "a"
+        },
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(TagFieldConflictError);
+    const err = caught as TagFieldConflictError;
+    expect(err.violations).toHaveLength(2);
+    const byField = new Map(err.violations.map((v) => [v.field, v.reason]));
+    expect(byField.get("x")).toBe("type_conflict");
+    expect(byField.get("y")).toBe("indexed_flag_conflict");
+    // States explicitly that no changes were applied.
+    expect(err.message).toContain("no changes were applied");
+    // Structured conflicting-declarer field (scrubbed by the server layer
+    // for tag-scoped sessions; full detail here — core is scope-unaware).
+    expect(err.violations[0]!.other_tag).toBe("a");
+
+    // Nothing partially landed — tag "b" has no field declarations at all.
+    const bRecord = await store.getTagRecord("b");
+    expect(bRecord?.fields ?? null).toBeFalsy();
+  });
+
+  it("a BOTH-indexed cross-tag type conflict keeps its pre-existing IndexedFieldError path (not TagFieldConflictError)", async () => {
+    // Wire-contract floor (vault#554): this exact case already errored on
+    // main via store.upsertTagRecord → declareField's cross-declarer
+    // sqlite-type check → IndexedFieldError (REST maps it to 400
+    // invalid_indexed_field). The new pre-check must not intercept it.
+    await store.upsertTagRecord("a", {
+      fields: { x: { type: "string", indexed: true } },
+    });
+
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "b",
+        fields: { x: { type: "integer", indexed: true } },
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught).not.toBeInstanceOf(TagFieldConflictError);
+    expect(caught.name).toBe("IndexedFieldError");
+    expect(caught.error_type).toBe("invalid_indexed_field");
+    // The structured declarer context the server's tag-scope scrub keys on.
+    expect(caught.field).toBe("x");
+    expect(caught.declarer_tags).toEqual(["a"]);
+
+    // The store's transaction rolled back — nothing persisted for "b".
+    const bRecord = await store.getTagRecord("b");
+    expect(bRecord?.fields ?? null).toBeFalsy();
+  });
+  // REST `PUT /api/tags/:name` coverage for the same behavior lives in
+  // src/contract-errors.test.ts (core/ shouldn't import from src/ — that
+  // boundary runs one direction only).
 });

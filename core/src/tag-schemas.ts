@@ -16,6 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { mapFieldType, validateFieldName } from "./indexed-fields.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -280,17 +281,23 @@ export function deleteTagSchema(db: Database, tag: string): boolean {
  * time"); dropping the inner-shape gate is consistent with that intent.
  */
 export function validateRelationships(raw: unknown): Record<string, unknown> {
+  // `error_type` (vault#554) is attached directly on the thrown Error
+  // (duck-typed extra property, same pattern as QueryError's optional
+  // fields) rather than via a dedicated class — this is a validation
+  // leaf with one caller-facing shape, not a reusable domain error. Both
+  // REST (src/routes.ts, which already hardcodes this same string) and the
+  // generic MCP domain-error mapping (src/mcp-http.ts) key off it.
   if (raw === null || raw === undefined) {
-    throw new Error("relationships: expected an object, got null/undefined");
+    throw relationshipsError("relationships: expected an object, got null/undefined");
   }
   if (typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error(
+    throw relationshipsError(
       "relationships: expected an object mapping relationship name → value (got an array or primitive)",
     );
   }
   for (const rel of Object.keys(raw as Record<string, unknown>)) {
     if (!rel) {
-      throw new Error("relationships: keys must be non-empty strings");
+      throw relationshipsError("relationships: keys must be non-empty strings");
     }
   }
   // Round-trip through JSON to (a) confirm the payload is serializable —
@@ -300,9 +307,13 @@ export function validateRelationships(raw: unknown): Record<string, unknown> {
   try {
     serialized = JSON.stringify(raw);
   } catch (err) {
-    throw new Error(`relationships: value must be JSON-serializable (${(err as Error).message})`);
+    throw relationshipsError(`relationships: value must be JSON-serializable (${(err as Error).message})`);
   }
   return JSON.parse(serialized) as Record<string, unknown>;
+}
+
+function relationshipsError(message: string): Error {
+  return Object.assign(new Error(message), { error_type: "invalid_relationships" as const });
 }
 
 // ---------------------------------------------------------------------------
@@ -333,4 +344,175 @@ function jsonOrNull(value: unknown): string | null {
     return value;
   }
   return JSON.stringify(value);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-tag field validation (vault#553 / #554) — update-tag messaging
+// ---------------------------------------------------------------------------
+
+/**
+ * A single field-declaration violation surfaced by {@link collectTagFieldViolations}.
+ * `reason` is a stable machine-checkable slug; `message` is the existing
+ * human-readable prose (unchanged wording, just no longer thrown on the
+ * first hit).
+ */
+export interface TagFieldViolation {
+  field: string;
+  reason: "type_conflict" | "indexed_flag_conflict" | "unsupported_indexed_type" | "invalid_field_name";
+  message: string;
+  /**
+   * The conflicting declarer tag — present on the cross-tag reasons
+   * (`type_conflict` / `indexed_flag_conflict`) only; the solo own-field
+   * reasons have no other party. Core populates it unconditionally
+   * (scope-unaware by architecture); the SERVER layers scrub it — and
+   * generalize `message` — when the declarer is outside a tag-scoped
+   * caller's allowlist (`scrubTagFieldViolationsByScope` in
+   * src/tag-scope.ts), so a scoped session learns THAT a conflict exists
+   * (the write is still rejected — integrity is scope-independent) but not
+   * WHICH out-of-scope tag it conflicts with or what that tag declares.
+   */
+  other_tag?: string;
+}
+
+/**
+ * Thrown by `update-tag` (MCP tool + REST `PUT /api/tags/:name`) when one or
+ * more fields in the incoming `fields` payload conflict with another tag's
+ * declaration, or declare an unindexable/invalid indexed field. Carries
+ * EVERY violation found in the call (vault#553 settled complaint: the prior
+ * behavior threw on the FIRST offending field and silently never reported
+ * the rest — two testers independently assumed the other fields had landed).
+ * The message states explicitly that no changes were applied — the whole
+ * `upsertTagRecord` call is validated BEFORE any write, so a rejection here
+ * always leaves the tag record untouched (atomicity unchanged from before;
+ * this only improves what the caller is told).
+ */
+export class TagFieldConflictError extends Error {
+  code = "TAG_FIELD_CONFLICT" as const;
+  error_type = "tag_field_conflict" as const;
+  tag: string;
+  violations: TagFieldViolation[];
+
+  constructor(tag: string, violations: TagFieldViolation[]) {
+    const summary = violations.map((v) => `${v.field} (${v.reason}): ${v.message}`).join("; ");
+    super(
+      `tag_field_conflict: ${violations.length} field violation(s) for tag "${tag}" — no changes were applied. ${summary}`,
+    );
+    this.name = "TagFieldConflictError";
+    this.tag = tag;
+    this.violations = violations;
+  }
+}
+
+/**
+ * Validate the fields a caller is declaring/redeclaring for `tag` against
+ * every OTHER tag's schema — `type` and `indexed` must agree across all
+ * declarers (both are global per field). Returns every violation found —
+ * never throws — so the caller can report the complete set in one
+ * structured error (or none, when the array is empty).
+ *
+ * `incomingFields` is the set of fields THIS call is declaring (MCP:
+ * `params.fields`; REST: `body.fields`) — not the full merged field map.
+ * Fields the call doesn't touch were already valid (or already accepted)
+ * and are not re-validated here, matching the pre-#553 scope of the check.
+ *
+ * Two deliberate exclusions preserve pre-existing wire contracts
+ * (vault#554 — statuses/error_types on previously-working calls must not
+ * change):
+ *
+ * 1. The SEPARATE own-field checks (unsupported type for indexing,
+ *    invalid identifier) are NOT included — REST's `PUT /api/tags/:name`
+ *    has an established, tested single-violation `IndexedFieldError` →
+ *    400 `invalid_indexed_field` contract for those (vault#478). Use
+ *    {@link collectTagFieldViolations} (own-field checks included) for a
+ *    caller — MCP's `update-tag` tool — with no such prior contract.
+ * 2. The type-conflict check is SKIPPED for any field whose INCOMING spec
+ *    is `indexed: true` (wire review, vault#554): a both-indexed cross-tag
+ *    type conflict already errors on main via `store.upsertTagRecord` →
+ *    `declareField`'s cross-declarer sqlite-type check (`IndexedFieldError`
+ *    → 400 `invalid_indexed_field`), and reporting it here would flip that
+ *    established 400 to a 422. Letting it fall through preserves the 400.
+ *    No case is silently re-accepted by the skip: an incoming-indexed type
+ *    conflict against an INDEXED declarer hits declareField's 400; against
+ *    a NON-indexed declarer the indexed-FLAG conflict below still fires
+ *    (the flags necessarily differ). What this function newly reports —
+ *    both silent 200s on main — is (a) type conflicts on NON-indexed
+ *    incoming fields and (b) indexed-flag conflicts.
+ */
+export function collectCrossTagFieldViolations(
+  db: Database,
+  tag: string,
+  incomingFields: Record<string, TagFieldSchema>,
+): TagFieldViolation[] {
+  const violations: TagFieldViolation[] = [];
+  const otherSchemas = listTagSchemas(db).filter((s) => s.tag !== tag);
+
+  for (const [fieldName, spec] of Object.entries(incomingFields)) {
+    const incomingIndexed = spec.indexed === true;
+    for (const other of otherSchemas) {
+      const otherSpec = other.fields?.[fieldName];
+      if (!otherSpec) continue;
+      // See doc comment exclusion 2: incoming-indexed type conflicts keep
+      // their pre-existing declareField → 400 invalid_indexed_field path.
+      if (!incomingIndexed && otherSpec.type !== spec.type) {
+        violations.push({
+          field: fieldName,
+          reason: "type_conflict",
+          message: `field "${fieldName}" type conflict: tag "${tag}" declares "${spec.type}"; tag "${other.tag}" declares "${otherSpec.type}". Types must agree across all declarers.`,
+          other_tag: other.tag,
+        });
+      }
+      if ((otherSpec.indexed === true) !== incomingIndexed) {
+        violations.push({
+          field: fieldName,
+          reason: "indexed_flag_conflict",
+          message: `field "${fieldName}" indexed-flag conflict: tag "${tag}" sets indexed=${incomingIndexed}; tag "${other.tag}" sets indexed=${otherSpec.indexed === true}. Must match across all declarers — change them atomically or not at all.`,
+          other_tag: other.tag,
+        });
+      }
+    }
+  }
+  return violations;
+}
+
+/**
+ * Full field-violation collection: {@link collectCrossTagFieldViolations}
+ * PLUS the own-field checks (unsupported type for indexing, invalid
+ * identifier). Used by the MCP `update-tag` tool, which — unlike REST — had
+ * no prior single-violation status-code contract to preserve for those two
+ * checks (its old inline loop threw an unstructured `Error` for them, same
+ * as everything else pre-#554); collecting everything here is a strict
+ * improvement. See {@link collectCrossTagFieldViolations}'s doc comment for
+ * why REST calls that narrower function directly instead of this one.
+ */
+export function collectTagFieldViolations(
+  db: Database,
+  tag: string,
+  incomingFields: Record<string, TagFieldSchema>,
+): TagFieldViolation[] {
+  const violations = collectCrossTagFieldViolations(db, tag, incomingFields);
+
+  for (const [fieldName, spec] of Object.entries(incomingFields)) {
+    if (spec.indexed === true) {
+      const mapped = mapFieldType(spec.type);
+      if (!mapped) {
+        violations.push({
+          field: fieldName,
+          reason: "unsupported_indexed_type",
+          message: `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
+        });
+      } else {
+        try {
+          validateFieldName(fieldName);
+        } catch (err) {
+          violations.push({
+            field: fieldName,
+            reason: "invalid_field_name",
+            message: (err as Error).message,
+          });
+        }
+      }
+    }
+  }
+
+  return violations;
 }

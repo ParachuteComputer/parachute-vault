@@ -22,8 +22,12 @@ import {
   expandTokenTagScope,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  scrubIndexedFieldConflictError,
+  scrubTagFieldViolationsByScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
+import { TagFieldConflictError } from "../core/src/tag-schemas.ts";
+import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 import {
   findTokensReferencingTag,
   recordMcpMintLedger,
@@ -344,7 +348,7 @@ function applyTagScopeWrappers(
     if (result && typeof result === "object" && "id" in result && "tags" in result) {
       return noteWithinTagScope(result as any, allowed, rawTags)
         ? scrubNoteLinks(result)
-        : { error: "Note not found", id: (result as any).id };
+        : { error: "Note not found", error_type: "not_found", id: (result as any).id };
     }
     return result;
   });
@@ -470,7 +474,7 @@ function applyTagScopeWrappers(
       if (!id) continue;
       const existing = await store.getNote(id as string);
       if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
-        return { error: "Note not found", id };
+        return { error: "Note not found", error_type: "not_found", id };
       }
       const removed = new Set<string>((item as any).tags?.remove ?? []);
       const projected = new Set<string>((existing.tags ?? []).filter((t) => !removed.has(t)));
@@ -489,7 +493,7 @@ function applyTagScopeWrappers(
     if (id) {
       const existing = await store.getNote(id as string);
       if (!existing || !noteWithinTagScope(existing, allowed, rawTags)) {
-        return { error: "Note not found", id };
+        return { error: "Note not found", error_type: "not_found", id };
       }
     }
     return await orig(params);
@@ -502,7 +506,37 @@ function applyTagScopeWrappers(
     if (typeof tag === "string" && !allowed.has(tag)) {
       return forbidden(`update-tag: tag "${tag}" is outside the token's allowlist`);
     }
-    return await orig(params);
+    try {
+      return await orig(params);
+    } catch (err: any) {
+      // Tag-scope scrub for cross-tag field conflicts (vault#554
+      // auth-and-scope fold). Core's validation scans EVERY tag's schema
+      // (scope-unaware by architecture), so its TagFieldConflictError can
+      // name an OUT-OF-SCOPE tag and reveal its declared type/flag in both
+      // the violation entries and the error message. The write stays
+      // rejected — schema integrity is scope-independent — but re-throw
+      // with scrubbed violations (out-of-scope declarers generalized, no
+      // tag name / declared type, `other_tag` dropped; in-scope declarers
+      // keep full detail). Rebuilding via the constructor also rebuilds
+      // the top-level message from the scrubbed entries. Same pattern as
+      // the list-tags `did_you_mean` scrub above.
+      if (err && err.code === "TAG_FIELD_CONFLICT" && Array.isArray(err.violations)) {
+        throw new TagFieldConflictError(
+          err.tag ?? (tag as string),
+          scrubTagFieldViolationsByScope(err.violations, allowed),
+        );
+      }
+      // Same leak through the OTHER door (wire-review interaction): a
+      // both-indexed cross-tag type conflict deliberately bypasses the
+      // pre-check (preserving its declareField → invalid_indexed_field
+      // contract), and declareField's IndexedFieldError message names the
+      // other declarer tag(s). Generalize for scoped callers; solo
+      // own-field IndexedFieldErrors (no declarer_tags) pass untouched.
+      if (err instanceof IndexedFieldError) {
+        throw scrubIndexedFieldConflictError(err, allowed);
+      }
+      throw err;
+    }
   });
 
   wrapReadTool(tools, "delete-tag", async (orig, params) => {
@@ -542,6 +576,16 @@ function overrideVaultInfo(
   if (!vaultInfo) return;
 
   vaultInfo.execute = async (params) => {
+    // NOTE (vault#554): these two throws are deliberately left as plain,
+    // unstructured `Error`s — NOT given `error_type` — even though the rest
+    // of this file's sweep attaches one everywhere else. Attaching one here
+    // routes the throw through mcp-http.ts's structured-error mapping, which
+    // surfaces it as a JSON-RPC protocol-level error (`response.error`)
+    // instead of the in-band tool result the existing contract test asserts
+    // (`response.result.isError === true`, `response.result.content[0].text`
+    // containing the scope name) — see "tools/call of vault-info with
+    // description arg and vault:read scope is refused" in src/vault.test.ts.
+    // Changing that transport shape is out of scope for this wave.
     const config = readVaultConfig(vaultName);
     if (!config) throw new Error(`Vault "${vaultName}" not found`);
 
