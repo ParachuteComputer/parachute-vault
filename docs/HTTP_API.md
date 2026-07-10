@@ -487,6 +487,22 @@ as the JSON response body at the listed HTTP status. Where a row lists two
 statuses, REST and MCP intentionally differ only in HTTP-status framing —
 the `error_type` and fields are identical.
 
+**MCP human-readable `message` (vault#555 fix 6).** The JSON-RPC `error.message`
+string now ALSO carries the `error_type` token — `"MCP error -32602:
+[schema_validation] schema_validation: 1 strict field violation(s) — ..."`
+— so a string-reading human sees which structured category an error
+belongs to without parsing `data`. (`data.error_type` was always correct;
+this only improves the prose.) This also fixed a real bug: `mcp-http.ts`'s
+domain-error mapping used to read the caught error's `.message` and feed it
+into a fresh `McpError` — the MCP SDK's `McpError` constructor bakes `"MCP
+error <code>: "` into `.message` itself, so an already-formed `McpError`
+(or a message that already carried that prefix) got double-prefixed
+(`"MCP error -32602: MCP error -32602: ..."`). Every domain error is now
+mapped through one function (`mcpDomainError`) that strips a pre-existing
+prefix before adding its own, and an already-formed `McpError` is re-thrown
+unchanged rather than re-wrapped. `data.error_type` fidelity was never
+actually affected by the bug — only the message string could double.
+
 ### Write-path conflicts (optimistic concurrency, path, schema)
 
 | `error_type` | HTTP | Key fields | Meaning |
