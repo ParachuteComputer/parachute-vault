@@ -377,6 +377,23 @@ describe("contract: search — recall + ranking legibility (WS2B/C, #551, schema
     expect(w.did_you_mean).toBe("vasquez");
   });
 
+  it("did_you_mean suggests a real surface word, not a porter stem (vault#570)", async () => {
+    // "cactus" is porter-stemmed to "cactu" in notes_fts_vocab — the exact
+    // fragment cited as a live bug in issue #570. A close-but-wrong query
+    // must resolve back to the dictionary word a user actually typed
+    // ("cactus"), not the truncated stem.
+    await store.createNote("A desert cactus stores water efficiently.");
+    const res = await search("search=cactuz");
+    expect(res.status).toBe(200);
+    const body = await bodyOf(res);
+    expect(body).toEqual([]);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings).not.toBeNull();
+    const w = warnings!.find((x: any) => x.code === "search_did_you_mean");
+    expect(w).toBeDefined();
+    expect(w.did_you_mean).toBe("cactus");
+  });
+
   it("a genuinely zero-result search with NO close vocabulary match carries no did_you_mean warning", async () => {
     await store.createNote(NOTES.bothWords);
     const res = await search("search=zzzznonexistentword");
