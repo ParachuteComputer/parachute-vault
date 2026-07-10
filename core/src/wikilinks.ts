@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
-import { getNote } from "./notes.js";
+import { getNote, findNotesByTitle } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
 import { transaction } from "./txn.js";
 
@@ -128,6 +128,14 @@ function stripCode(content: string): string {
  * 3. Basename match — target matches the last segment of a path
  *    (e.g., "README" matches "Projects/Parachute/README"). Same
  *    cross-extension ambiguity policy as #2.
+ * 4. **Title fallback** (additive) — only tried when #2/#3 found NO
+ *    candidates at all (a clean miss, not an ambiguous one). Matches the
+ *    note whose H1 title (first `# ` line in its content, see
+ *    {@link findNotesByTitle}) equals the target, case-insensitively.
+ *    Resolves only when EXACTLY one note has that title; 2+ matches is
+ *    ambiguous and stays unresolved rather than guessing. Rescues links
+ *    into a note whose displayed title differs from its path/basename —
+ *    the top source of silently-broken wikilinks.
  */
 export function resolveWikilink(db: Database, target: string): string | null {
   // 1. Explicit extension form: `[[path.ext]]` where `.ext` is a
@@ -176,6 +184,12 @@ export function resolveWikilink(db: Database, target: string): string | null {
   `).all(target, `%/${target}`) as { id: string }[];
 
   if (basename.length === 1) return basename[0]!.id;
+  if (basename.length > 1) return null; // ambiguous basename — don't fall through to title
+
+  // 4. Title fallback — only reached on a clean miss (0 basename
+  // candidates). See the doc comment above for the ambiguity policy.
+  const byTitle = findNotesByTitle(db, target);
+  if (byTitle.length === 1) return byTitle[0]!.id;
 
   // Ambiguous or no match
   return null;
@@ -243,6 +257,21 @@ export function resolveWikilinkDetailed(db: Database, target: string): WikilinkR
       resolved: false,
       ambiguous: true,
       candidates: basename.map((r) => ({ note_id: r.id, path: r.path })),
+    };
+  }
+
+  // 4. Title fallback — only reached on a clean basename miss (0
+  // candidates), mirroring resolveWikilink.
+  const byTitle = findNotesByTitle(db, target);
+  if (byTitle.length === 1) {
+    const match = byTitle[0]!;
+    return { resolved: true, note_id: match.id, path: match.path ?? undefined, candidates: [] };
+  }
+  if (byTitle.length > 1) {
+    return {
+      resolved: false,
+      ambiguous: true,
+      candidates: byTitle.map((r) => ({ note_id: r.id, path: r.path ?? "" })),
     };
   }
 
@@ -616,9 +645,9 @@ export function resolveUnresolvedWikilinks(
 /**
  * Resolve a structured-link `target` — an ID or a path/title — to a note
  * ID. ID lookup first (structured links accept "note ID or path" per the
- * tool docs; wikilinks never carry a raw ID), then the SAME path/basename
- * resolution `[[wikilinks]]` use ({@link resolveWikilink}: explicit
- * extension, exact path, basename).
+ * tool docs; wikilinks never carry a raw ID), then the SAME path/basename/
+ * title resolution `[[wikilinks]]` use ({@link resolveWikilink}: explicit
+ * extension, exact path, basename, then H1-title fallback on a clean miss).
  */
 export function resolveLinkTarget(db: Database, idOrPath: string): string | null {
   const byId = db.prepare("SELECT id FROM notes WHERE id = ?").get(idOrPath) as { id: string } | null;

@@ -34,6 +34,16 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.1-rc.1] - 2026-07-10
+
+### Added
+
+- **Title-fallback resolution for `[[wikilinks]]`, structured `links`, and note-id lookup.** Top friction from a UX round: a note's H1 title (its `# Heading`) commonly differs from its path/basename, so a natural `[[Some Title]]` link — or `query-notes { id: "Some Title" }` — silently broke even though a human reading the note would call it exactly that. Additive, last-resort fallback: exact id/path/basename resolution is unchanged and always wins first; only on a CLEAN miss (zero candidates, not an ambiguous one) do we try matching the note whose first `# ` content line equals the target, case-insensitively. Resolves only when EXACTLY one note carries that title — two-or-more stays unresolved rather than guessing, mirroring the existing basename-ambiguity policy (vault#328).
+  - New `core/src/notes.ts`: `extractH1Title` (first `"# "` line in a note's content) and `findNotesByTitle`/`getNoteByTitle` (title → note(s), case-insensitive, full-content scan — a fallback path reached only after the cheap indexed lookups already missed).
+  - `core/src/wikilinks.ts`: `resolveWikilink`/`resolveWikilinkDetailed` try the title match as step 4, after explicit-extension, exact-path, and basename all miss cleanly. `resolveLinkTarget`/`resolveStructuredLinkNote`/`resolveOrQueueLink` (structured `links` resolution) inherit it for free since they delegate to `resolveWikilink`.
+  - `core/src/mcp.ts` and `src/routes.ts`: the shared `resolveNote(id/path)` helper each transport uses for `query-notes`/`update-note`/`delete-note` `id`, `find-path` anchors, and REST `GET`/`PATCH`/`DELETE /api/notes/:idOrPath` now falls through to the title match after id and path/extension both miss.
+  - Docs: `docs/HTTP_API.md` and the relevant MCP tool descriptions (`query-notes`/`update-note`/`delete-note` `id`, `links[].target`, `find-path` source/target) updated to describe the four-step order (id → path[.ext] → basename → title-fallback-on-clean-miss).
+
 ## [0.7.0] - 2026-07-10
 
 The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the

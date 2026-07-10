@@ -84,7 +84,9 @@ function structuredError(
 
 /**
  * Resolve a note identifier — tries ID first, then case-insensitive
- * path match. Works everywhere a note reference is accepted.
+ * path match, then (additive fallback) an H1-title match. Works
+ * everywhere a note reference is accepted (query-notes `id`, update-note
+ * `id`, delete-note `id`, find-path anchors).
  *
  * Path-with-extension form (vault#330 S1): a trailing `.<ext>` matching
  * the extension pattern (`/^[a-z0-9]{1,16}$/i`) is parsed as
@@ -95,6 +97,12 @@ function structuredError(
  * On ambiguous path with no extension hint, `getNoteByPath` throws
  * `AmbiguousPathError` — `resolveNote` propagates it so MCP / REST
  * handlers can surface a clear 4xx rather than picking arbitrarily.
+ *
+ * Title fallback (additive): reached only when id AND path/extension
+ * BOTH miss cleanly (no throw). Resolves via `noteOps.getNoteByTitle` —
+ * the note whose first `# ` content line equals `idOrPath`, exactly one
+ * match required. Same [[wikilink]] semantics as `resolveWikilink`; exact
+ * id/path always wins first.
  */
 function resolveNote(db: Database, idOrPath: string): Note | null {
   // Try ID match first (fast, indexed)
@@ -110,7 +118,9 @@ function resolveNote(db: Database, idOrPath: string): Note | null {
     const explicit = noteOps.getNoteByPath(db, extMatch[1]!, extMatch[2]!);
     if (explicit) return explicit;
   }
-  return noteOps.getNoteByPath(db, idOrPath);
+  const byPath = noteOps.getNoteByPath(db, idOrPath);
+  if (byPath) return byPath;
+  return noteOps.getNoteByTitle(db, idOrPath);
 }
 
 function requireNote(db: Database, idOrPath: string): Note {
@@ -283,7 +293,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       requiredVerb: "read",
       description: `Query notes. Returns notes matching the given filters.
 
-- **Single note**: pass \`id\` (accepts note ID or path, e.g., "Projects/README")
+- **Single note**: pass \`id\` (accepts note ID, path, e.g., "Projects/README", or — as a last-resort fallback when id/path both miss cleanly and exactly one note matches — its H1 title, e.g. "Weekly Review")
 - **Filter**: pass \`tag\`, \`path\`, \`path_prefix\`, \`search\`, \`metadata\`, date range
 - **Graph neighborhood**: pass \`near\` to scope results to notes within N hops of an anchor note
 - **No filters**: returns all notes (paginated)
@@ -309,7 +319,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Get one note by ID or path" },
+          id: { type: "string", description: "Get one note by ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
           tag: {
             oneOf: [
               { type: "string" },
@@ -394,7 +404,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
           near: {
             type: "object",
             properties: {
-              note_id: { type: "string", description: "Anchor note ID or path" },
+              note_id: { type: "string", description: "Anchor note ID, path, or (fallback) H1 title" },
               depth: { type: "number", description: "Max hops from anchor (default 2, max 5)" },
               relationship: { type: "string", description: "Only follow links with this relationship" },
             },
@@ -914,12 +924,12 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
             items: {
               type: "object",
               properties: {
-                target: { type: "string", description: "Target note ID or path" },
+                target: { type: "string", description: "Target note ID, path, or (fallback) H1 title" },
                 relationship: { type: "string", description: "Relationship type (e.g., mentions, related-to)" },
               },
               required: ["target", "relationship"],
             },
-            description: "Links to create from this note. `target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title. A target created LATER in the same `notes` batch, or by a future call, resolves automatically (queued + backfilled) — the response carries an `unresolved_link` warning naming the target in the meantime; never silently dropped.",
+            description: "Links to create from this note. `target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename, then (only on a clean miss, and only when exactly one note matches) an H1-title fallback. A target created LATER in the same `notes` batch, or by a future call, resolves automatically (queued + backfilled) — the response carries an `unresolved_link` warning naming the target in the meantime; never silently dropped.",
           },
           created_at: { type: "string", description: "ISO timestamp (defaults to now)" },
           if_exists: {
@@ -1281,7 +1291,7 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
     {
       name: "update-note",
       requiredVerb: "write",
-      description: `Update one or more notes. Accepts ID or path. Supports content, path, metadata updates plus tag and link mutations.
+      description: `Update one or more notes. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title. Supports content, path, metadata updates plus tag and link mutations.
 
 - Three content-modification modes (mutually exclusive):
   - \`content\` — full replace.
@@ -1299,7 +1309,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID or path" },
+          id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
           content: { type: "string", description: "New content (full replace). Mutually exclusive with `append`/`prepend` and `content_edit`." },
           append: { type: "string", description: "Text to append to the end of the note. Atomic at the SQL layer — concurrent appends are safe. Mutually exclusive with `content` and `content_edit`. No precondition required." },
           prepend: { type: "string", description: "Text to prepend to the start of the note. Atomic at the SQL layer. Mutually exclusive with `content` and `content_edit`. May combine with `append`. No precondition required." },
@@ -1345,7 +1355,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 items: {
                   type: "object",
                   properties: {
-                    target: { type: "string", description: "Target note ID or path" },
+                    target: { type: "string", description: "Target note ID, path, or (fallback) H1 title" },
                     relationship: { type: "string" },
                   },
                   required: ["target", "relationship"],
@@ -1356,14 +1366,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 items: {
                   type: "object",
                   properties: {
-                    target: { type: "string", description: "Target note ID or path" },
+                    target: { type: "string", description: "Target note ID, path, or (fallback) H1 title" },
                     relationship: { type: "string" },
                   },
                   required: ["target", "relationship"],
                 },
               },
             },
-            description: "Links to add/remove. `add[].target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title — and lazily backfills (queued) when the target arrives later; the response carries an `unresolved_link` warning naming the target in the meantime, never a silent drop.",
+            description: "Links to add/remove. `add[].target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename, then (only on a clean miss, and only when exactly one note matches) an H1-title fallback — and lazily backfills (queued) when the target arrives later; the response carries an `unresolved_link` warning naming the target in the meantime, never a silent drop.",
           },
           include_content: {
             type: "boolean",
@@ -1896,11 +1906,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // genuinely append-only callers — gating WITHIN write rather
       // than promoting deletes out of it.
       requiredVerb: "write",
-      description: "Permanently delete a note and all its tags and links. Accepts ID or path.",
+      description: "Permanently delete a note and all its tags and links. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title.",
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID or path" },
+          id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
         },
         required: ["id"],
       },
@@ -2259,12 +2269,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "find-path",
       requiredVerb: "read",
-      description: "Find the shortest path between two notes in the link graph. Accepts IDs or paths. Returns null if no path exists, else `{path, relationships, nodes, edges}`: `path` (note IDs, source→target) and `relationships` (relationships[i] connects path[i] to path[i+1]) are the original id-only shape; `nodes` (vault#550, additive) hydrates each id in `path` with the note's own `path` field — `[{id, path}]` in the same order; `edges` (additive) is the self-contained hop list — `[{source, target, relationship, sourcePath, targetPath}]` — for rendering the chain without cross-referencing `nodes`.",
+      description: "Find the shortest path between two notes in the link graph. Accepts IDs, paths, or (fallback, only when id/path both miss and exactly one note matches) H1 titles. Returns null if no path exists, else `{path, relationships, nodes, edges}`: `path` (note IDs, source→target) and `relationships` (relationships[i] connects path[i] to path[i+1]) are the original id-only shape; `nodes` (vault#550, additive) hydrates each id in `path` with the note's own `path` field — `[{id, path}]` in the same order; `edges` (additive) is the self-contained hop list — `[{source, target, relationship, sourcePath, targetPath}]` — for rendering the chain without cross-referencing `nodes`.",
       inputSchema: {
         type: "object",
         properties: {
-          source: { type: "string", description: "Starting note ID or path" },
-          target: { type: "string", description: "Destination note ID or path" },
+          source: { type: "string", description: "Starting note ID, path, or (fallback) H1 title" },
+          target: { type: "string", description: "Destination note ID, path, or (fallback) H1 title" },
           max_depth: { type: "number", description: "Max path length (default 5)" },
         },
         required: ["source", "target"],

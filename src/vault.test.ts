@@ -2333,6 +2333,37 @@ describe("HTTP /notes", async () => {
     expect(body.content).toBe("hello");
   });
 
+  // ---- Title-fallback resolution (additive — id/path/basename still win first) ----
+
+  test("GET /notes/:idOrPath resolves via H1 title when id and path both miss", async () => {
+    await store.createNote("# My Great Note\n\nBody.", { path: "Inbox/2026-07-10-xyz" });
+    const enc = encodeURIComponent("My Great Note");
+    const res = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.path).toBe("Inbox/2026-07-10-xyz");
+  });
+
+  test("GET /notes/:idOrPath exact path still wins over a same-named title on another note", async () => {
+    const byPath = await store.createNote("Path note", { path: "My Great Note" });
+    await store.createNote("# My Great Note\n\nOther body.", { path: "Inbox/other" });
+    const enc = encodeURIComponent("My Great Note");
+    const res = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    const body = await res.json() as any;
+    expect(body.id).toBe(byPath.id);
+    expect(body.content).toBe("Path note");
+  });
+
+  test("GET /notes/:idOrPath stays 404 when 2+ notes share the same H1 title", async () => {
+    await store.createNote("# Dup Note\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Note\n\nB.", { path: "Inbox/dup-b" });
+    const enc = encodeURIComponent("Dup Note");
+    const res = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    expect(res.status).toBe(404);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("not_found");
+  });
+
   test("GET /notes/:id?include_content=false returns lean shape", async () => {
     await store.createNote("hello", { id: "x" });
     const res = await handleNotes(mkReq("GET", "/notes/x?include_content=false"), store, "/x");
