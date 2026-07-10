@@ -4,6 +4,161 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## 0.6.x → 0.7.0 — the Reliability & Usability Program (umbrella #556)
+
+`0.7.0` consolidates the `0.7.0-rc.1`–`rc.9` chain: a program that started
+from a nine-persona deep test against a live vault (2026-07-09, 9 sandboxed
+agents, 8 fresh vaults, ~230 notes) and closed every finding — mostly at the
+query/taxonomy/error boundaries, since the storage/concurrency core already
+tested trustworthy (zero corruption, zero lost writes). Full per-fix detail
+is in [CHANGELOG.md](./CHANGELOG.md)'s consolidated `[0.7.0]` entry and the
+`rc.1`–`rc.9` entries beneath it; this section is the operator's action list.
+
+### Migrations run automatically on first 0.7.0 boot
+
+No manual steps — every migration below is **automatic, transactional, and
+idempotent**, run once on first boot after upgrade. As with any upgrade,
+**back up your vault's SQLite file first** as standard practice (these
+migrations are crash-safe by construction — see the "all-or-nothing" note
+below — but a backup costs nothing and covers you against the unrelated
+unknown).
+
+- **`migrateToV24` (schema v23→24) — typed-index poison coercion
+  (`core/src/schema.ts`).** Scans every declared indexed metadata field for
+  values whose JSON type disagrees with the field's declared storage type
+  (e.g. `"4"` in an integer field) and **losslessly coerces** what has an
+  exact round-trip conversion (a clean numeric string → its number,
+  `"true"`/`"false"` → the boolean, and the reverse). Anything that can't be
+  losslessly coerced (a non-numeric string in an integer field, an
+  array/object value) is **left in place, never deleted or nulled** — it
+  surfaces afterward via `doctor`'s `mixed_type_indexed_field` finding for
+  you to clean up deliberately. Runs only if the vault has at least one
+  indexed field; a vault with none no-ops immediately.
+- **`migrateToV25` (schema v24→25) — full-text search rebuild
+  (`core/src/schema.ts`).** Rebuilds `notes_fts` to index a note's `path`
+  (title) alongside its `content` (previously content-only — a note's title
+  was completely unsearchable), adds Porter stemming to the tokenizer, and
+  repopulates the index from every existing note. `notes_fts` is an
+  external-content FTS5 table, so this is a DROP + CREATE + repopulate, not
+  an `ALTER` — the **entire sequence runs inside one transaction**, so a
+  crash mid-migration rolls back to the pre-v25 shape and cleanly retries on
+  next boot rather than leaving search silently, permanently empty. **Expect
+  a one-time cost proportional to note count** — the repopulation pass reads
+  every note once. On a large vault this can take a few seconds to
+  low-single-digit minutes; the server logs progress and search stays
+  unavailable only for the duration of that one pass.
+- **`unresolved_wikilinks` `relationship`-column self-heal
+  (`core/src/wikilinks.ts`) — lazy, not tied to `SCHEMA_VERSION`.** A vault
+  whose `unresolved_wikilinks` table predates the structured-link resolution
+  work (rc.8, #555) gets it rebuilt with a widened 3-column primary key
+  (`source_id, target_path, relationship`) the first time the table is
+  touched (a pending wikilink or structured-link forward-reference) rather
+  than on boot. Existing pending rows backfill as `relationship = 'wikilink'`
+  (the only kind that could have been queued pre-rc.8). Also wrapped in a
+  transaction for the same crash-safety reason as `migrateToV25`.
+
+### Breaking changes
+
+- **Search is literal-by-default (#551, rc.3).** `search=` (MCP `query-notes`
+  / REST `GET /notes`) no longer parses as raw FTS5 syntax — ordinary
+  punctuation that used to be silently misparsed as query syntax (a bare
+  hyphen as NOT, an apostrophe or decimal point breaking the parse: `search:
+  "didn't"`, `"eleven-day capping delay"`, `"18.6"` all used to return `[]`
+  against notes containing that exact text) now matches literally as
+  content. **Migration:** if you relied on raw FTS5 syntax — manual phrase
+  quoting to force exact-adjacency matching, boolean `AND`/`OR`/`NOT`,
+  prefix `*` — add `search_mode: "advanced"` to the call to keep that exact
+  behavior. Most manually-quoted phrases still find the same content under
+  the new literal default; only the adjacency *guarantee* of phrase syntax
+  stops being honored as syntax outside advanced mode.
+- **Indexed fields reject type-mismatched writes (#553, rc.6).** A write
+  whose value's type contradicts a metadata field's declared indexed type
+  (e.g. writing `metadata.count = "four"` to an indexed integer field) is
+  now **rejected** (`422 schema_validation` / MCP structured error),
+  regardless of the field's own `strict` setting — previously this landed
+  with only an advisory `type_mismatch` warning, and the poisoned value
+  could silently corrupt range queries on that field via SQLite's
+  type-affinity sort order. **Migration:** none needed for existing data —
+  `migrateToV24` (above) coerces what it safely can on upgrade. Going
+  forward, fix the caller to send the declared type; every other constraint
+  on an indexed field (enum membership, required, cardinality) still only
+  warns unless the field is also `strict: true`.
+- **Enum/default backfill is explicit-`default:`-only (#553, rc.6).** The
+  old implicit backfill (an unset field silently filled with its first enum
+  value, or a type zero-value) is retired. Only a tag schema's explicit
+  `fields.<field>.default` now backfills an unset field on write — meaning
+  `metadata: { field: { exists: false } }` is finally trustworthy: "never
+  set" and "explicitly set to the default" are now distinguishable.
+  **Migration:** future writes only — notes already backfilled under the old
+  behavior keep their values; nothing rewrites existing data. If you relied
+  on the implicit backfill, add an explicit `default:` to the field's schema
+  (`update-tag` / `PUT /api/tags/{name}`).
+- **`PUT /api/tags/:name` single-bad-default now returns `422
+  tag_field_conflict`, was `400 invalid_field_default` (#553/#555, rc.8).** A
+  single invalid `default:` value used to fail fast with a `400`, silently
+  dropping any other violation in the same call. It's now bundled into the
+  same collect-all `422 tag_field_conflict` response every other multi-field
+  violation already used (`violations: [{field, reason: "invalid_default",
+  message}]`), matching MCP's `update-tag` (which already bundled). **Migration:**
+  a REST client pattern-matching on `400`/`invalid_field_default` for this
+  one case should re-key on `422` + `violations[]` (the specific reason is
+  `invalid_default`).
+- **`GET /api/tags/{name}` on a nonexistent tag now 404, was a synthesized
+  all-null 200 (#550, rc.2).** Previously a tag with no identity row and no
+  notes carrying it returned a `200` with every field null; now it returns a
+  structured `404 tag_not_found` (`did_you_mean` populated when a close
+  match exists). **Migration:** a client checking for tag existence via
+  "did the 200 come back all-null" should check for `404` instead.
+
+### New capabilities (brief pointers — full docs in [docs/HTTP_API.md](./docs/HTTP_API.md))
+
+- **Honest-query warnings channel** (#550) — `unknown_tag`/`did_you_mean`,
+  `removed_param`, `empty_search`, `search_did_you_mean`, `ignored_param` on
+  `query-notes`/`GET /notes`, via REST envelope/`X-Parachute-Warnings` header
+  or MCP's wrapped response.
+- **Cursor bootstrap** (#550) — an explicit empty-string `cursor` (`?cursor=`
+  / `cursor: ""`) now correctly engages the `{notes, next_cursor}` envelope
+  on the first call.
+- **Structured error taxonomy** — `error_type` on essentially every REST
+  error body and full MCP domain-error mapping; see "Error taxonomy" in
+  `docs/HTTP_API.md`.
+- **`rename-tag`/`merge-tags` MCP tools + `vault doctor`** (#552) — cascading
+  tag rename/merge with referential-integrity and cycle guards; a new
+  read-only integrity scan (`doctor` MCP tool / `GET /api/doctor`) — run it
+  after upgrading (see below).
+- **Title search, stemming, ranking `score`, `search_did_you_mean`** (#551)
+  — a note's title/path is now searchable, English affixes stem
+  (firefighter/firefighters), every search result carries a relevance
+  `score`, and a zero-result search gets a spelling-correction hint.
+- **Structured-link lazy resolution + broken-link queries** (#555) — a
+  structured `links: [{target, relationship}]` entry now resolves like a
+  `[[wikilink]]` (basename/title match, lazy forward-ref queueing);
+  `has_broken_links`/`include_broken_links` surface dangling targets.
+- **`create-note if_exists` upsert** (#555) — `if_exists:
+  "error"|"ignore"|"update"|"replace"` makes `create-note`/`POST /notes`
+  idempotent on a path conflict, race-closed (not just sequential-safe).
+
+### Post-upgrade verification
+
+Run `doctor` (MCP tool, or `GET /api/doctor` with a `vault:admin` token)
+after upgrading. It's read-only and surfaces anything `migrateToV24` flagged
+but couldn't losslessly coerce (`mixed_type_indexed_field`), plus any
+pre-existing taxonomy issues (`dangling_parent_name`,
+`parent_names_cycle`, `orphaned_indexed_field_declarer`,
+`dead_tag_metadata_reference`) — nothing it reports is auto-fixed, so review
+the findings and clean up deliberately where they apply to you.
+
+### Known limitations / follow-ups
+
+- **0.7.x polish backlog:** tracked at issue #570.
+- **Hosted-door (cloud) gate:** the DO-SQLite backend behind the hosted door
+  must run the FTS5 v25 spike (parachute-cloud#114) — confirming
+  `tokenize='porter unicode61'` and the two-column external-content FTS5
+  shape used by `migrateToV25` behave identically on Cloudflare's SQLite
+  build — before the hosted door pulls this core. **This does not affect
+  self-hosted (hub/bun) deploys**, which are the only place `0.7.0` runs
+  today.
+
 ## JWKS now fetched from the local hub (vault#464)
 
 Vault now fetches the hub's JWKS (the signing keys it uses to verify
