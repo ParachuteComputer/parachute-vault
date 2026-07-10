@@ -45,6 +45,48 @@ function requiredVerbForTool(tool: { requiredVerb?: VaultVerb }): VaultVerb {
   return tool.requiredVerb ?? "write";
 }
 
+/** Matches the JSON-RPC prefix the MCP SDK's `McpError` constructor bakes
+ *  into `.message` itself (not just `.toString()`) — e.g.
+ *  `"MCP error -32602: the actual message"`. */
+const MCP_ERROR_PREFIX_RE = /^MCP error -?\d+:\s*/;
+
+/**
+ * Build a JSON-RPC `McpError` for a domain error, in ONE place (vault#555
+ * fix 6 — was 15 duplicated `new McpError(...)` call sites below, each a
+ * chance to drift). Two things this fixes over the old inline construction:
+ *
+ * 1. **No double-wrap.** The MCP SDK's `McpError` constructor bakes
+ *    `"MCP error <code>: "` into `.message` ITSELF. If the message being
+ *    wrapped ALREADY carries that prefix (a message forwarded verbatim
+ *    from another MCP-speaking service, or a stale caller that read
+ *    `err.message` off an already-formed `McpError` instead of re-throwing
+ *    it — see the `err instanceof McpError` guard at the top of the catch
+ *    block below, which is the PRIMARY fix for that exact case), naively
+ *    constructing `new McpError(code, message, data)` doubles it:
+ *    `"MCP error -32602: MCP error -32602: ..."`. This strips any
+ *    pre-existing prefix before building the new one, so the message is
+ *    single-prefixed no matter how many times a message string passes
+ *    through this function.
+ * 2. **`error_type` in the human-readable message too** (optional polish,
+ *    vault#555) — a string-reading human (not just a JSON-parsing agent
+ *    keying off `data.error_type`) sees `[error_type] message` rather than
+ *    a bare message with no clue which structured category it belongs to.
+ *
+ * `data.error_type` fidelity was never actually broken — it was always
+ * threaded correctly through the JSON-RPC `data` field; only the
+ * human-readable `message` string could double-prefix.
+ */
+export function mcpDomainError(
+  code: ErrorCode,
+  rawMessage: string,
+  data: Record<string, unknown>,
+): McpError {
+  const cleanMessage = rawMessage.replace(MCP_ERROR_PREFIX_RE, "");
+  const errorType = typeof data.error_type === "string" ? data.error_type : undefined;
+  const humanMessage = errorType ? `[${errorType}] ${cleanMessage}` : cleanMessage;
+  return new McpError(code, humanMessage, data);
+}
+
 /**
  * Handle scoped MCP at /vault/{name}/mcp (single vault).
  *
@@ -75,7 +117,10 @@ export async function handleScopedMcp(
   );
 }
 
-async function handleMcp(
+/** Exported for direct testing (vault#555 fix 6) — lets a test inject a
+ *  synthetic failing tool to exercise the `err instanceof McpError` guard
+ *  without needing a real domain error class to construct one naturally. */
+export async function handleMcp(
   req: Request,
   getTools: () => McpToolDef[],
   serverName: string,
@@ -139,6 +184,18 @@ async function handleMcp(
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };
     } catch (err) {
+      // vault#555 fix 6 — never re-wrap an already-formed McpError. Passing
+      // the SAME instance straight through is strictly correct (no
+      // information lost — `.message` AND `.data.error_type` are already
+      // exactly right) and is the primary fix for the double-prefix bug
+      // ("MCP error -32602: MCP error -32602: ..."): every branch below
+      // reads `err.message` and feeds it into a NEW McpError, which would
+      // double the SDK's baked-in "MCP error <code>: " prefix if `err` were
+      // already one. See `mcpDomainError`'s doc comment for the belt-and-
+      // suspenders half of this fix (stripping a pre-existing prefix from a
+      // plain message too).
+      if (err instanceof McpError) throw err;
+
       // Domain errors from the core tools (conflict, missing precondition,
       // path collisions, batch caps, cursor/query validation, tag-field
       // conflicts, ...) get surfaced as JSON-RPC errors with a structured
@@ -182,7 +239,7 @@ async function handleMcp(
       // existing unstructured `isError: true` fallback — only the NEW #550
       // call sites that explicitly set `error_type` opt into this shape.
       if (e?.error_type === "invalid_query") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "invalid_query",
           field: e.field,
           got: e.got,
@@ -195,7 +252,7 @@ async function handleMcp(
       // caller can tell "your search_mode:\"advanced\" syntax is malformed"
       // apart from "your query PARAMS are malformed."
       if (e?.error_type === "invalid_search_syntax") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "invalid_search_syntax",
           field: e.field,
           got: e.got,
@@ -203,7 +260,7 @@ async function handleMcp(
         });
       }
       if (e?.code === "CONFLICT") {
-        throw new McpError(ErrorCode.InvalidRequest, message, {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, {
           error_type: "conflict",
           current_updated_at: e.current_updated_at ?? null,
           your_updated_at: e.expected_updated_at,
@@ -216,7 +273,7 @@ async function handleMcp(
       // DISTINCT vocabulary from `conflict` (settled lead #3): the value
       // didn't match, not the updated_at token.
       if (e?.code === "TRANSITION_CONFLICT") {
-        throw new McpError(ErrorCode.InvalidRequest, message, {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, {
           error_type: "transition_conflict",
           note_id: e.note_id,
           path: e.note_path ?? null,
@@ -230,14 +287,14 @@ async function handleMcp(
       // Strict-schema rejection (vault#299 Part A) — one error carrying ALL
       // per-field violations (settled lead #1).
       if (e?.code === "SCHEMA_VALIDATION") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "schema_validation",
           violations: e.violations ?? [],
           hint: "fix every field listed in violations and retry — none of this write was applied",
         });
       }
       if (e?.code === "PRECONDITION_REQUIRED") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "precondition_required",
           note_id: e.note_id,
           path: e.note_path ?? null,
@@ -252,7 +309,7 @@ async function handleMcp(
       // REST already uses for this whole error class — so these no longer
       // fall through to the unstructured `isError: true` text.
       if (e?.name === "QueryError") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: e.error_type ?? "invalid_query",
           code: e.code,
           field: e.field,
@@ -266,14 +323,14 @@ async function handleMcp(
       // already the exact `error_type` vocabulary: "cursor_invalid" or
       // "cursor_query_mismatch".
       if (e?.name === "CursorError" && typeof e.code === "string") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: e.code,
         });
       }
       // Path-rename/create collision (vault#126, vault#554) — schema's
       // UNIQUE(path) tripped. Mirrors REST's 409 `path_conflict` shape.
       if (e?.code === "PATH_CONFLICT") {
-        throw new McpError(ErrorCode.InvalidRequest, message, {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, {
           error_type: "path_conflict",
           path: e.path,
         });
@@ -282,7 +339,7 @@ async function handleMcp(
       // mirrors REST's 409 `ambiguous_path` shape (candidates = the
       // disambiguating extensions).
       if (e?.code === "AMBIGUOUS_PATH") {
-        throw new McpError(ErrorCode.InvalidRequest, message, {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, {
           error_type: "ambiguous_path",
           path: e.path,
           candidates: e.candidates,
@@ -291,7 +348,7 @@ async function handleMcp(
       // Bad `extension` value (vault#328, vault#554) — mirrors REST's 400
       // `invalid_extension` shape.
       if (e?.code === "INVALID_EXTENSION") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "invalid_extension",
           extension: e.extension,
           reason: e.reason,
@@ -300,7 +357,7 @@ async function handleMcp(
       // Batch cap exceeded (#213, vault#554) — mirrors REST's 413
       // `batch_too_large` shape.
       if (e?.code === "BATCH_TOO_LARGE") {
-        throw new McpError(ErrorCode.InvalidRequest, message, {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, {
           error_type: "batch_too_large",
           limit: e.limit,
           got: e.got,
@@ -309,7 +366,7 @@ async function handleMcp(
       // update-tag cross-tag field conflicts (vault#553/#554) — carries
       // EVERY violation in one response (see `TagFieldConflictError`).
       if (e?.code === "TAG_FIELD_CONFLICT") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: "tag_field_conflict",
           tag: e.tag,
           violations: e.violations ?? [],
@@ -320,7 +377,7 @@ async function handleMcp(
       // wrapper (src/mcp-tools.ts) scope-scrubs `cycle` before this throw
       // for a tag-scoped caller, same as TAG_FIELD_CONFLICT above.
       if (e?.code === "PARENT_CYCLE") {
-        throw new McpError(ErrorCode.InvalidRequest, message, {
+        throw mcpDomainError(ErrorCode.InvalidRequest, message, {
           error_type: "parent_cycle",
           tag: e.tag,
           cycle: e.cycle ?? [],
@@ -338,7 +395,7 @@ async function handleMcp(
       // error" true by construction: only errors nobody tagged with
       // `error_type` still hit the fallback below.
       if (typeof e?.error_type === "string") {
-        throw new McpError(ErrorCode.InvalidParams, message, {
+        throw mcpDomainError(ErrorCode.InvalidParams, message, {
           error_type: e.error_type,
           field: e.field,
           hint: e.hint,

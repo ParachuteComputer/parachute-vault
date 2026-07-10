@@ -362,6 +362,11 @@ Warning codes today:
   (edit-distance against the FTS5 vocabulary + tag names). Carries `query`
   and `did_you_mean`. `search=` only, only on a zero-result query, and only
   for UNSCOPED sessions (the suggestion is computed vault-wide — see below).
+- `unresolved_link` (vault#555) — a structured `links` entry on
+  `POST /notes` or `PATCH /notes/{id}` (mirrored by MCP `create-note` /
+  `update-note`) didn't resolve to any note. Carries `target` and
+  `relationship`. **Write path, not the query path above** — see "Structured
+  `links` resolution" below for where this attaches on the response.
 
 **Surfacing differs by response shape** (compat-preserving — this is why
 it's additive, not a breaking wire-shape change):
@@ -482,6 +487,22 @@ as the JSON response body at the listed HTTP status. Where a row lists two
 statuses, REST and MCP intentionally differ only in HTTP-status framing —
 the `error_type` and fields are identical.
 
+**MCP human-readable `message` (vault#555 fix 6).** The JSON-RPC `error.message`
+string now ALSO carries the `error_type` token — `"MCP error -32602:
+[schema_validation] schema_validation: 1 strict field violation(s) — ..."`
+— so a string-reading human sees which structured category an error
+belongs to without parsing `data`. (`data.error_type` was always correct;
+this only improves the prose.) This also fixed a real bug: `mcp-http.ts`'s
+domain-error mapping used to read the caught error's `.message` and feed it
+into a fresh `McpError` — the MCP SDK's `McpError` constructor bakes `"MCP
+error <code>: "` into `.message` itself, so an already-formed `McpError`
+(or a message that already carried that prefix) got double-prefixed
+(`"MCP error -32602: MCP error -32602: ..."`). Every domain error is now
+mapped through one function (`mcpDomainError`) that strips a pre-existing
+prefix before adding its own, and an already-formed `McpError` is re-thrown
+unchanged rather than re-wrapped. `data.error_type` fidelity was never
+actually affected by the bug — only the message string could double.
+
 ### Write-path conflicts (optimistic concurrency, path, schema)
 
 | `error_type` | HTTP | Key fields | Meaning |
@@ -509,9 +530,10 @@ the `error_type` and fields are identical.
 
 | `error_type` | HTTP | Key fields | Meaning |
 |---|---|---|---|
-| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration, OR a field's declared `default` doesn't conform to its own `type`/`enum` (vault#553 Decision B). Carries EVERY conflicting field in one response (vault#553) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case), `indexed_flag_conflict`, or `invalid_default` (own-field — no `other_tag`); `other_tag` names the conflicting declarer for the cross-tag reasons. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail. |
-| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
-| `invalid_field_default` | 400 | `field` | vault#553 Decision B: a field's declared `default` doesn't match its own `type` (or isn't one of its own `enum` values). Own-field error — REST's single-violation fail-fast path via `store.upsertTagRecord`'s pre-validate (mirrors `invalid_indexed_field`'s posture); MCP's `update-tag` tool normally reports the SAME defect bundled as `tag_field_conflict`'s `invalid_default` reason instead (its own-field checks run first — see that row). |
+| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration, OR a field's declared `default` doesn't conform to its own `type`/`enum` (vault#553 Decision B), OR a field declares a `type` outside the recognized vocabulary (vault#555 fix 4). Carries EVERY violation found in one response (vault#553; extended to `invalid_default`/`invalid_type` by vault#555 fix 5 — both REST and MCP used to report only the FIRST bad field of these two classes) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case), `indexed_flag_conflict`, `invalid_default`, or `invalid_type` (the latter two are own-field — no `other_tag`, nothing to scope-scrub); `other_tag` names the conflicting declarer for the cross-tag reasons. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail; own-field violations (`invalid_default`/`invalid_type`) are never scrubbed (they never named another tag). |
+| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean — this ALSO covers a recognized-but-unindexable type like `array`/`object`/`number`, a different case from a genuinely unrecognized type string, which is `invalid_field_type` below), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
+| `invalid_field_default` | 400 | `field` | vault#553 Decision B: a field's declared `default` doesn't match its own `type` (or isn't one of its own `enum` values). Own-field error — a DEFENSE-IN-DEPTH path only as of vault#555 fix 5: both REST's `PUT /api/tags/:name` and MCP's `update-tag` now pre-validate every field and report this bundled as `tag_field_conflict`'s `invalid_default` reason instead (every invalid field in the call, not just the first); this single-violation 400 only surfaces for a caller that bypasses that pre-check (e.g. a direct `store.upsertTagRecord` call from outside REST/MCP). **BREAKING (vault#555 fix 5):** a REST `PUT /api/tags/:name` client that previously pinned on a **400 `invalid_field_default`** for the single-bad-default case now receives **422 `tag_field_conflict`** (with the bad default in `violations[]` as reason `invalid_default`). Re-key on the `tag_field_conflict` 422 + its `violations[]`; the 400 path above is now unreachable from REST/MCP. This aligns REST with MCP's already-bundled reporting. |
+| `invalid_field_type` | 400 | `field`, `type`, `valid_types[]` | vault#555 fix 4: a field's declared `type` isn't one of the six recognized values (`string`/`number`/`integer`/`boolean`/`array`/`object`) — e.g. `type: "frobnicator"`. Before this fix a NON-indexed field's `type` was never validated at all and a bogus type was silently accepted and persisted verbatim (indexed fields already got a type check, but scoped to "unsupported for indexing," not "unrecognized"). Same defense-in-depth posture as `invalid_field_default` — the normal path reports this bundled as `tag_field_conflict`'s `invalid_type` reason (see that row); this single-violation 400 only surfaces for a caller that bypasses the pre-check. |
 | `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
 | `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
 | `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
@@ -702,7 +724,10 @@ Current effective config values, with `writeOnly` fields (`scribeBearer`,
 #### `GET /vault/{name}/api/notes` — `vault:read`
 Query notes. Returns `NoteIndex[]` by default (lean shape). Many filter
 modes coexist; the canonical query body is sketched in the cursor section
-above.
+above. Each result carries `validation_status` when any tag it carries
+declares `fields` (vault#555 — additive, absent entirely for a vault that
+declares no tag schemas; same attachment rule as create/update responses,
+now extended to reads).
 
 Query params:
 
@@ -990,9 +1015,38 @@ Error shapes:
 - `400 invalid_extension` — extension validation failed (vault#328); body
   carries `extension`, `reason`.
 
+**Structured `links` resolution (vault#555).** A `links` entry's `target`
+resolves with the SAME semantics as a `[[wikilink]]` — ID match first, then
+exact path, then basename/title (e.g. `target: "Alice"` resolves a note
+filed at `People/Alice`) — NOT path-only as before. The `relationship` you
+pass is preserved verbatim (wikilinks always use `"wikilink"`; a structured
+link carries whatever you named). Two forward-ref cases are handled without
+dropping the edge:
+
+- **Same batch.** A `links` entry pointing at a note created LATER in the
+  same `notes` array (POST) resolves once every note in the batch exists —
+  order doesn't matter.
+- **Later call.** A target that doesn't exist yet anywhere is queued (same
+  `unresolved_wikilinks` machinery `[[wikilinks]]` already use) and
+  backfills automatically the moment a matching note is created, in this
+  vault, by any client. The response carries an `unresolved_link` warning
+  (see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
+  above) naming the `target` and `relationship` so the caller knows the edge
+  isn't live yet — it's never silently dropped.
+- **Genuinely unresolvable** (typo, or a target that will never exist)
+  looks identical to the "later call" case on the wire — the write still
+  queues it. Use `GET /vault/{name}/api/unresolved-wikilinks` to audit what's
+  pending across the vault (rows now carry a `relationship` field alongside
+  `source_id`/`target_path`).
+
 #### `GET /vault/{name}/api/notes/{idOrPath}` — `vault:read`
 Returns the full `Note` (defaults to `include_content=true` for point
-reads). `?include_content=false` returns a `NoteIndex`.
+reads). `?include_content=false` returns a `NoteIndex`. Carries
+`validation_status` when any tag on the note declares `fields` (vault#555 —
+previously this signal was visible ONLY on the one-time create/update write
+response; every subsequent read showed nothing even for an advisory
+violation like an out-of-enum value on a non-strict field). Same shape and
+attachment rule as the structured-query list below.
 
 > **Percent-encode slashes in `{idOrPath}`.** This route (and the `PATCH` /
 > `DELETE` siblings below) resolves a note by id-or-path; a literal `/` in a
@@ -1050,6 +1104,23 @@ still applies — `if_updated_at` wins and a mismatch returns `409 conflict`.
 `force` only waives the requirement to supply `if_updated_at`; it does not
 override one you actually passed. To update unconditionally, omit
 `if_updated_at` and send `force: true` alone.
+
+**`updated_at` bumps on every real mutation (vault#555).** A `tags`-only or
+`links`-only update bumps `updated_at` exactly like a `content`/`path`/
+`metadata` change does — this held true when the request carried
+`if_updated_at` even before this fix, but a `force: true` tags/links-only
+update used to skip the underlying `UPDATE notes` entirely and leave
+`updated_at` frozen, making the mutation invisible to cursor pagination
+(which orders by `updated_at`) and any `updated_at`-based sync filter. A tag
+**rename** cascade that rewrites note `content` (`#oldtag` → `#newtag`
+references) or a note's `path` bumps the rewritten notes' `updated_at` too,
+for the same reason. **`merge-tags` deliberately does NOT bump `updated_at`
+on the retagged notes** — a merge only relabels `note_tags` rows (it never
+rewrites a note's own `content` or `path`), and bumping every note that
+carried a merged-away tag would flood cursor consumers with a taxonomy-admin
+event that changed no note content; this intentional asymmetry with the
+content-rewriting rename cascade is tracked for reconsideration (vault#555
+follow-up).
 
 **Batch `force`/`if_updated_at` defaults (MCP `update-note` only, vault#554).**
 REST `PATCH` is single-note; the MCP `update-note` tool additionally accepts
@@ -1346,7 +1417,13 @@ the existing schema (mirrors MCP `update-tag`).
   would poison range queries (`gt`/`gte`/`lt`/`lte`) on that field via
   SQLite's TEXT-sorts-above-INTEGER affinity ordering (the root cause
   #553 tracks). Every OTHER constraint on an indexed field (enum/required/
-  cardinality) is still governed by `strict` as before.
+  cardinality) is still governed by `strict` as before — **`indexed: true`
+  guarantees TYPE, not enum-domain** (vault#555). An indexed field with an
+  `enum` declared but `strict` unset still accepts an out-of-enum value: it's
+  stored, fully queryable (`eq`/`in`/range operators all work normally — the
+  index doesn't care about enum membership), and surfaces an advisory
+  `enum_mismatch` warning in `validation_status.warnings`. Mark the field
+  `strict: true` too if you want an out-of-enum value hard-rejected instead.
 - **`default` is now the ONLY way to backfill a field.** `fields.<field>.default`
   (new, optional, typed per the field's own `type`/`enum` — a non-conforming
   value is rejected with `invalid_field_default`/`tag_field_conflict`
@@ -1682,8 +1759,12 @@ contract.
 ### Maintenance
 
 #### `GET /vault/{name}/api/unresolved-wikilinks` — `vault:read`
-List `[[wikilink]]`s in note content that don't currently resolve to any
-note. `?limit=N` (default 50).
+List `[[wikilink]]`s AND pending structured `links` forward-refs (vault#555)
+that don't currently resolve to any note. `?limit=N` (default 50). Each row
+carries `source_id`, `source_path`, `target_path`, and `relationship`
+(`"wikilink"` for content-parsed `[[targets]]`; the caller's own
+relationship string for a structured-link forward-ref queued by
+`create-note`/`update-note`/`POST /notes`/`PATCH /notes/{id}`).
 
 #### `GET /vault/{name}/api/health` — `vault:read`
 Per-vault liveness ping. `{status: "ok", vault: "<name>"}`.

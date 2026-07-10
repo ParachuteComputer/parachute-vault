@@ -22,7 +22,7 @@ import {
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
-import { listUnresolvedWikilinks } from "../core/src/wikilinks.ts";
+import { listUnresolvedWikilinks, resolveOrQueueLink, resolveStructuredLinkNote } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
 import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
 import {
@@ -52,10 +52,11 @@ import {
   scrubParentCycleError,
   scrubReferencingTagsByScope,
   scrubTagFieldViolationsByScope,
+  scrubValidationStatusByScope,
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
-import { ParentCycleError, InvalidFieldDefaultError } from "../core/src/tag-schemas.ts";
+import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
 import { findTokensReferencingTag } from "./token-store.ts";
 
 /**
@@ -1352,6 +1353,34 @@ async function handleNotesInner(
       if (contentRange.range && includeContent) {
         for (const n of output) applyContentRange(n, contentRange.range);
       }
+      // vault#555 fix 3 — attach validation_status on reads too (mirrors
+      // MCP query-notes). Additive, present only when a tag declares
+      // `fields`. Runs BEFORE metadata filtering so it sees full metadata
+      // regardless of `include_metadata`. Scrubbed for a tag-scoped caller
+      // (vault#555 auth review) so an out-of-scope co-tag's schema shape
+      // doesn't leak — `results` here is already scope-filtered, but a
+      // surviving note may carry an out-of-scope co-tag whose schema would
+      // otherwise appear in its validation_status. No-op when unscoped.
+      {
+        const statusById = new Map(
+          results.map((n) => [
+            n.id,
+            scrubValidationStatusByScope(
+              store.validateNoteAgainstSchemas({
+                path: n.path,
+                tags: n.tags,
+                metadata: n.metadata as Record<string, unknown> | undefined,
+              }),
+              tagScope.allowed,
+              tagScope.raw,
+            ),
+          ]),
+        );
+        for (const n of output as any[]) {
+          const status = statusById.get(n.id);
+          if (status) n.validation_status = status;
+        }
+      }
       if (inclMeta !== undefined && inclMeta !== true) {
         output = output.map((n: any) => filterMetadata(n, inclMeta));
       }
@@ -1475,6 +1504,14 @@ async function handleNotesInner(
       }
 
       const created: Note[] = [];
+      // Structured `links` are resolved in a second pass, after every note
+      // in this batch has been created (vault#555) — resolving inline (the
+      // old behavior) meant a link from item 0 to item 1's path silently
+      // dropped, since item 1 didn't exist yet at the moment item 0's links
+      // were processed. Mirrors the MCP create-note fix exactly (both
+      // layers share `resolveOrQueueLink` from core/wikilinks.ts).
+      const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
+      const linkWarningsByNote = new Map<string, QueryWarning[]>();
       // Wrap multi-item batches in a SQLite transaction so a mid-batch
       // failure (path conflict, etc.) rolls back every prior insert. Without
       // this, callers got half-applied batches where the prefix landed and
@@ -1510,15 +1547,35 @@ async function handleNotesInner(
             via: writeCtx.via,
           });
 
-          // Create explicit links
           if (item.links) {
-            for (const link of item.links as { target: string; relationship: string }[]) {
-              const target = await resolveNote(store, link.target);
-              if (target) await store.createLink(note.id, target.id, link.relationship);
-            }
+            pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
           }
 
           created.push((await store.getNote(note.id)) ?? note);
+        }
+
+        // --- Resolve structured links (vault#555) ---
+        // Same semantics as [[wikilinks]]: ID or path/title match, tried now
+        // that every sibling note in this batch exists. A target that still
+        // doesn't resolve is queued for lazy resolution (backfills
+        // automatically when a matching note is created later) and surfaces
+        // an `unresolved_link` warning naming the target — never silent.
+        for (const { sourceId, links } of pendingLinks) {
+          for (const link of links) {
+            const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            if (targetId) {
+              await store.createLink(sourceId, targetId, link.relationship);
+            } else {
+              const list = linkWarningsByNote.get(sourceId) ?? [];
+              list.push({
+                code: "unresolved_link",
+                message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+                target: link.target,
+                relationship: link.relationship,
+              });
+              linkWarningsByNote.set(sourceId, list);
+            }
+          }
         }
       };
       try {
@@ -1584,8 +1641,14 @@ async function handleNotesInner(
       // Attach `validation_status` so HTTP create-note matches the MCP
       // surface (vault#287). `attachValidationStatus` returns the note
       // unchanged when no tag declares fields, so vaults without any tag
-      // schemas see no behavior change.
-      const final = refreshed.map((n) => attachValidationStatus(store, db, n));
+      // schemas see no behavior change. Fold in any `unresolved_link`
+      // warnings (vault#555) — additive, present only when this note's
+      // `links` had a target that didn't resolve.
+      const final = refreshed.map((n) => {
+        const validated = attachValidationStatus(store, db, n);
+        const warnings = linkWarningsByNote.get(n.id);
+        return warnings && warnings.length > 0 ? { ...validated, warnings } : validated;
+      });
       return json(body.notes ? final : final[0], 201);
     }
 
@@ -1741,6 +1804,24 @@ async function handleNotesInner(
     const contentRange = parseContentRangeQuery(url, includeContent);
     if (contentRange.error) return contentRange.error;
     let result: any = includeContent ? { ...note } : toNoteIndex(note);
+    // vault#555 fix 3 — mirror the MCP query-notes fix: attach
+    // validation_status on reads too, not just on the one-time create/update
+    // write response. See core/src/mcp.ts's query-notes handler for the
+    // full rationale. Scrubbed for a tag-scoped caller (vault#555 auth
+    // review) so an out-of-scope co-tag's schema shape doesn't leak — no-op
+    // for unscoped callers (tagScope.raw === null).
+    {
+      const status = scrubValidationStatusByScope(
+        store.validateNoteAgainstSchemas({
+          path: note.path,
+          tags: note.tags,
+          metadata: note.metadata as Record<string, unknown> | undefined,
+        }),
+        tagScope.allowed,
+        tagScope.raw,
+      );
+      if (status) result.validation_status = status;
+    }
     const expand = parseExpandParams(url, db, tagScope);
     if (expand && includeContent && typeof result.content === "string") {
       expand.ctx.expanded.add(note.id);
@@ -1834,22 +1915,35 @@ async function handleNotesInner(
           //     fresh note).
           //   - Missing target notes skip silently (mirrors MCP).
           const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
+          // `unresolved_link` warnings (vault#555) — a target that doesn't
+          // resolve is queued for lazy resolution (backfills automatically
+          // when a matching note is created later), never silently dropped.
+          const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const target = await resolveNote(store, link.target);
-              if (target) {
-                await store.createLink(created.id, target.id, link.relationship, link.metadata);
+              const targetId = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              if (targetId) {
+                await store.createLink(created.id, targetId, link.relationship, link.metadata);
+              } else {
+                createWarnings.push({
+                  code: "unresolved_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                });
               }
             }
           }
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
-          const validated = attachValidationStatus(store, db, final);
+          const validated: any = attachValidationStatus(store, db, final);
+          if (createWarnings.length > 0) validated.warnings = createWarnings;
           const includeContentResp = body.include_content !== false;
           if (includeContentResp) return json({ ...validated, created: true });
           const lean: any = toNoteIndex(validated);
           const vs = (validated as any).validation_status;
           if (vs !== undefined) lean.validation_status = vs;
+          if (createWarnings.length > 0) lean.warnings = createWarnings;
           lean.created = true;
           return json(lean);
         }
@@ -1992,7 +2086,7 @@ async function handleNotesInner(
       const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
       if (linksRemove) {
         for (const link of linksRemove) {
-          const target = await resolveNote(store, link.target);
+          const target = resolveStructuredLinkNote(db, link.target);
           if (!target) continue;
           resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
           if (link.relationship === "wikilink" && target.path) {
@@ -2069,9 +2163,21 @@ async function handleNotesInner(
         gateStrictWrite(store, writeCtx, { path: note.path, tags: [...projectedTags], metadata: projectedMeta });
       }
 
-      if (Object.keys(updates).length > 0) {
+      // vault#555 fix 2 — tag and link mutations must bump `updated_at` too,
+      // not just core-field (content/path/metadata) changes. Mirrors the MCP
+      // `update-note` fix exactly: a tags-only or links-only PATCH with
+      // `force: true` (no `if_updated_at`) left `updates` empty, so
+      // `store.updateNote` was never even called and `updated_at` never
+      // moved despite a real tags/note_tags or links change.
+      const hasTagMutation = (body.tags?.add?.length ?? 0) > 0 || (body.tags?.remove?.length ?? 0) > 0;
+      const hasLinkMutation = body.links?.add !== undefined || body.links?.remove !== undefined;
+      if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         // Write-attribution (vault#298) — REST update. Stamp the most-recent-
-        // write columns on the same UPDATE that bumps updated_at.
+        // write columns on the same UPDATE that bumps updated_at. `updates`
+        // may carry no core fields at all (a pure tag/link mutation) — that's
+        // fine: `noteOps.updateNote` unconditionally SETs
+        // `updated_at`/`last_updated_by`/`last_updated_via` whenever
+        // `skipUpdatedAt` isn't set, so this still issues a real UPDATE.
         updates.actor = writeCtx.actor;
         updates.via = writeCtx.via;
         await store.updateNote(note.id, updates);
@@ -2091,11 +2197,24 @@ async function handleNotesInner(
         await store.untagNote(note.id, body.tags.remove);
       }
 
-      // Add links
+      // Add links. `unresolved_link` warnings (vault#555) — a target that
+      // doesn't resolve is queued for lazy resolution (backfills
+      // automatically when a matching note is created later), never
+      // silently dropped.
+      const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const target = await resolveNote(store, link.target);
-          if (target) await store.createLink(note.id, target.id, link.relationship, link.metadata);
+          const targetId = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          if (targetId) {
+            await store.createLink(note.id, targetId, link.relationship, link.metadata);
+          } else {
+            linkWarnings.push({
+              code: "unresolved_link",
+              message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+              target: link.target,
+              relationship: link.relationship,
+            });
+          }
         }
       }
 
@@ -2130,6 +2249,7 @@ async function handleNotesInner(
           tagScope.raw,
         );
       }
+      if (linkWarnings.length > 0) validated.warnings = linkWarnings;
       const includeContentResp = body.include_content !== false;
       // `created: false` is appended to every update-path response so
       // sync-loop callers using `if_missing: "create"` can distinguish
@@ -2142,6 +2262,7 @@ async function handleNotesInner(
       // Carry the link echo across the lean conversion — `toNoteIndex`
       // drops unknown fields, same as the `validation_status` recipe above.
       if (validated.links !== undefined) lean.links = validated.links;
+      if (linkWarnings.length > 0) lean.warnings = linkWarnings;
       lean.created = false;
       return json(lean);
     } catch (e: any) {
@@ -2642,11 +2763,22 @@ export async function handleTags(
     // — silent 200s on main — is non-indexed type conflicts and indexed-flag
     // conflicts. See `collectCrossTagFieldViolations`'s doc comment.
     if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+      const incomingFields = body.fields as Record<string, tagSchemaOps.TagFieldSchema>;
+      // vault#555 fix 5 — fold the own-field `default`/`type` checks into
+      // the SAME bundled report as the cross-tag ones. Before this, a bad
+      // `default` (and, since fix 4 added the check, an unrecognized
+      // `type`) went through `store.upsertTagRecord`'s fail-fast pre-
+      // validate below INSTEAD — a single-violation 400 that silently never
+      // mentioned any OTHER bad field in the same call. `unsupported_
+      // indexed_type`/`invalid_field_name` deliberately stay OUT of this
+      // bundle — REST's established single-violation `400
+      // invalid_indexed_field` contract for those two is unchanged
+      // (vault#478; see `collectCrossTagFieldViolations`'s doc comment).
       const fieldViolations = tagSchemaOps.collectCrossTagFieldViolations(
         store.db,
         putTagName,
-        body.fields as Record<string, tagSchemaOps.TagFieldSchema>,
-      );
+        incomingFields,
+      ).concat(tagSchemaOps.collectOwnFieldDefaultAndTypeViolations(incomingFields));
       if (fieldViolations.length > 0) {
         // Tag-scope scrub (vault#554 auth-and-scope fold): the write is
         // still rejected, but a violation whose conflicting declarer is
@@ -2694,12 +2826,23 @@ export async function handleTags(
       if (err instanceof InvalidFieldDefaultError) {
         // vault#553 Decision B — a declared `default` doesn't conform to its
         // own field's type/enum. Own-field error (no cross-tag data), so no
-        // scrub needed. Mirrors IndexedFieldError's 400 shape/posture — see
-        // store.upsertTagRecord's pre-validate comment for why REST hits
-        // this (fail-fast, single violation) while MCP's update-tag usually
-        // reports it bundled via `TagFieldConflictError` instead.
+        // scrub needed. DEFENSE-IN-DEPTH ONLY as of vault#555 fix 5 — the
+        // pre-check above (`collectOwnFieldDefaultAndTypeViolations`) now
+        // catches every `invalid_default` BEFORE reaching `store.upsertTagRecord`
+        // and reports it bundled via `tag_field_conflict` 422 instead; this
+        // branch only fires for a caller that somehow bypasses that pre-check.
         return json(
           { error: err.message, error_type: "invalid_field_default", field: err.field },
+          400,
+        );
+      }
+      if (err instanceof InvalidFieldTypeError) {
+        // vault#555 fix 4 — a declared `type` isn't one of the six
+        // recognized values. Same defense-in-depth posture as
+        // InvalidFieldDefaultError above — the pre-check catches this in
+        // the normal path and reports it bundled instead.
+        return json(
+          { error: err.message, error_type: "invalid_field_type", field: err.field, type: err.type, valid_types: err.valid_types },
           400,
         );
       }

@@ -15,6 +15,7 @@ import {
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
 import * as linkOps from "./links.js";
+import { resolveOrQueueLink, resolveStructuredLinkNote } from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
 import {
@@ -263,6 +264,8 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
 
 Defaults: include_content=true for single note, false for lists. include_links=false. tag_match="any".
 
+Each result carries \`validation_status\` when any tag it carries declares \`fields\` (vault#555) — same advisory-warnings shape create-note/update-note attach, now also on reads (an out-of-enum value on a non-strict field is stored and findable, but still surfaces its \`enum_mismatch\` warning here, not just on the write that introduced it). Absent entirely when no tag on the note declares a schema.
+
 Large notes: pass \`content_offset\` / \`content_length\` (UTF-8 bytes) for a bounded read of note content — the response carries the slice plus \`content_total_length\` and \`content_next_offset\` (null when complete). Loop, feeding \`content_next_offset\` back as \`content_offset\`, to read a note too large for one response.
 
 Link expansion: pass \`expand_links: true\` to inline [[wikilinks]] from returned content. Tune with \`expand_depth\` (1–3, default 1) and \`expand_mode\` ("full" inlines full content, "summary" inlines only metadata.summary). Expansions are deduplicated across the query and cycle-guarded.
@@ -458,6 +461,24 @@ Response shape (vault#550 — three variants, pick by what you passed):
           // `expand`).
           if (contentRange && !includeContent) throw contentRangeRequiresContent();
           let result: any = includeContent ? { ...note } : noteOps.toNoteIndex(note);
+          // --- Attach validation_status (vault#555 fix 3) ---
+          // Mirrors create/update-note's `attachValidationStatus` — additive,
+          // present only when at least one tag on the note declares
+          // `fields`. Before this, `validation_status` (including an
+          // `enum_mismatch` on a non-strict indexed field) was surfaced ONLY
+          // on the one-time create/update WRITE response; a caller reading
+          // the note back via `query-notes` (the natural way to re-check a
+          // value after write) saw nothing at all — contradicting the
+          // documented "advisory violations surface as warnings" for every
+          // read after the initial write.
+          {
+            const status = store.validateNoteAgainstSchemas({
+              path: note.path,
+              tags: note.tags,
+              metadata: note.metadata as Record<string, unknown> | undefined,
+            });
+            if (status) result.validation_status = status;
+          }
           if (expandCtx && includeContent && typeof result.content === "string") {
             // Mark the top-level note as already expanded so it can't recursively inline itself.
             expandCtx.expanded.add(note.id);
@@ -738,6 +759,29 @@ Response shape (vault#550 — three variants, pick by what you passed):
           for (const n of output) applyContentRange(n, contentRange);
         }
 
+        // --- Attach validation_status (vault#555 fix 3) ---
+        // Same reasoning as the single-note path above — additive, present
+        // only when at least one tag on the note declares `fields`. Runs
+        // BEFORE metadata filtering so it sees the note's full metadata
+        // regardless of `include_metadata`; the `validation_status` key
+        // itself survives `filterMetadata` (which only touches `metadata`).
+        {
+          const statusById = new Map(
+            results.map((n) => [
+              n.id,
+              store.validateNoteAgainstSchemas({
+                path: n.path,
+                tags: n.tags,
+                metadata: n.metadata as Record<string, unknown> | undefined,
+              }),
+            ]),
+          );
+          for (const n of output as any[]) {
+            const status = statusById.get(n.id);
+            if (status) n.validation_status = status;
+          }
+        }
+
         // --- Apply metadata filtering ---
         if (includeMetadata !== undefined && includeMetadata !== true) {
           output = output.map((n: any) => filterMetadata(n, includeMetadata));
@@ -826,7 +870,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
               },
               required: ["target", "relationship"],
             },
-            description: "Links to create from this note",
+            description: "Links to create from this note. `target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title. A target created LATER in the same `notes` batch, or by a future call, resolves automatically (queued + backfilled) — the response carries an `unresolved_link` warning naming the target in the meantime; never silently dropped.",
           },
           created_at: { type: "string", description: "ISO timestamp (defaults to now)" },
           // Batch
@@ -858,6 +902,20 @@ Response shape (vault#550 — three variants, pick by what you passed):
         }
 
         const created: Note[] = [];
+        // Structured `links` are resolved in a SECOND pass, after every
+        // note in this batch has been created (vault#555) — resolving
+        // inline (the old behavior) meant a link from item 0 to item 1's
+        // path silently dropped, since item 1 didn't exist yet at the
+        // moment item 0's links were processed. Deferring makes
+        // within-batch forward-refs resolve exactly like a same-content
+        // [[wikilink]] already does. `pendingLinks` carries the SOURCE
+        // note id (known immediately — createNote assigns it synchronously)
+        // alongside each item's raw `links` array.
+        const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
+        // Per-note `unresolved_link` warnings (vault#555 — "never silent").
+        // Populated in the second pass; folded into each note's response
+        // below, same pattern as `validation_status`.
+        const linkWarningsByNote = new Map<string, QueryWarning[]>();
         // Wrap multi-item batches in a SQLite transaction so a mid-batch
         // failure rolls back every prior insert — see #236. This guards
         // anything thrown from store.createNote / createLink (path
@@ -892,17 +950,36 @@ Response shape (vault#550 — three variants, pick by what you passed):
               via: writeVia,
             });
 
-            // Create explicit links (not wikilinks — those are automatic)
             if (item.links) {
-              for (const link of item.links as { target: string; relationship: string }[]) {
-                const target = resolveNote(db, link.target);
-                if (target) {
-                  await store.createLink(note.id, target.id, link.relationship);
-                }
-              }
+              pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
             }
 
             created.push(noteOps.getNote(db, note.id) ?? note);
+          }
+
+          // --- Resolve structured links (vault#555) ---
+          // Same semantics as [[wikilinks]]: ID or path/title match, tried
+          // now that every sibling note in this batch exists. A target that
+          // STILL doesn't resolve (typo, or a note that arrives in a later
+          // call) is queued for lazy resolution — it backfills automatically
+          // the moment a matching note is created — and surfaces an
+          // `unresolved_link` warning naming the target. Never silent.
+          for (const { sourceId, links } of pendingLinks) {
+            for (const link of links) {
+              const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              if (targetId) {
+                await store.createLink(sourceId, targetId, link.relationship);
+              } else {
+                const list = linkWarningsByNote.get(sourceId) ?? [];
+                list.push({
+                  code: "unresolved_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                });
+                linkWarningsByNote.set(sourceId, list);
+              }
+            }
           }
         };
         await (batched ? transactionAsync(db, runBatch) : runBatch());
@@ -934,8 +1011,17 @@ Response shape (vault#550 — three variants, pick by what you passed):
               })();
 
         // Attach `validation_status` from any tag's `fields` declaration that
-        // applies to this note, against the post-defaults state.
-        const final = refreshed.map((n) => attachValidationStatus(store, db, n));
+        // applies to this note, against the post-defaults state. Fold in any
+        // `unresolved_link` warnings collected above (vault#555) — additive,
+        // present only when this note's `links` had a target that didn't
+        // resolve.
+        const final = refreshed.map((n) => {
+          const validated = attachValidationStatus(store, db, n);
+          const warnings = linkWarningsByNote.get(n.id);
+          return warnings && warnings.length > 0
+            ? ({ ...validated, warnings } as Note & { warnings: QueryWarning[] })
+            : validated;
+        });
         return batch ? final : final[0];
       },
     },
@@ -1028,7 +1114,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 },
               },
             },
-            description: "Links to add/remove",
+            description: "Links to add/remove. `add[].target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title — and lazily backfills (queued) when the target arrives later; the response carries an `unresolved_link` warning naming the target in the meantime, never a silent drop.",
           },
           include_content: {
             type: "boolean",
@@ -1122,6 +1208,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         // key this so the create-on-missing branch, which assigns the id
         // late, can register correctly.
         const echoLinkIds = new Set<string>();
+        // Structured `links.add` entries, deferred to a second pass AFTER
+        // every item in this batch has been created/updated (vault#555) —
+        // resolving inline would silently drop a link from item 0 to a note
+        // item 1 (later in the same batch) creates via `if_missing:
+        // "create"`. Same fix as create-note's `pendingLinks`.
+        const pendingLinks: { sourceId: string; links: { target: string; relationship: string; metadata?: Record<string, unknown> }[] }[] = [];
+        // Per-note `unresolved_link` warnings (vault#555 — "never silent").
+        const linkWarningsByNote = new Map<string, QueryWarning[]>();
         // Wrap multi-item batches in a SQLite transaction so any mid-batch
         // failure (precondition error, content_edit miss, ConflictError, …)
         // rolls back every prior mutation in the batch — see #236.
@@ -1212,13 +1306,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 });
                 const created = await store.createNote(content, createOpts);
                 await applySchemaDefaults(store, db, [created.id], created.tags ?? []);
-                // Apply links.add if the caller declared any.
+                // Defer links.add resolution to the second pass (vault#555)
+                // — same reasoning as create-note.
                 const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
                 if (linksAdd) {
-                  for (const link of linksAdd) {
-                    const target = resolveNote(db, link.target);
-                    if (target) await store.createLink(created.id, target.id, link.relationship, link.metadata);
-                  }
+                  pendingLinks.push({ sourceId: created.id, links: linksAdd });
                 }
                 const fresh = noteOps.getNote(db, created.id) ?? created;
                 updated.push(fresh);
@@ -1326,7 +1418,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             const resolvedLinksToRemove: { targetId: string; relationship: string }[] = [];
             if (linksRemove) {
               for (const link of linksRemove) {
-                const target = resolveNote(db, link.target);
+                const target = resolveStructuredLinkNote(db, link.target);
                 if (!target) continue;
                 resolvedLinksToRemove.push({ targetId: target.id, relationship: link.relationship });
                 if (link.relationship === "wikilink" && target.path) {
@@ -1400,8 +1492,25 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               enforceStrict({ path: note.path, tags: [...projectedTags], metadata: projectedMeta });
             }
 
+            // vault#555 fix 2 — tag and link mutations must bump `updated_at`
+            // too, not just core-field (content/path/metadata) changes. Before
+            // this, a tags-only or links-only call with `force: true` (no
+            // `if_updated_at`) left `updates` completely empty — the branch
+            // below skipped `store.updateNote` ENTIRELY, so `updated_at` never
+            // moved even though tags/note_tags or links genuinely changed.
+            // (A tags-only call that happened to pass `if_updated_at` already
+            // worked by accident — it populated `updates.if_updated_at` — which
+            // is why this was easy to miss in ad hoc testing.) This breaks
+            // cursor polling (`ORDER BY updated_at`) and any `updated_at`-based
+            // sync filter: the mutation is real but invisible to a
+            // since-last-check loop.
+            const hasTagMutation = ((item.tags as any)?.add?.length ?? 0) > 0
+              || ((item.tags as any)?.remove?.length ?? 0) > 0;
+            const hasLinkMutation = (item.links as any)?.add !== undefined
+              || (item.links as any)?.remove !== undefined;
+
             let result: Note;
-            if (Object.keys(updates).length > 0) {
+            if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
               // Write-attribution (vault#298): stamp the most-recent-write
               // columns on the same UPDATE that bumps `updated_at`. Only set when
               // there's a real change to write (the empty-updates branch below
@@ -1412,7 +1521,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               // store.updateNote routes through noteOps.updateNote, which runs
               // the UPDATE (with optional `AND updated_at IS ?`) atomically and
               // throws ConflictError on mismatch. No mutations have happened
-              // yet, so a throw here leaves the note untouched.
+              // yet, so a throw here leaves the note untouched. `updates` may
+              // carry no core fields at all (a pure tag/link mutation) — that's
+              // fine: `noteOps.updateNote` unconditionally SETs
+              // `updated_at`/`last_updated_by`/`last_updated_via` whenever
+              // `skipUpdatedAt` isn't set, so this still issues a real UPDATE
+              // (not the true no-op/precondition-only branch, which only fires
+              // when the caller passes ZERO fields AND no mutation is pending).
               result = await store.updateNote(note.id, updates);
             } else {
               result = note;
@@ -1433,15 +1548,10 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               await store.untagNote(note.id, tagsOp.remove);
             }
 
-            // --- Add links ---
+            // --- Add links (deferred to the second pass — vault#555) ---
             const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
             if (linksAdd) {
-              for (const link of linksAdd) {
-                const target = resolveNote(db, link.target);
-                if (target) {
-                  await store.createLink(note.id, target.id, link.relationship, link.metadata);
-                }
-              }
+              pendingLinks.push({ sourceId: note.id, links: linksAdd });
             }
 
             // Echo links if this update mutated them (`links.add`/`links.remove`)
@@ -1453,6 +1563,32 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
 
             // Re-read for final state
             updated.push(noteOps.getNote(db, note.id) ?? result);
+          }
+
+          // --- Resolve structured `links.add` (vault#555) ---
+          // Deferred until every item in this batch has been created/
+          // updated — same [[wikilink]] semantics (ID or path/title match),
+          // now tried against the FULL post-batch note set so a forward-ref
+          // to a sibling item resolves. A target that still doesn't resolve
+          // is queued for lazy resolution (backfills when a matching note
+          // is created later) and surfaces an `unresolved_link` warning —
+          // never silently dropped.
+          for (const { sourceId, links } of pendingLinks) {
+            for (const link of links) {
+              const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              if (targetId) {
+                await store.createLink(sourceId, targetId, link.relationship, link.metadata);
+              } else {
+                const list = linkWarningsByNote.get(sourceId) ?? [];
+                list.push({
+                  code: "unresolved_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                });
+                linkWarningsByNote.set(sourceId, list);
+              }
+            }
           }
         };
         await (batched ? transactionAsync(db, runBatch) : runBatch());
@@ -1475,9 +1611,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           // when triggered — mirrors the GET / query-notes shape exactly via
           // the shared `linkOps.getLinksHydrated` call. vault feedback #8.
           const echoLinks = echoLinkIds.has(n.id);
+          // `unresolved_link` warnings (vault#555) — additive, present only
+          // when this note's `links.add` had a target that didn't resolve.
+          const warnings = linkWarningsByNote.get(n.id);
           if (includeContent) {
             const full: any = { ...validated, created };
             if (echoLinks) full.links = linkOps.getLinksHydrated(db, n.id);
+            if (warnings && warnings.length > 0) full.warnings = warnings;
             return full as Note & { created: boolean };
           }
           const lean: any = noteOps.toNoteIndex(validated);
@@ -1487,6 +1627,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           // Carry the link echo across the lean conversion — `toNoteIndex`
           // drops unknown fields.
           if (echoLinks) lean.links = linkOps.getLinksHydrated(db, n.id);
+          if (warnings && warnings.length > 0) lean.warnings = warnings;
           return lean;
         });
         return batch ? final : final[0];
@@ -1615,7 +1756,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             additionalProperties: {
               type: "object",
               properties: {
-                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object — all six are accepted for storage + advisory validation. Only string/integer/boolean are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field)." },
+                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object — all six are accepted for storage + advisory validation; any OTHER value is rejected outright (error_type invalid_field_type, vault#555 — bundled with every other violation in the same call, see the `update-tag` tool description). Only string/integer/boolean are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field)." },
                 description: { type: "string" },
                 enum: { type: "array", items: { type: "string" }, description: "Allowed values. Does NOT auto-backfill — a note that omits this field stays without it unless `default` is also set (vault#553; the pre-0.7.0 behavior of silently defaulting to the first enum value is retired). Set `default` explicitly if you want backfill." },
                 default: { description: "Explicit backfill value (vault#553) applied when a note gains this tag without setting the field. Must conform to this field's own `type` (and `enum`, if declared) — a non-conforming default is rejected (invalid_default / invalid_field_default) rather than silently stored. Omit entirely to leave the field ABSENT (not backfilled) on notes that don't set it — this is what makes `exists:false` a trustworthy \"never set\" query." },

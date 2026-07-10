@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
+import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
+import { getNote } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
+import { transaction } from "./txn.js";
 
 // ---------------------------------------------------------------------------
 // Parser — extract [[wikilinks]] from markdown content
@@ -251,19 +254,28 @@ export interface UnresolvedWikilink {
   source_id: string;
   source_path?: string;
   target_path: string;
+  /**
+   * Link relationship this pending entry will materialize as once
+   * resolved. `"wikilink"` for content-parsed `[[targets]]`; the
+   * caller's own relationship string for structured `links` forward-refs
+   * (vault#555). Always present post-migration; defaults to `"wikilink"`
+   * for rows written before the column existed.
+   */
+  relationship: string;
 }
 
 /**
  * List unresolved wikilinks across the vault.
  */
 export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved: UnresolvedWikilink[]; count: number } {
+  ensureRelationshipColumn(db);
   let total: number;
-  let rows: { source_id: string; target_path: string }[];
+  let rows: { source_id: string; target_path: string; relationship: string }[];
   try {
     total = (db.prepare("SELECT COUNT(*) as c FROM unresolved_wikilinks").get() as { c: number }).c;
     rows = db.prepare(
-      "SELECT source_id, target_path FROM unresolved_wikilinks ORDER BY source_id LIMIT ?",
-    ).all(limit) as { source_id: string; target_path: string }[];
+      "SELECT source_id, target_path, relationship FROM unresolved_wikilinks ORDER BY source_id LIMIT ?",
+    ).all(limit) as { source_id: string; target_path: string; relationship: string }[];
   } catch {
     // Table doesn't exist yet
     return { unresolved: [], count: 0 };
@@ -288,6 +300,7 @@ export function listUnresolvedWikilinks(db: Database, limit = 50): { unresolved:
     source_id: r.source_id,
     source_path: pathMap.get(r.source_id) ?? undefined,
     target_path: r.target_path,
+    relationship: r.relationship || WIKILINK_REL,
   }));
 
   return { unresolved, count: total };
@@ -383,6 +396,73 @@ export function syncWikilinks(
 // ---------------------------------------------------------------------------
 
 /**
+ * Self-heal the `relationship` column onto a pre-vault#555
+ * `unresolved_wikilinks` table. An `ALTER TABLE ADD COLUMN` alone can't
+ * widen the PRIMARY KEY, which would let a structured link (non-"wikilink"
+ * relationship) queued against the same (source, target_path) as an
+ * existing pending wikilink silently collide and get dropped by `INSERT OR
+ * IGNORE`. So on a table that predates the column, this rebuilds it with
+ * the 3-column PK (source_id, target_path, relationship) and backfills
+ * every existing row as `relationship = 'wikilink'` (the only kind that
+ * could have been queued before this fix). No-op on a fresh table (created
+ * directly with the new schema by {@link ensureUnresolvedTable}) or one
+ * already migrated. `PRAGMA table_info` on a nonexistent table returns zero
+ * rows rather than throwing, so this is safe to call unconditionally,
+ * including from read paths that don't want to create the table lazily.
+ */
+function ensureRelationshipColumn(db: Database): void {
+  const cols = db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as { name: string }[];
+  if (cols.length === 0) return; // table doesn't exist — nothing to heal
+  if (cols.some((c) => c.name === "relationship")) return; // already migrated
+
+  // The rebuild is a 4-statement DDL sequence (RENAME → CREATE → INSERT…
+  // SELECT → DROP) that MUST be atomic (wire + generalist review, vault#555
+  // — same class as W7's migrateToV25 must-fix). A crash between RENAME and
+  // CREATE would leave NO `unresolved_wikilinks` table at all (breaking every
+  // subsequent wikilink/structured-link write); a crash between CREATE and
+  // INSERT would strand every pending forward-ref row in the orphaned
+  // `_pre_v555` table permanently — silent data loss — because the guard
+  // above (`relationship` column present) flips true the moment CREATE
+  // commits, so a retry would skip the backfill.
+  const migrate = (): void => {
+    db.exec("ALTER TABLE unresolved_wikilinks RENAME TO unresolved_wikilinks_pre_v555");
+    db.exec(`
+      CREATE TABLE unresolved_wikilinks (
+        source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        target_path TEXT NOT NULL COLLATE NOCASE,
+        relationship TEXT NOT NULL DEFAULT '${WIKILINK_REL}',
+        PRIMARY KEY (source_id, target_path, relationship)
+      )
+    `);
+    db.exec(`
+      INSERT INTO unresolved_wikilinks (source_id, target_path, relationship)
+      SELECT source_id, target_path, '${WIKILINK_REL}' FROM unresolved_wikilinks_pre_v555
+    `);
+    db.exec("DROP TABLE unresolved_wikilinks_pre_v555");
+  };
+
+  // Nesting guard: this heal runs from `ensureUnresolvedTable` /
+  // `resolveUnresolvedWikilinks`, which are themselves reached from
+  // `store.createNote`/`updateNote` — and a BATCH create/update wraps those
+  // in `transactionAsync` (an already-open transaction). The txn seam is
+  // single-level by design (see core/src/txn.ts — a nested `BEGIN IMMEDIATE`
+  // throws "cannot start a transaction within a transaction"), so when a
+  // transaction is already active the DDL is ALREADY covered by that
+  // transaction's atomicity and we run it directly; only when idle do we open
+  // our own. `db.inTransaction` is bun:sqlite's active-transaction flag; a
+  // backend that doesn't expose it (a DO-SQLite Store) reads `undefined`
+  // (falsy) and takes the `transaction()` path — which for that backend
+  // delegates to its native `transactionSync`. (Immaterial in practice: a
+  // fresh DO deployment is created with the v555 schema directly, so this
+  // legacy heal never fires there.)
+  if (db.inTransaction) {
+    migrate();
+  } else {
+    transaction(db, migrate);
+  }
+}
+
+/**
  * Ensure the unresolved_wikilinks table exists.
  * Called lazily — only when we actually have unresolved links.
  */
@@ -391,13 +471,18 @@ export function ensureUnresolvedTable(db: Database): void {
     CREATE TABLE IF NOT EXISTS unresolved_wikilinks (
       source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
       target_path TEXT NOT NULL COLLATE NOCASE,
-      PRIMARY KEY (source_id, target_path)
+      relationship TEXT NOT NULL DEFAULT '${WIKILINK_REL}',
+      PRIMARY KEY (source_id, target_path, relationship)
     )
   `);
+  ensureRelationshipColumn(db);
 }
 
 /**
- * Update unresolved wikilinks for a note.
+ * Update unresolved wikilinks for a note. Scoped to `relationship =
+ * "wikilink"` rows only (vault#555) — a content re-parse must not clobber
+ * pending STRUCTURED-link forward-refs queued for this note via
+ * {@link queueUnresolvedLink} (a different relationship, same table).
  */
 function syncUnresolvedWikilinks(
   db: Database,
@@ -405,9 +490,9 @@ function syncUnresolvedWikilinks(
   unresolvedPaths: string[],
 ): void {
   if (unresolvedPaths.length === 0) {
-    // Clean up any old unresolved entries for this note
+    // Clean up any old wikilink-kind unresolved entries for this note
     try {
-      db.prepare("DELETE FROM unresolved_wikilinks WHERE source_id = ?").run(noteId);
+      db.prepare("DELETE FROM unresolved_wikilinks WHERE source_id = ? AND relationship = ?").run(noteId, WIKILINK_REL);
     } catch {
       // Table may not exist yet — that's fine
     }
@@ -416,19 +501,22 @@ function syncUnresolvedWikilinks(
 
   ensureUnresolvedTable(db);
 
-  // Replace all unresolved entries for this note
-  db.prepare("DELETE FROM unresolved_wikilinks WHERE source_id = ?").run(noteId);
+  // Replace wikilink-kind unresolved entries for this note only
+  db.prepare("DELETE FROM unresolved_wikilinks WHERE source_id = ? AND relationship = ?").run(noteId, WIKILINK_REL);
   const insert = db.prepare(
-    "INSERT OR IGNORE INTO unresolved_wikilinks (source_id, target_path) VALUES (?, ?)",
+    "INSERT OR IGNORE INTO unresolved_wikilinks (source_id, target_path, relationship) VALUES (?, ?, ?)",
   );
   for (const path of unresolvedPaths) {
-    insert.run(noteId, path);
+    insert.run(noteId, path, WIKILINK_REL);
   }
 }
 
 /**
- * Try to resolve pending wikilinks that point to a given path.
- * Called when a note is created or its path changes.
+ * Try to resolve pending wikilinks AND pending structured-link forward-refs
+ * (vault#555) that point to a given path. Called when a note is created or
+ * its path changes. Each pending row materializes with ITS OWN relationship
+ * (a structured link queued via {@link queueUnresolvedLink} backfills with
+ * the caller's original relationship, not "wikilink").
  *
  * Returns the number of links resolved.
  */
@@ -437,13 +525,14 @@ export function resolveUnresolvedWikilinks(
   notePath: string,
   noteId: string,
 ): number {
-  let rows: { source_id: string }[];
+  ensureRelationshipColumn(db);
+  let rows: { source_id: string; relationship: string }[];
   try {
     rows = db.prepare(`
-      SELECT source_id FROM unresolved_wikilinks
+      SELECT source_id, relationship FROM unresolved_wikilinks
       WHERE target_path = ? COLLATE NOCASE
          OR ? LIKE '%/' || target_path
-    `).all(notePath, notePath) as { source_id: string }[];
+    `).all(notePath, notePath) as { source_id: string; relationship: string }[];
   } catch {
     return 0; // Table doesn't exist
   }
@@ -454,15 +543,91 @@ export function resolveUnresolvedWikilinks(
   for (const row of rows) {
     if (row.source_id === noteId) continue; // Skip self-links
 
-    // Create the wikilink
-    linkOps.createLink(db, row.source_id, noteId, WIKILINK_REL);
+    const relationship = row.relationship || WIKILINK_REL;
+    linkOps.createLink(db, row.source_id, noteId, relationship);
     resolved++;
 
-    // Remove the unresolved entry
+    // Remove the unresolved entry (this exact relationship only — a
+    // source may have BOTH a wikilink and a structured-link forward-ref
+    // pending against the same target_path).
     db.prepare(
-      "DELETE FROM unresolved_wikilinks WHERE source_id = ? AND (target_path = ? COLLATE NOCASE OR ? LIKE '%/' || target_path)",
-    ).run(row.source_id, notePath, notePath);
+      "DELETE FROM unresolved_wikilinks WHERE source_id = ? AND relationship = ? AND (target_path = ? COLLATE NOCASE OR ? LIKE '%/' || target_path)",
+    ).run(row.source_id, relationship, notePath, notePath);
   }
 
   return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Structured links — same resolution + lazy forward-ref semantics as
+// [[wikilinks]] (vault#555). A structured `links: [{target, relationship}]`
+// entry (create-note/update-note) used to resolve by exact path only, with
+// no basename fallback and no forward-ref queueing — silently dropping the
+// edge whenever the equivalent `[[wikilink]]` would have resolved. These
+// helpers give both the MCP tool layer (core/src/mcp.ts) and the REST
+// handler layer (src/routes.ts) one shared implementation so they can't
+// drift.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a structured-link `target` — an ID or a path/title — to a note
+ * ID. ID lookup first (structured links accept "note ID or path" per the
+ * tool docs; wikilinks never carry a raw ID), then the SAME path/basename
+ * resolution `[[wikilinks]]` use ({@link resolveWikilink}: explicit
+ * extension, exact path, basename).
+ */
+export function resolveLinkTarget(db: Database, idOrPath: string): string | null {
+  const byId = db.prepare("SELECT id FROM notes WHERE id = ?").get(idOrPath) as { id: string } | null;
+  if (byId) return byId.id;
+  return resolveWikilink(db, idOrPath);
+}
+
+/**
+ * Resolve a structured-link `target` (create-note/update-note `links`) to
+ * its full {@link Note} — same ID-or-path/title semantics as `[[wikilinks]]`
+ * via {@link resolveLinkTarget}. Used for `links.remove`, where the
+ * bracket-cleanup step needs the target's `path`, not just its ID.
+ * `links.add` resolution goes through {@link resolveOrQueueLink} instead
+ * (it also queues a forward-ref on a miss). Single home for both the MCP
+ * tool layer (core/src/mcp.ts) and the REST handler layer (src/routes.ts) —
+ * vault#555 generalist review, was duplicated verbatim in both.
+ */
+export function resolveStructuredLinkNote(db: Database, target: string): Note | null {
+  const id = resolveLinkTarget(db, target);
+  return id ? getNote(db, id) : null;
+}
+
+/** Queue a structured-link forward-ref for lazy resolution. */
+export function queueUnresolvedLink(
+  db: Database,
+  sourceId: string,
+  targetPath: string,
+  relationship: string,
+): void {
+  ensureUnresolvedTable(db);
+  db.prepare(
+    "INSERT OR IGNORE INTO unresolved_wikilinks (source_id, target_path, relationship) VALUES (?, ?, ?)",
+  ).run(sourceId, targetPath, relationship);
+}
+
+/**
+ * Resolve a structured link NOW, or queue it for lazy resolution when the
+ * target doesn't exist yet — mirroring the wikilink forward-ref contract
+ * (a target created later, in this same batch or a future call, backfills
+ * the edge automatically via {@link resolveUnresolvedWikilinks}). Returns
+ * the resolved note ID, or `null` when queued. Callers MUST surface an
+ * `unresolved_link` warning naming the target when this returns `null` —
+ * the write itself never fails, but silence is never the fallback
+ * (vault#555 — "the API should never silently do the wrong thing").
+ */
+export function resolveOrQueueLink(
+  db: Database,
+  sourceId: string,
+  target: string,
+  relationship: string,
+): string | null {
+  const resolvedId = resolveLinkTarget(db, target);
+  if (resolvedId) return resolvedId;
+  queueUnresolvedLink(db, sourceId, target, relationship);
+  return null;
 }

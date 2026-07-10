@@ -741,22 +741,29 @@ export class BunSqliteStore implements Store {
         // Throws IndexedFieldError on an invalid identifier (e.g. kebab-case).
         indexedFieldOps.validateFieldName(fieldName);
       }
-      // Default-conformance pre-validate (vault#553 Decision B) — mirrors the
-      // indexed-type/name checks above: fail BEFORE any persistence so a bad
-      // `default` never gets written. Runs over EVERY field in the full
-      // (already-merged) `nextFields` map, not just indexed ones — a default
-      // that doesn't match its own field's type/enum is a tag-schema error
-      // regardless of queryability. This is the REST parity path: MCP's
-      // `update-tag` tool ALSO calls `collectTagFieldViolations` before
-      // reaching here (bundling every violation into one `TagFieldConflictError`
-      // — see that function's doc comment), so a conforming MCP call never
-      // trips this; a non-conforming one throws there first. REST has no such
-      // pre-check, so this is REST's only gate — same asymmetry as the
-      // indexed-type/name checks it sits beside.
+      // Default-conformance + type-vocabulary pre-validate (vault#553
+      // Decision B; vault#555 fix 4/5) — mirrors the indexed-type/name
+      // checks above: fail BEFORE any persistence so a bad `default` or an
+      // unrecognized `type` never gets written. Runs over EVERY field in the
+      // full (already-merged) `nextFields` map, not just indexed ones — both
+      // are tag-schema errors regardless of queryability. This is a
+      // DEFENSE-IN-DEPTH backstop, not the primary user-facing gate: both
+      // REST's `PUT /api/tags/:name` (`collectCrossTagFieldViolations` +
+      // `collectOwnFieldDefaultAndTypeViolations`, bundled 422) and MCP's
+      // `update-tag` (`collectTagFieldViolations`, same bundle) now
+      // pre-validate every field and report ALL violations together BEFORE
+      // ever reaching this chokepoint — a conforming call never trips this
+      // fail-fast loop. It stays here so any OTHER caller of
+      // `store.upsertTagRecord` (imports, migrations, scripts) still fails
+      // closed rather than persisting a lying schema.
       for (const [fieldName, spec] of Object.entries(nextFields ?? {})) {
-        const violation = tagSchemaOps.validateFieldDefault(fieldName, spec);
-        if (violation) {
-          throw new tagSchemaOps.InvalidFieldDefaultError(fieldName, violation.message);
+        const typeViolation = tagSchemaOps.validateFieldType(fieldName, spec);
+        if (typeViolation) {
+          throw new tagSchemaOps.InvalidFieldTypeError(fieldName, spec.type);
+        }
+        const defaultViolation = tagSchemaOps.validateFieldDefault(fieldName, spec);
+        if (defaultViolation) {
+          throw new tagSchemaOps.InvalidFieldDefaultError(fieldName, defaultViolation.message);
         }
       }
     }

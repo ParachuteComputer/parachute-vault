@@ -597,6 +597,22 @@ describe("renameTag cascade (vault#240 + #247)", async () => {
     expect(fresh!.content).toContain("#other"); // untouched
   });
 
+  // vault#555 fix 2 — a rename cascade's inline content rewrite is a real
+  // persisted-state change; `updated_at` must move or a cursor/sync-poll
+  // loop never sees the rewritten note.
+  it("1b. content rewrite bumps updated_at (vault#555)", async () => {
+    const note = await store.createNote("Today's #task is important.", { tags: ["task"] });
+    const before = note.updatedAt;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await store.renameTag("task", "todo");
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.content).toContain("#todo");
+    expect(fresh!.updatedAt).not.toBe(before);
+    expect(new Date(fresh!.updatedAt) > new Date(before)).toBe(true);
+  });
+
   it("2. cascades sub-tags recursively (task → todo, task/work → todo/work, task/work/client → todo/work/client)", async () => {
     await store.createNote("a", { tags: ["task"] });
     await store.createNote("b", { tags: ["task/work"] });
@@ -2253,6 +2269,92 @@ describe("MCP tools", async () => {
     expect(links.some((l) => l.relationship === "mentions")).toBe(true);
   });
 
+  // vault#555 — structured `links` used to resolve by exact path only (no
+  // basename/title fallback, unlike [[wikilinks]]). "Bare Title" against a
+  // note filed at "People/Alice" is a basename match, same as `[[Alice]]`.
+  it("create-note with links resolves targets by BASENAME (title), same as [[wikilinks]]", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    await store.createNote("Target", { path: "People/Alice" });
+    const result = await createNote.execute({
+      content: "Links to Alice by bare title",
+      links: [{ target: "Alice", relationship: "knows" }],
+    }) as any;
+    const links = await store.getLinks(result.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
+  // vault#555 — a link to a note created LATER in the same create-note
+  // batch used to silently drop (item 0 resolved before item 1 existed).
+  // The equivalent forward-ref via a [[wikilink]] already resolved; this
+  // makes structured `links` match.
+  it("create-note batch: a link to a note created LATER in the same batch resolves (forward-ref)", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { path: "A", content: "links to B", links: [{ target: "B", relationship: "knows" }] },
+        { path: "B", content: "the target" },
+      ],
+    }) as any[];
+    const a = result.find((n: any) => n.path === "A");
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("knows");
+    // No warning — it resolved within the batch.
+    expect(a.warnings).toBeUndefined();
+  });
+
+  // vault#555 — a target that genuinely can't resolve now must surface an
+  // `unresolved_link` warning (never silent), AND lazily backfill the edge
+  // the moment a matching note is created later — mirroring the
+  // `unresolved_wikilinks` forward-ref contract.
+  it("create-note with an unresolvable link target: warns now, backfills the edge when the target is created later", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "links to a note that doesn't exist yet",
+      links: [{ target: "Nonexistent Target", relationship: "knows" }],
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("unresolved_link");
+    expect(source.warnings[0].target).toBe("Nonexistent Target");
+    expect(source.warnings[0].relationship).toBe("knows");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Creating the target note later backfills the edge automatically.
+    const target = await store.createNote("here now", { path: "Nonexistent Target" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+    expect(links[0]!.relationship).toBe("knows");
+  });
+
+  // vault#555 — structured-link forward-refs (any relationship) must
+  // coexist with pending [[wikilink]] forward-refs on the SAME note without
+  // one clobbering the other when the note's content is re-synced.
+  it("pending structured-link forward-ref survives a wikilink content re-sync on the same note", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const source = await createNote.execute({
+      content: "no wikilinks yet",
+      links: [{ target: "Future Note", relationship: "knows" }],
+    }) as any;
+    expect(source.warnings?.[0]?.code).toBe("unresolved_link");
+
+    // Editing content (which re-syncs [[wikilink]]-kind unresolved entries)
+    // must not wipe the pending structured-link entry.
+    await updateNote.execute({ id: source.id, content: "now with a [[Some Other Unresolved Note]]", force: true });
+
+    const target = await store.createNote("arrived", { path: "Future Note" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "knows")).toBe(true);
+  });
+
   it("update-note tool updates created_at", async () => {
     const note = await store.createNote("Test");
     const tools = generateMcpTools(store);
@@ -2287,6 +2389,47 @@ describe("MCP tools", async () => {
     expect((await store.getNote(note.id))!.tags).toContain("daily");
   });
 
+  // vault#555 fix 2 — a tag-only (or links-only) update-note call with
+  // `force: true` (no `if_updated_at`) used to leave `updated_at` frozen:
+  // the mcp.ts `updates` object had no core fields, so `store.updateNote`
+  // was never even called. Breaks cursor polling (ORDER BY updated_at) and
+  // any updated_at-based sync filter.
+  it("update-note tags-only mutation with force:true bumps updated_at", async () => {
+    const note = await store.createNote("Test");
+    const before = note.updatedAt;
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await updateNote.execute({ id: note.id, tags: { add: ["pinned"] }, force: true });
+    const after1 = (await store.getNote(note.id))!.updatedAt;
+    expect(after1).not.toBe(before);
+    expect(new Date(after1) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    await updateNote.execute({ id: note.id, tags: { remove: ["pinned"] }, force: true });
+    const after2 = (await store.getNote(note.id))!.updatedAt;
+    expect(new Date(after2) > new Date(after1)).toBe(true);
+  });
+
+  it("update-note links-only mutation with force:true bumps updated_at", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("B", { id: "b" });
+    const before = (await store.getNote("a"))!.updatedAt;
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await updateNote.execute({ id: "a", links: { add: [{ target: "b", relationship: "mentions" }] }, force: true });
+    const after1 = (await store.getNote("a"))!.updatedAt;
+    expect(new Date(after1) > new Date(before)).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 5));
+    await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
+    const after2 = (await store.getNote("a"))!.updatedAt;
+    expect(new Date(after2) > new Date(after1)).toBe(true);
+  });
+
   it("update-note links add/remove works", async () => {
     await store.createNote("A", { id: "a" });
     await store.createNote("B", { id: "b" });
@@ -2300,6 +2443,38 @@ describe("MCP tools", async () => {
     // Remove link
     await updateNote.execute({ id: "a", links: { remove: [{ target: "b", relationship: "mentions" }] }, force: true });
     expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#555 — update-note's links.add gets the same basename/title
+  // resolution + lazy forward-ref queueing as create-note's.
+  it("update-note links.add resolves by BASENAME and warns+queues when unresolvable", async () => {
+    await store.createNote("A", { id: "a" });
+    await store.createNote("Target", { path: "People/Bob" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    // Basename match
+    const byTitle = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "Bob", relationship: "knows" }] },
+      force: true,
+    }) as any;
+    expect(byTitle.warnings).toBeUndefined();
+    expect(await store.getLinks("a", { direction: "outbound" })).toHaveLength(1);
+
+    // Unresolvable target: warns, queues, backfills later.
+    const unresolved = await updateNote.execute({
+      id: "a",
+      links: { add: [{ target: "Not Yet Real", relationship: "wants" }] },
+      force: true,
+    }) as any;
+    expect(unresolved.warnings).toBeDefined();
+    expect(unresolved.warnings[0].code).toBe("unresolved_link");
+    expect(unresolved.warnings[0].target).toBe("Not Yet Real");
+
+    const target = await store.createNote("arrived", { path: "Not Yet Real" });
+    const links = await store.getLinks("a", { direction: "outbound" });
+    expect(links.some((l) => l.targetId === target.id && l.relationship === "wants")).toBe(true);
   });
 
   // vault feedback #8 — echo hydrated links on the update response when the
@@ -3030,6 +3205,126 @@ describe("MCP tools", async () => {
     expect(err?.code).toBe("CONFLICT");
   });
 
+  // vault#555 fix 7 (INVESTIGATE) — a tester reported update-note batch
+  // AND parallel singles failing 7/8 with "old_text not found" when
+  // multiple items share the SAME content_edit.old_text, though each
+  // succeeded standalone. The orchestrator could NOT reproduce live (repro
+  // hit shell artifacts). Investigated here with proper in-memory tests:
+  //
+  //   - Batch AND parallel-singles, N items EACH TARGETING A DIFFERENT
+  //     note, all sharing the same old_text: every item succeeds. Each
+  //     item resolves its OWN note's content fresh (there's no shared
+  //     mutable state across items/calls — `resolveNote` reads straight
+  //     off the DB per item, and the content_edit search+replace is pure
+  //     synchronous JS with no `await` between the read and the write, so
+  //     two "parallel" async calls can't interleave mid-computation
+  //     either). Re-run 20x below with zero failures.
+  //   - The one scenario that DOES reproduce "1 succeeds, 7 fail
+  //     content_edit_not_found" is N calls sharing the same old_text
+  //     against the SAME note — and that's CORRECT behavior (the first
+  //     call consumes the only occurrence; the rest correctly report it's
+  //     gone), not a bug. This is the most plausible explanation for what
+  //     was actually observed: a test harness that accidentally pointed
+  //     every call at one note (a variable/loop bug — "shell artifacts")
+  //     rather than N distinct notes.
+  //
+  // VERDICT: not reproducible as a real bug against different notes. No
+  // fix applied — these tests document the correct behavior.
+  it("update-note BATCH: N items with the SAME content_edit.old_text on DIFFERENT notes all succeed", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `batch-ce-${i}` }));
+    }
+
+    const result = await updateNote.execute({
+      notes: notes.map((n) => ({
+        id: n.id,
+        content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+        force: true,
+      })),
+    }) as any[];
+
+    expect(result).toHaveLength(N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i].content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
+  it("update-note PARALLEL SINGLES: N concurrent calls with the SAME content_edit.old_text on DIFFERENT notes all succeed", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const N = 8;
+    const notes = [];
+    for (let i = 0; i < N; i++) {
+      notes.push(await store.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `parallel-ce-${i}` }));
+    }
+
+    const results = await Promise.all(
+      notes.map((n) =>
+        updateNote.execute({
+          id: n.id,
+          content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+          force: true,
+        }),
+      ),
+    ) as any[];
+
+    for (let i = 0; i < N; i++) {
+      expect(results[i].content).toBe(`prefix REPLACED suffix-${i}`);
+    }
+  });
+
+  it("update-note PARALLEL SINGLES with shared old_text: 20 repeated trials, zero failures (flake hunt)", async () => {
+    for (let trial = 0; trial < 20; trial++) {
+      const trialDb = new Database(":memory:");
+      const trialStore = new SqliteStore(trialDb);
+      const tools = generateMcpTools(trialStore);
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      const N = 8;
+      const notes = [];
+      for (let i = 0; i < N; i++) {
+        notes.push(await trialStore.createNote(`prefix TARGET_TEXT suffix-${i}`, { path: `flake-${i}` }));
+      }
+      const outcomes = await Promise.allSettled(
+        notes.map((n) =>
+          updateNote.execute({
+            id: n.id,
+            content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+            force: true,
+          }),
+        ),
+      );
+      const failures = outcomes.filter((o) => o.status === "rejected");
+      expect(failures.length).toBe(0);
+    }
+  });
+
+  it("update-note with shared old_text against the SAME note: 1 succeeds, 7 correctly fail (documents the LIKELY source of the original report — not a bug)", async () => {
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+    const note = await store.createNote("prefix TARGET_TEXT suffix", { path: "shared-ce" });
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 8 }, () =>
+        updateNote.execute({
+          id: note.id,
+          content_edit: { old_text: "TARGET_TEXT", new_text: "REPLACED" },
+          force: true,
+        }),
+      ),
+    );
+    const succeeded = outcomes.filter((o) => o.status === "fulfilled").length;
+    const failed = outcomes.filter((o) => o.status === "rejected");
+    expect(succeeded).toBe(1);
+    expect(failed).toHaveLength(7);
+    for (const f of failed) {
+      expect((f as PromiseRejectedResult).reason.error_type).toBe("content_edit_not_found");
+    }
+  });
+
   it("query-notes single note by id", async () => {
     const note = await store.createNote("Hello", { path: "test/note" });
     const tools = generateMcpTools(store);
@@ -3431,6 +3726,72 @@ describe("MCP tools", async () => {
     }) as any;
     expect(result.fields.name.type).toBe("string");
     expect(result.fields.age.type).toBe("integer");
+  });
+
+  // vault#555 fix 4 — a non-indexed field's `type` was never validated
+  // anywhere; a genuinely unrecognized type string was accepted and
+  // persisted verbatim, no error.
+  it("update-tag rejects an unrecognized field type (invalid_type)", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({ tag: "widget", fields: { weird: { type: "frobnicator" } } });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.error_type).toBe("tag_field_conflict");
+    expect(caught.violations).toHaveLength(1);
+    expect(caught.violations[0].field).toBe("weird");
+    expect(caught.violations[0].reason).toBe("invalid_type");
+
+    // Nothing persisted.
+    const record = await store.getTagRecord("widget");
+    expect(record?.fields ?? null).toBeFalsy();
+  });
+
+  // vault#555 fix 5 — one call declaring TWO bad fields (an unrecognized
+  // type AND a non-conforming default) reports BOTH violations together,
+  // not just the first one encountered.
+  it("update-tag reports an unrecognized type AND a bad default together in one call", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "widget",
+        fields: {
+          weird: { type: "frobnicator" },
+          bad_default: { type: "string", enum: ["a", "b"], default: "zzz" },
+        },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.violations).toHaveLength(2);
+    const byField = new Map(caught.violations.map((v: any) => [v.field, v.reason]));
+    expect(byField.get("weird")).toBe("invalid_type");
+    expect(byField.get("bad_default")).toBe("invalid_default");
+  });
+
+  it("update-tag accepts every recognized field type", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const result = await updateTag.execute({
+      tag: "widget",
+      fields: {
+        a: { type: "string" },
+        b: { type: "number" },
+        c: { type: "integer" },
+        d: { type: "boolean" },
+        e: { type: "array" },
+        f: { type: "object" },
+      },
+    }) as any;
+    expect(result.fields.a.type).toBe("string");
+    expect(result.fields.f.type).toBe("object");
   });
 
   it("find-path works with ID/path resolution", async () => {
@@ -4341,6 +4702,58 @@ describe("schema validation (tags.fields)", async () => {
     }) as any;
 
     expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
+  });
+
+  // vault#555 fix 3 — an enum-membership violation on an INDEXED
+  // (non-strict) field is stored, findable via `eq` (indexed⇒strict is
+  // TYPE-only, not enum-domain — a ratified policy, not a bug), but the
+  // advisory `enum_mismatch` warning used to be visible ONLY on the
+  // one-time create/update response — a caller reading the note back via
+  // query-notes (the natural way to re-check a stored value) saw nothing,
+  // contradicting "advisory violations surface as warnings."
+  it("query-notes surfaces validation_status (enum_mismatch on an indexed field) — single-id fetch", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await updateTag.execute({
+      tag: "widget",
+      fields: { status: { type: "string", enum: ["a", "b"], indexed: true } },
+    });
+    const created = await create.execute({ content: "x", tags: ["widget"], metadata: { status: "bogus" } }) as any;
+
+    // Findable via eq — indexed⇒strict is TYPE-only, enum stays advisory.
+    const found = await query.execute({ metadata: { status: { eq: "bogus" } }, include_content: true }) as any[];
+    expect(found).toHaveLength(1);
+    expect(found[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+
+    // Single-id fetch also carries it.
+    const single = await query.execute({ id: created.id }) as any;
+    expect(single.validation_status.warnings[0].reason).toBe("enum_mismatch");
+    expect(single.validation_status.warnings[0].field).toBe("status");
+  });
+
+  it("query-notes surfaces validation_status on the default list path (lean NoteIndex shape)", async () => {
+    await store.upsertTagSchema("task", {
+      fields: { priority: { type: "string", enum: ["high", "low"] } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    await create.execute({ content: "x", tags: ["task"], metadata: { priority: "ULTRA" } });
+
+    // Default list mode (include_content omitted → lean NoteIndex).
+    const list = await query.execute({ tag: "task" }) as any[];
+    expect(list).toHaveLength(1);
+    expect(list[0].validation_status?.warnings?.[0]?.reason).toBe("enum_mismatch");
+  });
+
+  it("query-notes omits validation_status entirely when no tag declares fields (no behavior change)", async () => {
+    await store.createNote("plain note", { tags: ["untagged-schema"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const list = await query.execute({ tag: "untagged-schema" }) as any[];
+    expect(list[0].validation_status).toBeUndefined();
   });
 
   it("validation never blocks the write — note exists with warnings attached", async () => {

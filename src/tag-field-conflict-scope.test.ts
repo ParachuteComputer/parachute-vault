@@ -330,4 +330,48 @@ describe("invalid_indexed_field × tag scope — the 400 door is scrubbed too (w
     expect(caught).toBeInstanceOf(IndexedFieldError);
     expect(caught.message).toContain("mine-too");
   });
+
+  // vault#555 fix 4/5 — `invalid_type` and `invalid_default` are own-field
+  // violations (no `other_tag`, no cross-tag data to leak) so
+  // `scrubTagFieldViolationsByScope` is a documented no-op for them by
+  // construction. Pin that a scoped caller still gets the FULL violation
+  // (field/reason/message) — nothing accidentally strips it.
+  test("invalid_type and invalid_default violations pass through the scope-scrub untouched (no other_tag to scrub)", async () => {
+    seedVault("journal");
+    getVaultStore("journal");
+
+    // REST
+    const res = await handleTags(
+      new Request("http://localhost/api/tags/mine", {
+        method: "PUT",
+        body: JSON.stringify({
+          fields: {
+            weird: { type: "frobnicator" },
+            bad_default: { type: "string", enum: ["a", "b"], default: "zzz" },
+          },
+        }),
+      }),
+      getVaultStore("journal"),
+      "/mine",
+      { allowed: new Set(["mine"]), raw: ["mine"] },
+    );
+    expect(res.status).toBe(422);
+    const body: any = await res.json();
+    expect(body.violations).toHaveLength(2);
+    const byField = new Map(body.violations.map((v: any) => [v.field, v]));
+    expect(byField.get("weird").reason).toBe("invalid_type");
+    expect(byField.get("weird").other_tag).toBeUndefined();
+    expect(byField.get("bad_default").reason).toBe("invalid_default");
+
+    // MCP
+    const tool = await updateTagTool("journal", ["mine"]);
+    let caught: any;
+    try {
+      await tool.execute({ tag: "mine", fields: { weird: { type: "frobnicator" } } });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.violations).toHaveLength(1);
+    expect(caught.violations[0].reason).toBe("invalid_type");
+  });
 });

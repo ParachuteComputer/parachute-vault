@@ -261,4 +261,77 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
     const bRecord = await store.getTagRecord("b");
     expect(bRecord?.fields ?? null).toBeFalsy();
   });
+
+  // vault#555 fix 4 — a non-indexed field's `type` was NEVER validated
+  // anywhere: `mapFieldType` (the only prior type check) ran solely on
+  // `indexed: true` fields. `update-tag{fields:{weird:{type:"frobnicator"}}}`
+  // used to be silently accepted and persisted verbatim.
+  it("REST PUT /api/tags/:name rejects an unrecognized field type with 422 tag_field_conflict / invalid_type", async () => {
+    const req = new Request("http://localhost/api/tags/widget", {
+      method: "PUT",
+      body: JSON.stringify({ fields: { weird: { type: "frobnicator" } } }),
+    });
+    const res = await handleTags(req, store, "/widget");
+    expect(res.status).toBe(422);
+    const body: any = await res.json();
+    expect(body.error_type).toBe("tag_field_conflict");
+    expect(body.violations).toHaveLength(1);
+    expect(body.violations[0].field).toBe("weird");
+    expect(body.violations[0].reason).toBe("invalid_type");
+    expect(body.violations[0].message).toContain("frobnicator");
+    expect(body.violations[0].message).toContain("string");
+
+    // Nothing persisted.
+    const record = await store.getTagRecord("widget");
+    expect(record?.fields ?? null).toBeFalsy();
+  });
+
+  // vault#555 fix 5 — invalid_field_default used to be FAIL-FAST on REST
+  // (a single-violation 400, silently dropping every OTHER bad field in the
+  // same call). Now bundled with invalid_type (and any cross-tag
+  // violations) into ONE 422 report — every invalid field at once.
+  it("REST PUT /api/tags/:name reports a bad default AND an unrecognized type together, not first-only", async () => {
+    const req = new Request("http://localhost/api/tags/widget", {
+      method: "PUT",
+      body: JSON.stringify({
+        fields: {
+          weird: { type: "frobnicator" },
+          bad_default: { type: "string", enum: ["a", "b"], default: "zzz" },
+        },
+      }),
+    });
+    const res = await handleTags(req, store, "/widget");
+    expect(res.status).toBe(422);
+    const body: any = await res.json();
+    expect(body.error_type).toBe("tag_field_conflict");
+    expect(body.violations).toHaveLength(2);
+    const byField = new Map(body.violations.map((v: any) => [v.field, v.reason]));
+    expect(byField.get("weird")).toBe("invalid_type");
+    expect(byField.get("bad_default")).toBe("invalid_default");
+    expect(body.message).toContain("no changes were applied");
+
+    // Nothing persisted.
+    const record = await store.getTagRecord("widget");
+    expect(record?.fields ?? null).toBeFalsy();
+  });
+
+  // Positive control — every one of the six recognized types (indexable or
+  // not) is accepted without complaint.
+  it("REST PUT /api/tags/:name accepts every recognized field type", async () => {
+    const req = new Request("http://localhost/api/tags/widget", {
+      method: "PUT",
+      body: JSON.stringify({
+        fields: {
+          a: { type: "string" },
+          b: { type: "number" },
+          c: { type: "integer" },
+          d: { type: "boolean" },
+          e: { type: "array" },
+          f: { type: "object" },
+        },
+      }),
+    });
+    const res = await handleTags(req, store, "/widget");
+    expect(res.status).toBe(200);
+  });
 });
