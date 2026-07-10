@@ -4672,6 +4672,104 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(links[0]!.relationship).toBe("knows");
   });
 
+  // vault#570 — content-parsed [[wikilinks]] to a missing target used to
+  // fire NO write-time warning over REST either, mirroring the MCP fix.
+  test("POST /notes with a content [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "See [[Nowhere REST]] for details." }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("unresolved_link");
+    expect(body.warnings[0].target).toBe("Nowhere REST");
+    expect(await store.getLinks(body.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a target matching ≥2 notes is a distinct situation from a
+  // genuine miss: `ambiguous_link`, not `unresolved_link`, and no edge.
+  test("POST /notes with a content [[wikilink]] to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/RestDup" });
+    await store.createNote("B", { path: "Folder2/RestDup" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "See [[RestDup]] for details." }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("ambiguous_link");
+    expect(body.warnings[0].target).toBe("RestDup");
+    expect(body.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(body.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a structured `links` entry against an ambiguous target gets
+  // the same treatment over REST (shared core implementation).
+  test("POST /notes with a structured link to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/RestDup2" });
+    await store.createNote("B", { path: "Folder2/RestDup2" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "no wikilinks here",
+        links: [{ target: "RestDup2", relationship: "knows" }],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("ambiguous_link");
+    expect(body.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(body.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  test("PATCH content update with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    await store.createNote("plain", { id: "patchable", path: "PatchableRest" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/patchable", { content: "now references [[Not Yet Real REST]]", force: true }),
+      store,
+      "/patchable",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("unresolved_link");
+    expect(body.warnings[0].target).toBe("Not Yet Real REST");
+
+    // A tags-only follow-up PATCH must not re-surface the warning.
+    const tagOnly = await handleNotes(
+      mkReq("PATCH", "/notes/patchable", { tags: { add: ["x"] }, force: true }),
+      store,
+      "/patchable",
+    );
+    const tagOnlyBody = await tagOnly.json() as any;
+    expect(tagOnlyBody.warnings).toBeUndefined();
+  });
+
+  // vault#570 — `if_missing: "create"` is a distinct create-shaped code
+  // path in routes.ts (separate from POST /notes); it needs the same fix.
+  test("PATCH if_missing:create with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/brand-new-rest", {
+        if_missing: "create",
+        content: "See [[Nowhere Upsert REST]].",
+      }),
+      store,
+      "/brand-new-rest",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("unresolved_link");
+    expect(body.warnings[0].target).toBe("Nowhere Upsert REST");
+  });
+
   test("PATCH without a link mutation or flag does NOT include links", async () => {
     await store.createNote("a", { id: "a" });
     await store.createNote("b", { id: "b" });

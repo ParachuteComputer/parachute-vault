@@ -377,11 +377,29 @@ Warning codes today:
   (edit-distance against the FTS5 vocabulary + tag names). Carries `query`
   and `did_you_mean`. `search=` only, only on a zero-result query, and only
   for UNSCOPED sessions (the suggestion is computed vault-wide — see below).
-- `unresolved_link` (vault#555) — a structured `links` entry on
-  `POST /notes` or `PATCH /notes/{id}` (mirrored by MCP `create-note` /
-  `update-note`) didn't resolve to any note. Carries `target` and
-  `relationship`. **Write path, not the query path above** — see "Structured
-  `links` resolution" below for where this attaches on the response.
+- `unresolved_link` (vault#555; content `[[wikilinks]]` since vault#570) — a
+  link target — a structured `links` entry OR a content-parsed
+  `[[wikilink]]` — on `POST /notes` or `PATCH /notes/{id}` (mirrored by MCP
+  `create-note` / `update-note`) didn't resolve to any note. Carries
+  `target` and `relationship` (`"wikilink"` for a content wikilink, the
+  caller's own string for a structured link). **Write path, not the query
+  path above** — see "Structured `links` resolution" below for where this
+  attaches on the response. Before vault#570, a content `[[wikilink]]` to a
+  missing target queued into `unresolved_wikilinks` (same as a structured
+  link) but fired NO write-time warning — the asymmetry is closed.
+- `ambiguous_link` (vault#570) — a link target (structured `links` OR a
+  content `[[wikilink]]`) matched **≥2 notes** (e.g. two notes share an H1
+  title/basename) rather than zero. Distinct from `unresolved_link` because
+  it's a factually different situation — "matched 2, not 0" — and the
+  response would be WRONG to describe it as "did not resolve to any note".
+  Carries `target`, `relationship`, and `candidate_count` (the number of
+  matching notes — never their ids/paths, to avoid leaking which specific
+  notes collided). **No edge is created** — there's no principled way to
+  pick one of the candidates — and the target is **not queued** for lazy
+  resolution either: a future note being created can't retroactively
+  resolve an ambiguity between two notes that already exist. Use a more
+  specific path, `[[Target.ext]]` (vault#328), or the note's ID to
+  disambiguate and retry.
 
 **Surfacing differs by response shape** (compat-preserving — this is why
 it's additive, not a breaking wire-shape change):
@@ -1124,24 +1142,36 @@ resolves with the SAME semantics as a `[[wikilink]]` — ID match first, then
 exact path, then basename/title (e.g. `target: "Alice"` resolves a note
 filed at `People/Alice`) — NOT path-only as before. The `relationship` you
 pass is preserved verbatim (wikilinks always use `"wikilink"`; a structured
-link carries whatever you named). Two forward-ref cases are handled without
-dropping the edge:
+link carries whatever you named). Content `[[wikilinks]]` and structured
+`links` share ONE resolver (`resolveWikilinkDetailed`/`resolveOrQueueLink`
+in `core/src/wikilinks.ts`), so every case below applies identically to
+both — a `links` entry and an equivalent `[[wikilink]]` in `content` behave
+the same:
 
-- **Same batch.** A `links` entry pointing at a note created LATER in the
-  same `notes` array (POST) resolves once every note in the batch exists —
-  order doesn't matter.
+- **Same batch.** A link pointing at a note created LATER in the same
+  `notes` array (POST) resolves once every note in the batch exists — order
+  doesn't matter. This applies to a content `[[wikilink]]` too (vault#570).
 - **Later call.** A target that doesn't exist yet anywhere is queued (same
-  `unresolved_wikilinks` machinery `[[wikilinks]]` already use) and
-  backfills automatically the moment a matching note is created, in this
-  vault, by any client. The response carries an `unresolved_link` warning
-  (see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
+  `unresolved_wikilinks` machinery for both kinds) and backfills
+  automatically the moment a matching note is created, in this vault, by
+  any client. The response carries an `unresolved_link` warning (see the
+  [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
   above) naming the `target` and `relationship` so the caller knows the edge
-  isn't live yet — it's never silently dropped.
+  isn't live yet — it's never silently dropped. Before vault#570 this
+  warning fired for a structured `links` miss but NOT for the equivalent
+  content `[[wikilink]]` miss (both were queued identically — only the
+  write-time signal was asymmetric).
 - **Genuinely unresolvable** (typo, or a target that will never exist)
   looks identical to the "later call" case on the wire — the write still
   queues it. Use `GET /vault/{name}/api/unresolved-wikilinks` to audit what's
   pending across the vault (rows now carry a `relationship` field alongside
   `source_id`/`target_path`).
+- **Ambiguous** (vault#570) — the target matches ≥2 notes (e.g. two notes
+  share a basename/title). The response carries an `ambiguous_link` warning
+  instead of `unresolved_link` — see the warnings-channel entry above for
+  the full shape. No edge is created and the target is NOT queued (queuing
+  would imply "wait for this to be created," which doesn't describe an
+  ambiguity between notes that already exist).
 
 **`if_exists` — idempotent upsert on a path conflict (vault#555).** Pass
 `if_exists: "error"|"ignore"|"update"|"replace"` (default `"error"` —

@@ -4,6 +4,7 @@ import * as linkOps from "./links.js";
 import { getNote } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
 import { transaction } from "./txn.js";
+import type { QueryWarning } from "./query-warnings.js";
 
 // ---------------------------------------------------------------------------
 // Parser — extract [[wikilinks]] from markdown content
@@ -357,19 +358,14 @@ export function getUnresolvedLinksForNote(db: Database, noteId: string): BrokenL
 const WIKILINK_REL = "wikilink";
 
 /**
- * Sync wikilink-based links for a note.
- * Parses content for [[wikilinks]], resolves targets, creates/removes links.
- *
- * Returns counts of changes made.
+ * Deduplicate parsed wikilinks by target (case-insensitively) — the same
+ * target mentioned multiple times in a note's content resolves to ONE
+ * link/warning, not one per mention. Shared by {@link syncWikilinks} (which
+ * mutates links/the pending-resolution table) and
+ * {@link getContentWikilinkWarnings} (which only reads) so the two can't
+ * drift on which targets they consider.
  */
-export function syncWikilinks(
-  db: Database,
-  noteId: string,
-  content: string,
-): { added: number; removed: number; unresolved: string[] } {
-  const parsed = parseWikilinks(content);
-
-  // Deduplicate by target (same target mentioned multiple times = one link)
+function dedupeWikilinkTargets(parsed: ParsedWikilink[]): Map<string, ParsedWikilink> {
   const targetMap = new Map<string, ParsedWikilink>();
   for (const wl of parsed) {
     const key = wl.target.toLowerCase();
@@ -377,17 +373,53 @@ export function syncWikilinks(
       targetMap.set(key, wl);
     }
   }
+  return targetMap;
+}
+
+/** One target's ambiguity — surfaced target string + how many notes it matched. */
+export interface AmbiguousWikilinkTarget {
+  target: string;
+  count: number;
+}
+
+/**
+ * Sync wikilink-based links for a note.
+ * Parses content for [[wikilinks]], resolves targets, creates/removes links.
+ *
+ * Returns counts of changes made. `unresolved` is content wikilinks whose
+ * target matched NO note (queued into `unresolved_wikilinks` for lazy
+ * backfill — see {@link resolveUnresolvedWikilinks}). `ambiguous` (vault#570)
+ * is content wikilinks whose target matched ≥2 notes — these are NEITHER
+ * linked NOR queued: a future note being created can't retroactively
+ * resolve an ambiguity between two notes that ALREADY exist, and queuing it
+ * would risk the pending-resolution sweep later linking to an arbitrary
+ * THIRD same-named note rather than reporting the collision. The caller
+ * (MCP `create-note`/`update-note`, REST `POST`/`PATCH /notes`) surfaces
+ * `ambiguous` as an `ambiguous_link` warning naming the target + match
+ * count, distinct from `unresolved`'s `unresolved_link`.
+ */
+export function syncWikilinks(
+  db: Database,
+  noteId: string,
+  content: string,
+): { added: number; removed: number; unresolved: string[]; ambiguous: AmbiguousWikilinkTarget[] } {
+  const targetMap = dedupeWikilinkTargets(parseWikilinks(content));
 
   // Resolve each unique target
   const resolvedLinks = new Map<string, { targetId: string; wl: ParsedWikilink }>();
   const unresolved: string[] = [];
+  const ambiguous: AmbiguousWikilinkTarget[] = [];
 
   for (const [key, wl] of targetMap) {
-    const targetId = resolveWikilink(db, wl.target);
-    if (targetId && targetId !== noteId) {
-      // Don't create self-links
-      resolvedLinks.set(targetId, { targetId, wl });
-    } else if (!targetId) {
+    const detail = resolveWikilinkDetailed(db, wl.target);
+    if (detail.resolved) {
+      // Don't create self-links — silently skipped, same as before.
+      if (detail.note_id !== noteId) {
+        resolvedLinks.set(detail.note_id!, { targetId: detail.note_id!, wl });
+      }
+    } else if (detail.ambiguous) {
+      ambiguous.push({ target: wl.target, count: detail.candidates.length });
+    } else {
       unresolved.push(wl.target);
     }
   }
@@ -429,10 +461,11 @@ export function syncWikilinks(
     }
   }
 
-  // Store unresolved wikilinks for later resolution
+  // Store unresolved wikilinks for later resolution. Ambiguous targets are
+  // deliberately NOT queued here — see the doc comment above.
   syncUnresolvedWikilinks(db, noteId, unresolved);
 
-  return { added, removed, unresolved };
+  return { added, removed, unresolved, ambiguous };
 }
 
 // ---------------------------------------------------------------------------
@@ -621,9 +654,24 @@ export function resolveUnresolvedWikilinks(
  * extension, exact path, basename).
  */
 export function resolveLinkTarget(db: Database, idOrPath: string): string | null {
-  const byId = db.prepare("SELECT id FROM notes WHERE id = ?").get(idOrPath) as { id: string } | null;
-  if (byId) return byId.id;
-  return resolveWikilink(db, idOrPath);
+  const detail = resolveLinkTargetDetailed(db, idOrPath);
+  return detail.resolved ? detail.note_id! : null;
+}
+
+/**
+ * Detailed counterpart to {@link resolveLinkTarget} — same ID-then-path/
+ * basename resolution order, but surfaces AMBIGUOUS (≥2 path/basename
+ * matches, vault#570) as a distinct outcome instead of collapsing it into
+ * the same `null` a genuine miss returns. An ID lookup is never ambiguous
+ * (the `id` column is the primary key), so ambiguity can only arise from
+ * the path/basename fallback — {@link resolveWikilinkDetailed}.
+ */
+export function resolveLinkTargetDetailed(db: Database, idOrPath: string): WikilinkResolution {
+  const byId = db.prepare("SELECT id, path FROM notes WHERE id = ?").get(idOrPath) as { id: string; path: string | null } | null;
+  if (byId) {
+    return { resolved: true, note_id: byId.id, path: byId.path ?? undefined, candidates: [] };
+  }
+  return resolveWikilinkDetailed(db, idOrPath);
 }
 
 /**
@@ -654,24 +702,90 @@ export function queueUnresolvedLink(
   ).run(sourceId, targetPath, relationship);
 }
 
+/** Outcome of {@link resolveOrQueueLink} — a discriminated union so callers can't confuse "queued" with "ambiguous" (vault#570; both used to collapse to the same `null`). */
+export type ResolveOrQueueOutcome =
+  | { status: "resolved"; note_id: string }
+  | { status: "ambiguous"; candidates: { note_id: string; path: string }[] }
+  | { status: "queued" };
+
 /**
  * Resolve a structured link NOW, or queue it for lazy resolution when the
  * target doesn't exist yet — mirroring the wikilink forward-ref contract
  * (a target created later, in this same batch or a future call, backfills
- * the edge automatically via {@link resolveUnresolvedWikilinks}). Returns
- * the resolved note ID, or `null` when queued. Callers MUST surface an
- * `unresolved_link` warning naming the target when this returns `null` —
- * the write itself never fails, but silence is never the fallback
- * (vault#555 — "the API should never silently do the wrong thing").
+ * the edge automatically via {@link resolveUnresolvedWikilinks}).
+ *
+ * Returns a {@link ResolveOrQueueOutcome}:
+ *   - `"resolved"` — the edge should be created against `note_id` now.
+ *   - `"ambiguous"` (vault#570) — the target matched ≥2 notes (e.g. two
+ *     notes sharing an H1 title). NEITHER linked nor queued — see
+ *     {@link syncWikilinks}'s doc comment for why queuing an ambiguous
+ *     target would be wrong. Callers MUST surface a distinct
+ *     `ambiguous_link` warning naming the target + `candidates.length`.
+ *   - `"queued"` — the target matched NO note; queued for lazy backfill.
+ *     Callers MUST surface an `unresolved_link` warning naming the target.
+ *
+ * The write itself never fails on either non-`"resolved"` outcome — silence
+ * is never the fallback (vault#555 — "the API should never silently do the
+ * wrong thing").
  */
 export function resolveOrQueueLink(
   db: Database,
   sourceId: string,
   target: string,
   relationship: string,
-): string | null {
-  const resolvedId = resolveLinkTarget(db, target);
-  if (resolvedId) return resolvedId;
+): ResolveOrQueueOutcome {
+  const detail = resolveLinkTargetDetailed(db, target);
+  if (detail.resolved) return { status: "resolved", note_id: detail.note_id! };
+  if (detail.ambiguous) return { status: "ambiguous", candidates: detail.candidates };
   queueUnresolvedLink(db, sourceId, target, relationship);
-  return null;
+  return { status: "queued" };
+}
+
+/**
+ * Content-wikilink counterpart of the `unresolved_link`/`ambiguous_link`
+ * warnings structured `links` already produce via {@link resolveOrQueueLink}
+ * (vault#570 — content-parsed `[[wikilinks]]` to a missing target used to
+ * fire NO write-time warning at all, even though the equivalent structured
+ * `links` entry did). READ-ONLY: does not mutate `unresolved_wikilinks` or
+ * create/remove any link — that mutation already happened inside
+ * {@link syncWikilinks} (called from `Store.createNote`/`updateNote`).
+ * Callers invoke this AFTER the note's content is committed, passing the
+ * SAME `noteId`/`content` pair, to recompute the identical per-target
+ * classification for the response's `warnings` array — single source of
+ * truth is {@link resolveWikilinkDetailed}, so this can't drift from what
+ * `syncWikilinks` actually did. Mirrors `syncWikilinks`'s target selection
+ * exactly: same lowercase-target dedupe key (via
+ * {@link dedupeWikilinkTargets}), same self-link skip (a wikilink resolving
+ * to the note's own id is neither linked nor warned about).
+ */
+export function getContentWikilinkWarnings(
+  db: Database,
+  noteId: string,
+  content: string,
+): QueryWarning[] {
+  const targetMap = dedupeWikilinkTargets(parseWikilinks(content));
+  const warnings: QueryWarning[] = [];
+
+  for (const [, wl] of targetMap) {
+    const detail = resolveWikilinkDetailed(db, wl.target);
+    if (detail.resolved) continue; // resolved (incl. self-link) — nothing to warn about
+    if (detail.ambiguous) {
+      warnings.push({
+        code: "ambiguous_link",
+        message: `wikilink target "${wl.target}" matched ${detail.candidates.length} notes — ambiguous, no link created. Use a more specific path, [[Target.ext]], or the note's ID to disambiguate.`,
+        target: wl.target,
+        relationship: WIKILINK_REL,
+        candidate_count: detail.candidates.length,
+      });
+    } else {
+      warnings.push({
+        code: "unresolved_link",
+        message: `wikilink target "${wl.target}" did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
+        target: wl.target,
+        relationship: WIKILINK_REL,
+      });
+    }
+  }
+
+  return warnings;
 }
