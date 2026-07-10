@@ -453,8 +453,10 @@ Your connection carries one of three scopes, and it shapes what you can do here
 - **\`admin\`** — everything, including that restructuring, plus minting scoped
   child tokens.
 
-If a tool this guide mentions fails with "Unknown tool," that's your scope, not
-a bug — the tool sits above your tier. Don't fight it: tell the person plainly
+If a tool this guide mentions fails with "Unknown tool" — or a normally-visible
+tool refuses one argument with "Forbidden" (e.g. \`vault-info { description }\`
+for a non-admin) — that's your scope, not a bug: the action sits above your
+tier. Don't fight it: tell the person plainly
 what you'd do with more access ("I can add notes, but reorganizing your tags
 needs admin — want to grant it?") and let them decide. Most people connect with
 admin, so usually you'll have the whole set.
