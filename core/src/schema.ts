@@ -1355,28 +1355,6 @@ function migrateToV24(db: Database): void {
 }
 
 /**
- * True when `notes_fts` already carries the v25 two-column shape (`path` +
- * `content`). `PRAGMA table_info` works on an FTS5 virtual table the same
- * way it does on an ordinary table — it reports the module's declared
- * columns — so this is a cheap, portable idempotency check: a fresh vault
- * (SCHEMA_SQL already created the v25 shape directly) short-circuits
- * `migrateToV25` without touching a row; a v24 vault (single `content`
- * column) does not have a `path` row here and proceeds to rebuild.
- */
-function notesFtsHasPathColumn(db: Database): boolean {
-  if (!hasTable(db, "notes_fts")) return false;
-  try {
-    const cols = db.prepare("PRAGMA table_info(notes_fts)").all() as { name: string }[];
-    return cols.some((c) => c.name === "path");
-  } catch {
-    // Defensive — PRAGMA table_info should never throw on an existing
-    // table/virtual-table, but if it somehow does, treat as "needs rebuild"
-    // rather than silently skipping the migration.
-    return false;
-  }
-}
-
-/**
  * Migrate v24 → v25: rebuild `notes_fts` to index BOTH `path` (title) and
  * `content` as separate weighted FTS5 columns, with Porter stemming added
  * to the tokenizer (vault#551 WS2B/C — the Reliability & Usability
@@ -1405,8 +1383,23 @@ function notesFtsHasPathColumn(db: Database): boolean {
  * this migration is self-contained (it does NOT read from the old
  * `notes_fts` — that data is gone the moment DROP TABLE runs).
  *
- * Idempotent via `notesFtsHasPathColumn` (checked first — a vault already
- * on the v25 shape, including every fresh vault, no-ops immediately).
+ * ALL-OR-NOTHING (generalist review, #565): the entire DROP + CREATE +
+ * trigger-recreate + repopulation sequence runs inside a SINGLE
+ * `transaction`, not just the repopulation loop. A crash partway through
+ * with the DDL committed but the index empty would otherwise be
+ * unrecoverable — the recreated table already has the `path` column, so the
+ * `hasColumn(db, "notes_fts", "path")` guard would report "done" and never
+ * retry, leaving search permanently empty. Wrapping the whole sequence means a
+ * rollback restores the pre-v25 single-column shape (no `path`), so the
+ * guard correctly re-detects "not migrated" and the next boot re-runs it —
+ * correct-by-construction rather than dependent on the DDL fully
+ * completing.
+ *
+ * Idempotent via `hasColumn(db, "notes_fts", "path")` (checked first — a
+ * vault already on the v25 shape, including every fresh vault, no-ops
+ * immediately; `PRAGMA table_info` returns `[]` for a nonexistent table and
+ * the declared columns for an FTS5 virtual table, so the shared helper is
+ * correct here without a separate `hasTable` pre-check).
  * Cross-runtime: DROP/CREATE VIRTUAL TABLE, triggers, and the repopulation
  * SELECT/INSERT are all standard FTS5 + SQL surface — no bun-only
  * functions — but `tokenize='porter unicode61'` and the two-column
@@ -1422,45 +1415,65 @@ function notesFtsHasPathColumn(db: Database): boolean {
  */
 function migrateToV25(db: Database): void {
   if (!hasTable(db, "notes")) return;
-  if (notesFtsHasPathColumn(db)) return;
+  if (hasColumn(db, "notes_fts", "path")) return;
 
   console.log(
     "[vault] migrating to schema v25 (vault#551): rebuilding notes_fts with path+content columns and porter stemming...",
   );
 
-  db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
-  db.exec("DROP TRIGGER IF EXISTS notes_fts_delete");
-  db.exec("DROP TRIGGER IF EXISTS notes_fts_update");
-  db.exec("DROP TABLE IF EXISTS notes_fts");
-
-  db.exec(`
-    CREATE VIRTUAL TABLE notes_fts USING fts5(
-      path,
-      content,
-      content='notes',
-      content_rowid='rowid',
-      tokenize='porter unicode61'
-    )
-  `);
-  db.exec(`
-    CREATE TRIGGER notes_fts_insert AFTER INSERT ON notes BEGIN
-      INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
-    END
-  `);
-  db.exec(`
-    CREATE TRIGGER notes_fts_delete AFTER DELETE ON notes BEGIN
-      INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
-    END
-  `);
-  db.exec(`
-    CREATE TRIGGER notes_fts_update AFTER UPDATE OF content, path ON notes BEGIN
-      INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
-      INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
-    END
-  `);
-
+  // The ENTIRE sequence — DROP triggers + table, CREATE the new virtual
+  // table, CREATE the three sync triggers, AND repopulate — runs inside ONE
+  // transaction so it's strictly all-or-nothing (generalist review, #565).
+  //
+  // Why this matters: if the DDL ran outside the transaction (only the
+  // repopulation transacted, the pre-review shape), a crash between
+  // "CREATE VIRTUAL TABLE" and the end of repopulation would leave a
+  // recreated-but-EMPTY notes_fts — and the idempotency guard
+  // (`hasColumn(db, "notes_fts", "path")`) would see the new `path` column
+  // and report the migration "done" on the next boot, so search stays
+  // PERMANENTLY empty with no retry. Worse, a crash before the CREATE TRIGGERs would leave
+  // future writes unindexed too. Wrapping the whole thing means a rollback
+  // restores the pre-v25 shape (single `content` column, no `path`), so the
+  // guard correctly reports "not migrated" and the next boot re-runs it
+  // cleanly — the guard becomes correct-by-construction rather than relying
+  // on the DDL having fully completed. The reviewer verified CREATE VIRTUAL
+  // TABLE + CREATE TRIGGER execute fine inside bun's `BEGIN IMMEDIATE …
+  // COMMIT`; a DO backend routes the same block through `transactionSync`
+  // (see core/src/txn.ts) with the identical commit-on-return /
+  // rollback-on-throw contract.
   let repopulated = 0;
   transaction(db, () => {
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_delete");
+    db.exec("DROP TRIGGER IF EXISTS notes_fts_update");
+    db.exec("DROP TABLE IF EXISTS notes_fts");
+
+    db.exec(`
+      CREATE VIRTUAL TABLE notes_fts USING fts5(
+        path,
+        content,
+        content='notes',
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+      )
+    `);
+    db.exec(`
+      CREATE TRIGGER notes_fts_insert AFTER INSERT ON notes BEGIN
+        INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
+      END
+    `);
+    db.exec(`
+      CREATE TRIGGER notes_fts_delete AFTER DELETE ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
+      END
+    `);
+    db.exec(`
+      CREATE TRIGGER notes_fts_update AFTER UPDATE OF content, path ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, path, content) VALUES('delete', old.rowid, COALESCE(old.path, ''), old.content);
+        INSERT INTO notes_fts(rowid, path, content) VALUES (new.rowid, COALESCE(new.path, ''), new.content);
+      END
+    `);
+
     const rows = db.prepare("SELECT rowid, path, content FROM notes").all() as {
       rowid: number;
       path: string | null;

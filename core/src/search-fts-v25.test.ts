@@ -24,6 +24,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { initSchema, SCHEMA_VERSION } from "./schema.js";
+import { transaction } from "./txn.js";
 import * as noteOps from "./notes.js";
 
 let store: SqliteStore;
@@ -246,6 +247,66 @@ describe("search — v24 → v25 migration (legacy vault upgrade)", () => {
     expect(() => initSchema(db)).not.toThrow();
     const hits = await store.searchNotes("hello");
     expect(hits.length).toBe(1);
+  });
+
+  /**
+   * MUST-FIX (generalist review, #565): the whole DDL + repopulation runs
+   * inside ONE `transaction`, so a crash partway through can NEVER leave a
+   * recreated-but-EMPTY notes_fts (which the path-column idempotency guard
+   * would then treat as "done," leaving search permanently empty). This test
+   * reproduces a mid-migration interruption by driving the exact rebuild DDL
+   * through the SAME `transaction` seam `migrateToV25` uses and throwing
+   * before repopulation completes, then asserts (a) the throw rolled the DDL
+   * back to the pre-v25 v24 shape — NOT a committed-empty v25 table — and (b)
+   * a subsequent clean `initSchema` fully repopulates search. The load-bearing
+   * assertion is (a): under the pre-review shape (DDL OUTSIDE the transaction)
+   * the rolled-back table would still carry the `path` column, the guard would
+   * skip, and search would be silently empty forever.
+   */
+  it("an interrupted migration rolls back to the v24 shape and the next initSchema fully recovers — never silent-empty", () => {
+    const legacy = buildLegacyV24Vault();
+
+    // Sanity: it starts on the OLD single-column shape.
+    const cols = () =>
+      (legacy.prepare("PRAGMA table_info(notes_fts)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols()).toEqual(["content"]);
+
+    // Simulate `migrateToV25` crashing AFTER the DDL but BEFORE repopulation
+    // finishes — same `transaction` seam, same DDL, forced throw.
+    expect(() =>
+      transaction(legacy, () => {
+        legacy.exec("DROP TRIGGER IF EXISTS notes_fts_insert");
+        legacy.exec("DROP TRIGGER IF EXISTS notes_fts_delete");
+        legacy.exec("DROP TRIGGER IF EXISTS notes_fts_update");
+        legacy.exec("DROP TABLE IF EXISTS notes_fts");
+        legacy.exec(`
+          CREATE VIRTUAL TABLE notes_fts USING fts5(
+            path, content, content='notes', content_rowid='rowid', tokenize='porter unicode61'
+          )
+        `);
+        // ... crash here, before any INSERT INTO notes_fts.
+        throw new Error("simulated crash mid-migration");
+      }),
+    ).toThrow("simulated crash mid-migration");
+
+    // (a) Rollback restored the v24 shape — the recreated v25 table is GONE,
+    //     so the `hasColumn(notes_fts, "path")` guard will re-detect
+    //     "not migrated". If the DDL had been outside the transaction, `path`
+    //     would still be present here and the migration would be skipped.
+    expect(cols()).toEqual(["content"]);
+    const versionAfterCrash = (
+      legacy.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number }
+    ).v;
+    expect(versionAfterCrash).toBe(24);
+
+    // (b) A clean restart re-runs the migration and fully populates search —
+    //     both a title-only term and a body term are findable, and the FTS
+    //     integrity-check passes. Never the silent-empty state.
+    initSchema(legacy);
+    expect(cols()).toContain("path");
+    expect(noteOps.searchNotes(legacy, "beekeeping").map((n) => n.id)).toContain("legacy-1"); // title-only
+    expect(noteOps.searchNotes(legacy, "firefighters").map((n) => n.id)).toContain("legacy-3"); // body
+    expect(() => legacy.exec(`INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')`)).not.toThrow();
   });
 });
 

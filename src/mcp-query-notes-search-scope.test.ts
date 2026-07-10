@@ -134,3 +134,56 @@ describe("MCP query-notes search × tag-scope — combined enforcement (vault#55
     }
   });
 });
+
+/**
+ * NIT 1 (auth-561 review, #565): did_you_mean on a zero-result search is
+ * computed against the WHOLE vault's FTS5 vocabulary regardless of scope
+ * (`computeSearchDidYouMean` is scope-unaware by architecture, like every
+ * warning core produces). The MCP query-notes wrapper
+ * (`applyTagScopeWrappers`, src/mcp-tools.ts) strips the ENTIRE `warnings`
+ * array for a tag-scoped session, which covers `search_did_you_mean`
+ * generically — but the security property (a scoped token must not learn an
+ * out-of-scope note's vocabulary via a spelling suggestion) deserves a
+ * direct test, mirroring the REST test in src/contract-search.test.ts.
+ */
+function warningsOf(result: unknown): any[] {
+  if (result && typeof result === "object" && "warnings" in result && Array.isArray((result as any).warnings)) {
+    return (result as any).warnings;
+  }
+  return [];
+}
+
+describe("MCP query-notes did_you_mean × tag-scope suppression (#565 NIT 1)", () => {
+  test("a scoped session's zero-result search does NOT surface an out-of-scope term via search_did_you_mean", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+
+    // The near-match term "Vasquez" lives ONLY in an out-of-scope note.
+    await store.createNote("a note that discusses Vasquez and the incident report", { tags: ["work"] });
+
+    const scopedTool = await queryNotesTool("journal", ["health"]);
+    const scopedResult = await scopedTool.execute({ search: "Vasqez" }); // typo → zero results
+    expect(idsOf(scopedResult)).toEqual([]);
+    // The wrapper strips warnings wholesale for a scoped session — no
+    // search_did_you_mean leaking the out-of-scope "vasquez".
+    expect(warningsOf(scopedResult).some((w: any) => w.code === "search_did_you_mean")).toBe(false);
+    // Belt-and-suspenders: the out-of-scope term must not appear ANYWHERE in
+    // the serialized response (no did_you_mean field slipping through under a
+    // different shape).
+    expect(JSON.stringify(scopedResult).toLowerCase()).not.toContain("vasquez");
+  });
+
+  test("control: an UNSCOPED session's zero-result search DOES surface the suggestion (proves it's suppressed by scope, not simply absent)", async () => {
+    seedVault("journal");
+    const store = getVaultStore("journal");
+
+    await store.createNote("a note that discusses Vasquez and the incident report", { tags: ["work"] });
+
+    const unscopedTool = await queryNotesTool("journal", null);
+    const result = await unscopedTool.execute({ search: "Vasqez" });
+    expect(idsOf(result)).toEqual([]);
+    const w = warningsOf(result).find((x: any) => x.code === "search_did_you_mean");
+    expect(w).toBeDefined();
+    expect(w.did_you_mean).toBe("vasquez");
+  });
+});
