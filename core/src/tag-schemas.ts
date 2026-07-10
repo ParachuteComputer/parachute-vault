@@ -44,6 +44,25 @@ export interface TagFieldSchema {
   // "one" (scalar, default) or "many" (array). Advisory unless `strict:true`.
   // Distinct from relationship cardinality. vault#299.
   cardinality?: "one" | "many";
+  /**
+   * Explicit backfill value (vault#553 Decision B). When a note gains this
+   * tag and doesn't set the field, `applySchemaDefaults` (core/src/mcp.ts)
+   * writes THIS value onto the note. Undeclared (the default) means the
+   * field stays ABSENT on notes that don't set it — no more implicit
+   * first-enum-value / type-zero-value backfill. This is what makes
+   * `exists:false` trustworthy: "never set" and "explicitly set to the
+   * default" are now distinguishable states.
+   *
+   * Must conform to this field's own `type` (and `enum`, when declared) —
+   * `upsertTagRecord` (core/src/store.ts, the single chokepoint both REST
+   * and MCP funnel through) validates the default BEFORE persisting via
+   * {@link validateFieldDefault}; a non-conforming default is a tag-schema
+   * error (`invalid_field_default` / `TagFieldViolation` reason
+   * `"invalid_default"`), not a silent typo. `undefined` is JSON-serialized
+   * away by `JSON.stringify` — an omitted `default` key round-trips as "not
+   * declared", never as a stored `null`.
+   */
+  default?: unknown;
 }
 
 /**
@@ -147,6 +166,86 @@ export function getTagRecord(db: Database, tag: string): TagRecord | null {
  * for a tag-scoped caller (`scrubParentCycleError` in src/tag-scope.ts),
  * same posture as `TagFieldConflictError`.
  */
+/**
+ * Thrown by `upsertTagRecord` (core/src/store.ts's chokepoint — REST
+ * `PUT /api/tags/:name` and MCP `update-tag` both funnel through it) when a
+ * field's declared `default` (vault#553 Decision B) doesn't conform to that
+ * SAME field's own `type` (or `enum`, when declared). A bad default is a
+ * tag-schema authoring error, not silently-accepted junk that would poison
+ * every note gaining the tag — fail closed, same posture as
+ * `IndexedFieldError` and `ParentCycleError`. `error_type` is stamped
+ * directly (own-field validation leaf, one caller-facing shape) so the
+ * generic MCP domain-error mapping (`src/mcp-http.ts`) and REST's dedicated
+ * catch branch both surface it without a bespoke class-specific mapping.
+ */
+export class InvalidFieldDefaultError extends Error {
+  code = "INVALID_FIELD_DEFAULT" as const;
+  error_type = "invalid_field_default" as const;
+  field: string;
+
+  constructor(field: string, message: string) {
+    super(message);
+    this.name = "InvalidFieldDefaultError";
+    this.field = field;
+  }
+}
+
+/**
+ * Validate that a field's declared `default` (vault#553 Decision B) conforms
+ * to its own `type` and (when declared) `enum`. Returns `null` when the
+ * field has no `default` (the common case) or the default is valid;
+ * otherwise a {@link TagFieldViolation} with `reason: "invalid_default"`.
+ * Pure — never throws; the two callers (the store chokepoint's fail-fast
+ * pre-validate, and {@link collectTagFieldViolations}'s bundled MCP report)
+ * each decide how to surface it.
+ *
+ * Deliberately independent of `schema-defaults.ts`'s `valueMatchesType` (this
+ * module doesn't import that one, and vice versa — no cycle either way) so
+ * the two modules' type vocabularies can drift without cross-coupling; the
+ * rules are kept in lockstep by hand (string/number/integer/boolean/array/
+ * object, the SAME six as `TagFieldSchema.type`'s documented vocabulary).
+ */
+export function validateFieldDefault(field: string, spec: TagFieldSchema): TagFieldViolation | null {
+  if (spec.default === undefined) return null;
+  const value = spec.default;
+  const typeOk = defaultMatchesType(value, spec.type);
+  if (!typeOk) {
+    return {
+      field,
+      reason: "invalid_default",
+      message: `field "${field}" declares default ${JSON.stringify(value)}, which does not match its own type "${spec.type}"`,
+    };
+  }
+  if (spec.enum && spec.enum.length > 0 && typeof value === "string" && !spec.enum.includes(value)) {
+    return {
+      field,
+      reason: "invalid_default",
+      message: `field "${field}" declares default "${value}", which is not one of its own enum values [${spec.enum.join(", ")}]`,
+    };
+  }
+  return null;
+}
+
+/** Same six-type vocabulary as `TagFieldSchema.type`'s doc comment. Unknown/unset types pass (nothing to check against). */
+function defaultMatchesType(value: unknown, type: string): boolean {
+  switch (type) {
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    case "boolean":
+      return typeof value === "boolean";
+    case "array":
+      return Array.isArray(value);
+    case "object":
+      return !!value && typeof value === "object" && !Array.isArray(value);
+    default:
+      return true;
+  }
+}
+
 export class ParentCycleError extends Error {
   code = "PARENT_CYCLE" as const;
   error_type = "parent_cycle" as const;
@@ -403,7 +502,12 @@ function jsonOrNull(value: unknown): string | null {
  */
 export interface TagFieldViolation {
   field: string;
-  reason: "type_conflict" | "indexed_flag_conflict" | "unsupported_indexed_type" | "invalid_field_name";
+  reason:
+    | "type_conflict"
+    | "indexed_flag_conflict"
+    | "unsupported_indexed_type"
+    | "invalid_field_name"
+    | "invalid_default";
   message: string;
   /**
    * The conflicting declarer tag — present on the cross-tag reasons
@@ -522,12 +626,17 @@ export function collectCrossTagFieldViolations(
 /**
  * Full field-violation collection: {@link collectCrossTagFieldViolations}
  * PLUS the own-field checks (unsupported type for indexing, invalid
- * identifier). Used by the MCP `update-tag` tool, which — unlike REST — had
- * no prior single-violation status-code contract to preserve for those two
- * checks (its old inline loop threw an unstructured `Error` for them, same
- * as everything else pre-#554); collecting everything here is a strict
+ * identifier, and — vault#553 Decision B — a non-conforming `default`).
+ * Used by the MCP `update-tag` tool, which — unlike REST — had no prior
+ * single-violation status-code contract to preserve for those checks (its
+ * old inline loop threw an unstructured `Error` for them, same as
+ * everything else pre-#554); collecting everything here is a strict
  * improvement. See {@link collectCrossTagFieldViolations}'s doc comment for
- * why REST calls that narrower function directly instead of this one.
+ * why REST calls that narrower function directly instead of this one — REST
+ * gets the SAME `invalid_default` coverage via `store.upsertTagRecord`'s
+ * fail-fast pre-validate (mirrors its indexed-type/name checks), just as a
+ * single-violation `InvalidFieldDefaultError` → 400 rather than a bundled
+ * `TagFieldConflictError` → 422.
  */
 export function collectTagFieldViolations(
   db: Database,
@@ -537,6 +646,12 @@ export function collectTagFieldViolations(
   const violations = collectCrossTagFieldViolations(db, tag, incomingFields);
 
   for (const [fieldName, spec] of Object.entries(incomingFields)) {
+    // Own-field default-conformance check (vault#553 Decision B) — applies
+    // to EVERY field (not just indexed ones); a bad default is a tag-schema
+    // error regardless of whether the field is queryable.
+    const defaultViolation = validateFieldDefault(fieldName, spec);
+    if (defaultViolation) violations.push(defaultViolation);
+
     if (spec.indexed === true) {
       const mapped = mapFieldType(spec.type);
       if (!mapped) {

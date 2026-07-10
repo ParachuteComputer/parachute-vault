@@ -196,28 +196,58 @@ const EXPECTED_JSON_TYPES: Record<string, Set<string>> = {
   TEXT: new Set(["text"]),
 };
 
+/** One vault-wide-scan result row from {@link findMixedTypeIndexedFieldNotes}. */
+export interface MixedTypeIndexedFieldRow {
+  id: string;
+  /** SQLite `json_type()` of the CURRENT `metadata.<field>` value — "text", "integer", "real", "true", "false", "array", "object" (never "null": absent/null keys are excluded upstream). */
+  jt: string;
+}
+
+/**
+ * Vault-wide detector: every note whose `metadata.<field>` JSON type
+ * disagrees with `sqliteType` (the field's declared indexed storage class —
+ * "INTEGER" or "TEXT"). Returns `[]` for an unknown `sqliteType` or when
+ * nothing mismatches. UNSCOPED — no tag-scope filtering (that's the caller's
+ * job; see `scanMixedTypeIndexedFields` below for the tag-scoped doctor
+ * finding, and `migrateToV24` in `core/src/schema.ts` for the unscoped
+ * migration consumer). `json_type(metadata, ?)` returns NULL when the key is
+ * absent — those notes simply don't declare the field and aren't a mismatch.
+ *
+ * Extracted (vault#553 Decision D) so the SAME detection query backs both
+ * the `mixed_type_indexed_field` doctor finding AND the `migrateToV24`
+ * startup migration's poison scan — one source of truth for "what counts as
+ * mismatched," so a fix to one can't silently diverge from the other.
+ */
+export function findMixedTypeIndexedFieldNotes(
+  db: Database,
+  field: string,
+  sqliteType: string,
+): MixedTypeIndexedFieldRow[] {
+  const expected = EXPECTED_JSON_TYPES[sqliteType];
+  if (!expected) return []; // unknown sqlite_type — nothing to compare against
+  const path = `$."${field}"`;
+  const rows = db
+    .prepare(
+      `SELECT id, json_type(metadata, ?) as jt FROM notes WHERE metadata IS NOT NULL AND metadata != '' AND json_valid(metadata)`,
+    )
+    .all(path) as { id: string; jt: string | null }[];
+  return rows.filter((r): r is MixedTypeIndexedFieldRow => r.jt !== null && !expected.has(r.jt));
+}
+
 function scanMixedTypeIndexedFields(db: Database, allowedTags: Set<string> | null): DoctorFinding[] {
   const findings: DoctorFinding[] = [];
   const noteInScope = makeNoteInScope(db, allowedTags);
   for (const f of listIndexedFields(db)) {
     if (allowedTags && !f.declarerTags.some((t) => allowedTags.has(t))) continue;
-    const expected = EXPECTED_JSON_TYPES[f.sqliteType];
-    if (!expected) continue; // unknown sqlite_type — nothing to compare against
 
-    // `json_type(metadata, ?)` returns NULL when the key is absent — those
-    // notes simply don't declare the field and aren't a mismatch. Only rows
-    // where the key IS present get compared.
-    const path = `$."${f.field}"`;
-    const rows = db
-      .prepare(
-        `SELECT id, json_type(metadata, ?) as jt FROM notes WHERE metadata IS NOT NULL AND metadata != '' AND json_valid(metadata)`,
-      )
-      .all(path) as { id: string; jt: string | null }[];
+    const rows = findMixedTypeIndexedFieldNotes(db, f.field, f.sqliteType);
+    if (rows.length === 0) continue;
+
     // Tag-scope (vault#552 auth fold): the note query above is vault-wide —
     // filter mismatches to IN-SCOPE notes so a scoped caller never sees an
     // out-of-scope note id (nor a count/exemplar reflecting one). If every
     // mismatch is on an out-of-scope note, the finding is dropped entirely.
-    const mismatches = rows.filter((r) => r.jt !== null && !expected.has(r.jt) && noteInScope(r.id));
+    const mismatches = rows.filter((r) => noteInScope(r.id));
     if (mismatches.length === 0) continue;
 
     // Also generalize the "Declared by" list to in-scope declarers only —

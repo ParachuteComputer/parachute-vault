@@ -61,6 +61,20 @@ export interface SchemaField {
   enum?: string[];
   description?: string;
   /**
+   * Mirrors `TagFieldSchema.indexed` (core/src/tag-schemas.ts) — this field
+   * has a generated column + B-tree index maintained on `notes` (see
+   * core/src/indexed-fields.ts). Parsed here (not just there) because
+   * `validateNote` uses it: an indexed field is a QUERY CONTRACT, not just a
+   * storage hint, so a `type_mismatch` on an indexed field is always
+   * enforced (`strict: true` on that ONE warning) regardless of this field's
+   * own `strict` flag (vault#553 Decision A). Every other constraint
+   * (enum/required/cardinality) on an indexed field stays governed by
+   * `strict` as before — only the TYPE contract is unconditional, because
+   * that's the one a type-mismatched write can silently poison range
+   * queries with (SQLite's TEXT-sorts-above-INTEGER affinity ordering).
+   */
+  indexed?: boolean;
+  /**
    * Strict enforcement opt-in (vault#299, Part A). Default `false` — when
    * unset/false, ALL constraints on this field are advisory: violations
    * surface as `validation_status` warnings and the write succeeds (the
@@ -169,6 +183,7 @@ function parseFieldsJson(raw: string | null): Record<string, SchemaField> {
     if (typeof f.type === "string") field.type = f.type as SchemaField["type"];
     if (Array.isArray(f.enum)) field.enum = f.enum.filter((x): x is string => typeof x === "string");
     if (typeof f.description === "string") field.description = f.description;
+    if (f.indexed === true) field.indexed = true;
     if (f.strict === true) field.strict = true;
     if (f.required === true) field.required = true;
     if (f.cardinality === "one" || f.cardinality === "many") field.cardinality = f.cardinality;
@@ -319,6 +334,20 @@ function stringArraysEqual(a: string[] | undefined, b: string[] | undefined): bo
   return true;
 }
 
+/**
+ * Human-readable JSON-shape name for a value, used to name the "got" side of
+ * a `type_mismatch` message (vault#553 — "message names field + expected
+ * type + got type"). Distinct from SQLite's `json_type()` vocabulary
+ * (integer/real/true/false/text/...) — this is the JSON-Schema-ish vocabulary
+ * `SchemaField.type` already uses, so the message reads as "expected X, got
+ * Y" in the SAME words the schema declares.
+ */
+function jsonTypeOf(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value; // "string" | "number" | "boolean" | "object" | ...
+}
+
 function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
   if (type === undefined) return true;
   switch (type) {
@@ -357,11 +386,15 @@ function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
  *   → `cardinality_mismatch`
  *
  * Every violation carries `strict: true` iff its field declared `strict:true`
- * (vault#299). The list itself is the SAME whether or not a field is strict —
- * the difference is only the per-warning `strict` flag, which the write path
- * uses to decide block-vs-warn. Under `strict:false` this is byte-identical to
- * the historical advisory behavior PLUS the new `required`/`cardinality`
- * advisory reasons (which fire for any field declaring those, strict or not).
+ * (vault#299) — EXCEPT a `type_mismatch` on an `indexed: true` field, which is
+ * ALWAYS `strict: true` regardless of the field's own `strict` setting
+ * (vault#553 Decision A — an indexed field's type is a query contract, not
+ * just guidance). The list itself is the SAME whether or not a field is
+ * strict — the difference is only the per-warning `strict` flag, which the
+ * write path uses to decide block-vs-warn. Under `strict:false` (and
+ * `indexed:false`) this is byte-identical to the historical advisory
+ * behavior PLUS the new `required`/`cardinality` advisory reasons (which
+ * fire for any field declaring those, strict or not).
  *
  * Fields not declared by any ancestor's schema are ignored entirely.
  */
@@ -397,12 +430,20 @@ export function validateNote(
     if (absent) continue;
 
     if (spec.type && !valueMatchesType(value, spec.type)) {
+      // Decision A (vault#553): an INDEXED field's type is a query
+      // contract — a type-mismatched write poisons range-query ordering
+      // (SQLite's TEXT-sorts-above-INTEGER affinity) regardless of whether
+      // this field opted into `strict`. Force `strict: true` on THIS
+      // warning alone when the field is indexed; every other constraint
+      // (enum/required/cardinality) stays governed by `spec.strict` as
+      // before.
+      const indexedTypeStrict = spec.indexed === true;
       warnings.push({
         field: fieldName,
         schema: sourceTag,
         reason: "type_mismatch",
-        message: `'${fieldName}' should be ${spec.type} (tag '${sourceTag}')`,
-        ...strictFlag,
+        message: `'${fieldName}' should be ${spec.type} (tag '${sourceTag}'), got ${jsonTypeOf(value)}${indexedTypeStrict ? " — indexed fields reject type-mismatched writes (vault#553)" : ""}`,
+        ...(strictFlag.strict || indexedTypeStrict ? { strict: true } : {}),
       });
     }
 

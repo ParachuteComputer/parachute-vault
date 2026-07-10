@@ -2081,8 +2081,11 @@ describe("MCP tools", async () => {
   // schema-default-filled field was missing from the returned note even
   // though it had just been written to disk.
   it("create-note response reflects post-applySchemaDefaults state (vault#316)", async () => {
+    // vault#553 Decision B: backfill is explicit-`default`-only now — declare
+    // one so this test still exercises the post-defaults re-read mechanism
+    // (the thing vault#316 is actually about).
     await store.upsertTagSchema("task", {
-      fields: { priority: { type: "string", enum: ["high", "low"] } },
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
     });
     const tools = generateMcpTools(store);
     const createNote = tools.find((t) => t.name === "create-note")!;
@@ -2093,7 +2096,7 @@ describe("MCP tools", async () => {
       path: "Inbox/task-1",
       tags: ["task"],
     }) as any;
-    expect(single.metadata?.priority).toBe("high"); // first enum value
+    expect(single.metadata?.priority).toBe("high"); // explicit schema default
     // Disk and response agree.
     const onDisk = await store.getNoteByPath("Inbox/task-1");
     expect((onDisk!.metadata as any)?.priority).toBe("high");
@@ -3456,7 +3459,7 @@ describe("MCP tools", async () => {
     expect(links.some((l) => l.relationship === "wikilink")).toBe(true);
   });
 
-  it("create-note with schema tag auto-populates defaults", async () => {
+  it("create-note with schema tag leaves undeclared fields ABSENT (vault#553 Decision B — no implicit enum[0]/zero-value backfill)", async () => {
     await store.upsertTagSchema("person", {
       description: "A person",
       fields: {
@@ -3472,10 +3475,36 @@ describe("MCP tools", async () => {
 
     const result = await createNote.execute({ content: "Alice", tags: ["person"] }) as any;
     const fresh = await query.execute({ id: result.id }) as any;
-    expect(fresh.metadata.first_appeared).toBe("");
-    expect(fresh.metadata.active).toBe(false);
-    expect(fresh.metadata.priority).toBe(0);
+    // None of these fields declares a `default` — the pre-0.7.0 behavior
+    // (enum[0] / type zero-value backfill) is retired. "Never set" now stays
+    // genuinely absent instead of masquerading as "explicitly set to X" — in
+    // fact NO field got backfilled, so `metadata` itself stays empty/absent.
+    expect(fresh.metadata?.first_appeared).toBeUndefined();
+    expect(fresh.metadata?.active).toBeUndefined();
+    expect(fresh.metadata?.priority).toBeUndefined();
+    expect(fresh.metadata?.status).toBeUndefined();
+  });
+
+  it("create-note with schema tag applies EXPLICIT `default:` values only (vault#553 Decision B)", async () => {
+    await store.upsertTagSchema("employee", {
+      description: "An employee",
+      fields: {
+        active: { type: "boolean", default: true },
+        priority: { type: "integer", default: 3 },
+        status: { type: "string", enum: ["active", "archived"], default: "active" },
+        nickname: { type: "string" }, // no default — stays absent
+      },
+    });
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await createNote.execute({ content: "Bob", tags: ["employee"] }) as any;
+    const fresh = await query.execute({ id: result.id }) as any;
+    expect(fresh.metadata.active).toBe(true);
+    expect(fresh.metadata.priority).toBe(3);
     expect(fresh.metadata.status).toBe("active");
+    expect(fresh.metadata.nickname).toBeUndefined();
   });
 
   // ---- query-notes input-shape tolerance (vault#214) ----
@@ -4616,8 +4645,9 @@ describe("update-note if_missing=create (vault#309)", async () => {
   });
 
   it("create branch applies tag-schema defaults when the new tag declares fields", async () => {
+    // vault#553 Decision B: backfill is explicit-`default`-only.
     await store.upsertTagSchema("task", {
-      fields: { priority: { type: "string", enum: ["high", "low"] } },
+      fields: { priority: { type: "string", enum: ["high", "low"], default: "high" } },
     });
     const tools = generateMcpTools(store);
     const update = tools.find((t) => t.name === "update-note")!;
@@ -4629,7 +4659,7 @@ describe("update-note if_missing=create (vault#309)", async () => {
     }) as any;
     expect(result.created).toBe(true);
     // Schema defaults populated metadata.priority on insert.
-    expect(result.metadata?.priority).toBeDefined();
+    expect(result.metadata?.priority).toBe("high");
   });
 
   it("create branch surfaces validation warnings just like create-note", async () => {

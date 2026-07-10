@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
 import { normalizePath } from "./paths.js";
-import { rebuildIndexes } from "./indexed-fields.js";
+import { rebuildIndexes, listIndexedFields } from "./indexed-fields.js";
+import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
 
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 24;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -501,6 +502,10 @@ export function initSchema(db: Database): void {
   // attribution" — we don't fabricate authors for legacy writes). See
   // vault#298.
   migrateToV23(db);
+
+  // Migrate v23 → v24: coerce existing typed-index poison where lossless,
+  // leave the rest in place for `doctor` to surface. See vault#553.
+  migrateToV24(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1184,6 +1189,146 @@ function migrateToV23(db: Database): void {
   }
   for (const col of cols) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_notes_${col} ON notes(${col})`);
+  }
+}
+
+/** Sentinel returned by {@link coerceIndexedValue} when no lossless conversion exists. */
+const NOT_COERCIBLE = Symbol("not-coercible");
+
+/** Full JSON-number grammar — used to gate string→number coercion to values that round-trip exactly. */
+const JSON_NUMBER_RE = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/;
+
+/**
+ * Decide the lossless coercion (if any) for a single poisoned indexed-field
+ * value, given `jt` — the SQLite `json_type()` of its CURRENT value (the
+ * SAME vocabulary `doctor`'s `findMixedTypeIndexedFieldNotes` compares
+ * against: "text", "integer", "real", "true", "false", "array", "object")
+ * — and `targetSqliteType`, the field's declared storage class ("INTEGER"
+ * or "TEXT"). Returns the coerced value, or {@link NOT_COERCIBLE} when no
+ * exact round-trip conversion exists — the caller leaves the value
+ * untouched (never deletes or nulls note data).
+ *
+ * Coercible cases (vault#553 Decision D):
+ *   - INTEGER target, TEXT source: a clean numeric string ("5", "5.5",
+ *     "-3") → the JSON number, ONLY when `String(Number(str)) === str`
+ *     (exact round-trip — rejects "5.50", scientific-notation reformats,
+ *     and anything outside safe double precision that wouldn't survive the
+ *     trip). "true"/"false" (exact string match) → the JSON boolean.
+ *   - TEXT target, INTEGER/REAL/boolean source: a number or boolean → its
+ *     JSON string form via `String(value)` — always exact for finite JS
+ *     numbers and booleans within IEEE-754 double precision.
+ * Never coercible: array/object/null values in either direction, or a TEXT
+ * value that isn't a clean number/boolean string (e.g. "four", "5,000").
+ */
+function coerceIndexedValue(
+  value: unknown,
+  jt: string,
+  targetSqliteType: string,
+): unknown | typeof NOT_COERCIBLE {
+  if (targetSqliteType === "INTEGER") {
+    if (jt !== "text" || typeof value !== "string") return NOT_COERCIBLE;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    if (JSON_NUMBER_RE.test(value)) {
+      const n = Number(value);
+      if (Number.isFinite(n) && String(n) === value) return n;
+    }
+    return NOT_COERCIBLE;
+  }
+  if (targetSqliteType === "TEXT") {
+    if ((jt === "true" || jt === "false") && typeof value === "boolean") {
+      return jt; // "true" / "false" — the json_type string IS the target text
+    }
+    if ((jt === "integer" || jt === "real") && typeof value === "number") {
+      const s = String(value);
+      if (Number(s) === value) return s;
+    }
+    return NOT_COERCIBLE;
+  }
+  return NOT_COERCIBLE;
+}
+
+/**
+ * Migrate v23 → v24: typed-index poison coercion (vault#553 Decision D).
+ *
+ * For every declared indexed field (`indexed_fields` — the SSOT from
+ * `core/src/indexed-fields.ts`) and every note whose `metadata.<field>` JSON
+ * type disagrees with the field's declared sqlite storage class — reusing
+ * `doctor`'s `findMixedTypeIndexedFieldNotes` (`core/src/doctor.ts`) as the
+ * DETECTOR, the exact same query that powers the `mixed_type_indexed_field`
+ * finding, so migration and diagnostic can never disagree on what counts as
+ * poisoned:
+ *
+ *   - COERCE where {@link coerceIndexedValue} finds a lossless conversion —
+ *     rewrites `notes.metadata` in place (the generated `meta_<field>`
+ *     column re-derives via `json_extract` automatically; nothing else to
+ *     touch).
+ *   - LEAVE IN PLACE everything else. NEVER DELETE OR NULL NOTE DATA in a
+ *     startup migration — a non-coercible value (e.g. `"hello"` in an
+ *     integer field) stays exactly as written and remains visible via
+ *     `doctor`'s `mixed_type_indexed_field` finding for the operator to
+ *     clean up deliberately.
+ *
+ * Rewrites happen at the JS level — `SELECT metadata` → `JSON.parse` →
+ * mutate the one field → `JSON.stringify` → single-row `UPDATE ... WHERE id
+ * = ?` (two bound params) — rather than SQL `json_set`, so the migration
+ * stays portable to a narrower json1 surface (Cloudflare DO SQLite; flagged
+ * for the wire reviewer to confirm). Detection still uses
+ * `json_extract`/`json_type`/`json_valid`, the same functions the indexed
+ * generated columns and `doctor` already depend on everywhere in this
+ * codebase — not a new cross-runtime risk. One row at a time also means this
+ * never approaches SQLite's bound-parameter ceiling regardless of how many
+ * notes are poisoned (no batched `WHERE id IN (...)`).
+ *
+ * Idempotent: every step is naturally re-runnable (a coerced value now
+ * agrees with the declared type and is never re-detected as a mismatch; a
+ * left-in-place value re-detects identically and is re-skipped identically).
+ * Safe on a vault with zero indexed fields (the field-list guard short-
+ * circuits before any table scan) and safe to run on every boot, matching
+ * the unconditional-migration-function idiom the rest of this file uses.
+ */
+function migrateToV24(db: Database): void {
+  if (!hasTable(db, "notes") || !hasTable(db, "indexed_fields")) return;
+  const fields = listIndexedFields(db);
+  if (fields.length === 0) return;
+
+  let coerced = 0;
+  let left = 0;
+
+  transaction(db, () => {
+    const readStmt = db.prepare("SELECT metadata FROM notes WHERE id = ?");
+    const updateStmt = db.prepare("UPDATE notes SET metadata = ? WHERE id = ?");
+
+    for (const f of fields) {
+      const mismatches = findMixedTypeIndexedFieldNotes(db, f.field, f.sqliteType);
+      for (const { id, jt } of mismatches) {
+        const row = readStmt.get(id) as { metadata: string | null } | null;
+        if (!row?.metadata) continue;
+        let meta: unknown;
+        try {
+          meta = JSON.parse(row.metadata);
+        } catch {
+          continue; // shouldn't happen — findMixedTypeIndexedFieldNotes already filters to json_valid rows
+        }
+        if (!meta || typeof meta !== "object" || Array.isArray(meta)) continue;
+        const obj = meta as Record<string, unknown>;
+        if (!(f.field in obj)) continue;
+        const coercedValue = coerceIndexedValue(obj[f.field], jt, f.sqliteType);
+        if (coercedValue === NOT_COERCIBLE) {
+          left++;
+          continue;
+        }
+        obj[f.field] = coercedValue;
+        updateStmt.run(JSON.stringify(obj), id);
+        coerced++;
+      }
+    }
+  });
+
+  if (coerced > 0 || left > 0) {
+    console.log(
+      `[vault] migrated to schema v24 (vault#553): typed-index poison scan — coerced ${coerced} value(s) to their declared indexed type; left ${left} non-coercible value(s) in place (see \`doctor\`'s mixed_type_indexed_field finding for cleanup).`,
+    );
   }
 }
 

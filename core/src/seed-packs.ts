@@ -468,9 +468,9 @@ update-tag {
   tag: "meeting",
   description: "A meeting with notes",
   fields: {
-    held_on: { type: "string", indexed: true },              // queryable with operators
-    status:  { type: "string", enum: ["scheduled", "done"] }, // first enum value is the default
-    rating:  { type: "integer" }
+    held_on: { type: "string", indexed: true },                                         // queryable with operators
+    status:  { type: "string", enum: ["scheduled", "done"], default: "scheduled" },      // explicit default — declare one to auto-fill
+    rating:  { type: "integer" }                                                        // no default — stays unset until written
   }
 }
 \`\`\`
@@ -490,16 +490,23 @@ A few behaviors worth knowing before you write at scale:
   conflict error (re-read, reconcile, retry). For bulk/scripted writes where
   concurrency is known-safe, pass \`force: true\` to waive the *requirement to
   supply* it. \`append\`/\`prepend\`-only updates are exempt (no-conflict-by-design).
-- **A schema field's default is filled in on write, so it shows up even when you
-  didn't set it.** When a note gets a tag whose schema declares a field, the
-  missing field is back-filled: an \`enum\` field → its **first listed value**, an
-  \`integer\` → \`0\`, a \`boolean\` → \`false\`, a plain string → \`""\`. So a
-  \`rating: { type: "integer" }\` reads as \`0\` on notes nobody rated — that \`0\`
-  is "unset," not "rated zero." Order an \`enum\`'s values so the first is a sane
-  default, and don't read a back-filled \`0\`/\`""\`/\`false\` as a real value.
-- **Validation is advisory, never blocking.** A type/enum mismatch comes back as
-  a \`validation_status\` warning on the write response — the write still lands.
-  Read those warnings and self-correct on the next turn.
+- **A schema field only back-fills when you declare an explicit \`default\`.**
+  When a note gets a tag whose schema declares a field with a \`default\`, an
+  unset field is filled with THAT value. A field with no \`default\` stays
+  genuinely absent — \`query-notes { metadata: { rating: { exists: false } } }\`
+  reliably finds notes that never set \`rating\`. Declare \`default\` on a field
+  only when "unset" and "explicitly set to X" should read the same; leave it
+  off when you need to tell them apart.
+- **Validation is advisory, never blocking — EXCEPT an \`indexed: true\`
+  field's type.** A type/enum mismatch on a non-indexed field (or a
+  non-\`strict\` constraint on any field) comes back as a \`validation_status\`
+  warning and the write still lands — read those warnings and self-correct on
+  the next turn. An \`indexed: true\` field's TYPE is always enforced, though:
+  writing a string into an indexed \`integer\` field is REJECTED with a
+  \`schema_validation\` error, because a bad-typed value would otherwise
+  silently poison range queries (\`gt\`/\`gte\`/\`lt\`/\`lte\`) on that field. Mark a
+  field \`strict: true\` to enforce its OTHER constraints
+  (enum/required/cardinality) the same hard way.
 
 (Full design guide, with copy-paste examples: https://parachute.computer/scripting/)
 

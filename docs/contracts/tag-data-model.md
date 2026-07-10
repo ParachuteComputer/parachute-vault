@@ -131,7 +131,13 @@ Conflicts (same field declared by two ancestors with diverging `type` or `enum`)
 - `reason: "schema_conflict"`
 - `message` — human-readable
 
-`schema_conflict` joins the existing `type_mismatch` and `enum_mismatch` warning reasons. Validation remains advisory: writes are never blocked. Schemas guide; they don't gate.
+`schema_conflict` joins the existing `type_mismatch` and `enum_mismatch` warning reasons. `schema_conflict` itself is always advisory — a resolver-precedence disagreement between ancestors describes operator schema state, not a note's data, so it's never enforced even on a `strict` field.
+
+**Correction (this line originally read "writes are never blocked" — no longer accurate as of vault#299 + vault#553):** validation is advisory BY DEFAULT, but two escalations flip specific violations to hard rejections (`422 schema_validation`, nothing written):
+- a field marked `strict: true` — ALL its declared constraints (type/enum/required/cardinality) reject (vault#299).
+- a field marked `indexed: true` — its TYPE constraint alone ALWAYS rejects, independent of `strict` (vault#553) — an indexed field's type is a query contract (a type-mismatched value silently poisons range-query ordering via SQLite's TEXT-sorts-above-INTEGER affinity), not just guidance.
+
+See `core/src/schema-defaults.ts` (the resolver + `strictViolations`) and `docs/HTTP_API.md`'s error-taxonomy table (`schema_validation`) for the current, canonical contract — this file otherwise predates both features and doesn't enumerate `strict`/`required`/`cardinality`/`indexed`/`default` per-field flags; treat the source as authoritative over this doc for field-flag semantics.
 
 ### `_default` is the implicit universal parent
 
