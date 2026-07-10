@@ -41,6 +41,8 @@ import {
   filterHydratedLinksByTagScope,
   filterNotesByTagScope,
   noteWithinTagScope,
+  scrubIndexedFieldConflictError,
+  scrubTagFieldViolationsByScope,
   tagScopeForbidden,
   tagsWithinScope,
 } from "./tag-scope.ts";
@@ -2600,17 +2602,19 @@ export async function handleTags(
 
     // Cross-tag field validation (vault#553/#554) — validate the fields THIS
     // call is declaring (`body.fields`, not the merged `fieldsPatch`) against
-    // every other tag's schema BEFORE any write: type + indexed-flag must
-    // agree across all declarers. Mirrors the MCP update-tag tool's
-    // cross-tag checks so REST and MCP report identically for this class:
-    // EVERY conflicting field in one response (not just the first), and the
-    // message states explicitly that no changes were applied — nothing is
-    // persisted before this check runs. Deliberately narrower than MCP's
-    // `collectTagFieldViolations` — the own-field checks (unsupported type,
-    // invalid name) are NOT included here; they keep going through
-    // `store.upsertTagRecord`'s existing single-violation `IndexedFieldError`
-    // → 400 `invalid_indexed_field` path below (vault#478, tested, unchanged
-    // status/error_type). See `collectCrossTagFieldViolations`'s doc comment.
+    // every other tag's schema BEFORE any write. Mirrors the MCP update-tag
+    // tool's cross-tag checks so REST and MCP report identically for this
+    // class: EVERY conflicting field in one response (not just the first),
+    // and the message states explicitly that no changes were applied —
+    // nothing is persisted before this check runs. Two case families are
+    // deliberately EXCLUDED and keep their pre-existing `IndexedFieldError`
+    // → 400 `invalid_indexed_field` path below (unchanged status/error_type):
+    // the own-field checks (unsupported type, invalid name — vault#478) AND
+    // both-indexed cross-tag type conflicts (already 400 on main via
+    // `declareField`'s cross-declarer sqlite-type check; the wire-contract
+    // floor forbids flipping that to 422). What this pre-check newly rejects
+    // — silent 200s on main — is non-indexed type conflicts and indexed-flag
+    // conflicts. See `collectCrossTagFieldViolations`'s doc comment.
     if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
       const fieldViolations = tagSchemaOps.collectCrossTagFieldViolations(
         store.db,
@@ -2618,13 +2622,18 @@ export async function handleTags(
         body.fields as Record<string, tagSchemaOps.TagFieldSchema>,
       );
       if (fieldViolations.length > 0) {
+        // Tag-scope scrub (vault#554 auth-and-scope fold): the write is
+        // still rejected, but a violation whose conflicting declarer is
+        // outside a scoped caller's allowlist must not name that tag or
+        // reveal its schema. No-op for unscoped callers (allowed === null).
+        const violations = scrubTagFieldViolationsByScope(fieldViolations, tagScope.allowed);
         return json(
           {
             error: "tag_field_conflict",
             error_type: "tag_field_conflict",
             tag: putTagName,
-            violations: fieldViolations,
-            message: `${fieldViolations.length} field violation(s) for tag "${putTagName}" — no changes were applied.`,
+            violations,
+            message: `${violations.length} field violation(s) for tag "${putTagName}" — no changes were applied.`,
           },
           422,
         );
@@ -2645,8 +2654,14 @@ export async function handleTags(
       });
     } catch (err) {
       if (err instanceof IndexedFieldError) {
+        // Tag-scope scrub (vault#554 fold): declareField's cross-declarer
+        // type-conflict message names the other declarer tag(s) + their
+        // sqlite type — generalize when any declarer is outside a scoped
+        // caller's allowlist. No-op for unscoped callers and for the solo
+        // own-field errors (no declarer_tags). Status/error_type unchanged.
+        const scrubbed = scrubIndexedFieldConflictError(err, tagScope.allowed);
         return json(
-          { error: err.message, error_type: "invalid_indexed_field" },
+          { error: scrubbed.message, error_type: "invalid_indexed_field" },
           400,
         );
       }

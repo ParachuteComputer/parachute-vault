@@ -176,14 +176,17 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
   });
 
   it("REST PUT /api/tags/:name reports ALL cross-tag field violations in one call and states no changes were applied (#553 messaging, mirrors the MCP tool)", async () => {
-    // Tag "a" declares two indexed fields; tag "b" redeclares BOTH with
-    // conflicting specs in the SAME PUT — a type conflict on "x" and an
-    // indexed-flag conflict on "y". Before this fix REST had no cross-tag
-    // pre-check at all here (a gap distinct from the MCP tool's old
-    // first-field-only throw); now both surfaces report identically.
+    // Tag "a" declares two fields; tag "b" redeclares BOTH with conflicting
+    // specs in the SAME PUT — a NON-indexed type conflict on "x" and an
+    // indexed-flag conflict on "y" (both were silent 200s on main; the
+    // both-indexed type-conflict case deliberately keeps its pre-existing
+    // 400 path — see the regression test below). Before this fix REST had
+    // no cross-tag pre-check at all here (a gap distinct from the MCP
+    // tool's old first-field-only throw); now both surfaces report
+    // identically.
     await store.upsertTagRecord("a", {
       fields: {
-        x: { type: "string", indexed: true },
+        x: { type: "string" },
         y: { type: "boolean", indexed: true },
       },
     });
@@ -192,7 +195,7 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
       method: "PUT",
       body: JSON.stringify({
         fields: {
-          x: { type: "integer", indexed: true },
+          x: { type: "integer" },
           y: { type: "boolean", indexed: false },
         },
       }),
@@ -206,6 +209,8 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
     expect(byField.get("x")).toBe("type_conflict");
     expect(byField.get("y")).toBe("indexed_flag_conflict");
     expect(body.message).toContain("no changes were applied");
+    // Full detail for an unscoped caller — the conflicting declarer is named.
+    expect(body.violations[0].other_tag).toBe("a");
 
     // Nothing partially landed.
     const bRecord = await store.getTagRecord("b");
@@ -226,5 +231,34 @@ describe("contract: error taxonomy — #554 (flipped from todo)", () => {
     expect(res.status).toBe(400);
     const body: any = await res.json();
     expect(body.error_type).toBe("invalid_indexed_field");
+  });
+
+  it("REST PUT /api/tags/:name: a BOTH-INDEXED cross-tag type conflict stays 400 invalid_indexed_field, NOT 422 (wire-contract floor — pre-existing declareField behavior)", async () => {
+    // Exact regression from the wire review: tag "a" declares x
+    // string+indexed; tag "b" PUTs x integer+indexed. On main this
+    // returned 400 invalid_indexed_field (declareField's cross-declarer
+    // sqlite-type check inside store.upsertTagRecord); the vault#554
+    // pre-check must NOT intercept it as a 422 — statuses/error_types on
+    // previously-working calls are wire contract. See
+    // `collectCrossTagFieldViolations`'s doc-comment exclusion 2.
+    await store.upsertTagRecord("a", {
+      fields: { x: { type: "string", indexed: true } },
+    });
+
+    const req = new Request("http://localhost/api/tags/b", {
+      method: "PUT",
+      body: JSON.stringify({ fields: { x: { type: "integer", indexed: true } } }),
+    });
+    const res = await handleTags(req, store, "/b");
+    expect(res.status).toBe(400);
+    const body: any = await res.json();
+    expect(body.error_type).toBe("invalid_indexed_field");
+    // Unscoped caller: declareField's full message (naming the declarer)
+    // is preserved verbatim.
+    expect(body.error).toContain("tag(s) [a]");
+
+    // Nothing persisted — the store's transaction rolled back.
+    const bRecord = await store.getTagRecord("b");
+    expect(bRecord?.fields ?? null).toBeFalsy();
   });
 });

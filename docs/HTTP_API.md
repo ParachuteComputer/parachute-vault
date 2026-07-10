@@ -482,8 +482,8 @@ the `error_type` and fields are identical.
 
 | `error_type` | HTTP | Key fields | Meaning |
 |---|---|---|---|
-| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message}`) | One or more fields in this call conflict with another tag's declaration — `type` or `indexed` disagree across declarers. Carries EVERY conflicting field in one response (vault#553) and states explicitly that **no changes were applied**. `reason` is `type_conflict` or `indexed_flag_conflict`. |
-| `invalid_indexed_field` | 400 | (message only) | A field this call is declaring `indexed: true` has an unsupported type (only string/integer/boolean are indexable) or an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`). Solo, single-tag issue — distinct from `tag_field_conflict`'s cross-tag scope; kept as the pre-existing single-violation shape (vault#478). |
+| `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration. Carries EVERY conflicting field in one response (vault#553) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case) or `indexed_flag_conflict`; `other_tag` names the conflicting declarer. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail. |
+| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
 | `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
 | `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
 | `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
@@ -510,6 +510,13 @@ the `error_type` and fields are identical.
 | `missing_required_field` | 400 | `field?`, `hint?` | A specific named field is required and absent (e.g. attachment `path`/`mimeType`, storage upload `file`). |
 | `tag_scope_violation` | 403 (REST) / forbidden (MCP) | `scoped_tags` | A tag-scoped token attempted a write outside its allowlist. |
 | `internal_error` | 500 | — | An invariant the server expected to hold didn't (e.g. a just-created note not found on immediate re-read). Rare; file an issue if seen. |
+
+### Vault config (`PATCH /api/vault`)
+
+| `error_type` | HTTP | Key fields | Meaning |
+|---|---|---|---|
+| `invalid_audio_retention` | 400 | `field`, `got`, `hint` | `config.audio_retention` isn't one of `keep`, `until_transcribed`, `never`. |
+| `invalid_auto_transcribe` | 400 | `field`, `got`, `hint` | `config.auto_transcribe.enabled` isn't a boolean. |
 
 ### Storage upload/serve
 
@@ -1267,16 +1274,31 @@ must agree across every tag that declares the same field. Declaring one or
 more fields that conflict with another tag's declaration in the SAME call
 is **rejected with `422` and `error_type: "tag_field_conflict"`**, carrying
 EVERY conflicting field in one response — not just the first — plus a
-`violations: [{field, reason, message}]` array (`reason` is `type_conflict`
-or `indexed_flag_conflict`) and a `message` stating explicitly that no
-changes were applied. Nothing is persisted before this check runs, so the
-tag's existing fields are always left exactly as they were on rejection.
-This is distinct from the SOLO, single-tag `400 invalid_indexed_field`
-error (an unsupported type for indexing, or an invalid field identifier —
-vault#478, unchanged) — that stays a single-violation 400 since it isn't a
-cross-tag disagreement. The MCP `update-tag` tool reports the same
-`tag_field_conflict` shape (plus the two solo checks folded in) via a
-structured JSON-RPC error.
+`violations: [{field, reason, message, other_tag?}]` array (`reason` is
+`type_conflict` or `indexed_flag_conflict`; `other_tag` names the
+conflicting declarer) and a `message` stating explicitly that no changes
+were applied. Nothing is persisted before this check runs, so the tag's
+existing fields are always left exactly as they were on rejection.
+
+Two case families stay on the pre-existing `400 invalid_indexed_field`
+path instead (unchanged wire contract): the SOLO, single-tag errors (an
+unsupported type for indexing, or an invalid field identifier —
+vault#478), and a cross-tag TYPE conflict where the incoming field is
+itself `indexed: true` (that combination already returned 400 before
+vault#554 via the indexed-field engine's cross-declarer check, and keeps
+doing so — only the previously-silent cases, non-indexed type conflicts
+and indexed-flag conflicts, are the new 422). The MCP `update-tag` tool
+reports the same split via structured JSON-RPC errors.
+
+**Tag-scope generalization (both error shapes).** For a tag-scoped
+session, the write is still rejected when the conflict is with an
+out-of-scope tag — schema integrity is scope-independent — but the
+response must not leak that tag: a `tag_field_conflict` violation whose
+conflicting declarer is outside the token's allowlist is generalized (no
+tag name, no declared type/flag, `other_tag` omitted), and the
+`invalid_indexed_field` cross-declarer message is likewise generalized
+when any declarer is out of scope. In-scope declarers keep full detail;
+unscoped callers always see full detail.
 
 #### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
 Removes the tag, its identity row, and untags every note. Returns the

@@ -22,8 +22,12 @@ import {
   expandTokenTagScope,
   filterHydratedLinksByTagScope,
   noteWithinTagScope,
+  scrubIndexedFieldConflictError,
+  scrubTagFieldViolationsByScope,
   tagsWithinScope,
 } from "./tag-scope.ts";
+import { TagFieldConflictError } from "../core/src/tag-schemas.ts";
+import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 import {
   findTokensReferencingTag,
   recordMcpMintLedger,
@@ -502,7 +506,37 @@ function applyTagScopeWrappers(
     if (typeof tag === "string" && !allowed.has(tag)) {
       return forbidden(`update-tag: tag "${tag}" is outside the token's allowlist`);
     }
-    return await orig(params);
+    try {
+      return await orig(params);
+    } catch (err: any) {
+      // Tag-scope scrub for cross-tag field conflicts (vault#554
+      // auth-and-scope fold). Core's validation scans EVERY tag's schema
+      // (scope-unaware by architecture), so its TagFieldConflictError can
+      // name an OUT-OF-SCOPE tag and reveal its declared type/flag in both
+      // the violation entries and the error message. The write stays
+      // rejected — schema integrity is scope-independent — but re-throw
+      // with scrubbed violations (out-of-scope declarers generalized, no
+      // tag name / declared type, `other_tag` dropped; in-scope declarers
+      // keep full detail). Rebuilding via the constructor also rebuilds
+      // the top-level message from the scrubbed entries. Same pattern as
+      // the list-tags `did_you_mean` scrub above.
+      if (err && err.code === "TAG_FIELD_CONFLICT" && Array.isArray(err.violations)) {
+        throw new TagFieldConflictError(
+          err.tag ?? (tag as string),
+          scrubTagFieldViolationsByScope(err.violations, allowed),
+        );
+      }
+      // Same leak through the OTHER door (wire-review interaction): a
+      // both-indexed cross-tag type conflict deliberately bypasses the
+      // pre-check (preserving its declareField → invalid_indexed_field
+      // contract), and declareField's IndexedFieldError message names the
+      // other declarer tag(s). Generalize for scoped callers; solo
+      // own-field IndexedFieldErrors (no declarer_tags) pass untouched.
+      if (err instanceof IndexedFieldError) {
+        throw scrubIndexedFieldConflictError(err, allowed);
+      }
+      throw err;
+    }
   });
 
   wrapReadTool(tools, "delete-tag", async (orig, params) => {

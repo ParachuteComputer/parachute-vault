@@ -49,6 +49,18 @@ export class IndexedFieldError extends Error {
   // hardcoded in its json response since vault#478. Lets the generic MCP
   // domain-error mapping (src/mcp-http.ts) pick this class up.
   error_type = "invalid_indexed_field" as const;
+  /**
+   * Structured context for the CROSS-DECLARER sqlite-type conflict thrown
+   * by `declareField` (vault#554 auth-and-scope fold): the message names
+   * the other declarer tag(s), which a tag-scoped caller must not learn
+   * when they're outside its allowlist. `declarer_tags` lets the server
+   * layer (`scrubIndexedFieldConflictError` in src/tag-scope.ts) detect
+   * that case and generalize the message. Absent on the solo own-field
+   * throws (invalid name, unsupported type), whose messages name no other
+   * tag.
+   */
+  field?: string;
+  declarer_tags?: string[];
 }
 
 // Restrict field names to safe SQL identifiers. This also bounds the
@@ -176,8 +188,14 @@ export function declareField(
   if (existing.sqliteType !== sqliteType) {
     const others = existing.declarerTags.filter((t) => t !== tag);
     if (others.length > 0) {
-      throw new IndexedFieldError(
-        `field "${field}" is declared by tag(s) [${others.join(", ")}] with sqlite type ${existing.sqliteType}; tag "${tag}" requested ${sqliteType}`,
+      // `field` + `declarer_tags` stamped so the server's tag-scope layer
+      // can generalize this message when a declarer is outside a scoped
+      // caller's allowlist (see IndexedFieldError's doc comment).
+      throw Object.assign(
+        new IndexedFieldError(
+          `field "${field}" is declared by tag(s) [${others.join(", ")}] with sqlite type ${existing.sqliteType}; tag "${tag}" requested ${sqliteType}`,
+        ),
+        { field, declarer_tags: others },
       );
     }
     dropColumnAndIndex(db, field);

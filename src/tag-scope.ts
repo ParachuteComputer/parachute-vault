@@ -20,6 +20,8 @@
  */
 
 import type { Store, Note, HydratedLink, NoteSummary } from "../core/src/types.ts";
+import type { TagFieldViolation } from "../core/src/tag-schemas.ts";
+import { IndexedFieldError } from "../core/src/indexed-fields.ts";
 
 /**
  * Build the effective tag-allowlist for a token: union of `{root} ∪
@@ -164,6 +166,70 @@ export function filterHydratedLinksByTagScope(
     (link) =>
       summaryWithinTagScope(link.sourceNote, allowed, rawRoots) &&
       summaryWithinTagScope(link.targetNote, allowed, rawRoots),
+  );
+}
+
+/**
+ * Scrub `tag_field_conflict` violations for a tag-scoped caller
+ * (vault#554 auth-and-scope review fold). Core's cross-tag field
+ * validation (`collectCrossTagFieldViolations` / `collectTagFieldViolations`
+ * in core/src/tag-schemas.ts) scans EVERY tag's schema — scope-unaware by
+ * architecture — so a scoped caller updating its own in-scope tag can
+ * receive a violation whose `message` names an OUT-OF-SCOPE tag and
+ * reveals its declared type/indexed flag (proven live on both MCP and
+ * REST). Policy: the write is STILL rejected (schema integrity is
+ * scope-independent — do not weaken the check), but the violation entry
+ * for an out-of-scope conflicting declarer is generalized: no tag name,
+ * no declared type/flag, `other_tag` dropped. In-scope conflicting
+ * declarers keep full detail; solo own-field violations (no `other_tag`)
+ * pass through untouched; unscoped callers (`allowed === null`) keep full
+ * detail everywhere.
+ *
+ * Membership is `allowed.has(other_tag)` — the same convention the
+ * `did_you_mean` scrub and the update-tag/delete-tag wrappers use in
+ * src/mcp-tools.ts (no string-form root fallback: when in doubt, scrub —
+ * the fail-closed direction only costs detail, never correctness).
+ */
+export function scrubTagFieldViolationsByScope(
+  violations: TagFieldViolation[],
+  allowed: Set<string> | null,
+): TagFieldViolation[] {
+  if (allowed === null) return violations;
+  return violations.map((v) => {
+    if (v.other_tag === undefined || allowed.has(v.other_tag)) return v;
+    const generalized =
+      v.reason === "type_conflict"
+        ? `field "${v.field}" type conflict: another tag (outside your token's tag scope) declares this field with a different type. Types must agree across all declarers.`
+        : `field "${v.field}" indexed-flag conflict: another tag (outside your token's tag scope) declares this field with a different indexed flag. Must match across all declarers.`;
+    const { other_tag: _dropped, ...rest } = v;
+    return { ...rest, message: generalized };
+  });
+}
+
+/**
+ * Companion scrub for the OTHER door the same information can leak
+ * through (vault#554 auth-and-scope × wire-review interaction): a
+ * both-indexed cross-tag type conflict deliberately bypasses the
+ * `tag_field_conflict` pre-check (preserving its pre-existing
+ * `declareField` → 400 `invalid_indexed_field` contract — see
+ * `collectCrossTagFieldViolations`'s doc comment), and declareField's
+ * message names the other declarer tag(s) plus their sqlite type. For a
+ * tag-scoped caller with any out-of-scope declarer, return a REPLACEMENT
+ * `IndexedFieldError` with a generalized message (no tag names, no
+ * existing type) — same rejection, same 400 status, same `error_type`,
+ * just no leak. If every declarer is in scope (or the error carries no
+ * `declarer_tags` — the solo own-field throws), or the caller is unscoped
+ * (`allowed === null`), the original error is returned untouched.
+ */
+export function scrubIndexedFieldConflictError(
+  err: IndexedFieldError & { field?: string; declarer_tags?: string[] },
+  allowed: Set<string> | null,
+): IndexedFieldError {
+  if (allowed === null) return err;
+  if (!Array.isArray(err.declarer_tags) || err.declarer_tags.length === 0) return err;
+  if (err.declarer_tags.every((t) => allowed.has(t))) return err;
+  return new IndexedFieldError(
+    `field "${err.field ?? "?"}" is already indexed by another tag (outside your token's tag scope) with a conflicting type. Types must agree across all declarers.`,
   );
 }
 

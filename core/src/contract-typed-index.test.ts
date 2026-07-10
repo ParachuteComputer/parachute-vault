@@ -105,15 +105,19 @@ describe("contract: typed indexes — todo (#553)", () => {
 
 describe("contract: update-tag messaging — #553/#554 (flipped from todo)", () => {
   it("update-tag reports ALL invalid fields in one call (not just the first) and states explicitly that no changes were applied", async () => {
-    // Tag "a" declares two indexed fields. Tag "b" then redeclares BOTH with
-    // conflicting specs — a type conflict on "x" AND an indexed-flag
-    // conflict on "y" — in the SAME update-tag call. Pre-#553 the
-    // cross-tag validation loop threw on the first offending field ("x")
-    // and never even evaluated "y"; two testers independently assumed the
-    // whole call (including "y") had partially landed.
+    // Tag "a" declares two fields. Tag "b" then redeclares BOTH with
+    // conflicting specs — a NON-indexed type conflict on "x" AND an
+    // indexed-flag conflict on "y" — in the SAME update-tag call. Pre-#553
+    // the cross-tag validation loop threw on the first offending field
+    // ("x") and never even evaluated "y"; two testers independently assumed
+    // the whole call (including "y") had partially landed. (The
+    // BOTH-indexed type-conflict case is deliberately absent here — it
+    // keeps its pre-existing declareField → IndexedFieldError path; see
+    // `collectCrossTagFieldViolations`'s doc-comment exclusion 2 and the
+    // both-indexed test below.)
     await store.upsertTagRecord("a", {
       fields: {
-        x: { type: "string", indexed: true },
+        x: { type: "string" },
         y: { type: "boolean", indexed: true },
       },
     });
@@ -126,7 +130,7 @@ describe("contract: update-tag messaging — #553/#554 (flipped from todo)", () 
       await updateTag.execute({
         tag: "b",
         fields: {
-          x: { type: "integer", indexed: true }, // type_conflict vs tag "a"
+          x: { type: "integer" }, // non-indexed type_conflict vs tag "a"
           y: { type: "boolean", indexed: false }, // indexed_flag_conflict vs tag "a"
         },
       });
@@ -142,8 +146,46 @@ describe("contract: update-tag messaging — #553/#554 (flipped from todo)", () 
     expect(byField.get("y")).toBe("indexed_flag_conflict");
     // States explicitly that no changes were applied.
     expect(err.message).toContain("no changes were applied");
+    // Structured conflicting-declarer field (scrubbed by the server layer
+    // for tag-scoped sessions; full detail here — core is scope-unaware).
+    expect(err.violations[0]!.other_tag).toBe("a");
 
     // Nothing partially landed — tag "b" has no field declarations at all.
+    const bRecord = await store.getTagRecord("b");
+    expect(bRecord?.fields ?? null).toBeFalsy();
+  });
+
+  it("a BOTH-indexed cross-tag type conflict keeps its pre-existing IndexedFieldError path (not TagFieldConflictError)", async () => {
+    // Wire-contract floor (vault#554): this exact case already errored on
+    // main via store.upsertTagRecord → declareField's cross-declarer
+    // sqlite-type check → IndexedFieldError (REST maps it to 400
+    // invalid_indexed_field). The new pre-check must not intercept it.
+    await store.upsertTagRecord("a", {
+      fields: { x: { type: "string", indexed: true } },
+    });
+
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "b",
+        fields: { x: { type: "integer", indexed: true } },
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught).not.toBeInstanceOf(TagFieldConflictError);
+    expect(caught.name).toBe("IndexedFieldError");
+    expect(caught.error_type).toBe("invalid_indexed_field");
+    // The structured declarer context the server's tag-scope scrub keys on.
+    expect(caught.field).toBe("x");
+    expect(caught.declarer_tags).toEqual(["a"]);
+
+    // The store's transaction rolled back — nothing persisted for "b".
     const bRecord = await store.getTagRecord("b");
     expect(bRecord?.fields ?? null).toBeFalsy();
   });

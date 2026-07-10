@@ -187,9 +187,17 @@ describe("update-tag: indexed flag", () => {
   it("type conflict across declarers throws and names the other tag", async () => {
     const t = findTool("update-tag");
     await t.execute({ tag: "project", fields: { status: { type: "string", indexed: true } } });
+    // vault#554 wire review: a BOTH-indexed cross-tag type conflict is
+    // deliberately excluded from the update-tag pre-check (see
+    // `collectCrossTagFieldViolations` doc-comment exclusion 2) so it keeps
+    // its pre-existing declareField → IndexedFieldError path — REST maps
+    // that to the established 400 invalid_indexed_field. The declarer is
+    // still named (declareField's message shape), which is this test's
+    // intent; the pre-#554 inline-loop wording (`tag "project" declares
+    // "string"`) is gone along with the loop.
     expect(() =>
       t.execute({ tag: "ticket", fields: { status: { type: "integer", indexed: true } } }),
-    ).toThrow(/tag "project".*"string"/);
+    ).toThrow(/declared by tag\(s\) \[project\]/);
   });
 
   it("indexed-flag conflict across declarers throws", async () => {
