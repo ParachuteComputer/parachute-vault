@@ -34,6 +34,7 @@ import {
   type TagHierarchy,
 } from "./tag-hierarchy.js";
 import { chunkForInClause } from "./sql-in.js";
+import { escapeFtsToken } from "./search-query.js";
 
 export interface QueryWarning {
   code: string;
@@ -231,13 +232,15 @@ export function ignoredParamWarning(param: string, reason: string): QueryWarning
  *   - the FTS5 vocabulary — a `notes_fts_vocab` `fts5vocab('row')` table
  *     created here LAZILY and BEST-EFFORT (not part of the schema/
  *     migration — see the try/catch below) — the terms actually indexed,
- *     POST-tokenization/stemming (porter). A suggestion therefore
- *     sometimes reads as a stemmed form ("propoli" rather than "propolis")
- *     rather than the original dictionary word — an accepted tradeoff
- *     (documented in docs/HTTP_API.md) rather than maintaining a second,
- *     unstemmed index just for spelling suggestions.
+ *     POST-tokenization/stemming (porter). The closest CANDIDATE is found
+ *     against this stemmed vocabulary (small, deduped, cheap to
+ *     range-scan), but a stemmed candidate is never returned verbatim —
+ *     see `resolveSurfaceForm` below, which maps it back to a real word
+ *     before it's handed to the caller (vault#570 — a raw stem like
+ *     "propoli" or "cactu" isn't a word anyone would type).
  *   - tag names, when the caller passes `tagNames` (already cached by the
- *     caller's tag hierarchy — free to include).
+ *     caller's tag hierarchy — free to include, and already real words —
+ *     no de-stemming needed).
  *
  * `fts5vocab` is registered by the same FTS5 extension init as `notes_fts`
  * itself (not a separately-enabled module) so it's expected to be
@@ -263,6 +266,8 @@ export function computeSearchDidYouMean(
     const tokens = rawQuery.trim().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) return undefined;
 
+    const tagNameSet = tagNames ? new Set(tagNames) : undefined;
+
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_vocab USING fts5vocab(notes_fts, 'row')");
     const exactStmt = db.prepare("SELECT 1 FROM notes_fts_vocab WHERE term = ? LIMIT 1");
     const rangeStmt = db.prepare("SELECT term FROM notes_fts_vocab WHERE length(term) BETWEEN ? AND ?");
@@ -284,18 +289,61 @@ export function computeSearchDidYouMean(
       const hi = clean.length + 2;
       const rows = rangeStmt.all(lo, hi) as { term: string }[];
       const candidates = new Set<string>(rows.map((r) => r.term));
-      if (tagNames) for (const t of tagNames) candidates.add(t);
+      if (tagNameSet) for (const t of tagNameSet) candidates.add(t);
 
       const suggestion = suggestSimilarTag(candidates, lower);
-      if (suggestion && suggestion.toLowerCase() !== lower) {
-        changed = true;
-        return suggestion;
-      }
-      return tok;
+      if (!suggestion || suggestion.toLowerCase() === lower) return tok;
+
+      changed = true;
+      // A literal tag name is already a real word — return it verbatim. A
+      // vocabulary hit, though, came out of the PORTER-STEMMED index, so
+      // it's usually a truncated stem ("cactu" for "cactus") rather than a
+      // word a user would ever type (vault#570) — recover the real surface
+      // form before handing it back.
+      if (tagNameSet?.has(suggestion)) return suggestion;
+      return resolveSurfaceForm(db, suggestion) ?? suggestion;
     });
 
     if (!changed) return undefined;
     return corrected.join(" ");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Map a porter-stemmed vocabulary term ("cactu") back to the real
+ * dictionary word a note actually contains ("cactus") — vault#570 (issue
+ * #570's search polish item). `notes_fts` is porter-tokenized, so MATCHing
+ * the bare stem finds any note carrying a word that stems to it (the stem
+ * came FROM `notes_fts_vocab` in the first place, so at least one match is
+ * guaranteed). From there, tokenize that note's own path/content text —
+ * unstemmed, done here in JS with the same punctuation-stripping rule used
+ * above — and return the first token that literally STARTS WITH the stem.
+ * This works because Porter's rules are almost entirely suffix-stripping:
+ * the stem is near-always a prefix of the original word. Irregular cases
+ * (a stem that isn't a literal prefix) are a known, accepted limitation —
+ * same class as the porter tokenizer's irregular-plural gap documented in
+ * docs/HTTP_API.md — and simply fall back to the raw stem via the caller's
+ * `?? suggestion`, never worse than the pre-fix behavior.
+ *
+ * Bounded to a handful of rows (`LIMIT 5`) and wrapped in try/catch same as
+ * the caller — a nicety, never worth risking the search response itself.
+ */
+function resolveSurfaceForm(db: Database, stem: string): string | undefined {
+  try {
+    const rows = db
+      .prepare("SELECT path, content FROM notes_fts WHERE notes_fts MATCH ? LIMIT 5")
+      .all(escapeFtsToken(stem)) as { path: string | null; content: string | null }[];
+    for (const row of rows) {
+      const text = `${row.path ?? ""} ${row.content ?? ""}`;
+      for (const raw of text.split(/[^\p{L}\p{N}]+/gu)) {
+        if (!raw) continue;
+        const lower = raw.toLowerCase();
+        if (lower.length > stem.length && lower.startsWith(stem)) return lower;
+      }
+    }
+    return undefined;
   } catch {
     return undefined;
   }

@@ -255,15 +255,23 @@ export function validateFieldDefault(field: string, spec: TagFieldSchema): TagFi
 
 /**
  * The full recognized vocabulary for `TagFieldSchema.type` — storage/
- * advisory validation accepts all six; only `string`/`integer`/`boolean`
- * are INDEXABLE (that narrower subset is `indexed-fields.ts`'s `TYPE_MAP`,
- * enforced separately via `mapFieldType` for `indexed: true` fields).
- * Matches `defaultMatchesType`'s switch and `schema-defaults.ts`'s
+ * advisory validation accepts all seven; only `string`/`integer`/`boolean`/
+ * `reference` are INDEXABLE (that narrower subset is `indexed-fields.ts`'s
+ * `TYPE_MAP`, enforced separately via `mapFieldType` for `indexed: true`
+ * fields). Matches `defaultMatchesType`'s switch and `schema-defaults.ts`'s
  * `SchemaField.type` union — kept in lockstep by hand across the two
  * deliberately-decoupled modules (see `validateFieldDefault`'s doc comment
  * for why they don't cross-import).
+ *
+ * `reference` (vault#typed-reference-field) is a dual-write field type: the
+ * value is stored + validated exactly like `string` (an id/path/title the
+ * caller passes), AND the write path (`core/src/store.ts` — see
+ * `BunSqliteStore.syncReferenceFieldLinks`) additionally resolves that value
+ * to a note and maintains a graph `links` edge from this note to the
+ * resolved target, with `relationship` set to the field name. See
+ * `docs/design/typed-reference-field.md` for the full design + known gaps.
  */
-export const VALID_FIELD_TYPES = ["string", "number", "integer", "boolean", "array", "object"] as const;
+export const VALID_FIELD_TYPES = ["string", "number", "integer", "boolean", "array", "object", "reference"] as const;
 
 /**
  * Validate that a field's declared `type` is one of the six recognized
@@ -320,7 +328,7 @@ export function collectOwnFieldDefaultAndTypeViolations(
   return violations;
 }
 
-/** Same six-type vocabulary as `TagFieldSchema.type`'s doc comment. Unknown/unset types pass (nothing to check against). */
+/** Same seven-type vocabulary as `TagFieldSchema.type`'s doc comment. Unknown/unset types pass (nothing to check against). */
 function defaultMatchesType(value: unknown, type: string): boolean {
   switch (type) {
     case "string":
@@ -335,6 +343,11 @@ function defaultMatchesType(value: unknown, type: string): boolean {
       return Array.isArray(value);
     case "object":
       return !!value && typeof value === "object" && !Array.isArray(value);
+    // `reference` stores/validates like `string` — the value is the
+    // id/path/title the write path resolves to a target note. See
+    // VALID_FIELD_TYPES's doc comment.
+    case "reference":
+      return typeof value === "string";
     default:
       return true;
   }
@@ -754,7 +767,7 @@ export function collectTagFieldViolations(
         violations.push({
           field: fieldName,
           reason: "unsupported_indexed_type",
-          message: `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean)`,
+          message: `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean, reference)`,
         });
       } else {
         try {

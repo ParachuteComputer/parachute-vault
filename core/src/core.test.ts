@@ -6,6 +6,9 @@ import { initSchema } from "./schema.js";
 import { decodeCursor } from "./cursor.js";
 import { traverseLinks } from "./links.js";
 import * as indexedFieldOps from "./indexed-fields.js";
+import { resolveLinkTarget } from "./wikilinks.js";
+import { generateUlid, ULID_REGEX } from "./ulid.js";
+import { getVaultMap, extractH1Title, findNotesByTitle, getNoteByTitle } from "./notes.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -458,6 +461,66 @@ describe("notes.extension (vault#328)", async () => {
   it("getNoteByPath returns null for unknown path (vault#330 S1 back-compat)", async () => {
     const note = await store.getNoteByPath("DoesNotExist");
     expect(note).toBeNull();
+  });
+});
+
+// ---- Title fallback (extractH1Title / findNotesByTitle / getNoteByTitle) ----
+
+describe("extractH1Title", () => {
+  it("extracts the first level-1 heading", () => {
+    expect(extractH1Title("# My Title\n\nBody text.")).toBe("My Title");
+  });
+
+  it("finds the H1 even when it isn't the first line", () => {
+    expect(extractH1Title("---\nid: x\n---\n\n# My Title\n\nBody.")).toBe("My Title");
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(extractH1Title("#   Spaced Out   \nBody.")).toBe("Spaced Out");
+  });
+
+  it("does not match a level-2+ heading", () => {
+    expect(extractH1Title("## Not H1\n\nBody.")).toBeNull();
+  });
+
+  it("returns null when there is no heading", () => {
+    expect(extractH1Title("Just a paragraph, no heading.")).toBeNull();
+  });
+
+  it("returns null when the heading marker has no space", () => {
+    expect(extractH1Title("#NoSpace\n\nBody.")).toBeNull();
+  });
+
+  it("returns null for a blank heading", () => {
+    expect(extractH1Title("#   \nBody.")).toBeNull();
+  });
+});
+
+describe("findNotesByTitle / getNoteByTitle", async () => {
+  it("finds a single note by its H1 title", async () => {
+    const note = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/a1" });
+    const matches = findNotesByTitle(db, "Weekly Review");
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.id).toBe(note.id);
+
+    const found = getNoteByTitle(db, "Weekly Review");
+    expect(found?.id).toBe(note.id);
+  });
+
+  it("matches case-insensitively", async () => {
+    const note = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/a2" });
+    expect(getNoteByTitle(db, "weekly review")?.id).toBe(note.id);
+  });
+
+  it("returns no match (not throw) when 2+ notes share a title — ambiguous", async () => {
+    await store.createNote("# Shared\n\nA.", { path: "Inbox/b1" });
+    await store.createNote("# Shared\n\nB.", { path: "Inbox/b2" });
+    expect(findNotesByTitle(db, "Shared")).toHaveLength(2);
+    expect(getNoteByTitle(db, "Shared")).toBeNull();
+  });
+
+  it("returns null for an unknown title", async () => {
+    expect(getNoteByTitle(db, "Nothing Like This")).toBeNull();
   });
 });
 
@@ -1126,6 +1189,116 @@ describe("vault stats", async () => {
   });
 });
 
+// ---- Vault Map (front-door structural orientation) ----
+
+describe("vault map", async () => {
+  it("handles an empty vault gracefully", async () => {
+    const map = getVaultMap(db);
+    expect(map.total_notes).toBe(0);
+    expect(map.tags).toEqual([]);
+    expect(map.path_buckets).toEqual([]);
+    expect(map.unfiled_notes).toBe(0);
+  });
+
+  it("counts total notes, tag membership, and top-level path buckets", async () => {
+    await store.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await store.createNote("b", { tags: ["person"], path: "People/Bob" });
+    await store.createNote("c", { tags: ["project"], path: "Projects/Acme" });
+    await store.createNote("d", { tags: ["project", "person"] }); // no path
+
+    const map = getVaultMap(db);
+    expect(map.total_notes).toBe(4);
+
+    const tagByName = Object.fromEntries(map.tags.map((t) => [t.name, t.count]));
+    expect(tagByName.person).toBe(3);
+    expect(tagByName.project).toBe(2);
+
+    const bucketByName = Object.fromEntries(map.path_buckets.map((b) => [b.name, b.count]));
+    expect(bucketByName.People).toBe(2);
+    expect(bucketByName.Projects).toBe(1);
+
+    expect(map.unfiled_notes).toBe(1);
+    // Invariant: unfiled + every bucket's count == total_notes (a note has at
+    // most one path, so buckets + unfiled partition the vault exactly).
+    const bucketSum = map.path_buckets.reduce((sum, b) => sum + b.count, 0);
+    expect(bucketSum + map.unfiled_notes).toBe(map.total_notes);
+  });
+
+  it("buckets a top-level (no-slash) path under its own full name", async () => {
+    await store.createNote("solo", { path: "Welcome" });
+    const map = getVaultMap(db);
+    expect(map.path_buckets).toEqual([{ name: "Welcome", count: 1 }]);
+    expect(map.unfiled_notes).toBe(0);
+  });
+
+  it("tags are sorted by count desc, then name asc", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`m-${i}`, { tags: ["popular"] });
+    await store.createNote("z", { tags: ["zzz-rare"] });
+    await store.createNote("a", { tags: ["aaa-rare"] });
+
+    const map = getVaultMap(db);
+    expect(map.tags).toEqual([
+      { name: "popular", count: 3 },
+      { name: "aaa-rare", count: 1 },
+      { name: "zzz-rare", count: 1 },
+    ]);
+  });
+
+  describe("tagFilter (scope-aware path)", () => {
+    it("omitting tagFilter computes the vault-wide map (unchanged default)", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+      await store.createNote("b", { tags: ["personal"], path: "Personal/Two" });
+
+      const map = getVaultMap(db);
+      expect(map.total_notes).toBe(2);
+      expect(map.tags.map((t) => t.name).sort()).toEqual(["personal", "work"]);
+      expect(map.path_buckets.map((b) => b.name).sort()).toEqual(["Personal", "Work"]);
+    });
+
+    it("an empty tagFilter array means nothing is in scope — all-zero map, NOT the full vault", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+
+      const map = getVaultMap(db, { tagFilter: [] });
+      expect(map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
+    });
+
+    it("a non-empty tagFilter restricts every count to notes reachable through that tag set", async () => {
+      await store.createNote("a", { tags: ["work"], path: "Work/One" });
+      await store.createNote("b", { tags: ["work", "urgent"], path: "Work/Two" });
+      await store.createNote("c", { tags: ["personal"], path: "Personal/Three" });
+      await store.createNote("d", { tags: ["personal"] }); // no path
+
+      const map = getVaultMap(db, { tagFilter: ["work", "urgent"] });
+      expect(map.total_notes).toBe(2); // a, b — "personal" notes excluded
+      expect(map.tags).toEqual([
+        { name: "work", count: 2 },
+        { name: "urgent", count: 1 },
+      ]);
+      expect(map.path_buckets).toEqual([{ name: "Work", count: 2 }]);
+      expect(map.unfiled_notes).toBe(0);
+    });
+
+    it("a note carrying both an in-scope and out-of-scope tag is counted once, not double", async () => {
+      await store.createNote("a", { tags: ["work", "personal"], path: "Work/One" });
+
+      const map = getVaultMap(db, { tagFilter: ["work"] });
+      expect(map.total_notes).toBe(1);
+      expect(map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+      // "personal" is out of scope — must not leak into the tags list.
+      expect(map.tags.map((t) => t.name)).not.toContain("personal");
+    });
+
+    it("scoped unfiled_notes counts only in-scope path-less notes", async () => {
+      await store.createNote("a", { tags: ["work"] }); // no path, in scope
+      await store.createNote("b", { tags: ["personal"] }); // no path, out of scope
+
+      const map = getVaultMap(db, { tagFilter: ["work"] });
+      expect(map.unfiled_notes).toBe(1);
+      expect(map.total_notes).toBe(1);
+    });
+  });
+});
+
 // ---- Query ----
 
 describe("queryNotes", async () => {
@@ -1612,6 +1785,119 @@ describe("queryNotes", async () => {
       // No new writes since seed → empty page, cursor still advances.
       expect(envelope.notes).toHaveLength(0);
       expect(typeof envelope.next_cursor).toBe("string");
+    });
+  });
+
+  describe("ULID ids for new notes (existing IDs unchanged)", () => {
+    function pinUpdatedAt(id: string, iso: string) {
+      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+    }
+
+    it("new notes get ULID-format ids (26-char Crockford base32)", async () => {
+      const note = await store.createNote("fresh note");
+      expect(note.id).toHaveLength(26);
+      expect(note.id).toMatch(ULID_REGEX);
+    });
+
+    it("generateUlid() output matches the ULID format directly", () => {
+      const id = generateUlid();
+      expect(id).toHaveLength(26);
+      expect(id).toMatch(ULID_REGEX);
+    });
+
+    it("ULIDs minted in the same millisecond are monotonically increasing", () => {
+      const ids = Array.from({ length: 200 }, () => generateUlid());
+      // No duplicates, and strictly increasing under plain string compare —
+      // this is the monotonic-within-a-ms guarantee, not just uniqueness.
+      const unique = new Set(ids);
+      expect(unique.size).toBe(ids.length);
+      for (let i = 1; i < ids.length; i++) {
+        expect(ids[i]! > ids[i - 1]!).toBe(true);
+      }
+    });
+
+    it("an explicitly-supplied old-format id still round-trips (create/read/link/resolve)", async () => {
+      const oldId = "2020-01-01-00-00-00-000001";
+
+      // create — old-format id passed explicitly via opts.id.
+      const oldNote = await store.createNote("legacy note", { id: oldId, path: "legacy-note" });
+      expect(oldNote.id).toBe(oldId);
+
+      // read — by id and by path.
+      const byId = await store.getNote(oldId);
+      expect(byId?.id).toBe(oldId);
+      expect(byId?.content).toBe("legacy note");
+      const byPath = await store.getNoteByPath("legacy-note");
+      expect(byPath?.id).toBe(oldId);
+
+      // link — a brand-new (ULID) note links to the old-format note, and
+      // vice versa; both directions traverse the graph correctly.
+      const newNote = await store.createNote("modern note");
+      expect(newNote.id).toMatch(ULID_REGEX);
+      await store.createLink(newNote.id, oldId, "references");
+      await store.createLink(oldId, newNote.id, "referenced-by");
+
+      const outbound = await store.getLinks(newNote.id, { direction: "outbound" });
+      expect(outbound.some((l) => l.targetId === oldId)).toBe(true);
+      const inbound = await store.getLinks(newNote.id, { direction: "inbound" });
+      expect(inbound.some((l) => l.sourceId === oldId)).toBe(true);
+
+      // resolve — resolveLinkTarget's id-then-path-then-title chain works
+      // identically for an old-format id as it does for a ULID.
+      expect(resolveLinkTarget(db, oldId)).toBe(oldId);
+      expect(resolveLinkTarget(db, "legacy-note")).toBe(oldId);
+      expect(resolveLinkTarget(db, newNote.id)).toBe(newNote.id);
+    });
+
+    it("mixed-format cursor pagination is stable under a shared updated_at (no miss/dupe)", async () => {
+      const ts = "2026-05-01T00:00:00.000Z";
+      const ids: string[] = [];
+
+      // Two "old" notes with explicit timestamp-format ids...
+      for (const oldId of ["2020-01-01-00-00-00-000001", "2020-06-15-12-30-00-500000"]) {
+        const n = await store.createNote(`old ${oldId}`, { id: oldId });
+        pinUpdatedAt(n.id, ts);
+        ids.push(n.id);
+      }
+      // ...and three "new" notes with auto-generated ULIDs, all sharing the
+      // exact same updated_at — id is the ONLY thing that can order them.
+      for (let i = 0; i < 3; i++) {
+        const n = await store.createNote(`new ${i}`);
+        expect(n.id).toMatch(ULID_REGEX);
+        pinUpdatedAt(n.id, ts);
+        ids.push(n.id);
+      }
+
+      // The expected stable total order is plain string comparison over the
+      // id column — same rule the SQL keyset ORDER BY uses (BINARY/ASCII
+      // collation), which holds regardless of id format.
+      const expectedOrder = [...ids].sort();
+
+      // Paginate with a small limit to force several pages across the
+      // format boundary and confirm no note is skipped or repeated.
+      //
+      // The first call MUST pass `cursor: ""` (the documented bootstrap
+      // value — see queryNotes's cursor-mode doc comment in
+      // core/src/notes.ts), NOT omit `cursor` entirely. Omitting it opts
+      // OUT of cursor/keyset mode altogether, which orders the first page
+      // by `created_at` (insertion order) instead of `updated_at` — a
+      // DIFFERENT order than every subsequent (real-cursor) page uses. That
+      // mismatch produces a watermark from a page in the wrong order, which
+      // can then skip rows once keyset mode takes over on page 2 — exactly
+      // the bug this test exists to catch, so the harness itself must use
+      // the correct bootstrap contract or it can flake based on whether
+      // `created_at` happens to tie across the fixture's notes.
+      const seen: string[] = [];
+      let cursor = "";
+      for (let page = 0; page < 10; page++) {
+        const result = await store.queryNotesPaged({ limit: 2, cursor });
+        if (result.notes.length === 0) break;
+        seen.push(...result.notes.map((n) => n.id));
+        cursor = result.next_cursor;
+      }
+
+      expect(seen).toEqual(expectedOrder);
+      expect(new Set(seen).size).toBe(seen.length);
     });
   });
 
@@ -2353,6 +2639,164 @@ describe("MCP tools", async () => {
     const target = await store.createNote("arrived", { path: "Future Note" });
     const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links.some((l) => l.targetId === target.id && l.relationship === "knows")).toBe(true);
+  });
+
+  // vault#570 — content-parsed [[wikilinks]] to a missing target used to
+  // fire NO write-time warning at all, even though the equivalent
+  // structured `links` entry (tested above) already did. This closes that
+  // asymmetry: the SAME `unresolved_link` warning shape, sourced from
+  // content instead of `links`.
+  it("create-note with a content [[wikilink]] to a missing target: warns (unresolved_link), same as structured links", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "See [[Missing Note]] for details.",
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("unresolved_link");
+    expect(source.warnings[0].target).toBe("Missing Note");
+    expect(source.warnings[0].relationship).toBe("wikilink");
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Backfills automatically, same as the structured-link contract.
+    const target = await store.createNote("here now", { path: "Missing Note" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target.id);
+  });
+
+  // vault#570 — a target matching ≥2 notes (e.g. two notes sharing a
+  // basename/title) is a factually different situation from "no note
+  // matches" — reporting it as `unresolved_link` ("did not resolve to any
+  // note") would be WRONG (it matched two, not zero). Must surface a
+  // distinct `ambiguous_link` warning instead, and must NOT create an edge
+  // (there's no principled way to pick one of the two candidates).
+  it("create-note with a content [[wikilink]] to an AMBIGUOUS target (2 same-title notes): ambiguous_link, not unresolved_link, no edge", async () => {
+    const a = await store.createNote("A", { path: "Folder1/Shared Title" });
+    const b = await store.createNote("B", { path: "Folder2/Shared Title" });
+
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "See [[Shared Title]] for details.",
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("ambiguous_link");
+    expect(source.warnings[0].target).toBe("Shared Title");
+    expect(source.warnings[0].relationship).toBe("wikilink");
+    expect(source.warnings[0].candidate_count).toBe(2);
+
+    // No edge created to EITHER candidate.
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(0);
+    expect(links.some((l) => l.targetId === a.id || l.targetId === b.id)).toBe(false);
+
+    // Not queued for lazy resolution either — a future note being created
+    // can't retroactively resolve an ambiguity between two EXISTING notes.
+    // The table itself may not even exist yet (nothing else in this test
+    // ever queued anything) — `PRAGMA table_info` on a nonexistent table
+    // returns zero rows rather than throwing, same tolerance the wikilinks
+    // module itself uses.
+    const tableExists = (db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as unknown[]).length > 0;
+    if (tableExists) {
+      const pending = db.prepare(
+        "SELECT * FROM unresolved_wikilinks WHERE source_id = ?",
+      ).all(source.id) as unknown[];
+      expect(pending).toHaveLength(0);
+    }
+  });
+
+  // vault#570 — the same ambiguous-target treatment applies to structured
+  // `links`, not just content [[wikilinks]] (resolveOrQueueLink is the
+  // shared implementation both paths call).
+  it("create-note with a structured link to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/Dup" });
+    await store.createNote("B", { path: "Folder2/Dup" });
+
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const source = await createNote.execute({
+      content: "no wikilinks here",
+      links: [{ target: "Dup", relationship: "knows" }],
+    }) as any;
+
+    expect(source.warnings).toBeDefined();
+    expect(source.warnings).toHaveLength(1);
+    expect(source.warnings[0].code).toBe("ambiguous_link");
+    expect(source.warnings[0].target).toBe("Dup");
+    expect(source.warnings[0].relationship).toBe("knows");
+    expect(source.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a content [[wikilink]] to a note created LATER in the same
+  // create-note batch must resolve silently (forward-ref), exactly like
+  // structured `links` already do — no spurious `unresolved_link` warning
+  // just because the classification pass runs before this fix would have.
+  it("create-note batch: a content [[wikilink]] to a note created LATER in the same batch resolves without warning", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    const result = await createNote.execute({
+      notes: [
+        { path: "WikiA", content: "links to [[WikiB]]" },
+        { path: "WikiB", content: "the target" },
+      ],
+    }) as any[];
+    const a = result.find((n: any) => n.path === "WikiA");
+    expect(a.warnings).toBeUndefined();
+    const links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.relationship).toBe("wikilink");
+  });
+
+  // vault#570 — update-note's content replace path gets the same
+  // unresolved_link/ambiguous_link treatment as create-note.
+  it("update-note content replace with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const note = await store.createNote("plain content", { path: "Updatable" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content: "now references [[Not Yet Real]]",
+      force: true,
+    }) as any;
+
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings[0].code).toBe("unresolved_link");
+    expect(result.warnings[0].target).toBe("Not Yet Real");
+
+    // A tags/links-only update on the SAME note must NOT re-surface the
+    // warning — nothing about content changed on this call.
+    const tagOnly = await updateNote.execute({
+      id: note.id,
+      tags: { add: ["x"] },
+      force: true,
+    }) as any;
+    expect(tagOnly.warnings).toBeUndefined();
+  });
+
+  it("update-note content replace with a [[wikilink]] to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/Both" });
+    await store.createNote("B", { path: "Folder2/Both" });
+    const note = await store.createNote("plain content", { path: "Updatable2" });
+    const tools = generateMcpTools(store);
+    const updateNote = tools.find((t) => t.name === "update-note")!;
+
+    const result = await updateNote.execute({
+      id: note.id,
+      content: "now references [[Both]]",
+      force: true,
+    }) as any;
+
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings[0].code).toBe("ambiguous_link");
+    expect(result.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(note.id, { direction: "outbound" })).toHaveLength(0);
   });
 
   it("update-note tool updates created_at", async () => {
@@ -3347,6 +3791,36 @@ describe("MCP tools", async () => {
     expect(result.content).toBe("By Path");
   });
 
+  // ---- Title-fallback id resolution (additive — vault "title-fallback link + id resolution") ----
+
+  it("query-notes single note by H1 title when id AND path both miss", async () => {
+    await store.createNote("# My Great Note\n\nBody.", { path: "Inbox/2026-07-10-xyz" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "My Great Note" }) as any;
+    expect(result.content).toBe("# My Great Note\n\nBody.");
+    expect(result.path).toBe("Inbox/2026-07-10-xyz");
+  });
+
+  it("query-notes exact path still wins over a same-named title on another note", async () => {
+    const byPath = await store.createNote("Path note", { path: "My Great Note" });
+    await store.createNote("# My Great Note\n\nOther body.", { path: "Inbox/other" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "My Great Note" }) as any;
+    expect(result.id).toBe(byPath.id);
+    expect(result.content).toBe("Path note");
+  });
+
+  it("query-notes stays unresolved (not_found) when 2+ notes share the same H1 title", async () => {
+    await store.createNote("# Dup Note\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Note\n\nB.", { path: "Inbox/dup-b" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = await query.execute({ id: "Dup Note" }) as any;
+    expect(result.error_type).toBe("not_found");
+  });
+
   it("query-notes by tag", async () => {
     await store.createNote("Test", { tags: ["daily"] });
     const tools = generateMcpTools(store);
@@ -3875,10 +4349,205 @@ describe("MCP tools", async () => {
         d: { type: "boolean" },
         e: { type: "array" },
         f: { type: "object" },
+        g: { type: "reference" },
       },
     }) as any;
     expect(result.fields.a.type).toBe("string");
     expect(result.fields.f.type).toBe("object");
+    expect(result.fields.g.type).toBe("reference");
+  });
+
+  // ---- Typed reference field: indexed value + auto-link (vault#typed-reference-field) ----
+
+  describe("typed reference field", () => {
+    it("create-note with a reference-typed field indexes the value AND creates the link", async () => {
+      const target = await store.createNote("Alice", { path: "People/Alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "People/Alice" },
+      }) as any;
+
+      // (a) the value half — stored + readable like a string field.
+      expect(result.metadata.assignee).toBe("People/Alice");
+
+      // (b) the link half — a graph edge to the resolved target, relationship = field name.
+      const links = await store.getLinks(result.id, { direction: "outbound" });
+      const assigneeLink = links.find((l) => l.relationship === "assignee");
+      expect(assigneeLink).toBeDefined();
+      expect(assigneeLink!.targetId).toBe(target.id);
+    });
+
+    it("resolves a reference field by note ID as well as path/title", async () => {
+      const target = await store.createNote("Bob", { id: "bob-id" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "bob-id" },
+      }) as any;
+
+      const links = await store.getLinks(result.id, { direction: "outbound" });
+      expect(links.find((l) => l.relationship === "assignee")?.targetId).toBe(target.id);
+    });
+
+    it("querying by a reference field's value works (plain metadata filter and, when indexed, the eq operator)", async () => {
+      await store.createNote("Alice", { path: "People/Alice", id: "alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "task",
+        fields: { assignee: { type: "reference", indexed: true } },
+      });
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const created = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const plain = await queryNotes.execute({ tags: ["task"], metadata: { assignee: "alice" } }) as any[];
+      expect(plain.map((n: any) => n.id)).toContain(created.id);
+
+      const viaOperator = await queryNotes.execute({
+        tags: ["task"],
+        metadata: { assignee: { eq: "alice" } },
+      }) as any[];
+      expect(viaOperator.map((n: any) => n.id)).toContain(created.id);
+    });
+
+    it("update-note changing a reference field's value moves the link (old edge dropped, new edge created)", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      const bob = await store.createNote("Bob", { id: "bob" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.filter((l) => l.relationship === "assignee").map((l) => l.targetId)).toEqual([alice.id]);
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      await updateNote.execute({ id: note.id, metadata: { assignee: "bob" }, force: true });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      const assigneeLinks = links.filter((l) => l.relationship === "assignee");
+      expect(assigneeLinks).toHaveLength(1);
+      expect(assigneeLinks[0]!.targetId).toBe(bob.id);
+
+      const fresh = await store.getNote(note.id);
+      expect(fresh!.metadata!.assignee).toBe("bob");
+    });
+
+    it("update-note clearing a reference field drops the link", async () => {
+      await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(true);
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      // RFC 7386 tombstone — null deletes the key.
+      await updateNote.execute({ id: note.id, metadata: { assignee: null }, force: true });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(false);
+
+      const fresh = await store.getNote(note.id);
+      expect(fresh!.metadata).not.toHaveProperty("assignee");
+    });
+
+    it("re-writing a reference field with the SAME value is a no-op (link untouched)", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const before = await store.getLinks(note.id, { direction: "outbound" });
+      const beforeLink = before.find((l) => l.relationship === "assignee");
+      expect(beforeLink).toBeDefined();
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      await updateNote.execute({ id: note.id, metadata: { assignee: "alice" }, force: true });
+
+      const after = await store.getLinks(note.id, { direction: "outbound" });
+      const afterLinks = after.filter((l) => l.relationship === "assignee");
+      expect(afterLinks).toHaveLength(1);
+      expect(afterLinks[0]!.targetId).toBe(alice.id);
+      // Same createdAt — proves the edge was never dropped and recreated.
+      expect(afterLinks[0]!.createdAt).toBe(beforeLink!.createdAt);
+    });
+
+    it("a reference field's unresolved target queues and backfills when the target note is created later", async () => {
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "Not Yet Created" },
+      }) as any;
+
+      let links = await store.getLinks(note.id, { direction: "outbound" });
+      expect(links.some((l) => l.relationship === "assignee")).toBe(false);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).toContain(note.id);
+
+      const target = await store.createNote("here now", { path: "Not Yet Created" });
+
+      links = await store.getLinks(note.id, { direction: "outbound" });
+      const assigneeLink = links.find((l) => l.relationship === "assignee");
+      expect(assigneeLink).toBeDefined();
+      expect(assigneeLink!.targetId).toBe(target.id);
+    });
+
+    it("a content-only or tags-only update does not touch a note's reference-field link", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const before = await store.getLinks(note.id, { direction: "outbound" });
+      const beforeLink = before.find((l) => l.relationship === "assignee");
+
+      // Content-only update — no `metadata` key in the call at all.
+      await store.updateNote(note.id, { content: "Ship it faster" });
+
+      const after = await store.getLinks(note.id, { direction: "outbound" });
+      const afterLink = after.find((l) => l.relationship === "assignee");
+      expect(afterLink).toBeDefined();
+      expect(afterLink!.targetId).toBe(alice.id);
+      expect(afterLink!.createdAt).toBe(beforeLink!.createdAt);
+    });
   });
 
   it("find-path works with ID/path resolution", async () => {

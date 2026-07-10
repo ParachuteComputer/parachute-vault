@@ -57,7 +57,7 @@ export interface SchemaField {
    * `type_mismatch` warning that previously fired on every integer-shaped
    * field because the validator had no `"integer"` case. See vault#310.
    */
-  type?: "string" | "number" | "integer" | "boolean" | "array" | "object";
+  type?: "string" | "number" | "integer" | "boolean" | "array" | "object" | "reference";
   enum?: string[];
   description?: string;
   /**
@@ -369,6 +369,12 @@ function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
       return Array.isArray(value);
     case "object":
       return !!value && typeof value === "object" && !Array.isArray(value);
+    // `reference` (vault#typed-reference-field) validates like `string` —
+    // the write path (core/src/store.ts) separately resolves this value to
+    // a note and maintains a graph link; see tag-schemas.ts's
+    // `VALID_FIELD_TYPES` doc comment for the full contract.
+    case "reference":
+      return typeof value === "string";
   }
 }
 

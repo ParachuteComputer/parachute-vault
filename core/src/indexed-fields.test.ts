@@ -67,10 +67,13 @@ describe("indexed-fields: module", () => {
     expect(() => validateFieldName("'; DROP TABLE notes; --")).toThrow(IndexedFieldError);
   });
 
-  it("TYPE_MAP covers string/integer/boolean", () => {
+  it("TYPE_MAP covers string/integer/boolean/reference", () => {
     expect(TYPE_MAP.string).toBe("TEXT");
     expect(TYPE_MAP.integer).toBe("INTEGER");
     expect(TYPE_MAP.boolean).toBe("INTEGER");
+    // vault#typed-reference-field: `reference` stores like `string` — the
+    // metadata VALUE (an id/path/title) is what's indexed here.
+    expect(TYPE_MAP.reference).toBe("TEXT");
   });
 
   it("declareField creates column + index on first declaration", () => {

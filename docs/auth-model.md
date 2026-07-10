@@ -80,9 +80,26 @@ tokens list` / `revoke` exist only to clean those rows up.)
 **Scopes** (carried in the JWT `scope` claim):
 
 - `vault:read` — GETs on `/api/*` and read-only MCP tools (`query-notes`,
-  `list-tags`, `find-path`, `vault-info`)
-- `vault:write` — all mutation routes and mutation MCP tools
-- `vault:admin` — `GET /.parachute/config`; inherits read + write
+  `list-tags`, `find-path`, `vault-info`, `doctor` — `doctor` moved here from
+  `admin` in the write/admin re-tier below: it never mutates and is already
+  tag-scope-restricted)
+- `vault:write` — mutation routes on `/api/*`, and the content-authorship MCP
+  tools (`create-note`, `update-note`, `delete-note`)
+- `vault:admin` — `GET /.parachute/config`; the schema/taxonomy-curation MCP
+  tools (`update-tag`, `delete-tag`, `rename-tag`, `merge-tags`,
+  `prune-schema`, `manage-token`) and `vault-info`'s description-update
+  branch, AND their REST-door equivalents — `PUT`/`DELETE
+  /api/tags/<name>`, `POST /api/tags/merge`, `POST /api/tags/<name>/rename`
+  — structure/taxonomy/vault-config curation is a distinct tier from
+  content authorship, moved here from `write` on BOTH doors (BREAKING —
+  see CHANGELOG); inherits read + write
+
+  MCP tool → verb reference: `read` = `query-notes`, `list-tags`,
+  `find-path`, `vault-info` (stats), `doctor`. `write` (additive) =
+  `create-note`, `update-note`, `delete-note`. `admin` (additive) =
+  `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`,
+  `manage-token`, `vault-info` (description update). Source of truth:
+  `requiredVerb` on each tool in `core/src/mcp.ts`.
 
 Inheritance: `vault:admin ⊇ vault:write ⊇ vault:read`. The
 `vault:<name>:<verb>` shape is the resource-narrowed form hub JWTs carry.
@@ -174,17 +191,21 @@ the hub's OAuth endpoints.
 
 | Path | Method | Auth required | Unauthenticated response | Authenticated-but-underscoped response |
 |---|---|---|---|---|
-| `/vault/<name>/mcp[/…]` | any | Bearer (any vault scope) | `401 {error:"Unauthorized", …}` + `WWW-Authenticate: Bearer resource_metadata="…"` (RFC 9728 challenge) | Per-tool: read-only tools require `vault:read`; mutation tools require `vault:write`. Under-scoped `tools/call` returns `{isError:true, content:[…"requires the 'vault:write' scope"…]}`. Under-scoped tools are *also filtered out of `tools/list`*. |
+| `/vault/<name>/mcp[/…]` | any | Bearer (any vault scope) | `401 {error:"Unauthorized", …}` + `WWW-Authenticate: Bearer resource_metadata="…"` (RFC 9728 challenge) | Per-tool: `vault:read` (`query-notes`/`list-tags`/`find-path`/`vault-info`/`doctor`), `vault:write` (`create-note`/`update-note`/`delete-note`), or `vault:admin` (`update-tag`/`delete-tag`/`rename-tag`/`merge-tags`/`prune-schema`/`manage-token`, and `vault-info`'s description-update branch). Under-scoped `tools/call` returns `{isError:true, content:[…"requires the '<verb>' scope"…]}`. Under-scoped tools are *also filtered out of `tools/list`*. |
 | `/vault/<name>/view/<idOrPath>` | GET | Auth-aware (see notes) | `404 Not Found` for private notes; `200 <html>` for published notes | — |
 | `/vault/<name>/public/<id>` | GET | Auth-aware (legacy alias) | `301` to `/vault/<name>/view/<id>` preserving `?key=…` | — |
 | `/vault/<name>` | GET | Bearer (any scope) | `401` | — |
 | `/vault/<name>/api/notes[/…]` | GET/HEAD | Bearer with `vault:read` | `401` | `403 {error:"Forbidden", error_type:"insufficient_scope", required_scope:"vault:read", granted_scopes:[…]}` |
 | `/vault/<name>/api/notes[/…]` | POST/PATCH/DELETE | Bearer with `vault:write` | `401` | `403` with `required_scope:"vault:write"` |
 | `/vault/<name>/api/tags[/…]` | GET | Bearer with `vault:read` | `401` | `403` |
-| `/vault/<name>/api/tags[/…]` | POST/PUT/DELETE | Bearer with `vault:write` | `401` | `403` |
+| `/vault/<name>/api/tags/<name>/conformance` | POST | Bearer with `vault:read` (read-only carve-out — counts violating notes, mutates nothing) | `401` | `403` |
+| `/vault/<name>/api/tags/<name>` | PUT/DELETE | Bearer with `vault:admin` (schema/taxonomy curation — re-tiered from `vault:write`, mirrors the MCP `update-tag`/`delete-tag` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
+| `/vault/<name>/api/tags/merge` | POST | Bearer with `vault:admin` (mirrors the MCP `merge-tags` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
+| `/vault/<name>/api/tags/<name>/rename` | POST | Bearer with `vault:admin` (mirrors the MCP `rename-tag` re-tier) | `401` | `403 {…required_scope:"vault:admin"…}` |
 | `/vault/<name>/api/find-path` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/vault` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/vault` | PATCH | Bearer with `vault:write` | `401` | `403` |
+| `/vault/<name>/api/doctor` | GET | Bearer with `vault:read` (re-tiered from `vault:admin` — mirrors the MCP `doctor` re-tier; never mutates, already tag-scope-restricted) | `401` | `403 {…required_scope:"vault:read"…}` |
 | `/vault/<name>/api/unresolved-wikilinks` | GET | Bearer with `vault:read` | `401` | `403` |
 | `/vault/<name>/api/storage/upload` | POST | Bearer with `vault:write` | `401` | `403` |
 | `/vault/<name>/api/storage/<path>` | GET | Bearer with `vault:read` | `401` | `403` |
@@ -204,7 +225,8 @@ fails write gates.
 
 **MCP `tools/list` visibility:** tools the caller can't execute are
 hidden from the list, not just rejected on call. Read-only keys see
-`query-notes`, `list-tags`, `find-path`, `vault-info` and nothing else.
+`query-notes`, `list-tags`, `find-path`, `vault-info`, `doctor` and nothing
+else.
 
 ## 3. What a user has to do
 

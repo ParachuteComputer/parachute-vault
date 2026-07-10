@@ -35,6 +35,28 @@ export function deleteLink(
   ).run(sourceId, targetId, relationship);
 }
 
+/**
+ * Delete every outbound link from `sourceId` carrying `relationship`,
+ * regardless of target. Used by the `reference`-field auto-link sync
+ * (core/src/store.ts's `syncReferenceFieldLinks`, vault#typed-reference-field)
+ * to re-establish "this field's link" as a single source of truth: rather
+ * than tracking the PRIOR resolved target to delete exactly one edge, the
+ * sync clears every edge under the field's relationship name and recreates
+ * at most one from the field's current value. This is safe because a
+ * `reference` field's relationship name is field-owned — a hand-authored
+ * `links` entry using the SAME relationship name on the SAME note is
+ * expected to be superseded by the field, not preserved alongside it.
+ */
+export function deleteLinksBySourceRelationship(
+  db: Database,
+  sourceId: string,
+  relationship: string,
+): void {
+  db.prepare(
+    "DELETE FROM links WHERE source_id = ? AND relationship = ?",
+  ).run(sourceId, relationship);
+}
+
 export function getLinks(
   db: Database,
   noteId: string,

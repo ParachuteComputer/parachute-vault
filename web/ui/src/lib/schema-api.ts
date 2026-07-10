@@ -41,9 +41,13 @@ export interface SchemaFieldSpec {
   cardinality?: "one" | "many";
 }
 
-/** Field types the editor offers. `string`/`integer`/`boolean` are the
- *  indexable subset (TYPE_MAP in core/src/indexed-fields.ts); `number`/
- *  `array`/`object` validate but can't back a generated column. */
+/** Field types the editor offers. `string`/`integer`/`boolean`/`reference`
+ *  are the indexable subset (TYPE_MAP in core/src/indexed-fields.ts);
+ *  `number`/`array`/`object` validate but can't back a generated column.
+ *  `reference` (vault#typed-reference-field) is a dual-write type: the
+ *  value stores/validates like `string`, AND create-note/update-note
+ *  additionally maintain a graph link to the resolved note, relationship =
+ *  the field name — see docs/design/typed-reference-field.md. */
 export const FIELD_TYPES = [
   "string",
   "integer",
@@ -51,6 +55,7 @@ export const FIELD_TYPES = [
   "boolean",
   "array",
   "object",
+  "reference",
 ] as const;
 export type FieldType = (typeof FIELD_TYPES)[number];
 
@@ -59,6 +64,7 @@ export const INDEXABLE_TYPES: ReadonlySet<string> = new Set([
   "string",
   "integer",
   "boolean",
+  "reference",
 ]);
 
 /** Tag list entry — name + count + the full identity row. */

@@ -11,7 +11,7 @@
  * and the Request, and returns a Response.
  */
 
-import type { Store, Note, QueryOpts } from "../core/src/types.ts";
+import type { Store, Note, QueryOpts, AggregateSpec } from "../core/src/types.ts";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "../core/src/tag-hierarchy.ts";
 import {
   collectUnknownTagWarnings,
@@ -28,9 +28,10 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  getContentWikilinkWarnings,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, getVaultMap } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -62,6 +63,7 @@ import {
   scrubValidationStatusByScope,
   tagScopeForbidden,
   tagsWithinScope,
+  tagVisibleInScope,
 } from "./tag-scope.ts";
 import { ParentCycleError, InvalidFieldDefaultError, InvalidFieldTypeError } from "../core/src/tag-schemas.ts";
 import { findTokensReferencingTag } from "./token-store.ts";
@@ -851,6 +853,58 @@ export function parseNotesQueryOpts(url: URL): {
 }
 
 /**
+ * Parse the `?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…`
+ * aggregation params (bracket-style, consistent with `meta[field][op]=`
+ * above) into an `AggregateSpec`. Absent entirely (none of the three keys
+ * present) → `{}` — no aggregate intent, the caller falls through to a
+ * normal query. `group_by` + `op` are required together when ANY of the
+ * three is present; `field` is optional at the parser level (its
+ * requiredness depends on `op`, enforced by `aggregateNotes` itself). Value
+ * validity beyond shape (indexed field, numeric type, sum-requires-field)
+ * is ALSO enforced by `aggregateNotes` — same FIELD_NOT_INDEXED /
+ * INVALID_QUERY contract every other query surface uses.
+ *
+ * Returns `{ aggregate? }` or `{ error }` (a 400 Response) on a malformed
+ * shape (missing `group_by`/`op`, or an unrecognized `op`).
+ */
+function parseAggregateParam(url: URL): { aggregate?: AggregateSpec; error?: Response } {
+  const groupBy = parseQuery(url, "aggregate[group_by]");
+  const op = parseQuery(url, "aggregate[op]");
+  const field = parseQuery(url, "aggregate[field]");
+  if (groupBy === null && op === null && field === null) return {};
+  if (groupBy === null || op === null) {
+    return {
+      error: json(
+        {
+          error: `aggregate requires both aggregate[group_by] and aggregate[op] — group_by is an indexed metadata field or "tag"; op is "count" or "sum".`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate",
+          hint: `pass ?aggregate[group_by]=<field|tag>&aggregate[op]=<count|sum>[&aggregate[field]=<numeric field>]`,
+        },
+        400,
+      ),
+    };
+  }
+  if (op !== "count" && op !== "sum") {
+    return {
+      error: json(
+        {
+          error: `invalid aggregate[op]: "${op}" — must be "count" or "sum"`,
+          code: "INVALID_QUERY",
+          error_type: "invalid_query",
+          field: "aggregate.op",
+          got: op,
+          hint: `pass "count" or "sum"`,
+        },
+        400,
+      ),
+    };
+  }
+  return { aggregate: { group_by: groupBy, op, field: field ?? undefined } };
+}
+
+/**
  * Parse include_metadata query param.
  * - absent/null → undefined (all metadata, default)
  * - "true"/"1" → true (all metadata)
@@ -907,6 +961,18 @@ function parseExpandParams(
  * differing only by extension (vault#330 S1). When the path is
  * ambiguous and no extension hint is supplied, `getNoteByPath` throws
  * `AmbiguousPathError` — REST handlers catch it and return 409.
+ *
+ * Title fallback (additive): when id AND path/extension both miss
+ * cleanly (no throw), tries an H1-title match via `getNoteByTitle` — the
+ * note whose first `# ` content line equals `idOrPath`, only when
+ * exactly one note has that title. Mirrors the MCP-layer `resolveNote`
+ * in core/src/mcp.ts and `[[wikilink]]` resolution (core/src/wikilinks.ts);
+ * exact id/path always wins first. Skipped (falls through to "not found")
+ * when `store.db` isn't available — the `Store` interface documents `db`
+ * as always present on the concrete class, but a handful of tests pass a
+ * minimal duck-typed stub (e.g. `handleViewNote`'s coverage in
+ * published.test.ts) that only implements `getNote`/`getNoteByPath`; this
+ * fallback must never turn that into a crash.
  */
 async function resolveNote(store: Store, idOrPath: string): Promise<Note | null> {
   const byId = await store.getNote(idOrPath);
@@ -916,7 +982,9 @@ async function resolveNote(store: Store, idOrPath: string): Promise<Note | null>
     const explicit = await store.getNoteByPath(extMatch[1]!, extMatch[2]!);
     if (explicit) return explicit;
   }
-  return await store.getNoteByPath(idOrPath);
+  const byPath = await store.getNoteByPath(idOrPath);
+  if (byPath) return byPath;
+  return store.db ? getNoteByTitle(store.db, idOrPath) : null;
 }
 
 async function requireNote(store: Store, idOrPath: string): Promise<Note> {
@@ -1241,6 +1309,87 @@ async function handleNotesInner(
           400,
         );
       }
+
+      // Aggregation / rollup mode (top new-feature ask from a UX round).
+      // Mutually exclusive with cursor/near — a rollup returns one row per
+      // group, not a paginated/graph-scoped note list — so reject those
+      // combos loudly before touching the DB, then short-circuit: none of
+      // the normal-query output machinery below (expand, include_links,
+      // metadata filtering, ...) applies to rollup rows.
+      const aggregateParsed = parseAggregateParam(url);
+      if (aggregateParsed.error) return aggregateParsed.error;
+      if (aggregateParsed.aggregate) {
+        if (cursorMode) {
+          return json(
+            {
+              error: "aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `cursor` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        if (nearNoteIdEarly) {
+          return json(
+            {
+              error: "aggregate is incompatible with near (graph neighborhood).",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "aggregate",
+              hint: "drop `near` when using `aggregate`",
+            },
+            400,
+          );
+        }
+        try {
+          let rows;
+          if (tagScope.raw === null) {
+            rows = await store.aggregateNotes({ ...queryOpts, aggregate: aggregateParsed.aggregate });
+          } else {
+            // Tag-scoped: filter to visible notes FIRST — fetch every note
+            // the OTHER filters match (unpaginated, same `limit: 1000000`
+            // "get everything" convention core's `syncAllWikilinks` uses),
+            // narrow via the SAME `filterNotesByTagScope` every other read
+            // path applies, THEN aggregate over just that visible id set
+            // (reusing the `ids` filter `near` already pushes into SQL).
+            const allMatches = await store.queryNotes({ ...queryOpts, limit: 1000000, offset: 0 });
+            const visible = filterNotesByTagScope(allMatches, tagScope.allowed, tagScope.raw);
+            rows = visible.length === 0
+              ? []
+              : await store.aggregateNotes({ ids: visible.map((n) => n.id), aggregate: aggregateParsed.aggregate });
+            // That note-level narrowing isn't sufficient on its own under
+            // `group_by: "tag"`: a note can be in scope via one tag while
+            // ALSO carrying an out-of-scope co-tag, and a tag rollup's
+            // `group` values ARE tag names — the co-tag would otherwise
+            // surface directly as a group. Scrub group NAMES too, mirroring
+            // the MCP wrapper's identical fix (src/mcp-tools.ts).
+            if (aggregateParsed.aggregate.group_by === "tag") {
+              rows = rows.filter(
+                (r: any) => typeof r?.group === "string" && tagVisibleInScope(r.group, tagScope.allowed, tagScope.raw),
+              );
+            }
+          }
+          return json(rows);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              400,
+            );
+          }
+          throw e;
+        }
+      }
+
       // Warnings channel (vault#550). `unknown_tag` stays structured-query
       // only (skipped entirely for a tag-scoped session:
       // `collectUnknownTagWarnings` resolves `did_you_mean` against the
@@ -1537,6 +1686,17 @@ async function handleNotesInner(
       // layers share `resolveOrQueueLink` from core/wikilinks.ts).
       const pendingLinks: { sourceId: string; links: { target: string; relationship: string }[] }[] = [];
       const linkWarningsByNote = new Map<string, QueryWarning[]>();
+      const pushLinkWarning = (noteId: string, warning: QueryWarning): void => {
+        const list = linkWarningsByNote.get(noteId) ?? [];
+        list.push(warning);
+        linkWarningsByNote.set(noteId, list);
+      };
+      // Content wikilinks whose note+content pair needs an `unresolved_link`/
+      // `ambiguous_link` warning check (vault#570) — deferred to the same
+      // second pass as `pendingLinks` for the same forward-ref-within-batch
+      // reason (a content `[[wikilink]]` to a batch sibling created later
+      // resolves via the pending-wikilink backfill by the time this runs).
+      const contentWikilinkNotes: { noteId: string; content: string }[] = [];
       // `if_exists` bookkeeping (vault#555) — mirrors core/src/mcp.ts's
       // create-note tool exactly (same contract, independent REST-layer
       // reimplementation sharing the same core primitives). See that file's
@@ -1608,6 +1768,14 @@ async function handleNotesInner(
             actor: writeCtx.actor,
             via: writeCtx.via,
           });
+        }
+
+        // Content-wikilink warnings (vault#570) — this branch's content
+        // update (if any) already ran `syncWikilinks` inside
+        // `store.updateNote` above; queue for the shared second-pass
+        // classification below.
+        if (updates.content !== undefined) {
+          contentWikilinkNotes.push({ noteId: result.id, content: updates.content });
         }
 
         if (incomingTags.length > 0) {
@@ -1705,6 +1873,13 @@ async function handleNotesInner(
             pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
           }
 
+          // Content-wikilink warnings (vault#570) — `store.createNote` above
+          // already ran `syncWikilinks` (gated on `content` truthy, same
+          // condition here); queue for the shared second-pass classification.
+          if (item.content) {
+            contentWikilinkNotes.push({ noteId: note.id, content: item.content });
+          }
+
           created.push((await store.getNote(note.id)) ?? note);
         }
 
@@ -1713,22 +1888,38 @@ async function handleNotesInner(
         // that every sibling note in this batch exists. A target that still
         // doesn't resolve is queued for lazy resolution (backfills
         // automatically when a matching note is created later) and surfaces
-        // an `unresolved_link` warning naming the target — never silent.
+        // an `unresolved_link` warning naming the target. A target that
+        // matched ≥2 notes (vault#570) is neither linked nor queued —
+        // surfaces a distinct `ambiguous_link` warning instead. Never silent.
         for (const { sourceId, links } of pendingLinks) {
           for (const link of links) {
-            const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
-            if (targetId) {
-              await store.createLink(sourceId, targetId, link.relationship);
+            const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+            if (outcome.status === "resolved") {
+              await store.createLink(sourceId, outcome.note_id, link.relationship);
+            } else if (outcome.status === "ambiguous") {
+              pushLinkWarning(sourceId, {
+                code: "ambiguous_link",
+                message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+                target: link.target,
+                relationship: link.relationship,
+                candidate_count: outcome.candidates.length,
+              });
             } else {
-              const list = linkWarningsByNote.get(sourceId) ?? [];
-              list.push({
+              pushLinkWarning(sourceId, {
                 code: "unresolved_link",
                 message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
                 target: link.target,
                 relationship: link.relationship,
               });
-              linkWarningsByNote.set(sourceId, list);
             }
+          }
+        }
+
+        // --- Content-wikilink warnings (vault#570) ---
+        // Same forward-ref-aware timing as the structured-links pass above.
+        for (const { noteId, content } of contentWikilinkNotes) {
+          for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+            pushLinkWarning(noteId, warning);
           }
         }
       };
@@ -2096,15 +2287,25 @@ async function handleNotesInner(
           //     fresh note).
           //   - Missing target notes skip silently (mirrors MCP).
           const linksAdd = (body.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
-          // `unresolved_link` warnings (vault#555) — a target that doesn't
-          // resolve is queued for lazy resolution (backfills automatically
-          // when a matching note is created later), never silently dropped.
+          // `unresolved_link` / `ambiguous_link` warnings (vault#555, vault#570)
+          // — a target that doesn't resolve is queued for lazy resolution
+          // (backfills automatically when a matching note is created later),
+          // and a target matching ≥2 notes is neither linked nor queued.
+          // Never silently dropped.
           const createWarnings: QueryWarning[] = [];
           if (linksAdd) {
             for (const link of linksAdd) {
-              const targetId = resolveOrQueueLink(db, created.id, link.target, link.relationship);
-              if (targetId) {
-                await store.createLink(created.id, targetId, link.relationship, link.metadata);
+              const outcome = resolveOrQueueLink(db, created.id, link.target, link.relationship);
+              if (outcome.status === "resolved") {
+                await store.createLink(created.id, outcome.note_id, link.relationship, link.metadata);
+              } else if (outcome.status === "ambiguous") {
+                createWarnings.push({
+                  code: "ambiguous_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                  candidate_count: outcome.candidates.length,
+                });
               } else {
                 createWarnings.push({
                   code: "unresolved_link",
@@ -2114,6 +2315,13 @@ async function handleNotesInner(
                 });
               }
             }
+          }
+          // Content-wikilink warnings (vault#570) — `store.createNote` above
+          // already ran `syncWikilinks`; this is the single-note (non-batch)
+          // create path, so there's no batch-sibling forward-ref to wait for
+          // — compute right away against the committed content.
+          if (content) {
+            createWarnings.push(...getContentWikilinkWarnings(db, created.id, content));
           }
           const final = await store.getNote(created.id);
           if (!final) return json({ error: "Note disappeared", error_type: "internal_error" }, 500);
@@ -2352,6 +2560,14 @@ async function handleNotesInner(
       // moved despite a real tags/note_tags or links change.
       const hasTagMutation = (body.tags?.add?.length ?? 0) > 0 || (body.tags?.remove?.length ?? 0) > 0;
       const hasLinkMutation = body.links?.add !== undefined || body.links?.remove !== undefined;
+      // Content-wikilink warnings (vault#570) gate on the SAME condition
+      // `store.updateNote`/`syncWikilinks` use to decide whether to re-sync
+      // content wikilinks at all — a tags/links-only PATCH must not
+      // spuriously re-warn about pre-existing broken links this call never
+      // touched.
+      const contentChanged = updates.content !== undefined
+        || updates.append !== undefined
+        || updates.prepend !== undefined;
       if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
         // Write-attribution (vault#298) — REST update. Stamp the most-recent-
         // write columns on the same UPDATE that bumps updated_at. `updates`
@@ -2378,16 +2594,25 @@ async function handleNotesInner(
         await store.untagNote(note.id, body.tags.remove);
       }
 
-      // Add links. `unresolved_link` warnings (vault#555) — a target that
-      // doesn't resolve is queued for lazy resolution (backfills
-      // automatically when a matching note is created later), never
-      // silently dropped.
+      // Add links. `unresolved_link` / `ambiguous_link` warnings (vault#555,
+      // vault#570) — a target that doesn't resolve is queued for lazy
+      // resolution (backfills automatically when a matching note is created
+      // later); a target matching ≥2 notes is neither linked nor queued.
+      // Never silently dropped.
       const linkWarnings: QueryWarning[] = [];
       if (body.links?.add) {
         for (const link of body.links.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[]) {
-          const targetId = resolveOrQueueLink(db, note.id, link.target, link.relationship);
-          if (targetId) {
-            await store.createLink(note.id, targetId, link.relationship, link.metadata);
+          const outcome = resolveOrQueueLink(db, note.id, link.target, link.relationship);
+          if (outcome.status === "resolved") {
+            await store.createLink(note.id, outcome.note_id, link.relationship, link.metadata);
+          } else if (outcome.status === "ambiguous") {
+            linkWarnings.push({
+              code: "ambiguous_link",
+              message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+              target: link.target,
+              relationship: link.relationship,
+              candidate_count: outcome.candidates.length,
+            });
           } else {
             linkWarnings.push({
               code: "unresolved_link",
@@ -2409,6 +2634,13 @@ async function handleNotesInner(
       // `toNoteIndex` drops unknown fields).
       const updatedNote = await store.getNote(note.id);
       if (updatedNote === null) return json({ error: "Note disappeared", error_type: "not_found" }, 404);
+      // Content-wikilink warnings (vault#570) — `store.updateNote` above
+      // already ran `syncWikilinks` when `contentChanged`; this PATCH
+      // handles a single note (no batch-sibling forward-ref to wait for),
+      // so compute right away against the committed content.
+      if (contentChanged) {
+        linkWarnings.push(...getContentWikilinkWarnings(db, note.id, updatedNote.content));
+      }
       const validated: any = attachValidationStatus(store, db, updatedNote);
       // Echo hydrated links when a link mutation was part of this request,
       // OR the caller explicitly asked for them via `?include_links=true`
@@ -3224,6 +3456,13 @@ export async function handleVault(
    * configured AND available), which is what a surface gates its mic on.
    */
   resolveCapability: () => Promise<TranscriptionCapability> = resolveTranscriptionCapability,
+  /**
+   * Tag-scope allowlist (front-door structural map). Threaded from
+   * routing.ts the same way every other read handler gets it. Unscoped
+   * (`NO_TAG_SCOPE`) by default so every pre-existing call site — none of
+   * which pass this — is unaffected.
+   */
+  tagScope: TagScopeCtx = NO_TAG_SCOPE,
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -3233,6 +3472,16 @@ export async function handleVault(
     // and available. `minutes_remaining` is omitted (cloud/plan concern;
     // self-host is unmetered). This is the field Notes gates the mic on.
     result.transcription = await resolveCapability();
+    // Front-door structural map — ALWAYS included (unlike `stats`, which is
+    // include_stats-gated): three cheap grouped-COUNT queries, so a fresh
+    // reader orients in one call. Scope-aware: a tag-scoped token's map
+    // covers only notes reachable through an in-scope tag (`tagFilter`
+    // restricts the underlying query rather than post-hoc filtering an
+    // unscoped rollup — see `getVaultMap`'s doc comment for why).
+    result.map =
+      tagScope.raw === null
+        ? getVaultMap(store.db)
+        : getVaultMap(store.db, { tagFilter: [...(tagScope.allowed ?? [])] });
     if (parseBool(parseQuery(url, "include_stats"), false)) {
       result.stats = await store.getVaultStats();
     }

@@ -7,7 +7,7 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNoteTags } from "../core/src/notes.ts";
+import { getNoteTags, getVaultMap } from "../core/src/notes.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -28,6 +28,7 @@ import {
   scrubTagFieldViolationsByScope,
   scrubValidationStatusByScope,
   tagsWithinScope,
+  tagVisibleInScope,
 } from "./tag-scope.ts";
 import { TagFieldConflictError, ParentCycleError } from "../core/src/tag-schemas.ts";
 import { IndexedFieldError } from "../core/src/indexed-fields.ts";
@@ -131,7 +132,9 @@ function resolveVaultCoordinates(): { hubOrigin: string; hubOriginKnown: boolean
  * `auth` is the resolved token for the caller and is captured by vault-info's
  * execute closure so the description-update branch can perform a secondary
  * scope check: the tool itself is gated at vault:read (so read-only callers
- * can fetch stats), but writing a new description requires vault:write.
+ * can fetch stats), but writing a new description requires vault:admin
+ * (tightened from vault:write by the write/admin re-tier — description is
+ * vault curation, not content).
  *
  * When omitted (internal callers that only inspect the tool list — no execute
  * path exercised), the description-update branch is disabled entirely.
@@ -155,6 +158,19 @@ export function generateScopedMcpTools(
   const allowedHolder: { value: Set<string> | null } = { value: null };
   const rawTags = scoped ? auth!.scoped_tags : null;
   const expandVisibility = scoped
+    ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
+    : undefined;
+
+  // Tag-scope for `query-notes`'s `aggregate` mode (top new-feature ask
+  // from a UX round): a rollup has no per-note shape to post-filter (the
+  // response is `[{group, value}]`, not notes), so scope has to be applied
+  // BEFORE core aggregates, not after. Same shared `allowedHolder` /
+  // `getAllowed()`-before-`orig()` ordering invariant as `expandVisibility`
+  // above — reads the resolved allowlist safely because the query-notes
+  // wrapper always awaits `getAllowed()` before invoking core's (synchronous
+  // use of this) execute. Unscoped sessions install no predicate → the
+  // aggregate runs core's fast direct-SQL path.
+  const aggregateVisibility = scoped
     ? (note: Note) => noteWithinTagScope(note, allowedHolder.value, rawTags)
     : undefined;
 
@@ -211,11 +227,12 @@ export function generateScopedMcpTools(
 
   const tools = generateMcpTools(
     store,
-    expandVisibility || nearTraversable || ifExistsVisible || writeContext || strictBypass
+    expandVisibility || nearTraversable || ifExistsVisible || aggregateVisibility || writeContext || strictBypass
       ? {
           ...(expandVisibility ? { expandVisibility } : {}),
           ...(nearTraversable ? { nearTraversable } : {}),
           ...(ifExistsVisible ? { ifExistsVisible } : {}),
+          ...(aggregateVisibility ? { aggregateVisibility } : {}),
           ...(writeContext ? { writeContext } : {}),
           ...(strictBypass ? { strictBypass } : {}),
           ...(onStrictBypass ? { onStrictBypass } : {}),
@@ -301,9 +318,11 @@ function applyTagDependencyGuards(tools: McpToolDef[], vaultName: string): void 
  *   - vault-info:  filter projection.tags + projection.indexed_fields
  *                  to entries an in-scope tag contributes to
  *
- * Write-tool gating happens in handleScopedMcp at the verb-scope layer
- * AND inside each tool's wrapper here (so a tag-scoped `vault:write`
- * token can't write outside its allowlist). See applyTagScopeWriteGuards.
+ * Mutating-tool gating happens in handleScopedMcp at the verb-scope layer
+ * (`vault:write` for create/update/delete-note, `vault:admin` for the
+ * tag-schema/taxonomy tools since the write/admin re-tier) AND inside each
+ * tool's wrapper here, so a tag-scoped token — whatever verb it holds —
+ * can't mutate outside its allowlist. See applyTagScopeWriteGuards.
  */
 function applyTagScopeWrappers(
   tools: McpToolDef[],
@@ -365,6 +384,29 @@ function applyTagScopeWrappers(
     const allowed = await getAllowed();
     const result = await orig(params);
     if (!allowed) return result;
+    // `aggregate` mode returns `[{group, value}]` rollup rows — no `.tags`
+    // to post-filter (and `noteWithinTagScope` would wrongly drop every
+    // row, since an absent `.tags` reads as "out of scope"). WHICH NOTES
+    // count was already narrowed INSIDE core via the `aggregateVisibility`
+    // predicate (see `generateScopedMcpTools`): fetch the full filtered
+    // set, keep only allowlisted notes, THEN aggregate.
+    //
+    // That note-level narrowing is NOT sufficient on its own under
+    // `group_by: "tag"`, though: a note can be in scope via one tag while
+    // ALSO carrying an out-of-scope co-tag (the same class of leak
+    // `scrubValidationStatusByScope` closes for `validation_status`), and a
+    // tag rollup's `group` values ARE tag names — the co-tag would surface
+    // directly as a group. Scrub group NAMES here, the same way every other
+    // tag-shaped output on this wrapper is scrubbed.
+    if ((params as any).aggregate) {
+      const groupBy = (params as any).aggregate?.group_by;
+      if (groupBy === "tag" && Array.isArray(result)) {
+        return result.filter(
+          (r: any) => typeof r?.group === "string" && tagVisibleInScope(r.group, allowed, rawTags),
+        );
+      }
+      return result;
+    }
     // Possible response shapes (vault#550 added the `warnings` variants):
     //   - Array (legacy list, no cursor, no warnings)
     //   - `{notes, next_cursor}` (cursor mode, vault#313)
@@ -478,20 +520,34 @@ function applyTagScopeWrappers(
       tags: Array.isArray(r.tags) ? r.tags : [],
       indexed_fields: Array.isArray(r.indexed_fields) ? r.indexed_fields : [],
       query_hints: Array.isArray(r.query_hints) ? r.query_hints : [],
+      // Unused by filterProjectionByScope (map is handled separately below,
+      // via a live recompute) — a placeholder to satisfy VaultProjection's
+      // shape.
+      map: { total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 },
     };
     const filtered = filterProjectionByScope(partial, allowed);
     r.tags = filtered.tags;
     r.indexed_fields = filtered.indexed_fields;
+    // `map` (front-door structural rollup): post-hoc filtering the unscoped
+    // aggregate isn't possible for path-bucket counts (they need per-note
+    // tag membership, not just a tag-name allowlist over a precomputed
+    // rollup) — so re-run the cheap grouped-count query restricted to the
+    // resolved allowlist instead of filtering `orig`'s unscoped result.
+    if (r.map) {
+      r.map = getVaultMap(store.db, { tagFilter: [...allowed] });
+    }
     return r;
   });
 
   // ---- Write-side guards ----
   //
-  // The verb-scope check (`vault:write`) is enforced at the dispatch layer
-  // in handleScopedMcp. These wrappers add the second axis: a scoped
-  // `vault:write` token can only mutate within its tag-allowlist, never
-  // outside it. Tag operations (`update-tag`, `delete-tag`) gate on the
-  // tag name itself; note operations gate on the prospective tag set.
+  // The verb-scope check (`vault:write` for note ops, `vault:admin` for the
+  // tag-schema/taxonomy ops post-re-tier) is enforced at the dispatch layer
+  // in handleScopedMcp. These wrappers add the second axis: a scoped token
+  // can only mutate within its tag-allowlist, never outside it. Tag
+  // operations (`update-tag`, `delete-tag`, `rename-tag`, `merge-tags`) gate
+  // on the tag name(s) themselves; note operations gate on the prospective
+  // tag set.
 
   const forbidden = (msg: string): unknown => ({
     error: "Forbidden",
@@ -709,13 +765,15 @@ function overrideVaultInfo(
 
     if (params.description !== undefined) {
       // Secondary scope check: vault-info is read-gated so read-only callers
-      // can fetch stats, but mutating the vault description requires write
-      // for THIS vault. Without this, a vault:read token could bypass the
-      // outer gate by passing `description` to a tool the outer gate
-      // considers read-only.
-      if (!auth || !hasScopeForVault(auth.scopes, vaultName, "write")) {
+      // can fetch stats, but mutating the vault description requires admin
+      // for THIS vault (was `write` — tightened by the write/admin re-tier:
+      // writing the vault's own description/config is curation, same class
+      // as update-tag et al, not content authorship). Without this, a
+      // vault:read OR vault:write token could bypass the outer gate by
+      // passing `description` to a tool the outer gate considers read-only.
+      if (!auth || !hasScopeForVault(auth.scopes, vaultName, "admin")) {
         throw new Error(
-          `Forbidden: updating the vault description requires the 'vault:write' scope (or 'vault:${vaultName}:write'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
+          `Forbidden: updating the vault description requires the 'vault:admin' scope (or 'vault:${vaultName}:admin'). Granted scopes: ${auth?.scopes.join(" ") || "(none)"}.`,
         );
       }
       config.description = params.description as string;
@@ -747,6 +805,7 @@ function overrideVaultInfo(
       tags: projection.tags,
       indexed_fields: projection.indexed_fields,
       query_hints: projection.query_hints,
+      map: projection.map,
     };
 
     // A2: surface a pointer (path, not body) to the seeded onboarding guide so

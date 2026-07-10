@@ -2,9 +2,17 @@
  * End-to-end coverage for the vault#552 MCP + REST surface: rename-tag and
  * merge-tags tool wiring (verb + tag-scope gating), delete-tag's
  * cascade/detach flags flowing through the MCP wrapper, and the `doctor`
- * tool/endpoint's admin-gate + tag-scope filtering. Fixture pattern mirrors
+ * tool/endpoint's tag-scope filtering. Fixture pattern mirrors
  * tag-field-conflict-scope.test.ts (PARACHUTE_HOME temp home + hand-built
  * AuthResult).
+ *
+ * Write/admin re-tier (this PR): the MCP `doctor` tool moved admin → read
+ * (read-only, tag-scope-restricted diagnostic); `rename-tag`/`merge-tags`/
+ * `delete-tag`/`update-tag` moved write → admin (schema/taxonomy curation,
+ * not content). The REST `GET /api/doctor` endpoint is intentionally
+ * UNCHANGED — it stays admin-gated (a separate enforcement point in
+ * src/routing.ts) — so it and the MCP `doctor` tool now sit at different
+ * tiers for the same underlying scan; see CHANGELOG.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync, existsSync } from "fs";
@@ -156,8 +164,8 @@ describe("delete-tag cascade/detach — MCP wrapper pass-through (vault#552)", (
   });
 });
 
-describe("doctor — admin gate + tag-scope filtering (vault#552)", () => {
-  test("MCP: doctor is invisible in tools/list to a write-only (non-admin) session, and excluded-tool-called-explicitly still refuses it", async () => {
+describe("doctor — read gate (re-tier) + tag-scope filtering (vault#552)", () => {
+  test("MCP: doctor is visible + callable for a read-only session (re-tier: admin → read)", async () => {
     // `generateScopedMcpTools` (the `toolsFor` helper) always returns the
     // FULL tool set — the `requiredVerb` visibility filter lives one layer
     // up, in `handleScopedMcp`'s tools/list dispatch (mcp-http.ts). Drive
@@ -169,16 +177,47 @@ describe("doctor — admin gate + tag-scope filtering (vault#552)", () => {
       headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
     });
-    const listRes = await handleScopedMcp(listReq, "journal", authFor("journal", null, "write"));
+    const listRes = await handleScopedMcp(listReq, "journal", authFor("journal", null, "read"));
     const listBody = await listRes.json() as any;
     const names: string[] = listBody.result.tools.map((t: any) => t.name);
-    expect(names).not.toContain("doctor");
+    expect(names).toContain("doctor");
 
-    // Explicitly calling it anyway is refused, not silently executed.
+    // Explicitly calling it succeeds — no admin credential needed anymore.
     const callReq = new Request("http://localhost:1940/vault/journal/mcp", {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "doctor", arguments: {} } }),
+    });
+    const callRes = await handleScopedMcp(callReq, "journal", authFor("journal", null, "read"));
+    const callBody = await callRes.json() as any;
+    expect(callBody.result?.isError).toBeFalsy();
+    const report = JSON.parse(callBody.result.content[0].text);
+    expect(report.findings).toBeDefined();
+  });
+
+  test("MCP: update-tag is invisible in tools/list to a write-only (non-admin) session, and excluded-tool-called-explicitly still refuses it (re-tier: write → admin)", async () => {
+    seedVault("journal");
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const listReq = new Request("http://localhost:1940/vault/journal/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    const listRes = await handleScopedMcp(listReq, "journal", authFor("journal", null, "write"));
+    const listBody = await listRes.json() as any;
+    const names: string[] = listBody.result.tools.map((t: any) => t.name);
+    expect(names).not.toContain("update-tag");
+    expect(names).not.toContain("delete-tag");
+    expect(names).not.toContain("rename-tag");
+    expect(names).not.toContain("merge-tags");
+    // doctor, by contrast, IS visible — it's read-tier now, and write ⊇ read.
+    expect(names).toContain("doctor");
+
+    // Explicitly calling update-tag anyway is refused, not silently executed.
+    const callReq = new Request("http://localhost:1940/vault/journal/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "update-tag", arguments: { tag: "mine" } } }),
     });
     const callRes = await handleScopedMcp(callReq, "journal", authFor("journal", null, "write"));
     const callBody = await callRes.json() as any;

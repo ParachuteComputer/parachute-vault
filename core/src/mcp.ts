@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Store, Note } from "./types.js";
+import type { Store, Note, QueryOpts } from "./types.js";
 import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
@@ -21,6 +21,7 @@ import {
   resolveStructuredLinkNote,
   getUnresolvedLinksForNote,
   getUnresolvedLinksForNotes,
+  getContentWikilinkWarnings,
 } from "./wikilinks.js";
 import * as tagSchemaOps from "./tag-schemas.js";
 import type { TagFieldSchema } from "./tag-schemas.js";
@@ -84,7 +85,9 @@ function structuredError(
 
 /**
  * Resolve a note identifier — tries ID first, then case-insensitive
- * path match. Works everywhere a note reference is accepted.
+ * path match, then (additive fallback) an H1-title match. Works
+ * everywhere a note reference is accepted (query-notes `id`, update-note
+ * `id`, delete-note `id`, find-path anchors).
  *
  * Path-with-extension form (vault#330 S1): a trailing `.<ext>` matching
  * the extension pattern (`/^[a-z0-9]{1,16}$/i`) is parsed as
@@ -95,6 +98,12 @@ function structuredError(
  * On ambiguous path with no extension hint, `getNoteByPath` throws
  * `AmbiguousPathError` — `resolveNote` propagates it so MCP / REST
  * handlers can surface a clear 4xx rather than picking arbitrarily.
+ *
+ * Title fallback (additive): reached only when id AND path/extension
+ * BOTH miss cleanly (no throw). Resolves via `noteOps.getNoteByTitle` —
+ * the note whose first `# ` content line equals `idOrPath`, exactly one
+ * match required. Same [[wikilink]] semantics as `resolveWikilink`; exact
+ * id/path always wins first.
  */
 function resolveNote(db: Database, idOrPath: string): Note | null {
   // Try ID match first (fast, indexed)
@@ -110,7 +119,9 @@ function resolveNote(db: Database, idOrPath: string): Note | null {
     const explicit = noteOps.getNoteByPath(db, extMatch[1]!, extMatch[2]!);
     if (explicit) return explicit;
   }
-  return noteOps.getNoteByPath(db, idOrPath);
+  const byPath = noteOps.getNoteByPath(db, idOrPath);
+  if (byPath) return byPath;
+  return noteOps.getNoteByTitle(db, idOrPath);
 }
 
 function requireNote(db: Database, idOrPath: string): Note {
@@ -220,20 +231,46 @@ export interface GenerateMcpToolsOpts {
    * against the full vault exactly as before.
    */
   ifExistsVisible?: (note: Note) => boolean;
+  /**
+   * `aggregateVisibility` is an OPTIONAL per-note visibility predicate for
+   * `query-notes`'s `aggregate` mode. When provided, the aggregate is
+   * computed by first fetching every note the OTHER filters match
+   * (unpaginated), narrowing to the notes the predicate accepts, and THEN
+   * aggregating over just that visible id set — rather than the (faster)
+   * direct SQL GROUP BY the unscoped path takes. This mirrors
+   * `expandVisibility`/`nearTraversable`: core stays scope-unaware, it only
+   * invokes a plain `(note) => boolean` closure the server injects. Omitted
+   * (unscoped / internal callers) → the aggregate runs the fast direct-SQL
+   * path with no extra fetch.
+   */
+  aggregateVisibility?: (note: Note) => boolean;
 }
 
 /**
  * Generate the consolidated MCP tools for a vault. Surface (13):
- * query-notes, create-note, update-note, delete-note, list-tags, update-tag,
- * delete-tag, rename-tag, merge-tags, find-path, vault-info, prune-schema
- * (admin), doctor (admin). `manage-token` (admin) is appended by the SERVER
- * layer (src/mcp-tools.ts), not here — see that file's doc comment.
+ * query-notes, list-tags, find-path, vault-info, doctor (read); create-note,
+ * update-note, delete-note (write); update-tag, delete-tag, rename-tag,
+ * merge-tags, prune-schema (admin). `manage-token` (admin) is appended by
+ * the SERVER layer (src/mcp-tools.ts), not here — see that file's doc
+ * comment.
+ *
+ * **Re-tier (this PR):** content-authorship (write) is now separate from
+ * structure/taxonomy/schema-curation (admin). `update-tag`/`delete-tag`/
+ * `rename-tag`/`merge-tags` moved write → admin — they define schemas and
+ * restructure the tag graph across ALL notes, not just author content.
+ * `doctor` moved admin → read — it's a read-only, tag-scope-restricted
+ * diagnostic (see `applyTagScopeWrappers` in src/mcp-tools.ts), and
+ * read-scoped monitoring/tending jobs need to be able to run it without an
+ * admin credential. BREAKING: a `vault:write` token that used to
+ * rename/merge/delete/update tags now gets `insufficient_scope`; a
+ * `vault:read` token can now call `doctor`. See CHANGELOG.
  */
 export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): McpToolDef[] {
   const db: Database = store.db;
   const expandVisibility = opts?.expandVisibility;
   const nearTraversable = opts?.nearTraversable;
   const ifExistsVisible = opts?.ifExistsVisible;
+  const aggregateVisibility = opts?.aggregateVisibility;
   // Write-attribution (vault#298) — captured once at tool-generation time
   // (a fresh tool set is generated per MCP request, so this is request-scoped)
   // and folded into every create/update the tools perform.
@@ -283,7 +320,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
       requiredVerb: "read",
       description: `Query notes. Returns notes matching the given filters.
 
-- **Single note**: pass \`id\` (accepts note ID or path, e.g., "Projects/README")
+- **Single note**: pass \`id\` (accepts note ID, path, e.g., "Projects/README", or — as a last-resort fallback when id/path both miss cleanly and exactly one note matches — its H1 title, e.g. "Weekly Review")
 - **Filter**: pass \`tag\`, \`path\`, \`path_prefix\`, \`search\`, \`metadata\`, date range
 - **Graph neighborhood**: pass \`near\` to scope results to notes within N hops of an anchor note
 - **No filters**: returns all notes (paginated)
@@ -302,6 +339,9 @@ Response shape (vault#550 — three variants, pick by what you passed):
 - Default (no \`cursor\`, no warnings): a bare array of notes.
 - Cursor mode (\`cursor\` param present — including \`cursor: ""\` to bootstrap): \`{notes: [...], next_cursor}\`. See \`cursor\` below for the bootstrap flow.
 - Warnings present (e.g. an unrecognized \`tag\`) and NOT in cursor mode: \`{notes: [...], warnings: [...]}\`. Cursor mode + warnings compose: \`{notes, next_cursor, warnings}\`. Absent \`warnings\` key means nothing to flag — don't assume its presence either way.
+- \`aggregate\` mode: \`[{group, value}]\` — a rollup row per group, NOT notes. See \`aggregate\` below.
+
+\`aggregate\` (group_by + count/sum): pass \`aggregate: {group_by, op, field?}\` to get counts/sums instead of note rows — e.g. "how many notes per status" (\`{group_by: "status", op: "count"}\`) or "total amount per category" (\`{group_by: "category", op: "sum", field: "amount"}\`). Every other filter (\`tag\`, \`metadata\`, date range, ...) narrows the input set FIRST, exactly like a normal query. \`group_by\` is either \"tag\" (group by tag membership) or an indexed metadata field; \`op: "sum"\` additionally requires \`field\` to be an indexed NUMERIC field. Mutually exclusive with \`search\`/\`near\`/\`cursor\`.
 
 \`search\` is literal-by-default (vault#551): your text is escaped and phrase-quoted before it reaches FTS5, so ordinary punctuation ("didn't", "eleven-day", "18.6") is matched as literal content instead of being parsed as query syntax (a bare hyphen used to mean NOT; an apostrophe or decimal point used to break the parse and silently return \`[]\`). Pass \`search_mode: "advanced"\` to opt back into raw FTS5 syntax (AND/OR/NOT, manual phrase quoting, prefix \`*\`) — a malformed advanced query now throws a structured error instead of silently returning \`[]\`. \`sort\` is honored under \`search\` too: omit it for relevance ranking (default), or pass "asc"/"desc" to order by \`created_at\` instead.
 
@@ -309,7 +349,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Get one note by ID or path" },
+          id: { type: "string", description: "Get one note by ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
           tag: {
             oneOf: [
               { type: "string" },
@@ -391,10 +431,20 @@ Response shape (vault#550 — three variants, pick by what you passed):
             },
             description: "Generalized date-range filter. Use this when the date that matters is the *content* date (e.g. an email's received date, a meeting's scheduled date) rather than the vault ingestion time, or when paging by `updated_at` for incremental rebuilds. Mutually exclusive with the top-level `date_from` / `date_to` shorthand.",
           },
+          aggregate: {
+            type: "object",
+            properties: {
+              group_by: { type: "string", description: "What to group by: an indexed metadata field name (declared `indexed: true` in a tag schema — same FIELD_NOT_INDEXED contract as `metadata` operator queries / `order_by`), or the special value \"tag\" to group by tag membership. Under \"tag\", a note carrying N of the tags present in the filtered result set contributes to N separate groups (a membership rollup, not a partition)." },
+              op: { type: "string", enum: ["count", "sum"], description: "\"count\": number of matching notes per group. \"sum\": sum of `field` per group." },
+              field: { type: "string", description: "Required when `op` is \"sum\"; ignored for \"count\". Must be an indexed metadata field with a numeric storage type (declared `type: \"integer\"` or `type: \"boolean\"` — the only indexable numeric shapes; a bare `type: \"number\"` field is never indexed and a TEXT-backed field can't be summed)." },
+            },
+            required: ["group_by", "op"],
+            description: "Aggregation / rollup mode. Every OTHER filter above (tag, metadata, date range, write-attribution, ...) is applied FIRST, exactly as a normal query would; the matching notes are then grouped and the response becomes `[{group, value}]` instead of note rows — one row per group, `value` is the count/sum. A note whose group_by value is absent collects into one `{group: null, value: ...}` row rather than being dropped. Mutually exclusive with `search`, `near`, and `cursor` (a rollup has no pagination/ranking/graph-neighborhood shape). Tag-scoped sessions see the SAME visibility enforcement as every other read — the rollup is computed only over notes the token can see.",
+          },
           near: {
             type: "object",
             properties: {
-              note_id: { type: "string", description: "Anchor note ID or path" },
+              note_id: { type: "string", description: "Anchor note ID, path, or (fallback) H1 title" },
               depth: { type: "number", description: "Max hops from anchor (default 2, max 5)" },
               relationship: { type: "string", description: "Only follow links with this relationship" },
             },
@@ -600,6 +650,89 @@ Response shape (vault#550 — three variants, pick by what you passed):
             );
           }
           expand = params.expand as TagExpandMode;
+        }
+
+        // --- Aggregation / rollup mode (top new-feature ask from a UX round) ---
+        // Mutually exclusive with `search`/`near`/`cursor` — a rollup returns
+        // one row per group, not a paginated / graph-scoped / ranked note
+        // list — so reject those combos loudly before touching the DB.
+        if (params.aggregate) {
+          if (params.search) {
+            throw new QueryError(
+              `aggregate is incompatible with full-text search — pick one.`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `search` when using `aggregate`" },
+            );
+          }
+          if (params.near) {
+            throw new QueryError(
+              `aggregate is incompatible with near (graph neighborhood).`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `near` when using `aggregate`" },
+            );
+          }
+          if (typeof params.cursor === "string") {
+            throw new QueryError(
+              `aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `cursor` when using `aggregate`" },
+            );
+          }
+          const aggRaw = params.aggregate as Record<string, unknown>;
+          if (typeof aggRaw !== "object" || aggRaw === null || Array.isArray(aggRaw)) {
+            throw new QueryError(
+              `aggregate must be an object: {group_by, op, field?}`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", got: aggRaw },
+            );
+          }
+          // Shape coercion only — `group_by`/`op`/`field` validity (indexed
+          // field, numeric type, sum requires field, ...) is enforced by
+          // `aggregateNotes` itself, reusing the exact FIELD_NOT_INDEXED /
+          // INVALID_QUERY contract every other query surface uses.
+          const aggregateSpec = {
+            group_by: aggRaw.group_by as string,
+            op: aggRaw.op as "count" | "sum",
+            field: aggRaw.field as string | undefined,
+          };
+          const aggTags = normalizeTags(params.tag);
+          const aggExcludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
+          const aggExcludeTags = normalizeTags(aggExcludeTagsRaw);
+          const aggFilterOpts: QueryOpts = {
+            tags: aggTags,
+            tagMatch: (params.tag_match as "all" | "any") ?? (aggTags && aggTags.length > 1 ? "any" : undefined),
+            expand,
+            excludeTags: aggExcludeTags,
+            hasTags: params.has_tags as boolean | undefined,
+            hasLinks: params.has_links as boolean | undefined,
+            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            path: params.path as string | undefined,
+            pathPrefix: params.path_prefix as string | undefined,
+            extension: params.extension as string | string[] | undefined,
+            metadata: params.metadata as Record<string, unknown> | undefined,
+            createdBy: params.created_by as string | undefined,
+            lastUpdatedBy: params.last_updated_by as string | undefined,
+            createdVia: params.created_via as string | undefined,
+            lastUpdatedVia: params.last_updated_via as string | undefined,
+            dateFrom: params.date_from as string | undefined,
+            dateTo: params.date_to as string | undefined,
+            dateFilter: params.date_filter as
+              | { field?: string; from?: string; to?: string }
+              | undefined,
+          };
+          if (!aggregateVisibility) {
+            return await store.aggregateNotes({ ...aggFilterOpts, aggregate: aggregateSpec });
+          }
+          // Tag-scoped: filter to visible notes FIRST — fetch every note the
+          // OTHER filters match (unpaginated, same `limit: 1000000` "get
+          // everything" convention `syncAllWikilinks` uses), narrow to what
+          // the injected predicate accepts, THEN aggregate over just that id
+          // set (reusing the `ids` semijoin `near` already pushes into SQL).
+          // Core stays scope-unaware — it only invokes the plain closure.
+          const aggAllMatches = await store.queryNotes({ ...aggFilterOpts, limit: 1000000 });
+          const aggVisibleIds = aggAllMatches.filter(aggregateVisibility).map((n) => n.id);
+          if (aggVisibleIds.length === 0) return [];
+          return await store.aggregateNotes({ ids: aggVisibleIds, aggregate: aggregateSpec });
         }
 
         // `search_mode` (vault#551) — validate loudly (same policy as
@@ -914,12 +1047,12 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
             items: {
               type: "object",
               properties: {
-                target: { type: "string", description: "Target note ID or path" },
+                target: { type: "string", description: "Target note ID, path, or (fallback) H1 title" },
                 relationship: { type: "string", description: "Relationship type (e.g., mentions, related-to)" },
               },
               required: ["target", "relationship"],
             },
-            description: "Links to create from this note. `target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title. A target created LATER in the same `notes` batch, or by a future call, resolves automatically (queued + backfilled) — the response carries an `unresolved_link` warning naming the target in the meantime; never silently dropped.",
+            description: "Links to create from this note. `target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename, then (only on a clean miss, and only when exactly one note matches) an H1-title fallback. A target created LATER in the same `notes` batch, or by a future call, resolves automatically (queued + backfilled) — the response carries an `unresolved_link` warning naming the target in the meantime; never silently dropped.",
           },
           created_at: { type: "string", description: "ISO timestamp (defaults to now)" },
           if_exists: {
@@ -975,6 +1108,18 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
         // Populated in the second pass; folded into each note's response
         // below, same pattern as `validation_status`.
         const linkWarningsByNote = new Map<string, QueryWarning[]>();
+        const pushLinkWarning = (noteId: string, warning: QueryWarning): void => {
+          const list = linkWarningsByNote.get(noteId) ?? [];
+          list.push(warning);
+          linkWarningsByNote.set(noteId, list);
+        };
+        // Content wikilinks whose note+content pair needs an `unresolved_link`/
+        // `ambiguous_link` warning check (vault#570). Deferred to the same
+        // second pass as `pendingLinks` — a content `[[wikilink]]` to a
+        // sibling created LATER in this batch resolves via the same
+        // forward-ref backfill structured `links` use, so the classification
+        // must run only after every item in the batch exists.
+        const contentWikilinkNotes: { noteId: string; content: string }[] = [];
         // `if_exists` bookkeeping (vault#555). `existedMap` is set ONLY for
         // items whose `if_exists` engaged (ignore/update/replace) — absent
         // means the default "error" path ran, so a plain create-note call
@@ -1079,6 +1224,15 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
             });
           }
 
+          // Content-wikilink warnings (vault#570) — this branch's content
+          // update (if any) already ran `syncWikilinks` inside
+          // `store.updateNote` above; queue the (noteId, content) pair for
+          // the shared second-pass classification below (same treatment as
+          // a fresh create's content).
+          if (updates.content !== undefined) {
+            contentWikilinkNotes.push({ noteId: result.id, content: updates.content });
+          }
+
           if (incomingTags.length > 0) {
             await store.tagNote(result.id, incomingTags);
             // Note: applySchemaDefaults also runs in the outer batch loop for
@@ -1181,6 +1335,14 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
               pendingLinks.push({ sourceId: note.id, links: item.links as { target: string; relationship: string }[] });
             }
 
+            // Content-wikilink warnings (vault#570) — `store.createNote`
+            // above already ran `syncWikilinks` (gated on `content` truthy,
+            // same condition here) — queue for the shared second-pass
+            // classification below.
+            if (item.content) {
+              contentWikilinkNotes.push({ noteId: note.id, content: item.content as string });
+            }
+
             created.push(noteOps.getNote(db, note.id) ?? note);
           }
 
@@ -1190,22 +1352,42 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
           // STILL doesn't resolve (typo, or a note that arrives in a later
           // call) is queued for lazy resolution — it backfills automatically
           // the moment a matching note is created — and surfaces an
-          // `unresolved_link` warning naming the target. Never silent.
+          // `unresolved_link` warning naming the target. A target that
+          // matched ≥2 notes (vault#570) is neither linked nor queued —
+          // surfaces a distinct `ambiguous_link` warning instead. Never silent.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
-              if (targetId) {
-                await store.createLink(sourceId, targetId, link.relationship);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              if (outcome.status === "resolved") {
+                await store.createLink(sourceId, outcome.note_id, link.relationship);
+              } else if (outcome.status === "ambiguous") {
+                pushLinkWarning(sourceId, {
+                  code: "ambiguous_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                  candidate_count: outcome.candidates.length,
+                });
               } else {
-                const list = linkWarningsByNote.get(sourceId) ?? [];
-                list.push({
+                pushLinkWarning(sourceId, {
                   code: "unresolved_link",
                   message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
                   target: link.target,
                   relationship: link.relationship,
                 });
-                linkWarningsByNote.set(sourceId, list);
               }
+            }
+          }
+
+          // --- Content-wikilink warnings (vault#570) ---
+          // Same forward-ref-aware timing as the structured-links pass above
+          // — every sibling in this batch exists by now, so a content
+          // `[[wikilink]]` to a later batch item already resolved via the
+          // pending-wikilink backfill (`resolveUnresolvedWikilinks`, run
+          // inside each `store.createNote`/`updateNote` call above).
+          for (const { noteId, content } of contentWikilinkNotes) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+              pushLinkWarning(noteId, warning);
             }
           }
         };
@@ -1281,7 +1463,7 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
     {
       name: "update-note",
       requiredVerb: "write",
-      description: `Update one or more notes. Accepts ID or path. Supports content, path, metadata updates plus tag and link mutations.
+      description: `Update one or more notes. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title. Supports content, path, metadata updates plus tag and link mutations.
 
 - Three content-modification modes (mutually exclusive):
   - \`content\` — full replace.
@@ -1299,7 +1481,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID or path" },
+          id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
           content: { type: "string", description: "New content (full replace). Mutually exclusive with `append`/`prepend` and `content_edit`." },
           append: { type: "string", description: "Text to append to the end of the note. Atomic at the SQL layer — concurrent appends are safe. Mutually exclusive with `content` and `content_edit`. No precondition required." },
           prepend: { type: "string", description: "Text to prepend to the start of the note. Atomic at the SQL layer. Mutually exclusive with `content` and `content_edit`. May combine with `append`. No precondition required." },
@@ -1345,7 +1527,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 items: {
                   type: "object",
                   properties: {
-                    target: { type: "string", description: "Target note ID or path" },
+                    target: { type: "string", description: "Target note ID, path, or (fallback) H1 title" },
                     relationship: { type: "string" },
                   },
                   required: ["target", "relationship"],
@@ -1356,14 +1538,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 items: {
                   type: "object",
                   properties: {
-                    target: { type: "string", description: "Target note ID or path" },
+                    target: { type: "string", description: "Target note ID, path, or (fallback) H1 title" },
                     relationship: { type: "string" },
                   },
                   required: ["target", "relationship"],
                 },
               },
             },
-            description: "Links to add/remove. `add[].target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename/title — and lazily backfills (queued) when the target arrives later; the response carries an `unresolved_link` warning naming the target in the meantime, never a silent drop.",
+            description: "Links to add/remove. `add[].target` resolves with the SAME semantics as a [[wikilink]] (vault#555) — ID, then exact path, then basename, then (only on a clean miss, and only when exactly one note matches) an H1-title fallback — and lazily backfills (queued) when the target arrives later; the response carries an `unresolved_link` warning naming the target in the meantime, never a silent drop.",
           },
           include_content: {
             type: "boolean",
@@ -1465,6 +1647,16 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         const pendingLinks: { sourceId: string; links: { target: string; relationship: string; metadata?: Record<string, unknown> }[] }[] = [];
         // Per-note `unresolved_link` warnings (vault#555 — "never silent").
         const linkWarningsByNote = new Map<string, QueryWarning[]>();
+        const pushLinkWarning = (noteId: string, warning: QueryWarning): void => {
+          const list = linkWarningsByNote.get(noteId) ?? [];
+          list.push(warning);
+          linkWarningsByNote.set(noteId, list);
+        };
+        // Content wikilinks whose note+content pair needs an `unresolved_link`/
+        // `ambiguous_link` warning check (vault#570) — deferred to the same
+        // second pass as `pendingLinks` for the same forward-ref-within-batch
+        // reason.
+        const contentWikilinkNotes: { noteId: string; content: string }[] = [];
         // Wrap multi-item batches in a SQLite transaction so any mid-batch
         // failure (precondition error, content_edit miss, ConflictError, …)
         // rolls back every prior mutation in the batch — see #236.
@@ -1560,6 +1752,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 const linksAdd = (item.links as any)?.add as { target: string; relationship: string; metadata?: Record<string, unknown> }[] | undefined;
                 if (linksAdd) {
                   pendingLinks.push({ sourceId: created.id, links: linksAdd });
+                }
+                // Content-wikilink warnings (vault#570) — same deferral as
+                // create-note's fresh-create branch.
+                if (content) {
+                  contentWikilinkNotes.push({ noteId: created.id, content });
                 }
                 const fresh = noteOps.getNote(db, created.id) ?? created;
                 updated.push(fresh);
@@ -1758,6 +1955,15 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             const hasLinkMutation = (item.links as any)?.add !== undefined
               || (item.links as any)?.remove !== undefined;
 
+            // Content-wikilink warnings (vault#570) gate on the SAME
+            // condition `store.updateNote`/`syncWikilinks` use to decide
+            // whether to re-sync content wikilinks at all — a tags/links-only
+            // update must not spuriously re-warn about pre-existing broken
+            // links this call never touched.
+            const contentChanged = updates.content !== undefined
+              || updates.append !== undefined
+              || updates.prepend !== undefined;
+
             let result: Note;
             if (Object.keys(updates).length > 0 || hasTagMutation || hasLinkMutation) {
               // Write-attribution (vault#298): stamp the most-recent-write
@@ -1811,7 +2017,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             }
 
             // Re-read for final state
-            updated.push(noteOps.getNote(db, note.id) ?? result);
+            const finalNote = noteOps.getNote(db, note.id) ?? result;
+            if (contentChanged) {
+              contentWikilinkNotes.push({ noteId: note.id, content: finalNote.content });
+            }
+            updated.push(finalNote);
           }
 
           // --- Resolve structured `links.add` (vault#555) ---
@@ -1824,19 +2034,33 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           // never silently dropped.
           for (const { sourceId, links } of pendingLinks) {
             for (const link of links) {
-              const targetId = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
-              if (targetId) {
-                await store.createLink(sourceId, targetId, link.relationship, link.metadata);
+              const outcome = resolveOrQueueLink(db, sourceId, link.target, link.relationship);
+              if (outcome.status === "resolved") {
+                await store.createLink(sourceId, outcome.note_id, link.relationship, link.metadata);
+              } else if (outcome.status === "ambiguous") {
+                pushLinkWarning(sourceId, {
+                  code: "ambiguous_link",
+                  message: `link target "${link.target}" (relationship "${link.relationship}") matched ${outcome.candidates.length} notes — ambiguous, no link created. Use a more specific path or the note's ID to disambiguate.`,
+                  target: link.target,
+                  relationship: link.relationship,
+                  candidate_count: outcome.candidates.length,
+                });
               } else {
-                const list = linkWarningsByNote.get(sourceId) ?? [];
-                list.push({
+                pushLinkWarning(sourceId, {
                   code: "unresolved_link",
                   message: `link target "${link.target}" (relationship "${link.relationship}") did not resolve to any note — queued and will backfill automatically if a matching note is created later.`,
                   target: link.target,
                   relationship: link.relationship,
                 });
-                linkWarningsByNote.set(sourceId, list);
               }
+            }
+          }
+
+          // --- Content-wikilink warnings (vault#570) ---
+          // Same forward-ref-aware timing as the structured-links pass above.
+          for (const { noteId, content } of contentWikilinkNotes) {
+            for (const warning of getContentWikilinkWarnings(db, noteId, content)) {
+              pushLinkWarning(noteId, warning);
             }
           }
         };
@@ -1896,11 +2120,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       // genuinely append-only callers — gating WITHIN write rather
       // than promoting deletes out of it.
       requiredVerb: "write",
-      description: "Permanently delete a note and all its tags and links. Accepts ID or path.",
+      description: "Permanently delete a note and all its tags and links. Accepts ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title.",
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Note ID or path" },
+          id: { type: "string", description: "Note ID, path, or (fallback, only when id/path both miss and exactly one note matches) its H1 title" },
         },
         required: ["id"],
       },
@@ -1992,7 +2216,14 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "update-tag",
-      requiredVerb: "write",
+      // `admin` (was `write`) — this PR: update-tag defines a tag's SCHEMA
+      // (description, indexed-field types, relationship vocabulary,
+      // hierarchy parents), which every note carrying the tag inherits.
+      // That's structure/taxonomy curation, not content authorship — the
+      // same distinction that keeps content out of admin and structure out
+      // of write. See the `generateMcpTools` doc comment above for the full
+      // re-tier rationale + BREAKING note.
+      requiredVerb: "admin",
       description: "Create or update a tag's identity row: description, indexed-field schemas, relationship-vocabulary map, and hierarchy parents. If the tag doesn't exist, it's created. Fields are merged (new keys added, existing keys replaced); relationships and parent_names are replaced wholesale when provided. Pass null for fields/relationships/parent_names to clear that column. See parachute-vault/docs/contracts/tag-data-model.md.",
       inputSchema: {
         type: "object",
@@ -2005,11 +2236,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             additionalProperties: {
               type: "object",
               properties: {
-                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object — all six are accepted for storage + advisory validation; any OTHER value is rejected outright (error_type invalid_field_type, vault#555 — bundled with every other violation in the same call, see the `update-tag` tool description). Only string/integer/boolean are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field)." },
+                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object, reference — all seven are accepted for storage + advisory validation; any OTHER value is rejected outright (error_type invalid_field_type, vault#555 — bundled with every other violation in the same call, see the `update-tag` tool description). Only string/integer/boolean/reference are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field). `reference` is a DUAL-WRITE type (typed-reference-field): the value is stored + validated exactly like `string` (pass a note id, path, or title), AND create-note/update-note additionally resolve that value to a note and maintain a graph `links` edge from this note to it, with `relationship` set to the field name — kept in sync on every write that changes the field (a new value re-points the link; clearing the field drops it). A target that doesn't resolve yet is queued and backfills automatically, same as a structured `links` entry — see `docs/design/typed-reference-field.md`." },
                 description: { type: "string" },
                 enum: { type: "array", items: { type: "string" }, description: "Allowed values. Does NOT auto-backfill — a note that omits this field stays without it unless `default` is also set (vault#553; the pre-0.7.0 behavior of silently defaulting to the first enum value is retired). Set `default` explicitly if you want backfill." },
                 default: { description: "Explicit backfill value (vault#553) applied when a note gains this tag without setting the field. Must conform to this field's own `type` (and `enum`, if declared) — a non-conforming default is rejected (invalid_default / invalid_field_default) rather than silently stored. Omit entirely to leave the field ABSENT (not backfilled) on notes that don't set it — this is what makes `exists:false` a trustworthy \"never set\" query." },
-                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed. Only string/integer/boolean are indexable. Indexed ⇒ a type-mismatched write is HARD-REJECTED (schema_validation), not just warned — vault#553." },
+                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed. Only string/integer/boolean/reference are indexable. Indexed ⇒ a type-mismatched write is HARD-REJECTED (schema_validation), not just warned — vault#553." },
                 strict: { type: "boolean", description: "vault#299. Default false (advisory). When true, ALL of this field's declared constraints (type + enum + required + cardinality) are ENFORCED — a violating write is rejected with a schema_validation error, not just warned. All-or-nothing per field; free-form fields on a strict tag simply leave strict off. Note: `indexed: true` fields enforce their TYPE constraint regardless of this flag (vault#553)." },
                 required: { type: "boolean", description: "vault#299. The field must be present + non-null on a note with this tag. Advisory unless `strict: true`." },
                 cardinality: { type: "string", enum: ["one", "many"], description: "vault#299. 'one' (scalar, default) or 'many' (array). Advisory unless `strict: true`." },
@@ -2128,10 +2359,15 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "delete-tag",
-      // `write` — Aaron's call 2026-05-27: admin reserved for token
-      // mgmt + future config writes; deletes are write-tier mutations.
-      // See delete-note rationale.
-      requiredVerb: "write",
+      // `admin` (was `write` — Aaron's 2026-05-27 call reserved admin for
+      // token mgmt + future config writes; deletes were write-tier
+      // mutations, see delete-note's rationale). Superseded by this PR:
+      // delete-tag removes a tag's identity row + schema and untags it
+      // vault-wide — that's structure/taxonomy curation, the same class as
+      // update-tag/rename-tag/merge-tags, not content authorship. See the
+      // `generateMcpTools` doc comment above for the full re-tier rationale
+      // + BREAKING note.
+      requiredVerb: "admin",
       description: "Delete a tag, remove it from all notes, and delete its schema. Notes themselves are NOT deleted — just untagged. Refused with error_type \"tag_referenced_as_parent\" (vault#552) when another tag's parent_names still names this one — pass cascade OR detach (either — both mean the same thing: strip the stale reference from the referencing tag(s)' parent_names, never delete them) to proceed anyway. Also refused with error_type \"tag_in_use_by_tokens\" (vault#555 fix — this case existed pre-#555 but was undocumented here; see \"merge-tags\" for the identical guard) when the tag is referenced by a tag-scoped token's allowlist — revoke or re-mint the token(s) first. A no-op on a tag with no identity row and no notes returns {deleted: false, notes_untagged: 0} rather than erroring.",
       inputSchema: {
         type: "object",
@@ -2166,7 +2402,13 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "rename-tag",
-      requiredVerb: "write",
+      // `admin` (was `write`) — this PR: an atomic cascading rename across
+      // note memberships, other tags' parent_names, tokens' allowlists,
+      // indexed-field declarer lists, and inline #tag mentions is structural
+      // taxonomy surgery, not content authorship. Same tier as
+      // update-tag/delete-tag/merge-tags. See the `generateMcpTools` doc
+      // comment above for the full re-tier rationale + BREAKING note.
+      requiredVerb: "admin",
       description:
         "Atomically rename a tag across EVERY surface that references it: note memberships, OTHER tags' parent_names, tag-scoped tokens' allowlists, indexed-field declarer lists, inline #tag mentions in note bodies, and _tags/<name> config-note paths — all in one transaction. THIS is the fix for the manual retag→delete dance (create the new tag, retag notes, delete the old one): that dance silently orphans parent_names references (the renamed-away tag stays a live query surface via subtype expansion while list-tags reports it at count 0, and the new tag misses every child-tagged note) and leaves stale #tag mentions behind. Sub-tags rename recursively — renaming \"task\" to \"todo\" also renames \"task/work\" to \"todo/work\". Does NOT rewrite metadata values that happen to equal the old tag name (e.g. metadata.epic: \"task\") — that's a distinct drift class the doctor tool's dead_tag_metadata_reference finding flags heuristically; rename-tag's job is structural (tags/note_tags/parent_names/tokens/content), not a blind string search-and-replace over arbitrary metadata.",
       inputSchema: {
@@ -2223,7 +2465,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "merge-tags",
-      requiredVerb: "write",
+      // `admin` (was `write`) — this PR: merging N source tags into a
+      // target (retagging every note, dropping the sources' identity rows)
+      // is structural taxonomy surgery, not content authorship. Same tier
+      // as update-tag/delete-tag/rename-tag. See the `generateMcpTools` doc
+      // comment above for the full re-tier rationale + BREAKING note.
+      requiredVerb: "admin",
       description:
         "Atomically merge one or more source tags into a target tag: every note carrying any source is retagged with the target, then the source tags (and their identity rows — description/fields/relationships/parent_names) are dropped. target is created if it doesn't exist yet; target's own schema is preserved (sources' schemas are consumed, not merged field-by-field). Sources that don't exist are reported at count 0. Refused with error_type \"tag_in_use_by_tokens\" if a source is referenced by a tag-scoped token — revoke or re-mint it first.",
       inputSchema: {
@@ -2259,12 +2506,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "find-path",
       requiredVerb: "read",
-      description: "Find the shortest path between two notes in the link graph. Accepts IDs or paths. Returns null if no path exists, else `{path, relationships, nodes, edges}`: `path` (note IDs, source→target) and `relationships` (relationships[i] connects path[i] to path[i+1]) are the original id-only shape; `nodes` (vault#550, additive) hydrates each id in `path` with the note's own `path` field — `[{id, path}]` in the same order; `edges` (additive) is the self-contained hop list — `[{source, target, relationship, sourcePath, targetPath}]` — for rendering the chain without cross-referencing `nodes`.",
+      description: "Find the shortest path between two notes in the link graph. Accepts IDs, paths, or (fallback, only when id/path both miss and exactly one note matches) H1 titles. Returns null if no path exists, else `{path, relationships, nodes, edges}`: `path` (note IDs, source→target) and `relationships` (relationships[i] connects path[i] to path[i+1]) are the original id-only shape; `nodes` (vault#550, additive) hydrates each id in `path` with the note's own `path` field — `[{id, path}]` in the same order; `edges` (additive) is the self-contained hop list — `[{source, target, relationship, sourcePath, targetPath}]` — for rendering the chain without cross-referencing `nodes`.",
       inputSchema: {
         type: "object",
         properties: {
-          source: { type: "string", description: "Starting note ID or path" },
-          target: { type: "string", description: "Destination note ID or path" },
+          source: { type: "string", description: "Starting note ID, path, or (fallback) H1 title" },
+          target: { type: "string", description: "Destination note ID, path, or (fallback) H1 title" },
           max_depth: { type: "number", description: "Max path length (default 5)" },
         },
         required: ["source", "target"],
@@ -2284,11 +2531,15 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     {
       name: "vault-info",
       // `read` so vault:read callers can fetch stats. The
-      // description-update branch performs an inner write-check (see
+      // description-update branch performs an inner ADMIN-check (see
       // overrideVaultInfo in src/mcp-tools.ts) — do not promote this to
-      // `write` or read-only callers lose the stats projection.
+      // `admin` or read-only callers lose the stats projection. Was an
+      // inner write-check pre-this-PR; writing the vault's own
+      // description/config is curation, not content, so it moved to the
+      // same admin tier as the other structure-curation tools (update-tag
+      // et al) — see the `generateMcpTools` doc comment above.
       requiredVerb: "read",
-      description: "Get a comprehensive vault projection: name, description, `coordinates` (this vault's own REST/MCP URL templates — `{name, base_url, rest_api, mcp}`, always present), tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, query hints, and (when a seeded onboarding guide exists) a `getting_started` note pointer. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution as a `stats` field. Pass `description` to update the vault description (changes how AI agents behave in future sessions) — requires the `vault:write` scope for this vault even though the tool itself is read-gated (vault#555: a `vault:read`-only caller passing `description` gets a `Forbidden` rejection, not a silent no-op). Call this anytime mid-session to refresh schema context. NOTE (vault#555): the stats `tagCount` counts only tags at least one note currently carries (`COUNT(DISTINCT tag_name)` over note-tag memberships) — `list-tags`'s row count can run higher because it also lists zero-membership tags (an identity row from a declared schema or a since-untagged tag). Neither is wrong; they answer different questions.",
+      description: "Get a comprehensive vault projection: name, description, `coordinates` (this vault's own REST/MCP URL templates — `{name, base_url, rest_api, mcp}`, always present), tags-with-schemas (own + effective parents/fields per #270 inheritance), indexed metadata fields catalog, query hints, `map` (front-door structural orientation, always present — see below), and (when a seeded onboarding guide exists) a `getting_started` note pointer. Pass `include_stats: true` to add note/tag/link counts and the monthly distribution as a `stats` field. Pass `description` to update the vault description (changes how AI agents behave in future sessions) — requires the `vault:admin` scope for this vault even though the tool itself is read-gated (vault#555 originally required `vault:write` here; a later PR tightened it to `vault:admin` since a description edit is curation, not content — a `vault:read`-or-`vault:write`-only caller passing `description` gets a `Forbidden` rejection, not a silent no-op). Call this anytime mid-session to refresh schema context. NOTE (vault#555): the stats `tagCount` counts only tags at least one note currently carries (`COUNT(DISTINCT tag_name)` over note-tag memberships) — `list-tags`'s row count can run higher because it also lists zero-membership tags (an identity row from a declared schema or a since-untagged tag). Neither is wrong; they answer different questions. `map` — `{ total_notes, tags: [{name, count}], path_buckets: [{name, count}], unfiled_notes }` — is a compact, counts-only structural rollup (no content) meant to orient a fresh reader in this ONE call, no `include_stats` needed: every tag currently in use with its membership count, and every top-level path segment (the text before the first `/`) with how many notes live under it, plus how many notes carry no path at all. For a tag-scoped token, `map.tags`/`map.path_buckets`/`map.total_notes`/`map.unfiled_notes` cover only notes reachable through an in-scope tag — same confidentiality posture as the `tags`/`indexed_fields` catalogs above.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2344,9 +2595,17 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     // =====================================================================
     {
       name: "doctor",
-      // `admin` — same tier as prune-schema: a diagnostic over the WHOLE
-      // vault's taxonomy, not scoped to any one tag's write authority.
-      requiredVerb: "admin",
+      // `read` (was `admin` — the original reasoning: same tier as
+      // prune-schema, a diagnostic over the WHOLE vault's taxonomy, not
+      // scoped to any one tag's write authority). Superseded by this PR:
+      // doctor never mutates and is ALREADY tag-scope-restricted at the MCP
+      // layer (see `applyTagScopeWrappers`'s `doctor` wrapper in
+      // src/mcp-tools.ts, which re-runs the scan against the caller's
+      // allowlist) — it's a read, not a curation op, and read-scoped
+      // monitoring/tending jobs need to be able to run it without an admin
+      // credential. The REST `GET /api/doctor` endpoint (routing.ts) is
+      // re-tiered to `read` too, so both doors agree — no MCP/REST divergence.
+      requiredVerb: "read",
       description:
         "Read-only integrity scan across the tag/metadata taxonomy — run this after any bulk tag reorg (rename/merge/delete/subtree move) to confirm nothing leaked. Returns {findings, summary, scanned_at} — findings is an array, each entry {type, severity, subject, detail, remedy} — NEVER auto-fixes; apply the suggested remedy (usually rename-tag/merge-tags/update-tag/prune-schema) yourself. Finding types: dangling_parent_name (a parent_names entry naming a tag with no identity row), parent_names_cycle (a tag reaching itself through its ancestor chain — traversal tolerates this, but it's dishonest hierarchy state), mixed_type_indexed_field (a note's metadata value for an indexed field has a JSON type disagreeing with the field's declared storage type — the ordering/filtering-goes-silently-wrong precursor), orphaned_indexed_field_declarer (an indexed field naming a dead declarer tag — see prune-schema), and dead_tag_metadata_reference (HEURISTIC, always carries heuristic:true — a metadata value that looks like a stale reference to a renamed/merged/deleted tag, inferred from sibling notes using the same metadata key with values that ARE live tags; can never be certain since vault keeps no tag-rename history).",
       inputSchema: { type: "object", properties: {} },

@@ -34,6 +34,367 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.1-rc.1] - 2026-07-10
+
+**Launch integration** of eight feature branches (#572–#579) into one
+release — ULIDs, MCP scope re-tier + REST-door completion, search/doctor
+polish, the `vault-info` front door, aggregation, typed reference fields,
+title-fallback link resolution, and honest link warnings. All eight touch
+overlapping surface (`core/src/wikilinks.ts`, `core/src/store.ts`,
+`core/src/mcp.ts`) and are reconciled here into one coherent whole rather
+than eight sequential PRs — see the PR description for the reconciliation
+approach on the two highest-risk overlaps (the wikilinks resolution chain,
+and `resolveOrQueueLink`'s discriminated-union return type vs. the
+reference-field auto-linker that was written against its old signature).
+
+### Breaking — re-tier read/write/admin across BOTH doors (MCP + REST)
+
+Deliberate, ratified scope-model change: content-authorship (`write`) is now
+separate from structure/taxonomy/schema-curation (`admin`). No new scope —
+the `read`/`write`/`admin` vocabulary is unchanged, only which tier each
+tool/endpoint requires moves, and — new in this integration — the MCP and
+REST doors are made to **agree** on every one of these moves (previously
+only MCP was re-tiered, leaving REST on the old, looser tier — a real gap:
+a `vault:write` token could rename/merge/delete/update a tag over REST
+while MCP already refused it).
+
+- **`update-tag`, `delete-tag`, `rename-tag`, `merge-tags` (MCP) and
+  `PUT`/`DELETE /api/tags/<name>`, `POST /api/tags/merge`,
+  `POST /api/tags/<name>/rename` (REST): `write` → `admin`.** These
+  define a tag's schema (description, indexed-field types, relationship
+  vocabulary, hierarchy parents) or restructure the tag graph across every
+  note carrying it — structure, not content. **BREAKING:** a token holding
+  only `vault:write` that used to be able to rename/merge/delete/update a
+  tag now gets `insufficient_scope` (REST: `403` with
+  `required_scope:"vault:admin"`; MCP: the tool disappears from
+  `tools/list` and `tools/call` returns `Unknown tool`) and needs
+  `vault:admin`. `create-note`/`update-note`/`delete-note` and
+  `POST`/`PATCH`/`DELETE /api/notes` are unaffected — content authorship
+  stays `write` on both doors. The REST-side gate lives in the generic
+  method→verb scope check in `src/routing.ts` (an `isTagSchemaMutation`
+  carve-out alongside the pre-existing `isReadOnlyPost` one for
+  `/tags/<name>/conformance`, which stays `read`).
+- **`vault-info`'s description-update branch (MCP): `write` → `admin`.**
+  The tool's own `requiredVerb` stays `read` (so read-only callers keep the
+  stats/map projection), but the inner scope check performed when a caller
+  passes `description` (`overrideVaultInfo` in `src/mcp-tools.ts`) now
+  requires `vault:admin` — writing the vault's own description/config is
+  curation, the same tier as the tag-schema tools above, not content.
+  **BREAKING:** a `vault:write`-only caller passing `description` now gets
+  `Forbidden` (previously succeeded). REST's `PATCH /api/vault` config-write
+  path is unaffected by this specific branch (already gated elsewhere).
+- **`doctor` (MCP tool) and `GET /api/doctor` (REST): `admin` → `read`.**
+  It's a read-only, tag-scope-restricted diagnostic (already re-run against
+  the caller's tag allowlist — `applyTagScopeWrappers` in
+  `src/mcp-tools.ts` for MCP, the `doctorTagScope` threaded into
+  `handleDoctor` for REST) — read-scoped monitoring/tending jobs need to be
+  able to run it without an admin credential, on either door. A
+  `vault:read` token can now call `doctor` over MCP AND `GET /api/doctor`
+  over REST (previously `Forbidden` on both, then only fixed on MCP by the
+  source branch — this integration completes the REST side, which is the
+  security-completeness fix called out in the PR description). The REST
+  gate moved from a hardcoded `admin` check in the early
+  "`/api/doctor` dispatched before the generic gate" block in
+  `src/routing.ts` to the same block, now checking `read`.
+- **`prune-schema` and `manage-token` are unchanged** — both stay `admin`
+  on MCP (destructive schema maintenance / token minting, operator-only;
+  no REST equivalent exists for either).
+
+Updated: MCP tool descriptions + inline scope comments (`core/src/mcp.ts`,
+`src/mcp-tools.ts`), REST scope gate + doc comments (`src/routing.ts`),
+`docs/auth-model.md` (scope vocabulary, the per-vault endpoint table now
+listing the tag-mutation/doctor rows individually instead of a lumped
+`POST/PUT/DELETE → write` row), and `docs/HTTP_API.md` (the four tag-schema
+endpoint headers, the `/api/doctor` header, and the MCP tool → verb table —
+the REST/MCP `doctor` divergence noted in earlier drafts of this PR is now
+**resolved**, not just documented).
+
+Tests: MCP — 7 in `src/vault.test.ts`'s `tools/list`/`tools/call`
+scope-tier suite (`vault:write` can `create-note` but is denied
+`rename-tag`/`merge-tags`/`delete-tag`/`update-tag`; `vault:read` can run
+`doctor`; `vault:write` is denied the `vault-info` description write;
+`vault:admin` can do all of the above), plus tool-count assertions (read
+tier: 5 tools incl. `doctor`; write tier: 8 cumulative; admin tier: 14
+total). REST — 5 new in `src/routing.test.ts`'s "scope enforcement on
+`/api/*`" describe block, mirroring the MCP suite exactly: a `vault:write`
+token can `POST /api/notes` but is denied `PUT`/`DELETE /api/tags/<name>`,
+`POST /api/tags/merge`, and `POST /api/tags/<name>/rename` (each `403` with
+`required_scope:"vault:admin"`, and the tag itself is left untouched); a
+`vault:read` token can `GET /api/doctor` (`200`, `{findings, summary}`); a
+`vault:admin` token can do all of the above; a `vault:write` token can
+still `GET /api/doctor` via `write ⊇ read` inheritance; a `vault:read`
+token is denied `PUT /api/tags/<name>`.
+
+### Added
+
+- **Aggregation / rollup queries — `group_by` + count/sum** (top
+  new-feature ask from a UX round). `query-notes`'s
+  `aggregate: {group_by, op, field?}` (MCP) and
+  `GET /notes?aggregate[group_by]=…&aggregate[op]=…&aggregate[field]=…`
+  (REST) apply every OTHER filter (tag, metadata, date range,
+  write-attribution, ...) exactly as a normal query would, then group the
+  matching notes and return `[{group, value}]` instead of note rows.
+  `group_by` is either the special value `"tag"` (group by tag membership —
+  a note carrying N of the matched tags contributes to N groups) or an
+  indexed metadata field — same `FIELD_NOT_INDEXED` contract
+  `meta[field][op]=` operators and `order_by` use. `op: "sum"` requires a
+  second indexed NUMERIC field (`type: "integer"`/`"boolean"`; a bare
+  `type: "number"` field is never indexed and can't be summed). A note
+  missing the `group_by` value collects into one `{group: null, ...}` row
+  rather than being silently dropped. Mutually exclusive with
+  `search`/`near`/`cursor`. Tag-scoped tokens see the rollup computed only
+  over notes they can see — AND, under `group_by: "tag"`, group NAMES are
+  scrubbed to the allowlist too, closing a leak class the naive
+  note-level narrowing alone would have missed: a note visible via one tag
+  but also carrying an out-of-scope co-tag can't surface that co-tag as a
+  group. Core (`core/src/notes.ts`, `store.ts`'s new `aggregateNotes`)
+  computes the rollup via SQL `GROUP BY` over the shared filter-condition
+  builder extracted from `queryNotes`; server-layer scope enforcement
+  mirrors the `expandVisibility`/`nearTraversable` predicate-injection
+  pattern (MCP) and the existing `filterNotesByTagScope` post-query filter
+  (REST). See `docs/HTTP_API.md`'s "Aggregation / rollup" section. Tests:
+  `core/src/aggregate.test.ts`, `src/aggregate-routes.test.ts`,
+  `src/mcp-query-notes-aggregate-scope.test.ts`.
+
+- **Typed reference field — indexed value + auto-link.** A new tag-schema
+  field type, `type: "reference"`, collapses a pattern builders were
+  hand-syncing: an indexed string value AND a structured `links` edge to
+  the same target, kept in agreement by hand. Declaring a field
+  `type: "reference"` makes it dual-write: the value is stored + validated
+  exactly like `string` (an id/path/title), and `create-note`/`update-note`
+  (both MCP and REST — the shared `core/src/store.ts` write-path
+  chokepoint, `syncReferenceFieldLinks`) additionally resolve that value to
+  a note and maintain a graph `links` edge from this note to it,
+  `relationship` = the field name — reusing the same id/path/title
+  resolution and lazy forward-ref queueing that structured `links` entries
+  use (`resolveOrQueueLink`). Changing the field's value re-points the
+  link; clearing it drops the link; an unchanged value is left untouched
+  (no DB churn on unrelated writes). An ambiguous resolution (≥2 matching
+  notes — see the title-fallback and honest-link-warnings entries below)
+  is treated the same as a miss: no link created, nothing queued. Declare
+  `indexed: true` alongside `type: "reference"` for a B-tree index over the
+  raw value (operator queries `eq`/`in`/...); a plain metadata-equality
+  filter already works on any field regardless of `indexed`. Scalar values
+  only in this release — see `docs/design/typed-reference-field.md` for
+  the full design and known gaps (no inline `unresolved_link` warning yet
+  on the reference-field write path itself, `cardinality: "many"`
+  reference arrays don't link, no retroactive backfill when a tag gains
+  the declaration). Tests: `core/src/core.test.ts`'s reference-field
+  suite, `core/src/indexed-fields.test.ts`,
+  `core/src/contract-typed-index.test.ts`, `src/contract-errors.test.ts`.
+
+- **Title-fallback resolution for `[[wikilinks]]`, structured `links`, and
+  note-id lookup.** Top friction from a UX round: a note's H1 title (its
+  `# Heading`) commonly differs from its path/basename, so a natural
+  `[[Some Title]]` link — or `query-notes { id: "Some Title" }` — silently
+  broke even though a human reading the note would call it exactly that.
+  Additive, last-resort fallback: exact id/path/basename resolution is
+  unchanged and always wins first; only on a CLEAN miss (zero candidates,
+  not an ambiguous one) do we try matching the note whose first `# `
+  content line equals the target, case-insensitively. Resolves only when
+  EXACTLY one note carries that title — two-or-more is **ambiguous** (see
+  the honest-link-warnings entry below), never a silent guess, mirroring
+  the existing basename-ambiguity policy (vault#328).
+  - New in `core/src/notes.ts`: `extractH1Title` (first `"# "` line in a
+    note's content) and `findNotesByTitle`/`getNoteByTitle` (title →
+    note(s), case-insensitive, full-content scan — a fallback path reached
+    only after the cheap indexed lookups already missed).
+  - `core/src/wikilinks.ts`: `resolveWikilink`/`resolveWikilinkDetailed` try
+    the title match as step 4, after explicit-extension, exact-path, and
+    basename all miss cleanly — a ≥2-title-match returns `ambiguous: true`
+    from `resolveWikilinkDetailed`, never a silent resolve.
+    `resolveLinkTarget`/`resolveLinkTargetDetailed`/`resolveStructuredLinkNote`/
+    `resolveOrQueueLink` (structured `links` resolution) inherit the
+    title-fallback (and its ambiguity handling) for free since they all
+    delegate to `resolveWikilinkDetailed`.
+  - `core/src/mcp.ts` and `src/routes.ts`: the shared `resolveNote(id/path)`
+    helper each transport uses for `query-notes`/`update-note`/`delete-note`
+    `id`, `find-path` anchors, and REST
+    `GET`/`PATCH`/`DELETE /api/notes/:idOrPath` now falls through to the
+    title match after id and path/extension both miss.
+  - Docs: `docs/HTTP_API.md` and the relevant MCP tool descriptions
+    (`query-notes`/`update-note`/`delete-note` `id`, `links[].target`,
+    `find-path` source/target) describe the four-step order
+    (id → path[.ext] → basename → title-fallback-on-clean-miss).
+  - Tests: `core/src/core.test.ts`'s title-fallback suite,
+    `core/src/wikilinks.test.ts` (H1 extraction, single vs. ambiguous title
+    match, id/path/basename always winning first, the four-step order end
+    to end).
+
+- **Honest unresolved + ambiguous link warnings** (issue #570, P3 polish
+  from the rc.9 convergence harness round).
+  - **Content `[[wikilinks]]` to a missing target now warn
+    (`unresolved_link`) — closing an asymmetry with structured `links`.**
+    Before this fix, a `[[wikilink]]` whose target didn't exist queued into
+    `unresolved_wikilinks` (same as a structured `links` miss) but fired NO
+    write-time warning — the pending state was only discoverable later via
+    `has_broken_links`/`include_broken_links` or
+    `GET /vault/{name}/api/unresolved-wikilinks`. `create-note`/`update-note`
+    (MCP) and `POST`/`PATCH /notes` (REST) now attach an `unresolved_link`
+    warning for a content-wikilink miss identical in shape to the existing
+    structured-link one (`target`, `relationship: "wikilink"`), and it
+    stays out of the response entirely when a call doesn't touch content (a
+    tags/links-only update never re-surfaces a warning about content it
+    didn't write). New `core/src/wikilinks.ts` export
+    `getContentWikilinkWarnings(db, noteId, content)` — read-only, single
+    source of truth is `resolveWikilinkDetailed` (the same resolver
+    `syncWikilinks` itself now uses), so it can't drift from what the write
+    actually did. Batch-aware: a content wikilink to a note created LATER
+    in the same batch resolves silently (forward-ref), same timing as
+    structured `links`.
+  - **A target matching ≥2 notes gets a distinct `ambiguous_link` warning
+    instead of the misleading `unresolved_link` "did not resolve to any
+    note."** Applies to BOTH a content `[[wikilink]]` and a structured
+    `links` entry (one shared resolver — now also feeding the
+    title-fallback and typed-reference-field features above). Carries
+    `target`, `relationship`, and `candidate_count` (the match count —
+    never the candidates' ids/paths, so the warning can't be used to
+    enumerate which notes collided). **No edge is created** and the target
+    is explicitly **not queued** into `unresolved_wikilinks` either: a
+    future note being created can't retroactively resolve an ambiguity
+    between two notes that already exist, and queuing it risked the
+    lazy-resolution sweep (`resolveUnresolvedWikilinks`) later linking to
+    an arbitrary THIRD same-titled note rather than reporting the
+    collision. `core/src/wikilinks.ts`: `resolveWikilinkDetailed`/
+    `resolveLinkTargetDetailed` are now the single resolution path for
+    both content and structured links, INCLUDING the title fallback above
+    and the reference-field auto-linker; `resolveOrQueueLink` returns a
+    discriminated `{status: "resolved"|"ambiguous"|"queued", ...}` outcome
+    (was `string | null`, which couldn't distinguish "ambiguous" from
+    "genuinely missing" — both collapsed to `null`); `syncWikilinks` gains
+    an `ambiguous` field alongside the existing `added`/`removed`/
+    `unresolved` counts.
+  - **Scope stance (unchanged, verified).** `unresolved_link`/
+    `ambiguous_link` describe the CALLER's own note's own outgoing link
+    (named by the caller), not a vault-wide vocabulary scan — unlike
+    `unknown_tag`/`did_you_mean`/`search_did_you_mean` (which tag-scoped
+    sessions never see), these warnings are NOT stripped for a tag-scoped
+    session, matching the existing structured-link `unresolved_link`
+    behavior exactly.
+  - Core-vs-handler split: `core/src/wikilinks.ts` (resolver + warning
+    derivation, shared), `core/src/mcp.ts` (`create-note`/`update-note`
+    tools), `src/routes.ts` (independent REST reimplementation of the same
+    contract). `docs/HTTP_API.md` updated: the warnings-channel table
+    gains `ambiguous_link` and an updated `unresolved_link` entry; the
+    "Structured `links` resolution" section states the shared-resolver
+    contract and the ambiguous case explicitly.
+  - Tests: 6 new in `core/src/core.test.ts`, 11 new in
+    `core/src/wikilinks.test.ts`, 5 new in `src/vault.test.ts` (REST
+    parity), 4 new in `src/mcp-link-warnings-scope.test.ts` (tag-scope
+    stance).
+
+- **`vault-info` gains a `map` field — the front door** — ALWAYS present,
+  no flag required. `{ total_notes, tags: [{name, count}], path_buckets:
+  [{name, count}], unfiled_notes }`: every tag currently carried by at
+  least one note with its membership count (uncapped, unlike
+  `stats.topTags`'s top-20), every top-level path segment (the text before
+  the first `/`, or the whole path when it has none) among notes that HAVE
+  a path with how many notes live under it, and how many notes carry no
+  path at all (excluded from `path_buckets`; `unfiled_notes` + every
+  bucket's count == `total_notes`). A 2026-07-09 UX round on cold-start
+  vaults found the gap: a fresh reader with no prior context had no single
+  cheap call that says "here's the shape of this vault" —
+  `vault-info`'s existing catalog covered only tags-*with-schemas*, and the
+  deeper `getVaultStats` distribution required an extra
+  `include_stats: true` round trip and returned more than orientation
+  needs. Three cheap grouped-`COUNT` SQL queries — no content, no
+  full-table scan — new `getVaultMap` in `core/src/notes.ts`, wired into
+  the shared `buildVaultProjection` (`core/src/vault-projection.ts`) so
+  both the MCP `vault-info` tool and `GET /vault/{name}/api/vault` return
+  the identical shape. `include_stats: true` still adds the deeper
+  `VaultStats` distribution alongside `map`, not instead of it.
+  Scope-aware: a tag-scoped token's `map` covers only notes reachable
+  through an in-scope tag — path-bucket counts RE-RUN the grouped-count
+  query restricted to the caller's allowlist rather than filtering an
+  unscoped result (per-note tag membership can't be reconstructed from a
+  tag-name allowlist over a precomputed rollup); an allowlist matching
+  zero tags returns an explicit all-zero map, never the full vault. Getting
+  Started (`core/src/seed-packs.ts`) gains a front-door convention: the
+  tool-list bullet mentions the always-present `map`; the "if this vault
+  already has content" orientation step leads with plain `vault-info`
+  before reaching for `include_stats`; a new "A few shapes worth reusing"
+  bullet recommends maintaining one human-legible "Map" note (once a vault
+  grows past a few dozen notes) as the "why" companion to `vault-info`'s
+  auto-computed "what's there" counts. Tests: 9 new in
+  `core/src/core.test.ts`, 7 new in `src/vault.test.ts` (3 MCP + 4 REST).
+
+### Changed
+
+- **New note/attachment IDs are ULIDs, not timestamp-format strings —
+  existing IDs are NOT migrated.** `generateId()` (`core/src/notes.ts`)
+  previously returned `YYYY-MM-DD-HH-MM-SS-ffffff`; it now returns a
+  26-character Crockford-base32 [ULID](https://github.com/ulid/spec)
+  (48-bit ms timestamp + 80-bit randomness), monotonic within the same
+  millisecond so lexicographic order matches generation order under bursty
+  writes. Every `generateId()` call site is unchanged — this is a pure
+  change to what the single ID source returns, not a new codepath. New
+  `core/src/ulid.ts`: a small, dependency-light, hand-rolled generator
+  using `crypto.getRandomValues` (Web Crypto, available in Bun) rather
+  than `Math.random` — no new npm dependency added.
+- **Old timestamp-format IDs are untouched and stay valid forever —
+  mixed-format IDs coexist by design.** No migration runs, no backfill,
+  nothing rewrites existing rows. A vault's `notes.id`/`attachments.id`
+  columns are (and will remain indefinitely) a mix of the old timestamp
+  shape and the new ULID shape; every codepath that touches `id` treats it
+  as an opaque string (equality, prefix/path resolution, or the cursor's
+  `(updated_at, id)` string-compare tiebreaker) — none of which cares
+  about the id's internal format.
+- **Audit: nothing in the codebase parses a note ID to recover its
+  creation time.** Full-codebase grep for id-slicing/splitting/
+  date-parsing turned up zero hits outside test fixtures. The only places
+  `id` participates in ordering are all `created_at`/`updated_at`-primary
+  with `id` as a stable secondary tiebreaker — correct and format-agnostic
+  behavior that needed no change. `generateId()`'s doc comment now states
+  the invariant explicitly (id format must never be assumed, and nothing
+  may derive time from it — use `created_at`).
+- Tests: 11 new — `core/src/ulid.test.ts` (format, charset, monotonic
+  ordering, no duplicates across 5000 calls) and `core/src/core.test.ts`'s
+  `describe("ULID ids for new notes (existing IDs unchanged)")` (new notes
+  get ULID-format ids; an explicit old-format id round-trips through
+  create/read/link; mixed old-timestamp-format + new-ULID ids sharing one
+  `updated_at` paginate via cursor with no miss or duplicate).
+
+### Fixed
+
+- **`search_did_you_mean` now suggests a real surface word, not a porter
+  stem** (issue #570). `computeSearchDidYouMean` (`core/src/query-warnings.ts`)
+  drew its candidate pool from `notes_fts_vocab` — the porter-STEMMED FTS5
+  vocabulary — so a zero-result search's suggestion sometimes read as a
+  truncated fragment a user would never type ("cactu" for "cactus"). The
+  stemmed vocabulary is still used to find the closest CANDIDATE, but a
+  stemmed candidate is no longer returned verbatim: new `resolveSurfaceForm`
+  maps it back to a real dictionary word via the matching note's own
+  unstemmed text. Irregular cases fall back to the raw stem, same as
+  before this fix — never worse.
+- **`doctor`'s `dead_tag_metadata_reference` heuristic no longer
+  false-positives on schema-declared enum values** (issue #570).
+  `scanDeadTagMetadataReferences` (`core/src/doctor.ts`) flags a metadata
+  value that matches no live tag when sibling notes' values under the same
+  key ARE live tags — but a schema-declared ENUM field whose values merely
+  *coincide* with an unrelated live tag name used to drag the enum's OTHER
+  legitimate values into a false "stale tag reference" finding. The scan
+  now collects every metadata key declared as an enum field on ANY tag
+  schema and skips it entirely — an enum is a closed, schema-governed
+  vocabulary; drift there already surfaces as `enum_mismatch` validation.
+- Docs: `docs/HTTP_API.md` (`search_did_you_mean`'s stemming caveat,
+  `dead_tag_metadata_reference`'s enum-skip behavior). Tests: 2 new —
+  `src/contract-search.test.ts`, `core/src/contract-taxonomy.test.ts`.
+
+### Gates
+
+Combined, post-integration: `bun run typecheck` clean; `bun test ./core/src/`
+1126 pass / 0 fail (35 files); `bun test ./src/` 2206 pass / 1 skip
+(pre-existing opt-in `VAULT_SCALE_BENCH` bench suite, unrelated) / 0 fail
+(90 files). One integration-only fix folded in: `core/src/core.test.ts`'s
+ULID mixed-format cursor-pagination test bootstrapped its first page
+without `cursor: ""` (the documented bootstrap contract), which orders
+that page by `created_at` instead of `updated_at` and can produce a
+watermark that skips rows once real keyset pagination takes over on page 2
+— a timing-dependent flake (whether `created_at` ties across the fixture's
+notes) surfaced only when run alongside other suites in the same process,
+not a defect in `queryNotesPaged` itself. Fixed to bootstrap correctly;
+verified stable across repeated runs, isolated and combined.
+
 ## [0.7.0] - 2026-07-10
 
 The `0.7.0-rc.1` through `rc.9` chain (below) promotes to stable — the

@@ -675,6 +675,34 @@ describe("scoped MCP wrapper", async () => {
     closeAllStores();
   });
 
+  test("vault-info includes a compact structural map WITHOUT include_stats (front-door)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `map-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const vaultStore = getVaultStore(vaultName);
+    await vaultStore.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await vaultStore.createNote("b", { tags: ["person"] }); // no path
+
+    const tools = generateScopedMcpTools(vaultName);
+    const vaultInfo = tools.find((t) => t.name === "vault-info")!;
+
+    // No `include_stats` flag — the map must still be present (that's the
+    // whole point: orient in ONE call, no flag needed).
+    const result = await vaultInfo.execute({}) as any;
+    expect(result.stats).toBeUndefined();
+    expect(result.map).toBeTruthy();
+    expect(result.map.total_notes).toBe(2);
+    expect(result.map.tags).toEqual([{ name: "person", count: 2 }]);
+    expect(result.map.path_buckets).toEqual([{ name: "People", count: 1 }]);
+    expect(result.map.unfiled_notes).toBe(1);
+
+    closeAllStores();
+  });
+
   test("getServerInstruction renders projection markdown for a populated vault (vault#271)", async () => {
     const { getServerInstruction } = await import("./mcp-tools.ts");
     const { writeVaultConfig } = await import("./config.ts");
@@ -1263,6 +1291,51 @@ describe("scoped MCP wrapper", async () => {
     expect(tagNames.sort()).toEqual(["project", "task"]);
     const status = (result.indexed_fields as { name: string; tags: string[] }[]).find((f) => f.name === "status")!;
     expect(status.tags.sort()).toEqual(["project", "task"]);
+
+    closeAllStores();
+  });
+
+  test("scoped vault-info's map covers only notes reachable through an in-scope tag (front-door)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vault-info-map-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const store0 = getVaultStore(vaultName);
+    await store0.createNote("a", { tags: ["work"], path: "Work/One" });
+    await store0.createNote("b", { tags: ["work"] }); // no path
+    await store0.createNote("c", { tags: ["personal"], path: "Personal/Two" });
+
+    // Scoped to `work` only.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const result = await tools.find((t) => t.name === "vault-info")!.execute({}) as any;
+
+    expect(result.map.total_notes).toBe(2); // a, b — "c" (personal) excluded
+    expect(result.map.tags).toEqual([{ name: "work", count: 2 }]);
+    expect(result.map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+    expect(result.map.unfiled_notes).toBe(1);
+
+    closeAllStores();
+  });
+
+  test("scoped vault-info with an allowlist matching nothing returns an all-zero map, not the full vault", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-vault-info-map-empty-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const store0 = getVaultStore(vaultName);
+    await store0.createNote("a", { tags: ["work"], path: "Work/One" });
+
+    // Scoped to a tag that doesn't exist in this vault at all.
+    const tools = generateScopedMcpTools(vaultName, authForTags(["nonexistent"]) as any);
+    const result = await tools.find((t) => t.name === "vault-info")!.execute({}) as any;
+
+    expect(result.map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
 
     closeAllStores();
   });
@@ -2331,6 +2404,37 @@ describe("HTTP /notes", async () => {
     const res = await handleNotes(mkReq("GET", "/notes/x"), store, "/x");
     const body = await res.json() as any;
     expect(body.content).toBe("hello");
+  });
+
+  // ---- Title-fallback resolution (additive — id/path/basename still win first) ----
+
+  test("GET /notes/:idOrPath resolves via H1 title when id and path both miss", async () => {
+    await store.createNote("# My Great Note\n\nBody.", { path: "Inbox/2026-07-10-xyz" });
+    const enc = encodeURIComponent("My Great Note");
+    const res = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.path).toBe("Inbox/2026-07-10-xyz");
+  });
+
+  test("GET /notes/:idOrPath exact path still wins over a same-named title on another note", async () => {
+    const byPath = await store.createNote("Path note", { path: "My Great Note" });
+    await store.createNote("# My Great Note\n\nOther body.", { path: "Inbox/other" });
+    const enc = encodeURIComponent("My Great Note");
+    const res = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    const body = await res.json() as any;
+    expect(body.id).toBe(byPath.id);
+    expect(body.content).toBe("Path note");
+  });
+
+  test("GET /notes/:idOrPath stays 404 when 2+ notes share the same H1 title", async () => {
+    await store.createNote("# Dup Note\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Note\n\nB.", { path: "Inbox/dup-b" });
+    const enc = encodeURIComponent("Dup Note");
+    const res = await handleNotes(mkReq("GET", `/notes/${enc}`), store, `/${enc}`);
+    expect(res.status).toBe(404);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("not_found");
   });
 
   test("GET /notes/:id?include_content=false returns lean shape", async () => {
@@ -4672,6 +4776,104 @@ describe("HTTP PATCH /notes/:idOrPath (update)", async () => {
     expect(links[0]!.relationship).toBe("knows");
   });
 
+  // vault#570 — content-parsed [[wikilinks]] to a missing target used to
+  // fire NO write-time warning over REST either, mirroring the MCP fix.
+  test("POST /notes with a content [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "See [[Nowhere REST]] for details." }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("unresolved_link");
+    expect(body.warnings[0].target).toBe("Nowhere REST");
+    expect(await store.getLinks(body.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a target matching ≥2 notes is a distinct situation from a
+  // genuine miss: `ambiguous_link`, not `unresolved_link`, and no edge.
+  test("POST /notes with a content [[wikilink]] to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/RestDup" });
+    await store.createNote("B", { path: "Folder2/RestDup" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "See [[RestDup]] for details." }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("ambiguous_link");
+    expect(body.warnings[0].target).toBe("RestDup");
+    expect(body.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(body.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  // vault#570 — a structured `links` entry against an ambiguous target gets
+  // the same treatment over REST (shared core implementation).
+  test("POST /notes with a structured link to an AMBIGUOUS target: ambiguous_link, no edge", async () => {
+    await store.createNote("A", { path: "Folder1/RestDup2" });
+    await store.createNote("B", { path: "Folder2/RestDup2" });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "no wikilinks here",
+        links: [{ target: "RestDup2", relationship: "knows" }],
+      }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("ambiguous_link");
+    expect(body.warnings[0].candidate_count).toBe(2);
+    expect(await store.getLinks(body.id, { direction: "outbound" })).toHaveLength(0);
+  });
+
+  test("PATCH content update with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    await store.createNote("plain", { id: "patchable", path: "PatchableRest" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/patchable", { content: "now references [[Not Yet Real REST]]", force: true }),
+      store,
+      "/patchable",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("unresolved_link");
+    expect(body.warnings[0].target).toBe("Not Yet Real REST");
+
+    // A tags-only follow-up PATCH must not re-surface the warning.
+    const tagOnly = await handleNotes(
+      mkReq("PATCH", "/notes/patchable", { tags: { add: ["x"] }, force: true }),
+      store,
+      "/patchable",
+    );
+    const tagOnlyBody = await tagOnly.json() as any;
+    expect(tagOnlyBody.warnings).toBeUndefined();
+  });
+
+  // vault#570 — `if_missing: "create"` is a distinct create-shaped code
+  // path in routes.ts (separate from POST /notes); it needs the same fix.
+  test("PATCH if_missing:create with a [[wikilink]] to a missing target: warns (unresolved_link)", async () => {
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/brand-new-rest", {
+        if_missing: "create",
+        content: "See [[Nowhere Upsert REST]].",
+      }),
+      store,
+      "/brand-new-rest",
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.created).toBe(true);
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings[0].code).toBe("unresolved_link");
+    expect(body.warnings[0].target).toBe("Nowhere Upsert REST");
+  });
+
   test("PATCH without a link mutation or flag does NOT include links", async () => {
     await store.createNote("a", { id: "a" });
     await store.createNote("b", { id: "b" });
@@ -6161,19 +6363,24 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).toContain("list-tags");
     expect(toolNames).toContain("find-path");
     expect(toolNames).toContain("vault-info");
+    // `doctor` moved admin → read (re-tier): a read-only, tag-scope-
+    // restricted diagnostic, visible to a plain vault:read session.
+    expect(toolNames).toContain("doctor");
     // Mutation tools are hidden — filter applied before advertising
     expect(toolNames).not.toContain("create-note");
     expect(toolNames).not.toContain("update-note");
     expect(toolNames).not.toContain("delete-note");
+    // Tag-schema/taxonomy tools moved write → admin (re-tier): hidden from
+    // a vault:read (and, per the next describe block, a plain vault:write)
+    // session — they now need vault:admin.
     expect(toolNames).not.toContain("update-tag");
     expect(toolNames).not.toContain("delete-tag");
     expect(toolNames).not.toContain("rename-tag");
     expect(toolNames).not.toContain("merge-tags");
     // Admin tools (vault#376) are hidden too
     expect(toolNames).not.toContain("manage-token");
-    expect(toolNames).not.toContain("doctor");
-    // Read tier is exactly 4 tools.
-    expect(toolNames.length).toBe(4);
+    // Read tier is exactly 5 tools (doctor added by the re-tier).
+    expect(toolNames.length).toBe(5);
 
     closeAllStores();
   });
@@ -6221,7 +6428,7 @@ describe("stateless MCP transport", async () => {
     // the required scope — the inner guard fired even though the outer tool
     // gate allowed read-only callers through for stats.
     expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("vault:write");
+    expect(body.result.content[0].text).toContain("vault:admin");
 
     // And critically: the vault description must NOT have been mutated.
     const cfg = readVaultConfig(vaultName);
@@ -6230,7 +6437,7 @@ describe("stateless MCP transport", async () => {
     closeAllStores();
   });
 
-  test("tools/call of vault-info with description arg and vault:write scope is allowed", async () => {
+  test("tools/call of vault-info with description arg and vault:write scope is refused (re-tier: description-write now needs admin)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -6269,8 +6476,56 @@ describe("stateless MCP transport", async () => {
 
     expect(res.status).toBe(200);
     const body = await res.json() as any;
+    // Was `isError: false` pre-re-tier — a plain vault:write session could
+    // update the vault's own description. Now needs vault:admin.
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("vault:admin");
+    expect(readVaultConfig(vaultName)?.description).toBe("original");
+
+    closeAllStores();
+  });
+
+  test("tools/call of vault-info with description arg and vault:admin scope is allowed", async () => {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `scope-vault-info-admin-${Date.now()}`;
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      description: "original",
+    });
+
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "vault-info",
+          arguments: { description: "updated via admin scope" },
+        },
+      }),
+    });
+
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: "full",
+      scopes: ["vault:read", "vault:write", "vault:admin"],
+      legacyDerived: false,
+      scoped_tags: null,
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
     expect(body.result.isError).toBeFalsy();
-    expect(readVaultConfig(vaultName)?.description).toBe("updated via write scope");
+    expect(readVaultConfig(vaultName)?.description).toBe("updated via admin scope");
 
     closeAllStores();
   });
@@ -6406,15 +6661,15 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     return names;
   }
 
-  test("vault:read sees exactly the 4 read tools", async () => {
+  test("vault:read sees exactly the 5 read tools (doctor moved admin → read)", async () => {
     const names = await listToolNames(["vault:read"]);
     expect(new Set(names)).toEqual(
-      new Set(["query-notes", "list-tags", "find-path", "vault-info"]),
+      new Set(["query-notes", "list-tags", "find-path", "vault-info", "doctor"]),
     );
-    expect(names.length).toBe(4);
+    expect(names.length).toBe(5);
   });
 
-  test("vault:read + vault:write sees the 11 read+write tools", async () => {
+  test("vault:read + vault:write sees the 8 read+write tools (tag-schema tools moved write → admin)", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(new Set(names)).toEqual(
       new Set([
@@ -6422,30 +6677,31 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
         "list-tags",
         "find-path",
         "vault-info",
+        "doctor",
         "create-note",
         "update-note",
         "delete-note",
-        "update-tag",
-        "delete-tag",
-        // vault#552: MCP parity with the pre-existing REST rename/merge engine.
-        "rename-tag",
-        "merge-tags",
       ]),
     );
-    expect(names.length).toBe(11);
+    expect(names.length).toBe(8);
     expect(names).not.toContain("manage-token");
-    expect(names).not.toContain("doctor");
-    // Aaron 2026-05-27: delete-* are write-tier (same destructive verb as
-    // update). Only manage-token/prune-schema/doctor are admin-gated.
+    // Re-tier (this PR): update-tag/delete-tag/rename-tag/merge-tags are now
+    // admin-tier — structure/taxonomy curation, not content authorship.
+    // Only delete-note (content) stays write-tier.
+    expect(names).not.toContain("update-tag");
+    expect(names).not.toContain("delete-tag");
+    expect(names).not.toContain("rename-tag");
+    expect(names).not.toContain("merge-tags");
     expect(names).toContain("delete-note");
-    expect(names).toContain("delete-tag");
   });
 
-  test("vault:admin sees all 14 tools including manage-token + prune-schema + doctor", async () => {
+  test("vault:admin sees all 14 tools including manage-token + prune-schema + the tag-schema tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
     expect(names).toContain("doctor");
+    expect(names).toContain("update-tag");
+    expect(names).toContain("delete-tag");
     expect(names).toContain("rename-tag");
     expect(names).toContain("merge-tags");
     expect(names.length).toBe(14);
@@ -6531,6 +6787,144 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(body.result.content[0].text).toContain("Unknown tool");
     expect(body.result.content[0].text).toContain("manage-token");
     expect(body.result.content[0].text).not.toContain("vault:admin");
+    closeAllStores();
+  });
+});
+
+// ===========================================================================
+// Write/admin re-tier — schema/taxonomy-curation tools moved write → admin,
+// doctor moved admin → read. Content-authorship (write) is now separate from
+// structure/taxonomy/schema-curation (admin). No new scope — same
+// read/write/admin vocabulary, only which tier each tool requires moves.
+// ===========================================================================
+
+describe("MCP write/admin re-tier — scope enforcement at the tools/call layer", () => {
+  async function callTool(
+    vaultName: string,
+    scopes: string[],
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<any> {
+    const { handleScopedMcp } = await import("./mcp-http.ts");
+    const req = new Request(`http://localhost:1940/vault/${vaultName}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const res = await handleScopedMcp(req, vaultName, {
+      permission: scopes.includes("vault:write") || scopes.includes("vault:admin") ? "full" : "read",
+      scopes,
+      legacyDerived: false,
+      scoped_tags: null,
+    } as any);
+    return res.json();
+  }
+
+  test("vault:write CAN create-note but is DENIED rename-tag/merge-tags/delete-tag/update-tag (now admin-tier)", async () => {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-write-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("seed", { tags: ["mine"] });
+
+    const WRITE = ["vault:read", "vault:write"];
+
+    // Allowed: content authorship.
+    const create = await callTool(vaultName, WRITE, "create-note", { content: "hello", tags: ["mine"] });
+    expect(create.result?.isError).toBeFalsy();
+
+    // Denied: each now requires vault:admin, not vault:write.
+    const rename = await callTool(vaultName, WRITE, "rename-tag", { old_name: "mine", new_name: "mine2" });
+    expect(rename.result?.isError).toBe(true);
+    expect(rename.result.content[0].text).toContain("Unknown tool");
+
+    const merge = await callTool(vaultName, WRITE, "merge-tags", { sources: ["mine"], target: "mine2" });
+    expect(merge.result?.isError).toBe(true);
+    expect(merge.result.content[0].text).toContain("Unknown tool");
+
+    const del = await callTool(vaultName, WRITE, "delete-tag", { tag: "mine" });
+    expect(del.result?.isError).toBe(true);
+    expect(del.result.content[0].text).toContain("Unknown tool");
+
+    const upd = await callTool(vaultName, WRITE, "update-tag", { tag: "mine", description: "hijacked" });
+    expect(upd.result?.isError).toBe(true);
+    expect(upd.result.content[0].text).toContain("Unknown tool");
+
+    // Untouched — the denied calls above never reached core. "mine" already
+    // has a bare identity row (auto-inserted when the seed note was tagged),
+    // but its description is still unset — update-tag never ran.
+    expect((await store.getTagRecord("mine"))?.description ?? null).toBeNull();
+    const stillThere = await store.listTags();
+    expect(stillThere.some((t) => t.name === "mine")).toBe(true);
+
+    closeAllStores();
+  });
+
+  test("vault:read CAN run doctor (now read-tier)", async () => {
+    const { writeVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-read-doctor-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+
+    const result = await callTool(vaultName, ["vault:read"], "doctor", {});
+    expect(result.result?.isError).toBeFalsy();
+    const report = JSON.parse(result.result.content[0].text);
+    expect(report.findings).toBeDefined();
+    expect(report.summary).toBeDefined();
+
+    closeAllStores();
+  });
+
+  test("vault:write is DENIED the vault-info description write (now admin-tier)", async () => {
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-write-vaultinfo-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString(), description: "orig" });
+
+    const result = await callTool(vaultName, ["vault:read", "vault:write"], "vault-info", { description: "nope" });
+    expect(result.result?.isError).toBe(true);
+    expect(result.result.content[0].text).toContain("vault:admin");
+    expect(readVaultConfig(vaultName)?.description).toBe("orig");
+
+    closeAllStores();
+  });
+
+  test("vault:admin CAN do all of the above — create-note, rename/merge/delete/update-tag, doctor, and the vault-info description write", async () => {
+    const { writeVaultConfig, readVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `retier-admin-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString(), description: "orig" });
+    const store = getVaultStore(vaultName);
+    await store.upsertTagRecord("a", {});
+    await store.upsertTagRecord("b", {});
+    await store.createNote("seed", { tags: ["a"] });
+
+    const ADMIN = ["vault:read", "vault:write", "vault:admin"];
+
+    const create = await callTool(vaultName, ADMIN, "create-note", { content: "hello", tags: ["a"] });
+    expect(create.result?.isError).toBeFalsy();
+
+    const upd = await callTool(vaultName, ADMIN, "update-tag", { tag: "a", description: "updated" });
+    expect(upd.result?.isError).toBeFalsy();
+
+    const doctor = await callTool(vaultName, ADMIN, "doctor", {});
+    expect(doctor.result?.isError).toBeFalsy();
+
+    const vinfo = await callTool(vaultName, ADMIN, "vault-info", { description: "updated via admin" });
+    expect(vinfo.result?.isError).toBeFalsy();
+    expect(readVaultConfig(vaultName)?.description).toBe("updated via admin");
+
+    const merge = await callTool(vaultName, ADMIN, "merge-tags", { sources: ["b"], target: "a" });
+    expect(merge.result?.isError).toBeFalsy();
+
+    const del = await callTool(vaultName, ADMIN, "delete-tag", { tag: "a" });
+    expect(del.result?.isError).toBeFalsy();
+
     closeAllStores();
   });
 });
@@ -7314,6 +7708,60 @@ describe("handleVault: transcription capability (scribe-fold Phase 1)", async ()
     const body = await res.json() as any;
     expect(body.config.auto_transcribe.enabled).toBe(true);
     expect(body.transcription.enabled).toBe(false);
+  });
+});
+
+describe("handleVault: front-door structural map", async () => {
+  test("GET always includes `map` — no ?include_stats needed", async () => {
+    await store.createNote("a", { tags: ["person"], path: "People/Alice" });
+    await store.createNote("b", { tags: ["person"] }); // no path
+
+    const cfg = { name: "default" } as { name: string };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any);
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.stats).toBeUndefined();
+    expect(body.map).toBeTruthy();
+    expect(body.map.total_notes).toBe(2);
+    expect(body.map.tags).toEqual([{ name: "person", count: 2 }]);
+    expect(body.map.path_buckets).toEqual([{ name: "People", count: 1 }]);
+    expect(body.map.unfiled_notes).toBe(1);
+  });
+
+  test("?include_stats=true adds stats ALONGSIDE map, not instead of it", async () => {
+    await store.createNote("a", { tags: ["person"] });
+    const cfg = { name: "default" } as { name: string };
+    const res = await handleVault(mkReq("GET", "/vault?include_stats=true"), store, cfg as any);
+    const body = await res.json() as any;
+    expect(body.stats).toBeTruthy();
+    expect(body.map).toBeTruthy();
+  });
+
+  test("a tag-scoped caller's map covers only notes reachable through an in-scope tag", async () => {
+    await store.createNote("a", { tags: ["work"], path: "Work/One" });
+    await store.createNote("b", { tags: ["work"] }); // no path
+    await store.createNote("c", { tags: ["personal"], path: "Personal/Two" });
+
+    const cfg = { name: "default" } as { name: string };
+    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["work"]), raw: ["work"] };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any, undefined, undefined, scope);
+    const body = await res.json() as any;
+
+    expect(body.map.total_notes).toBe(2); // a, b — "c" (personal) excluded
+    expect(body.map.tags).toEqual([{ name: "work", count: 2 }]);
+    expect(body.map.path_buckets).toEqual([{ name: "Work", count: 1 }]);
+    expect(body.map.unfiled_notes).toBe(1);
+  });
+
+  test("a tag-scoped caller whose allowlist matches nothing gets an all-zero map, not the full vault", async () => {
+    await store.createNote("a", { tags: ["work"], path: "Work/One" });
+
+    const cfg = { name: "default" } as { name: string };
+    const scope: TagScopeCtx = { allowed: await expandTokenTagScope(store, ["nonexistent"]), raw: ["nonexistent"] };
+    const res = await handleVault(mkReq("GET", "/vault"), store, cfg as any, undefined, undefined, scope);
+    const body = await res.json() as any;
+
+    expect(body.map).toEqual({ total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 });
   });
 });
 

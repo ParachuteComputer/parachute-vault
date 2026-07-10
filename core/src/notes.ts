@@ -1,5 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats } from "./types.js";
+import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow } from "./types.js";
 import { normalizePath } from "./paths.js";
 import { transaction } from "./txn.js";
 import {
@@ -28,8 +28,7 @@ import {
   SEARCH_WEIGHT_CONTENT,
   type SearchMode,
 } from "./search-query.js";
-
-let idCounter = 0;
+import { generateUlid } from "./ulid.js";
 
 /**
  * Write-attribution context (vault#298) — the two axes of provenance threaded
@@ -61,20 +60,25 @@ function attrValue(v: string | null | undefined): string | null {
   return t.length === 0 ? null : t;
 }
 
-/** Generate a timestamp-based ID: YYYY-MM-DD-HH-MM-SS-ffffff */
+/**
+ * Generate a new note/attachment ID.
+ *
+ * As of vault#ulid-ids this returns a ULID (see `ulid.ts`) — monotonic,
+ * lexicographically time-sortable, Crockford base32, opaque, and
+ * collision-resistant. Previously this returned a timestamp-format ID
+ * (`YYYY-MM-DD-HH-MM-SS-ffffff`).
+ *
+ * IMPORTANT: existing notes are NOT migrated. Old timestamp-format IDs
+ * stay exactly as they are — only newly-generated IDs use the ULID
+ * format, so a vault's `id` column is (and must remain) a mix of both
+ * shapes indefinitely. Nothing may assume a uniform id format, and
+ * nothing may parse a note's ID to recover its creation time — that's
+ * what the `created_at` column is for. The cursor-pagination tiebreaker
+ * (`cursor.ts`) treats `id` as an opaque, stable string for ordering
+ * ties only, which holds for any id format.
+ */
 export function generateId(): string {
-  const now = new Date();
-  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
-  const micro = now.getMilliseconds() * 1000 + (idCounter++ % 1000);
-  return [
-    now.getFullYear(),
-    pad(now.getMonth() + 1),
-    pad(now.getDate()),
-    pad(now.getHours()),
-    pad(now.getMinutes()),
-    pad(now.getSeconds()),
-    pad(micro, 6),
-  ].join("-");
+  return generateUlid();
 }
 
 export function createNote(
@@ -181,6 +185,66 @@ export function getNoteByPath(db: Database, path: string, extension?: string): N
     path,
     rows.map((r) => ({ id: r.id, extension: r.extension ?? "md" })),
   );
+}
+
+/**
+ * Extract a note's "H1 title" — the first line in `content` that starts
+ * with a literal `"# "` (a level-1 Markdown heading; `"## "`+ don't match
+ * because `^#[ \t]` fails at that line's start once a second `#` follows
+ * the first). Returns null when no such line exists, or the text after
+ * the marker is blank once trimmed.
+ */
+export function extractH1Title(content: string): string | null {
+  const match = content.match(/^#[ \t]+(.+)$/m);
+  if (!match) return null;
+  const title = match[1]!.trim();
+  return title.length > 0 ? title : null;
+}
+
+/**
+ * Find every note whose H1 title (see {@link extractH1Title}) equals
+ * `title`, case-insensitively (matches the COLLATE NOCASE policy every
+ * other path/basename lookup in this file uses). Used as the title-fallback
+ * step for wikilink/id/path resolution — a target that misses on
+ * id/path/basename gets one more chance against notes whose displayed
+ * title differs from their path.
+ *
+ * This is a full-content scan: no index exists on "first heading line," so
+ * every note's content is read once and matched in JS. Acceptable because
+ * every call site reaches this ONLY after the cheap indexed lookups (id,
+ * path, basename) have already missed — a rare fallback path, not the hot
+ * resolution route.
+ */
+export function findNotesByTitle(db: Database, title: string): { id: string; path: string | null }[] {
+  const needle = title.trim().toLowerCase();
+  if (!needle) return [];
+  const rows = db.prepare("SELECT id, path, content FROM notes").all() as {
+    id: string;
+    path: string | null;
+    content: string;
+  }[];
+  const matches: { id: string; path: string | null }[] = [];
+  for (const row of rows) {
+    const h1 = extractH1Title(row.content);
+    if (h1 && h1.toLowerCase() === needle) {
+      matches.push({ id: row.id, path: row.path });
+    }
+  }
+  return matches;
+}
+
+/**
+ * Title-fallback lookup: resolve `title` to a note ONLY when exactly one
+ * note in the vault carries that H1 title (see {@link findNotesByTitle}).
+ * Zero matches or 2+ matches (ambiguous) both return null — "don't guess"
+ * mirrors the existing basename-ambiguity policy (vault#328). Callers use
+ * this as the LAST resort after id and path/basename resolution have
+ * already missed; exact id/path matches always win first.
+ */
+export function getNoteByTitle(db: Database, title: string): Note | null {
+  const matches = findNotesByTitle(db, title);
+  if (matches.length !== 1) return null;
+  return getNote(db, matches[0]!.id);
 }
 
 export function getNotes(db: Database, ids: string[]): Note[] {
@@ -769,8 +833,20 @@ function validateIsoDateValue(field: string, value: string): void {
   }
 }
 
-export function queryNotes(db: Database, opts: QueryOpts): Note[] {
-  validateLimitOffset(opts);
+/**
+ * Build the shared WHERE-clause conditions + bound params for the filter
+ * surface both `queryNotes` and `aggregateNotes` apply: tag membership
+ * (include/exclude/presence), link/broken-link presence, id-set scoping,
+ * exact path / path-prefix / extension, write-attribution, metadata
+ * (operator + plain-equality), and date range. Does NOT include the
+ * cursor-keyset predicate, ORDER BY, or LIMIT/OFFSET — those are
+ * query-shape concerns specific to `queryNotes`'s paginated-list contract
+ * and don't apply to an aggregate rollup (which spans every matching row,
+ * not a page of them). Extracted so aggregation reuses the EXACT filter
+ * semantics a normal query applies, rather than risking the two drifting
+ * apart.
+ */
+function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: string[]; params: SQLQueryBindings[] } {
   const conditions: string[] = [];
   const params: SQLQueryBindings[] = [];
 
@@ -1054,6 +1130,13 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
     }
   }
 
+  return { conditions, params };
+}
+
+export function queryNotes(db: Database, opts: QueryOpts): Note[] {
+  validateLimitOffset(opts);
+  const { conditions, params } = buildFilterConditions(db, opts);
+
   // ---- Cursor predicate (vault#313) ----
   //
   // Cursor mode is keyed on PRESENCE of `opts.cursor`, not truthiness
@@ -1200,6 +1283,133 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
 
   const idRows = db.prepare(idSql).all(...params) as { id: string }[];
   return fetchNotesByIdsOrdered(db, idRows.map((r) => r.id));
+}
+
+/**
+ * Aggregation / rollup query (top new-feature ask from a UX round — see
+ * `QueryOpts.aggregate` / `AggregateSpec` in types.ts). Applies the SAME
+ * filter surface `queryNotes` does — via the shared `buildFilterConditions`:
+ * tags, exclude-tags, presence filters, `ids`, path/extension, write-
+ * attribution, metadata, date range — BEFORE grouping, so aggregating over a
+ * filtered query rolls up exactly the notes that query would have listed.
+ *
+ * Tag-scope is NOT enforced here — core stays scope-unaware, same division
+ * every other core query surface keeps. A tag-scoped caller narrows via
+ * `opts.ids` to a pre-computed visible-note-id set (see `src/mcp-tools.ts`'s
+ * `aggregateVisibility` wiring for MCP and `src/routes.ts`'s REST aggregate
+ * branch — both filter to visible notes FIRST, then pass the resulting ids
+ * in here, exactly like a normal query's `near` neighborhood scoping does).
+ *
+ * `group_by: "tag"` groups by tag MEMBERSHIP, not partition: implemented as
+ * a JOIN against `note_tags`, so a note carrying N of the tags present in
+ * the filtered result set contributes to N separate group rows (the
+ * existing filter conditions, which reference `n.*`, compose unchanged
+ * against the join). Any other `group_by` value must be a declared
+ * `indexed: true` metadata field — reuses `requireIndexedField`, the same
+ * FIELD_NOT_INDEXED contract `metadata` operator queries and `order_by`
+ * use — and groups by its generated `meta_<field>` column.
+ *
+ * `op: "sum"` requires `field` — another indexed field whose declared
+ * storage type is `INTEGER` (the only indexable numeric shape; a bare
+ * `type: "number"` schema field is never indexed — see
+ * `indexed-fields.ts`'s `TYPE_MAP` — and a `TEXT`-backed field can't be
+ * summed). `op: "count"` ignores `field`.
+ *
+ * A note whose group_by value is absent/null collects into one
+ * `{group: null, ...}` row — standard SQL `GROUP BY` behavior, not silently
+ * dropped.
+ */
+export function aggregateNotes(db: Database, opts: QueryOpts): AggregateRow[] {
+  const spec = opts.aggregate;
+  if (!spec) {
+    throw new QueryError(
+      `aggregateNotes requires opts.aggregate`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate",
+        hint: `pass { group_by, op } — group_by is an indexed metadata field or "tag"; op is "count" or "sum"`,
+      },
+    );
+  }
+  if (typeof spec.group_by !== "string" || spec.group_by.length === 0) {
+    throw new QueryError(
+      `aggregate.group_by is required — an indexed metadata field name, or "tag"`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate.group_by",
+        got: spec.group_by,
+        hint: `pass an indexed metadata field name, or "tag"`,
+      },
+    );
+  }
+  if (spec.op !== "count" && spec.op !== "sum") {
+    throw new QueryError(
+      `invalid aggregate.op: ${JSON.stringify(spec.op)} — must be "count" or "sum"`,
+      "INVALID_QUERY",
+      { error_type: "invalid_query", field: "aggregate.op", got: spec.op, hint: `pass "count" or "sum"` },
+    );
+  }
+  if (spec.op === "sum" && (typeof spec.field !== "string" || spec.field.length === 0)) {
+    throw new QueryError(
+      `aggregate.field is required when aggregate.op is "sum"`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field: "aggregate.field",
+        hint: "pass the indexed numeric metadata field to sum",
+      },
+    );
+  }
+
+  const { conditions, params } = buildFilterConditions(db, opts);
+
+  const groupByTag = spec.group_by === "tag";
+  let groupExpr: string;
+  let fromClause: string;
+  if (groupByTag) {
+    groupExpr = "nt.tag_name";
+    fromClause = "FROM notes n JOIN note_tags nt ON nt.note_id = n.id";
+  } else {
+    // `group_by` came from indexed_fields (validated via FIELD_NAME_RE at
+    // declaration time), so interpolating the column name is safe — same
+    // justification `orderBy`/`buildOperatorClause` use.
+    requireIndexedField(db, spec.group_by);
+    groupExpr = `"meta_${spec.group_by}"`;
+    fromClause = "FROM notes n";
+  }
+
+  let valueExpr: string;
+  if (spec.op === "count") {
+    valueExpr = "COUNT(*)";
+  } else {
+    const fieldInfo = requireIndexedField(db, spec.field!);
+    if (fieldInfo.sqliteType !== "INTEGER") {
+      throw new QueryError(
+        `aggregate.field "${spec.field}" is not numeric (declared sqlite type ${fieldInfo.sqliteType}) — "sum" requires a field declared type: "integer" or "boolean" in its tag schema`,
+        "INVALID_QUERY",
+        {
+          error_type: "invalid_query",
+          field: "aggregate.field",
+          got: spec.field,
+          hint: `sum requires a numeric indexed field (type: "integer"/"boolean"); "${spec.field}" is declared a non-numeric type`,
+        },
+      );
+    }
+    valueExpr = `SUM("meta_${spec.field}")`;
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const sql = `
+    SELECT ${groupExpr} AS group_key, ${valueExpr} AS value
+    ${fromClause}
+    ${whereClause}
+    GROUP BY ${groupExpr}
+    ORDER BY ${groupExpr}
+  `;
+  const rows = db.prepare(sql).all(...params) as { group_key: string | number | null; value: number | null }[];
+  return rows.map((r) => ({ group: r.group_key, value: r.value ?? 0 }));
 }
 
 /**
@@ -2356,6 +2566,122 @@ export function getVaultStats(
     attachmentCount,
     linkCount,
     contentBytes,
+  };
+}
+
+// ---- Vault map (front-door structural orientation) ----
+
+/** Shared bucket-expression for the top-level path segment: the text before
+ *  the first `/`, or the whole path when it has none. Applied to whichever
+ *  `path` column reference the caller substitutes in (`path` or `n.path`). */
+function pathBucketExpr(pathCol: string): string {
+  return `CASE WHEN instr(${pathCol}, '/') > 0 THEN substr(${pathCol}, 1, instr(${pathCol}, '/') - 1) ELSE ${pathCol} END`;
+}
+
+/**
+ * Compute the compact structural map `vault-info` surfaces for one-call
+ * orientation: total note count, every tag currently carried by at least one
+ * note with its membership count, and every top-level path "bucket" (the
+ * first `/`-delimited segment of `path`) with its note count — plus a count
+ * of notes with no path at all (excluded from `path_buckets`, nothing to
+ * bucket). Counts only, no content; three grouped-COUNT queries, safe on
+ * large vaults.
+ *
+ * `opts.tagFilter`, when the KEY IS PRESENT, restricts every count to notes
+ * reachable through that exact tag-name set (an `IN`-clause join through
+ * `note_tags`) — the scope-aware path a tag-scoped caller's already-expanded
+ * allowlist takes (server layer; core stays scope-unaware, it just filters
+ * by the plain tag-name list it's given). An empty array is a valid,
+ * meaningful filter — "nothing is in scope" — and short-circuits to an
+ * all-zero map WITHOUT falling through to the unfiltered/full-vault query;
+ * only OMITTING `tagFilter` entirely computes the vault-wide map.
+ */
+export function getVaultMap(
+  db: Database,
+  opts?: { tagFilter?: string[] },
+): VaultMap {
+  const hasFilter = opts !== undefined && opts.tagFilter !== undefined;
+  const tagFilter = opts?.tagFilter ?? [];
+
+  if (hasFilter && tagFilter.length === 0) {
+    return { total_notes: 0, tags: [], path_buckets: [], unfiled_notes: 0 };
+  }
+
+  if (hasFilter) {
+    const placeholders = tagFilter.map(() => "?").join(",");
+
+    const totalRow = db
+      .prepare(`SELECT COUNT(DISTINCT note_id) as c FROM note_tags WHERE tag_name IN (${placeholders})`)
+      .get(...tagFilter) as { c: number };
+
+    const tagRows = db
+      .prepare(
+        `SELECT tag_name AS name, COUNT(*) AS count
+         FROM note_tags
+         WHERE tag_name IN (${placeholders})
+         GROUP BY tag_name
+         ORDER BY count DESC, name ASC`,
+      )
+      .all(...tagFilter) as { name: string; count: number }[];
+
+    const bucketRows = db
+      .prepare(
+        `SELECT ${pathBucketExpr("n.path")} AS name, COUNT(DISTINCT n.id) AS count
+         FROM notes n
+         JOIN note_tags nt ON nt.note_id = n.id
+         WHERE nt.tag_name IN (${placeholders}) AND n.path IS NOT NULL
+         GROUP BY name
+         ORDER BY count DESC, name ASC`,
+      )
+      .all(...tagFilter) as { name: string; count: number }[];
+
+    const unfiledRow = db
+      .prepare(
+        `SELECT COUNT(DISTINCT n.id) as c
+         FROM notes n
+         JOIN note_tags nt ON nt.note_id = n.id
+         WHERE nt.tag_name IN (${placeholders}) AND n.path IS NULL`,
+      )
+      .get(...tagFilter) as { c: number };
+
+    return {
+      total_notes: totalRow.c,
+      tags: tagRows,
+      path_buckets: bucketRows,
+      unfiled_notes: unfiledRow.c,
+    };
+  }
+
+  const totalRow = db.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number };
+
+  const tagRows = db
+    .prepare(
+      `SELECT tag_name AS name, COUNT(*) AS count
+       FROM note_tags
+       GROUP BY tag_name
+       ORDER BY count DESC, name ASC`,
+    )
+    .all() as { name: string; count: number }[];
+
+  const bucketRows = db
+    .prepare(
+      `SELECT ${pathBucketExpr("path")} AS name, COUNT(*) AS count
+       FROM notes
+       WHERE path IS NOT NULL
+       GROUP BY name
+       ORDER BY count DESC, name ASC`,
+    )
+    .all() as { name: string; count: number }[];
+
+  const unfiledRow = db
+    .prepare("SELECT COUNT(*) as c FROM notes WHERE path IS NULL")
+    .get() as { c: number };
+
+  return {
+    total_notes: totalRow.c,
+    tags: tagRows,
+    path_buckets: bucketRows,
+    unfiled_notes: unfiledRow.c,
   };
 }
 

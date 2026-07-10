@@ -377,11 +377,29 @@ Warning codes today:
   (edit-distance against the FTS5 vocabulary + tag names). Carries `query`
   and `did_you_mean`. `search=` only, only on a zero-result query, and only
   for UNSCOPED sessions (the suggestion is computed vault-wide — see below).
-- `unresolved_link` (vault#555) — a structured `links` entry on
-  `POST /notes` or `PATCH /notes/{id}` (mirrored by MCP `create-note` /
-  `update-note`) didn't resolve to any note. Carries `target` and
-  `relationship`. **Write path, not the query path above** — see "Structured
-  `links` resolution" below for where this attaches on the response.
+- `unresolved_link` (vault#555; content `[[wikilinks]]` since vault#570) — a
+  link target — a structured `links` entry OR a content-parsed
+  `[[wikilink]]` — on `POST /notes` or `PATCH /notes/{id}` (mirrored by MCP
+  `create-note` / `update-note`) didn't resolve to any note. Carries
+  `target` and `relationship` (`"wikilink"` for a content wikilink, the
+  caller's own string for a structured link). **Write path, not the query
+  path above** — see "Structured `links` resolution" below for where this
+  attaches on the response. Before vault#570, a content `[[wikilink]]` to a
+  missing target queued into `unresolved_wikilinks` (same as a structured
+  link) but fired NO write-time warning — the asymmetry is closed.
+- `ambiguous_link` (vault#570) — a link target (structured `links` OR a
+  content `[[wikilink]]`) matched **≥2 notes** (e.g. two notes share an H1
+  title/basename) rather than zero. Distinct from `unresolved_link` because
+  it's a factually different situation — "matched 2, not 0" — and the
+  response would be WRONG to describe it as "did not resolve to any note".
+  Carries `target`, `relationship`, and `candidate_count` (the number of
+  matching notes — never their ids/paths, to avoid leaking which specific
+  notes collided). **No edge is created** — there's no principled way to
+  pick one of the candidates — and the target is **not queued** for lazy
+  resolution either: a future note being created can't retroactively
+  resolve an ambiguity between two notes that already exist. Use a more
+  specific path, `[[Target.ext]]` (vault#328), or the note's ID to
+  disambiguate and retry.
 
 **Surfacing differs by response shape** (compat-preserving — this is why
 it's additive, not a breaking wire-shape change):
@@ -546,9 +564,9 @@ actually affected by the bug — only the message string could double.
 | `error_type` | HTTP | Key fields | Meaning |
 |---|---|---|---|
 | `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration, OR a field's declared `default` doesn't conform to its own `type`/`enum` (vault#553 Decision B), OR a field declares a `type` outside the recognized vocabulary (vault#555 fix 4). Carries EVERY violation found in one response (vault#553; extended to `invalid_default`/`invalid_type` by vault#555 fix 5 — both REST and MCP used to report only the FIRST bad field of these two classes) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case), `indexed_flag_conflict`, `invalid_default`, or `invalid_type` (the latter two are own-field — no `other_tag`, nothing to scope-scrub); `other_tag` names the conflicting declarer for the cross-tag reasons. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail; own-field violations (`invalid_default`/`invalid_type`) are never scrubbed (they never named another tag). |
-| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean — this ALSO covers a recognized-but-unindexable type like `array`/`object`/`number`, a different case from a genuinely unrecognized type string, which is `invalid_field_type` below), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
+| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean/reference — this ALSO covers a recognized-but-unindexable type like `array`/`object`/`number`, a different case from a genuinely unrecognized type string, which is `invalid_field_type` below), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
 | `invalid_field_default` | 400 | `field` | vault#553 Decision B: a field's declared `default` doesn't match its own `type` (or isn't one of its own `enum` values). Own-field error — a DEFENSE-IN-DEPTH path only as of vault#555 fix 5: both REST's `PUT /api/tags/:name` and MCP's `update-tag` now pre-validate every field and report this bundled as `tag_field_conflict`'s `invalid_default` reason instead (every invalid field in the call, not just the first); this single-violation 400 only surfaces for a caller that bypasses that pre-check (e.g. a direct `store.upsertTagRecord` call from outside REST/MCP). **BREAKING (vault#555 fix 5):** a REST `PUT /api/tags/:name` client that previously pinned on a **400 `invalid_field_default`** for the single-bad-default case now receives **422 `tag_field_conflict`** (with the bad default in `violations[]` as reason `invalid_default`). Re-key on the `tag_field_conflict` 422 + its `violations[]`; the 400 path above is now unreachable from REST/MCP. This aligns REST with MCP's already-bundled reporting. |
-| `invalid_field_type` | 400 | `field`, `type`, `valid_types[]` | vault#555 fix 4: a field's declared `type` isn't one of the six recognized values (`string`/`number`/`integer`/`boolean`/`array`/`object`) — e.g. `type: "frobnicator"`. Before this fix a NON-indexed field's `type` was never validated at all and a bogus type was silently accepted and persisted verbatim (indexed fields already got a type check, but scoped to "unsupported for indexing," not "unrecognized"). Same defense-in-depth posture as `invalid_field_default` — the normal path reports this bundled as `tag_field_conflict`'s `invalid_type` reason (see that row); this single-violation 400 only surfaces for a caller that bypasses the pre-check. |
+| `invalid_field_type` | 400 | `field`, `type`, `valid_types[]` | vault#555 fix 4: a field's declared `type` isn't one of the seven recognized values (`string`/`number`/`integer`/`boolean`/`array`/`object`/`reference`) — e.g. `type: "frobnicator"`. Before this fix a NON-indexed field's `type` was never validated at all and a bogus type was silently accepted and persisted verbatim (indexed fields already got a type check, but scoped to "unsupported for indexing," not "unrecognized"). Same defense-in-depth posture as `invalid_field_default` — the normal path reports this bundled as `tag_field_conflict`'s `invalid_type` reason (see that row); this single-violation 400 only surfaces for a caller that bypasses the pre-check. |
 | `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
 | `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
 | `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
@@ -991,11 +1009,15 @@ Query params:
     vocabulary regardless of any tag-scoped token's allowlist, so
     surfacing it to a scoped caller would leak an out-of-scope note's
     content across the scope boundary (same "no leak" stance as
-    `unknown_tag`/`did_you_mean` above). A suggestion occasionally reads as
-    a STEMMED form (`propoli` rather than `propolis`) rather than the
-    original dictionary word — the FTS5 vocabulary is the post-stemming
-    index, not a separate dictionary; an accepted tradeoff rather than
-    maintaining a second unstemmed index just for spelling suggestions.
+    `unknown_tag`/`did_you_mean` above). The closest CANDIDATE is found
+    against the FTS5 vocabulary (the post-stemming index — cheap to scan,
+    since it's small and deduped), but a stemmed candidate is never
+    returned verbatim (vault#570): the suggestion is mapped back to the
+    real dictionary word a note actually contains (`propolis`, not
+    `propoli`) before it's returned. Irregular cases where the stem isn't a
+    literal prefix of the original word are a known, accepted limitation
+    (same class as the tokenizer gaps below) and fall back to the raw stem
+    rather than nothing.
   - **Known tokenizer limitations (documented, not fixed — not worth
     fighting FTS5's tokenizer for):**
     - A fused decimal+unit token like `3.14mm` is ONE token to the
@@ -1026,6 +1048,41 @@ Query params:
 
 - **Cursor pagination** (see [Cursor pagination](#cursor-pagination--the-since-last-checked-pattern))
   - `cursor=<opaque>` — switches response to `{notes, next_cursor}`.
+
+- **Aggregation / rollup** — group_by + count/sum
+  - `aggregate[group_by]=<field|tag>&aggregate[op]=count|sum&aggregate[field]=<numeric field>` —
+    every OTHER filter above (`tag`, `meta[...]`/`metadata=`, date filters,
+    write-attribution, ...) narrows the input set FIRST, exactly as a normal
+    query would; the matching notes are then grouped and the response
+    becomes `[{group, value}]` — one row per group — instead of `NoteIndex[]`
+    / `Note[]`. `value` is the count (or sum, per `op`) for that group.
+  - `aggregate[group_by]` is either the special value `tag` (group by tag
+    MEMBERSHIP — a note carrying N of the tags present in the filtered
+    result set contributes to N separate groups; a membership rollup, not a
+    partition) or an indexed metadata field name. A non-`"tag"` value must
+    be declared `indexed: true` in a tag schema — same `FIELD_NOT_INDEXED`
+    contract `meta[field][op]=` operators and `order_by` use.
+  - `aggregate[op]=count` — number of matching notes per group.
+    `aggregate[op]=sum` additionally requires `aggregate[field]=<field>` — a
+    SECOND indexed metadata field, numeric (declared `type: "integer"` or
+    `type: "boolean"` — the only indexable numeric storage shapes; a bare
+    `type: "number"` field is never indexed, and a `TEXT`-backed field can't
+    be summed) — and sums that field's value per group.
+  - A note whose `group_by` value is absent/unset collects into one
+    `{group: null, value: ...}` row — standard SQL `GROUP BY` behavior, not
+    silently dropped from the rollup.
+  - **Mutually exclusive with `cursor` and `near[...]`** — a rollup has no
+    pagination watermark or graph-neighborhood shape to compose with;
+    combining either is `400 invalid_query` (`field: "aggregate"`).
+  - **Tag-scope respected.** A tag-scoped token's rollup is computed only
+    over notes it can see — exactly like a normal query — AND, under
+    `group_by: "tag"`, group NAMES themselves are scrubbed to the token's
+    allowlist: a note visible via one tag but ALSO carrying an
+    out-of-scope co-tag does not leak that co-tag as a group (the narrower
+    "which notes count" restriction alone isn't sufficient once tag names
+    are the output, not just note content).
+  - Example: `GET /notes?tag=expense&aggregate[group_by]=category&aggregate[op]=sum&aggregate[field]=amount`
+    → `[{"group":"food","value":142},{"group":"travel","value":900}]`.
 
 - **Graph-neighborhood scope**
   - `near[note_id]=<id>` — restrict results to the graph neighborhood of
@@ -1074,6 +1131,16 @@ Error shapes notable to callers:
 - `409 ambiguous_path` — `id=<path>` resolved to more than one note. Body
   carries `path` + `candidates: NoteIndex[]`. Re-issue with the exact id of
   the intended candidate.
+- `400 FIELD_NOT_INDEXED` — `aggregate[group_by]` (when not `"tag"`) or
+  `aggregate[field]` names a metadata field that isn't declared
+  `indexed: true` in any tag schema. Same contract as `meta[field][op]=`
+  operators and `order_by`.
+- `400 invalid_query` (`field: "aggregate"` / `"aggregate.field"` /
+  `"aggregate.op"`) — `aggregate[op]=sum` without `aggregate[field]`, an
+  unrecognized `aggregate[op]` value, `aggregate[group_by]`/`aggregate[op]`
+  passed without the other, `aggregate[field]` naming a non-numeric
+  (TEXT-backed) indexed field under `sum`, or `aggregate[...]` combined with
+  `cursor`/`near[...]`.
 
 Response may also carry a `warnings` field / `X-Parachute-Warnings` header —
 see [Honest queries](#honest-queries--warnings-channel--structured-invalids-vault550) above.
@@ -1119,29 +1186,51 @@ Error shapes:
 - `400 invalid_extension` — extension validation failed (vault#328); body
   carries `extension`, `reason`.
 
-**Structured `links` resolution (vault#555).** A `links` entry's `target`
-resolves with the SAME semantics as a `[[wikilink]]` — ID match first, then
-exact path, then basename/title (e.g. `target: "Alice"` resolves a note
-filed at `People/Alice`) — NOT path-only as before. The `relationship` you
-pass is preserved verbatim (wikilinks always use `"wikilink"`; a structured
-link carries whatever you named). Two forward-ref cases are handled without
-dropping the edge:
+**Structured `links` resolution (vault#555, title-fallback + ambiguity
+additive — vault#570).** A `links` entry's `target` resolves with the SAME
+semantics as a `[[wikilink]]` — ID match first, then exact path, then
+basename (e.g. `target: "Alice"` resolves a note filed at `People/Alice`),
+then — only on a CLEAN miss (zero candidates, not an ambiguous one) — a
+fallback match against the note whose H1 title (its first `# Heading`
+content line) equals `target`, case-insensitively. The title fallback
+resolves ONLY when exactly one note in the vault carries that title;
+two-or-more is **ambiguous** rather than a guess (same "don't guess" policy
+the basename step already has). This rescues a link into a note whose
+displayed title differs from its path/basename — e.g. a daily-note-style
+path (`Inbox/2026-07-10-abc123`) whose content opens with `# Weekly Review`
+is now reachable via `target: "Weekly Review"`, not just its path. Exact
+id/path/basename resolution is unchanged and always wins first. This is NOT
+path-only as before. The `relationship` you pass is preserved verbatim
+(wikilinks always use `"wikilink"`; a structured link carries whatever you
+named). Content `[[wikilinks]]` and structured `links` share ONE resolver
+(`resolveWikilinkDetailed`/`resolveOrQueueLink` in `core/src/wikilinks.ts`),
+so every case below applies identically to both — a `links` entry and an
+equivalent `[[wikilink]]` in `content` behave the same:
 
-- **Same batch.** A `links` entry pointing at a note created LATER in the
-  same `notes` array (POST) resolves once every note in the batch exists —
-  order doesn't matter.
+- **Same batch.** A link pointing at a note created LATER in the same
+  `notes` array (POST) resolves once every note in the batch exists — order
+  doesn't matter. This applies to a content `[[wikilink]]` too (vault#570).
 - **Later call.** A target that doesn't exist yet anywhere is queued (same
-  `unresolved_wikilinks` machinery `[[wikilinks]]` already use) and
-  backfills automatically the moment a matching note is created, in this
-  vault, by any client. The response carries an `unresolved_link` warning
-  (see the [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
+  `unresolved_wikilinks` machinery for both kinds) and backfills
+  automatically the moment a matching note is created, in this vault, by
+  any client. The response carries an `unresolved_link` warning (see the
+  [warnings channel](#honest-queries--warnings-channel--structured-invalids-vault550)
   above) naming the `target` and `relationship` so the caller knows the edge
-  isn't live yet — it's never silently dropped.
+  isn't live yet — it's never silently dropped. Before vault#570 this
+  warning fired for a structured `links` miss but NOT for the equivalent
+  content `[[wikilink]]` miss (both were queued identically — only the
+  write-time signal was asymmetric).
 - **Genuinely unresolvable** (typo, or a target that will never exist)
   looks identical to the "later call" case on the wire — the write still
   queues it. Use `GET /vault/{name}/api/unresolved-wikilinks` to audit what's
   pending across the vault (rows now carry a `relationship` field alongside
   `source_id`/`target_path`).
+- **Ambiguous** (vault#570) — the target matches ≥2 notes (e.g. two notes
+  share a basename/title). The response carries an `ambiguous_link` warning
+  instead of `unresolved_link` — see the warnings-channel entry above for
+  the full shape. No edge is created and the target is NOT queued (queuing
+  would imply "wait for this to be created," which doesn't describe an
+  ambiguity between notes that already exist).
 
 **`if_exists` — idempotent upsert on a path conflict (vault#555).** Pass
 `if_exists: "error"|"ignore"|"update"|"replace"` (default `"error"` —
@@ -1212,6 +1301,18 @@ attachment rule as the structured-query list below.
 > path must be percent-encoded as `%2F` (e.g.
 > `GET .../api/notes/Projects%2FFoo`) so it isn't parsed as a route separator.
 > The same applies to path-valued query params like `?path=Projects%2FFoo`.
+
+> **Title fallback (additive).** `{idOrPath}` resolution order is: exact ID,
+> then exact path (or `path.ext` to disambiguate a path shared by two
+> extensions — see `ambiguous_path` below), then — only when id and path
+> BOTH miss cleanly — a fallback match against the note whose H1 title (its
+> first `# Heading` content line) equals `{idOrPath}`, case-insensitively.
+> Resolves only when exactly one note carries that title; two-or-more stays
+> a `404 not_found` rather than guessing. Exact id/path resolution is
+> unchanged and always wins first — this only rescues the case where a
+> note's displayed title differs from its path/basename (the same
+> resolution `find-path`'s `source`/`target`, `update-note`/`delete-note`
+> `id`, and `[[wikilink]]`/structured-`links` targets already use).
 
 Folding options:
 
@@ -1558,7 +1659,7 @@ leak for existing out-of-scope tags, vault#560).
 #### `GET /vault/{name}/api/tags/{name}` — `vault:read`
 Same as the `?tag=` query — single-tag detail by path, same 404 shape.
 
-#### `PUT /vault/{name}/api/tags/{name}` — `vault:write`
+#### `PUT /vault/{name}/api/tags/{name}` — `vault:admin`
 Upsert a tag's identity row. Body accepts any combination of:
 
 ```json
@@ -1604,12 +1705,33 @@ the existing schema (mirrors MCP `update-tag`).
   from "explicitly set to the default." **Blast radius:** this only changes
   FUTURE writes — notes already backfilled under the old behavior keep their
   values; no migration touches them.
-- **Honest type list.** `type` accepts all six of `string`/`boolean`/`integer`/
-  `number`/`array`/`object` for storage and advisory validation, but only
-  `string`/`integer`/`boolean` are INDEXABLE — declaring `indexed: true`
-  with `number`/`array`/`object` is rejected (`unsupported_indexed_type` /
-  `invalid_indexed_field`, unchanged behavior from before 0.7.0 — only the
-  DOCUMENTED type list was dishonest, not the enforcement).
+- **Honest type list.** `type` accepts all seven of `string`/`boolean`/
+  `integer`/`number`/`array`/`object`/`reference` for storage and advisory
+  validation, but only `string`/`integer`/`boolean`/`reference` are
+  INDEXABLE — declaring `indexed: true` with `number`/`array`/`object` is
+  rejected (`unsupported_indexed_type` / `invalid_indexed_field`, unchanged
+  behavior from before 0.7.0 — only the DOCUMENTED type list was dishonest,
+  not the enforcement).
+
+**`type: "reference"` — typed reference field (0.7.1).** A dual-write field
+type: the value is stored + validated exactly like `string` (pass a note id,
+path, or title), **and** `POST`/`PATCH /api/notes` additionally resolve that
+value to a note and maintain a graph link from this note to it, with
+`relationship` set to the field name — reusing the same id/path/title
+resolution and lazy forward-ref queueing that structured `links` entries use
+(`core/src/wikilinks.ts`'s `resolveOrQueueLink`). Kept in sync on every write
+that changes the field's value: a new value re-points the link (the old edge
+is dropped first), clearing the field drops the link entirely, and an
+unchanged value is left untouched. A target that doesn't resolve yet is
+queued and backfills automatically the moment a matching note is created —
+same contract as an unresolved structured link, visible today via
+`has_broken_links`/`include_broken_links` on `query-notes`/`GET /api/notes`.
+Declare `indexed: true` alongside `type: "reference"` to also get a B-tree
+index over the raw value for operator queries (`eq`/`in`/...); a plain
+metadata-equality filter works either way. Scalar values only in this
+release — an array (`cardinality: "many"`) reference value is stored and
+validated but does NOT create a link. See
+`docs/design/typed-reference-field.md` for the full design and known gaps.
 
 **Startup migration (schema v24).** Existing vaults get a one-time,
 idempotent startup pass (`migrateToV24`) that reuses `doctor`'s
@@ -1702,7 +1824,7 @@ MCP `update-tag` tool reports the same shape via a structured JSON-RPC
 error. See the error taxonomy table above for the full field contract,
 including the tag-scope generalization.
 
-#### `DELETE /vault/{name}/api/tags/{name}` — `vault:write`
+#### `DELETE /vault/{name}/api/tags/{name}` — `vault:admin`
 Removes the tag, its identity row, and untags every note. Returns the
 delete result — `{ deleted: true, notes_untagged: number, parent_refs_detached?: number }`.
 Refused with `409 tag_in_use_by_tokens` if any tag-scoped token references
@@ -1720,7 +1842,7 @@ themselves) to proceed anyway. Default (neither flag) is refuse. See the
 error taxonomy table above for the tag-scope generalization on
 `referencing_tags`.
 
-#### `POST /vault/{name}/api/tags/{name}/rename` — `vault:write`
+#### `POST /vault/{name}/api/tags/{name}/rename` — `vault:admin`
 Body: `{ "new_name": string }`. Atomically renames the tag across EVERY
 surface that references it in a single transaction: the `tags` row,
 `note_tags`, OTHER tags' `parent_names`, tag-scoped tokens' allowlists,
@@ -1753,7 +1875,7 @@ shapes (`tag_not_found` / `target_exists` as structured JSON-RPC errors).
 Tag-scoped callers: both `old_name` and `new_name` must be in the caller's
 allowlist.
 
-#### `POST /vault/{name}/api/tags/merge` — `vault:write`
+#### `POST /vault/{name}/api/tags/merge` — `vault:admin`
 Body: `{ "sources": string[], "target": string }`. Retags every note
 carrying any of the `sources` tags with `target`, then drops the source
 tags (and their identity rows — description/fields/relationships/parent_names)
@@ -1775,13 +1897,14 @@ a tag-scoped token.
 guard. Tag-scoped callers: every source AND the target must be in the
 caller's allowlist.
 
-#### `GET /vault/{name}/api/doctor` — `vault:admin`
+#### `GET /vault/{name}/api/doctor` — `vault:read`
 Read-only integrity scan across the tag/metadata taxonomy (vault#552) —
 run after any bulk tag reorg (rename/merge/delete/subtree move) to confirm
-nothing leaked. Admin-tier regardless of method (this is a whole-vault
-diagnostic, same tier as the MCP `doctor` tool and `prune-schema`), gated
-BEFORE the generic read/write scope check — same dispatch shape as
-`/api/triggers`.
+nothing leaked. `read`-tier (was `admin` — re-tiered to match the MCP
+`doctor` tool's own admin→read move: doctor never mutates and is already
+tag-scope-restricted, so a read-scoped monitoring/tending caller doesn't
+need an admin credential over either door), gated BEFORE the generic
+read/write scope check — same dispatch shape as `/api/triggers`.
 
 Never mutates. Returns `{ findings: [...], summary: string, scanned_at: string }`,
 where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
@@ -1806,7 +1929,11 @@ where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
   — a metadata value that looks like a stale reference to a
   renamed/merged/deleted tag, inferred from sibling notes using the same
   metadata key with values that ARE live tags. Never certain — vault keeps
-  no tag-rename history.
+  no tag-rename history. Skips any metadata key declared as an ENUM field
+  on a tag schema (vault#570) — an enum is a closed, schema-governed
+  vocabulary, so one of its values coincidentally matching an unrelated
+  live tag name no longer drags the enum's OTHER legitimate values into a
+  false positive.
 
 **Tag-scope.** A tag-scoped admin token's scan covers only in-scope
 tags/fields/notes — the report is re-run with the caller's expanded
@@ -1817,7 +1944,8 @@ counts never reflect out-of-scope activity.
 
 #### `GET /vault/{name}/api/vault` — `vault:read`
 Returns the vault's identity plus a nested `config` block for mutable
-settings.
+settings, and a `map` — a compact, counts-only structural rollup meant to
+orient a fresh reader in this ONE call, no `?include_stats=true` needed:
 
 ```json
 {
@@ -1825,12 +1953,37 @@ settings.
   "description": "My knowledge graph",
   "config": {
     "audio_retention": "keep"
+  },
+  "map": {
+    "total_notes": 42,
+    "tags": [
+      { "name": "meeting", "count": 18 },
+      { "name": "person", "count": 9 }
+    ],
+    "path_buckets": [
+      { "name": "Projects", "count": 12 },
+      { "name": "Decisions", "count": 4 }
+    ],
+    "unfiled_notes": 6
   }
 }
 ```
 
+`map.tags` lists every tag currently carried by at least one note, with its
+membership count (sorted by count desc, then name — uncapped, unlike the
+`stats.topTags` list below). `map.path_buckets` lists every top-level path
+segment (the text before the first `/`, or the whole path when it has none)
+among notes that HAVE a path, with how many notes live under it.
+`unfiled_notes` counts notes with no `path` at all — excluded from
+`path_buckets` (nothing to bucket); `unfiled_notes` plus the sum of every
+`path_buckets[].count` equals `map.total_notes`. A tag-scoped token's `map`
+covers only notes reachable through an in-scope tag — same confidentiality
+posture as `GET /tags` and `GET /vault/{name}/api/find-path`.
+
 `?include_stats=true` folds the same `VaultStats` shape into the response
-under `stats`.
+under `stats` — the deeper aggregate (monthly distribution, earliest/latest
+note, content bytes, top 20 tags). `map` is always present and cheaper;
+reach for `include_stats` only when you need those extras.
 
 #### `PATCH /vault/{name}/api/vault` — `vault:write`
 Update the description and/or nested `config` fields. Only the fields you
@@ -1983,7 +2136,32 @@ tokens keep the path-only behavior.
 `GET|POST /vault/{name}/mcp[/*]` — Streaming HTTP transport. Auth is by
 the same credentials as REST (Bearer / X-API-Key). Per-tool scope is
 enforced inside the MCP layer; the same `vault:read` / `vault:write` /
-`vault:admin` shape applies. See `core/src/mcp.ts` for the tool surface.
+`vault:admin` shape applies. `requiredVerb` on each tool in
+`core/src/mcp.ts` is the source of truth; as of this PR the tiers are:
+
+| Verb | Tools |
+|---|---|
+| `read` | `query-notes`, `list-tags`, `find-path`, `vault-info` (get/stats), `doctor` |
+| `write` (additive over read) | `create-note`, `update-note`, `delete-note` |
+| `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
+
+**BREAKING (this release):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
+moved `write` → `admin` (schema/taxonomy curation is a distinct tier from
+content authorship); `vault-info`'s description-update branch moved
+`write` → `admin` for the same reason. `doctor` moved `admin` → `read` (it's
+a read-only, tag-scope-restricted diagnostic). A token that used to hold
+`vault:write` and rename/merge/delete/update tags now gets
+`insufficient_scope` and needs `vault:admin`; a `vault:read` token can now
+run `doctor`.
+
+**Both doors agree.** The REST surface mirrors every one of these moves:
+`PUT`/`DELETE /vault/{name}/api/tags/{name}`, `POST /vault/{name}/api/tags/merge`,
+and `POST /vault/{name}/api/tags/{name}/rename` now require `vault:admin`
+(was `vault:write` — the generic method→verb default every other mutating
+REST verb still gets); `GET /vault/{name}/api/doctor` (above) now requires
+only `vault:read` (was hardcoded `vault:admin`). A `vault:write` token is
+denied tag rename/merge/delete/update over BOTH MCP and REST; a `vault:read`
+token can run `doctor` over BOTH. See CHANGELOG.
 
 ## See also
 

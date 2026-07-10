@@ -1,7 +1,16 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
-import { parseWikilinks, syncWikilinks, resolveWikilink, resolveUnresolvedWikilinks, listUnresolvedWikilinks } from "./wikilinks.js";
+import {
+  parseWikilinks,
+  syncWikilinks,
+  resolveWikilink,
+  resolveWikilinkDetailed,
+  resolveUnresolvedWikilinks,
+  listUnresolvedWikilinks,
+  getContentWikilinkWarnings,
+  resolveOrQueueLink,
+} from "./wikilinks.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -143,6 +152,81 @@ describe("resolveWikilink", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Title fallback (additive — id/path/basename still win first)
+// ---------------------------------------------------------------------------
+
+describe("resolveWikilink — title fallback", async () => {
+  it("resolves via H1 title when path/basename both miss", async () => {
+    const note = await store.createNote("# My Real Title\n\nSome body text.", { path: "Inbox/2026-07-10-abc123" });
+    const id = resolveWikilink(db, "My Real Title");
+    expect(id).toBe(note.id);
+  });
+
+  it("matches the H1 title case-insensitively", async () => {
+    const note = await store.createNote("# My Real Title\n\nBody.", { path: "Inbox/xyz" });
+    const id = resolveWikilink(db, "my real title");
+    expect(id).toBe(note.id);
+  });
+
+  it("exact path match wins over a title match on a DIFFERENT note", async () => {
+    // A note literally path-named "My Real Title" ...
+    const byPath = await store.createNote("Path note body", { path: "My Real Title" });
+    // ... and an unrelated note whose H1 happens to be the same string.
+    await store.createNote("# My Real Title\n\nOther body.", { path: "Inbox/other" });
+    const id = resolveWikilink(db, "My Real Title");
+    expect(id).toBe(byPath.id);
+  });
+
+  it("basename match wins over title fallback", async () => {
+    const byBasename = await store.createNote("Body", { path: "Projects/Parachute/README" });
+    await store.createNote("# README\n\nOther body.", { path: "Inbox/other-readme" });
+    const id = resolveWikilink(db, "README");
+    expect(id).toBe(byBasename.id);
+  });
+
+  it("stays unresolved when two notes share the same H1 title (ambiguous)", async () => {
+    await store.createNote("# Shared Title\n\nA.", { path: "Inbox/a" });
+    await store.createNote("# Shared Title\n\nB.", { path: "Inbox/b" });
+    const id = resolveWikilink(db, "Shared Title");
+    expect(id).toBeNull();
+  });
+
+  it("does not fall through to title when basename is itself ambiguous", async () => {
+    // Two notes share basename "README" (ambiguous at step 3) AND a third
+    // note has an H1 title of "README" too — the ambiguous basename step
+    // must not be rescued by the title step.
+    await store.createNote("A", { path: "Folder1/README" });
+    await store.createNote("B", { path: "Folder2/README" });
+    await store.createNote("# README\n\nC.", { path: "Inbox/c" });
+    const id = resolveWikilink(db, "README");
+    expect(id).toBeNull();
+  });
+
+  it("ignores H2+ headings — only a literal single-# line counts", async () => {
+    await store.createNote("## Not An H1\n\nBody.", { path: "Inbox/h2" });
+    const id = resolveWikilink(db, "Not An H1");
+    expect(id).toBeNull();
+  });
+
+  it("resolveWikilinkDetailed reports the title match as resolved", async () => {
+    const note = await store.createNote("# Detailed Title\n\nBody.", { path: "Inbox/detail" });
+    const result = resolveWikilinkDetailed(db, "Detailed Title");
+    expect(result.resolved).toBe(true);
+    expect(result.note_id).toBe(note.id);
+    expect(result.path).toBe("Inbox/detail");
+  });
+
+  it("resolveWikilinkDetailed reports an ambiguous title match", async () => {
+    await store.createNote("# Dup Title\n\nA.", { path: "Inbox/dup-a" });
+    await store.createNote("# Dup Title\n\nB.", { path: "Inbox/dup-b" });
+    const result = resolveWikilinkDetailed(db, "Dup Title");
+    expect(result.resolved).toBe(false);
+    expect(result.ambiguous).toBe(true);
+    expect(result.candidates).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
@@ -150,6 +234,16 @@ describe("syncWikilinks", async () => {
   it("creates links for resolved wikilinks", async () => {
     const target = await store.createNote("Target", { path: "Target Note" });
     const source = await store.createNote("See [[Target Note]]");
+
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0].targetId).toBe(target.id);
+    expect(links[0].relationship).toBe("wikilink");
+  });
+
+  it("creates a link via the title fallback when path/basename miss", async () => {
+    const target = await store.createNote("# Weekly Review\n\nBody.", { path: "Inbox/2026-07-10-abc123" });
+    const source = await store.createNote("See [[Weekly Review]]");
 
     const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
@@ -253,6 +347,116 @@ describe("syncWikilinks", async () => {
     expect(links).toHaveLength(1);
     expect(links[0].metadata?.display).toBe("intro");
     expect(links[0].metadata?.anchor).toBe("Introduction");
+  });
+
+  // vault#570 — an ambiguous target (≥2 notes share the same basename/
+  // title) must be reported distinctly from a genuine miss, via
+  // `syncWikilinks`'s `ambiguous` array, and must NOT be linked or queued
+  // into `unresolved_wikilinks` (queuing implies "wait for this to be
+  // created", which doesn't describe an already-existing ambiguity).
+  it("returns ambiguous targets separately from unresolved, creates no link, and does not queue them", async () => {
+    const a = await store.createNote("A", { path: "Folder1/Dup" });
+    const b = await store.createNote("B", { path: "Folder2/Dup" });
+    // Empty content on create so the note exists (satisfying the
+    // `unresolved_wikilinks` FK) without triggering `syncWikilinks` yet —
+    // the manual call below is what's under test, and its return value
+    // isn't otherwise observable through the Store API.
+    const source = await store.createNote("");
+
+    const content = "See [[Dup]] and also [[Truly Missing]]";
+    const result = syncWikilinks(db, source.id, content);
+    expect(result.added).toBe(0);
+    expect(result.unresolved).toEqual(["Truly Missing"]);
+    expect(result.ambiguous).toEqual([{ target: "Dup", count: 2 }]);
+
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links.some((l) => l.targetId === a.id || l.targetId === b.id)).toBe(false);
+
+    const pending = db.prepare(
+      "SELECT target_path FROM unresolved_wikilinks WHERE source_id = ?",
+    ).all(source.id) as { target_path: string }[];
+    // Only the genuinely-missing target is queued — "Dup" is absent.
+    expect(pending.map((r) => r.target_path)).toEqual(["Truly Missing"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getContentWikilinkWarnings (vault#570) — read-only warning derivation
+// ---------------------------------------------------------------------------
+
+describe("getContentWikilinkWarnings", () => {
+  it("returns an unresolved_link warning for a content wikilink to a missing target", async () => {
+    const source = await store.createNote("See [[Nowhere]]");
+    const warnings = getContentWikilinkWarnings(db, source.id, "See [[Nowhere]]");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.code).toBe("unresolved_link");
+    expect(warnings[0]!.target).toBe("Nowhere");
+    expect(warnings[0]!.relationship).toBe("wikilink");
+  });
+
+  it("returns an ambiguous_link warning (with candidate_count) for a content wikilink matching 2 notes", async () => {
+    await store.createNote("A", { path: "Folder1/Same" });
+    await store.createNote("B", { path: "Folder2/Same" });
+    const source = await store.createNote("See [[Same]]");
+    const warnings = getContentWikilinkWarnings(db, source.id, "See [[Same]]");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.code).toBe("ambiguous_link");
+    expect(warnings[0]!.target).toBe("Same");
+    expect(warnings[0]!.candidate_count).toBe(2);
+  });
+
+  it("returns no warnings for a resolved wikilink, including a self-link", async () => {
+    const target = await store.createNote("Target", { path: "Resolvable" });
+    const source = await store.createNote("See [[Resolvable]]", { path: "Myself Again" });
+    expect(getContentWikilinkWarnings(db, source.id, "See [[Resolvable]]")).toEqual([]);
+    expect(getContentWikilinkWarnings(db, source.id, "See [[Myself Again]]")).toEqual([]);
+    void target;
+  });
+
+  it("returns no warnings when content has no wikilinks", () => {
+    expect(getContentWikilinkWarnings(db, "some-id", "plain text, no brackets")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveOrQueueLink (vault#555 + vault#570) — discriminated outcome
+// ---------------------------------------------------------------------------
+
+describe("resolveOrQueueLink", () => {
+  it("returns {status: 'resolved', note_id} for a resolvable target", async () => {
+    const target = await store.createNote("Target", { path: "Findable" });
+    const source = await store.createNote("source");
+    const outcome = resolveOrQueueLink(db, source.id, "Findable", "knows");
+    expect(outcome.status).toBe("resolved");
+    if (outcome.status === "resolved") expect(outcome.note_id).toBe(target.id);
+  });
+
+  it("returns {status: 'queued'} and queues the pending row for a genuinely missing target", async () => {
+    const source = await store.createNote("source");
+    const outcome = resolveOrQueueLink(db, source.id, "Not There", "knows");
+    expect(outcome.status).toBe("queued");
+    const pending = db.prepare(
+      "SELECT target_path, relationship FROM unresolved_wikilinks WHERE source_id = ?",
+    ).all(source.id) as { target_path: string; relationship: string }[];
+    expect(pending).toEqual([{ target_path: "Not There", relationship: "knows" }]);
+  });
+
+  it("returns {status: 'ambiguous', candidates} and does NOT queue for a target matching 2 notes", async () => {
+    const a = await store.createNote("A", { path: "Folder1/Twice" });
+    const b = await store.createNote("B", { path: "Folder2/Twice" });
+    const source = await store.createNote("source");
+    const outcome = resolveOrQueueLink(db, source.id, "Twice", "knows");
+    expect(outcome.status).toBe("ambiguous");
+    if (outcome.status === "ambiguous") {
+      expect(outcome.candidates.map((c) => c.note_id).sort()).toEqual([a.id, b.id].sort());
+    }
+    const tableExists = (db.prepare("PRAGMA table_info(unresolved_wikilinks)").all() as unknown[]).length > 0;
+    if (tableExists) {
+      const pending = db.prepare(
+        "SELECT * FROM unresolved_wikilinks WHERE source_id = ?",
+      ).all(source.id) as unknown[];
+      expect(pending).toHaveLength(0);
+    }
   });
 });
 

@@ -90,8 +90,17 @@ export function filterNotesByTagScope<T extends Note>(
  * about a warning's `schema`/`loser_schema` tag NAMES, not a note's whole
  * tag set) uses the identical visibility rule. `rawRoots === null` (unscoped)
  * → always visible.
+ *
+ * Exported (vault aggregate/rollup feature) so `query-notes`'s `aggregate`
+ * mode under `group_by: "tag"` can scrub GROUP NAMES for a scoped caller —
+ * a co-tagged note that's itself in scope (visible via one tag) still
+ * carries out-of-scope tags, and a tag rollup's groups ARE tag names, so
+ * narrowing which NOTES count (the `aggregateVisibility` note-level
+ * predicate) isn't sufficient on its own to keep an out-of-scope tag name
+ * from surfacing as a group. See `src/mcp-tools.ts` / `src/routes.ts`'s
+ * aggregate branches.
  */
-function tagVisibleInScope(
+export function tagVisibleInScope(
   tag: string,
   allowed: Set<string> | null,
   rawRoots: string[] | null,

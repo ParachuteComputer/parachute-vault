@@ -30,7 +30,14 @@
  *     flagged as a possible stale reference to a renamed/merged/deleted tag
  *     — the PM's `metadata.epic` drift class from the #552 write-up. Vault
  *     has no history of past tag names, so this can never be certain —
- *     hence heuristic.
+ *     hence heuristic. Skips any key declared as an ENUM field on any tag
+ *     schema (vault#570) — an enum is a closed, schema-governed vocabulary
+ *     (drift there already surfaces as `enum_mismatch` validation, not this
+ *     heuristic), so one enum value coincidentally matching an unrelated
+ *     live tag name (e.g. a `status` enum with `"active"`/`"archived"`/
+ *     `"done"` where some other tag happens to be named "archived") no
+ *     longer drags the enum's OTHER legitimate values into a false
+ *     "stale tag reference" finding.
  *
  * Tag-scope (vault#552): pass `allowedTags` (the caller's EXPANDED
  * allowlist, e.g. from `expandTokenTagScope`) to restrict every finding to
@@ -44,6 +51,7 @@ import { Database } from "bun:sqlite";
 import { loadTagHierarchy, findHierarchyCycles } from "./tag-hierarchy.js";
 import { listIndexedFields } from "./indexed-fields.js";
 import { pruneOrphanedIndexedFields } from "./indexed-fields.js";
+import { loadSchemaConfig } from "./schema-defaults.js";
 
 export type DoctorFindingType =
   | "dangling_parent_name"
@@ -304,6 +312,19 @@ function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | 
     (db.prepare("SELECT name FROM tags").all() as { name: string }[]).map((r) => r.name),
   );
 
+  // Schema-declared enum fields (vault#570) — a metadata key declared as an
+  // enum on ANY tag's schema is a closed, schema-governed vocabulary; skip
+  // it from this heuristic entirely so the enum's own values coincidentally
+  // colliding with an unrelated live tag name can't drag its OTHER
+  // legitimate values into a false "stale tag reference" finding (see the
+  // module doc comment above).
+  const enumFieldKeys = new Set<string>();
+  for (const fields of loadSchemaConfig(db).tagToFields.values()) {
+    for (const [key, spec] of Object.entries(fields)) {
+      if (Array.isArray(spec.enum) && spec.enum.length > 0) enumFieldKeys.add(key);
+    }
+  }
+
   const rows = db
     .prepare("SELECT id, metadata FROM notes WHERE metadata IS NOT NULL AND metadata != ''")
     .all() as { id: string; metadata: string }[];
@@ -315,6 +336,7 @@ function scanDeadTagMetadataReferences(db: Database, allowedTags: Set<string> | 
     try { parsed = JSON.parse(row.metadata); } catch { continue; }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
     for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (enumFieldKeys.has(key)) continue;
       if (typeof value !== "string" || value.length === 0) continue;
       let valueMap = byKey.get(key);
       if (!valueMap) { valueMap = new Map(); byKey.set(key, valueMap); }

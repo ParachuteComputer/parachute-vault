@@ -220,12 +220,14 @@ describe("contract: typed indexes — Decision B: explicit-default-only enum bac
 });
 
 describe("contract: typed indexes — Decision C: honest type list (#553, flipped from todo)", () => {
-  it("the update-tag field-type description clarifies only string/integer/boolean are indexable", () => {
+  it("the update-tag field-type description clarifies only string/integer/boolean/reference are indexable", () => {
     const updateTag = generateMcpTools(store).find((t) => t.name === "update-tag")!;
     const typeDesc = (updateTag.inputSchema as any).properties.fields.additionalProperties.properties.type.description as string;
     // Honest about the full storage/advisory vocabulary AND the indexable subset.
     expect(typeDesc).toContain("number");
-    expect(typeDesc).toContain("Only string/integer/boolean are INDEXABLE");
+    // vault#typed-reference-field: `reference` joined the indexable subset
+    // alongside string/integer/boolean.
+    expect(typeDesc).toContain("Only string/integer/boolean/reference are INDEXABLE");
   });
 
   it("declaring indexed:true with an unindexable type (number) is rejected", async () => {

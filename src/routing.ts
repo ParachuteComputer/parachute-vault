@@ -828,20 +828,28 @@ export async function route(
 
   // /api/doctor — read-only taxonomy/metadata integrity scan (vault#552).
   // Same "dispatch before the generic read/write gate" shape as /triggers
-  // above, because this is ADMIN-tier regardless of method (GET-only, but
-  // admin — not read — since it's a whole-vault diagnostic, same tier as
-  // the MCP `doctor` tool and `prune-schema`).
+  // above — dispatched early because it's GET-only and doesn't otherwise
+  // fall under the generic verb→scope gate's method-based default.
+  //
+  // Tier: `read` (was `admin` — re-tiered to match the MCP `doctor` tool's
+  // own read/write/admin re-tier, vault#570-adjacent scope-completion pass:
+  // doctor never mutates and is ALREADY tag-scope-restricted via
+  // `doctorTagScope` below, so read-scoped monitoring/tending callers need
+  // to be able to run it without an admin credential over EITHER door. A
+  // `vault:read` token can now call `GET /api/doctor` (previously
+  // `Forbidden`) — matching MCP's `doctor` tool exactly, closing the
+  // REST/MCP divergence the scope re-tier PR left as a known gap.
   if (apiMatch[1] === "/doctor") {
     if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed", error_type: "method_not_allowed" }, { status: 405 });
     }
-    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+    if (!hasScopeForVault(auth.scopes, vaultName, "read")) {
       return Response.json(
         {
           error: "Forbidden",
           error_type: "insufficient_scope",
-          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
-          required_scope: SCOPE_ADMIN,
+          message: `This endpoint requires the '${SCOPE_READ}' scope (or '${SCOPE_READ.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_READ,
           granted_scopes: auth.scopes,
         },
         { status: 403 },
@@ -867,9 +875,30 @@ export async function route(
   const apiSubpath = apiMatch[1] ?? "";
   const isReadOnlyPost =
     req.method === "POST" && /^\/tags\/[^/]+\/conformance$/.test(apiSubpath);
-  const requiredVerb = isReadOnlyPost ? "read" : verbForMethod(req.method);
+  // Tag-schema/taxonomy mutation carve-out — mirrors the MCP-side
+  // update-tag/delete-tag/rename-tag/merge-tags re-tier (write → admin):
+  // these tools define a tag's SCHEMA or restructure the tag graph across
+  // every note carrying it — structure, not content — the same distinction
+  // that keeps `create-note`/`update-note`/`delete-note` at `write` while
+  // moving these to `admin`. Before this fix, the REST door only required
+  // `vault:write` here — a gap between doors (a `vault:write` token could
+  // rename/merge/delete/update a tag over REST while MCP already refused
+  // it). Matches PUT/DELETE `/tags/:name` (update-tag / delete-tag), POST
+  // `/tags/merge` (merge-tags), and POST `/tags/:name/rename` (rename-tag).
+  // Deliberately does NOT match `/tags/:name/conformance` (2 path segments,
+  // not 1 — see `isReadOnlyPost` above for that endpoint's own, lower tier)
+  // or plain GET `/tags[/:name]` (read, unaffected).
+  const isTagSchemaMutation =
+    ((req.method === "PUT" || req.method === "DELETE") && /^\/tags\/[^/]+$/.test(apiSubpath)) ||
+    (req.method === "POST" &&
+      (apiSubpath === "/tags/merge" || /^\/tags\/[^/]+\/rename$/.test(apiSubpath)));
+  const requiredVerb = isReadOnlyPost ? "read" : isTagSchemaMutation ? "admin" : verbForMethod(req.method);
   if (!hasScopeForVault(auth.scopes, vaultName, requiredVerb)) {
-    const requiredApiScope = isReadOnlyPost ? SCOPE_READ : scopeForMethod(req.method);
+    const requiredApiScope = isReadOnlyPost
+      ? SCOPE_READ
+      : isTagSchemaMutation
+        ? SCOPE_ADMIN
+        : scopeForMethod(req.method);
     return Response.json(
       {
         error: "Forbidden",
@@ -931,9 +960,16 @@ export async function route(
   if (apiPath.startsWith("/tags")) return handleTags(req, store, apiPath.slice(5), tagScope);
   if (apiPath === "/find-path") return handleFindPath(req, store, tagScope);
   if (apiPath === "/vault") {
-    return handleVault(req, store, vaultConfig, () => {
-      writeVaultConfig(vaultConfig);
-    });
+    return handleVault(
+      req,
+      store,
+      vaultConfig,
+      () => {
+        writeVaultConfig(vaultConfig);
+      },
+      undefined, // resolveCapability — keep the production default
+      tagScope,
+    );
   }
   if (apiPath === "/unresolved-wikilinks") return handleUnresolvedWikilinks(req, store, tagScope);
   if (apiPath.startsWith("/storage")) return handleStorage(req, apiPath.slice(8), vaultName, store, tagScope);

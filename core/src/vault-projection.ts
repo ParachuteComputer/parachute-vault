@@ -32,7 +32,7 @@ import {
 } from "./tag-schemas.ts";
 import { DEFAULT_TAG_NAME } from "./tag-hierarchy.ts";
 import * as noteOps from "./notes.ts";
-import type { VaultStats } from "./types.ts";
+import type { VaultStats, VaultMap } from "./types.ts";
 import { GETTING_STARTED_PATH } from "./seed-packs.ts";
 
 /**
@@ -103,6 +103,17 @@ export interface VaultProjection {
   getting_started?: string;
   /** Included when the caller requests stats; omitted otherwise. */
   stats?: VaultStats;
+  /**
+   * Compact structural map — total note count, tag counts, top-level
+   * path-bucket counts (front-door orientation). ALWAYS present (unlike
+   * `stats`): it's three cheap grouped-COUNT queries, so a fresh reader
+   * orients in one `vault-info` call without also passing
+   * `include_stats: true`. See `noteOps.getVaultMap`. Scope-aware callers
+   * (tag-scoped tokens) get a RECOMPUTED map from the server layer — see
+   * `applyTagScopeWrappers` in src/mcp-tools.ts — because path-bucket counts
+   * can't be reconstructed by post-hoc filtering an unscoped rollup.
+   */
+  map: VaultMap;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +193,12 @@ export const QUERY_HINTS: readonly string[] = [
  *   - `stats`: included when `opts.includeStats === true`. Uses the
  *     existing `getVaultStats` shape unchanged — camelCase keys, full
  *     monthly distribution.
+ *
+ *   - `map`: ALWAYS included (unlike `stats`) — `getVaultMap`'s cheap
+ *     total-notes / tag-counts / path-bucket-counts rollup, computed
+ *     vault-wide (unscoped). See the `VaultProjection.map` doc comment for
+ *     why a tag-scoped caller's map is recomputed one layer up rather than
+ *     filtered here.
  */
 export function buildVaultProjection(
   db: Database,
@@ -233,6 +250,7 @@ export function buildVaultProjection(
     tags,
     indexed_fields,
     query_hints: [...QUERY_HINTS],
+    map: noteOps.getVaultMap(db),
   };
 
   // A2: point any connected AI at the seeded onboarding guide (a path pointer,
