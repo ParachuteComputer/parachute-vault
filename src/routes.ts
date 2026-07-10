@@ -30,7 +30,7 @@ import {
   getUnresolvedLinksForNotes,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -1553,6 +1553,22 @@ async function handleNotesInner(
         existingNote: Note,
         mode: "ignore" | "update" | "replace",
       ): Promise<{ note: Note; noMutate: boolean }> => {
+        // CRITICAL scope guard (vault#555 auth-review must-fix): `existingNote`
+        // was resolved VAULT-WIDE by path (store.getNoteByPath) at BOTH call
+        // sites below (proactive + race-backstop). The batch's incoming-tag
+        // pre-validation guards only each item's OWN tags — NOT this resolved
+        // note — so without this a token scoped to `public` could READ (ignore)
+        // or OVERWRITE (update/replace) a note carrying only an out-of-scope
+        // tag `secret` just by naming its path. When the note is outside the
+        // caller's tag scope, treat it as a path conflict — the path is taken,
+        // but invisible to this caller — throwing BEFORE any read/mutation so
+        // we never expose content or write. `noteWithinTagScope` is a no-op for
+        // unscoped tokens (tagScope.raw === null → always true). The throw
+        // propagates to runBatch's PATH_CONFLICT catch → 409 path_conflict,
+        // byte-identical to a genuine conflict (leaks nothing about WHY).
+        if (!noteWithinTagScope(existingNote, tagScope.allowed, tagScope.raw)) {
+          throw new PathConflictError(existingNote.path ?? "");
+        }
         if (mode === "ignore") {
           return { note: existingNote, noMutate: true };
         }
@@ -1577,8 +1593,16 @@ async function handleNotesInner(
         const projectedMetadata = updates.metadata ?? ((existingNote.metadata as Record<string, unknown>) ?? {});
         gateStrictWrite(store, writeCtx, { path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
 
+        // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): gate the
+        // core UPDATE on the tag/link mutation too, not just `updates` — a
+        // tags-only/links-only "update" leaves `updates` empty, and skipping
+        // store.updateNote would freeze `updated_at` even though store.tagNote
+        // genuinely mutates the note (breaking cursor polling + updated_at
+        // sync). Mirrors the update-note/PATCH hasTagMutation||hasLinkMutation
+        // gate. "replace" always sets content+metadata, so it was unaffected.
+        const hasLinkMutation = item.links !== undefined;
         let result: Note = existingNote;
-        if (Object.keys(updates).length > 0) {
+        if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
           result = await store.updateNote(existingNote.id, {
             ...updates,
             actor: writeCtx.actor,
@@ -1588,6 +1612,9 @@ async function handleNotesInner(
 
         if (incomingTags.length > 0) {
           await store.tagNote(result.id, incomingTags);
+          // Redundant with the outer batch loop's applySchemaDefaults (this
+          // note isn't in `noMutateIds` — only "ignore" hits are), but harmless
+          // (idempotent) — kept so the update/replace branch is self-contained.
           await applySchemaDefaults(store, db, [result.id], incomingTags);
         }
 

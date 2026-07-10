@@ -1815,6 +1815,81 @@ describe("scoped MCP wrapper", async () => {
 
     closeAllStores();
   });
+
+  // vault#555 auth-review CRITICAL: `if_exists` must NOT let a scoped MCP
+  // session read/update/replace an out-of-scope note by naming its path.
+  // The create-note wrapper pre-resolves the path and throws path_conflict on
+  // an out-of-scope hit (byte-identical to a genuine conflict). Each assertion
+  // MUST fail without the wrapper guard.
+  test('scoped create-note if_exists:"ignore" does NOT return an out-of-scope note (throws path_conflict)', async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-ifexists-ignore-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    await store.createNote("SECRET MCP PAYLOAD", { path: "Secret", tags: ["personal"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+    // in-scope incoming tag passes the item-tag pre-check; the OUT-OF-SCOPE
+    // existing note at this path must still be blocked.
+    await expect(
+      create.execute({ content: "attempted read", path: "Secret", tags: ["work"], if_exists: "ignore" }),
+    ).rejects.toThrow(/path_conflict/);
+
+    closeAllStores();
+  });
+
+  test('scoped create-note if_exists:"update"/"replace" does NOT mutate an out-of-scope note', async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-ifexists-mutate-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const secret = await store.createNote("ORIGINAL SECRET", { path: "Secret", tags: ["personal"], metadata: { keep: "me" } });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+
+    await expect(
+      create.execute({ content: "OVERWRITE", path: "Secret", tags: ["work"], metadata: { injected: true }, if_exists: "update" }),
+    ).rejects.toThrow(/path_conflict/);
+    await expect(
+      create.execute({ content: "REPLACE", path: "Secret", tags: ["work"], if_exists: "replace" }),
+    ).rejects.toThrow(/path_conflict/);
+
+    // Ground truth: the out-of-scope note is untouched by both attempts.
+    const onDisk = (await store.getNote(secret.id))!;
+    expect(onDisk.content).toBe("ORIGINAL SECRET");
+    expect(onDisk.metadata).toEqual({ keep: "me" });
+    expect(onDisk.tags).toEqual(["personal"]);
+
+    closeAllStores();
+  });
+
+  test("scoped create-note if_exists against an IN-scope note works normally (guard doesn't over-block)", async () => {
+    const { generateScopedMcpTools } = await import("./mcp-tools.ts");
+    const { writeVaultConfig } = await import("./config.ts");
+    const { getVaultStore, closeAllStores } = await import("./vault-store.ts");
+
+    const vaultName = `tagscope-ifexists-inscope-${Date.now()}`;
+    writeVaultConfig({ name: vaultName, api_keys: [], created_at: new Date().toISOString() });
+    const store = getVaultStore(vaultName);
+    const existing = await store.createNote("WORK BODY", { path: "MyWork", tags: ["work"] });
+
+    const tools = generateScopedMcpTools(vaultName, authForTags(["work"]) as any);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({ content: "x", path: "MyWork", tags: ["work"], if_exists: "ignore" }) as any;
+    expect(result.existed).toBe(true);
+    expect(result.id).toBe(existing.id);
+    expect(result.content).toBe("WORK BODY");
+
+    closeAllStores();
+  });
 });
 
 describe("auth permissions", () => {
@@ -3986,6 +4061,111 @@ describe("HTTP tag-scope confidentiality (security review)", async () => {
     const targets = (body.unresolved as any[]).map((r) => r.target_path);
     expect(targets).toContain("NoSuchWork");
     expect(targets).toContain("NoSuchPersonal");
+  });
+
+  // vault#555 auth-review CRITICAL: `if_exists` must NOT become a tag-scope
+  // bypass. A scoped token naming an out-of-scope note's PATH must not read
+  // (ignore), update, or replace it — treat it as a path_conflict (path taken,
+  // invisible to this caller). Each assertion MUST fail without the guard in
+  // applyExistingNote.
+  test('if_exists:"ignore" does NOT return an out-of-scope note by path (POST /notes)', async () => {
+    await store.createNote("SECRET WORK PAYLOAD", { path: "Secret", tags: ["personal"] });
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "attempted read",
+        path: "Secret",
+        tags: ["work"], // in-scope incoming tag — passes the item-tag pre-check
+        if_exists: "ignore",
+      }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    // Path is taken but invisible to this caller → 409 path_conflict, and the
+    // secret content appears NOWHERE in the response.
+    expect(res.status).toBe(409);
+    const text = await res.text();
+    expect(text).not.toContain("SECRET WORK PAYLOAD");
+    expect(JSON.parse(text).error_type).toBe("path_conflict");
+  });
+
+  test('if_exists:"update" does NOT mutate an out-of-scope note by path (POST /notes)', async () => {
+    const secret = await store.createNote("ORIGINAL SECRET", { path: "Secret", tags: ["personal"], metadata: { keep: "me" } });
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "OVERWRITE ATTEMPT",
+        path: "Secret",
+        tags: ["work"],
+        metadata: { injected: true },
+        if_exists: "update",
+      }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect(res.status).toBe(409);
+    // Ground truth: the out-of-scope note is byte-for-byte unchanged.
+    const onDisk = (await store.getNote(secret.id))!;
+    expect(onDisk.content).toBe("ORIGINAL SECRET");
+    expect(onDisk.metadata).toEqual({ keep: "me" });
+    expect(onDisk.tags).toEqual(["personal"]); // "work" never applied
+  });
+
+  test('if_exists:"replace" does NOT mutate an out-of-scope note by path (POST /notes)', async () => {
+    const secret = await store.createNote("ORIGINAL SECRET", { path: "Secret", tags: ["personal"], metadata: { a: 1 } });
+
+    const res = await handleNotes(
+      mkReq("POST", "/notes", {
+        content: "REPLACE ATTEMPT",
+        path: "Secret",
+        tags: ["work"],
+        if_exists: "replace",
+      }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect(res.status).toBe(409);
+    const onDisk = (await store.getNote(secret.id))!;
+    expect(onDisk.content).toBe("ORIGINAL SECRET");
+    expect(onDisk.metadata).toEqual({ a: 1 });
+  });
+
+  test("UNSCOPED if_exists:ignore still returns the existing note (regression — guard is scope-gated)", async () => {
+    const existing = await store.createNote("PLAIN BODY", { path: "Plain", tags: ["work"] });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", path: "Plain", if_exists: "ignore" }),
+      store,
+      "",
+      "v",
+      NO_SCOPE,
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(existing.id);
+    expect(body.content).toBe("PLAIN BODY");
+  });
+
+  test("in-scope if_exists:ignore against an in-scope note works normally (guard doesn't over-block)", async () => {
+    const existing = await store.createNote("WORK BODY", { path: "MyWork", tags: ["work"] });
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", path: "MyWork", tags: ["work"], if_exists: "ignore" }),
+      store,
+      "",
+      "v",
+      await scopeCtx(["work"]),
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(body.existed).toBe(true);
+    expect(body.id).toBe(existing.id);
+    expect(body.content).toBe("WORK BODY");
   });
 
 });

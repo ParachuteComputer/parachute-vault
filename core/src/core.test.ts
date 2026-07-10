@@ -5558,6 +5558,48 @@ describe("create-note if_exists (vault#555)", async () => {
     expect(result.content).toBe("v2");
     expect(result.metadata?.status).toBe("open");
   });
+
+  // vault#555 CRITICAL 2 (W8 fix-2 bug class): a tags-ONLY if_exists:"update"
+  // (no content/metadata) must still bump updated_at — store.tagNote genuinely
+  // mutates the note, and a frozen updated_at breaks cursor polling + sync.
+  it('if_exists:"update" with ONLY tags added still advances updated_at', async () => {
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const first = await create.execute({ content: "body", path: "Inbox/tagonly", tags: ["alpha"] }) as any;
+    const before = (await store.getNoteByPath("Inbox/tagonly"))!.updatedAt!;
+
+    // Ensure a strictly-later wall-clock so the bump is observable even if the
+    // two writes land in the same millisecond.
+    await new Promise((r) => setTimeout(r, 5));
+
+    const second = await create.execute({
+      path: "Inbox/tagonly",
+      tags: ["beta"], // ONLY a tag change — no content, no metadata
+      if_exists: "update",
+    }) as any;
+    expect(second.existed).toBe(true);
+    expect(second.tags?.sort()).toEqual(["alpha", "beta"]); // tag actually added
+    const after = (await store.getNoteByPath("Inbox/tagonly"))!.updatedAt!;
+    expect(after > before).toBe(true); // updated_at advanced
+    expect(second.id).toBe(first.id);
+  });
+
+  it('if_exists:"update" with ONLY links added still advances updated_at', async () => {
+    await store.createNote("target", { id: "tgt-linkonly", path: "Targets/linkonly" });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({ content: "body", path: "Inbox/linkonly", tags: ["alpha"] });
+    const before = (await store.getNoteByPath("Inbox/linkonly"))!.updatedAt!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await create.execute({
+      path: "Inbox/linkonly",
+      links: [{ target: "tgt-linkonly", relationship: "relates-to" }],
+      if_exists: "update",
+    });
+    const after = (await store.getNoteByPath("Inbox/linkonly"))!.updatedAt!;
+    expect(after > before).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

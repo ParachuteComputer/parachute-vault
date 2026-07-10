@@ -1021,8 +1021,19 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
           // to re-supply every `required` field just to pass validation.
           enforceStrict({ path: existingNote.path, tags: [...projectedTags], metadata: projectedMetadata });
 
+          // vault#555 fix 2 (W8 fix-2 bug class, generalist must-fix): a
+          // tags-only or links-only "update" leaves `updates` empty, so
+          // gating store.updateNote on `updates` ALONE would skip it — and
+          // then a genuine tag/link mutation (store.tagNote below) would never
+          // bump `updated_at`, breaking cursor polling (`ORDER BY updated_at`)
+          // and any since-last-check sync. Gate on the tag/link mutation too,
+          // mirroring the update-note/PATCH path's hasTagMutation||hasLinkMutation.
+          // store.updateNote with empty core fields still issues a real UPDATE
+          // that bumps updated_at (+ last_updated_by/via). "replace" always
+          // sets content+metadata, so it was never affected.
+          const hasLinkMutation = item.links !== undefined;
           let result: Note = existingNote;
-          if (Object.keys(updates).length > 0) {
+          if (Object.keys(updates).length > 0 || incomingTags.length > 0 || hasLinkMutation) {
             result = await store.updateNote(existingNote.id, {
               ...updates,
               actor: writeActor,
@@ -1032,6 +1043,11 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
 
           if (incomingTags.length > 0) {
             await store.tagNote(result.id, incomingTags);
+            // Note: applySchemaDefaults also runs in the outer batch loop for
+            // this note (it's not in `noMutateIds` — only "ignore" hits are),
+            // so this inline call is redundant. Harmless (idempotent — fills
+            // only still-missing fields), kept so the update/replace branch is
+            // self-contained; left un-gated to avoid coupling to the outer loop.
             await applySchemaDefaults(store, db, [result.id], incomingTags);
           }
 

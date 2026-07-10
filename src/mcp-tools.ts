@@ -7,7 +7,8 @@
 
 import { generateMcpTools } from "../core/src/mcp.ts";
 import type { McpToolDef, GenerateMcpToolsOpts } from "../core/src/mcp.ts";
-import { getNoteTags } from "../core/src/notes.ts";
+import { getNoteTags, PathConflictError } from "../core/src/notes.ts";
+import { normalizePath } from "../core/src/paths.ts";
 import type { Note } from "../core/src/types.ts";
 import {
   buildVaultProjection,
@@ -496,6 +497,37 @@ function applyTagScopeWrappers(
       const itemTags = Array.isArray((item as any).tags) ? ((item as any).tags as string[]) : [];
       if (!tagsWithinScope(itemTags, allowed, rawTags)) {
         return forbidden("create-note: every note must carry at least one tag in the token's allowlist");
+      }
+      // CRITICAL scope guard (vault#555 auth-review must-fix): `if_exists`
+      // resolves the target `path` VAULT-WIDE inside scope-unaware core
+      // (`store.getNoteByPath`), then returns (ignore) / updates / replaces
+      // whatever it finds. The `tagsWithinScope` check above guards only the
+      // item's OWN incoming tags — NOT the resolved existing note — so without
+      // this a token scoped to `public` could READ (ignore) or OVERWRITE
+      // (update/replace) a note that carries only an out-of-scope tag `secret`
+      // just by naming its path. Core stays scope-unaware by design, so we
+      // pre-resolve HERE (the scope-aware server layer) and treat an
+      // out-of-scope hit as a path conflict — the path is taken, but invisible
+      // to this caller — never exposing the note's content or mutating it. We
+      // THROW `PathConflictError` (not an in-band object) so the wire result is
+      // byte-identical to a genuine `path_conflict`, leaking nothing about
+      // WHY (taken-by-out-of-scope vs. simply taken). Holds for ignore,
+      // update, AND replace.
+      const ifExists = (item as any).if_exists;
+      const path = (item as any).path;
+      if (
+        (ifExists === "ignore" || ifExists === "update" || ifExists === "replace") &&
+        typeof path === "string" &&
+        path.length > 0
+      ) {
+        const normalized = normalizePath(path);
+        if (normalized) {
+          const ext = typeof (item as any).extension === "string" ? (item as any).extension : "md";
+          const existing = await store.getNoteByPath(normalized, ext);
+          if (existing && !noteWithinTagScope(existing, allowed, rawTags)) {
+            throw new PathConflictError(normalized);
+          }
+        }
       }
     }
     return await orig(params);
