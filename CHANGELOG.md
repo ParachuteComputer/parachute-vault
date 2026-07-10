@@ -34,7 +34,14 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
-## [0.7.0-rc.10] - 2026-07-10
+## [0.7.1-rc.1] - 2026-07-10
+
+> This release integrates eight feature branches (ULIDs, MCP scope re-tier
+> + REST completion, search/doctor polish, vault-info front door,
+> aggregation, typed reference fields, title-fallback link resolution,
+> honest link warnings). This stanza accumulates their content
+> merge-by-merge; see the end of the integration for the final
+> consolidated Added/Changed/Breaking/Fixed writeup.
 
 ### Changed
 
@@ -43,6 +50,15 @@ to `@latest`.
 - **Audit: nothing in the codebase parses a note ID to recover its creation time.** Full-codebase grep for id-slicing/splitting/date-parsing (`id.slice`/`id.substring`/`id.split`, `new Date(...id...)`, `Date.parse(...id...)`, id-shaped date regexes, id-format validators) turned up zero hits outside test fixtures. The only places `id` participates in ordering are all `created_at`/`updated_at`-primary with `id` as a stable secondary tiebreaker for otherwise-equal timestamps (`core/src/cursor.ts`'s `(updated_at, id)` keyset predicate, `getNotes`'s `(created_at, id)` merge-sort across chunked `IN`-list queries, `portable-md.ts`'s `id`-sorted attachment list for byte-identical export ordering) — correct and format-agnostic behavior that needed no change. `generateId()`'s doc comment now states the invariant explicitly (id format must never be assumed, and nothing may derive time from it — use `created_at`) so a future change doesn't quietly reintroduce the assumption.
 
 Tests: 11 new — `core/src/ulid.test.ts` (6: 26-char Crockford-base32 format, excluded-letter charset check, timestamp-prefix sanity against `Date.now()`, same-ms monotonic ordering, no duplicates across 5000 calls, back-to-back strict ordering) and `core/src/core.test.ts`'s new `describe("ULID ids for new notes (existing IDs unchanged)")` (5: new notes get ULID-format ids; an explicitly-supplied old-format id round-trips through create/read-by-id/read-by-path/link/`resolveLinkTarget`; mixed old-timestamp-format + new-ULID ids sharing one `updated_at` paginate via cursor with no miss or duplicate under a small page limit; `generateUlid()` direct-call format check). Gates: `bun run typecheck` clean; `bun test ./core/src/` 1053 pass / 0 fail (was 1042 — +11 matches this PR's new tests exactly); `bun test ./src/` 2152 pass / 1 skip (pre-existing opt-in `VAULT_SCALE_BENCH` bench suite, unrelated) / 0 fail.
+
+### Fixed — 0.7.x polish (issue #570, both verified real on the rc.9 harness round)
+
+- **`search_did_you_mean` now suggests a real surface word, not a porter stem.** `computeSearchDidYouMean` (`core/src/query-warnings.ts`) drew its candidate pool from `notes_fts_vocab` — the porter-STEMMED FTS5 vocabulary — so a zero-result search's suggestion sometimes read as a truncated fragment a user would never type ("cactu" for "cactus", "lighthous" for "lighthouse"). The stemmed vocabulary is still used to find the closest CANDIDATE (small, deduped, cheap to range-scan) — but a stemmed candidate is no longer returned verbatim. New `resolveSurfaceForm` maps it back to the real dictionary word: `notes_fts` is porter-tokenized, so MATCHing the bare stem finds a note carrying a word that stems to it (guaranteed, since the stem came from that same vocabulary); from there the note's own path/content text is tokenized unstemmed (JS-side) and the first token that literally STARTS WITH the stem is returned — true for Porter's suffix-stripping rules in the overwhelming majority of cases. Irregular cases fall back to the raw stem, same as before this fix — never worse. Literal tag-name suggestions (the `tagNames` param) are unaffected — they were already real words.
+- **`doctor`'s `dead_tag_metadata_reference` heuristic no longer false-positives on schema-declared enum values.** `scanDeadTagMetadataReferences` (`core/src/doctor.ts`) flags a metadata value that matches no live tag when sibling notes' values under the same key ARE live tags — but a schema-declared ENUM field (e.g. a `status` field with `enum: ["active", "archived", "done"]`) whose values merely *coincide* with an unrelated live tag name (say, some other tag is also named "archived") used to drag the enum's OTHER legitimate values ("active", "done") into a false "stale tag reference" finding, on the strength of that one coincidental collision. The scan now collects every metadata key declared as an enum field on ANY tag schema (via `loadSchemaConfig`) and skips it entirely — an enum is a closed, schema-governed vocabulary; drift there already surfaces as `enum_mismatch` validation, not this heuristic.
+
+Docs: `docs/HTTP_API.md` (`search_did_you_mean`'s stemming caveat updated to describe the de-stemming fix; `dead_tag_metadata_reference`'s enum-skip behavior documented).
+
+Tests: 2 new — `src/contract-search.test.ts` (`did_you_mean` resolves "cactuz" → "cactus", not the stem "cactu"), `core/src/contract-taxonomy.test.ts` (a `status` enum field whose values coincide with an unrelated live tag "archived" produces zero `dead_tag_metadata_reference` findings for `metadata.status`). Gates: `bun run typecheck` clean; `bun test ./src/` 2153 pass / 1 skip / 0 fail; `bun test ./core/src/` 1043 pass / 0 fail.
 
 ## [0.7.0] - 2026-07-10
 

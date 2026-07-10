@@ -292,4 +292,26 @@ describe("contract: taxonomy — #552 (flipped from test.todo)", () => {
     expect(cleanReport.findings).toEqual([]);
     expect(cleanReport.summary).toContain("clean");
   });
+
+  it("dead_tag_metadata_reference does not false-positive on a schema-declared enum field whose values coincide with an unrelated live tag (vault#570)", async () => {
+    // "archived" is a real, unrelated live tag — coincidentally sharing a
+    // name with one of "status"'s declared enum values. Pre-fix, this ONE
+    // coincidental collision was enough to convince the heuristic that
+    // metadata.status "holds tag-shaped values", and then flag status's
+    // OTHER legitimate enum values ("active", "done") as stale tag
+    // references — even though neither was ever a tag at all.
+    await store.upsertTagRecord("archived", {});
+    await store.upsertTagRecord("task", {
+      fields: { status: { type: "string", enum: ["active", "archived", "done"] } },
+    });
+    await store.createNote("task one", { tags: ["task"], metadata: { status: "active" } });
+    await store.createNote("task two", { tags: ["task"], metadata: { status: "done" } });
+    await store.createNote("task three", { tags: ["task"], metadata: { status: "archived" } });
+
+    const report = await store.doctor();
+    const driftFindings = report.findings.filter(
+      (f) => f.type === "dead_tag_metadata_reference" && f.subject === "metadata.status",
+    );
+    expect(driftFindings).toEqual([]);
+  });
 });

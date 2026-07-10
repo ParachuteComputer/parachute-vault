@@ -991,11 +991,15 @@ Query params:
     vocabulary regardless of any tag-scoped token's allowlist, so
     surfacing it to a scoped caller would leak an out-of-scope note's
     content across the scope boundary (same "no leak" stance as
-    `unknown_tag`/`did_you_mean` above). A suggestion occasionally reads as
-    a STEMMED form (`propoli` rather than `propolis`) rather than the
-    original dictionary word — the FTS5 vocabulary is the post-stemming
-    index, not a separate dictionary; an accepted tradeoff rather than
-    maintaining a second unstemmed index just for spelling suggestions.
+    `unknown_tag`/`did_you_mean` above). The closest CANDIDATE is found
+    against the FTS5 vocabulary (the post-stemming index — cheap to scan,
+    since it's small and deduped), but a stemmed candidate is never
+    returned verbatim (vault#570): the suggestion is mapped back to the
+    real dictionary word a note actually contains (`propolis`, not
+    `propoli`) before it's returned. Irregular cases where the stem isn't a
+    literal prefix of the original word are a known, accepted limitation
+    (same class as the tokenizer gaps below) and fall back to the raw stem
+    rather than nothing.
   - **Known tokenizer limitations (documented, not fixed — not worth
     fighting FTS5's tokenizer for):**
     - A fused decimal+unit token like `3.14mm` is ONE token to the
@@ -1806,7 +1810,11 @@ where each finding is `{ type, severity, subject, detail, remedy, heuristic? }`:
   — a metadata value that looks like a stale reference to a
   renamed/merged/deleted tag, inferred from sibling notes using the same
   metadata key with values that ARE live tags. Never certain — vault keeps
-  no tag-rename history.
+  no tag-rename history. Skips any metadata key declared as an ENUM field
+  on a tag schema (vault#570) — an enum is a closed, schema-governed
+  vocabulary, so one of its values coincidentally matching an unrelated
+  live tag name no longer drags the enum's OTHER legitimate values into a
+  false positive.
 
 **Tag-scope.** A tag-scoped admin token's scan covers only in-scope
 tags/fields/notes — the report is re-run with the caller's expanded
