@@ -591,7 +591,7 @@ actually affected by the bug — only the message string could double.
 | `not_found` | 404 | `id?`/`note_id?` (varies by endpoint) | Generic resource-not-found: a note, an anchor/source/target note reference, a vault, or (for a tag-scoped session) a note outside the token's allowlist — 404, never 403, so scope boundaries don't leak existence. |
 | `method_not_allowed` | 405 | — | The HTTP method isn't supported on this route. |
 | `invalid_json` | 400 | — | The request body failed to parse as JSON. |
-| `invalid_request` | 400 | `field?`, `hint?` | A required param/field is missing or the wrong shape (e.g. `find-path`'s `source`/`target`, tag-merge's `sources`/`target`, or a JSON body that parsed but isn't the expected object — `null`/a bare number/an array to `POST /notes`, a non-array `notes`). |
+| `invalid_request` | 400 | `field?`, `hint?` | A required param/field is missing or the wrong shape (e.g. `find-path`'s `source`/`target`, tag-merge's `sources`/`target`, a JSON body that parsed but isn't the expected object — `null`/a bare number/an array to `POST /notes`, a non-array `notes` — or a `POST /upload` body that isn't parseable as `multipart/form-data` at all — vault#588). |
 | `missing_required_field` | 400 | `field?`, `hint?` | A specific named field is required and absent (e.g. attachment `path`/`mimeType`, storage upload `file`). |
 | `payload_too_large` | 413 | `limit`, `got` | The JSON request body exceeds the 10MB cap on the mutating routes (`POST /notes`, `POST /notes/{id}/attachments`, `PATCH /notes/{idOrPath}`, `PUT /tags/{name}`, `PATCH /vault`). Parallel to `file_too_large` (the 100MB `/upload` cap); use the binary `/upload` path for large attachments. |
 | `tag_scope_violation` | 403 (REST) / forbidden (MCP) | `scoped_tags` | A tag-scoped token attempted a write outside its allowlist. |
@@ -611,6 +611,7 @@ actually affected by the bug — only the message string could double.
 | `file_too_large` | 413 | `limit`, `got` | Upload exceeds the 100MB cap. |
 | `blocked_upload_extension` | 400 | `extension` | The extension is on the active-content blocklist (`.html`, `.svg`, `.js`, `.css`, ...) — same-origin XSS surface if served back. |
 | `invalid_path` | 403 | — | The requested storage path resolves outside the vault's assets directory (traversal guard). |
+| `invalid_request` | 400 | `hint` | The body isn't parseable as `multipart/form-data` at all (bad boundary, truncated body, wrong `Content-Type`) — vault#588. Distinct from `missing_required_field`, which is a well-formed multipart body missing the `file` field. |
 
 ### Transcription retry (`POST /notes/{idOrPath}/retry-transcription`)
 
@@ -2116,7 +2117,14 @@ Multipart form upload.
   .webp .pdf .mp4`. `.svg` and `.html` are explicitly disallowed (XSS).
 
 Returns `{path, size, mimeType}` with status `201` on success. A file
-larger than the 100MB limit is rejected with `413`.
+larger than the 100MB limit is rejected with `413`. A body that isn't
+parseable as `multipart/form-data` at all is rejected with `400
+invalid_request` (vault#588) rather than a generic `500`.
+
+The server's `Bun.serve` `maxRequestBodySize` is set to 120MB — the 100MB
+`/upload` cap plus headroom for multipart overhead — so this transport-level
+ceiling never rejects a legitimate max-size upload before the app-level
+100MB check above even runs.
 
 #### `GET /vault/{name}/api/storage/{date}/{filename}` — `vault:read`
 Serves the uploaded file bytes with the matching `Content-Type`. Path is

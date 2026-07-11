@@ -95,6 +95,25 @@ but **two operator-visible behavior changes** worth knowing:
   get a structured `400` instead of whatever it was getting before — branch
   on `error_type` and fix the request body.
 
+## 0.7.1 → 0.7.2 — transport robustness leftovers (#588, the rc.4 follow-up)
+
+Two low-severity gaps left over from the request-body hardening above. No
+schema migration, no manual steps — one operator-relevant note:
+
+- **The server now sets an explicit `maxRequestBodySize` (120MB) on
+  `Bun.serve`, replacing Bun's unconfigured 128MB default.** 120MB is the
+  100MB `/upload` app-level cap (`MAX_UPLOAD_BYTES`) plus 20MB of headroom
+  for multipart overhead — comfortably above both `/upload`'s 100MB limit
+  and the JSON routes' 10MB limit, so no legitimate request is affected.
+  This closes the gap where a **chunked** request with no `Content-Length`
+  header (so the JSON routes' pre-parse size check can't see it coming)
+  relied entirely on Bun's default rather than a value this codebase
+  actually chose and documented.
+- **`POST /upload` with a malformed or non-multipart body now returns `400
+  invalid_request` instead of a `500`.** Purely an error-shape improvement
+  (worse-than-useless 500s become an actionable 400) — no legitimate upload
+  behavior changes.
+
 ## 0.7.1 → 0.7.2 — data-integrity hardening (import / export / paths)
 
 Three fixes from the round-4 bug hunt. No schema migration, no manual steps —

@@ -4255,7 +4255,30 @@ async function handleRetryLegacyInBody(
 // existing importers are unaffected.
 // ---------------------------------------------------------------------------
 
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
+
+/**
+ * Transport-level `Bun.serve` `maxRequestBodySize` ceiling (vault#588 FIX 2).
+ *
+ * The app-level caps above (`MAX_JSON_BODY_BYTES` 10MB, `MAX_UPLOAD_BYTES`
+ * 100MB) only run AFTER the transport has already buffered the body: the
+ * `Content-Length` pre-check in `parseJsonBody` short-circuits early, but a
+ * chunked request with no `Content-Length` header falls through to the
+ * post-parse backstop — which still means Bun buffered the whole thing into
+ * memory first. Bun's *default* `maxRequestBodySize` (128MB) happened to sit
+ * above `MAX_UPLOAD_BYTES` and so never bit in practice, but it was never
+ * actually configured — an accident of the default, not a deliberate
+ * ceiling wired to this codebase's own limits.
+ *
+ * Set explicitly here so the ceiling is legible and reconciled: it MUST be
+ * >= `MAX_UPLOAD_BYTES` (a legitimate max-size attachment upload must not be
+ * rejected at the transport layer before `/upload`'s own 100MB check ever
+ * runs) with headroom for multipart overhead (boundary delimiters, per-part
+ * headers — a few hundred bytes in practice, but the 20MB margin is
+ * generous rather than exact). `MAX_JSON_BODY_BYTES` (10MB) is well under
+ * `MAX_UPLOAD_BYTES`, so it never drives this number.
+ */
+export const MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 20 * 1024 * 1024; // 120MB
 
 // Storage upload policy: DENY-LIST (vault#517). A knowledge vault stores
 // arbitrary files — ebooks, office docs, datasets, archives, binaries — so we
@@ -4359,7 +4382,31 @@ export async function handleStorage(
   const assets = assetsDir(vault);
 
   if (req.method === "POST" && path === "/upload") {
-    const form = await req.formData();
+    // vault#588 FIX 1 — `req.formData()` throws on a malformed/non-multipart
+    // body (bad boundary, truncated body, wrong Content-Type entirely). Left
+    // uncaught, that throw escapes to server.ts's generic top-level catch: a
+    // 500 with no `error_type` — the multipart-transport analog of the
+    // `req.json()` gap LB7 fixed for the JSON routes (`parseJsonBody` above).
+    // Catch it here and return the same `invalid_request` taxonomy entry
+    // LB7b uses for "syntactically-parseable-transport but wrong/unusable
+    // shape" (see docs/HTTP_API.md's error-taxonomy table) rather than
+    // minting a new `invalid_form` type for what's ultimately the same bucket.
+    // Typed off `req.formData()`'s own return, not the DOM lib `FormData`
+    // global — `req: Request` resolves through undici's ambient types here,
+    // whose `FormData` isn't structurally assignable to lib.dom's.
+    let form: Awaited<ReturnType<typeof req.formData>>;
+    try {
+      form = await req.formData();
+    } catch {
+      return json(
+        {
+          error: "Request body must be valid multipart/form-data",
+          error_type: "invalid_request",
+          hint: "expected a multipart/form-data body with a `file` field",
+        },
+        400,
+      );
+    }
     const file = form.get("file");
     if (!(file instanceof File)) {
       return json({ error: "file is required", error_type: "missing_required_field", field: "file" }, 400);

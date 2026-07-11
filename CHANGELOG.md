@@ -34,6 +34,40 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.7] - 2026-07-11
+
+**Fix (low-severity transport robustness): the two leftovers from rc.4's
+request-body hardening (#590), tracked as #588.**
+
+### Fixed
+
+- **`POST /upload` with a malformed or non-multipart body now returns a
+  clean `400`, never a generic `500`.** `req.formData()` was called
+  uncaught — a bad multipart boundary, a truncated body, or a body sent
+  with a non-multipart `Content-Type` threw past the handler into the
+  server's generic top-level catch, the same `{"error": "Internal server
+  error"}`-with-no-`error_type` gap rc.4 fixed for `req.json()` on the
+  JSON-bodied routes. It's now caught and returns `400 invalid_request`
+  (the existing "wrong/unusable request-body shape" taxonomy entry — no new
+  `error_type` introduced). A well-formed multipart body missing the `file`
+  field keeps its existing `400 missing_required_field`; a normal upload is
+  unaffected.
+
+- **`Bun.serve` now sets `maxRequestBodySize` explicitly (120MB), instead of
+  relying on Bun's unconfigured 128MB default.** The JSON-body cap
+  (`MAX_JSON_BODY_BYTES`, 10MB) checks `Content-Length` before parsing, but
+  a chunked request with no `Content-Length` header falls through to the
+  post-parse backstop — which still means the transport buffered the whole
+  body into memory first. The only thing standing between that and Bun's
+  default ceiling was an accident of Bun's default happening to exceed
+  `MAX_UPLOAD_BYTES`, not a deliberate configured limit. `MAX_REQUEST_BODY_BYTES`
+  (`src/routes.ts`) is now `MAX_UPLOAD_BYTES` (100MB, the `/upload`
+  app-level cap) + 20MB headroom for multipart overhead, and is wired
+  explicitly into the `Bun.serve(...)` config in `src/server.ts` — a
+  legitimate max-size attachment upload is never capped below its own
+  app-level limit, and the transport now rejects an oversized chunked body
+  before it fully buffers rather than depending on an unstated default.
+
 ## [0.7.2-rc.6] - 2026-07-11
 
 **Fix (P1 correctness): date-range filtering, sorting, and incremental
