@@ -517,7 +517,7 @@ update-tag {
   fields: {
     held_on: { type: "string", indexed: true },                                         // queryable with operators
     status:  { type: "string", enum: ["scheduled", "done"], default: "scheduled" },      // explicit default — declare one to auto-fill
-    meeting_rating: { type: "integer" }                                                 // no default — stays unset until written; tag-specific name, not a bare `rating`
+    meeting_rating: { type: "integer" }                                                 // no default — stays unset until written; tag-specific name, not a bare rating
   }
 }
 \`\`\`
