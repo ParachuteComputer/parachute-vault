@@ -4572,6 +4572,390 @@ describe("MCP tools", async () => {
       expect(afterLink!.targetId).toBe(alice.id);
       expect(afterLink!.createdAt).toBe(beforeLink!.createdAt);
     });
+
+    it("regression guard: cardinality:'one' (scalar) reference field still creates exactly one edge", async () => {
+      const alice = await store.createNote("Alice", { id: "alice" });
+      await store.upsertTagSchema("task", { fields: { assignee: { type: "reference", cardinality: "one" } } });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { assignee: "alice" },
+      }) as any;
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "assignee");
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(alice.id);
+    });
+
+    // ---- Gap #2: cardinality:"many" (array) reference fields (vault#typed-reference-field) ----
+
+    it("cardinality:'many' reference field creates one link per array element, deduped, with no spurious type_mismatch warning", async () => {
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const result = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        // "People/Carol" appears twice — duplicate elements must dedupe to one edge.
+        metadata: { collaborators: ["People/Carol", "People/Dave", "People/Carol"] },
+      }) as any;
+
+      // No spurious type_mismatch — an array is exactly what cardinality:"many" asks
+      // for; pre-fix, valueMatchesType's "reference" case only accepted strings.
+      expect(result.validation_status.warnings).toEqual([]);
+
+      const links = (await store.getLinks(result.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      expect(new Set(links.map((l) => l.targetId))).toEqual(new Set([carol.id, dave.id]));
+
+      // Traversable via find-path, same as a scalar reference link.
+      const findPath = tools.find((t) => t.name === "find-path")!;
+      const path = await findPath.execute({ source: result.id, target: carol.id }) as any;
+      expect(path?.path).toEqual([result.id, carol.id]);
+    });
+
+    it("update-note changing a cardinality:'many' reference array adds the new link, drops the removed one, and leaves the unchanged one alone", async () => {
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      const erin = await store.createNote("Erin", { path: "People/Erin" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Carol", "People/Dave"] },
+      }) as any;
+
+      let links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      const carolLinkBefore = links.find((l) => l.targetId === carol.id)!;
+
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+      // Drop Dave, add Erin, keep Carol.
+      await updateNote.execute({
+        id: note.id,
+        metadata: { collaborators: ["People/Carol", "People/Erin"] },
+        force: true,
+      });
+
+      links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      expect(new Set(links.map((l) => l.targetId))).toEqual(new Set([carol.id, erin.id]));
+      // Dropped — Dave's link is gone.
+      expect(links.some((l) => l.targetId === dave.id)).toBe(false);
+      // Unchanged — Carol's edge is the SAME row (createdAt preserved), proving a
+      // real diff (not a blanket clear-and-recreate under the relationship).
+      const carolLinkAfter = links.find((l) => l.targetId === carol.id)!;
+      expect(carolLinkAfter.createdAt).toBe(carolLinkBefore.createdAt);
+    });
+
+    it("an unresolved array element is queued and backfills when its target note is created later, without disturbing already-resolved siblings", async () => {
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Carol", "People/Not Yet Created"] },
+      }) as any;
+
+      let links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(1); // only Carol resolves so far
+      expect(links[0]!.targetId).toBe(carol.id);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).toContain(note.id);
+
+      const target = await store.createNote("here now", { path: "People/Not Yet Created" });
+
+      links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(2);
+      expect(new Set(links.map((l) => l.targetId))).toEqual(new Set([carol.id, target.id]));
+    });
+
+    it("an array element resolving to the note itself creates a self-loop link, matching scalar self-reference behavior", async () => {
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        path: "Tasks/Self",
+        metadata: { collaborators: ["Tasks/Self"] },
+      }) as any;
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(note.id);
+    });
+
+    it("an ambiguous array element (matches ≥2 notes) is neither linked nor queued, mirroring the scalar ambiguous contract", async () => {
+      await store.createNote("Shared Title", { path: "A/Shared Title" });
+      await store.createNote("Shared Title", { path: "B/Shared Title" });
+      const target = await store.createNote("Target", { path: "People/Target" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["Shared Title", "People/Target"] },
+      }) as any;
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      // Only the unambiguous element links; "Shared Title" is neither linked nor queued.
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(target.id);
+
+      const queryNotes = tools.find((t) => t.name === "query-notes")!;
+      const broken = await queryNotes.execute({ has_broken_links: true }) as any[];
+      expect(broken.map((n: any) => n.id)).not.toContain(note.id);
+    });
+
+    // ---- Gap #3: schema-after-data backfill (vault#typed-reference-field) ----
+
+    it("declaring type:'reference' via update-tag after notes already carry the value backfills links for existing notes (scalar and array)", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const bob = await store.createNote("Bob", { path: "People/Bob" });
+      const carol = await store.createNote("Carol", { path: "People/Carol" });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // Written BEFORE the tag declares these fields as `reference` — plain
+      // untyped metadata, no schema applies at write time, so no link is created.
+      const scalarNote = await createNote.execute({
+        content: "Scalar task",
+        tags: ["task"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+      const arrayNote = await createNote.execute({
+        content: "Array task",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Bob", "People/Carol"] },
+      }) as any;
+
+      expect((await store.getLinks(scalarNote.id, { direction: "outbound" })).length).toBe(0);
+      expect((await store.getLinks(arrayNote.id, { direction: "outbound" })).length).toBe(0);
+
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "task",
+        fields: {
+          manager: { type: "reference" },
+          collaborators: { type: "reference", cardinality: "many" },
+        },
+      });
+
+      const scalarLinks = (await store.getLinks(scalarNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(scalarLinks).toHaveLength(1);
+      expect(scalarLinks[0]!.targetId).toBe(alice.id);
+
+      const arrayLinks = (await store.getLinks(arrayNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(arrayLinks).toHaveLength(2);
+      expect(new Set(arrayLinks.map((l) => l.targetId))).toEqual(new Set([bob.id, carol.id]));
+
+      // Idempotency: a LATER update-tag call that declares a NEW reference
+      // field re-triggers the tag's whole backfill walk (see
+      // `backfillReferenceFieldLinks` — it re-syncs every reference field on
+      // each note, not just the newly-added one). Already-synced links must
+      // not duplicate.
+      await updateTag.execute({
+        tag: "task",
+        fields: { reviewer: { type: "reference" } },
+      });
+
+      const scalarLinksAfter = (await store.getLinks(scalarNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(scalarLinksAfter).toHaveLength(1);
+      const arrayLinksAfter = (await store.getLinks(arrayNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(arrayLinksAfter).toHaveLength(2);
+    });
+
+    it("declaring type:'reference' on a PARENT tag backfills links for notes carrying a descendant (child) tag", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      // `subtask` is a child of `task` via parent_names — schema inheritance
+      // (vault#270) means `subtask` notes are in `task`'s effective walk.
+      await updateTag.execute({ tag: "subtask", parent_names: ["task"] });
+
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const note = await createNote.execute({
+        content: "Child task",
+        tags: ["subtask"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+
+      expect((await store.getLinks(note.id, { direction: "outbound" })).length).toBe(0);
+
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      const links = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(links).toHaveLength(1);
+      expect(links[0]!.targetId).toBe(alice.id);
+    });
+
+    // ---- Round-4 review fixes (2026-07-10) ----
+
+    it("BLOCKER 1: the schema-declaration backfill walks ALL notes, not the first 100", async () => {
+      // One shared target every note references.
+      const target = await store.createNote("Target", { path: "People/Target" });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // 120 notes each carrying a `manager` value BEFORE the field is a
+      // reference — exceeds queryNotes' default LIMIT 100.
+      const noteIds: string[] = [];
+      for (let i = 0; i < 120; i++) {
+        const n = await createNote.execute({
+          content: `Task ${i}`,
+          tags: ["task"],
+          metadata: { manager: "People/Target" },
+        }) as any;
+        noteIds.push(n.id);
+      }
+
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      // EVERY one of the 120 notes must have a manager edge — a 100-cap would
+      // leave 20 unlinked (the silent-half-graph this feature prevents).
+      let linked = 0;
+      for (const id of noteIds) {
+        const links = (await store.getLinks(id, { direction: "outbound" }))
+          .filter((l) => l.relationship === "manager" && l.targetId === target.id);
+        if (links.length === 1) linked++;
+      }
+      expect(linked).toBe(120);
+    });
+
+    it("BLOCKER 2: re-declaring an ALREADY-reference field via update-tag heals notes whose links were never built", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // Field is declared reference from the start, and a note is written.
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager")).toHaveLength(1);
+
+      // Simulate a pre-fix vault: the edge was never built. Delete it directly,
+      // leaving the metadata value in place but the graph edge missing.
+      await store.deleteLink(note.id, alice.id, "manager");
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager")).toHaveLength(0);
+
+      // Re-declare the SAME already-reference field — the documented heal path.
+      // A transition-keyed trigger would no-op here; the fix fires the backfill
+      // for any reference field in the declared schema.
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      const healed = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(healed).toHaveLength(1);
+      expect(healed[0]!.targetId).toBe(alice.id);
+    });
+
+    it("NIT 3: dropping an array element reconciles against RESOLVED targets — a since-renamed target's stale edge is dropped, and an aliased-same-target edge survives", async () => {
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      const erin = await store.createNote("Erin", { path: "People/Erin" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+
+      // --- Corner (a): a still-present element whose target is renamed after
+      // linking; then a DIFFERENT element is dropped. The renamed target's
+      // stale edge must be reconciled away (the old re-resolve-removed-value
+      // approach left it forever).
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Dave", "People/Erin"] },
+      }) as any;
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators")).toHaveLength(2);
+
+      // Rename Dave's target note — the raw value "People/Dave" no longer resolves.
+      await updateNote.execute({ id: dave.id, path: "People/David", force: true });
+
+      // Drop Erin (a different element); keep the now-stale "People/Dave".
+      await updateNote.execute({
+        id: note.id,
+        metadata: { collaborators: ["People/Dave"] },
+        force: true,
+      });
+
+      const afterA = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      // Erin dropped; Dave's stale edge (target renamed, value no longer
+      // resolves) reconciled away → zero edges, not a lingering stale one.
+      expect(afterA.some((l) => l.targetId === erin.id)).toBe(false);
+      expect(afterA.some((l) => l.targetId === dave.id)).toBe(false);
+
+      // --- Corner (c): two elements ALIAS the same target (path + H1 title).
+      // Dropping one alias must keep the shared edge (still referenced by the
+      // survivor), not delete it.
+      const carol = await store.createNote("# Carol\n\nbody", { path: "People/Carol" });
+      const aliasNote = await createNote.execute({
+        content: "Alias task",
+        tags: ["task"],
+        // "People/Carol" (path) and "Carol" (H1 title) both resolve to carol.
+        metadata: { collaborators: ["People/Carol", "Carol"] },
+      }) as any;
+      let aliasLinks = (await store.getLinks(aliasNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(aliasLinks).toHaveLength(1);
+      expect(aliasLinks[0]!.targetId).toBe(carol.id);
+
+      // Drop the title alias, keep the path alias → the shared edge survives.
+      await updateNote.execute({
+        id: aliasNote.id,
+        metadata: { collaborators: ["People/Carol"] },
+        force: true,
+      });
+      aliasLinks = (await store.getLinks(aliasNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(aliasLinks).toHaveLength(1);
+      expect(aliasLinks[0]!.targetId).toBe(carol.id);
+    });
   });
 
   it("find-path works with ID/path resolution", async () => {

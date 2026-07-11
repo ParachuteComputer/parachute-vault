@@ -348,7 +348,7 @@ function jsonTypeOf(value: unknown): string {
   return typeof value; // "string" | "number" | "boolean" | "object" | ...
 }
 
-function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
+function valueMatchesType(value: unknown, type: SchemaField["type"], cardinality?: SchemaField["cardinality"]): boolean {
   if (type === undefined) return true;
   switch (type) {
     case "string":
@@ -373,7 +373,22 @@ function valueMatchesType(value: unknown, type: SchemaField["type"]): boolean {
     // the write path (core/src/store.ts) separately resolves this value to
     // a note and maintains a graph link; see tag-schemas.ts's
     // `VALID_FIELD_TYPES` doc comment for the full contract.
+    //
+    // `cardinality: "many"` (vault#typed-reference-field gap #2) is a
+    // one-to-MANY reference field — the value is an ARRAY of reference
+    // strings, one per linked note, not a single string. Validate the
+    // shape a "many" reference actually takes: an array whose elements are
+    // ALL non-empty-typed strings (per-item type check — the ARRAY shape
+    // itself is separately covered by the `cardinality_mismatch` check
+    // below in `validateNote`, so this only needs to judge element types).
+    // Without this branch, EVERY valid `cardinality:"many"` reference write
+    // fired a self-contradictory `type_mismatch` ("should be reference, got
+    // array") — an array is exactly what "many" asks for; only a
+    // non-string ELEMENT should ever fail this check.
     case "reference":
+      if (cardinality === "many") {
+        return Array.isArray(value) && value.every((item) => typeof item === "string");
+      }
       return typeof value === "string";
   }
 }
@@ -435,7 +450,7 @@ export function validateNote(
 
     if (absent) continue;
 
-    if (spec.type && !valueMatchesType(value, spec.type)) {
+    if (spec.type && !valueMatchesType(value, spec.type, spec.cardinality)) {
       // Decision A (vault#553): an INDEXED field's type is a query
       // contract — a type-mismatched write poisons range-query ordering
       // (SQLite's TEXT-sorts-above-INTEGER affinity) regardless of whether

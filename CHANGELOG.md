@@ -34,6 +34,72 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.5] - 2026-07-10
+
+**Typed reference fields grow up: one-to-many links + retroactive backfill**
+— closes gaps #2 and #3 from `docs/design/typed-reference-field.md` (round-4
+bug hunt, LB8). `type: "reference"` schema fields were shipped for the
+single-target case only; this closes the two gaps that made a multi-target
+or declared-after-the-fact reference field silently lie about the graph.
+
+### Fixed
+
+- **`cardinality: "many"` reference fields now build real graph links.** A
+  field declared `{ type: "reference", cardinality: "many" }` (e.g.
+  `collaborators: ["carol", "dave"]`) was stored and indexed like any other
+  metadata, but the auto-link sync's `typeof value === "string"` guard
+  silently skipped every array value — the note read as connected in its
+  metadata but had zero edges in the graph. Array values now get ONE link
+  per element (same `relationship` = the field name, one row per resolved
+  target — the `links` table's own `UNIQUE(source_id, target_id,
+  relationship)` naturally handles duplicate elements resolving to the same
+  target). Updating the array **reconciles** the edges to match the new
+  value: it resolves the whole new array to a set of target notes, drops
+  every edge that's no longer among them, and (re-)creates the rest — an
+  unchanged element keeps its original `created_at`. Reconciling on resolved
+  targets (not on the raw strings) means the tricky cases come out right: a
+  dropped element whose target was renamed since still gets its stale edge
+  cleaned up; and two entries that point at the same note (say a path and
+  its title) keep the shared edge as long as one of them survives. An
+  element with no matching note yet queues exactly like a scalar reference
+  and backfills automatically the moment a matching note is created; an
+  ambiguous element (matches ≥2 notes) is neither linked nor guessed at,
+  same as the scalar contract. A self-referencing element creates a
+  self-loop link, matching the (unguarded) scalar behavior.
+
+- **The spurious `type_mismatch` warning on valid `cardinality: "many"`
+  reference writes is gone.** Validation's `reference` type check only ever
+  accepted a bare string, so every conforming array write — exactly what
+  `cardinality: "many"` asks for — fired a self-contradictory
+  `"'collaborators' should be reference, got array"` warning. The type
+  check now validates per-element (every array entry must be a string) when
+  `cardinality: "many"` is declared, instead of rejecting the array shape
+  outright.
+
+- **`update-tag` backfills links for notes that already carry a reference
+  value — for the whole tag, and re-declaring heals.** Previously, a tag
+  gaining a `type: "reference"` declaration AFTER notes already had matching
+  metadata values left those notes unlinked — only a future write touching
+  the field would sync it. `update-tag` (and REST's `PUT /api/tags/:name`,
+  the same underlying chokepoint) now walks **every** note carrying the tag
+  or a descendant and creates the missing links for the declared reference
+  field(s) — scalar or array, resolved or queued-for-backfill. Two things
+  make this trustworthy at scale: the walk is **unbounded** (an earlier cut
+  silently stopped at the first 100 notes, so a large tag stayed
+  half-linked), and it fires for **any** reference field in the tag's
+  schema — so **re-declaring an already-reference field HEALS** notes whose
+  links were never built (e.g. a vault upgraded from before one-to-many
+  links worked), which is exactly what the upgrade guide tells operators to
+  do. The backfill is purely **additive and idempotent** — it only ever
+  creates missing links, never deletes, so re-running it (or declaring an
+  unrelated field) never churns or drops an already-correct edge — and it
+  runs in the **same transaction** as the schema write, so if the walk fails
+  the schema change rolls back and a retry starts clean rather than leaving
+  a reference field whose links silently never built. Scoped to the field(s)
+  the call declared reference, so declaring a reference field on one tag
+  never disturbs an unrelated reference field on another tag the note also
+  carries.
+
 ## [0.7.2-rc.4] - 2026-07-10
 
 **Runtime-robustness hardening** — four fixes (two P1, two minor) from the
