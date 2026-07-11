@@ -1539,27 +1539,53 @@ function migrateToV25(db: Database): void {
  * — never NULL, never a throw.
  *
  * ALL-OR-NOTHING (matches the #565 migrateToV25 pattern): the ALTER + backfill
- * run inside a SINGLE `transaction`. The idempotency guard is
- * `hasColumn(db, "notes", "updated_at_ms")`; if the ALTER committed but the
- * backfill then crashed, the guard would see the column on the next boot and
- * skip — leaving rows with NULL `updated_at_ms` and a permanently broken
- * keyset. Wrapping the whole sequence means a rollback removes the column too,
- * so the guard correctly re-detects "not migrated" and the next boot re-runs
- * it cleanly. The index create lives OUTSIDE the wrapped block (`CREATE INDEX
- * IF NOT EXISTS`) so a fresh vault — column already present from SCHEMA_SQL —
- * still gets the index; on a fresh vault the ALTER+backfill guard short-
- * circuits and only the index-ensure runs.
+ * run inside a SINGLE `transaction`. If the ALTER committed but the backfill
+ * then crashed, a column-presence-only guard would see the column on the next
+ * boot and skip — leaving rows with NULL `updated_at_ms` and a permanently
+ * broken keyset. Wrapping the whole sequence means a rollback removes the
+ * column too, so the next boot re-detects "not migrated" and re-runs cleanly.
+ * The index create lives OUTSIDE the wrapped block (`CREATE INDEX IF NOT
+ * EXISTS`) so a fresh vault — column already present from SCHEMA_SQL — still
+ * gets the index.
+ *
+ * SELF-HEALING (generalist review nit 1): the backfill is NOT gated on column
+ * absence — it runs whenever ANY row has a NULL `updated_at_ms`, via a single
+ * `WHERE updated_at_ms IS NULL` pass that serves BOTH the fresh-ALTER case
+ * (every row NULL right after ADD COLUMN) AND the leak case (a row that slipped
+ * in with NULL while the column already existed). The leak is real: a
+ * schema-v2-era vault upgrades through `migrateFromV2`, whose
+ * `INSERT INTO notes … SELECT` omits `updated_at_ms`, landing rows with NULL
+ * even though SCHEMA_SQL created the column — a column-presence guard would
+ * skip them forever (the exact keyset-invisibility class this migration
+ * closes). Steady state (column present, zero NULLs) does a single cheap
+ * COUNT and no writes.
  */
 function migrateToV26(db: Database): void {
   if (!hasTable(db, "notes")) return;
 
-  if (!hasColumn(db, "notes", "updated_at_ms")) {
+  const needsColumn = !hasColumn(db, "notes", "updated_at_ms");
+  // Backfill runs when the column is being added OR when any existing row
+  // carries a NULL keyset key (self-heal). A steady-state boot short-circuits
+  // here on the cheap COUNT and touches nothing.
+  let pending = needsColumn;
+  if (!needsColumn) {
+    const nulls = (
+      db.prepare("SELECT COUNT(*) AS n FROM notes WHERE updated_at_ms IS NULL").get() as { n: number }
+    ).n;
+    pending = nulls > 0;
+  }
+
+  if (pending) {
     let backfilled = 0;
     let fellBack = 0;
     transaction(db, () => {
-      db.exec("ALTER TABLE notes ADD COLUMN updated_at_ms INTEGER");
+      if (needsColumn) {
+        db.exec("ALTER TABLE notes ADD COLUMN updated_at_ms INTEGER");
+      }
+      // One `WHERE updated_at_ms IS NULL` pass covers both cases: right after
+      // ALTER every row is NULL; on a self-heal only the leaked rows are.
       const rows = db.prepare(
-        "SELECT id, created_at, updated_at FROM notes",
+        "SELECT id, created_at, updated_at FROM notes WHERE updated_at_ms IS NULL",
       ).all() as { id: string; created_at: string | null; updated_at: string | null }[];
       const update = db.prepare("UPDATE notes SET updated_at_ms = ? WHERE id = ?");
       for (const row of rows) {
@@ -1578,6 +1604,7 @@ function migrateToV26(db: Database): void {
     if (backfilled > 0) {
       console.log(
         `[vault] migrated to schema v26 (vault#586): backfilled updated_at_ms for ${backfilled} note(s)` +
+          (needsColumn ? "" : " (self-heal — NULL keyset keys on an existing column)") +
           (fellBack > 0 ? ` (${fellBack} fell back to created_at / sentinel for an unparseable updated_at)` : "") +
           `.`,
       );

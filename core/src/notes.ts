@@ -1115,6 +1115,11 @@ function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: str
     if (field === "created_at") {
       column = "n.created_at";
     } else if (field === "updated_at") {
+      // NOTE (vault#586 follow-up): this range filter compares the TEXT
+      // `updated_at`, which is inconsistent on non-canonical rows the same way
+      // the cursor keyset was pre-v26. Cursor pagination moved to the integer
+      // `updated_at_ms` column; `date_filter`/`order_by`/export `--since` still
+      // read the string and are tracked separately. Behavior unchanged here.
       column = "n.updated_at";
     } else {
       // Re-uses the same indexed-field gate as `metadata` operator queries
@@ -1148,7 +1153,15 @@ function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: str
   return { conditions, params };
 }
 
-export function queryNotes(db: Database, opts: QueryOpts): Note[] {
+/**
+ * `_outUpdatedAtMs` (internal, vault#586) — when supplied, the phase-1 page
+ * query writes each returned id's integer `updated_at_ms` keyset key into it.
+ * Only `queryNotesPaged` passes it, to derive the cursor watermark from the
+ * SAME statement that determined page membership + order (one consistent
+ * snapshot — see the call site). Ordinary callers omit it and are unaffected;
+ * it never touches the returned `Note` shape.
+ */
+export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<string, number>): Note[] {
   validateLimitOffset(opts);
   const { conditions, params } = buildFilterConditions(db, opts);
 
@@ -1300,15 +1313,26 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // Phase 2 fetches full rows for just the page (≤ limit ids) and re-orders
   // to the phase-1 order; tags are hydrated in ONE batched query instead of
   // one query per returned note.
+  // Phase 1 also selects `n.updated_at_ms` (vault#586) so a paging caller can
+  // read the keyset key from the SAME statement that applied the keyset order
+  // — the watermark then comes from one consistent snapshot, immune to a
+  // cross-process writer bumping a page row's ms between two separate reads.
   const idSql = `
-    SELECT n.id FROM notes n
+    SELECT n.id, n.updated_at_ms FROM notes n
     ${whereClause}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
   `;
   params.push(limit, offset);
 
-  const idRows = db.prepare(idSql).all(...params) as { id: string }[];
+  const idRows = db.prepare(idSql).all(...params) as { id: string; updated_at_ms: number | null }[];
+  if (_outUpdatedAtMs) {
+    for (const r of idRows) {
+      if (r.updated_at_ms !== null && r.updated_at_ms !== undefined) {
+        _outUpdatedAtMs.set(r.id, r.updated_at_ms);
+      }
+    }
+  }
   return fetchNotesByIdsOrdered(db, idRows.map((r) => r.id));
 }
 
@@ -1488,33 +1512,6 @@ export function getNoteTagsForNotes(db: Database, noteIds: string[]): Map<string
 }
 
 /**
- * Read the integer `updated_at_ms` keyset key (vault#586) for a set of note
- * ids, one IN-list query per chunk. Returns id → ms; a row whose column is
- * NULL (shouldn't occur post-migrateToV26 — every write and the backfill set
- * it) is omitted, so callers default to 0. This is the AUTHORITATIVE watermark
- * source — the SAME column the cursor walk-order reads — so the max derived
- * here can never diverge from the walk boundary.
- */
-function getUpdatedAtMsForIds(db: Database, noteIds: string[]): Map<string, number> {
-  const map = new Map<string, number>();
-  if (noteIds.length === 0) return map;
-  const ids = [...new Set(noteIds)];
-  // Chunk under the DO 100-bound-param cap (see sql-in.ts).
-  for (const chunk of chunkForInClause(ids)) {
-    const placeholders = chunk.map(() => "?").join(", ");
-    const rows = db.prepare(
-      `SELECT id, updated_at_ms FROM notes WHERE id IN (${placeholders})`,
-    ).all(...chunk) as { id: string; updated_at_ms: number | null }[];
-    for (const row of rows) {
-      if (row.updated_at_ms !== null && row.updated_at_ms !== undefined) {
-        map.set(row.id, row.updated_at_ms);
-      }
-    }
-  }
-  return map;
-}
-
-/**
  * Extract the result-set-affecting subset of `QueryOpts` for cursor hashing.
  *
  * `cursor`, `limit`, `offset`, `_tagsExpanded` (internal cache key) are
@@ -1571,7 +1568,12 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
  * with a non-null `updated_at` greater than the unix epoch).
  */
 export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
-  const notes = queryNotes(db, opts);
+  // Capture each page row's integer keyset key (vault#586) from the SAME
+  // phase-1 statement that ordered + sliced the page — one consistent
+  // snapshot, so the watermark can't leapfrog rows a cross-process writer
+  // bumps between reads. This replaces a separate post-query round-trip.
+  const updatedAtMsById = new Map<string, number>();
+  const notes = queryNotes(db, opts, updatedAtMsById);
   const queryHash = computeQueryHash(toQueryHashInputs(opts));
 
   // Watermark math: pick the larger of (last returned row, prior cursor
@@ -1590,20 +1592,20 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
     lastId = prior.last_id;
   }
   if (notes.length > 0) {
-    // Advance the watermark to the page's MAX (updated_at_ms, id) by reading
-    // the AUTHORITATIVE keyset key straight from the column (vault#586) — the
-    // SAME integer `updated_at_ms` the walk-order used. Reading the column,
-    // rather than re-deriving ms from each note's `updatedAt` string, is what
-    // keeps walk-order and watermark from diverging: a row whose backfilled
-    // column and non-canonical `updated_at` TEXT disagree would otherwise
-    // re-parse to a different ms here and skip or re-deliver at the boundary.
-    // No throw — a NULL column (shouldn't occur post-migrateToV26) reads as 0.
-    // When a cursor is in effect the SQL already returns rows in
-    // (updated_at_ms, id) order so the last row IS the max; the explicit max
-    // also covers the created_at-ordered no-cursor path.
-    const msById = getUpdatedAtMsForIds(db, notes.map((n) => n.id));
+    // Advance the watermark to the page's MAX (updated_at_ms, id) using the
+    // keyset keys captured in the phase-1 snapshot above (vault#586) — the
+    // SAME integer `updated_at_ms` the walk-order used, from the SAME read.
+    // Using the snapshot, rather than re-deriving ms from each note's
+    // `updatedAt` string or re-reading the column, is what keeps walk-order
+    // and watermark from diverging: a row whose backfilled column and
+    // non-canonical `updated_at` TEXT disagree would otherwise re-parse to a
+    // different ms here and skip or re-deliver at the boundary. No throw — a
+    // NULL key (shouldn't occur post-migrateToV26) reads as 0. When a cursor
+    // is in effect the SQL already returns rows in (updated_at_ms, id) order
+    // so the last row IS the max; the explicit max also covers the
+    // created_at-ordered no-cursor path.
     for (const note of notes) {
-      const ms = msById.get(note.id) ?? 0;
+      const ms = updatedAtMsById.get(note.id) ?? 0;
       if (ms > lastUpdatedAt || (ms === lastUpdatedAt && note.id > lastId)) {
         lastUpdatedAt = ms;
         lastId = note.id;

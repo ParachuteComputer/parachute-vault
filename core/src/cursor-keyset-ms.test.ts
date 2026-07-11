@@ -23,8 +23,18 @@
 import { describe, it, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { initSchema, SCHEMA_VERSION } from "./schema.js";
-import { timestampToMs } from "./cursor.js";
+import { timestampToMs, decodeCursor } from "./cursor.js";
+import { SqliteStore } from "./store.js";
 import * as noteOps from "./notes.js";
+
+/** Raw read of a note's integer keyset key (not on the Note wire shape). */
+function msOf(db: Database, id: string): number | null {
+  return (
+    db.prepare("SELECT updated_at_ms FROM notes WHERE id = ?").get(id) as {
+      updated_at_ms: number | null;
+    }
+  ).updated_at_ms;
+}
 
 // ---------------------------------------------------------------------------
 // timestampToMs — the ONE UTC-correct parser feeding the backfill + writes.
@@ -364,5 +374,164 @@ describe("migrateToV26 is all-or-nothing (crash mid-backfill) (vault#586)", () =
       ).updated_at_ms;
       expect(got).toBe(row.expectedMs);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SELF-HEAL (review nit 1): a vault whose notes table ALREADY has the column
+// but carries NULL updated_at_ms rows — the shape a schema-v2-era upgrade
+// produces (migrateFromV2's INSERT…SELECT omits the column). A
+// column-presence-only guard would leave those NULL forever (invisible to the
+// keyset). migrateToV26 must backfill WHERE updated_at_ms IS NULL regardless.
+// ---------------------------------------------------------------------------
+describe("migrateToV26 self-heals NULL updated_at_ms on an existing column (vault#586)", () => {
+  function buildColumnPresentWithNullRows(): Database {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE notes (
+        id TEXT PRIMARY KEY,
+        content TEXT DEFAULT '',
+        path TEXT,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT,
+        extension TEXT NOT NULL DEFAULT 'md',
+        created_by TEXT,
+        created_via TEXT,
+        last_updated_by TEXT,
+        last_updated_via TEXT,
+        updated_at_ms INTEGER
+      );
+      CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT);
+      INSERT INTO schema_version (version, applied_at) VALUES (25, '2026-01-01T00:00:00.000Z');
+    `);
+    const ins = db.prepare(
+      "INSERT INTO notes (id, content, created_at, updated_at, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
+    );
+    // Two leaked rows: column present, updated_at_ms NULL — one space-form, one
+    // unparseable (falls back to created_at).
+    ins.run("leak-space", "", "2024-03-03T08:15:00.000Z", "2024-03-03 08:15:00", null);
+    ins.run("leak-bad", "", "2024-07-07T00:00:00.000Z", "not-a-timestamp", null);
+    // An already-populated row carrying a deliberately-arbitrary ms — the
+    // self-heal touches only NULLs, so this must survive UNCHANGED.
+    ins.run("already", "", "2024-01-01T00:00:00.000Z", "2024-01-01T00:00:00.000Z", 999);
+    return db;
+  }
+
+  it("backfills the NULL rows UTC-correctly, leaves populated rows untouched, ends with zero NULLs", () => {
+    const db = buildColumnPresentWithNullRows();
+    expect(msOf(db, "leak-space")).toBeNull(); // precondition: leaked NULL
+    initSchema(db);
+
+    expect(
+      (db.prepare("SELECT COUNT(*) AS n FROM notes WHERE updated_at_ms IS NULL").get() as { n: number }).n,
+    ).toBe(0);
+    // Space-form healed to UTC (not local-shifted).
+    expect(msOf(db, "leak-space")).toBe(Date.UTC(2024, 2, 3, 8, 15));
+    // Unparseable updated_at healed via created_at fallback.
+    expect(msOf(db, "leak-bad")).toBe(Date.UTC(2024, 6, 7));
+    // Already-populated row: NOT re-derived (still the arbitrary 999).
+    expect(msOf(db, "already")).toBe(999);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WRITE-SITE PINS (review nit 3): assert updated_at_ms actually advances at
+// the restore + rename-cascade sites, so reverting either ms hunk goes RED
+// (previously the whole suite passed with those hunks removed).
+// ---------------------------------------------------------------------------
+describe("write sites maintain updated_at_ms in lockstep (vault#586)", () => {
+  it("restoreNoteTimestamps derives updated_at_ms UTC-correctly from a non-canonical updated_at (pins store.ts hunk)", async () => {
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    const note = await store.createNote("x");
+    const createMs = msOf(db, note.id)!;
+
+    // Import restores a verbatim, non-canonical (space-form) updated_at.
+    await store.restoreNoteTimestamps(note.id, "2024-01-01T00:00:00.000Z", "2024-03-03 08:15:00");
+
+    // updated_at kept verbatim (round-trip fidelity); ms derived UTC-correctly.
+    const row = db.prepare("SELECT updated_at, updated_at_ms FROM notes WHERE id = ?").get(note.id) as {
+      updated_at: string;
+      updated_at_ms: number;
+    };
+    expect(row.updated_at).toBe("2024-03-03 08:15:00");
+    expect(row.updated_at_ms).toBe(Date.UTC(2024, 2, 3, 8, 15));
+    // A revert of the store hunk would leave ms at the createNote value.
+    expect(row.updated_at_ms).not.toBe(createMs);
+  });
+
+  it("renameTag path-cascade bumps updated_at_ms on a `_tags/<old>` note (pins notes.ts path hunk)", async () => {
+    const db = new Database(":memory:");
+    const store = new SqliteStore(db);
+    // Body has no #task, so ONLY the path cascade touches this note — isolating
+    // the path hunk from the content hunk.
+    const note = await store.createNote("plain body, no hashtags", {
+      path: "_tags/task",
+      tags: ["task"],
+    });
+    const beforeMs = msOf(db, note.id)!;
+    await new Promise((r) => setTimeout(r, 5));
+
+    await store.renameTag("task", "todo");
+
+    const fresh = await store.getNote(note.id);
+    expect(fresh!.path).toBe("_tags/todo");
+    const afterMs = msOf(db, note.id)!;
+    expect(afterMs).toBeGreaterThan(beforeMs);
+    expect(afterMs).toBe(Date.parse(fresh!.updatedAt!));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SAME-SNAPSHOT WATERMARK (review nit 2): the watermark is captured in the
+// phase-1 page statement (the one that ordered + sliced the page), not a
+// separate later read. A concurrent writer that bumps a page row's ms AFTER
+// the page is read must NOT make the watermark leapfrog past unseen rows.
+// ---------------------------------------------------------------------------
+describe("queryNotesPaged watermark comes from the phase-1 page snapshot (vault#586)", () => {
+  it("a concurrent writer bumping a page row's ms after the page read does NOT advance the watermark past it", () => {
+    const db = buildPreV26Vault();
+    initSchema(db);
+
+    // The true max keyset key of the full page (bootstrap, limit > N): the
+    // July row. note-offset-plus (an EARLIER row) is what we'll bump.
+    const trueMax = Date.UTC(2024, 6, 7); // note-unparseable → created_at fallback
+    const bumpTarget = "note-offset-plus";
+
+    const origPrepare = db.prepare.bind(db);
+    let bumped = false;
+    (db as any).prepare = (sql: string) => {
+      const stmt = origPrepare(sql);
+      // Intercept ONLY the phase-1 ordering statement.
+      if (/SELECT n\.id, n\.updated_at_ms FROM notes n/.test(sql)) {
+        const origAll = stmt.all.bind(stmt);
+        (stmt as any).all = (...args: unknown[]) => {
+          const rows = (origAll as (...a: unknown[]) => unknown[])(...args);
+          // A concurrent writer lands right AFTER the page snapshot is read,
+          // shoving the target row's ms far into the future. A watermark that
+          // re-read the column in a SECOND statement would leapfrog to it.
+          if (!bumped) {
+            bumped = true;
+            origPrepare("UPDATE notes SET updated_at_ms = ? WHERE id = ?").run(9_000_000_000_000, bumpTarget);
+          }
+          return rows;
+        };
+      }
+      return stmt;
+    };
+
+    const page = noteOps.queryNotesPaged(db, { cursor: "", limit: 100 });
+    (db as any).prepare = origPrepare;
+
+    // Positive control: the interception actually fired (guards against the
+    // phase-1 SQL drifting and silently no-op'ing the test).
+    expect(bumped).toBe(true);
+    // The watermark reflects the PRE-bump page snapshot — the real max — NOT
+    // the injected 9e12. A re-read-based watermark would encode 9e12 and skip
+    // every row between trueMax and 9e12 on the next call.
+    const wm = decodeCursor(page.next_cursor).last_updated_at;
+    expect(wm).toBe(trueMax);
+    expect(wm).not.toBe(9_000_000_000_000);
   });
 });

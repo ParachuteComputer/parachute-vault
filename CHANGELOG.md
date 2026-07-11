@@ -59,7 +59,10 @@ predicate, and watermark all read, so they can no longer disagree.
   genuinely unparseable value falls back to the row's `created_at`, then to a
   stable sentinel — never NULL, never a throw. The ALTER + backfill run in one
   transaction (crash-safe: a partial backfill rolls back and re-runs cleanly on
-  the next boot).
+  the next boot). The backfill is **self-healing** — it runs whenever any row
+  carries a NULL `updated_at_ms`, not only when the column is first added, so a
+  schema-v2-era upgrade (whose `INSERT…SELECT` leaves the column NULL) is
+  repaired rather than left permanently invisible to the keyset.
 - **Opaque + backward-compatible.** `updated_at_ms` is an internal ordering
   key; note IDs, `updated_at`, and every response shape are unchanged.
   Cursors already encoded their watermark in milliseconds, so **cursors minted
