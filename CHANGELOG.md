@@ -34,6 +34,38 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2] - 2026-07-11
+
+**Round-4 reliability release — promoted to `@latest`.** Consolidates rc.1–rc.7
+(a bug-hunt → fix → real-agent-harness arc), each detailed below. Headline
+fixes, all with regression tests and confirmed working in a persona-harness
+round (Sonnet-5 agents doing real work, every claim verified against REST):
+
+- **Cursor pagination no longer skips notes on aged/imported vaults** (P0) — the
+  `(updated_at, id)` keyset moved onto an integer `updated_at_ms` mirror (rc.2);
+  `date_filter`/`order_by`/`export --since` follow (rc.6).
+- **Import/export data-integrity** — `--blow-away` import is atomic; note paths
+  with NUL/`..` are rejected and can't brick an export; duplicate-id imports are
+  reported, not silently dropped (rc.3).
+- **Wikilink resilience** — deleting then recreating a target re-heals inbound
+  `[[links]]` across all four resolution legs (path/basename/title/extension);
+  malformed requests return a clean 400, not a 500 (rc.4).
+- **Typed reference fields** — `cardinality:"many"` arrays build real graph
+  links, and declaring a reference field backfills links for notes that already
+  carry the value (rc.5).
+- **Transport** — malformed uploads return 400; an explicit request-body ceiling
+  (rc.7).
+
+Onboarding-guide polish (from the harness): the seeded Getting Started guide now
+tells a connecting AI to **capture a first note from what the person already
+said before asking for more** (a first session shouldn't end with an empty
+vault), and to **prefer tag-specific field names** (field names are global
+across the vault, so a shared `rating` across tags with different types
+collides).
+
+No manual migration — schema upgrades (through v26) run automatically on first
+boot. See `UPGRADING.md` for the 0.7.1 → 0.7.2 notes.
+
 ## [0.7.2-rc.7] - 2026-07-11
 
 **Fix (low-severity transport robustness): the two leftovers from rc.4's
