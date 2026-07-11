@@ -372,6 +372,19 @@ export function computeExpandedTagCounts(
 export function findHierarchyCycles(h: TagHierarchy): string[] {
   const cycles: string[] = [];
   for (const tag of h.childrenOf.keys()) {
+    // Direct self-edge (`parent_names` lists the tag itself) — checked
+    // separately from the descendant-set gate below because
+    // `getTagDescendants` can't see it: its traversal seeds `result` with
+    // `{tag}` and then skips re-expanding any child already present in
+    // `result` (the visited-set that makes runtime traversal cycle-safe) —
+    // so a bare `X -> X` edge never grows `descendants` past size 1, and
+    // `descendants.size > 1` alone silently reports it clean. Only
+    // reachable via guard-bypassing data (a direct DB write, or an import
+    // that skips `upsertTagRecord`'s write-time cycle guard).
+    if (h.childrenOf.get(tag)?.has(tag)) {
+      cycles.push(tag);
+      continue;
+    }
     const descendants = getTagDescendants(h, tag);
     if (descendants.has(tag) && descendants.size > 1) {
       // tag reaches itself through a non-trivial path

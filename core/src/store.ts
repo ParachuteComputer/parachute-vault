@@ -15,6 +15,7 @@ import {
   resolveUnresolvedWikilinks,
   resolveOrQueueLink,
   clearQueuedLink,
+  requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
 import { timestampToMs } from "./cursor.js";
@@ -382,6 +383,13 @@ export class BunSqliteStore implements Store {
     // by design, hooks subscribing to "deleted" receive a DeletedNoteRef,
     // not a Note.
     const existing = noteOps.getNote(this.db, id);
+    // LB6: re-queue inbound wikilink edges BEFORE the FK cascade drops the
+    // `links` rows, so recreating a note at this path/title auto-heals the
+    // edge instead of leaving every referencing note's `[[link]]` dead until
+    // it's individually re-saved. See requeueInboundWikilinksForDelete's doc
+    // comment for why this must run pre-delete and what it deliberately
+    // excludes (typed `links`, not just wikilinks).
+    requeueInboundWikilinksForDelete(this.db, id);
     noteOps.deleteNote(this.db, id);
     if (existing?.path) this.invalidateConfigCachesForPath(existing.path);
     // Dispatch even when `existing` was null — the caller asked for a

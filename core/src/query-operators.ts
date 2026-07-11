@@ -102,12 +102,68 @@ function toBinding(field: string, op: string, value: unknown): SQLQueryBindings 
 }
 
 /**
+ * Best-effort lookup of a metadata field's declared `type` across every tag
+ * schema — used ONLY to sharpen the {@link requireIndexedField} error hint
+ * below when the field was never indexed. Scans `tags.fields` directly
+ * rather than going through `indexed_fields` (which by construction has no
+ * row for a type that can never BE indexed, e.g. `"number"`) or a
+ * per-note schema resolution (scoped to one note's tags, not "any tag
+ * anywhere"). Only reached on the FIELD_NOT_INDEXED error path — a full
+ * table scan here is fine since it runs once per rejected call, never on a
+ * hot path. Returns the type from the FIRST tag found declaring `field`
+ * (a cross-tag type conflict on the same field name is its own separate
+ * validation elsewhere, not this function's job); `undefined` when no tag
+ * declares this field name, or its `fields` JSON doesn't parse.
+ */
+function findDeclaredFieldType(db: Database, field: string): string | undefined {
+  const rows = db.prepare(
+    `SELECT fields FROM tags WHERE fields IS NOT NULL`,
+  ).all() as { fields: string | null }[];
+  for (const row of rows) {
+    if (!row.fields) continue;
+    try {
+      const parsed: unknown = JSON.parse(row.fields);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const spec = (parsed as Record<string, unknown>)[field];
+      if (spec === null || typeof spec !== "object" || Array.isArray(spec)) continue;
+      const type = (spec as Record<string, unknown>).type;
+      if (typeof type === "string") return type;
+    } catch {
+      // Malformed `fields` JSON on some other tag — not this lookup's job
+      // to validate; skip and keep scanning.
+    }
+  }
+  return undefined;
+}
+
+/**
  * Look up `field` in `indexed_fields` or throw a loud error suggesting the
  * caller declare it via `update-tag` with `indexed: true`.
+ *
+ * That generic advice is IMPOSSIBLE to satisfy for a field whose schema
+ * declares `type: "number"` (a float) — only `integer`/`boolean` are
+ * indexable numeric shapes (see `indexed-fields.ts`'s `TYPE_MAP`), so
+ * `update-tag` with `indexed: true` on a `number` field itself throws
+ * "unsupported type ... for indexing". An agent that only sees the generic
+ * hint has no escape from that loop (LB — round-4 bug hunt). When the
+ * declared type is `"number"`, swap in a hint that names the actual fix:
+ * store the value as an integer (e.g. cents instead of dollars) and index
+ * THAT field instead.
  */
 export function requireIndexedField(db: Database, field: string): IndexedField {
   const row = getIndexedField(db, field);
   if (!row) {
+    if (findDeclaredFieldType(db, field) === "number") {
+      throw new QueryError(
+        `metadata field "${field}" is not indexed, and can never be: it's declared type: "number" (a float), and only integer/boolean fields are indexable numeric types. "declare indexed: true" will not work on this field.`,
+        "FIELD_NOT_INDEXED",
+        {
+          error_type: "field_not_indexed",
+          field,
+          hint: `"${field}" is a float ("number") field — float fields can't be server-side indexed, filtered with operators, used in order_by, or summed via aggregate. Store the value as an integer instead (e.g. cents rather than dollars) and declare indexed: true on THAT field to enable those.`,
+        },
+      );
+    }
     throw new QueryError(
       `metadata field "${field}" is not indexed. To use operator queries or order_by on this field, declare it via update-tag with indexed: true.`,
       "FIELD_NOT_INDEXED",

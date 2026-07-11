@@ -840,3 +840,66 @@ export function getContentWikilinkWarnings(
 
   return warnings;
 }
+
+// ---------------------------------------------------------------------------
+// Delete-time re-queue (LB6) — a deleted note's INBOUND wikilink edges must
+// come back to life if a note is later recreated at the same path/title.
+// ---------------------------------------------------------------------------
+
+/**
+ * Before a note is deleted, re-queue every INBOUND `wikilink`-relationship
+ * edge pointing at it into `unresolved_wikilinks`, so that recreating a note
+ * matching the original `[[target]]` text (same path, basename, or title —
+ * anything {@link resolveWikilink} would have matched) auto-heals the edge
+ * via {@link resolveUnresolvedWikilinks}, exactly as if the link had never
+ * resolved in the first place.
+ *
+ * Without this, `deleteNote`'s `DELETE FROM notes` cascades the `links` row
+ * away (FK `ON DELETE CASCADE`) but leaves `unresolved_wikilinks` untouched —
+ * a note recreated at the deleted note's path never gets linked back to,
+ * because nothing is pending resolution for it. Only a re-save of the
+ * SOURCE note (which reparses its own content from scratch) would recover
+ * it; a fresh `[[Foo]]` reference elsewhere would work, but the ORIGINAL
+ * source note's edge stayed dead despite its unchanged `[[Foo]]` text.
+ *
+ * MUST be called BEFORE the note row is deleted — it needs both the `links`
+ * row (about to cascade away) and, per source, the CURRENT content (to
+ * recover the raw `[[target]]` text the resolver actually matched on: a
+ * resolved link's row retains the target NOTE id, not the original bracket
+ * text, and title-fallback / basename resolution mean that text can differ
+ * from the deleted note's own path).
+ *
+ * Scope: only `relationship = "wikilink"` inbound edges are re-queued.
+ * Explicit typed `links` (structured `links: [{target, relationship}]`
+ * entries, vault#555) are left alone — those are hand-authored associations
+ * the caller owns, not content-derived, so silently resurrecting them as a
+ * forward-ref on an unrelated future note would be surprising. A source
+ * that links to itself is never queued (wikilinks never create self-links,
+ * so no such inbound row can exist) and is skipped defensively anyway.
+ */
+export function requeueInboundWikilinksForDelete(db: Database, noteId: string): void {
+  let inbound: { source_id: string }[];
+  try {
+    inbound = db.prepare(
+      "SELECT DISTINCT source_id FROM links WHERE target_id = ? AND relationship = ?",
+    ).all(noteId, WIKILINK_REL) as { source_id: string }[];
+  } catch {
+    return; // links table missing (shouldn't happen post-schema-init, but never block a delete on this)
+  }
+  if (inbound.length === 0) return;
+
+  for (const { source_id } of inbound) {
+    if (source_id === noteId) continue; // defensive — wikilinks never self-link
+
+    const source = getNote(db, source_id);
+    if (!source || !source.content) continue;
+
+    const targetMap = dedupeWikilinkTargets(parseWikilinks(source.content));
+    for (const [, wl] of targetMap) {
+      const detail = resolveWikilinkDetailed(db, wl.target);
+      if (detail.resolved && detail.note_id === noteId) {
+        queueUnresolvedLink(db, source_id, wl.target, WIKILINK_REL);
+      }
+    }
+  }
+}

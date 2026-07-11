@@ -11,7 +11,7 @@ import { BunStore } from "./vault-store.ts";
 import { generateMcpTools } from "../core/src/mcp.ts";
 import { getLinksHydrated } from "../core/src/links.ts";
 import { buildVaultProjection } from "../core/src/vault-projection.ts";
-import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks } from "./routes.ts";
+import { handleNotes, handleTags, handleFindPath, handleVault, handleUnresolvedWikilinks, MAX_JSON_BODY_BYTES } from "./routes.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import type { TagScopeCtx } from "./routes.ts";
 import { extractApiKey } from "./auth.ts";
@@ -4194,6 +4194,131 @@ describe("HTTP /notes", async () => {
       const after = await store.getNote(noteId);
       expect((after!.metadata as any)?.transcribe_stub).toBe(true);
       delete process.env.ASSETS_DIR;
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REST transport hardening — malformed/wrong-shape/oversize JSON bodies
+// (LB7). Before the fix: malformed JSON on POST /notes, POST
+// /notes/:id/attachments, and PUT /tags/:name threw past the handler into
+// server.ts's generic top-level catch — a 500 with no `error_type` (LB7a),
+// unlike the already-hardened /tags/merge and /tags/:name/rename routes,
+// which returned a clean 400 `invalid_json`. A syntactically-valid but
+// wrong-shape body (`null`, `42`, `[]`) either threw a TypeError deep in the
+// handler or sailed through property access as `undefined`, silently
+// creating a blank note / no-op update (LB7b). And nothing capped request
+// body size, so an oversized `content` field reached the store unbounded
+// (LB7c). Every assertion here MUST fail without the fix (parseJsonBody).
+// ---------------------------------------------------------------------------
+describe("REST transport hardening — malformed/wrong-shape/oversize JSON bodies (LB7)", async () => {
+  /** Raw (non-JSON.stringify'd) request body — for malformed-JSON cases mkReq can't express. */
+  function mkRawReq(method: string, path: string, rawBody: string): Request {
+    return new Request(`${BASE}${path}`, {
+      method,
+      body: rawBody,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  describe("malformed JSON -> clean 400 invalid_json, not a 500 (LB7a)", () => {
+    test("POST /notes", async () => {
+      const res = await handleNotes(mkRawReq("POST", "/notes", "{not valid json"), store, "");
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_json");
+    });
+
+    test("POST /notes/:id/attachments", async () => {
+      await store.createNote("x", { id: "att-malformed" });
+      const res = await handleNotes(
+        mkRawReq("POST", "/notes/att-malformed/attachments", "{not valid json"),
+        store,
+        "/att-malformed/attachments",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_json");
+    });
+
+    test("PATCH /notes/:idOrPath", async () => {
+      await store.createNote("x", { id: "patch-malformed" });
+      const res = await handleNotes(
+        mkRawReq("PATCH", "/notes/patch-malformed", "{not valid json"),
+        store,
+        "/patch-malformed",
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_json");
+    });
+
+    test("PUT /tags/:name — parity with the already-hardened /tags/merge shape", async () => {
+      const res = await handleTags(mkRawReq("PUT", "/tags/malformed", "{not valid json"), store, "/malformed");
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_json");
+    });
+
+    test("PATCH /vault-info", async () => {
+      const cfg = { name: "default" } as { name: string };
+      const res = await handleVault(mkRawReq("PATCH", "/vault", "{not valid json"), store, cfg as any);
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_json");
+    });
+  });
+
+  describe("wrong-shape (but syntactically valid) JSON body -> 400, not 500 or a silent blank write (LB7b)", () => {
+    test("POST /notes with a `null` body -> 400, not a 500 TypeError", async () => {
+      const res = await handleNotes(mkReq("POST", "/notes", null), store, "");
+      expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_json");
+    });
+
+    test("POST /notes with a bare number body -> 400, not a silently-created blank note", async () => {
+      const res = await handleNotes(mkReq("POST", "/notes", 42), store, "");
+      expect(res.status).toBe(400);
+      const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
+      expect(after).toHaveLength(0); // no blank note landed
+    });
+
+    test("POST /notes with a bare array body -> 400, not a silently-created blank note", async () => {
+      const res = await handleNotes(mkReq("POST", "/notes", []), store, "");
+      expect(res.status).toBe(400);
+      const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
+      expect(after).toHaveLength(0);
+    });
+
+    test("POST /notes with notes: \"not-an-array\" -> 400, not per-character blank notes", async () => {
+      const res = await handleNotes(mkReq("POST", "/notes", { notes: "oops" }), store, "");
+      expect(res.status).toBe(400);
+      const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
+      expect(after).toHaveLength(0);
+    });
+
+    test("POST /notes with a non-object item inside notes[] -> 400", async () => {
+      const res = await handleNotes(
+        mkReq("POST", "/notes", { notes: [{ content: "ok", path: "ok-one" }, 42] }),
+        store,
+        "",
+      );
+      expect(res.status).toBe(400);
+      const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
+      expect(after).toHaveLength(0); // the whole batch is rejected, not a partial write
+    });
+  });
+
+  describe("oversize request body -> 413, not an unbounded write (LB7c)", () => {
+    test("POST /notes with an oversized content field is rejected", async () => {
+      const huge = "x".repeat(MAX_JSON_BODY_BYTES + 1024);
+      const res = await handleNotes(mkReq("POST", "/notes", { content: huge, path: "huge-note" }), store, "");
+      expect(res.status).toBe(413);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("payload_too_large");
+      const stored = await store.getNoteByPath("huge-note");
+      expect(stored).toBeNull();
     });
   });
 });

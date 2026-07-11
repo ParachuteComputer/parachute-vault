@@ -179,6 +179,101 @@ function jsonWithWarnings(data: unknown, warnings: QueryWarning[], status = 200)
 }
 
 /**
+ * Sane upper bound on a mutating-route JSON request body (LB7c). Without
+ * this, a giant field (most commonly a note's `content`) sails straight
+ * through `req.json()` and into wikilink parsing + the store write with no
+ * gate at all — reproduced at 50MB `content` -> 201 Created, RSS 92MB ->
+ * 663MB (memory-DoS via a single request). 10MB is generous for
+ * hand-authored or transcribed note content (multiple hours of dense
+ * transcript) while bounding the failure mode. Mirrors `/upload`'s
+ * `MAX_UPLOAD_BYTES` file-size gate for the JSON-body transport.
+ */
+export const MAX_JSON_BODY_BYTES = 10 * 1024 * 1024;
+
+function payloadTooLargeResponse(bytes: number): Response {
+  return json(
+    {
+      error: `Request body too large (${(bytes / 1024 / 1024).toFixed(1)}MB). Max: ${Math.round(MAX_JSON_BODY_BYTES / 1024 / 1024)}MB`,
+      error_type: "payload_too_large",
+      limit: MAX_JSON_BODY_BYTES,
+      got: bytes,
+    },
+    413,
+  );
+}
+
+/**
+ * Single choke point for every mutating route that reads a JSON request
+ * body (LB7 — door asymmetry fix). Three failure modes, all returning a
+ * clean 400/413 instead of falling through to server.ts's generic
+ * `{ error: "Internal server error" }` 500-with-no-`error_type` (LB7a), or
+ * silently succeeding on a wrong-shape body (LB7b — `null` used to throw a
+ * TypeError deep in the handler; `42`/`[]` used to sail through property
+ * access as `undefined` and create a blank note/no-op update):
+ *
+ *   1. **Oversize** — `Content-Length` over {@link MAX_JSON_BODY_BYTES}
+ *      rejects BEFORE `req.json()` even buffers/parses the body (the cheap
+ *      path). When the header is absent or understates the true size
+ *      (chunked transfer, a lying client), the parsed body's own
+ *      JSON-serialized size is checked as a backstop — one extra parse, but
+ *      still cheaper than letting the oversized value reach the store and
+ *      get re-processed (wikilink scan, indexing, etc.).
+ *   2. **Malformed JSON** — `req.json()` rejects; caught here rather than
+ *      propagating to the top-level handler.
+ *   3. **Wrong shape** — valid JSON, but not a plain object (`null`, an
+ *      array, or a bare primitive). Gated by `requireObject` (default
+ *      `true`); every current caller wants this — the parameter exists so a
+ *      future non-object-bodied route doesn't have to bypass the helper
+ *      entirely to opt out.
+ *
+ * Callers: check `.ok` and return `.response` on failure; `.body` is the
+ * parsed JSON value (still `any` — this validates SHAPE, not the specific
+ * fields a given route requires, which callers keep checking themselves).
+ */
+async function parseJsonBody(
+  req: Request,
+  opts?: { requireObject?: boolean },
+): Promise<{ ok: true; body: any } | { ok: false; response: Response }> {
+  const contentLengthHeader = req.headers.get("content-length");
+  if (contentLengthHeader) {
+    const declaredBytes = Number(contentLengthHeader);
+    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_JSON_BODY_BYTES) {
+      return { ok: false, response: payloadTooLargeResponse(declaredBytes) };
+    }
+  }
+
+  const INVALID_JSON = Symbol("invalid-json");
+  const parsed = await req.json().catch(() => INVALID_JSON);
+  if (parsed === INVALID_JSON) {
+    return { ok: false, response: json({ error: "Invalid JSON body", error_type: "invalid_json" }, 400) };
+  }
+
+  if (!contentLengthHeader) {
+    const approxBytes = Buffer.byteLength(JSON.stringify(parsed) ?? "", "utf8");
+    if (approxBytes > MAX_JSON_BODY_BYTES) {
+      return { ok: false, response: payloadTooLargeResponse(approxBytes) };
+    }
+  }
+
+  const requireObject = opts?.requireObject ?? true;
+  if (requireObject && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) {
+    return {
+      ok: false,
+      response: json(
+        {
+          error: "Request body must be a JSON object",
+          error_type: "invalid_json",
+          hint: `expected a JSON object body — got ${parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed}`,
+        },
+        400,
+      ),
+    };
+  }
+
+  return { ok: true, body: parsed };
+}
+
+/**
  * REST-only `removed_param` warning (vault#550) — the flat `date_field` /
  * `date_from` / `date_to` query-string params were removed at 0.6.4
  * (vault#288) and have been silently ignored ever since (routes.ts:633-ish
@@ -1647,8 +1742,39 @@ async function handleNotesInner(
 
     // POST /notes — create (single or batch)
     if (method === "POST") {
-      const body = await req.json() as any;
+      const parsedBody = await parseJsonBody(req);
+      if (!parsedBody.ok) return parsedBody.response;
+      const body = parsedBody.body as any;
+      // `notes` (when present) must actually be an array — otherwise
+      // `items` below iterates whatever `body.notes` happens to be (e.g. a
+      // STRING iterates as one-character items), silently creating a batch
+      // of blank notes (LB7b).
+      if (body.notes !== undefined && !Array.isArray(body.notes)) {
+        return json(
+          {
+            error: "notes must be an array",
+            error_type: "invalid_json",
+            field: "notes",
+            hint: 'pass { "notes": [...] } for a batch, or a single note object with no `notes` key',
+          },
+          400,
+        );
+      }
       const items: any[] = body.notes ?? [body];
+      // Every batch item must itself be a plain object — a primitive/array
+      // entry would otherwise read as an all-`undefined` note (LB7b).
+      for (const item of items) {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          return json(
+            {
+              error: "each note must be a JSON object",
+              error_type: "invalid_json",
+              hint: 'each entry in "notes" (or the top-level body, for a single-note POST) must be an object, e.g. {"content": "..."}',
+            },
+            400,
+          );
+        }
+      }
 
       // Batch cap (#213): refuse oversized batches before doing any work. 500
       // is the cap (Benjamin's number) — tighter blast radius than 1000 for
@@ -2052,7 +2178,9 @@ async function handleNotesInner(
       if (!noteWithinTagScope(note, tagScope.allowed, tagScope.raw)) {
         return json({ error: "Not found", error_type: "not_found" }, 404);
       }
-      const body = await req.json() as { path: string; mimeType: string; transcribe?: boolean };
+      const parsedBody = await parseJsonBody(req);
+      if (!parsedBody.ok) return parsedBody.response;
+      const body = parsedBody.body as { path: string; mimeType: string; transcribe?: boolean };
       if (!body.path || !body.mimeType) {
         return json(
           { error: "path and mimeType are required", error_type: "missing_required_field", hint: "pass both `path` and `mimeType`" },
@@ -2235,7 +2363,9 @@ async function handleNotesInner(
       // Body is parsed up front so the `if_missing: "create"` branch
       // (vault#309) can fire when the note doesn't exist. Pre-#309
       // shape parsed the body only after the not-found check.
-      const body = await req.json() as any;
+      const parsedBody = await parseJsonBody(req);
+      if (!parsedBody.ok) return parsedBody.response;
+      const body = parsedBody.body as any;
       const note = await resolveNote(store, idOrPath);
       if (!note) {
         // vault#309 — `if_missing: "create"` turns this PATCH into a
@@ -3100,7 +3230,9 @@ export async function handleTags(
     if (tagScope.allowed && !tagScope.allowed.has(putTagName)) {
       return tagScopeForbidden(tagScope.raw ?? []);
     }
-    const body = (await req.json()) as {
+    const parsedBody = await parseJsonBody(req);
+    if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.body as {
       description?: string | null;
       fields?: Record<string, unknown> | null;
       relationships?: Record<string, unknown> | null;
@@ -3514,7 +3646,9 @@ export async function handleVault(
   }
 
   if (req.method === "PATCH") {
-    const body = await req.json() as {
+    const parsedBody = await parseJsonBody(req);
+    if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.body as {
       description?: string;
       config?: { audio_retention?: string; auto_transcribe?: { enabled?: unknown } };
     };
