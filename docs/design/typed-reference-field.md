@@ -1,7 +1,7 @@
 # Typed reference field — indexed value + auto-link
 
-**Status:** shipped (scalar case), known gaps below
-**Date:** 2026-07-10
+**Status:** shipped (scalar case + `cardinality: "many"` arrays + schema-after-data backfill); remaining known gaps below
+**Date:** 2026-07-10 (gaps #2/#3 closed 2026-07-10, round-4 bug hunt LB8)
 **Author:** vault builder (Claude)
 **Repos touched:** parachute-vault
 
@@ -83,6 +83,58 @@ link; an unresolved target queues and backfills when the target note is
 created later; querying by the field (both plain metadata-equality and, when
 `indexed: true`, the `eq` operator) works.
 
+### 3. `cardinality: "many"` (array) values, and schema-after-data backfill — CLOSED (round-4 bug hunt, LB8, 2026-07-10)
+
+Gaps #2 and #3 below (as originally numbered) are now closed:
+
+- **Array reference values create real links — one edge per element.**
+  `BunSqliteStore.syncReferenceFieldArrayLinks` (`core/src/store.ts`) is the
+  `cardinality: "many"` counterpart to the scalar sync above, dispatched
+  whenever either side of a field's before/after comparison is an array.
+  Old-vs-new membership is diffed as a SET (order and duplicate elements
+  don't matter — `["carol","carol"]` collapses to one edge, matching what
+  the `links` table's own `UNIQUE(source_id, target_id, relationship)`
+  would do anyway): elements only in the new set are resolved-or-queued
+  exactly like a scalar reference (same self-link, ambiguous-match, and
+  forward-ref-backfill contracts); elements only in the old set have their
+  specific edge (and only that element's queued forward-ref, via the new
+  `clearQueuedLinkTarget`, NOT the blanket `clearQueuedLink` a multi-element
+  field can't safely use) removed; elements in BOTH sets are left
+  completely untouched — no delete/recreate churn on an unchanged element,
+  same "don't touch what didn't change" discipline the scalar path already
+  had. `valueMatchesType` (`core/src/schema-defaults.ts`) also gained a
+  `cardinality: "many"` branch for the `reference` type — a conforming array
+  write no longer trips a self-contradictory `type_mismatch` warning (an
+  array is exactly what "many" asks for; only a non-string ELEMENT now
+  fails the check).
+
+- **`update-tag` backfills links when a field is newly declared (or
+  changed) to `type: "reference"`.** `BunSqliteStore.upsertTagRecord` (the
+  chokepoint both the MCP `update-tag` tool and REST's `PUT
+  /api/tags/:name` funnel through) now diffs the tag's prior field map
+  against the incoming one; for every field whose type is transitioning TO
+  `"reference"`, `backfillReferenceFieldLinks` walks every note carrying the
+  tag (or a descendant, via schema inheritance — same scope
+  `countConformanceViolations` uses for its own schema-change impact walk)
+  and re-runs the write-path sync against each note's CURRENT metadata, as
+  if the value had just been set. Runs AFTER the schema-config cache is
+  invalidated, so the sync resolves against the just-persisted declaration;
+  runs in its own transaction, separate from the tag-record write itself.
+  Idempotent by construction (same clear-before-create / diff-only
+  discipline as the write-path sync) — re-declaring an unchanged schema, or
+  a later call that adds an unrelated reference field (which re-walks the
+  WHOLE tag, since the sync is per-note not per-field), never duplicates an
+  already-correct link. Scoped to fields transitioning TO `"reference"`
+  specifically — a field that's ALREADY `"reference"` and stays
+  `"reference"` on a re-declare skips the walk entirely (already in sync
+  from prior writes/backfills); a `cardinality` change on an
+  already-`"reference"` field (e.g. `"one"` → `"many"`) does NOT re-trigger
+  this walk today — see the still-open note under gap #3 below.
+
+Both are covered in `core/src/core.test.ts` under the same `describe("typed
+reference field", …)` block (search `cardinality:'many'` and
+`backfills links for existing notes`).
+
 ## Known gaps (deliberately out of scope for this PR)
 
 1. **No inline `unresolved_link` warning on the response.** Structured
@@ -97,45 +149,38 @@ created later; querying by the field (both plain metadata-equality and, when
    "this write queued N forward-refs" result the MCP/REST layers can fold
    into their existing `warnings` array — a small, mechanical follow-up.
 
-2. **Scalar values only.** `cardinality: "many"` (an array of references,
-   e.g. `assignees: ["alice", "bob"]`) is stored and validated (each item
-   would need to independently satisfy `type: "reference"`'s string check,
-   though `valueMatchesType`'s array/cardinality checks today validate the
-   ARRAY shape, not per-item types) but does **not** create any links — the
-   sync's `typeof nextValue === "string"` guard means a non-string (array)
-   value is simply skipped for linking. Multi-target reference fields would
-   need: (a) per-item type validation, and (b) diffing an array-of-old vs
-   array-of-new to add/remove the right subset of links rather than the
-   current "clear all under this relationship, recreate one" strategy. Left
-   for a follow-up once there's a concrete multi-assignee use case to design
-   against.
+2. ~~Scalar values only.~~ **CLOSED 2026-07-10** — see the new "§3" section
+   above. `cardinality: "many"` array values now create one link per element
+   with proper add/remove diffing, and the spurious `type_mismatch` warning
+   on a valid array write is gone.
 
-3. **No retroactive backfill.** If a tag GAINS a `type: "reference"`
-   declaration for a field that existing notes already carry a value for,
-   those notes are not retroactively linked — only a write that actually
-   touches the field (going forward) triggers the sync. This mirrors the
-   existing posture for `indexed: true` (declaring a field indexed doesn't
-   retroactively index prior notes' values beyond the generated column
-   itself, which IS backfilled by SQLite's `GENERATED ALWAYS AS`) and for
-   `default` (vault#553 Decision B — no implicit backfill). An operator
-   wanting to backfill links for pre-existing data would re-`update-note`
-   each affected note (even a no-op `metadata` echo would trigger the sync,
-   since the "unchanged" fast path compares against the PRE-write value, not
-   "was this call's payload identical" — actually: echoing the SAME value
-   back IS treated as unchanged and skipped. A genuine backfill needs a
-   one-off script that walks affected notes and re-writes with a real
-   value, or a small dedicated `reconcileReferenceLinks` admin op — not
-   built here).
+3. ~~No retroactive backfill.~~ **CLOSED (mostly) 2026-07-10** — see the new
+   "§3" section above. `update-tag` now backfills links for existing notes
+   when a field is newly declared (or changed) to `type: "reference"`. One
+   narrower case remains open: a field that's ALREADY `type: "reference"`
+   and has its `cardinality` changed (e.g. `"one"` → `"many"`) does NOT
+   re-trigger the backfill walk, since the trigger is keyed on the field's
+   TYPE transitioning to `"reference"`, not on any change to its spec. Notes
+   with array-shaped values written while the field was still misdeclared
+   as `cardinality: "one"` (or written against pre-fix code, before gap #2
+   closed) stay unlinked until either a real write touches the field again
+   or the field's `type` is round-tripped (cleared then re-declared
+   `"reference"`, which re-triggers the walk). No test/use case has needed
+   this yet; flag it if one shows up.
 
 4. **Tag-mutation-triggered sync not wired.** Adding/removing a TAG on a
    note (`tagNote`/`untagNote`, or the `tags` param some update-note flows
    pass separately from `metadata`) can change which schema fields apply to
    a note without touching `metadata` in that same `store.updateNote` call.
    If that tag-add newly makes an already-set field a reference field, the
-   link isn't created until the field is next written. Same rationale as
-   #3 — the sync is a WRITE-PATH concern (mirrors how `applySchemaDefaults`
-   backfill also only runs at the moment tags are being added in the same
-   MCP/REST call, not retroactively).
+   link isn't created until the field is next written. This is the mirror
+   image of the now-closed gap #3 (schema changes under a note vs. a note
+   changing under a schema): #3's backfill runs from the TAG side
+   (`update-tag` walking its notes); this one would need to run from the
+   NOTE side (`tagNote` walking the note's newly-effective schema) — not
+   wired here, same "sync is a write-path concern" rationale (mirrors how
+   `applySchemaDefaults` backfill also only runs at the moment tags are
+   being added in the same MCP/REST call, not retroactively).
 
 5. **Relationship-name collision is intentional, not defended against.** A
    reference field's relationship name is field-owned: if a note ALSO

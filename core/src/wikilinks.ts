@@ -808,6 +808,35 @@ export function clearQueuedLink(db: Database, sourceId: string, relationship: st
 }
 
 /**
+ * Drop exactly ONE pending forward-ref — scoped by `targetPath` in addition
+ * to `sourceId`/`relationship` (the full `unresolved_wikilinks` primary
+ * key). Used by the `cardinality:"many"` reference-field array sync
+ * (core/src/store.ts's `syncReferenceFieldLinks`) when a SPECIFIC array
+ * element is removed from a field's value: unlike the scalar path (which
+ * owns the ENTIRE relationship namespace and can safely clear every queued
+ * row via {@link clearQueuedLink}), an array field can have MULTIPLE
+ * pending forward-refs under the same relationship at once (one per
+ * unresolved element) — blanket-clearing all of them on a single element's
+ * removal would silently drop the other still-pending elements' queue rows.
+ * Safe no-op when the table doesn't exist yet or nothing is queued for this
+ * exact (source, target, relationship) triple.
+ */
+export function clearQueuedLinkTarget(
+  db: Database,
+  sourceId: string,
+  relationship: string,
+  targetPath: string,
+): void {
+  try {
+    db.prepare(
+      "DELETE FROM unresolved_wikilinks WHERE source_id = ? AND relationship = ? AND target_path = ? COLLATE NOCASE",
+    ).run(sourceId, relationship, targetPath);
+  } catch {
+    // Table may not exist yet — nothing to clear.
+  }
+}
+
+/**
  * Resolve a structured link NOW, or queue it for lazy resolution when the
  * target doesn't exist yet — mirroring the wikilink forward-ref contract
  * (a target created later, in this same batch or a future call, backfills

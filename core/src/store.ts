@@ -14,7 +14,9 @@ import {
   syncWikilinks,
   resolveUnresolvedWikilinks,
   resolveOrQueueLink,
+  resolveLinkTargetDetailed,
   clearQueuedLink,
+  clearQueuedLinkTarget,
   requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
@@ -24,6 +26,7 @@ import { HookRegistry } from "./hooks.js";
 import {
   loadTagHierarchy,
   getTagExpansion,
+  getTagDescendants,
   stripTagHash,
   TAG_CONFIG_PREFIX,
   DEFAULT_TAG_NAME,
@@ -44,6 +47,36 @@ import {
 } from "./conformance.js";
 import type { SearchMode } from "./search-query.js";
 import { runDoctorScan, type DoctorReport, type DoctorScanOpts } from "./doctor.js";
+
+/**
+ * Normalize a `type: "reference"` field value (scalar OR array — see
+ * `BunSqliteStore.syncReferenceFieldArrayLinks`) into a Set of non-empty,
+ * trimmed string elements. A bare scalar string becomes a one-element set
+ * (so a cardinality transition between scalar and array diffs correctly
+ * against the other side); a non-array/non-string value (undefined, null,
+ * number, object, …) becomes the empty set; array elements that aren't
+ * non-empty strings are dropped (they can never resolve to a link target).
+ * Set semantics absorb both element ORDER and DUPLICATE entries, matching
+ * how the underlying `links` table's UNIQUE(source_id, target_id,
+ * relationship) would collapse duplicate-target elements anyway.
+ */
+function referenceValueToSet(value: unknown): Set<string> {
+  const out = new Set<string>();
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === "string" && item.trim() !== "") out.add(item);
+    }
+  } else if (typeof value === "string" && value.trim() !== "") {
+    out.add(value);
+  }
+  return out;
+}
+
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
 
 /**
  * bun:sqlite-backed Store implementation. Internally everything is
@@ -115,7 +148,8 @@ export class BunSqliteStore implements Store {
   /**
    * Auto-link sync for `type: "reference"` schema fields
    * (vault#typed-reference-field — see `docs/design/typed-reference-field.md`
-   * for the full design + known gaps).
+   * for the full design; gaps #2/#3 closed below, see the doc for what
+   * remains open).
    *
    * A `reference`-typed field is BOTH an indexed value (handled by the
    * ordinary metadata write — no special casing needed there, see
@@ -130,27 +164,34 @@ export class BunSqliteStore implements Store {
    *
    * Called from `createNote`/`updateNote`/`createNotes` — the single
    * chokepoint both MCP and REST funnel through — AFTER the note row itself
-   * is written, so `note.tags`/`note.metadata` reflect the final state.
+   * is written, so `note.tags`/`note.metadata` reflect the final state. Also
+   * called from `backfillReferenceFieldLinks` (below) when `update-tag`
+   * newly declares a field `type: "reference"` — gap #3.
    *
    * `priorMetadata` is the note's metadata BEFORE this write (`undefined` on
-   * create). For each reference field, if its value is unchanged from
-   * `priorMetadata`, nothing is touched — the existing link (if any) already
-   * reflects it, and re-running the resolve/queue machinery on every
-   * unrelated write (e.g. a content-only edit) would be wasted work. When
-   * the value DID change (set, changed, or removed), every existing link +
-   * queued forward-ref under that field's relationship name is cleared
-   * first, then re-established from the new value — this makes the field's
-   * current value the single source of truth for "this field's link"
-   * without needing to track the specific prior target.
+   * create, and on a backfill walk — the current value is treated as freshly
+   * set so it resolves/queues unconditionally). For each SCALAR reference
+   * field, if its value is unchanged from `priorMetadata`, nothing is
+   * touched — the existing link (if any) already reflects it, and
+   * re-running the resolve/queue machinery on every unrelated write (e.g. a
+   * content-only edit) would be wasted work. When the value DID change (set,
+   * changed, or removed), every existing link + queued forward-ref under
+   * that field's relationship name is cleared first, then re-established
+   * from the new value — this makes the field's current value the single
+   * source of truth for "this field's link" without needing to track the
+   * specific prior target.
    *
-   * Known gaps (see the design doc): only scalar (`cardinality: "one"`,
-   * the default) reference values are linked — an array value is left as a
-   * validated-like-string-per-item... actually an array value simply isn't
-   * a string, so no link is created for it (the write still succeeds; a
-   * `type_mismatch`/`cardinality_mismatch` warning surfaces via the normal
-   * `validation_status` path). A tag gaining a `reference` field declaration
-   * does NOT retroactively link notes that already carry a matching value —
-   * only writes that actually touch the field (going forward) sync.
+   * A `cardinality: "many"` (array) value takes a different path —
+   * {@link syncReferenceFieldArrayLinks} — since a relationship name can now
+   * back MULTIPLE edges (one per element) rather than at most one, so
+   * "clear everything under this relationship, recreate" would be wrong: it
+   * would drop+recreate edges for elements that didn't even change. That
+   * method diffs old-vs-new array membership (a Set, so element order and
+   * duplicate entries don't matter) and only touches what actually changed.
+   * Dispatched whenever EITHER side of the comparison is an array — this
+   * also correctly handles a field transitioning between scalar and array
+   * shape (e.g. a schema's `cardinality` changes), by treating a scalar side
+   * as a one-element set.
    */
   private syncReferenceFieldLinks(
     note: Note,
@@ -167,6 +208,12 @@ export class BunSqliteStore implements Store {
 
       const nextValue = metadata[fieldName];
       const priorValue = prior[fieldName];
+
+      if (Array.isArray(nextValue) || Array.isArray(priorValue)) {
+        this.syncReferenceFieldArrayLinks(note.id, fieldName, nextValue, priorValue);
+        continue;
+      }
+
       if (nextValue === priorValue) continue; // unchanged — link (if any) already reflects it
 
       // Re-establish this field's link from scratch: drop whatever it
@@ -198,6 +245,120 @@ export class BunSqliteStore implements Store {
         }
       }
     }
+  }
+
+  /**
+   * The `cardinality: "many"` counterpart of the scalar sync above (vault
+   * typed-reference-field gap #2, docs/design/typed-reference-field.md).
+   * ONE link per array element, all sharing `relationship = fieldName` — the
+   * `links` table's `UNIQUE(source_id, target_id, relationship)` naturally
+   * dedupes distinct elements resolving to the same target, and distinct
+   * elements resolving to distinct targets coexist as separate rows under
+   * the same relationship name.
+   *
+   * `nextValue`/`priorValue` are read as SETS of non-empty, trimmed string
+   * elements (via {@link referenceValueToSet}) — a non-array scalar
+   * contributes a one-element set (so a cardinality transition diffs
+   * correctly), non-string/empty elements are dropped (they can never
+   * resolve to a link target; `valueMatchesType` already flags them via the
+   * normal `type_mismatch` path if the schema disagrees), and DUPLICATE
+   * elements collapse to one (a `["carol","carol"]` array creates exactly
+   * one edge to carol, matching how `createLink`'s own UNIQUE constraint
+   * would collapse it anyway).
+   *
+   * Diffs the two sets and only touches what changed:
+   * - Elements in BOTH sets are left alone — no DB write, and (crucially)
+   *   an element still queued as an unresolved forward-ref stays queued
+   *   rather than being torn down and re-queued under a fresh row.
+   * - Elements only in the OLD set are REMOVED: resolve the value now (the
+   *   same resolver the original write used — a target's path/id is stable
+   *   unless the target itself was renamed/deleted since) and, if resolved,
+   *   delete that one edge; either way, drop any queued forward-ref scoped
+   *   to that exact element via {@link clearQueuedLinkTarget} (NOT the
+   *   blanket {@link clearQueuedLink}, which would also drop OTHER elements'
+   *   still-pending queue rows under the same relationship).
+   * - Elements only in the NEW set are ADDED: resolve-or-queue exactly like
+   *   the scalar path, including the same self-link (no guard — mirrors the
+   *   scalar path, which has none either) and ambiguous-match (neither
+   *   linked nor queued, vault#570) contracts.
+   *
+   * Two sets that are IDENTICAL (regardless of original order/duplicates in
+   * either array) short-circuit to a no-op — mirrors the scalar path's
+   * unchanged-value fast path.
+   */
+  private syncReferenceFieldArrayLinks(
+    noteId: string,
+    fieldName: string,
+    nextValue: unknown,
+    priorValue: unknown,
+  ): void {
+    const nextSet = referenceValueToSet(nextValue);
+    const priorSet = referenceValueToSet(priorValue);
+
+    if (setsEqual(nextSet, priorSet)) return; // same membership — nothing to do
+
+    for (const value of priorSet) {
+      if (nextSet.has(value)) continue; // present in both — untouched
+      const detail = resolveLinkTargetDetailed(this.db, value);
+      if (detail.resolved && detail.note_id) {
+        linkOps.deleteLink(this.db, noteId, detail.note_id, fieldName);
+      }
+      clearQueuedLinkTarget(this.db, noteId, fieldName, value);
+    }
+
+    for (const value of nextSet) {
+      if (priorSet.has(value)) continue; // present in both — untouched
+      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName);
+      if (outcome.status === "resolved") {
+        linkOps.createLink(this.db, noteId, outcome.note_id, fieldName);
+      }
+    }
+  }
+
+  /**
+   * Gap #3 backfill (vault typed-reference-field,
+   * docs/design/typed-reference-field.md): when `update-tag` DECLARES a
+   * field `type: "reference"` for the first time, or CHANGES an existing
+   * field's type TO `"reference"`, existing notes that already carry a
+   * value for that field predate the declaration and would otherwise sit
+   * unlinked forever — only a future write that actually touches the field
+   * triggers `syncReferenceFieldLinks`. This walks every note carrying
+   * `tag` (or a descendant — same scope `countConformanceViolations` uses
+   * for its own schema-change impact walk) and re-runs the write-path sync
+   * against each note's CURRENT metadata, exactly as if the value had just
+   * been set (`priorMetadata: undefined`).
+   *
+   * Idempotent by construction: re-declaring an unchanged schema (or
+   * calling this twice) re-clears-and-recreates the SAME link/queue state
+   * `syncReferenceFieldLinks`/`syncReferenceFieldArrayLinks` would already
+   * be in — no duplicate rows (the `links` UNIQUE constraint plus this
+   * method's own clear-before-create discipline), and a note with no value
+   * for the field is a no-op (`nextValue`/`priorValue` both undefined).
+   *
+   * Called AFTER the schema-config cache has already been invalidated (see
+   * the call site in `upsertTagRecord`), so `resolveNoteSchemas` inside the
+   * sync sees the JUST-persisted field declaration rather than a stale
+   * pre-write cache. Runs in its own transaction, separate from the tag
+   * record write — `update-tag` is `vault:admin`-tier, so a bounded
+   * per-tag(+descendants) walk here is an accepted cost, same posture as
+   * `countConformanceViolations`.
+   */
+  private backfillReferenceFieldLinks(tag: string): void {
+    const hierarchy = this.getTagHierarchy();
+    const tagSet = Array.from(getTagDescendants(hierarchy, tag));
+    if (tagSet.length === 0) return;
+
+    const notes = noteOps.queryNotes(this.db, { tags: tagSet, tagMatch: "any" });
+    if (notes.length === 0) return;
+
+    const tagsById = noteOps.getNoteTagsForNotes(this.db, notes.map((n) => n.id));
+
+    this.transaction(() => {
+      for (const note of notes) {
+        const tags = tagsById.get(note.id) ?? note.tags ?? [];
+        this.syncReferenceFieldLinks({ ...note, tags }, undefined);
+      }
+    });
   }
 
   /**
@@ -863,6 +1024,24 @@ export class BunSqliteStore implements Store {
     const priorIndexed = indexedSet(priorRecord?.fields);
     const nextIndexed = indexedSet(nextFields);
 
+    // Gap #3 backfill trigger (vault typed-reference-field,
+    // docs/design/typed-reference-field.md) — a field that's newly declared
+    // (or newly CHANGED to) `type: "reference"` in THIS call needs existing
+    // notes reconciled, since only a future write touching the field would
+    // otherwise sync it. Scoped to fields whose type is transitioning TO
+    // "reference" (prior type was something else, or the field didn't exist
+    // in the prior record at all) — a field that was ALREADY "reference" and
+    // stays "reference" on a re-declare is skipped here (its notes are
+    // already in sync from prior writes/backfills; re-declaring an unchanged
+    // schema should be a cheap no-op, not a full re-walk every time).
+    const priorFieldsForRefCheck = priorRecord?.fields ?? {};
+    const needsReferenceBackfill =
+      patch.fields !== undefined &&
+      Object.entries(nextFields ?? {}).some(
+        ([fieldName, spec]) =>
+          spec.type === "reference" && priorFieldsForRefCheck[fieldName]?.type !== "reference",
+      );
+
     // PRE-VALIDATE every newly-indexed field BEFORE any persistence. A bad
     // field name (or unmappable type) must fail closed — the schema record
     // must NOT be written when the backing index can't be created. Pre-checking
@@ -942,6 +1121,13 @@ export class BunSqliteStore implements Store {
     }
     if (patch.fields !== undefined) {
       this._schemaConfig = null;
+    }
+    // Gap #3 backfill (see the `needsReferenceBackfill` computation above) —
+    // MUST run after the `_schemaConfig` invalidation immediately above, so
+    // the sync below resolves fields against the JUST-persisted declaration
+    // rather than a stale pre-write cache.
+    if (needsReferenceBackfill) {
+      this.backfillReferenceFieldLinks(tag);
     }
     // First-time creation of a tag row (e.g. an empty `_default` placeholder)
     // changes the `_default` universal-parent gate even when no fields or
