@@ -43,6 +43,33 @@ boot. Back up your vault's SQLite file first as standard practice.
   position was previously *wrong* (skipped) now sort correctly, so a
   since-last-check poll may surface notes it had silently missed. That's the
   fix landing, not a regression.
+
+## 0.7.1 → 0.7.2 — `updated_at` correctness on date_filter / order_by / export --since (#585)
+
+**P1 correctness fix**, the round-4 follow-up to the cursor keyset fix
+above (#586). No schema migration, no manual steps — three consumers now
+read the `updated_at_ms` integer column rc.2 already introduced and
+maintains, instead of comparing the TEXT `updated_at` column. **Two
+operator-visible behavior changes** worth knowing:
+
+- **`date_filter: { field: "updated_at" }` and `export --since <iso>` are
+  now correct on aged/imported vaults.** If your vault has non-canonical
+  `updated_at` values (see the cursor section above for the shapes), a
+  range query or incremental export around a boundary date could previously
+  include/exclude the wrong rows because the comparison was TEXT
+  lexicographic, not chronological. It's chronological now. If you rely on
+  `date_filter` on `updated_at` or `export --since` for an incremental
+  build/sync, you may see previously mis-filtered rows correctly flip sides
+  of the boundary on first use — that's the fix landing, not a regression.
+  `date_filter` on `created_at` is unchanged (no ms mirror; out of scope).
+- **`order_by: "updated_at"` now works** — it previously errored with
+  `400 FIELD_NOT_INDEXED` on every call (documented, intentional behavior:
+  `updated_at` is a real column, not a declared-indexed metadata field). If
+  you have code that relied on that error (e.g. a try/catch that silently
+  fell back to a different sort), it will now receive results instead. No
+  `indexed: true` declaration needed — like the existing
+  `order_by: "link_count"`, it's a built-in pseudo-field.
+
 ## 0.7.1 → 0.7.2 — runtime-robustness hardening (request bodies / wikilinks / taxonomy)
 
 Four fixes from the round-4 bug hunt. No schema migration, no manual steps —

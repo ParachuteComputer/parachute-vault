@@ -2226,10 +2226,13 @@ describe("HTTP /notes", async () => {
     const a = await store.createNote("untouched", { id: "ua", path: "ua" });
     const b = await store.createNote("modified", { id: "ub", path: "ub" });
     // Bump b's updated_at into the test window, leave a's at its createdAt.
-    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-      .run("2026-01-15T00:00:00.000Z", a.id);
-    db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-      .run("2026-04-25T00:00:00.000Z", b.id);
+    // Pin BOTH `updated_at` and `updated_at_ms` — mirrors production
+    // (vault#586: every real write keeps them in lockstep) — the vault#585
+    // fix compares the ms mirror, not the TEXT column.
+    db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+      .run("2026-01-15T00:00:00.000Z", Date.parse("2026-01-15T00:00:00.000Z"), a.id);
+    db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+      .run("2026-04-25T00:00:00.000Z", Date.parse("2026-04-25T00:00:00.000Z"), b.id);
 
     const res = await handleNotes(
       mkReq("GET", "/notes?meta[updated_at][gte]=2026-04-01&include_content=true"),
@@ -3370,10 +3373,11 @@ describe("HTTP /notes", async () => {
     test("`meta[updated_at][gte]=…` routes to dateFilter on n.updated_at", async () => {
       const a = await store.createNote("untouched");
       const b = await store.createNote("modified");
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-        .run("2026-01-15T00:00:00.000Z", a.id);
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-        .run("2026-04-25T00:00:00.000Z", b.id);
+      // Pin BOTH columns (vault#585/#586 — see the identical note above).
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-01-15T00:00:00.000Z", Date.parse("2026-01-15T00:00:00.000Z"), a.id);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", Date.parse("2026-04-25T00:00:00.000Z"), b.id);
       const res = await handleNotes(
         mkReq("GET", "/notes?meta[updated_at][gte]=2026-04-01&include_content=true"),
         store,

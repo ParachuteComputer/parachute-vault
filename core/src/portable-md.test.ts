@@ -24,6 +24,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 
 import { SqliteStore } from "./store.js";
+import { timestampToMs } from "./cursor.js";
 import { getIndexedField } from "./indexed-fields.js";
 import { buildVaultProjection } from "./vault-projection.js";
 import {
@@ -591,6 +592,48 @@ describe("exportVaultToDir", async () => {
     if (older.createdAt < since) {
       expect(existsSync(join(outDir, "old.md"))).toBe(false);
     }
+  });
+
+  it("respects --since correctly on non-canonical `updated_at` (vault#585)", async () => {
+    // Independent db/store pair (not the describe's shared `store`) so the
+    // test can reach the raw `updated_at` / `updated_at_ms` columns
+    // directly — same pattern used elsewhere in this file (pruneOrphans,
+    // case-collision describes).
+    const db = new Database(":memory:");
+    const localStore = new SqliteStore(db);
+
+    const included = await localStore.createNote("space-form, after since", { id: "inc", path: "inc" });
+    const excluded = await localStore.createNote("canonical, before since", { id: "exc", path: "exc" });
+
+    // "2024-11-02 14:30:00" (space-form, no zone) is UTC-correct 14:30 on
+    // Nov 2 per timestampToMs — AFTER the 10:00 `since` bound below, so it
+    // MUST be exported. A TEXT `>=` comparison (the pre-vault#585 behavior)
+    // disagrees: the space (0x20) sorts BEFORE 'T' (0x54), so this string
+    // compares as LESS than the canonical `since` bound on the same
+    // calendar day — the old code wrongly EXCLUDED it from the incremental
+    // export.
+    const includedRaw = "2024-11-02 14:30:00";
+    const excludedRaw = "2024-11-01T00:00:00.000Z";
+    const includedMs = timestampToMs(includedRaw);
+    const excludedMs = timestampToMs(excludedRaw);
+    if (includedMs === null || excludedMs === null) {
+      throw new Error("test fixture bug: unparseable timestamp");
+    }
+    db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+      .run(includedRaw, includedMs, included.id);
+    db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+      .run(excludedRaw, excludedMs, excluded.id);
+
+    const outDir = join(tmpBase, "since-non-canonical");
+    const stats = await exportVaultToDir(localStore, {
+      outDir,
+      since: "2024-11-02T10:00:00.000Z",
+      exportedAt: "2026-05-12T00:00:00.000Z",
+    });
+
+    expect(stats.filtered_by_since).toBe(true);
+    expect(existsSync(join(outDir, "inc.md"))).toBe(true);
+    expect(existsSync(join(outDir, "exc.md"))).toBe(false);
   });
 
   it("re-export with same exportedAt produces byte-identical output (idempotency)", async () => {

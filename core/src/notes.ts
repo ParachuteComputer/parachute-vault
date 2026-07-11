@@ -906,6 +906,42 @@ function validateIsoDateValue(field: string, value: string): void {
 }
 
 /**
+ * Resolve a `date_filter` bound on the `updated_at` field to a millisecond
+ * epoch, for comparison against the integer `n.updated_at_ms` mirror column
+ * instead of the TEXT `n.updated_at` (vault#585 — the same TEXT-vs-ms class
+ * of bug vault#586 closed for the cursor keyset: a non-canonical stored
+ * timestamp — space-form, offset, no-`Z` — sorts/compares WRONG
+ * lexicographically).
+ *
+ * Runs `validateIsoDateValue` first — same loud `INVALID_QUERY` contract a
+ * caller already gets for a malformed bound — then converts with
+ * `timestampToMs` (the UTC-correct parse `updated_at_ms` itself was
+ * backfilled with). `timestampToMs` returning `null` here would mean the
+ * bound matched `Date.parse`'s more permissive grammar (e.g. a non-ISO
+ * locale string) but not `timestampToMs`'s stricter one — a defensive
+ * fallback, not an expected path for any bound `validateIsoDateValue`'s own
+ * error message advertises as valid ("2026-07-09" / full ISO timestamps).
+ * Surfaces the SAME `INVALID_QUERY` shape rather than binding `NaN`.
+ */
+function resolveUpdatedAtBoundMs(field: string, value: string): number {
+  validateIsoDateValue(field, value);
+  const ms = timestampToMs(value);
+  if (ms === null) {
+    throw new QueryError(
+      `invalid date value for "${field}": ${JSON.stringify(value)} — must be an ISO-8601 date/timestamp (e.g. "2026-07-09" or "2026-07-09T00:00:00.000Z").`,
+      "INVALID_QUERY",
+      {
+        error_type: "invalid_query",
+        field,
+        got: value,
+        hint: "pass an ISO-8601 date or timestamp",
+      },
+    );
+  }
+  return ms;
+}
+
+/**
  * Build the shared WHERE-clause conditions + bound params for the filter
  * surface both `queryNotes` and `aggregateNotes` apply: tag membership
  * (include/exclude/presence), link/broken-link presence, id-set scoping,
@@ -1169,15 +1205,17 @@ function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: str
     const filter = opts.dateFilter!;
     const field = filter.field ?? "created_at";
     let column: string;
+    // vault#585: `updated_at` compares against the integer `updated_at_ms`
+    // mirror (vault#586), not the TEXT `n.updated_at` — a TEXT compare
+    // mis-filters non-canonical rows (space-form / offset / no-`Z`) the same
+    // way the pre-v26 cursor keyset did. `created_at` has no ms mirror and
+    // stays a TEXT compare (out of scope — tracked separately, see vault#585
+    // follow-up note in the fix PR).
+    const isUpdatedAt = field === "updated_at";
     if (field === "created_at") {
       column = "n.created_at";
-    } else if (field === "updated_at") {
-      // NOTE (vault#586 follow-up): this range filter compares the TEXT
-      // `updated_at`, which is inconsistent on non-canonical rows the same way
-      // the cursor keyset was pre-v26. Cursor pagination moved to the integer
-      // `updated_at_ms` column; `date_filter`/`order_by`/export `--since` still
-      // read the string and are tracked separately. Behavior unchanged here.
-      column = "n.updated_at";
+    } else if (isUpdatedAt) {
+      column = "n.updated_at_ms";
     } else {
       // Re-uses the same indexed-field gate as `metadata` operator queries
       // and `orderBy` so the error message and contract are consistent.
@@ -1185,14 +1223,24 @@ function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: str
       column = `"meta_${field}"`;
     }
     if (filter.from !== undefined) {
-      validateIsoDateValue(field === "created_at" ? "date_filter.from" : `date_filter.from (${field})`, filter.from);
+      const label = field === "created_at" ? "date_filter.from" : `date_filter.from (${field})`;
       conditions.push(`${column} >= ?`);
-      params.push(filter.from);
+      if (isUpdatedAt) {
+        params.push(resolveUpdatedAtBoundMs(label, filter.from));
+      } else {
+        validateIsoDateValue(label, filter.from);
+        params.push(filter.from);
+      }
     }
     if (filter.to !== undefined) {
-      validateIsoDateValue(field === "created_at" ? "date_filter.to" : `date_filter.to (${field})`, filter.to);
+      const label = field === "created_at" ? "date_filter.to" : `date_filter.to (${field})`;
       conditions.push(`${column} < ?`);
-      params.push(filter.to);
+      if (isUpdatedAt) {
+        params.push(resolveUpdatedAtBoundMs(label, filter.to));
+      } else {
+        validateIsoDateValue(label, filter.to);
+        params.push(filter.to);
+      }
     }
   } else if (hasLegacyDate) {
     if (opts.dateFrom) {
@@ -1316,6 +1364,18 @@ export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<
     // without it, two notes sharing an `updated_at_ms` would be at the mercy
     // of SQLite's row order and the next page could miss or duplicate one.
     orderBy = "n.updated_at_ms ASC, n.id ASC";
+  } else if (opts.orderBy === "updated_at") {
+    // `updated_at` is a pseudo-field like `link_count` below — it's a native
+    // notes column, not a declared-indexed metadata field, so it bypasses
+    // `requireIndexedField` (vault#585). Prior to this, `order_by:
+    // "updated_at"` always 400'd FIELD_NOT_INDEXED (a documented, intentional
+    // reject — see the 2026-06 MCP-tool-description-audit CHANGELOG entry);
+    // it never silently sorted on the TEXT column. Ordering on the integer
+    // `updated_at_ms` mirror (vault#586) from the start means this new
+    // capability is UTC-correct on day one — no TEXT-lexicographic pass ever
+    // shipped for it. `id` is the explicit tiebreak for stable ordering when
+    // two notes share a millisecond, matching the cursor keyset's tiebreak.
+    orderBy = `n.updated_at_ms ${direction}, n.id ${direction}`;
   } else if (opts.orderBy === "link_count") {
     // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
     // dateFilter block above, it bypasses `requireIndexedField` (it's not a
