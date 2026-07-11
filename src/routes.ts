@@ -257,12 +257,16 @@ async function parseJsonBody(
 
   const requireObject = opts?.requireObject ?? true;
   if (requireObject && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) {
+    // The body PARSED as JSON but is the wrong SHAPE (a primitive/array/null,
+    // not an object) — a `invalid_request` per the taxonomy (parallel to
+    // `/tags/merge`'s `sources`/`target` shape errors). `invalid_json` is
+    // reserved for a genuine parse failure (the branch above).
     return {
       ok: false,
       response: json(
         {
           error: "Request body must be a JSON object",
-          error_type: "invalid_json",
+          error_type: "invalid_request",
           hint: `expected a JSON object body — got ${parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed}`,
         },
         400,
@@ -1753,7 +1757,7 @@ async function handleNotesInner(
         return json(
           {
             error: "notes must be an array",
-            error_type: "invalid_json",
+            error_type: "invalid_request",
             field: "notes",
             hint: 'pass { "notes": [...] } for a batch, or a single note object with no `notes` key',
           },
@@ -1768,7 +1772,7 @@ async function handleNotesInner(
           return json(
             {
               error: "each note must be a JSON object",
-              error_type: "invalid_json",
+              error_type: "invalid_request",
               hint: 'each entry in "notes" (or the top-level body, for a single-note POST) must be an object, e.g. {"content": "..."}',
             },
             400,

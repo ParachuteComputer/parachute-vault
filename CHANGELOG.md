@@ -53,10 +53,19 @@ and a confusing dead-end error message.
   nothing to resolve against. Only re-saving A itself (forcing a fresh
   content parse) recovered the link. Deleting a note now re-queues every
   inbound `[[wikilink]]` edge that pointed at it as pending, so recreating a
-  note at the same path/title auto-heals the link exactly as if it had never
-  resolved — matching the documented "unresolved links auto-resolve when the
-  target is created" contract. Hand-authored typed `links` (not
-  content-parsed wikilinks) are left untouched, by design.
+  note that the original `[[link]]` resolves to auto-heals the edge exactly
+  as if it had never resolved — matching the documented "unresolved links
+  auto-resolve when the target is created" contract. This covers **every way
+  a wikilink resolves** — exact path, basename, H1 **title**, and the
+  `[[Foo.csv]]` **extension** form — because deferred resolution now runs
+  each pending link through the *same* resolver used when a note is saved.
+  (That closes a pre-existing gap beyond delete/recreate: a `[[John Doe]]`
+  that resolves by a note's H1 title, or a `[[budget.csv]]` by extension,
+  now also backfills correctly when its target is created *after* the
+  referencing note.) An ambiguous target (two notes now share the path or
+  title) stays a visible broken link rather than resolving to a guess.
+  Hand-authored typed `links` (not content-parsed wikilinks) are left
+  untouched, by design.
 
 - **Malformed or wrong-shaped request bodies now get a clean `400`, never a
   generic `500` or a silently-created blank note.** Several REST write
@@ -66,16 +75,17 @@ and a confusing dead-end error message.
   past the handler into the server's generic top-level catch, returning
   `{"error": "Internal server error"}` with no `error_type` an agent could
   branch on (unlike the already-hardened `/tags/merge` and
-  `/tags/:name/rename` routes, which returned a clean `400 invalid_json`).
-  Worse, a syntactically-valid but wrong-shaped body — `null`, a bare number,
-  or an empty array — either threw a raw `TypeError` or sailed through as
+  `/tags/:name/rename` routes, which returned a clean `400`). Worse, a
+  syntactically-valid but wrong-shaped body — `null`, a bare number, or an
+  empty array — either threw a raw `TypeError` or sailed through as
   `undefined`, silently creating a blank note or a no-op update. Every one of
-  these routes now shares one hardened body parser: malformed JSON and
-  wrong-shape bodies both return `400 invalid_json` (matching the routes that
-  already got this right), and a request body over 10MB is rejected with
-  `413 payload_too_large` instead of reaching the store unbounded (closing a
-  memory-DoS class — a single oversized `content` field used to sail
-  straight through).
+  these routes now shares one hardened body parser: **unparseable** JSON
+  returns `400 invalid_json`; a **wrong-shape** body (valid JSON that isn't
+  the expected object) returns `400 invalid_request` (the same taxonomy the
+  `/tags/merge` shape errors use); and a request body over 10MB is rejected
+  with `413 payload_too_large` instead of reaching the store unbounded
+  (closing a memory-DoS class — a single oversized `content` field used to
+  sail straight through).
 
 - **`doctor` now catches a tag that lists itself as its own parent.** The
   taxonomy-integrity scan's cycle check missed the degenerate case of a tag

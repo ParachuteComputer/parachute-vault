@@ -4269,42 +4269,55 @@ describe("REST transport hardening — malformed/wrong-shape/oversize JSON bodie
     });
   });
 
-  describe("wrong-shape (but syntactically valid) JSON body -> 400, not 500 or a silent blank write (LB7b)", () => {
-    test("POST /notes with a `null` body -> 400, not a 500 TypeError", async () => {
+  // Wrong-SHAPE bodies parse fine as JSON but aren't the object a route
+  // expects — the taxonomy calls that `invalid_request` (parallel to
+  // /tags/merge's sources/target shape errors), NOT `invalid_json` (which is
+  // reserved for a genuine parse failure, asserted in the LB7a block above).
+  describe("wrong-shape (but syntactically valid) JSON body -> 400 invalid_request, not 500 or a silent blank write (LB7b)", () => {
+    test("POST /notes with a `null` body -> 400 invalid_request, not a 500 TypeError", async () => {
       const res = await handleNotes(mkReq("POST", "/notes", null), store, "");
       expect(res.status).toBe(400);
       const body = await res.json() as any;
-      expect(body.error_type).toBe("invalid_json");
+      expect(body.error_type).toBe("invalid_request");
     });
 
-    test("POST /notes with a bare number body -> 400, not a silently-created blank note", async () => {
+    test("POST /notes with a bare number body -> 400 invalid_request, not a silently-created blank note", async () => {
       const res = await handleNotes(mkReq("POST", "/notes", 42), store, "");
       expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_request");
       const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
       expect(after).toHaveLength(0); // no blank note landed
     });
 
-    test("POST /notes with a bare array body -> 400, not a silently-created blank note", async () => {
+    test("POST /notes with a bare array body -> 400 invalid_request, not a silently-created blank note", async () => {
       const res = await handleNotes(mkReq("POST", "/notes", []), store, "");
       expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_request");
       const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
       expect(after).toHaveLength(0);
     });
 
-    test("POST /notes with notes: \"not-an-array\" -> 400, not per-character blank notes", async () => {
+    test("POST /notes with notes: \"not-an-array\" -> 400 invalid_request, not per-character blank notes", async () => {
       const res = await handleNotes(mkReq("POST", "/notes", { notes: "oops" }), store, "");
       expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_request");
+      expect(body.field).toBe("notes");
       const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
       expect(after).toHaveLength(0);
     });
 
-    test("POST /notes with a non-object item inside notes[] -> 400", async () => {
+    test("POST /notes with a non-object item inside notes[] -> 400 invalid_request", async () => {
       const res = await handleNotes(
         mkReq("POST", "/notes", { notes: [{ content: "ok", path: "ok-one" }, 42] }),
         store,
         "",
       );
       expect(res.status).toBe(400);
+      const body = await res.json() as any;
+      expect(body.error_type).toBe("invalid_request");
       const after = await (await handleNotes(mkReq("GET", "/notes"), store, "")).json() as any[];
       expect(after).toHaveLength(0); // the whole batch is rejected, not a partial write
     });

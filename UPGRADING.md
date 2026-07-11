@@ -60,11 +60,13 @@ but **two operator-visible behavior changes** worth knowing:
   unaffected.
 - **Malformed or wrong-shaped JSON bodies on those same routes now return a
   clean `400` instead of a `500`, a thrown `TypeError`, or (for `POST
-  /notes`) silently creating a blank note.** If any automation was
-  (knowingly or not) sending malformed JSON, `null`, a bare number, or an
-  array as the body to one of these routes, it will now get a structured
-  `400 invalid_json` response instead of whatever it was getting before —
-  fix the request body and retry.
+  /notes`) silently creating a blank note.** Unparseable JSON returns
+  `400 invalid_json`; valid JSON of the wrong shape (`null`, a bare number,
+  an array, or a non-array `notes`) returns `400 invalid_request` (the same
+  `error_type` the tag-merge shape errors already use). If any automation was
+  (knowingly or not) sending such a body to one of these routes, it will now
+  get a structured `400` instead of whatever it was getting before — branch
+  on `error_type` and fix the request body.
 
 ## 0.7.1 → 0.7.2 — data-integrity hardening (import / export / paths)
 
