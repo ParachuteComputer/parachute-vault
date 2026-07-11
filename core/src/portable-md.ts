@@ -903,11 +903,29 @@ export async function exportVault(
     ...(opts.vaultName ? { name: opts.vaultName } : {}),
     ...(opts.vaultDescription ? { description: opts.vaultDescription } : {}),
   };
-  sink.writeText(join(SIDECAR_DIR, "vault.yaml"), emitYamlDoc(vaultMeta as unknown as Record<string, unknown>));
+  // The manifest is STRUCTURAL, not per-note: a portable-md export WITHOUT its
+  // `.parachute/vault.yaml` is unusable — restore (`importPortableVault`), CLI
+  // autodetect, and mirror-import all hard-reject a dir that lacks it. So the
+  // skip-with-warn belt that hardens per-note writes (vault#589 / FIX 2b) is
+  // exactly WRONG here: a discarded `{ok:false}` would produce a manifest-less
+  // "success" — a silently-broken backup. Fail LOUDLY instead. (Per-note
+  // content/attachment writes below stay skip-with-warn — one poisoned note
+  // must not abort the whole export.)
+  const manifestPath = join(SIDECAR_DIR, "vault.yaml");
+  const manifestWrite = sink.writeText(manifestPath, emitYamlDoc(vaultMeta as unknown as Record<string, unknown>));
+  if (!manifestWrite.ok) {
+    throw new Error(
+      `export aborted: failed to write the vault manifest "${manifestPath}": ${manifestWrite.reason}. ` +
+      `A portable-md export without its manifest is unusable (restore/import hard-rejects it), so this fails loudly rather than producing a manifest-less "success".`,
+    );
+  }
 
   // 2. Per-tag schemas. Only tags carrying at least one schema-shaped
   // field (description, fields, relationships, parent_names) get a file;
-  // tags that are just-a-name don't pollute the sidecar.
+  // tags that are just-a-name don't pollute the sidecar. Schemas are
+  // structural too — a dropped schema sidecar silently loses a tag's
+  // definition from the backup — so a write failure here also fails loudly
+  // (and never increments `schemasWritten` on a failed write).
   const tagRecords = await store.listTagRecords();
   let schemasWritten = 0;
   for (const tag of tagRecords) {
@@ -920,7 +938,14 @@ export async function exportVault(
     if (tag.parent_names !== undefined && tag.parent_names.length > 0) {
       doc.parent_names = tag.parent_names;
     }
-    sink.writeText(join(SIDECAR_DIR, "schemas", filename), emitYamlDoc(doc));
+    const schemaPath = join(SIDECAR_DIR, "schemas", filename);
+    const schemaWrite = sink.writeText(schemaPath, emitYamlDoc(doc));
+    if (!schemaWrite.ok) {
+      throw new Error(
+        `export aborted: failed to write schema sidecar "${schemaPath}" for tag "${tag.tag}": ${schemaWrite.reason}. ` +
+        `Tag schemas are structural — a partial export would silently drop a schema definition — so this fails loudly.`,
+      );
+    }
     schemasWritten++;
   }
 

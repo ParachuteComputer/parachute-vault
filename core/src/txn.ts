@@ -31,6 +31,23 @@
  * The `transactionSync` (Durable-Object) delegate path is unchanged — a DO
  * backend supplies its own natively re-entrant primitive, so the SAVEPOINT
  * bookkeeping here only governs the bun `BEGIN` path.
+ *
+ * **Shared-connection invariant (load-bearing for {@link transactionAsync}).**
+ * The bun backend is a single synchronous connection. A `transactionAsync`
+ * body — AND anything it calls — must not `await` genuine, slow I/O while the
+ * transaction is open: every `await` yields the event loop, and any work that
+ * runs during that yield and touches the store (a concurrent request, a
+ * mutation hook that writes before its first real await) will `SAVEPOINT`-JOIN
+ * this open transaction on the shared connection — committing/rolling back
+ * with it, its writes cross-wiped by a `ROLLBACK TO`. The blow-away import
+ * (the sole `transactionAsync` wrapping non-batch work) is safe by
+ * construction: its replay awaits only already-resolved promises over the
+ * synchronous bun store, so it never actually yields to unrelated work
+ * mid-transaction, and the mutation hooks it fires do no synchronous store
+ * writes (they defer via `queueMicrotask` and arm debounces / kick idempotent
+ * workers — see hooks.ts). Any NEW `transactionAsync` caller must preserve
+ * this: keep the body's awaits confined to the same synchronous connection,
+ * never awaiting network/disk/subprocess I/O with the transaction open.
  */
 
 /** The minimal DB surface the transaction seam needs — kept structural (no
@@ -105,8 +122,19 @@ function rollbackTxn(db: TxnCapableDb, frame: TxnFrame): void {
       db.exec(`ROLLBACK TO ${frame.savepoint}`);
       db.exec(`RELEASE ${frame.savepoint}`);
     }
-  } catch {
-    // nothing to unwind — the transaction was already resolved
+  } catch (rollbackErr) {
+    // Only swallow the ONE expected case: the COMMIT/RELEASE itself already
+    // resolved the transaction, so there's nothing left to unwind — SQLite
+    // reports "cannot rollback - no transaction is active" / "no such
+    // savepoint". Any OTHER rollback failure is a real problem (a corrupt
+    // connection, a lost write lock) and must not be masked — re-throw it so
+    // the caller sees a failed rollback rather than a false success. Depth is
+    // restored first so the connection's bookkeeping stays consistent even on
+    // the re-throw path.
+    txnDepth.set(db, frame.priorDepth);
+    const msg = String((rollbackErr as Error)?.message ?? rollbackErr);
+    if (/no transaction is active|no such savepoint/i.test(msg)) return;
+    throw rollbackErr;
   }
   txnDepth.set(db, frame.priorDepth);
 }

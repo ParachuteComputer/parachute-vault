@@ -89,9 +89,12 @@ describe("transaction (sync)", () => {
     expect(calls).toEqual(["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]);
   });
 
-  it("preserves the callback error even when ROLLBACK also fails", () => {
+  it("preserves the callback error when ROLLBACK fails for the expected 'already-resolved' reason", () => {
     const callbackErr = new Error("callback boom");
-    const rollbackErr = new Error("rollback boom");
+    // The one swallowed case: the txn was already resolved, so ROLLBACK is a
+    // no-op that reports "no transaction is active". The ORIGINAL callback
+    // error is the root cause and must still propagate.
+    const rollbackErr = new Error("cannot rollback - no transaction is active");
     const { db } = fakeDb({ rollbackThrows: rollbackErr });
     let thrown: unknown;
     try {
@@ -100,6 +103,22 @@ describe("transaction (sync)", () => {
       thrown = e;
     }
     expect(thrown).toBe(callbackErr);
+  });
+
+  it("re-throws an UNEXPECTED ROLLBACK failure instead of silently masking it (vault#589 NIT 2)", () => {
+    const callbackErr = new Error("callback boom");
+    // A rollback failure that is NOT the benign "already-resolved" case (a
+    // corrupt connection / lost write lock) means the transaction may NOT have
+    // rolled back — surfacing it beats a false "clean rollback".
+    const rollbackErr = new Error("database disk image is malformed");
+    const { db } = fakeDb({ rollbackThrows: rollbackErr });
+    let thrown: unknown;
+    try {
+      transaction(db, () => { throw callbackErr; });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBe(rollbackErr);
   });
 });
 
@@ -214,9 +233,9 @@ describe("transactionAsync", () => {
     expect(calls).toEqual(["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]);
   });
 
-  it("preserves the callback error even when ROLLBACK also fails", async () => {
+  it("preserves the callback error when ROLLBACK fails for the expected 'already-resolved' reason", async () => {
     const callbackErr = new Error("callback boom");
-    const rollbackErr = new Error("rollback boom");
+    const rollbackErr = new Error("cannot rollback - no transaction is active");
     const { db } = fakeDb({ rollbackThrows: rollbackErr });
     let thrown: unknown;
     try {
@@ -225,6 +244,19 @@ describe("transactionAsync", () => {
       thrown = e;
     }
     expect(thrown).toBe(callbackErr);
+  });
+
+  it("re-throws an UNEXPECTED ROLLBACK failure instead of silently masking it (vault#589 NIT 2)", async () => {
+    const callbackErr = new Error("callback boom");
+    const rollbackErr = new Error("database disk image is malformed");
+    const { db } = fakeDb({ rollbackThrows: rollbackErr });
+    let thrown: unknown;
+    try {
+      await transactionAsync(db, async () => { throw callbackErr; });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBe(rollbackErr);
   });
 });
 

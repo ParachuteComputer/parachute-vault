@@ -539,6 +539,37 @@ describe("MCP tools", async () => {
     expect(result.tags).toContain("daily");
   });
 
+  // FIX 2 (vault#589) — the MCP door rejects illegal paths too. The core tool
+  // throws a `PathValidationError` (error_type invalid_path) exactly like
+  // ExtensionValidationError; mcp-http.ts's generic error_type mapping turns it
+  // into a structured domain error at the transport. Assert the MCP tool path
+  // itself refuses the write (parity with the REST-door tests below).
+  test("create-note MCP tool rejects a '..' path with error_type invalid_path", async () => {
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    let thrown: any;
+    try {
+      await createNote.execute({ content: "x", path: "../escape" });
+    } catch (e) { thrown = e; }
+    expect(thrown).toBeTruthy();
+    expect(thrown.error_type).toBe("invalid_path");
+    expect(thrown.code).toBe("INVALID_PATH");
+    // Nothing written.
+    expect(await store.getNoteByPath("escape")).toBeNull();
+  });
+
+  test("create-note MCP tool rejects a NUL path with error_type invalid_path", async () => {
+    const NUL = String.fromCharCode(0);
+    const tools = generateMcpTools(store);
+    const createNote = tools.find((t) => t.name === "create-note")!;
+    let thrown: any;
+    try {
+      await createNote.execute({ content: "x", path: `bad${NUL}path` });
+    } catch (e) { thrown = e; }
+    expect(thrown).toBeTruthy();
+    expect(thrown.error_type).toBe("invalid_path");
+  });
+
   test("every tool has inputSchema and execute", () => {
     const tools = generateMcpTools(store);
     for (const tool of tools) {

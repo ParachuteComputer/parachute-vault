@@ -29,6 +29,7 @@ import { buildVaultProjection } from "./vault-projection.js";
 import {
   CaseCollisionError,
   emitYamlDoc,
+  exportVault,
   exportVaultToDir,
   importPortableVault,
   noteToPortable,
@@ -41,7 +42,9 @@ import {
   supportsInlineFrontmatter,
   toPortableMarkdown,
   toSidecarYaml,
+  type ExportSink,
   type PortableNote,
+  type SinkWriteResult,
 } from "./portable-md.js";
 
 // ---------------------------------------------------------------------------
@@ -447,6 +450,53 @@ describe("exportVaultToDir", async () => {
     expect(stats.skipped_traversal).toBeGreaterThanOrEqual(1);
     const poisonSkip = stats.skipped_notes.find((s) => s.reason.includes("fs write failed"));
     expect(poisonSkip).toBeTruthy();
+  });
+
+  // BLOCKER (vault#589 review) — the skip-with-warn export belt (FIX 2b) is
+  // correct ONLY for per-NOTE writes. The STRUCTURAL writes (the vault.yaml
+  // manifest + per-tag schema sidecars) are global: a dir missing
+  // `.parachute/vault.yaml` is hard-rejected at restore/import, so a discarded
+  // `{ok:false}` there would produce a manifest-less "success" — a silently
+  // broken backup. Those must FAIL LOUDLY.
+  //
+  // RED-without-fix: with the structural writes discarding the sink result,
+  // both `exportVault` calls RESOLVE (no throw) and the manifest/schema is
+  // silently absent. Verified manually during development.
+  it("aborts loudly when the manifest write fails (structural, not skip-with-warn)", async () => {
+    await store.createNote("n", { id: "n1", path: "p" });
+    // Stub sink that fails ONLY the manifest write; everything else succeeds.
+    const sink: ExportSink = {
+      caseSensitive: true,
+      attachmentsEnabled: false,
+      writeText(relPath: string): SinkWriteResult {
+        if (relPath === join(SIDECAR_DIR, "vault.yaml")) {
+          return { ok: false, reason: "simulated EACCES on .parachute/" };
+        }
+        return { ok: true };
+      },
+      copyAttachment(): SinkWriteResult { return { ok: true }; },
+    };
+    await expect(exportVault(store, sink, { exportedAt: "2026-05-13T00:00:00.000Z" }))
+      .rejects.toThrow(/manifest/i);
+  });
+
+  it("aborts loudly when a schema sidecar write fails (structural, not skip-with-warn)", async () => {
+    await store.upsertTagSchema("task", { description: "A unit of work" });
+    await store.createNote("x", { id: "x1", tags: ["task"] });
+    // Fail ONLY the schema write; the manifest (and everything else) succeeds.
+    const sink: ExportSink = {
+      caseSensitive: true,
+      attachmentsEnabled: false,
+      writeText(relPath: string): SinkWriteResult {
+        if (relPath.startsWith(join(SIDECAR_DIR, "schemas"))) {
+          return { ok: false, reason: "simulated disk full" };
+        }
+        return { ok: true };
+      },
+      copyAttachment(): SinkWriteResult { return { ok: true }; },
+    };
+    await expect(exportVault(store, sink, { exportedAt: "2026-05-13T00:00:00.000Z" }))
+      .rejects.toThrow(/schema sidecar/i);
   });
 
   it("writes per-tag schemas to .parachute/schemas/", async () => {

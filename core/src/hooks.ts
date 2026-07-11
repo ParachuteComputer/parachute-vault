@@ -372,6 +372,15 @@ export class HookRegistry {
 
     // Defer to a microtask so we unwind the caller's stack (and its
     // SQLite transaction, if any) before handlers run.
+    //
+    // Caveat (vault#589): under an ASYNC transaction that spans awaits (the
+    // atomic blow-away import wrapped in `transactionAsync`), the connection
+    // stays open across the microtask boundary. A handler that writes to the
+    // store BEFORE its first real `await` would `SAVEPOINT`-join that open
+    // transaction (rolled back with it). Every handler here is audited safe —
+    // it defers real work behind an `await` (semaphore acquire) and does no
+    // synchronous store write — but the invariant lives in txn.ts's header
+    // ("shared-connection invariant"), not just this comment; keep it true.
     queueMicrotask(() => {
       for (const hook of matches) {
         const task = this.runHandler(hook, event, note, store);
