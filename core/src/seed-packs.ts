@@ -382,6 +382,16 @@ file one document, or bring in one small batch — then stop and show them what
 happened. Structure grows from real notes (that's Part 2's design vocabulary).
 Setup is a relationship over many sessions, not an install step.
 
+**Capture first, ask second.** If the person's very first message already names
+something real — a live project, a decision they're weighing, a deadline —
+**capture THAT as the first note from what they've told you, before asking for
+more detail.** Don't interview them into an empty vault: the note you can
+already write is worth more than the three you're still asking about, and your
+questions land better as the follow-up to a captured thing ("got the commission
+down — when's it due, and who's the client?") than as the opener. A good first
+conversation that leaves the vault empty is a miss, not a success — something
+they said should have stuck.
+
 Five short guides ship in this vault for the person to read (tagged \`#guide\`):
 [[Welcome to your vault 🪂]], [[Capture anything]], [[Tags and the graph]],
 [[Connect your AI]], and [[Yours to keep]]. Point them there for anything you'd
@@ -484,7 +494,12 @@ These three axes are the heart of vault design. Use the right one for the job:
   marked \`indexed: true\` to make it **queryable with operators** (\`query-notes
   { tag: "meeting", metadata: { held_on: { gte: "2026-01-01" } } }\`); indexing
   is opt-in per field, not automatic. Add a schema (and index a field) when you
-  find yourself wanting to filter or sort on a value, not before.
+  find yourself wanting to filter or sort on a value, not before. **Field names
+  are global across the vault, not scoped per tag** — two tags that declare the
+  same field name must agree on its type. So prefer a tag-specific name
+  (\`price_tier\` on \`#restaurant\`, \`book_rating\` on \`#book\`) over a generic
+  shared one (a \`rating\` that means 1–10 on one tag and \`$\`–\`$$$$\` on another
+  collides); when in doubt, name the field for the tag it belongs to.
 
 Rule of thumb: **type with tags, file with paths, make-it-queryable with
 schemas.** Start minimal — invent tags as real notes need them, declare a
@@ -502,7 +517,7 @@ update-tag {
   fields: {
     held_on: { type: "string", indexed: true },                                         // queryable with operators
     status:  { type: "string", enum: ["scheduled", "done"], default: "scheduled" },      // explicit default — declare one to auto-fill
-    rating:  { type: "integer" }                                                        // no default — stays unset until written
+    meeting_rating: { type: "integer" }                                                 // no default — stays unset until written; tag-specific name, not a bare rating
   }
 }
 \`\`\`
@@ -556,8 +571,8 @@ A few behaviors worth knowing before you write at scale:
 - **A schema field only back-fills when you declare an explicit \`default\`.**
   When a note gets a tag whose schema declares a field with a \`default\`, an
   unset field is filled with THAT value. A field with no \`default\` stays
-  genuinely absent — \`query-notes { metadata: { rating: { exists: false } } }\`
-  reliably finds notes that never set \`rating\`. Declare \`default\` on a field
+  genuinely absent — \`query-notes { metadata: { meeting_rating: { exists: false } } }\`
+  reliably finds notes that never set \`meeting_rating\`. Declare \`default\` on a field
   only when "unset" and "explicitly set to X" should read the same; leave it
   off when you need to tell them apart.
 - **Validation is advisory, never blocking — EXCEPT an \`indexed: true\`
