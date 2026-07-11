@@ -34,6 +34,77 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.4] - 2026-07-10
+
+**Runtime-robustness hardening** — four fixes (two P1, two minor) from the
+round-4 bug hunt, continuing rc.3's data-integrity pass. These are about a
+vault staying honest and recoverable during ordinary agent use — deleting
+and recreating notes, malformed requests, self-referential taxonomy data,
+and a confusing dead-end error message.
+
+### Fixed
+
+- **A deleted-then-recreated note now re-links to everything that pointed at
+  it.** If note A contained `[[Foo]]`, Foo was created (the link resolved),
+  then Foo was **deleted and recreated**, A's link used to stay permanently
+  dead — even though A's `[[Foo]]` text never changed. Deleting a note only
+  dropped the `links` row (via the database's cascade); nothing told the
+  wikilink system "this edge is pending again," so recreating Foo had
+  nothing to resolve against. Only re-saving A itself (forcing a fresh
+  content parse) recovered the link. Deleting a note now re-queues every
+  inbound `[[wikilink]]` edge that pointed at it as pending, so recreating a
+  note that the original `[[link]]` resolves to auto-heals the edge exactly
+  as if it had never resolved — matching the documented "unresolved links
+  auto-resolve when the target is created" contract. This covers path,
+  basename, H1 **title**, and the `[[Foo.csv]]` **extension** form — because
+  deferred resolution now runs each pending link through the *same* resolver
+  used when a note is saved. (One rare edge remains: a non-ASCII title
+  differing only in letter case re-heals on the source note's next save
+  rather than on the target's recreate.)
+  (That closes a pre-existing gap beyond delete/recreate: a `[[John Doe]]`
+  that resolves by a note's H1 title, or a `[[budget.csv]]` by extension,
+  now also backfills correctly when its target is created *after* the
+  referencing note.) An ambiguous target (two notes now share the path or
+  title) stays a visible broken link rather than resolving to a guess.
+  Hand-authored typed `links` (not content-parsed wikilinks) are left
+  untouched, by design.
+
+- **Malformed or wrong-shaped request bodies now get a clean `400`, never a
+  generic `500` or a silently-created blank note.** Several REST write
+  routes (`POST /notes`, `POST /notes/:id/attachments`, `PATCH
+  /notes/:idOrPath`, `PUT /tags/:name`, `PATCH /vault-info`) parsed the
+  request body with a bare, uncaught `req.json()` — malformed JSON threw
+  past the handler into the server's generic top-level catch, returning
+  `{"error": "Internal server error"}` with no `error_type` an agent could
+  branch on (unlike the already-hardened `/tags/merge` and
+  `/tags/:name/rename` routes, which returned a clean `400`). Worse, a
+  syntactically-valid but wrong-shaped body — `null`, a bare number, or an
+  empty array — either threw a raw `TypeError` or sailed through as
+  `undefined`, silently creating a blank note or a no-op update. Every one of
+  these routes now shares one hardened body parser: **unparseable** JSON
+  returns `400 invalid_json`; a **wrong-shape** body (valid JSON that isn't
+  the expected object) returns `400 invalid_request` (the same taxonomy the
+  `/tags/merge` shape errors use); and a request body over 10MB is rejected
+  with `413 payload_too_large` instead of reaching the store unbounded
+  (closing a memory-DoS class — a single oversized `content` field used to
+  sail straight through).
+
+- **`doctor` now catches a tag that lists itself as its own parent.** The
+  taxonomy-integrity scan's cycle check missed the degenerate case of a tag
+  whose `parent_names` names itself directly (`X → X`) — reachable only
+  through guard-bypassing data (a direct database write or an import), since
+  normal tag writes already reject this. The scan now flags this bare
+  self-reference the same as any other cycle.
+
+- **A clearer error when you try to sum a decimal field.** Declaring an
+  indexed field as `type: "number"` (a float) and then trying to `sum` it in
+  an `aggregate` query, filter it with an operator, or `order_by` it used to
+  fail with the generic "declare `indexed: true`" hint — advice that's
+  **impossible to follow** for a `number` field, since only `integer`/
+  `boolean` fields can ever be indexed. The error now says so directly and
+  points at the real fix: store the value as an integer (e.g. cents instead
+  of dollars) and index that field instead.
+
 ## [0.7.2-rc.3] - 2026-07-10
 
 **Data-integrity hardening** — three import/export/path fixes from the

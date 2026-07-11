@@ -591,8 +591,9 @@ actually affected by the bug — only the message string could double.
 | `not_found` | 404 | `id?`/`note_id?` (varies by endpoint) | Generic resource-not-found: a note, an anchor/source/target note reference, a vault, or (for a tag-scoped session) a note outside the token's allowlist — 404, never 403, so scope boundaries don't leak existence. |
 | `method_not_allowed` | 405 | — | The HTTP method isn't supported on this route. |
 | `invalid_json` | 400 | — | The request body failed to parse as JSON. |
-| `invalid_request` | 400 | `field?`, `hint?` | A required param/field is missing or the wrong shape (e.g. `find-path`'s `source`/`target`, tag-merge's `sources`/`target`). |
+| `invalid_request` | 400 | `field?`, `hint?` | A required param/field is missing or the wrong shape (e.g. `find-path`'s `source`/`target`, tag-merge's `sources`/`target`, or a JSON body that parsed but isn't the expected object — `null`/a bare number/an array to `POST /notes`, a non-array `notes`). |
 | `missing_required_field` | 400 | `field?`, `hint?` | A specific named field is required and absent (e.g. attachment `path`/`mimeType`, storage upload `file`). |
+| `payload_too_large` | 413 | `limit`, `got` | The JSON request body exceeds the 10MB cap on the mutating routes (`POST /notes`, `POST /notes/{id}/attachments`, `PATCH /notes/{idOrPath}`, `PUT /tags/{name}`, `PATCH /vault`). Parallel to `file_too_large` (the 100MB `/upload` cap); use the binary `/upload` path for large attachments. |
 | `tag_scope_violation` | 403 (REST) / forbidden (MCP) | `scoped_tags` | A tag-scoped token attempted a write outside its allowlist. |
 | `internal_error` | 500 | — | An invariant the server expected to hold didn't (e.g. a just-created note not found on immediate re-read). Rare; file an issue if seen. |
 

@@ -295,6 +295,28 @@ describe("contract: taxonomy — #552 (flipped from test.todo)", () => {
     expect(cleanReport.summary).toContain("clean");
   });
 
+  // LB — a DIRECT self-parent (`parent_names: [tag]` on tag itself) is a
+  // degenerate one-node cycle: `getTagDescendants` starts its traversal
+  // result at `{tag}`, and the moment it walks the tag's own self-edge it
+  // finds `tag` already `result.has(child)` and skips re-expanding it — so
+  // `descendants` never grows past size 1. `findHierarchyCycles`'s original
+  // gate (`descendants.has(tag) && descendants.size > 1`) requires size>1,
+  // so this exact case reported clean despite being a real cycle. Only
+  // reachable via guard-bypassing data (direct DB write / import) since
+  // `upsertTagRecord` rejects a self-parent at write time (see the "bare
+  // self-parent: also caught" assertion above, which exercises the WRITE
+  // guard — this test exercises the READ-side doctor scan on data that
+  // skipped that guard).
+  it("doctor flags a bare self-parent cycle (X declares parent_names: [X]), which the size>1 gate alone misses", async () => {
+    await store.upsertTagRecord("self-cyc", {});
+    db.prepare("UPDATE tags SET parent_names = ? WHERE name = ?").run(JSON.stringify(["self-cyc"]), "self-cyc");
+
+    const report = await store.doctor();
+    const finding = report.findings.find((f) => f.type === "parent_names_cycle" && f.subject === "self-cyc");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("error");
+  });
+
   it("dead_tag_metadata_reference does not false-positive on a schema-declared enum field whose values coincide with an unrelated live tag (vault#570)", async () => {
     // "archived" is a real, unrelated live tag — coincidentally sharing a
     // name with one of "status"'s declared enum values. Pre-fix, this ONE

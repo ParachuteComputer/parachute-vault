@@ -43,6 +43,31 @@ boot. Back up your vault's SQLite file first as standard practice.
   position was previously *wrong* (skipped) now sort correctly, so a
   since-last-check poll may surface notes it had silently missed. That's the
   fix landing, not a regression.
+## 0.7.1 → 0.7.2 — runtime-robustness hardening (request bodies / wikilinks / taxonomy)
+
+Four fixes from the round-4 bug hunt. No schema migration, no manual steps —
+but **two operator-visible behavior changes** worth knowing:
+
+- **A JSON request body over 10MB is now rejected with `413
+  payload_too_large`.** `POST /notes`, `POST /notes/:id/attachments`, `PATCH
+  /notes/:idOrPath`, `PUT /tags/:name`, and `PATCH /vault-info` previously had
+  **no size limit at all** on the JSON body — a single oversized `content`
+  field (reproduced at 50MB) reached the store unbounded, spiking server
+  memory. If you legitimately create or update notes with content over 10MB
+  through one of these JSON endpoints, that request will now fail; use the
+  binary `/upload` path for large files/attachments, or split the content.
+  Ordinary note-taking and transcript content (well under 10MB) is
+  unaffected.
+- **Malformed or wrong-shaped JSON bodies on those same routes now return a
+  clean `400` instead of a `500`, a thrown `TypeError`, or (for `POST
+  /notes`) silently creating a blank note.** Unparseable JSON returns
+  `400 invalid_json`; valid JSON of the wrong shape (`null`, a bare number,
+  an array, or a non-array `notes`) returns `400 invalid_request` (the same
+  `error_type` the tag-merge shape errors already use). If any automation was
+  (knowingly or not) sending such a body to one of these routes, it will now
+  get a structured `400` instead of whatever it was getting before — branch
+  on `error_type` and fix the request body.
+
 ## 0.7.1 → 0.7.2 — data-integrity hardening (import / export / paths)
 
 Three fixes from the round-4 bug hunt. No schema migration, no manual steps —

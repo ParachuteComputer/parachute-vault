@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Note } from "./types.js";
 import * as linkOps from "./links.js";
-import { getNote, findNotesByTitle } from "./notes.js";
+import { getNote, findNotesByTitle, extractH1Title } from "./notes.js";
 import { chunkForInClause } from "./sql-in.js";
 import { transaction } from "./txn.js";
 import type { QueryWarning } from "./query-warnings.js";
@@ -619,10 +619,31 @@ function syncUnresolvedWikilinks(
 
 /**
  * Try to resolve pending wikilinks AND pending structured-link forward-refs
- * (vault#555) that point to a given path. Called when a note is created or
+ * (vault#555) that point to a given note. Called when a note is created or
  * its path changes. Each pending row materializes with ITS OWN relationship
  * (a structured link queued via {@link queueUnresolvedLink} backfills with
  * the caller's original relationship, not "wikilink").
+ *
+ * Deferred resolution now covers all four legs of
+ * {@link resolveWikilinkDetailed}: exact path, basename, H1 title, and the
+ * explicit `path.ext` form. (Caveat: the candidate pre-filter below matches the
+ * title/ext legs via SQL `COLLATE NOCASE`, which case-folds ASCII only — a
+ * non-ASCII title differing from the target only in letter case is missed at
+ * the candidate stage and re-heals on the source's next save instead. Rare;
+ * tracked as a follow-up.) Before this, the sweep matched a pending row to
+ * the new note by PATH TEXT ONLY (`target_path = path OR path LIKE
+ * '%/'||target_path`) — so a `[[John Doe]]` that resolved at write time via
+ * the H1-title fallback (its note's displayed title differs from its path,
+ * e.g. `people/jdoe`), or a `[[Foo.csv]]` that resolved via the extension
+ * leg, silently never re-healed on a delete→recreate (the exact LB6 gap) and
+ * more broadly never backfilled when the target note was created AFTER the
+ * referencing note. Each candidate pending row is now VERIFIED through
+ * `resolveWikilinkDetailed` against the current DB — a row is healed only
+ * when its target string actually resolves to THIS note. An AMBIGUOUS target
+ * (≥2 notes now share the path/title) resolves to neither and stays queued,
+ * identical to write-time's "don't guess" contract — this also closes the
+ * pre-existing asymmetry where the path-only sweep would link an ambiguous
+ * `[[Foo]]` to whichever colliding note happened to be created.
  *
  * Returns the number of links resolved.
  */
@@ -632,13 +653,32 @@ export function resolveUnresolvedWikilinks(
   noteId: string,
 ): number {
   ensureRelationshipColumn(db);
-  let rows: { source_id: string; relationship: string }[];
+
+  // The newly-created / newly-repathed note supplies the two resolution keys
+  // the pending row's `target_path` (a bare path/basename string) can't carry
+  // on its own: the note's H1 title (title-fallback leg) and its extension
+  // (explicit `path.ext` leg). `getNote` is one indexed PK lookup; the title
+  // is parsed from content in JS (no separate query).
+  const note = getNote(db, noteId);
+  const h1Title = note?.content ? extractH1Title(note.content) : null;
+  const pathDotExt = note?.extension ? `${notePath}.${note.extension}` : null;
+
+  let rows: { source_id: string; target_path: string; relationship: string }[];
   try {
+    // Candidate pre-filter: every pending row whose `target_path` COULD
+    // resolve to this note under any resolveWikilinkDetailed leg — exact
+    // path, basename (target is the last path segment), H1 title, or the
+    // `path.ext` form. A `null` bind (no H1 heading / no extension) makes its
+    // clause never match (`target_path = NULL` is NULL, i.e. falsy in SQL).
+    // The verify step below is what enforces correctness; this clause only
+    // BOUNDS how many rows reach the (title-fallback-scanning) resolver.
     rows = db.prepare(`
-      SELECT source_id, relationship FROM unresolved_wikilinks
+      SELECT source_id, target_path, relationship FROM unresolved_wikilinks
       WHERE target_path = ? COLLATE NOCASE
          OR ? LIKE '%/' || target_path
-    `).all(notePath, notePath) as { source_id: string; relationship: string }[];
+         OR target_path = ? COLLATE NOCASE
+         OR target_path = ? COLLATE NOCASE
+    `).all(notePath, notePath, h1Title, pathDotExt) as typeof rows;
   } catch {
     return 0; // Table doesn't exist
   }
@@ -649,16 +689,24 @@ export function resolveUnresolvedWikilinks(
   for (const row of rows) {
     if (row.source_id === noteId) continue; // Skip self-links
 
+    // Verify against the SAME resolver write-time uses, so deferred
+    // resolution can't diverge from it: heal a pending row ONLY when its
+    // target string actually resolves to THIS note now. A miss or an
+    // ambiguous result leaves the row queued (surfaced as a visible broken
+    // link, and re-tried on the next matching note create).
+    const detail = resolveWikilinkDetailed(db, row.target_path);
+    if (!detail.resolved || detail.note_id !== noteId) continue;
+
     const relationship = row.relationship || WIKILINK_REL;
     linkOps.createLink(db, row.source_id, noteId, relationship);
     resolved++;
 
-    // Remove the unresolved entry (this exact relationship only — a
-    // source may have BOTH a wikilink and a structured-link forward-ref
-    // pending against the same target_path).
+    // Remove exactly this pending row — a source may have BOTH a wikilink and
+    // a structured-link forward-ref pending against the same target_path
+    // (distinct relationships), so scope the delete to all three PK columns.
     db.prepare(
-      "DELETE FROM unresolved_wikilinks WHERE source_id = ? AND relationship = ? AND (target_path = ? COLLATE NOCASE OR ? LIKE '%/' || target_path)",
-    ).run(row.source_id, relationship, notePath, notePath);
+      "DELETE FROM unresolved_wikilinks WHERE source_id = ? AND target_path = ? AND relationship = ?",
+    ).run(row.source_id, row.target_path, relationship);
   }
 
   return resolved;
@@ -839,4 +887,97 @@ export function getContentWikilinkWarnings(
   }
 
   return warnings;
+}
+
+// ---------------------------------------------------------------------------
+// Delete-time re-queue (LB6) — a deleted note's INBOUND wikilink edges must
+// come back to life if a note is later recreated at the same path/title.
+// ---------------------------------------------------------------------------
+
+/**
+ * Before a note is deleted, re-queue every INBOUND `wikilink`-relationship
+ * edge pointing at it into `unresolved_wikilinks`, so that recreating a note
+ * matching the original `[[target]]` text (same path, basename, H1 title, or
+ * `path.ext` form — anything {@link resolveWikilinkDetailed} would have
+ * matched) auto-heals the edge via {@link resolveUnresolvedWikilinks} — which
+ * now verifies each pending row through that same resolver — exactly as if
+ * the link had never resolved in the first place.
+ *
+ * Without this, `deleteNote`'s `DELETE FROM notes` cascades the `links` row
+ * away (FK `ON DELETE CASCADE`) but leaves `unresolved_wikilinks` untouched —
+ * a note recreated at the deleted note's path never gets linked back to,
+ * because nothing is pending resolution for it. Only a re-save of the
+ * SOURCE note (which reparses its own content from scratch) would recover
+ * it; a fresh `[[Foo]]` reference elsewhere would work, but the ORIGINAL
+ * source note's edge stayed dead despite its unchanged `[[Foo]]` text.
+ *
+ * MUST be called BEFORE the note row is deleted — it needs both the `links`
+ * row (about to cascade away) and, per source, the CURRENT content (to
+ * recover the raw `[[target]]` text the resolver actually matched on: a
+ * resolved link's row retains the target NOTE id, not the original bracket
+ * text, and title-fallback / basename resolution mean that text can differ
+ * from the deleted note's own path).
+ *
+ * Scope: only `relationship = "wikilink"` inbound edges are re-queued.
+ * Explicit typed `links` (structured `links: [{target, relationship}]`
+ * entries, vault#555) are left alone — those are hand-authored associations
+ * the caller owns, not content-derived, so silently resurrecting them as a
+ * forward-ref on an unrelated future note would be surprising. A source
+ * that links to itself is never queued (wikilinks never create self-links,
+ * so no such inbound row can exist) and is skipped defensively anyway.
+ */
+export function requeueInboundWikilinksForDelete(db: Database, noteId: string): void {
+  let inbound: { source_id: string }[];
+  try {
+    inbound = db.prepare(
+      "SELECT DISTINCT source_id FROM links WHERE target_id = ? AND relationship = ?",
+    ).all(noteId, WIKILINK_REL) as { source_id: string }[];
+  } catch {
+    return; // links table missing (shouldn't happen post-schema-init, but never block a delete on this)
+  }
+  if (inbound.length === 0) return;
+
+  // Cheap string pre-filter (perf): a wikilink can only have resolved to the
+  // note being deleted if its raw target text equals one of THIS note's own
+  // resolution keys — its path, basename, H1 title, or `path.ext` form (the
+  // four legs {@link resolveWikilinkDetailed} matches on; every leg produces a
+  // target string equal to one of these, so the key set is a complete
+  // necessary-condition superset). Computed ONCE, then each source wikilink's
+  // target is gated on set membership BEFORE the expensive resolver call
+  // (whose title-fallback leg scans every note's content). Without this, a hub
+  // note with hundreds of inbound sources would fire hundreds of full-vault
+  // scans in one delete. The resolver still CONFIRMS each survivor — the
+  // pre-filter narrows, it doesn't decide.
+  const deleted = getNote(db, noteId);
+  const keys = new Set<string>();
+  const addKey = (s: string | null | undefined): void => {
+    const k = s?.trim().toLowerCase();
+    if (k) keys.add(k);
+  };
+  if (deleted?.path) {
+    addKey(deleted.path);
+    const slash = deleted.path.lastIndexOf("/");
+    addKey(slash >= 0 ? deleted.path.slice(slash + 1) : deleted.path); // basename
+    if (deleted.extension) addKey(`${deleted.path}.${deleted.extension}`);
+  }
+  if (deleted?.content) addKey(extractH1Title(deleted.content));
+  if (keys.size === 0) return; // no key any wikilink could have matched on
+
+  for (const { source_id } of inbound) {
+    if (source_id === noteId) continue; // defensive — wikilinks never self-link
+
+    const source = getNote(db, source_id);
+    if (!source || !source.content) continue;
+
+    const targetMap = dedupeWikilinkTargets(parseWikilinks(source.content));
+    for (const [, wl] of targetMap) {
+      // Skip the resolver unless this target text could match the deleted
+      // note by one of its resolution keys (necessary-condition pre-filter).
+      if (!keys.has(wl.target.trim().toLowerCase())) continue;
+      const detail = resolveWikilinkDetailed(db, wl.target);
+      if (detail.resolved && detail.note_id === noteId) {
+        queueUnresolvedLink(db, source_id, wl.target, WIKILINK_REL);
+      }
+    }
+  }
 }

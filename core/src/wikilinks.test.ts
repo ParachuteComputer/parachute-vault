@@ -10,7 +10,10 @@ import {
   listUnresolvedWikilinks,
   getContentWikilinkWarnings,
   resolveOrQueueLink,
+  requeueInboundWikilinksForDelete,
+  getUnresolvedLinksForNote,
 } from "./wikilinks.js";
+import { findPath } from "./links.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -477,6 +480,178 @@ describe("path-based resolution", async () => {
     const links = await store.getLinks(source.id, { direction: "outbound" });
     expect(links).toHaveLength(1);
     expect(links[0].targetId).toBe(target.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requeueInboundWikilinksForDelete (LB6) — a deleted note's inbound wikilink
+// edges must re-queue so recreating a note at the same path/title heals
+// them, instead of staying dead until the SOURCE note is individually
+// re-saved.
+// ---------------------------------------------------------------------------
+
+describe("delete → recreate re-resolves inbound wikilinks (LB6)", () => {
+  it("A [[Foo]] survives Foo's delete-then-recreate without touching A", async () => {
+    const a = await store.createNote("Link to [[Foo]]", { path: "A" });
+
+    // Foo doesn't exist yet — the link is queued, not yet live.
+    expect(await store.getLinks(a.id, { direction: "outbound" })).toHaveLength(0);
+    const pendingBefore = db.prepare(
+      "SELECT target_path FROM unresolved_wikilinks WHERE source_id = ?",
+    ).all(a.id) as { target_path: string }[];
+    expect(pendingBefore.map((r) => r.target_path)).toEqual(["Foo"]);
+
+    // Create Foo — the wikilink resolves and the edge + backlink exist.
+    const foo1 = await store.createNote("First Foo", { path: "Foo" });
+    let links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(foo1.id);
+    expect(findPath(db, a.id, foo1.id)).not.toBeNull();
+    const backlinks = await store.getLinks(foo1.id, { direction: "inbound" });
+    expect(backlinks.some((l) => l.sourceId === a.id)).toBe(true);
+
+    // Delete Foo. Without the LB6 fix, `unresolved_wikilinks` stays empty —
+    // nothing pending — even though A's `[[Foo]]` text is untouched.
+    await store.deleteNote(foo1.id);
+    expect(await store.getLinks(a.id, { direction: "outbound" })).toHaveLength(0);
+    const pendingAfterDelete = db.prepare(
+      "SELECT target_path, relationship FROM unresolved_wikilinks WHERE source_id = ?",
+    ).all(a.id) as { target_path: string; relationship: string }[];
+    expect(pendingAfterDelete).toEqual([{ target_path: "Foo", relationship: "wikilink" }]);
+
+    // Recreate Foo (new note, new id — same path). A was never re-saved.
+    const foo2 = await store.createNote("Second Foo", { path: "Foo" });
+
+    // The A -> Foo edge is back, pointed at the NEW Foo, and find-path sees it.
+    links = await store.getLinks(a.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(foo2.id);
+    expect(links[0]!.relationship).toBe("wikilink");
+    expect(findPath(db, a.id, foo2.id)).not.toBeNull();
+
+    // A's content was never touched.
+    const reread = await store.getNote(a.id);
+    expect(reread!.content).toBe("Link to [[Foo]]");
+
+    // The pending row is consumed on resolution.
+    const pendingAfterRecreate = db.prepare(
+      "SELECT * FROM unresolved_wikilinks WHERE source_id = ?",
+    ).all(a.id);
+    expect(pendingAfterRecreate).toHaveLength(0);
+  });
+
+  it("only re-queues wikilink-relationship inbound edges, not explicit typed links", async () => {
+    const source = await store.createNote("A", { id: "src", path: "Src" });
+    const target = await store.createNote("B", { id: "tgt", path: "Tgt" });
+    await store.createLink("src", "tgt", "related-to"); // hand-authored typed link, not a wikilink
+
+    requeueInboundWikilinksForDelete(db, target.id);
+
+    // getUnresolvedLinksForNote tolerates the table not existing at all
+    // (no wikilink was ever parsed in this test) — a raw SELECT would throw.
+    expect(getUnresolvedLinksForNote(db, source.id)).toHaveLength(0);
+  });
+
+  it("re-queues via basename resolution, not just exact path, and recovers on recreate at the same path", async () => {
+    // Target lives at a nested path; source links via the bare basename —
+    // resolved through resolveWikilink's basename fallback (rule #3), not
+    // an exact path match.
+    const target = await store.createNote("# Weekly Review\n\nBody.", { path: "Projects/Weekly Review" });
+    const source = await store.createNote("See [[Weekly Review]]", { path: "A" });
+    expect(await store.getLinks(source.id, { direction: "outbound" })).toHaveLength(1);
+
+    await store.deleteNote(target.id);
+
+    const pending = db.prepare(
+      "SELECT target_path FROM unresolved_wikilinks WHERE source_id = ?",
+    ).all(source.id) as { target_path: string }[];
+    // The re-queued key is the RAW bracket text ("Weekly Review"), not the
+    // deleted note's full path — that's what the basename-fallback lazy
+    // resolver (`resolveUnresolvedWikilinks`'s `? LIKE '%/' || target_path`
+    // suffix match) actually matches on.
+    expect(pending.map((r) => r.target_path)).toEqual(["Weekly Review"]);
+
+    // Recreate at the SAME nested path — the suffix match backfills it.
+    const target2 = await store.createNote("# Weekly Review v2\n\nBody.", { path: "Projects/Weekly Review" });
+    const links = await store.getLinks(source.id, { direction: "outbound" });
+    expect(links).toHaveLength(1);
+    expect(links[0]!.targetId).toBe(target2.id);
+  });
+
+  // BLOCKER (Fable review) — the delete→recreate re-heal must cover links
+  // that resolved via the H1-TITLE fallback and the explicit-EXTENSION form,
+  // not just path/basename. The re-queued row's target string is the raw
+  // bracket text (e.g. "John Doe" / "budget.csv"), which the OLD sweep
+  // matched against the new note by PATH TEXT ONLY — so a title- or
+  // extension-resolved link stayed queued (0 links rebuilt) forever. The
+  // sweep now runs each candidate through the SAME resolver write-time uses,
+  // so deferred resolution finally matches write-time on all four legs.
+  it("re-heals a TITLE-fallback link AND an EXTENSION-form link on delete→recreate at the same path+H1", async () => {
+    // A resolves to `people/jdoe` only via its H1 title "John Doe".
+    // B resolves to `budget` (ext csv) only via the explicit [[budget.csv]]
+    // form (the extension leg is exact-path, so `budget` lives at path
+    // "budget", disambiguating it from a same-named `.md` note).
+    const person = await store.createNote("# John Doe\n\nBio.", { path: "people/jdoe" });
+    const budget = await store.createNote("month,total\n2026-01,9000", { path: "budget", extension: "csv" });
+    const a = await store.createNote("met [[John Doe]] today", { path: "A" });
+    const b = await store.createNote("see [[budget.csv]]", { path: "B" });
+
+    // Both links live at write time (title fallback + extension form).
+    expect((await store.getLinks(a.id, { direction: "outbound" }))[0]?.targetId).toBe(person.id);
+    expect((await store.getLinks(b.id, { direction: "outbound" }))[0]?.targetId).toBe(budget.id);
+
+    await store.deleteNote(person.id);
+    await store.deleteNote(budget.id);
+
+    // Both re-queued with their raw bracket text — NOT the deleted notes' paths.
+    const pendingA = db.prepare("SELECT target_path FROM unresolved_wikilinks WHERE source_id = ?").all(a.id) as { target_path: string }[];
+    const pendingB = db.prepare("SELECT target_path FROM unresolved_wikilinks WHERE source_id = ?").all(b.id) as { target_path: string }[];
+    expect(pendingA.map((r) => r.target_path)).toEqual(["John Doe"]);
+    expect(pendingB.map((r) => r.target_path)).toEqual(["budget.csv"]);
+    expect(await store.getLinks(a.id, { direction: "outbound" })).toHaveLength(0);
+    expect(await store.getLinks(b.id, { direction: "outbound" })).toHaveLength(0);
+
+    // Recreate each at the SAME path + H1 (new note, new id). Neither A nor B
+    // is re-saved — only the deferred sweep can rebuild these edges.
+    const person2 = await store.createNote("# John Doe\n\nBio v2.", { path: "people/jdoe" });
+    const budget2 = await store.createNote("month,total\n2026-02,9500", { path: "budget", extension: "csv" });
+
+    // BOTH re-heal (RED before the sweep completion — title/ext legs missing).
+    const aLinks = await store.getLinks(a.id, { direction: "outbound" });
+    const bLinks = await store.getLinks(b.id, { direction: "outbound" });
+    expect(aLinks).toHaveLength(1);
+    expect(aLinks[0]!.targetId).toBe(person2.id);
+    expect(findPath(db, a.id, person2.id)).not.toBeNull();
+    expect(bLinks).toHaveLength(1);
+    expect(bLinks[0]!.targetId).toBe(budget2.id);
+
+    // Pending rows consumed on resolution.
+    expect(getUnresolvedLinksForNote(db, a.id)).toHaveLength(0);
+    expect(getUnresolvedLinksForNote(db, b.id)).toHaveLength(0);
+  });
+
+  // The completed sweep must NOT mis-resolve an AMBIGUOUS target — matching
+  // write-time's "don't guess" contract. A pending [[John Doe]] is swept when
+  // a same-titled note is created; if TWO notes already share that H1 by the
+  // time the sweep verifies, the resolver returns ambiguous and the row stays
+  // queued rather than the old path-only sweep's "link to whoever showed up."
+  // (Reached via a pathless first note — the sweep is path-gated, so it never
+  // fired to consume the row when only ONE John Doe existed.)
+  it("does not re-heal a title link when the target is ambiguous (two notes share the H1)", async () => {
+    const a = await store.createNote("met [[John Doe]]", { path: "A" });
+    expect(getUnresolvedLinksForNote(db, a.id).map((l) => l.target)).toEqual(["John Doe"]); // queued, no John Doe yet
+
+    // A PATHLESS note carrying the H1 — createNote's sweep is path-gated, so
+    // it does NOT fire here; A's pending row survives with one John Doe extant.
+    await store.createNote("# John Doe\n\nfirst.");
+    expect(getUnresolvedLinksForNote(db, a.id).map((l) => l.target)).toEqual(["John Doe"]); // still queued
+
+    // A SECOND note with the same H1, WITH a path → the sweep fires. Now two
+    // notes carry "John Doe" → resolveWikilinkDetailed is ambiguous → the row
+    // is left queued, nothing linked.
+    await store.createNote("# John Doe\n\nsecond.", { path: "people/jd" });
+    expect(await store.getLinks(a.id, { direction: "outbound" })).toHaveLength(0);
+    expect(getUnresolvedLinksForNote(db, a.id).map((l) => l.target)).toEqual(["John Doe"]);
   });
 });
 

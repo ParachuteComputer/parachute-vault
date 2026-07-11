@@ -214,6 +214,29 @@ describe("aggregateNotes — errors", () => {
     }
   });
 
+  // LB — a `type: "number"` (float) field can NEVER be `indexed: true`
+  // (only integer/boolean are indexable numeric shapes), so it legitimately
+  // never appears in `indexed_fields`. Before the fix, the FIELD_NOT_INDEXED
+  // thrown here carried the SAME generic "declare it via update-tag with
+  // indexed: true" hint every other unindexed field gets — advice that's
+  // impossible to satisfy for `number` specifically, dead-ending an agent
+  // that tries it and hits the SEPARATE "unsupported type ... for indexing"
+  // error. The hint must instead name the real fix: store as an integer.
+  it("FIELD_NOT_INDEXED on a type: \"number\" sum field carries an actionable hint, not the impossible generic \"declare indexed: true\" advice", async () => {
+    await store.upsertTagRecord("expense", { fields: { amount: { type: "number" } } });
+    await store.createNote("a", { tags: ["expense"], metadata: { amount: 9.99 } });
+    try {
+      aggregateNotes(db, { aggregate: { group_by: "tag", op: "sum", field: "amount" } });
+      throw new Error("expected throw");
+    } catch (e: any) {
+      expect(e.code).toBe("FIELD_NOT_INDEXED");
+      expect(e.message).not.toContain("declare it via update-tag with indexed: true");
+      const guidance = `${e.message} ${e.hint ?? ""}`.toLowerCase();
+      expect(guidance).toContain("integer");
+      expect(guidance).toMatch(/float|number|decimal/);
+    }
+  });
+
   it("throws INVALID_QUERY when the sum field is indexed but not numeric (TEXT-backed)", async () => {
     await store.upsertTagRecord("task", {
       fields: {
