@@ -143,6 +143,19 @@ Gaps #2 and #3 below (as originally numbered) are now closed:
   the schema write back and the retry re-fires rather than persisting a
   `reference` schema whose links never got built.
 
+  **The additive-only tradeoff** (round-4 review nit): because the heal never
+  deletes, it cannot reconcile away a *stale* edge left by a prior type
+  round-trip — declare `manager` reference (edge → Alice) → flip `manager` to
+  `type: "string"` → change the value to Bob via a normal write (reference sync
+  doesn't fire on a non-reference field, so the Alice edge persists) →
+  re-declare `manager` reference. The heal correctly adds the Bob edge, but the
+  orphaned Alice edge remains until the next reference-typed write to that field
+  reconciles it (via the normal `syncReferenceFieldLinks` delete-and-recreate
+  path). Reconciling during the heal-walk is deliberately avoided: it would
+  clobber hand-authored structured `links` under the same relationship (see the
+  known gap below) and reintroduce the whole-tag churn nit 5 removed. The stale
+  edge is stranded by the type-flip, not by the backfill.
+
 All of the above are covered in `core/src/core.test.ts` under the same
 `describe("typed reference field", …)` block (search `cardinality:'many'`,
 `backfills links for existing notes`, `BLOCKER`, and `NIT 3`).
