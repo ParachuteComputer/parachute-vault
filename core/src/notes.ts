@@ -922,6 +922,14 @@ function validateIsoDateValue(field: string, value: string): void {
  * fallback, not an expected path for any bound `validateIsoDateValue`'s own
  * error message advertises as valid ("2026-07-09" / full ISO timestamps).
  * Surfaces the SAME `INVALID_QUERY` shape rather than binding `NaN`.
+ *
+ * One deliberate tightening for `updated_at` only: an ISO *shorthand* bound
+ * like `"2024"` or `"2024-06"` passes `Date.parse` (so `validateIsoDateValue`
+ * accepted it, and on a canonical vault it compared correctly via lexicographic
+ * prefix) but fails `timestampToMs`'s stricter `TIMESTAMP_RE`, so it now
+ * returns `INVALID_QUERY` here — loud, not silent. `date_filter` on
+ * `created_at` (no ms mirror) still accepts the shorthand; the asymmetry is
+ * intentional (ambiguous precision on a range bound).
  */
 function resolveUpdatedAtBoundMs(field: string, value: string): number {
   validateIsoDateValue(field, value);
