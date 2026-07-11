@@ -388,9 +388,9 @@ something real — a live project, a decision they're weighing, a deadline —
 more detail.** Don't interview them into an empty vault: the note you can
 already write is worth more than the three you're still asking about, and your
 questions land better as the follow-up to a captured thing ("got the commission
-down — when's it due, and who's the client?") than as the opener. A blank vault
-at the end of a first session means the conversation went well and nothing
-stuck.
+down — when's it due, and who's the client?") than as the opener. A good first
+conversation that leaves the vault empty is a miss, not a success — something
+they said should have stuck.
 
 Five short guides ship in this vault for the person to read (tagged \`#guide\`):
 [[Welcome to your vault 🪂]], [[Capture anything]], [[Tags and the graph]],
@@ -517,7 +517,7 @@ update-tag {
   fields: {
     held_on: { type: "string", indexed: true },                                         // queryable with operators
     status:  { type: "string", enum: ["scheduled", "done"], default: "scheduled" },      // explicit default — declare one to auto-fill
-    rating:  { type: "integer" }                                                        // no default — stays unset until written
+    meeting_rating: { type: "integer" }                                                 // no default — stays unset until written; tag-specific name, not a bare `rating`
   }
 }
 \`\`\`
@@ -571,8 +571,8 @@ A few behaviors worth knowing before you write at scale:
 - **A schema field only back-fills when you declare an explicit \`default\`.**
   When a note gets a tag whose schema declares a field with a \`default\`, an
   unset field is filled with THAT value. A field with no \`default\` stays
-  genuinely absent — \`query-notes { metadata: { rating: { exists: false } } }\`
-  reliably finds notes that never set \`rating\`. Declare \`default\` on a field
+  genuinely absent — \`query-notes { metadata: { meeting_rating: { exists: false } } }\`
+  reliably finds notes that never set \`meeting_rating\`. Declare \`default\` on a field
   only when "unset" and "explicitly set to X" should read the same; leave it
   off when you need to tell them apart.
 - **Validation is advisory, never blocking — EXCEPT an \`indexed: true\`
