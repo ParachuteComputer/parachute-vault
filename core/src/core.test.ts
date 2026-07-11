@@ -4823,6 +4823,139 @@ describe("MCP tools", async () => {
       expect(links).toHaveLength(1);
       expect(links[0]!.targetId).toBe(alice.id);
     });
+
+    // ---- Round-4 review fixes (2026-07-10) ----
+
+    it("BLOCKER 1: the schema-declaration backfill walks ALL notes, not the first 100", async () => {
+      // One shared target every note references.
+      const target = await store.createNote("Target", { path: "People/Target" });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // 120 notes each carrying a `manager` value BEFORE the field is a
+      // reference — exceeds queryNotes' default LIMIT 100.
+      const noteIds: string[] = [];
+      for (let i = 0; i < 120; i++) {
+        const n = await createNote.execute({
+          content: `Task ${i}`,
+          tags: ["task"],
+          metadata: { manager: "People/Target" },
+        }) as any;
+        noteIds.push(n.id);
+      }
+
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      // EVERY one of the 120 notes must have a manager edge — a 100-cap would
+      // leave 20 unlinked (the silent-half-graph this feature prevents).
+      let linked = 0;
+      for (const id of noteIds) {
+        const links = (await store.getLinks(id, { direction: "outbound" }))
+          .filter((l) => l.relationship === "manager" && l.targetId === target.id);
+        if (links.length === 1) linked++;
+      }
+      expect(linked).toBe(120);
+    });
+
+    it("BLOCKER 2: re-declaring an ALREADY-reference field via update-tag heals notes whose links were never built", async () => {
+      const alice = await store.createNote("Alice", { path: "People/Alice" });
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      const createNote = tools.find((t) => t.name === "create-note")!;
+
+      // Field is declared reference from the start, and a note is written.
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { manager: "People/Alice" },
+      }) as any;
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager")).toHaveLength(1);
+
+      // Simulate a pre-fix vault: the edge was never built. Delete it directly,
+      // leaving the metadata value in place but the graph edge missing.
+      await store.deleteLink(note.id, alice.id, "manager");
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager")).toHaveLength(0);
+
+      // Re-declare the SAME already-reference field — the documented heal path.
+      // A transition-keyed trigger would no-op here; the fix fires the backfill
+      // for any reference field in the declared schema.
+      await updateTag.execute({ tag: "task", fields: { manager: { type: "reference" } } });
+
+      const healed = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "manager");
+      expect(healed).toHaveLength(1);
+      expect(healed[0]!.targetId).toBe(alice.id);
+    });
+
+    it("NIT 3: dropping an array element reconciles against RESOLVED targets — a since-renamed target's stale edge is dropped, and an aliased-same-target edge survives", async () => {
+      const dave = await store.createNote("Dave", { path: "People/Dave" });
+      const erin = await store.createNote("Erin", { path: "People/Erin" });
+      await store.upsertTagSchema("task", {
+        fields: { collaborators: { type: "reference", cardinality: "many" } },
+      });
+      const tools = generateMcpTools(store);
+      const createNote = tools.find((t) => t.name === "create-note")!;
+      const updateNote = tools.find((t) => t.name === "update-note")!;
+
+      // --- Corner (a): a still-present element whose target is renamed after
+      // linking; then a DIFFERENT element is dropped. The renamed target's
+      // stale edge must be reconciled away (the old re-resolve-removed-value
+      // approach left it forever).
+      const note = await createNote.execute({
+        content: "Ship it",
+        tags: ["task"],
+        metadata: { collaborators: ["People/Dave", "People/Erin"] },
+      }) as any;
+      expect((await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators")).toHaveLength(2);
+
+      // Rename Dave's target note — the raw value "People/Dave" no longer resolves.
+      await updateNote.execute({ id: dave.id, path: "People/David", force: true });
+
+      // Drop Erin (a different element); keep the now-stale "People/Dave".
+      await updateNote.execute({
+        id: note.id,
+        metadata: { collaborators: ["People/Dave"] },
+        force: true,
+      });
+
+      const afterA = (await store.getLinks(note.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      // Erin dropped; Dave's stale edge (target renamed, value no longer
+      // resolves) reconciled away → zero edges, not a lingering stale one.
+      expect(afterA.some((l) => l.targetId === erin.id)).toBe(false);
+      expect(afterA.some((l) => l.targetId === dave.id)).toBe(false);
+
+      // --- Corner (c): two elements ALIAS the same target (path + H1 title).
+      // Dropping one alias must keep the shared edge (still referenced by the
+      // survivor), not delete it.
+      const carol = await store.createNote("# Carol\n\nbody", { path: "People/Carol" });
+      const aliasNote = await createNote.execute({
+        content: "Alias task",
+        tags: ["task"],
+        // "People/Carol" (path) and "Carol" (H1 title) both resolve to carol.
+        metadata: { collaborators: ["People/Carol", "Carol"] },
+      }) as any;
+      let aliasLinks = (await store.getLinks(aliasNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(aliasLinks).toHaveLength(1);
+      expect(aliasLinks[0]!.targetId).toBe(carol.id);
+
+      // Drop the title alias, keep the path alias → the shared edge survives.
+      await updateNote.execute({
+        id: aliasNote.id,
+        metadata: { collaborators: ["People/Carol"] },
+        force: true,
+      });
+      aliasLinks = (await store.getLinks(aliasNote.id, { direction: "outbound" }))
+        .filter((l) => l.relationship === "collaborators");
+      expect(aliasLinks).toHaveLength(1);
+      expect(aliasLinks[0]!.targetId).toBe(carol.id);
+    });
   });
 
   it("find-path works with ID/path resolution", async () => {

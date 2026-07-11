@@ -14,11 +14,11 @@ import {
   syncWikilinks,
   resolveUnresolvedWikilinks,
   resolveOrQueueLink,
-  resolveLinkTargetDetailed,
   clearQueuedLink,
   clearQueuedLinkTarget,
   requeueInboundWikilinksForDelete,
 } from "./wikilinks.js";
+import { chunkForInClause } from "./sql-in.js";
 import { pathTitle } from "./paths.js";
 import { timestampToMs } from "./cursor.js";
 import { transaction } from "./txn.js";
@@ -164,13 +164,14 @@ export class BunSqliteStore implements Store {
    *
    * Called from `createNote`/`updateNote`/`createNotes` — the single
    * chokepoint both MCP and REST funnel through — AFTER the note row itself
-   * is written, so `note.tags`/`note.metadata` reflect the final state. Also
-   * called from `backfillReferenceFieldLinks` (below) when `update-tag`
-   * newly declares a field `type: "reference"` — gap #3.
+   * is written, so `note.tags`/`note.metadata` reflect the final state. This
+   * is the WRITE-PATH (reconciling) sync; the gap #3 schema-declaration
+   * backfill is a separate, purely-additive path
+   * ({@link backfillReferenceFieldLinks}), so a `update-tag` re-declare never
+   * churns already-correct edges.
    *
    * `priorMetadata` is the note's metadata BEFORE this write (`undefined` on
-   * create, and on a backfill walk — the current value is treated as freshly
-   * set so it resolves/queues unconditionally). For each SCALAR reference
+   * create). For each SCALAR reference
    * field, if its value is unchanged from `priorMetadata`, nothing is
    * touched — the existing link (if any) already reflects it, and
    * re-running the resolve/queue machinery on every unrelated write (e.g. a
@@ -266,21 +267,35 @@ export class BunSqliteStore implements Store {
    * one edge to carol, matching how `createLink`'s own UNIQUE constraint
    * would collapse it anyway).
    *
-   * Diffs the two sets and only touches what changed:
-   * - Elements in BOTH sets are left alone — no DB write, and (crucially)
-   *   an element still queued as an unresolved forward-ref stays queued
-   *   rather than being torn down and re-queued under a fresh row.
-   * - Elements only in the OLD set are REMOVED: resolve the value now (the
-   *   same resolver the original write used — a target's path/id is stable
-   *   unless the target itself was renamed/deleted since) and, if resolved,
-   *   delete that one edge; either way, drop any queued forward-ref scoped
-   *   to that exact element via {@link clearQueuedLinkTarget} (NOT the
+   * Reconciles against the RESOLVED next-set, NOT a raw-value diff (round-4
+   * review NIT 3). Resolving every element of the new array yields the exact
+   * set of `target_id`s the field's edges under this relationship SHOULD
+   * point at; existing edges are then reconciled TO that set:
+   * - Delete every existing edge under `(noteId, relationship)` whose
+   *   `target_id` is NOT in the resolved next-set. Reconciling on resolved
+   *   TARGETS (not by re-resolving each removed raw string) is what makes
+   *   the three corners the raw-value diff got wrong come out right:
+   *   (a) a removed element whose target was renamed/deleted since — its
+   *   edge's `target_id` is simply absent from the next-set, so it's
+   *   dropped (the raw-value approach re-resolved the stale string, missed,
+   *   and left the edge forever); (b) a removed element now ambiguous —
+   *   same, dropped by target; (c) two elements ALIASING the same target
+   *   (a path and its H1 title both resolving to one note) — removing one
+   *   alias keeps the shared edge, because the surviving alias still
+   *   resolves that `target_id` INTO the next-set (the raw-value approach
+   *   deleted the shared edge when it processed the removed alias, then
+   *   never recreated it because the surviving alias looked "unchanged").
+   * - Create every resolved next-set edge via `createLink`'s `INSERT OR
+   *   IGNORE` — an already-present edge (an element unchanged across the
+   *   update) is untouched, so it KEEPS its original `created_at`.
+   * - A next-set element that doesn't resolve is queued exactly like a
+   *   scalar reference (self-links and ambiguous matches follow the same
+   *   contract: a self element creates a self-loop; an ambiguous one is
+   *   neither linked nor queued, vault#570). Queued forward-refs for
+   *   elements DROPPED from the array (in prior, absent from next) are
+   *   cleared per-element via {@link clearQueuedLinkTarget} — NOT the
    *   blanket {@link clearQueuedLink}, which would also drop OTHER elements'
-   *   still-pending queue rows under the same relationship).
-   * - Elements only in the NEW set are ADDED: resolve-or-queue exactly like
-   *   the scalar path, including the same self-link (no guard — mirrors the
-   *   scalar path, which has none either) and ambiguous-match (neither
-   *   linked nor queued, vault#570) contracts.
+   *   still-pending queue rows under the same relationship.
    *
    * Two sets that are IDENTICAL (regardless of original order/duplicates in
    * either array) short-circuit to a no-op — mirrors the scalar path's
@@ -297,68 +312,139 @@ export class BunSqliteStore implements Store {
 
     if (setsEqual(nextSet, priorSet)) return; // same membership — nothing to do
 
-    for (const value of priorSet) {
-      if (nextSet.has(value)) continue; // present in both — untouched
-      const detail = resolveLinkTargetDetailed(this.db, value);
-      if (detail.resolved && detail.note_id) {
-        linkOps.deleteLink(this.db, noteId, detail.note_id, fieldName);
-      }
-      clearQueuedLinkTarget(this.db, noteId, fieldName, value);
+    // Resolve the ENTIRE next-set (queuing misses) → the target ids the
+    // field's edges under this relationship should point at right now.
+    const desiredTargetIds = new Set<string>();
+    for (const value of nextSet) {
+      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName);
+      if (outcome.status === "resolved") desiredTargetIds.add(outcome.note_id);
     }
 
-    for (const value of nextSet) {
-      if (priorSet.has(value)) continue; // present in both — untouched
-      const outcome = resolveOrQueueLink(this.db, noteId, value, fieldName);
-      if (outcome.status === "resolved") {
-        linkOps.createLink(this.db, noteId, outcome.note_id, fieldName);
+    // Reconcile existing edges to the desired target set (see the doc comment
+    // for why deleting by resolved TARGET, not by re-resolved raw value, is
+    // what fixes the rename / ambiguous / aliasing corners).
+    const existing = linkOps.getLinks(this.db, noteId, { direction: "outbound" });
+    for (const link of existing) {
+      if (link.relationship !== fieldName) continue;
+      if (!desiredTargetIds.has(link.targetId)) {
+        linkOps.deleteLink(this.db, noteId, link.targetId, fieldName);
       }
+    }
+
+    // Create every desired edge — INSERT OR IGNORE keeps an unchanged
+    // element's row (and its `created_at`) intact.
+    for (const targetId of desiredTargetIds) {
+      linkOps.createLink(this.db, noteId, targetId, fieldName);
+    }
+
+    // Drop queued forward-refs for elements removed from the array. A
+    // still-present-but-unresolved element stays queued (re-queued
+    // idempotently above).
+    for (const value of priorSet) {
+      if (!nextSet.has(value)) clearQueuedLinkTarget(this.db, noteId, fieldName, value);
     }
   }
 
   /**
    * Gap #3 backfill (vault typed-reference-field,
-   * docs/design/typed-reference-field.md): when `update-tag` DECLARES a
-   * field `type: "reference"` for the first time, or CHANGES an existing
-   * field's type TO `"reference"`, existing notes that already carry a
-   * value for that field predate the declaration and would otherwise sit
-   * unlinked forever — only a future write that actually touches the field
-   * triggers `syncReferenceFieldLinks`. This walks every note carrying
-   * `tag` (or a descendant — same scope `countConformanceViolations` uses
-   * for its own schema-change impact walk) and re-runs the write-path sync
-   * against each note's CURRENT metadata, exactly as if the value had just
-   * been set (`priorMetadata: undefined`).
+   * docs/design/typed-reference-field.md): when `update-tag`'s persisted
+   * schema for `tag` includes one or more `type: "reference"` fields,
+   * existing notes that already carry a value for such a field may predate
+   * the declaration (or predate the gap #2 array-link fix) and sit unlinked
+   * — only a future write that actually touches the field would otherwise
+   * sync it. This walks every note carrying `tag` (or a descendant, via
+   * schema inheritance — same scope `countConformanceViolations` uses for
+   * its own schema-change impact walk) and materializes the missing links
+   * for each note's CURRENT value of the declared reference field(s).
    *
-   * Idempotent by construction: re-declaring an unchanged schema (or
-   * calling this twice) re-clears-and-recreates the SAME link/queue state
-   * `syncReferenceFieldLinks`/`syncReferenceFieldArrayLinks` would already
-   * be in — no duplicate rows (the `links` UNIQUE constraint plus this
-   * method's own clear-before-create discipline), and a note with no value
-   * for the field is a no-op (`nextValue`/`priorValue` both undefined).
+   * `referenceFieldNames` is the set of fields THIS `update-tag` persisted
+   * as `type: "reference"` (round-4 review NIT 5) — the walk syncs ONLY
+   * those, never every reference field the note happens to carry from OTHER
+   * co-tags/ancestors, so declaring a reference field on tag A can't churn
+   * an unrelated reference field contributed by tag B on a note carrying
+   * both. Fired for ANY reference field in the declared schema, not just a
+   * type-transition (round-4 review BLOCKER 2), so re-declaring an
+   * already-reference field HEALS notes whose links were never built —
+   * exactly what UPGRADING tells operators to do. Safe to re-run: the
+   * backfill is purely ADDITIVE + idempotent (see
+   * {@link backfillOneReferenceField}).
    *
-   * Called AFTER the schema-config cache has already been invalidated (see
-   * the call site in `upsertTagRecord`), so `resolveNoteSchemas` inside the
-   * sync sees the JUST-persisted field declaration rather than a stale
-   * pre-write cache. Runs in its own transaction, separate from the tag
-   * record write — `update-tag` is `vault:admin`-tier, so a bounded
-   * per-tag(+descendants) walk here is an accepted cost, same posture as
-   * `countConformanceViolations`.
+   * Walks the FULL matching note set — the id sweep is unbounded (round-4
+   * review BLOCKER 1: `queryNotes` silently caps at LIMIT 100, which on a
+   * >100-note tag left the majority of notes unlinked — the exact
+   * silent-half-graph this feature exists to prevent). Ids are collected by
+   * a direct `note_tags` scan chunked under the IN-param cap, then hydrated
+   * in batches.
+   *
+   * Runs INSIDE the caller's tag-write transaction (round-4 review NIT 4 —
+   * NOT its own separate transaction), so a walk failure rolls the schema
+   * write back and the retry re-fires rather than leaving a persisted
+   * `reference` schema whose links never got built. `update-tag` is
+   * `vault:admin`-tier, so a bounded per-tag(+descendants) walk is an
+   * accepted cost.
    */
-  private backfillReferenceFieldLinks(tag: string): void {
+  private backfillReferenceFieldLinks(tag: string, referenceFieldNames: Set<string>): void {
+    if (referenceFieldNames.size === 0) return;
     const hierarchy = this.getTagHierarchy();
     const tagSet = Array.from(getTagDescendants(hierarchy, tag));
     if (tagSet.length === 0) return;
 
-    const notes = noteOps.queryNotes(this.db, { tags: tagSet, tagMatch: "any" });
-    if (notes.length === 0) return;
+    // Unbounded id sweep: every note carrying `tag` or a descendant. Direct
+    // note_tags scan (deduped across tags), chunked under the IN-param cap —
+    // NO default LIMIT, unlike `queryNotes`.
+    const idSet = new Set<string>();
+    for (const chunk of chunkForInClause(tagSet)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db.prepare(
+        `SELECT DISTINCT note_id FROM note_tags WHERE tag_name IN (${placeholders})`,
+      ).all(...chunk) as { note_id: string }[];
+      for (const r of rows) idSet.add(r.note_id);
+    }
+    if (idSet.size === 0) return;
 
-    const tagsById = noteOps.getNoteTagsForNotes(this.db, notes.map((n) => n.id));
+    const ids = Array.from(idSet);
+    const schemaConfig = this.getSchemaConfig();
+    const tagsById = noteOps.getNoteTagsForNotes(this.db, ids);
+    const notes = noteOps.getNotes(this.db, ids);
 
-    this.transaction(() => {
-      for (const note of notes) {
-        const tags = tagsById.get(note.id) ?? note.tags ?? [];
-        this.syncReferenceFieldLinks({ ...note, tags }, undefined);
+    for (const note of notes) {
+      const tags = tagsById.get(note.id) ?? note.tags ?? [];
+      const resolution = resolveNoteSchemas(schemaConfig, { tags });
+      const metadata = note.metadata ?? {};
+      for (const fieldName of referenceFieldNames) {
+        const merged = resolution.mergedFields.get(fieldName);
+        // The field must actually be `reference` in THIS note's effective
+        // schema — a descendant tag can override it to a non-reference type
+        // (first-in-walk wins), in which case this note doesn't get a link.
+        if (!merged || merged.spec.type !== "reference") continue;
+        this.backfillOneReferenceField(note.id, fieldName, metadata[fieldName]);
       }
-    });
+    }
+  }
+
+  /**
+   * Materialize the missing graph link(s) for ONE reference field's current
+   * value on one note (gap #3 backfill helper). Purely ADDITIVE and
+   * idempotent: for each element of the value (a scalar string is a
+   * one-element set; an array is deduped via {@link referenceValueToSet}),
+   * resolve-or-queue and, on a resolve, `createLink`. It NEVER deletes an
+   * edge — a backfill materializes links that were never built; reconciling
+   * divergent state (removing a stale edge when a value CHANGES) stays the
+   * write path's job (`syncReferenceFieldLinks` /
+   * {@link syncReferenceFieldArrayLinks}). Because `createLink` and the
+   * forward-ref queue are both `INSERT OR IGNORE`, a re-run — or an edge
+   * that already exists — is a no-op that preserves the existing row's
+   * `created_at` (so re-declaring a schema doesn't churn already-correct
+   * edges, and a scalar value that has since gone ambiguous doesn't silently
+   * lose its already-built edge — round-4 review NIT 5).
+   */
+  private backfillOneReferenceField(noteId: string, fieldName: string, value: unknown): void {
+    for (const element of referenceValueToSet(value)) {
+      const outcome = resolveOrQueueLink(this.db, noteId, element, fieldName);
+      if (outcome.status === "resolved") {
+        linkOps.createLink(this.db, noteId, outcome.note_id, fieldName);
+      }
+    }
   }
 
   /**
@@ -1024,23 +1110,24 @@ export class BunSqliteStore implements Store {
     const priorIndexed = indexedSet(priorRecord?.fields);
     const nextIndexed = indexedSet(nextFields);
 
-    // Gap #3 backfill trigger (vault typed-reference-field,
-    // docs/design/typed-reference-field.md) — a field that's newly declared
-    // (or newly CHANGED to) `type: "reference"` in THIS call needs existing
-    // notes reconciled, since only a future write touching the field would
-    // otherwise sync it. Scoped to fields whose type is transitioning TO
-    // "reference" (prior type was something else, or the field didn't exist
-    // in the prior record at all) — a field that was ALREADY "reference" and
-    // stays "reference" on a re-declare is skipped here (its notes are
-    // already in sync from prior writes/backfills; re-declaring an unchanged
-    // schema should be a cheap no-op, not a full re-walk every time).
-    const priorFieldsForRefCheck = priorRecord?.fields ?? {};
-    const needsReferenceBackfill =
-      patch.fields !== undefined &&
-      Object.entries(nextFields ?? {}).some(
-        ([fieldName, spec]) =>
-          spec.type === "reference" && priorFieldsForRefCheck[fieldName]?.type !== "reference",
-      );
+    // Gap #3 backfill target set (vault typed-reference-field,
+    // docs/design/typed-reference-field.md) — the field names THIS call
+    // persists as `type: "reference"`. Fired for ANY reference field in the
+    // declared schema, NOT just a type-transition (round-4 review BLOCKER
+    // 2): keying on "transition to reference" made the documented
+    // "re-declare the field to heal existing notes" path a silent no-op (an
+    // already-reference field stays reference, so the transition never
+    // fires), stranding pre-fix vaults whose reference-many links were never
+    // built. The backfill itself is additive + idempotent, so re-firing on
+    // every declare is safe; `update-tag` is a rare admin op, so the bounded
+    // walk is an accepted cost. Empty when `fields` is untouched or cleared.
+    const referenceFieldNames = new Set<string>(
+      patch.fields !== undefined
+        ? Object.entries(nextFields ?? {})
+            .filter(([, spec]) => spec.type === "reference")
+            .map(([name]) => name)
+        : [],
+    );
 
     // PRE-VALIDATE every newly-indexed field BEFORE any persistence. A bad
     // field name (or unmappable type) must fail closed — the schema record
@@ -1089,57 +1176,73 @@ export class BunSqliteStore implements Store {
       }
     }
 
-    // Persist the record + reconcile the indexed-field lifecycle atomically.
-    // If declareField throws inside the transaction (e.g. a cross-tag type
-    // mismatch only detectable once the existing declarer set is consulted),
-    // the whole write rolls back — the schema never ends up claiming an index
-    // that doesn't exist. vault#478 transactional fix.
-    const result = this.transaction(() => {
-      const record = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
+    // Persist the record + reconcile the indexed-field lifecycle AND the
+    // gap #3 reference-link backfill atomically, in ONE transaction (round-4
+    // review NIT 4). If declareField throws (e.g. a cross-tag type mismatch
+    // only detectable once the existing declarer set is consulted) OR the
+    // backfill walk throws, the whole write rolls back — the schema never
+    // ends up claiming an index that doesn't exist (vault#478), and never
+    // persists a `reference` declaration whose links silently failed to
+    // build (a partial-state 500 whose retry, post-BLOCKER-2, would re-fire
+    // and heal — but atomic avoids the partial state in the first place).
+    let result: tagSchemaOps.TagRecord;
+    try {
+      result = this.transaction(() => {
+        const record = tagSchemaOps.upsertTagRecord(this.db, tag, patch);
 
-      if (patch.fields !== undefined) {
-        for (const fieldName of nextIndexed) {
-          const spec = nextFields![fieldName]!;
-          // Type already validated above; non-null assertion is safe here.
-          const mapped = indexedFieldOps.mapFieldType(spec.type)!;
-          indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
-        }
-        for (const fieldName of priorIndexed) {
-          if (!nextIndexed.has(fieldName)) {
-            indexedFieldOps.releaseField(this.db, fieldName, tag);
+        if (patch.fields !== undefined) {
+          for (const fieldName of nextIndexed) {
+            const spec = nextFields![fieldName]!;
+            // Type already validated above; non-null assertion is safe here.
+            const mapped = indexedFieldOps.mapFieldType(spec.type)!;
+            indexedFieldOps.declareField(this.db, fieldName, mapped, tag);
+          }
+          for (const fieldName of priorIndexed) {
+            if (!nextIndexed.has(fieldName)) {
+              indexedFieldOps.releaseField(this.db, fieldName, tag);
+            }
           }
         }
-      }
-      return record;
-    });
 
-    if (patch.parent_names !== undefined) {
-      // parent_names drives both query expansion (tag hierarchy) AND, post
-      // vault#270, schema inheritance — bust both caches.
-      this._tagHierarchy = null;
-      this._schemaConfig = null;
+        // Gap #3 backfill — INSIDE the transaction. Bust the in-memory
+        // caches FIRST (round-4 review NIT 6): the walk's
+        // `resolveNoteSchemas` must see the just-persisted reference
+        // declaration, and `getTagDescendants` must see the post-write
+        // hierarchy — including the `_default` universal-parent gate a
+        // first-time `_default` row flips (which used to be busted only
+        // AFTER the backfill call). Nulling a cache inside the txn is safe:
+        // it only forces a rebuild from the current in-txn DB state; the
+        // `finally` below re-nulls so a rollback can't strand the rebuild.
+        if (referenceFieldNames.size > 0) {
+          this._tagHierarchy = null;
+          this._schemaConfig = null;
+          this.backfillReferenceFieldLinks(tag, referenceFieldNames);
+        }
+        return record;
+      });
+    } finally {
+      // Invalidate whatever this write (or the backfill's mid-txn cache
+      // rebuild) may have touched — on BOTH the commit and the rollback
+      // path. `parent_names` drives query expansion + (vault#270) schema
+      // inheritance; `fields` drives schema validation; a first-time
+      // `_default` row flips the universal-parent gate; and the backfill
+      // above re-caches mid-transaction state a rollback must not keep.
+      if (
+        patch.parent_names !== undefined ||
+        patch.fields !== undefined ||
+        tag === "_default" ||
+        referenceFieldNames.size > 0
+      ) {
+        this._tagHierarchy = null;
+        this._schemaConfig = null;
+      }
     }
-    if (patch.fields !== undefined) {
-      this._schemaConfig = null;
-    }
-    // Gap #3 backfill (see the `needsReferenceBackfill` computation above) —
-    // MUST run after the `_schemaConfig` invalidation immediately above, so
-    // the sync below resolves fields against the JUST-persisted declaration
-    // rather than a stale pre-write cache.
-    if (needsReferenceBackfill) {
-      this.backfillReferenceFieldLinks(tag);
-    }
-    // First-time creation of a tag row (e.g. an empty `_default` placeholder)
-    // changes the `_default` universal-parent gate even when no fields or
-    // parent_names are touched. Cheap to bust: caches rebuild on next read.
-    if (tag === "_default") {
-      this._tagHierarchy = null;
-      this._schemaConfig = null;
-    }
+
     // Tag-mutation event for the git-mirror and any other downstream
     // consumer. Fire "upserted" on every successful tag-record write —
     // schema/relationship/parent-name mutations all alter the sidecar
-    // contents the mirror persists.
+    // contents the mirror persists. (Success path only — a thrown/rolled-back
+    // write never reaches here.)
     this.hooks.dispatchTag("upserted", tag, this);
     return result;
   }

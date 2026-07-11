@@ -53,15 +53,19 @@ or declared-after-the-fact reference field silently lie about the graph.
   per element (same `relationship` = the field name, one row per resolved
   target — the `links` table's own `UNIQUE(source_id, target_id,
   relationship)` naturally handles duplicate elements resolving to the same
-  target). Updating the array **diffs** old vs. new membership: added
-  elements get new links, dropped elements lose theirs, and unchanged
-  elements are left alone (no needless delete/recreate — an unchanged
-  element's edge keeps its original `created_at`). An element with no
-  matching note yet queues exactly like a scalar reference and backfills
-  automatically the moment a matching note is created; an ambiguous element
-  (matches ≥2 notes) is neither linked nor guessed at, same as the scalar
-  contract. A self-referencing element creates a self-loop link, matching
-  the (unguarded) scalar behavior.
+  target). Updating the array **reconciles** the edges to match the new
+  value: it resolves the whole new array to a set of target notes, drops
+  every edge that's no longer among them, and (re-)creates the rest — an
+  unchanged element keeps its original `created_at`. Reconciling on resolved
+  targets (not on the raw strings) means the tricky cases come out right: a
+  dropped element whose target was renamed since still gets its stale edge
+  cleaned up; and two entries that point at the same note (say a path and
+  its title) keep the shared edge as long as one of them survives. An
+  element with no matching note yet queues exactly like a scalar reference
+  and backfills automatically the moment a matching note is created; an
+  ambiguous element (matches ≥2 notes) is neither linked nor guessed at,
+  same as the scalar contract. A self-referencing element creates a
+  self-loop link, matching the (unguarded) scalar behavior.
 
 - **The spurious `type_mismatch` warning on valid `cardinality: "many"`
   reference writes is gone.** Validation's `reference` type check only ever
@@ -72,20 +76,29 @@ or declared-after-the-fact reference field silently lie about the graph.
   `cardinality: "many"` is declared, instead of rejecting the array shape
   outright.
 
-- **Declaring a `reference` field on `update-tag` now backfills links for
-  notes that already carry the value.** Previously, a tag gaining a
-  `type: "reference"` declaration AFTER notes already had matching metadata
-  values left those notes permanently unlinked — only a future write that
-  actually touched the field would sync it, so pre-existing data needed a
-  manual no-op re-write per note to heal. `update-tag` (and REST's `PUT
-  /api/tags/:name`, the same underlying chokepoint) now walks every note
-  carrying the tag (or a descendant, via schema inheritance) whenever a
-  field is newly declared or changed **to** `type: "reference"`, and
-  re-syncs that note's current value as if it had just been set — scalar or
-  array, resolved or queued-for-backfill. Bounded to the declaring tag's
-  membership (this is an admin-tier operation); idempotent — re-declaring an
-  unchanged schema, or a later call that adds an unrelated reference field,
-  never duplicates an already-correct link.
+- **`update-tag` backfills links for notes that already carry a reference
+  value — for the whole tag, and re-declaring heals.** Previously, a tag
+  gaining a `type: "reference"` declaration AFTER notes already had matching
+  metadata values left those notes unlinked — only a future write touching
+  the field would sync it. `update-tag` (and REST's `PUT /api/tags/:name`,
+  the same underlying chokepoint) now walks **every** note carrying the tag
+  or a descendant and creates the missing links for the declared reference
+  field(s) — scalar or array, resolved or queued-for-backfill. Two things
+  make this trustworthy at scale: the walk is **unbounded** (an earlier cut
+  silently stopped at the first 100 notes, so a large tag stayed
+  half-linked), and it fires for **any** reference field in the tag's
+  schema — so **re-declaring an already-reference field HEALS** notes whose
+  links were never built (e.g. a vault upgraded from before one-to-many
+  links worked), which is exactly what the upgrade guide tells operators to
+  do. The backfill is purely **additive and idempotent** — it only ever
+  creates missing links, never deletes, so re-running it (or declaring an
+  unrelated field) never churns or drops an already-correct edge — and it
+  runs in the **same transaction** as the schema write, so if the walk fails
+  the schema change rolls back and a retry starts clean rather than leaving
+  a reference field whose links silently never built. Scoped to the field(s)
+  the call declared reference, so declaring a reference field on one tag
+  never disturbs an unrelated reference field on another tag the note also
+  carries.
 
 ## [0.7.2-rc.4] - 2026-07-10
 

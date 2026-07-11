@@ -83,38 +83,6 @@ but **one operator-visible behavior change** worth knowing:
   automation was somehow planting such paths, it will now get a clear 400;
   fix the path and retry.
 
-## 0.7.1 → 0.7.2 — typed reference fields: one-to-many links + retroactive backfill
-
-Two fixes from the round-4 bug hunt (closing gaps #2/#3 of
-`docs/design/typed-reference-field.md`). No schema migration, no manual
-steps — but **new graph edges may appear** the next time you touch reference
-fields, which is the fix landing, not a regression:
-
-- **A `type: "reference", cardinality: "many"` field now creates one graph
-  link per array element.** Previously an array-valued reference field
-  (e.g. `collaborators: ["carol", "dave"]`) was stored and indexed
-  correctly, but the auto-link sync silently skipped it — zero edges, no
-  error, no warning (worse, a spurious `type_mismatch` warning fired on the
-  perfectly valid array). If you have `cardinality: "many"` reference
-  fields declared today, their notes have been missing links since the
-  field was introduced — **the next write that touches the field** (or a
-  fresh `update-tag` re-declare, see below) now creates the correct edges.
-  If you were querying the graph and wondering why a multi-assignee field
-  never showed up in `near`/`find-path`, this is why.
-- **`update-tag` (and REST `PUT /api/tags/:name`) now backfills links when a
-  field is newly declared `type: "reference"`.** Previously, declaring a
-  reference field AFTER notes already carried matching values left those
-  notes permanently unlinked — only a future write touching the field
-  synced it, so retrofitting an existing vault meant manually re-writing
-  every affected note. Declaring (or changing a field to)
-  `type: "reference"` now walks every note carrying the tag (or a
-  descendant tag) and creates the missing links in the same call — for a
-  **large vault**, this is a bounded-but-real scan of that tag's notes, so
-  a schema edit that newly reference-types a field on a heavily-used tag
-  may take noticeably longer than before (still a single request; no
-  background job). This is additive-only — it only ever creates links that
-  should already have existed, never removes or changes unrelated data.
-
 - **Already have a poisoned note?** If a pre-0.7.2 vault already holds a
   note with a NUL in its path, export no longer aborts on it — that one note
   is **skipped with a warning** (shown in the export summary) and every other
@@ -131,6 +99,44 @@ fields, which is the fix landing, not a regression:
   files with the same note `id`, the import keeps the first (in sorted path
   order), skips the rest, and lists them in the import summary rather than
   silently overwriting.
+
+## 0.7.1 → 0.7.2 — typed reference fields: one-to-many links + retroactive backfill
+
+Two fixes from the round-4 bug hunt (closing gaps #2/#3 of
+`docs/design/typed-reference-field.md`). No schema migration, no manual
+steps — but **new graph edges may appear** the next time you touch (or
+re-declare) reference fields, which is the fix landing, not a regression:
+
+- **A `type: "reference", cardinality: "many"` field now creates one graph
+  link per array element.** Previously an array-valued reference field
+  (e.g. `collaborators: ["carol", "dave"]`) was stored and indexed
+  correctly, but the auto-link sync silently skipped it — zero edges, no
+  error, no warning (worse, a spurious `type_mismatch` warning fired on the
+  perfectly valid array). If you have `cardinality: "many"` reference
+  fields declared today, their notes have been missing links since the
+  field was introduced — **re-declaring the field** (see below) builds them
+  for all existing notes, and any future write to the field keeps them in
+  sync. If you were querying the graph and wondering why a multi-assignee
+  field never showed up in `near`/`find-path`, this is why.
+- **`update-tag` (and REST `PUT /api/tags/:name`) backfills links for
+  notes that already carry a reference value — and re-declaring heals an
+  existing vault.** Previously, a reference field's links only got built by
+  a write that touched the field, so notes written before the field became
+  a reference (or before one-to-many links worked) stayed unlinked. Now,
+  **calling `update-tag` with a `type: "reference"` field walks every note
+  carrying that tag (or a descendant tag) and creates the missing links** —
+  scalar or array. **To retrofit an existing vault, re-declare the reference
+  field** (call `update-tag` with the same `{ type: "reference" }` schema):
+  the walk fires for any reference field in the tag's schema, not just a
+  brand-new one, so a re-declare heals notes whose links were never built.
+  The backfill is **additive only** — it creates links that should already
+  have existed and never deletes or rewrites anything, so re-running it is
+  safe and idempotent. It walks the **whole** tag (not a capped subset), so
+  on a **large, heavily-used tag** a reference-field declaration is a real
+  scan of that tag's notes and may take noticeably longer than an ordinary
+  schema edit (still one synchronous request; no background job). It runs in
+  the same transaction as the schema change, so if it can't complete, the
+  schema edit rolls back and you can simply retry.
 
 ## 0.6.x → 0.7.1 — the Reliability & Usability Program + the 0.7.1 launch
 
