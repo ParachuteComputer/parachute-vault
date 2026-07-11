@@ -43,6 +43,37 @@ boot. Back up your vault's SQLite file first as standard practice.
   position was previously *wrong* (skipped) now sort correctly, so a
   since-last-check poll may surface notes it had silently missed. That's the
   fix landing, not a regression.
+## 0.7.1 → 0.7.2 — data-integrity hardening (import / export / paths)
+
+Three fixes from the round-4 bug hunt. No schema migration, no manual steps —
+but **one operator-visible behavior change** worth knowing:
+
+- **Note paths with a NUL byte or a `..` segment are now rejected at write.**
+  Creating or updating a note (REST or MCP) with such a path returns a `400`
+  `invalid_path` error instead of being accepted. These paths were never
+  legitimate — a NUL-in-path note used to crash and abort the *entire* vault
+  export; a `..` note was silently un-round-trippable. **Ordinary paths are
+  unaffected** — only NUL and `..` segments are refused (paths containing
+  dots, colons, question marks, etc. still work exactly as before). If some
+  automation was somehow planting such paths, it will now get a clear 400;
+  fix the path and retry.
+
+- **Already have a poisoned note?** If a pre-0.7.2 vault already holds a
+  note with a NUL in its path, export no longer aborts on it — that one note
+  is **skipped with a warning** (shown in the export summary) and every other
+  note exports normally. Nothing to do; the bad note is simply left out of
+  the export until you fix or delete it.
+
+- **`import --blow-away` is now crash-safe.** A blow-away (replace-mode)
+  import that fails partway through now rolls the vault back to its exact
+  pre-import state instead of leaving it wiped-and-partial. Backing up the
+  SQLite file before a blow-away is still good practice, but a failed restore
+  can no longer empty your vault.
+
+- **Duplicate-id imports are now reported.** If an export tree contains two
+  files with the same note `id`, the import keeps the first (in sorted path
+  order), skips the rest, and lists them in the import summary rather than
+  silently overwriting.
 
 ## 0.6.x → 0.7.1 — the Reliability & Usability Program + the 0.7.1 launch
 

@@ -34,6 +34,50 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.3] - 2026-07-10
+
+**Data-integrity hardening** — three import/export/path fixes from the
+round-4 bug hunt. Each targets a way a single bad note or a mid-restore
+failure could lose or corrupt data.
+
+### Fixed
+
+- **Blow-away import is now atomic — a failed restore no longer empties
+  your vault.** `parachute-vault import --blow-away` (the disaster-recovery
+  path) wipes the target vault before replaying the export. Previously the
+  wipe and the replay ran with **no enclosing transaction**: if any note
+  failed to replay partway through (two exported files claiming the same
+  `path`, a malformed record, a crash), the vault was left **wiped and only
+  partially restored — the originals gone for good.** The wipe + the entire
+  replay now run inside **one transaction**, so any mid-replay failure rolls
+  back to the exact pre-import vault. (Additive, non-blow-away imports were
+  never destructive and are unchanged.) Under the hood the transaction seam
+  (`core/src/txn.ts`) gained SAVEPOINT-based re-entrancy so the replay's own
+  transactional writes compose inside the outer wrap.
+
+- **Notes with illegal paths are rejected instead of silently breaking
+  export.** A note path containing a **NUL byte** or a **`..` segment** is
+  now refused at write time (REST + MCP `create`/`update`) with a clear
+  `invalid_path` validation error (HTTP `400`). A NUL-in-path note used to
+  slip the export's path-traversal guard and then crash the file write —
+  **aborting the entire vault export for every note**, so any write-capable
+  token could permanently break backup/export for everyone. As a belt for
+  vaults that already hold such a row, the export sink now **skips an
+  unwritable file with a warning + a skipped-note stat** rather than
+  aborting the whole export. (Legitimate paths — including ones containing
+  dots or characters like `:`/`?` — are unaffected; only NUL and `..` are
+  rejected.)
+
+- **Duplicate-id imports are reported, not silently dropped.** When two
+  files in a portable-md export declared the **same note `id`**, the import
+  silently kept the last one and discarded the first (data loss folded into
+  the "updated N" count); a whitespace-only id was accepted as a real key.
+  The import now keeps the **first** of any id collision (deterministic —
+  files are walked in sorted path order), **skips and reports** the
+  duplicate and any blank/whitespace-only id via a new `skipped_duplicate_ids`
+  stat (surfaced in the CLI import summary and the mirror import result),
+  and warns per file.
+
 ## [0.7.2-rc.2] - 2026-07-10
 
 **Fix (P0 correctness): aged/imported vaults silently skipped notes in cursor

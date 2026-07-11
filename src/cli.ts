@@ -2983,6 +2983,12 @@ async function cmdImport(args: string[]) {
     if (stats.skipped_attachments.length > 0) {
       console.log(`Skipped ${stats.skipped_attachments.length} attachment(s) — see warnings above.`);
     }
+    if (stats.skipped_duplicate_ids.length > 0) {
+      console.log(
+        `Skipped ${stats.skipped_duplicate_ids.length} file(s) with duplicate/blank note id(s) — ` +
+        `kept the first of each collision; see warnings above.`,
+      );
+    }
     return;
   }
 

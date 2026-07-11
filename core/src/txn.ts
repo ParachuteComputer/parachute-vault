@@ -14,12 +14,40 @@
  * one of them only ever wrote, so acquiring the write lock eagerly is a
  * strict improvement (no lazy busy-upgrade) and never a semantic change.
  *
- * **Nesting is unsupported**, matching the pre-seam code exactly: SQLite
- * throws "cannot start a transaction within a transaction" on a nested
- * `BEGIN`, and none of the migrated call sites nest (a batch wraps individual
- * `createNote`s, none of which open their own transaction). If a nested
- * caller ever appears, the fix is SAVEPOINT-based re-entrancy *in the bun
- * implementation here* — the call sites stay untouched.
+ * **Nesting via SAVEPOINTs** (vault#589): the outermost `transaction` /
+ * `transactionAsync` on a connection opens a real `BEGIN IMMEDIATE`; a nested
+ * call (one whose connection is already inside a transaction) opens a
+ * `SAVEPOINT` instead, so composing an atomic block out of primitives that
+ * each open their own transaction never hits SQLite's "cannot start a
+ * transaction within a transaction". This is the re-entrancy the original
+ * seam anticipated ("the fix is SAVEPOINT-based re-entrancy in the bun
+ * implementation here — the call sites stay untouched"). The nesting depth is
+ * tracked per connection in {@link txnDepth}; a non-nested caller (depth 0 →
+ * 1) is byte-for-byte the old `BEGIN … COMMIT` / `ROLLBACK` path, so existing
+ * single-level callers are unaffected. The motivating nested caller is the
+ * atomic blow-away import (`importVault` wrapping schema/note/link writes,
+ * several of which open their own `transaction`).
+ *
+ * The `transactionSync` (Durable-Object) delegate path is unchanged — a DO
+ * backend supplies its own natively re-entrant primitive, so the SAVEPOINT
+ * bookkeeping here only governs the bun `BEGIN` path.
+ *
+ * **Shared-connection invariant (load-bearing for {@link transactionAsync}).**
+ * The bun backend is a single synchronous connection. A `transactionAsync`
+ * body — AND anything it calls — must not `await` genuine, slow I/O while the
+ * transaction is open: every `await` yields the event loop, and any work that
+ * runs during that yield and touches the store (a concurrent request, a
+ * mutation hook that writes before its first real await) will `SAVEPOINT`-JOIN
+ * this open transaction on the shared connection — committing/rolling back
+ * with it, its writes cross-wiped by a `ROLLBACK TO`. The blow-away import
+ * (the sole `transactionAsync` wrapping non-batch work) is safe by
+ * construction: its replay awaits only already-resolved promises over the
+ * synchronous bun store, so it never actually yields to unrelated work
+ * mid-transaction, and the mutation hooks it fires do no synchronous store
+ * writes (they defer via `queueMicrotask` and arm debounces / kick idempotent
+ * workers — see hooks.ts). Any NEW `transactionAsync` caller must preserve
+ * this: keep the body's awaits confined to the same synchronous connection,
+ * never awaiting network/disk/subprocess I/O with the transaction open.
  */
 
 /** The minimal DB surface the transaction seam needs — kept structural (no
@@ -39,6 +67,79 @@ export interface TxnCapableDb {
 }
 
 /**
+ * Per-connection nesting depth for the bun `BEGIN` path. Keyed on the db
+ * handle so two connections track independently; a `WeakMap` so a dropped
+ * connection's entry is collected. Depth 0 = no open transaction; the first
+ * `transaction`/`transactionAsync` opens `BEGIN IMMEDIATE` and sets depth 1;
+ * each further nested call opens a `SAVEPOINT` and bumps the depth. See the
+ * file header (vault#589).
+ */
+const txnDepth = new WeakMap<TxnCapableDb, number>();
+
+/** One entry on the nesting stack: whether this frame owns the outer
+ *  `BEGIN … COMMIT`/`ROLLBACK` (outermost) or a `SAVEPOINT` (nested), plus the
+ *  depth to restore on exit. */
+interface TxnFrame {
+  outermost: boolean;
+  savepoint: string | null;
+  priorDepth: number;
+}
+
+/** Open a transaction frame: `BEGIN IMMEDIATE` at depth 0, else a uniquely
+ *  named `SAVEPOINT`. Bumps {@link txnDepth} only after the SQL succeeds. */
+function enterTxn(db: TxnCapableDb): TxnFrame {
+  const priorDepth = txnDepth.get(db) ?? 0;
+  if (priorDepth === 0) {
+    db.exec("BEGIN IMMEDIATE");
+    txnDepth.set(db, 1);
+    return { outermost: true, savepoint: null, priorDepth };
+  }
+  const savepoint = `parachute_sp_${priorDepth}`;
+  db.exec(`SAVEPOINT ${savepoint}`);
+  txnDepth.set(db, priorDepth + 1);
+  return { outermost: false, savepoint, priorDepth };
+}
+
+/** Commit a frame: `COMMIT` for the outermost, `RELEASE` for a savepoint
+ *  (which merges its writes into the enclosing transaction). */
+function commitTxn(db: TxnCapableDb, frame: TxnFrame): void {
+  if (frame.outermost) db.exec("COMMIT");
+  else db.exec(`RELEASE ${frame.savepoint}`);
+  txnDepth.set(db, frame.priorDepth);
+}
+
+/** Roll a frame back: `ROLLBACK` for the outermost (whole transaction),
+ *  `ROLLBACK TO` + `RELEASE` for a savepoint (unwind just this frame; the
+ *  error still propagates so an enclosing frame decides its own fate).
+ *  Best-effort — if the COMMIT itself threw, the transaction is already
+ *  resolved and these throw "no transaction"/"no such savepoint"; swallow so
+ *  the original error propagates. */
+function rollbackTxn(db: TxnCapableDb, frame: TxnFrame): void {
+  try {
+    if (frame.outermost) {
+      db.exec("ROLLBACK");
+    } else {
+      db.exec(`ROLLBACK TO ${frame.savepoint}`);
+      db.exec(`RELEASE ${frame.savepoint}`);
+    }
+  } catch (rollbackErr) {
+    // Only swallow the ONE expected case: the COMMIT/RELEASE itself already
+    // resolved the transaction, so there's nothing left to unwind — SQLite
+    // reports "cannot rollback - no transaction is active" / "no such
+    // savepoint". Any OTHER rollback failure is a real problem (a corrupt
+    // connection, a lost write lock) and must not be masked — re-throw it so
+    // the caller sees a failed rollback rather than a false success. Depth is
+    // restored first so the connection's bookkeeping stays consistent even on
+    // the re-throw path.
+    txnDepth.set(db, frame.priorDepth);
+    const msg = String((rollbackErr as Error)?.message ?? rollbackErr);
+    if (/no transaction is active|no such savepoint/i.test(msg)) return;
+    throw rollbackErr;
+  }
+  txnDepth.set(db, frame.priorDepth);
+}
+
+/**
  * Run `fn` inside a single write transaction, committing its result or
  * rolling back on throw. Synchronous — the callback must not await (see
  * `transactionAsync` for the batch paths that legitimately await the async
@@ -55,20 +156,13 @@ export function transaction<T>(db: TxnCapableDb, fn: () => T): T {
   if (typeof db.transactionSync === "function") {
     return db.transactionSync(fn);
   }
-  db.exec("BEGIN IMMEDIATE");
+  const frame = enterTxn(db);
   try {
     const result = fn();
-    db.exec("COMMIT");
+    commitTxn(db, frame);
     return result;
   } catch (err) {
-    // Best-effort rollback — if the COMMIT itself threw the transaction is
-    // already resolved and ROLLBACK would throw "no transaction is active";
-    // swallow that so the original error is the one that propagates.
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // no active transaction to roll back
-    }
+    rollbackTxn(db, frame);
     throw err;
   }
 }
@@ -86,20 +180,21 @@ export function transaction<T>(db: TxnCapableDb, fn: () => T): T {
  * so it cannot wrap an `async` body that awaits the Store facade between writes.
  * A DO backend that needs an atomic async batch has to reshape the batch as a
  * synchronous unit (or use an async DO transaction primitive) — out of scope
- * for this seam; the raw `BEGIN IMMEDIATE` path stays the single implementation.
+ * for this seam; the bun `BEGIN IMMEDIATE` path stays the single implementation.
+ *
+ * Re-entrant (vault#589): if the connection is already inside a transaction —
+ * e.g. the atomic blow-away import wraps this around store writes that
+ * themselves call {@link transaction} — a nested call opens a SAVEPOINT rather
+ * than a second `BEGIN`. See the file header.
  */
 export async function transactionAsync<T>(db: TxnCapableDb, fn: () => Promise<T>): Promise<T> {
-  db.exec("BEGIN IMMEDIATE");
+  const frame = enterTxn(db);
   try {
     const result = await fn();
-    db.exec("COMMIT");
+    commitTxn(db, frame);
     return result;
   } catch (err) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // no active transaction to roll back
-    }
+    rollbackTxn(db, frame);
     throw err;
   }
 }

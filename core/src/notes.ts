@@ -474,6 +474,63 @@ export function validateExtension(extension: unknown): string {
 }
 
 /**
+ * Thrown by {@link validatePath} when a caller-supplied note `path` can never
+ * round-trip safely (vault#589 / FIX 2). Carries a stable `error_type`
+ * (`invalid_path`) so REST's catch and the generic MCP domain-error mapping
+ * (`src/mcp-http.ts`) both surface a clean 400 — same shape rule as
+ * `ExtensionValidationError`.
+ */
+export class PathValidationError extends Error {
+  code = "INVALID_PATH" as const;
+  error_type = "invalid_path" as const;
+  path: string;
+  reason: string;
+
+  constructor(path: string, reason: string) {
+    super(`invalid_path: "${path}" ${reason}`);
+    this.name = "PathValidationError";
+    this.path = path;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Reject a caller-supplied note path that can never round-trip safely
+ * (vault#589 / FIX 2). Two rules, both enforced at the WRITE surface only
+ * (REST + MCP create/update, exactly where `validateExtension` sits):
+ *
+ *   1. **No NUL byte** — never valid in a filename. A NUL-in-path note keeps
+ *      its resolved target inside the export root (so it slips the traversal
+ *      guard), then uncaught-throws `writeFileSync`, aborting the ENTIRE vault
+ *      export for everyone. Rejecting NUL at write is the primary fix; the
+ *      export sink's per-file try/catch (portable-md.ts) is the belt for rows
+ *      that predate this guard.
+ *   2. **No `..` path segment** — traversal-shaped. Export guard-skips such a
+ *      note (silently un-round-trippable) and it has no legitimate use as a
+ *      vault note path.
+ *
+ * A `null`/empty-after-normalize path is fine — notes need no path. Reads /
+ * queries never call this, so a lookup by a `..`/NUL path degrades to
+ * not-found rather than throwing. The Store itself still trusts internal /
+ * importer writes (mirrors the `validateExtension` split). Throws
+ * `PathValidationError`.
+ */
+export function validatePath(path: unknown): void {
+  if (path === null || path === undefined) return;
+  if (typeof path !== "string") return; // non-string: not a path; caller's shape check owns it
+  // NUL check on the RAW value — `normalizePath` strips NUL, so this must run
+  // before normalization to actually reject rather than silently clean.
+  if (path.includes("\0")) {
+    throw new PathValidationError(path, "contains a NUL byte");
+  }
+  const normalized = normalizePath(path);
+  if (normalized === null) return;
+  if (normalized.split("/").some((seg) => seg === "..")) {
+    throw new PathValidationError(path, "contains a '..' path segment (path traversal)");
+  }
+}
+
+/**
  * Match bun:sqlite's UNIQUE-constraint error on the notes path index.
  * Post-vault#328 the unique index is composite `(path, extension)`, so
  * the message text is "UNIQUE constraint failed: notes.path,

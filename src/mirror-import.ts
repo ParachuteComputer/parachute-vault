@@ -523,6 +523,11 @@ function importResultFromStats(
       `Dropped parent_names on tag "${sp.tag}": ${sp.reason}`,
     );
   }
+  for (const sd of stats.skipped_duplicate_ids) {
+    warnings.push(
+      `Skipped file (id "${sd.id}", path=${sd.path ?? "—"}): ${sd.reason}`,
+    );
+  }
   const result: ImportResult = {
     notes_imported: stats.notes_created + stats.notes_updated,
     tags_imported: stats.schemas_restored,

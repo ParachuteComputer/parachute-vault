@@ -31,7 +31,7 @@ import {
   getContentWikilinkWarnings,
 } from "../core/src/wikilinks.ts";
 import { transactionAsync } from "../core/src/txn.ts";
-import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, getVaultMap } from "../core/src/notes.ts";
+import { getNote, getNotes, getNoteTags, getNoteByTitle, toNoteIndex, filterMetadata, mergeMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, PathConflictError, validatePath, PathValidationError, getVaultMap } from "../core/src/notes.ts";
 import { normalizePath } from "../core/src/paths.ts";
 import {
   parseContentRange,
@@ -1811,6 +1811,9 @@ async function handleNotesInner(
           const extension = item.extension !== undefined
             ? validateExtension(item.extension)
             : undefined;
+          // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+          // Same batch-transaction throw semantics as extension validation.
+          validatePath(item.path);
           const effectiveExtension = extension ?? "md";
           const ifExists: string = item.if_exists ?? "error";
           const upsertMode = ifExists === "ignore" || ifExists === "update" || ifExists === "replace";
@@ -1955,6 +1958,13 @@ async function handleNotesInner(
         if (e && e.code === "INVALID_EXTENSION") {
           return json(
             { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+            400,
+          );
+        }
+        // Bad `path` value (vault#589 / FIX 2) — NUL byte or `..` segment.
+        if (e && e.code === "INVALID_PATH") {
+          return json(
+            { error_type: "invalid_path", error: "invalid_path", path: e.path, reason: e.reason, message: e.message },
             400,
           );
         }
@@ -2253,6 +2263,9 @@ async function handleNotesInner(
           const createExt = body.extension !== undefined
             ? validateExtension(body.extension)
             : undefined;
+          // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+          // Covers both the explicit `path` and the idOrPath-as-path shape.
+          validatePath(explicitPath ?? (idLooksLikePath ? idOrPathStr : undefined));
           const createOpts: Parameters<Store["createNote"]>[1] = {
             ...(idLooksLikePath ? { path: explicitPath ?? idOrPathStr } : { id: idOrPathStr, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
             ...(tagsArr.length > 0 ? { tags: tagsArr } : {}),
@@ -2499,7 +2512,12 @@ async function handleNotesInner(
         if (body.append !== undefined) updates.append = body.append;
         if (body.prepend !== undefined) updates.prepend = body.prepend;
       }
-      if (body.path !== undefined) updates.path = body.path;
+      if (body.path !== undefined) {
+        // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+        // Throws PathValidationError → 400 in the outer catch.
+        validatePath(body.path);
+        updates.path = body.path;
+      }
       if (body.extension !== undefined) {
         // Validate up front (vault#328). Throws ExtensionValidationError
         // which the outer catch converts to a 400.
@@ -2753,6 +2771,13 @@ async function handleNotesInner(
       if (e && e.code === "INVALID_EXTENSION") {
         return json(
           { error_type: "invalid_extension", error: "invalid_extension", extension: e.extension, reason: e.reason, message: e.message },
+          400,
+        );
+      }
+      // Bad `path` value (vault#589 / FIX 2) — NUL byte or `..` segment.
+      if (e && e.code === "INVALID_PATH") {
+        return json(
+          { error_type: "invalid_path", error: "invalid_path", path: e.path, reason: e.reason, message: e.message },
           400,
         );
       }
