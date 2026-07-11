@@ -27,7 +27,7 @@ import { loadVaultTriggers } from "./triggers-api.ts";
 import { route } from "./routing.ts";
 import { startTranscriptionWorker, registerTranscriptionHook, type TranscriptionWorker } from "./transcription-worker.ts";
 import { setTranscriptionWorker } from "./transcription-registry.ts";
-import { assetsDir } from "./routes.ts";
+import { assetsDir, MAX_REQUEST_BODY_BYTES } from "./routes.ts";
 import { resolveScribeAuthToken, ensureScribeBearer } from "./scribe-env.ts";
 import { getCachedScribeUrl } from "./scribe-discovery.ts";
 import { TranscribeCppProvider } from "./transcription/providers/transcribe-cpp.ts";
@@ -502,6 +502,14 @@ const server = Bun.serve({
   port,
   hostname,
   idleTimeout: 120, // seconds — webhook triggers can take a while
+  // vault#588 FIX 2 — explicit transport-level body-size ceiling. Without
+  // this, Bun's *default* maxRequestBodySize (128MB) is the only backstop
+  // for a chunked request with no Content-Length header (the app-level JSON
+  // cap in parseJsonBody's post-parse branch still buffers the full body
+  // first). MAX_REQUEST_BODY_BYTES is MAX_UPLOAD_BYTES (100MB) + headroom —
+  // see its doc comment in routes.ts for the reconciliation with the
+  // /upload and JSON-body app-level caps.
+  maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
   websocket: subscribeWs.handlers,
   async fetch(req, server) {
     const url = new URL(req.url);

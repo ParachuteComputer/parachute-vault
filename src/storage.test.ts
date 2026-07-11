@@ -14,7 +14,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { rmSync, existsSync, mkdirSync, writeFileSync } from "fs";
+import { rmSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
@@ -30,7 +30,7 @@ const testDir = join(
 process.env.PARACHUTE_HOME = testDir;
 process.env.ASSETS_DIR = join(testDir, "assets");
 
-const { handleStorage } = await import("./routes.ts");
+const { handleStorage, MAX_UPLOAD_BYTES, MAX_REQUEST_BODY_BYTES } = await import("./routes.ts");
 const { expandTokenTagScope } = await import("./tag-scope.ts");
 
 // The upload-allowlist tests never touch the store (POST /upload writes to
@@ -173,6 +173,126 @@ describe("storage upload allowlist", () => {
       const res = await handleStorage(uploadRequest(name, "text/plain"), "/upload", "default", uploadStore);
       expect(res.status).toBe(400);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#588 FIX 1 — a malformed/non-multipart POST /upload body used to
+// throw uncaught out of `req.formData()`, escaping to server.ts's generic
+// top-level catch: a 500 with no `error_type`. Same class LB7 (vault.test.ts)
+// fixed for `req.json()` on the JSON-bodied mutating routes, applied to the
+// multipart transport. Every assertion here MUST fail without the fix.
+// ---------------------------------------------------------------------------
+describe("storage upload — malformed multipart body (vault#588 FIX 1)", () => {
+  test("garbage body + a multipart Content-Type header -> 400 invalid_request, not 500", async () => {
+    const req = new Request("http://localhost:1940/storage/upload", {
+      method: "POST",
+      body: "not a valid multipart body at all",
+      headers: { "Content-Type": "multipart/form-data; boundary=----doesNotMatchBody" },
+    });
+    const res = await handleStorage(req, "/upload", "default", uploadStore);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("invalid_request");
+  });
+
+  test("plain-text body with no multipart Content-Type at all -> 400 invalid_request, not 500", async () => {
+    const req = new Request("http://localhost:1940/storage/upload", {
+      method: "POST",
+      body: "just some text, not multipart",
+      headers: { "Content-Type": "text/plain" },
+    });
+    const res = await handleStorage(req, "/upload", "default", uploadStore);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("invalid_request");
+  });
+
+  test("empty body -> 400 invalid_request, not 500", async () => {
+    const req = new Request("http://localhost:1940/storage/upload", {
+      method: "POST",
+      body: "",
+      headers: { "Content-Type": "multipart/form-data; boundary=----empty" },
+    });
+    const res = await handleStorage(req, "/upload", "default", uploadStore);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("invalid_request");
+  });
+
+  test("well-formed multipart form MISSING the `file` field -> 400 missing_required_field (unchanged, not a TypeError)", async () => {
+    const form = new FormData();
+    form.set("not_file", "some value");
+    const req = new Request("http://localhost:1940/storage/upload", { method: "POST", body: form });
+    const res = await handleStorage(req, "/upload", "default", uploadStore);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error_type: string; field: string };
+    expect(body.error_type).toBe("missing_required_field");
+    expect(body.field).toBe("file");
+  });
+
+  test("a well-formed upload still succeeds (regression — the catch doesn't swallow the happy path)", async () => {
+    const res = await handleStorage(uploadRequest("still-works.pdf", "application/pdf"), "/upload", "default", uploadStore);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { mimeType: string };
+    expect(body.mimeType).toBe("application/pdf");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// vault#588 FIX 2 — explicit Bun.serve `maxRequestBodySize` transport ceiling.
+// The JSON-body cap (MAX_JSON_BODY_BYTES) only gates AFTER the transport
+// already buffered the body when Content-Length is absent (chunked
+// requests); before this fix, the only backstop was Bun's unconfigured
+// default (128MB). MAX_REQUEST_BODY_BYTES must sit >= MAX_UPLOAD_BYTES (the
+// /upload app-level cap) with headroom, or a legitimate max-size attachment
+// upload would be rejected at the transport layer before /upload's own
+// 100MB check ever runs. These pin the reconciliation and the wiring;
+// see routes.ts's MAX_REQUEST_BODY_BYTES doc comment for the full rationale.
+// ---------------------------------------------------------------------------
+describe("transport-level request-body ceiling (vault#588 FIX 2)", () => {
+  test("MAX_REQUEST_BODY_BYTES is comfortably >= MAX_UPLOAD_BYTES (never caps a legitimate attachment below its own app-level limit)", () => {
+    expect(MAX_UPLOAD_BYTES).toBe(100 * 1024 * 1024);
+    expect(MAX_REQUEST_BODY_BYTES).toBeGreaterThanOrEqual(MAX_UPLOAD_BYTES);
+    // Pin the chosen ceiling (100MB upload cap + 20MB multipart-overhead
+    // headroom = 120MB) so a future edit that silently narrows it fails loudly.
+    expect(MAX_REQUEST_BODY_BYTES).toBe(120 * 1024 * 1024);
+  });
+
+  test("server.ts wires maxRequestBodySize to MAX_REQUEST_BODY_BYTES on the Bun.serve config", () => {
+    // A config-level assertion (per vault#588's own guidance — a real
+    // >MAX_REQUEST_BODY_BYTES streaming test isn't worth the fixture cost).
+    // server.ts's `Bun.serve({...})` is a module-level side effect (it boots
+    // the real listener on import), so we can't import it in-test; read the
+    // source instead to confirm the constant is actually wired in, not just
+    // defined and forgotten.
+    const serverSrc = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    expect(serverSrc).toMatch(/import\s*\{[^}]*MAX_REQUEST_BODY_BYTES[^}]*\}\s*from\s*"\.\/routes\.ts"/);
+    expect(serverSrc).toMatch(/maxRequestBodySize:\s*MAX_REQUEST_BODY_BYTES/);
+  });
+
+  test("a legitimate upload at exactly MAX_UPLOAD_BYTES still succeeds (not capped below its own limit)", async () => {
+    const bytes = new Uint8Array(MAX_UPLOAD_BYTES);
+    const file = new File([bytes], "max-size.bin", { type: "application/octet-stream" });
+    const form = new FormData();
+    form.set("file", file);
+    const req = new Request("http://localhost:1940/storage/upload", { method: "POST", body: form });
+    const res = await handleStorage(req, "/upload", "default", uploadStore);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { size: number };
+    expect(body.size).toBe(MAX_UPLOAD_BYTES);
+  });
+
+  test("one byte over MAX_UPLOAD_BYTES still rejects at the app-level gate (413 file_too_large, unaffected by the transport ceiling)", async () => {
+    const bytes = new Uint8Array(MAX_UPLOAD_BYTES + 1);
+    const file = new File([bytes], "over-size.bin", { type: "application/octet-stream" });
+    const form = new FormData();
+    form.set("file", file);
+    const req = new Request("http://localhost:1940/storage/upload", { method: "POST", body: form });
+    const res = await handleStorage(req, "/upload", "default", uploadStore);
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as { error_type: string };
+    expect(body.error_type).toBe("file_too_large");
   });
 });
 
