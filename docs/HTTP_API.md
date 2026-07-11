@@ -2124,7 +2124,13 @@ invalid_request` (vault#588) rather than a generic `500`.
 The server's `Bun.serve` `maxRequestBodySize` is set to 120MB — the 100MB
 `/upload` cap plus headroom for multipart overhead — so this transport-level
 ceiling never rejects a legitimate max-size upload before the app-level
-100MB check above even runs.
+100MB check above even runs. A body that exceeds 120MB is rejected by the
+transport layer itself, *before* any app handler runs, so it does **not**
+carry the JSON `error_type` envelope: a request with a `Content-Length` over
+the cap gets a bare `413`, and an over-cap chunked body is dropped mid-stream
+with a raw `400 Bad Request` + `Connection: close`. (App-level caps — the
+10MB JSON body and the 100MB `/upload` — still return the normal
+`payload_too_large` / `file_too_large` error shapes.)
 
 #### `GET /vault/{name}/api/storage/{date}/{filename}` — `vault:read`
 Serves the uploaded file bytes with the matching `Content-Type`. Path is
