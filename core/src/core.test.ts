@@ -663,9 +663,13 @@ describe("renameTag cascade (vault#240 + #247)", async () => {
   // vault#555 fix 2 — a rename cascade's inline content rewrite is a real
   // persisted-state change; `updated_at` must move or a cursor/sync-poll
   // loop never sees the rewritten note.
-  it("1b. content rewrite bumps updated_at (vault#555)", async () => {
+  it("1b. content rewrite bumps updated_at (vault#555) AND updated_at_ms (vault#586)", async () => {
     const note = await store.createNote("Today's #task is important.", { tags: ["task"] });
     const before = note.updatedAt;
+    const msOf = (id: string) =>
+      (db.prepare("SELECT updated_at_ms FROM notes WHERE id = ?").get(id) as { updated_at_ms: number })
+        .updated_at_ms;
+    const beforeMs = msOf(note.id);
     await new Promise((r) => setTimeout(r, 5));
 
     await store.renameTag("task", "todo");
@@ -674,6 +678,12 @@ describe("renameTag cascade (vault#240 + #247)", async () => {
     expect(fresh!.content).toContain("#todo");
     expect(fresh!.updatedAt).not.toBe(before);
     expect(new Date(fresh!.updatedAt) > new Date(before)).toBe(true);
+    // vault#586: the integer keyset key must move in lockstep with updated_at —
+    // else a cursor sync-poll never surfaces the rewritten note. Pins the
+    // renameTag content-cascade ms hunk (a revert leaves ms stale → RED).
+    const afterMs = msOf(note.id);
+    expect(afterMs).toBeGreaterThan(beforeMs);
+    expect(afterMs).toBe(Date.parse(fresh!.updatedAt!));
   });
 
   it("2. cascades sub-tags recursively (task → todo, task/work → todo/work, task/work/client → todo/work/client)", async () => {
@@ -1543,7 +1553,16 @@ describe("queryNotes", async () => {
     // Helper: pin a note's updated_at to a known value so cursor math
     // doesn't race wall-clock writes from the test harness.
     function pinUpdatedAt(id: string, iso: string) {
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+      // Mirror production: EVERY write maintains updated_at_ms in lockstep with
+      // updated_at (vault#586 — the integer column is the keyset-ordering
+      // authority). A helper that pinned only the string would leave a stale ms
+      // and mis-order the cursor. The pinned values here are canonical `...Z`,
+      // so `Date.parse` is exact.
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(
+        iso,
+        Date.parse(iso),
+        id,
+      );
     }
 
     it("first call returns notes + a next_cursor string", async () => {
@@ -1790,7 +1809,12 @@ describe("queryNotes", async () => {
 
   describe("ULID ids for new notes (existing IDs unchanged)", () => {
     function pinUpdatedAt(id: string, iso: string) {
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+      // Keep updated_at_ms in lockstep — see the sibling helper's note (vault#586).
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(
+        iso,
+        Date.parse(iso),
+        id,
+      );
     }
 
     it("new notes get ULID-format ids (26-char Crockford base32)", async () => {

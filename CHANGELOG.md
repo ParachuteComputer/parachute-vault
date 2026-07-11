@@ -34,6 +34,42 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.2] - 2026-07-10
+
+**Fix (P0 correctness): aged/imported vaults silently skipped notes in cursor
+pagination — fixed.** The `query-notes` cursor (the "what changed since I last
+polled" agent-memory primitive) ordered its keyset three different ways that
+only agreed when every `updated_at` was a canonical `.toISOString()` string.
+Import preserves frontmatter timestamps verbatim, so vaults that were imported
+or carry aged rows commonly hold non-canonical `updated_at` (space-separated
+`2024-11-02 14:30:00`, a `+02:00` offset, or a missing `Z`) — and under those,
+the three orderings diverged: notes were silently skipped, offset-form rows
+could re-deliver in a loop, and an unparseable timestamp could 400 the whole
+walk. A paginating client could miss a large fraction of its notes with no
+error.
+
+The fix makes cursor ordering a single integer: a new **`updated_at_ms`**
+column on `notes` is the one source of truth the keyset walk-order, boundary
+predicate, and watermark all read, so they can no longer disagree.
+
+- **Schema v26 migration (`migrateToV26`).** Adds `notes.updated_at_ms
+  INTEGER`, a `(updated_at_ms, id)` index, and backfills every existing row
+  from its `updated_at` with a **UTC-correct** parse (the previous watermark
+  read space-form timestamps in *local* time — a whole-hours error). A
+  genuinely unparseable value falls back to the row's `created_at`, then to a
+  stable sentinel — never NULL, never a throw. The ALTER + backfill run in one
+  transaction (crash-safe: a partial backfill rolls back and re-runs cleanly on
+  the next boot). The backfill is **self-healing** — it runs whenever any row
+  carries a NULL `updated_at_ms`, not only when the column is first added, so a
+  schema-v2-era upgrade (whose `INSERT…SELECT` leaves the column NULL) is
+  repaired rather than left permanently invisible to the keyset.
+- **Opaque + backward-compatible.** `updated_at_ms` is an internal ordering
+  key; note IDs, `updated_at`, and every response shape are unchanged.
+  Cursors already encoded their watermark in milliseconds, so **cursors minted
+  before this release keep resuming correctly** — no client action needed.
+- Every write path (create, update, import/restore, tag-rename cascades)
+  now maintains `updated_at_ms` in lockstep with `updated_at`.
+
 ## [0.7.2-rc.1] - 2026-07-10
 
 **Scope-honest onboarding.** The seeded "Getting Started" guide and the

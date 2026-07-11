@@ -14,8 +14,7 @@ import {
   computeQueryHash,
   decodeCursor,
   encodeCursor,
-  isoToMillis,
-  millisToIso,
+  timestampToMs,
   type CursorPayload,
   type QueryHashInputs,
 } from "./cursor.js";
@@ -115,10 +114,18 @@ export function createNote(
   // value. Hook-style writes with `skipUpdatedAt` preserve this; real user
   // edits bump it strictly upward, so `updated_at > created_at` still means
   // "user-touched since creation."
+  //
+  // `updated_at_ms` (vault#586) is the integer keyset-ordering mirror of
+  // `updated_at`. Derived from the SAME `createdAt` value with the UTC-correct
+  // `timestampToMs`; a `null` (unparseable caller-supplied `created_at`, e.g.
+  // via `createNoteRaw` during import) falls back to wall-clock now so a fresh
+  // row never lands with a NULL keyset key. Import's `restoreNoteTimestamps`
+  // overwrites both columns from the exported bytes immediately after.
+  const updatedAtMs = timestampToMs(createdAt) ?? Date.now();
   try {
     db.prepare(
-      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at, extension, created_by, created_via, last_updated_by, last_updated_via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, content, path, metadata, createdAt, createdAt, extension, actor, via, actor, via);
+      `INSERT INTO notes (id, content, path, metadata, created_at, updated_at, updated_at_ms, extension, created_by, created_via, last_updated_by, last_updated_via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, content, path, metadata, createdAt, createdAt, updatedAtMs, extension, actor, via, actor, via);
   } catch (err) {
     if (path !== null && isPathUniqueError(err)) {
       throw new PathConflictError(path);
@@ -542,7 +549,9 @@ export function updateNote(
   // and path has been removed.
 
   const sets: string[] = [];
-  const values: (string | null)[] = [];
+  // `updated_at_ms` binds as a number (INTEGER column), so the value list
+  // carries numbers alongside strings/nulls (vault#586).
+  const values: (string | number | null)[] = [];
 
   // Hooks and other machine-level writers pass `skipUpdatedAt: true` so
   // their metadata markers don't look like user activity. See issue #44.
@@ -560,6 +569,12 @@ export function updateNote(
     }
     sets.push("updated_at = ?");
     values.push(now);
+    // `updated_at_ms` (vault#586) rides the SAME gate as `updated_at` — the
+    // integer keyset-ordering mirror must move in lockstep with the string.
+    // `now` is canonical `.toISOString()`, so `timestampToMs` never returns
+    // null here; the fallback is belt-and-suspenders.
+    sets.push("updated_at_ms = ?");
+    values.push(timestampToMs(now) ?? Date.now());
 
     // Write-attribution (vault#298): the most-recent-write columns ride the
     // SAME gate as `updated_at`. A `skipUpdatedAt` machine write doesn't bump
@@ -1100,6 +1115,11 @@ function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: str
     if (field === "created_at") {
       column = "n.created_at";
     } else if (field === "updated_at") {
+      // NOTE (vault#586 follow-up): this range filter compares the TEXT
+      // `updated_at`, which is inconsistent on non-canonical rows the same way
+      // the cursor keyset was pre-v26. Cursor pagination moved to the integer
+      // `updated_at_ms` column; `date_filter`/`order_by`/export `--since` still
+      // read the string and are tracked separately. Behavior unchanged here.
       column = "n.updated_at";
     } else {
       // Re-uses the same indexed-field gate as `metadata` operator queries
@@ -1133,11 +1153,19 @@ function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: str
   return { conditions, params };
 }
 
-export function queryNotes(db: Database, opts: QueryOpts): Note[] {
+/**
+ * `_outUpdatedAtMs` (internal, vault#586) — when supplied, the phase-1 page
+ * query writes each returned id's integer `updated_at_ms` keyset key into it.
+ * Only `queryNotesPaged` passes it, to derive the cursor watermark from the
+ * SAME statement that determined page membership + order (one consistent
+ * snapshot — see the call site). Ordinary callers omit it and are unaffected;
+ * it never touches the returned `Note` shape.
+ */
+export function queryNotes(db: Database, opts: QueryOpts, _outUpdatedAtMs?: Map<string, number>): Note[] {
   validateLimitOffset(opts);
   const { conditions, params } = buildFilterConditions(db, opts);
 
-  // ---- Cursor predicate (vault#313) ----
+  // ---- Cursor predicate (vault#313; keyset column vault#586) ----
   //
   // Cursor mode is keyed on PRESENCE of `opts.cursor`, not truthiness
   // (vault#550 bootstrap fix). `cursor: ""` is the bootstrap call — "I want
@@ -1148,24 +1176,38 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // Before this fix, `if (opts.cursor)` treated an empty string exactly
   // like "no cursor" — the caller's bootstrap intent silently vanished and
   // the first page came back in `created_at` order instead of the
-  // `updated_at` keyset order the SECOND page (a real cursor) would use,
+  // keyset order the SECOND page (a real cursor) would use,
   // so naive "did I see this note already" comparisons could skip or
   // duplicate rows across the boundary.
+  //
+  // The keyset orders on the integer `n.updated_at_ms` column (vault#586),
+  // NOT the TEXT `n.updated_at`. That column is the single source of truth
+  // for cursor ordering: walk-order, the boundary predicate below, and the
+  // watermark in `queryNotesPaged` all read the SAME integer, so they can't
+  // diverge the way three separate readings of `updated_at` did on
+  // aged/imported vaults whose timestamps aren't canonical `.toISOString()`
+  // (space-form / offset / no-`Z`) — under which TEXT-lex order, an ISO
+  // boundary string, and a `Date.parse` watermark disagreed and silently
+  // skipped or re-delivered rows.
   //
   // When a REAL (non-empty) cursor is present, decode it, verify its
   // query_hash matches the current query, and add a keyset predicate of
   // the form:
   //
-  //   (updated_at > last_updated_at)
-  //     OR (updated_at = last_updated_at AND id > last_id)
+  //   (updated_at_ms > last_updated_at)
+  //     OR (updated_at_ms = last_updated_at AND id > last_id)
   //
-  // The cursor also forces ORDER BY n.updated_at ASC, n.id ASC so the
-  // watermark math is sound — paginating by updated_at while ordering
-  // by created_at would skip rows whose update timestamp differs from
-  // their creation timestamp. `orderBy` and `sort: "desc"` are mutually
-  // exclusive with cursor mode (a "since last checked" loop wants
-  // ascending updated_at, full stop); we reject with INVALID_QUERY so
-  // callers don't silently get a broken iteration.
+  // The cursor payload's `last_updated_at` is ALREADY a millisecond epoch
+  // (see cursor.ts) — the same units as the column — so it binds directly
+  // with no ISO round-trip. This is also why existing client cursors keep
+  // working unchanged across the upgrade: the encoded watermark was always
+  // ms. The cursor forces ORDER BY n.updated_at_ms ASC, n.id ASC so the
+  // watermark math is sound — paginating by update time while ordering by
+  // created_at would skip rows whose update differs from their creation.
+  // `orderBy` and `sort: "desc"` are mutually exclusive with cursor mode (a
+  // "since last checked" loop wants ascending update order, full stop); we
+  // reject with INVALID_QUERY so callers don't silently get a broken
+  // iteration.
   const cursorMode = opts.cursor !== undefined;
   let cursorPayload: CursorPayload | null = null;
   if (cursorMode) {
@@ -1190,20 +1232,17 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
           "cursor_query_mismatch",
         );
       }
-      // Translate the millis watermark back to an ISO string for the SQL
-      // comparison. SQLite's `n.updated_at` is TEXT in canonical ISO form
-      // (the store's `toISOString()` output), and ISO timestamps sort
-      // lexicographically in the same order as their millisecond epochs
-      // when they all use the same canonical form — which every timestamp
-      // vault mints does. Cursors minted on heterogeneous timestamps
-      // (e.g. an import that preserved unusual formatting) are still
-      // safe: we round-trip the cursor's millis through `new Date()`'s
-      // canonical ISO so the comparison is apples-to-apples.
-      const cursorIso = millisToIso(cursorPayload.last_updated_at);
+      // The cursor's `last_updated_at` is a millisecond epoch (cursor.ts) —
+      // the SAME units as the integer `n.updated_at_ms` column — so it binds
+      // straight into the keyset predicate with no ISO round-trip. Ordering
+      // and boundary now read one numeric column, so heterogeneous /
+      // non-canonical `updated_at` TEXT (space-form, offset, no-`Z`) can no
+      // longer make the walk and the watermark disagree.
+      const cursorMs = cursorPayload.last_updated_at;
       conditions.push(
-        "(n.updated_at > ? OR (n.updated_at = ? AND n.id > ?))",
+        "(n.updated_at_ms > ? OR (n.updated_at_ms = ? AND n.id > ?))",
       );
-      params.push(cursorIso, cursorIso, cursorPayload.last_id);
+      params.push(cursorMs, cursorMs, cursorPayload.last_id);
     }
     // else: bootstrap call (`cursor === ""`) — no watermark yet, no
     // predicate to add, but the ORDER BY below still switches to the
@@ -1214,11 +1253,12 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   const direction = opts.sort === "desc" ? "DESC" : "ASC";
   let orderBy: string;
   if (cursorMode) {
-    // Cursor mode forces a deterministic keyset order. `id` is the
-    // tiebreaker — without it, two notes sharing an `updated_at` would
-    // be at the mercy of SQLite's row order and the next page could
-    // miss or duplicate one.
-    orderBy = "n.updated_at ASC, n.id ASC";
+    // Cursor mode forces a deterministic keyset order on the integer
+    // `updated_at_ms` column (vault#586), matching the boundary predicate
+    // above and the `idx_notes_updated_ms` index. `id` is the tiebreaker —
+    // without it, two notes sharing an `updated_at_ms` would be at the mercy
+    // of SQLite's row order and the next page could miss or duplicate one.
+    orderBy = "n.updated_at_ms ASC, n.id ASC";
   } else if (opts.orderBy === "link_count") {
     // `link_count` is a pseudo-field — like `created_at`/`updated_at` in the
     // dateFilter block above, it bypasses `requireIndexedField` (it's not a
@@ -1273,15 +1313,26 @@ export function queryNotes(db: Database, opts: QueryOpts): Note[] {
   // Phase 2 fetches full rows for just the page (≤ limit ids) and re-orders
   // to the phase-1 order; tags are hydrated in ONE batched query instead of
   // one query per returned note.
+  // Phase 1 also selects `n.updated_at_ms` (vault#586) so a paging caller can
+  // read the keyset key from the SAME statement that applied the keyset order
+  // — the watermark then comes from one consistent snapshot, immune to a
+  // cross-process writer bumping a page row's ms between two separate reads.
   const idSql = `
-    SELECT n.id FROM notes n
+    SELECT n.id, n.updated_at_ms FROM notes n
     ${whereClause}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
   `;
   params.push(limit, offset);
 
-  const idRows = db.prepare(idSql).all(...params) as { id: string }[];
+  const idRows = db.prepare(idSql).all(...params) as { id: string; updated_at_ms: number | null }[];
+  if (_outUpdatedAtMs) {
+    for (const r of idRows) {
+      if (r.updated_at_ms !== null && r.updated_at_ms !== undefined) {
+        _outUpdatedAtMs.set(r.id, r.updated_at_ms);
+      }
+    }
+  }
   return fetchNotesByIdsOrdered(db, idRows.map((r) => r.id));
 }
 
@@ -1517,7 +1568,12 @@ function toQueryHashInputs(opts: QueryOpts): QueryHashInputs {
  * with a non-null `updated_at` greater than the unix epoch).
  */
 export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
-  const notes = queryNotes(db, opts);
+  // Capture each page row's integer keyset key (vault#586) from the SAME
+  // phase-1 statement that ordered + sliced the page — one consistent
+  // snapshot, so the watermark can't leapfrog rows a cross-process writer
+  // bumps between reads. This replaces a separate post-query round-trip.
+  const updatedAtMsById = new Map<string, number>();
+  const notes = queryNotes(db, opts, updatedAtMsById);
   const queryHash = computeQueryHash(toQueryHashInputs(opts));
 
   // Watermark math: pick the larger of (last returned row, prior cursor
@@ -1536,14 +1592,20 @@ export function queryNotesPaged(db: Database, opts: QueryOpts): QueryNotesPage {
     lastId = prior.last_id;
   }
   if (notes.length > 0) {
-    // queryNotes with a cursor orders by (updated_at ASC, id ASC), so
-    // the last note in the array is the new watermark. When no cursor
-    // was passed, the SQL is ordered by created_at; we still want the
-    // cursor to advance to the MAX (updated_at, id) of this page so
-    // the next call resumes correctly. Compute the max explicitly.
+    // Advance the watermark to the page's MAX (updated_at_ms, id) using the
+    // keyset keys captured in the phase-1 snapshot above (vault#586) — the
+    // SAME integer `updated_at_ms` the walk-order used, from the SAME read.
+    // Using the snapshot, rather than re-deriving ms from each note's
+    // `updatedAt` string or re-reading the column, is what keeps walk-order
+    // and watermark from diverging: a row whose backfilled column and
+    // non-canonical `updated_at` TEXT disagree would otherwise re-parse to a
+    // different ms here and skip or re-deliver at the boundary. No throw — a
+    // NULL key (shouldn't occur post-migrateToV26) reads as 0. When a cursor
+    // is in effect the SQL already returns rows in (updated_at_ms, id) order
+    // so the last row IS the max; the explicit max also covers the
+    // created_at-ordered no-cursor path.
     for (const note of notes) {
-      const updatedIso = note.updatedAt ?? note.createdAt;
-      const ms = isoToMillis(updatedIso);
+      const ms = updatedAtMsById.get(note.id) ?? 0;
       if (ms > lastUpdatedAt || (ms === lastUpdatedAt && note.id > lastId)) {
         lastUpdatedAt = ms;
         lastId = note.id;
@@ -2041,6 +2103,10 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
     // note_tags FK on `tag_name` has no ON DELETE, so the delete must
     // come AFTER the repoint.
     const now = new Date().toISOString();
+    // Integer keyset mirror of `now` for the note `updated_at_ms` bumps in the
+    // content/path rewrite passes below (vault#586). `now` is canonical, so
+    // `timestampToMs` never returns null here.
+    const nowMs = timestampToMs(now) ?? Date.now();
     const readStmt = db.prepare(
       "SELECT description, fields, relationships, parent_names, created_at FROM tags WHERE name = ?",
     );
@@ -2168,12 +2234,13 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
       // `#newtag`) and must bump `updated_at` like any other content
       // write, or a cursor/sync-poll loop never sees it. Shares the one
       // `now` timestamp for the whole cascade (same convention as the
-      // tag-row rename pass above).
-      const updateStmt = db.prepare("UPDATE notes SET content = ?, updated_at = ? WHERE id = ?");
+      // tag-row rename pass above). `updated_at_ms` moves with it (vault#586)
+      // so the cursor keyset actually surfaces the rewrite.
+      const updateStmt = db.prepare("UPDATE notes SET content = ?, updated_at = ?, updated_at_ms = ? WHERE id = ?");
       for (const row of candidates) {
         const next = rewriteNoteBody(row.content, renames);
         if (next === row.content) continue;
-        updateStmt.run(next, now, row.id);
+        updateStmt.run(next, now, nowMs, row.id);
         notesRewritten++;
       }
     }
@@ -2189,12 +2256,13 @@ export function renameTag(db: Database, oldName: string, newName: string): Renam
         .prepare(`SELECT id, path FROM notes WHERE path IS NOT NULL AND (${orClauses})`)
         .all(...params) as { id: string; path: string }[];
       // vault#555 fix 2 — same reasoning as the content rewrite above: a
-      // path rewrite is a real persisted-state change.
-      const updateStmt = db.prepare("UPDATE notes SET path = ?, updated_at = ? WHERE id = ?");
+      // path rewrite is a real persisted-state change. `updated_at_ms` moves
+      // with `updated_at` (vault#586).
+      const updateStmt = db.prepare("UPDATE notes SET path = ?, updated_at = ?, updated_at_ms = ? WHERE id = ?");
       for (const row of candidates) {
         const next = rewriteTagConfigPath(row.path, renames);
         if (next === row.path) continue;
-        updateStmt.run(next, now, row.id);
+        updateStmt.run(next, now, nowMs, row.id);
         pathsRenamed++;
       }
     }
