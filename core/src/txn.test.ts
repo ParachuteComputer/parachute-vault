@@ -227,3 +227,67 @@ describe("transactionAsync", () => {
     expect(thrown).toBe(callbackErr);
   });
 });
+
+describe("transaction — re-entrancy via SAVEPOINTs (vault#589)", () => {
+  it("a nested sync transaction uses SAVEPOINT/RELEASE, not a second BEGIN", () => {
+    const { db, calls } = fakeDb();
+    const out = transaction(db, () => {
+      const inner = transaction(db, () => "inner");
+      expect(inner).toBe("inner");
+      return "outer";
+    });
+    expect(out).toBe("outer");
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT parachute_sp_1",
+      "RELEASE parachute_sp_1",
+      "COMMIT",
+    ]);
+  });
+
+  it("an inner throw rolls back to the savepoint; the outer can still commit", () => {
+    const db = freshDb();
+    transaction(db, () => {
+      db.exec("INSERT INTO t (id, v) VALUES (1, 'keep')");
+      try {
+        transaction(db, () => {
+          db.exec("INSERT INTO t (id, v) VALUES (2, 'drop')");
+          throw new Error("inner boom");
+        });
+      } catch {
+        // Outer decides to continue past the failed nested block.
+      }
+      db.exec("INSERT INTO t (id, v) VALUES (3, 'keep2')");
+    });
+    // Only the savepoint'd insert (2) was undone; 1 and 3 committed.
+    const ids = (db.prepare("SELECT id FROM t ORDER BY id").all() as { id: number }[]).map((r) => r.id);
+    expect(ids).toEqual([1, 3]);
+  });
+
+  it("an UNCAUGHT inner throw rolls back the WHOLE outer transaction", () => {
+    const db = freshDb();
+    expect(() =>
+      transaction(db, () => {
+        db.exec("INSERT INTO t (id, v) VALUES (1, 'a')");
+        transaction(db, () => {
+          db.exec("INSERT INTO t (id, v) VALUES (2, 'b')");
+          throw new Error("boom");
+        });
+      }),
+    ).toThrow("boom");
+    expect((db.prepare("SELECT COUNT(*) AS c FROM t").get() as { c: number }).c).toBe(0);
+  });
+
+  it("transactionAsync composes a nested sync transaction via SAVEPOINT (the atomic blow-away shape)", async () => {
+    const { db, calls } = fakeDb();
+    await transactionAsync(db, async () => {
+      transaction(db, () => "nested-sync-write");
+    });
+    expect(calls).toEqual([
+      "BEGIN IMMEDIATE",
+      "SAVEPOINT parachute_sp_1",
+      "RELEASE parachute_sp_1",
+      "COMMIT",
+    ]);
+  });
+});

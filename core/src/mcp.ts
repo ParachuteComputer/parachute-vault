@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import type { Store, Note, QueryOpts } from "./types.js";
 import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
-import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError } from "./notes.js";
+import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, validatePath } from "./notes.js";
 import { normalizePath } from "./paths.js";
 import { QueryError } from "./query-operators.js";
 import { TAG_EXPAND_MODES, stripTagHash, suggestSimilarTag, type TagExpandMode } from "./tag-hierarchy.js";
@@ -1269,6 +1269,10 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
             const extension = item.extension !== undefined
               ? validateExtension(item.extension)
               : undefined;
+            // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+            // Throws inside the batch transaction — rolls it back, same as a
+            // path conflict; mcp-http's generic error_type mapping → clean 400.
+            validatePath(item.path);
             const effectiveExtension = extension ?? "md";
             const ifExists = (item.if_exists as string | undefined) ?? "error";
             const upsertMode = ifExists === "ignore" || ifExists === "update" || ifExists === "replace";
@@ -1719,6 +1723,8 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
                 const createExt = item.extension !== undefined
                   ? validateExtension(item.extension)
                   : undefined;
+                // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+                validatePath(explicitPath ?? (idLooksLikePath ? idOrPath : undefined));
                 const createOpts: Parameters<Store["createNote"]>[1] = {
                   ...(idLooksLikePath ? { path: explicitPath ?? idOrPath } : { id: idOrPath, ...(explicitPath !== undefined ? { path: explicitPath } : {}) }),
                   ...(item.tags && Array.isArray((item.tags as any).add)
@@ -1895,7 +1901,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               if (item.append !== undefined) updates.append = item.append;
               if (item.prepend !== undefined) updates.prepend = item.prepend;
             }
-            if (item.path !== undefined) updates.path = item.path;
+            if (item.path !== undefined) {
+              // Reject NUL / `..` paths at the write surface (vault#589 / FIX 2).
+              validatePath(item.path);
+              updates.path = item.path;
+            }
             if (item.extension !== undefined) {
               updates.extension = validateExtension(item.extension);
             }

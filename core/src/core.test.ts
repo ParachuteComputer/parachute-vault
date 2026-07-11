@@ -8,7 +8,7 @@ import { traverseLinks } from "./links.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import { resolveLinkTarget } from "./wikilinks.js";
 import { generateUlid, ULID_REGEX } from "./ulid.js";
-import { getVaultMap, extractH1Title, findNotesByTitle, getNoteByTitle } from "./notes.js";
+import { getVaultMap, extractH1Title, findNotesByTitle, getNoteByTitle, validatePath, PathValidationError } from "./notes.js";
 
 let store: SqliteStore;
 let db: Database;
@@ -7674,5 +7674,47 @@ describe("vault projection (vault#271)", async () => {
     // Rough token approximation: 1 token ≈ 4 chars. Budget: 5K tokens.
     const approxTokens = md.length / 4;
     expect(approxTokens).toBeLessThan(5000);
+  });
+});
+
+// ---- Path write-validation (vault#589 / FIX 2) ----
+
+describe("validatePath — reject NUL / '..' at the write surface", () => {
+  const NUL = String.fromCharCode(0);
+
+  it("rejects a NUL byte in the path", () => {
+    expect(() => validatePath(`bad${NUL}path`)).toThrow(PathValidationError);
+    try {
+      validatePath(`x${NUL}y`);
+      throw new Error("expected validatePath to throw");
+    } catch (e: any) {
+      expect(e.code).toBe("INVALID_PATH");
+      expect(e.error_type).toBe("invalid_path");
+      expect(e.reason).toMatch(/NUL/);
+    }
+  });
+
+  it("rejects a '..' path segment (traversal-shaped)", () => {
+    expect(() => validatePath("..")).toThrow(PathValidationError);
+    expect(() => validatePath("../secrets")).toThrow(PathValidationError);
+    expect(() => validatePath("a/../b")).toThrow(PathValidationError);
+    expect(() => validatePath("a/..")).toThrow(PathValidationError);
+    // Backslash form normalizes to '/', so it's caught too.
+    expect(() => validatePath("a\\..\\b")).toThrow(PathValidationError);
+  });
+
+  it("accepts legitimate paths, including ones that merely contain dots", () => {
+    expect(() => validatePath("Projects/Parachute/README")).not.toThrow();
+    expect(() => validatePath("notes/2026-07-09")).not.toThrow();
+    expect(() => validatePath("weird...name")).not.toThrow(); // three literal dots, not a '..' segment
+    expect(() => validatePath("a/.hidden/b")).not.toThrow();   // single-dot-prefixed segment is fine
+    expect(() => validatePath("with spaces and : colon?")).not.toThrow(); // FORBIDDEN_CHARS stay un-enforced at write
+  });
+
+  it("treats a null / undefined / empty path as valid (notes need no path)", () => {
+    expect(() => validatePath(null)).not.toThrow();
+    expect(() => validatePath(undefined)).not.toThrow();
+    expect(() => validatePath("")).not.toThrow();
+    expect(() => validatePath("   ")).not.toThrow(); // normalizes to null
   });
 });

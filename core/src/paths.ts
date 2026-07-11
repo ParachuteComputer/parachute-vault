@@ -19,6 +19,10 @@ export function normalizePath(path: string | null | undefined): string | null {
   if (path === null || path === undefined) return null;
 
   let p = path
+    .replace(/\0/g, "")           // strip NUL bytes — never valid in a path;
+                                   // belt for legacy/imported rows so a stored
+                                   // NUL can't reach the filesystem (writes
+                                   // reject NUL up front via validatePath)
     .trim()
     .replace(/\\/g, "/")          // backslash → forward slash
     .replace(/\.md$/i, "")         // strip .md extension

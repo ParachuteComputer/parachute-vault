@@ -77,6 +77,7 @@ import { basename, join, relative, extname, dirname, resolve as resolvePath, sep
 import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
+import { transactionAsync } from "./txn.js";
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -786,8 +787,23 @@ export class FsExportSink implements ExportSink {
         reason: `path-traversal: resolved write target "${fullResolved}" escapes export root "${this.rootResolved}"`,
       };
     }
-    mkdirSync(dirname(full), { recursive: true });
-    writeFileSync(full, content);
+    // Belt for already-poisoned vaults (vault#589 / FIX 2). A NUL-in-path note
+    // resolves WITHIN the export root (passing the traversal guard above) but
+    // then makes `writeFileSync` throw ("path contains null byte") — an
+    // uncaught throw here would abort the ENTIRE export, so one bad note breaks
+    // backup for every note. Any fs failure (NUL, EACCES, ENAMETOOLONG, …)
+    // becomes a skip-with-reason the caller records as a `skipped_notes` stat +
+    // a warning, exactly like the traversal skip, so the rest of the vault
+    // still exports.
+    try {
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `fs write failed for "${relPath}": ${(err as Error)?.message ?? String(err)}`,
+      };
+    }
     return { ok: true };
   }
 
@@ -812,8 +828,17 @@ export class FsExportSink implements ExportSink {
         reason: `path-traversal: dest "${destResolved}" escapes export root "${this.rootResolved}"`,
       };
     }
-    mkdirSync(dirname(destFull), { recursive: true });
-    copyFileSync(srcResolved, destResolved);
+    // Same belt as `writeText` (vault#589 / FIX 2): a NUL/otherwise-unwritable
+    // attachment dest must skip-with-reason, not abort the whole export.
+    try {
+      mkdirSync(dirname(destFull), { recursive: true });
+      copyFileSync(srcResolved, destResolved);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `fs copy failed for "${destRelPath}": ${(err as Error)?.message ?? String(err)}`,
+      };
+    }
     return { ok: true };
   }
 }
@@ -1643,6 +1668,17 @@ export interface ImportStats {
    * imports — the cycle is warned, not fatal. Empty in the common case.
    */
   skipped_schema_parents: Array<{ tag: string; parent_names: string[]; reason: string }>;
+  /**
+   * Content files skipped because their frontmatter `id` couldn't be used as
+   * a note key (vault#589 / FIX 3): a DUPLICATE id (a later file shares an id
+   * with one already imported — the first wins, deterministically, since
+   * `listContentFiles()` walks in sorted path order) or a BLANK id
+   * (whitespace-only, e.g. `"   "`). Without this the later duplicate silently
+   * clobbered the earlier note (data loss folded into "updated N") and a
+   * blank id seeded a bogus map key. Each entry names the offending id, the
+   * skipped file's path, and why. Empty in the common case.
+   */
+  skipped_duplicate_ids: Array<{ id: string; path: string | undefined; reason: string }>;
   /** Set when the caller passed `blowAway: true`; counts notes removed. */
   notes_wiped: number;
   /**
@@ -1815,10 +1851,49 @@ export async function importVault(
     skipped_attachments: [],
     skipped_sidecars: [],
     skipped_schema_parents: [],
+    skipped_duplicate_ids: [],
     notes_wiped: 0,
     indexes_declared: 0,
   };
 
+  // Blow-away is all-or-nothing (vault#589 / FIX 1). A blow-away import wipes
+  // the vault (step 1) then replays every schema/note/link/attachment. If any
+  // replay step throws mid-flight — a `PathConflictError` from two source
+  // files sharing a path, a malformed record, a crash — an UNWRAPPED run would
+  // leave the vault wiped-and-partial with the originals gone for good. Wrap
+  // the wipe + the whole replay in ONE transaction so a failure rolls back to
+  // the exact pre-import vault. The transaction seam is re-entrant (SAVEPOINTs,
+  // vault#589) so the replay's own transactional writes (`upsertTagRecord`,
+  // `deleteTag` cascade, …) compose inside it rather than hitting SQLite's
+  // "cannot start a transaction within a transaction". Additive (non-blow-away)
+  // and dry-run imports are never destructive, so they replay unwrapped —
+  // exactly as before. Hook dispatch stays best-effort/reconciled: no
+  // registered hook does synchronous destructive work (the mirror arms a
+  // debounce; transcription only fires on attachment `created` and kicks an
+  // idempotent worker), so a rollback can't leave a half-applied side effect
+  // the sweep won't reconcile.
+  if (opts.blowAway && !opts.dryRun) {
+    await transactionAsync(store.db, () => importVaultReplay(store, source, opts, stats));
+  } else {
+    await importVaultReplay(store, source, opts, stats);
+  }
+
+  return stats;
+}
+
+/**
+ * The replay body of {@link importVault} — wipe (blow-away only) then restore
+ * schemas → notes → links → attachments → wikilinks → indexes, mutating the
+ * shared `stats`. Split out so `importVault` can run it either bare or inside a
+ * single `transactionAsync` (the atomic blow-away path); the restoration order
+ * and every skip/warn policy are unchanged from the pre-split code.
+ */
+async function importVaultReplay(
+  store: Store,
+  source: ImportSource,
+  opts: ImportEngineOptions,
+  stats: ImportStats,
+): Promise<void> {
   // 1. Optional wipe. Notes are deleted via the public Store API so hooks
   // fire (callers depend on `attachment.deleted` hooks for assets-dir
   // cleanup; we don't bypass that on blow-away). Deleted in bounded batches
@@ -2049,6 +2124,39 @@ export async function importVault(
       ...(links ? { links: links as PortableLink[] } : {}),
       ...(attachments ? { attachments: attachments as PortableAttachmentRef[] } : {}),
     };
+
+    // FIX 3 (vault#589) — guard the `seenNotes` key before it's set:
+    //   - A whitespace-only id ("   ") slips past the `!id` truthiness guard
+    //     above (non-empty string) but is not a real note key. Skip it rather
+    //     than seeding a bogus map entry / clobbering a real note.
+    //   - A DUPLICATE id means a LATER content file carries an id already
+    //     imported from an earlier file. The old `Map.set` silently
+    //     last-wins-clobbered the first note (data loss, folded into
+    //     "updated N"). Keep the FIRST (deterministic — `listContentFiles()`
+    //     returns sorted paths) and skip the later, recording the collision.
+    // Both cases land in `skipped_duplicate_ids` + a per-file `console.warn`
+    // so the operator sees the collision instead of it vanishing.
+    if (id.trim() === "") {
+      stats.skipped_duplicate_ids.push({
+        id,
+        path: portable.path,
+        reason: "blank (whitespace-only) id is not a valid note key",
+      });
+      // eslint-disable-next-line no-console
+      console.warn(`[import] skipped "${relPath}": blank (whitespace-only) \`id\` in frontmatter`);
+      continue;
+    }
+    if (seenNotes.has(id)) {
+      const kept = seenNotes.get(id)!;
+      stats.skipped_duplicate_ids.push({
+        id,
+        path: portable.path,
+        reason: `duplicate id "${id}" — already imported from an earlier file${kept.path ? ` (path="${kept.path}")` : ""}; kept the first, skipped this one`,
+      });
+      // eslint-disable-next-line no-console
+      console.warn(`[import] skipped "${relPath}": duplicate id "${id}" (kept the first file's note; this file's content is NOT imported)`);
+      continue;
+    }
     seenNotes.set(id, portable);
 
     if (opts.dryRun) {
@@ -2232,8 +2340,6 @@ export async function importVault(
       }
     }
   }
-
-  return stats;
 }
 
 /**

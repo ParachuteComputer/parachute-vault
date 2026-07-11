@@ -416,6 +416,39 @@ describe("exportVaultToDir", async () => {
     expect(vault).toContain("name: test");
   });
 
+  // FIX 2(b) (vault#589) — a NUL-in-path note (a pre-fix poisoned row a
+  // write-capable token could have planted) must be SKIPPED with a warning +
+  // stat, never abort the whole export. Before the sink hardening the
+  // uncaught `writeFileSync` throw aborted the entire vault export, so one bad
+  // note broke backup/export for everyone.
+  //
+  // RED-without-fix: drop the try/catch from `FsExportSink.writeText` and this
+  // test's `exportVaultToDir` call throws (whole export aborts) instead of
+  // returning a partial-with-skip result. Verified manually during development.
+  it("hardened export sink: a NUL-in-path note is skipped, not fatal (vault#589)", async () => {
+    await store.createNote("clean one", { id: "c1", path: "clean/one" });
+    await store.createNote("clean two", { id: "c2", path: "clean/two" });
+    await store.createNote("poison", { id: "p1", path: "temp" });
+    // Simulate a pre-fix vault: inject a real NUL directly into the stored
+    // path, bypassing normalizePath (which now strips NUL). `char(0)` yields a
+    // NUL byte in the TEXT column that survives read-back into note.path.
+    store.db.prepare("UPDATE notes SET path = 'bad' || char(0) || 'path' WHERE id = ?").run("p1");
+
+    const outDir = join(tmpBase, "poisoned-out");
+    const stats = await exportVaultToDir(store, { outDir, exportedAt: "2026-05-13T00:00:00.000Z" });
+
+    // The export completes and every OTHER note is written ...
+    expect(existsSync(join(outDir, "clean/one.md"))).toBe(true);
+    expect(existsSync(join(outDir, "clean/two.md"))).toBe(true);
+    expect(stats.notes).toBe(2); // only the two clean notes counted as written
+
+    // ... while the poisoned note is skipped-with-reason (fs write failure),
+    // surfaced as a stat rather than a thrown, aborted export.
+    expect(stats.skipped_traversal).toBeGreaterThanOrEqual(1);
+    const poisonSkip = stats.skipped_notes.find((s) => s.reason.includes("fs write failed"));
+    expect(poisonSkip).toBeTruthy();
+  });
+
   it("writes per-tag schemas to .parachute/schemas/", async () => {
     await store.upsertTagSchema("task", {
       description: "A unit of work",
@@ -708,6 +741,84 @@ describe("importPortableVault", async () => {
     expect(stats.notes_created).toBe(1);
     expect(await targetStore.getNote("old1")).toBeNull();
     expect(await targetStore.getNote("k1")).toBeTruthy();
+  });
+
+  // FIX 1 (vault#589) — blow-away must be all-or-nothing. Before the fix, the
+  // wipe + replay ran with NO enclosing transaction: a mid-replay throw (here a
+  // PathConflictError from two source files declaring the same `path`) left the
+  // vault WIPED + partially replayed, originals gone for good. The wrap rolls
+  // the whole thing back to the exact pre-import vault.
+  //
+  // RED-without-fix: temporarily change `importVault` to always call
+  // `importVaultReplay` unwrapped (drop the `transactionAsync`) and this test
+  // ends with 1 note (`n-first`), all three originals gone — the assertions
+  // below fail. Verified manually during development.
+  it("--blow-away is atomic — a mid-replay throw rolls back to the original vault (vault#589)", async () => {
+    // Target vault holds originals that MUST survive a failed restore.
+    const target = new SqliteStore(new Database(":memory:"));
+    await target.createNote("original one", { id: "orig1", path: "keep/one" });
+    await target.createNote("original two", { id: "orig2", path: "keep/two" });
+    await target.createNote("original three", { id: "orig3", path: "keep/three" });
+
+    // Hand-build a poisoned export: two notes declaring the SAME frontmatter
+    // `path` → the 2nd createNote throws PathConflictError mid-replay. Files
+    // walk in sorted order (first.md before second.md), so first.md lands, then
+    // second.md collides.
+    const inDir = join(tmpBase, "poison-collide");
+    mkdirSync(join(inDir, ".parachute"), { recursive: true });
+    writeFileSync(join(inDir, ".parachute", "vault.yaml"), "name: poison\nexport_format_version: 1\n");
+    writeFileSync(join(inDir, "first.md"), "---\nid: nfirst\npath: collide\n---\nfirst body\n");
+    writeFileSync(join(inDir, "second.md"), "---\nid: nsecond\npath: collide\n---\nsecond body\n");
+
+    // The blow-away import propagates the collision (rejects) ...
+    await expect(importPortableVault(target, { inDir, blowAway: true })).rejects.toThrow();
+
+    // ... and rolls back: all three ORIGINALS survive, and NONE of the
+    // poisoned import's notes landed. The vault is exactly as it was.
+    expect(await target.getNote("orig1")).toBeTruthy();
+    expect(await target.getNote("orig2")).toBeTruthy();
+    expect(await target.getNote("orig3")).toBeTruthy();
+    expect(await target.getNote("nfirst")).toBeNull();
+    expect(await target.getNote("nsecond")).toBeNull();
+    const all = await target.queryNotes({ limit: 100 });
+    expect(all.length).toBe(3);
+  });
+
+  // FIX 3 (vault#589) — duplicate-id and blank-id content files must be
+  // reported + skipped, not silently clobber (last-wins) or seed a bogus key.
+  it("reports duplicate + blank note ids instead of silently clobbering (vault#589)", async () => {
+    // Hand-build a tree: two files share id "dup" (distinct content); a third
+    // carries a whitespace-only id. Files walk sorted: aaa < bbb < ccc.
+    const inDir = join(tmpBase, "dup-ids");
+    mkdirSync(join(inDir, ".parachute"), { recursive: true });
+    writeFileSync(join(inDir, ".parachute", "vault.yaml"), "name: dup\nexport_format_version: 1\n");
+    writeFileSync(join(inDir, "aaa.md"), "---\nid: dup\npath: pa\n---\nfrom aaa\n");
+    writeFileSync(join(inDir, "bbb.md"), "---\nid: dup\npath: pb\n---\nfrom bbb\n");
+    writeFileSync(join(inDir, "ccc.md"), "---\nid: '   '\npath: pc\n---\nfrom ccc\n");
+
+    const target = new SqliteStore(new Database(":memory:"));
+    const stats = await importPortableVault(target, { inDir });
+
+    // Exactly ONE note created — the FIRST of the id collision (aaa) — and the
+    // collision is NOT folded into "updated".
+    expect(stats.notes_created).toBe(1);
+    expect(stats.notes_updated).toBe(0);
+    const kept = await target.getNote("dup");
+    expect(kept).toBeTruthy();
+    expect(kept!.content.trimEnd()).toBe("from aaa"); // first-wins, deterministic
+
+    // Both the duplicate (bbb) and the blank-id (ccc) file are reported as
+    // skipped — surfaced in stats, not absorbed into the created/updated count.
+    expect(stats.skipped_duplicate_ids.length).toBe(2);
+    const dupEntry = stats.skipped_duplicate_ids.find((s) => s.reason.includes("duplicate id"));
+    expect(dupEntry).toBeTruthy();
+    expect(dupEntry!.path).toBe("pb");
+    const blankEntry = stats.skipped_duplicate_ids.find((s) => s.reason.includes("blank"));
+    expect(blankEntry).toBeTruthy();
+
+    // The whitespace-id file clobbered nothing — no bogus key, only "dup" exists.
+    const allNotes = await target.queryNotes({ limit: 100 });
+    expect(allNotes.length).toBe(1);
   });
 
   it("restores tag schemas (description + fields)", async () => {

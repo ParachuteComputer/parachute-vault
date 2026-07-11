@@ -2664,6 +2664,63 @@ describe("HTTP /notes", async () => {
     expect(body.error_type).toBe("invalid_extension");
   });
 
+  // FIX 2 (vault#589) — a note path with a NUL byte or a `..` segment is
+  // rejected at the write surface (400 invalid_path), never persisted. A
+  // NUL-in-path note otherwise slips the export traversal guard and then
+  // aborts the entire vault export; a `..` note is silently un-round-trippable.
+  test("POST /notes rejects a NUL-byte path with 400 invalid_path (not 201)", async () => {
+    const NUL = String.fromCharCode(0);
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", path: `bad${NUL}path` }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_path");
+    // Nothing was written.
+    expect(await store.getNoteByPath("bad")).toBeNull();
+  });
+
+  test("POST /notes rejects a '..' path with 400 invalid_path", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "x", path: "../escape" }),
+      store,
+      "",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_path");
+  });
+
+  test("POST /notes still accepts a legitimate path with dots (regression)", async () => {
+    const res = await handleNotes(
+      mkReq("POST", "/notes", { content: "ok", path: "Projects/v1.2/notes" }),
+      store,
+      "",
+    );
+    expect(res.status).toBeLessThan(400);
+    const body = await res.json() as any;
+    expect(body.path).toBe("Projects/v1.2/notes");
+  });
+
+  test("PATCH /notes/:id rejects a '..' path with 400 invalid_path", async () => {
+    const note = await store.createNote("hi", { id: "path-bad", path: "p" });
+    const res = await handleNotes(
+      mkReq("PATCH", "/notes/path-bad", {
+        path: "../../etc/passwd",
+        if_updated_at: note.updatedAt,
+      }),
+      store,
+      "/path-bad",
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.error_type).toBe("invalid_path");
+    // The note's original path is untouched.
+    expect((await store.getNote("path-bad"))!.path).toBe("p");
+  });
+
   test("GET /notes?extension=csv filters by extension", async () => {
     await store.createNote("md note", { path: "a" });
     await store.createNote("csv note", { path: "b", extension: "csv" });
