@@ -287,13 +287,83 @@ export function isoToMillis(iso: string): number {
 /**
  * Convert millisecond epoch back to an ISO-8601 timestamp string.
  *
- * Used to translate the cursor's `last_updated_at` into the form SQLite
- * compares (`n.updated_at` is a TEXT column carrying ISO strings). ISO
- * timestamps sort correctly lexicographically when they're all in the same
- * canonical form (Z-suffixed, fixed millisecond precision) — every
- * timestamp vault mints goes through `new Date(...).toISOString()` so the
- * lex-order matches the millis-order.
+ * Historically used to translate the cursor's `last_updated_at` into the form
+ * SQLite compared (`n.updated_at` TEXT). Post-vault#586 the keyset compares
+ * against the integer `notes.updated_at_ms` column directly, so this is no
+ * longer on the cursor hot path — kept as a tested utility.
  */
 export function millisToIso(ms: number): string {
   return new Date(ms).toISOString();
+}
+
+/**
+ * Matches an ISO-8601-ish timestamp. The time portion (and each finer field)
+ * is optional so a bare `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` still parses. The
+ * separator is `T` or a space (aged/imported vaults carry both). Zone is an
+ * optional trailing `Z`/`z` or `±HH:MM` / `±HHMM`.
+ */
+const TIMESTAMP_RE =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?\s*(Z|z|[+-]\d{2}:?\d{2})?)?$/;
+
+/**
+ * UTC-correct millisecond-epoch parse of a stored timestamp string, or `null`
+ * when the value is genuinely unparseable (vault#586).
+ *
+ * The cursor keyset orders by an integer `notes.updated_at_ms` column; this is
+ * the ONE parser that derives that integer from a timestamp string — used by
+ * the schema backfill (`migrateToV26`), the write sites that maintain the
+ * column, and any watermark fallback. It exists because `Date.parse` is WRONG
+ * for the two zone-less shapes aged/imported vaults carry (import stores
+ * frontmatter timestamps verbatim, so non-canonical forms are common):
+ *
+ *   - space-separated `YYYY-MM-DD HH:MM:SS` — implementation-defined per spec;
+ *     V8/Bun parse it as LOCAL time, shifting the epoch by the host's UTC
+ *     offset. This was the live bug — a watermark computed in local time
+ *     skipped or re-delivered rows by whole hours.
+ *   - zone-less ISO `YYYY-MM-DDTHH:MM:SS` — ES2015+ parse date-TIME forms with
+ *     no offset as LOCAL time too.
+ *
+ * Both are interpreted here as UTC. An explicit `Z` or `±HH:MM` offset is
+ * honored. Fractional seconds are truncated (floored) to millisecond
+ * precision. NEVER throws — the caller supplies its own deterministic fallback
+ * for a `null` result (e.g. the row's `created_at` ms, else a stable
+ * sentinel), so a single pathological timestamp can't 400 an entire walk.
+ */
+export function timestampToMs(value: string | null | undefined): number | null {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  if (s.length === 0) return null;
+  const m = TIMESTAMP_RE.exec(s);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]) - 1;
+    const day = Number(m[3]);
+    const hour = m[4] !== undefined ? Number(m[4]) : 0;
+    const min = m[5] !== undefined ? Number(m[5]) : 0;
+    const sec = m[6] !== undefined ? Number(m[6]) : 0;
+    // Fractional seconds → ms: right-pad to 3 digits, take the first 3
+    // (millisecond precision; finer digits are floored, not rounded).
+    const ms = m[7] !== undefined ? Number((m[7] + "000").slice(0, 3)) : 0;
+    let epoch = Date.UTC(year, month, day, hour, min, sec, ms);
+    if (!Number.isFinite(epoch)) return null;
+    const zone = m[8];
+    if (zone && zone !== "Z" && zone !== "z") {
+      // `±HH:MM` or `±HHMM` — the wall-clock is stated IN this offset; subtract
+      // it to reach UTC. (`14:30+02:00` is `12:30Z`.)
+      const sign = zone[0] === "-" ? -1 : 1;
+      const digits = zone.slice(1).replace(":", "");
+      const offMin = Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2, 4));
+      epoch -= sign * offMin * 60_000;
+    }
+    return epoch;
+  }
+  // Anything the regex didn't match but that carries an explicit zone marker
+  // (exotic offset spellings, RFC-2822) — trust Date.parse ONLY then, since a
+  // zone-bearing string doesn't hit the local-time trap. Zone-less non-matches
+  // fall through to `null` rather than risk a local-time misread.
+  if (/(?:[Zz]|[+-]\d{2}:?\d{2})$/.test(s)) {
+    const p = Date.parse(s);
+    return Number.isFinite(p) ? p : null;
+  }
+  return null;
 }

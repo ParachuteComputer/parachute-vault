@@ -17,6 +17,7 @@ import {
   clearQueuedLink,
 } from "./wikilinks.js";
 import { pathTitle } from "./paths.js";
+import { timestampToMs } from "./cursor.js";
 import { transaction } from "./txn.js";
 import { HookRegistry } from "./hooks.js";
 import {
@@ -360,9 +361,18 @@ export class BunSqliteStore implements Store {
     // the importer write a specific historical timestamp. Skips hooks
     // by design: this isn't a user-edit, it's a state restoration.
     // See vault#308 PR 2.
+    //
+    // This is THE path by which non-canonical timestamps (space-form,
+    // `+02:00` offset, no-`Z`) land in a vault — frontmatter is preserved
+    // VERBATIM (byte-identical re-export round-trip), so `updated_at` is NOT
+    // canonicalized here. The keyset ordering key `updated_at_ms` (vault#586)
+    // is derived UTC-correctly from that verbatim value: `timestampToMs` does
+    // NOT read space-form as local time. A genuinely unparseable `updated_at`
+    // falls back to `created_at`'s ms, then to 0 — never NULL, never a throw.
+    const updatedAtMs = timestampToMs(updatedAt) ?? timestampToMs(createdAt) ?? 0;
     this.db
-      .prepare("UPDATE notes SET created_at = ?, updated_at = ? WHERE id = ?")
-      .run(createdAt, updatedAt, id);
+      .prepare("UPDATE notes SET created_at = ?, updated_at = ?, updated_at_ms = ? WHERE id = ?")
+      .run(createdAt, updatedAt, updatedAtMs, id);
   }
 
   async deleteNote(id: string): Promise<void> {

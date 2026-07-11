@@ -4,6 +4,46 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## 0.7.1 → 0.7.2 — cursor keyset correctness on aged/imported vaults
+
+**P0 correctness fix.** If you paginate `query-notes` with a cursor (the
+"what changed since I last polled" loop), and your vault was **imported** or
+carries **aged rows** with non-canonical `updated_at` timestamps
+(space-separated `2024-11-02 14:30:00`, a `+02:00` offset, or a missing `Z` —
+import preserves frontmatter timestamps verbatim), the cursor could **silently
+skip notes**, re-deliver offset-form rows in a loop, or error out mid-walk.
+Freshly-created vaults whose timestamps are all canonical were unaffected.
+
+### Migration runs automatically on first 0.7.2 boot
+
+No manual steps — **automatic, transactional, idempotent**, run once on first
+boot. Back up your vault's SQLite file first as standard practice.
+
+- **`migrateToV26` (schema v25→26) — cursor keyset column
+  (`core/src/schema.ts`).** Adds an integer `notes.updated_at_ms` column (the
+  single source of truth for cursor ordering) plus a `(updated_at_ms, id)`
+  index, and backfills every existing row from its `updated_at` with a
+  **UTC-correct** parse — specifically NOT the old `Date.parse`, which read
+  space-form timestamps in *local* time and shifted them by whole hours. A
+  genuinely unparseable `updated_at` falls back to the row's `created_at`, then
+  to a stable sentinel — never NULL, never a throw. The ALTER + backfill run in
+  **one transaction** (same crash-safety discipline as `migrateToV25`): a crash
+  mid-backfill rolls the column back and the next boot re-runs cleanly. Cost is
+  one pass over `notes`; the server logs the row count.
+
+### What cursor / sync consumers should know
+
+- **`updated_at_ms` is an internal ordering key — nothing you read changes.**
+  Note IDs, the `updated_at` field, and every REST/MCP response shape are
+  identical. The column is opaque; you never pass or read it.
+- **Existing cursors keep working.** Cursors have always encoded their
+  watermark in milliseconds, so a cursor minted before 0.7.2 resumes correctly
+  against a 0.7.2 vault with no client change.
+- **You may see a one-time re-delivery on an aged vault.** Rows whose keyset
+  position was previously *wrong* (skipped) now sort correctly, so a
+  since-last-check poll may surface notes it had silently missed. That's the
+  fix landing, not a regression.
+
 ## 0.6.x → 0.7.1 — the Reliability & Usability Program + the 0.7.1 launch
 
 `0.7.1` is one launch covering two bodies of work: (1) the reliability

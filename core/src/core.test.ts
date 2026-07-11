@@ -1543,7 +1543,16 @@ describe("queryNotes", async () => {
     // Helper: pin a note's updated_at to a known value so cursor math
     // doesn't race wall-clock writes from the test harness.
     function pinUpdatedAt(id: string, iso: string) {
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+      // Mirror production: EVERY write maintains updated_at_ms in lockstep with
+      // updated_at (vault#586 — the integer column is the keyset-ordering
+      // authority). A helper that pinned only the string would leave a stale ms
+      // and mis-order the cursor. The pinned values here are canonical `...Z`,
+      // so `Date.parse` is exact.
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(
+        iso,
+        Date.parse(iso),
+        id,
+      );
     }
 
     it("first call returns notes + a next_cursor string", async () => {
@@ -1790,7 +1799,12 @@ describe("queryNotes", async () => {
 
   describe("ULID ids for new notes (existing IDs unchanged)", () => {
     function pinUpdatedAt(id: string, iso: string) {
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?").run(iso, id);
+      // Keep updated_at_ms in lockstep — see the sibling helper's note (vault#586).
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(
+        iso,
+        Date.parse(iso),
+        id,
+      );
     }
 
     it("new notes get ULID-format ids (26-char Crockford base32)", async () => {

@@ -3,8 +3,19 @@ import { normalizePath } from "./paths.js";
 import { rebuildIndexes, listIndexedFields } from "./indexed-fields.js";
 import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
+import { timestampToMs } from "./cursor.js";
 
-export const SCHEMA_VERSION = 25;
+export const SCHEMA_VERSION = 26;
+
+/**
+ * Deterministic last-resort epoch for a note whose `updated_at` AND
+ * `created_at` are both unparseable (vault#586). 0 (the Unix epoch) sorts such
+ * a row to the very start of the keyset walk — honest "oldest / unknown"
+ * placement — and, being a fixed constant, keeps the backfill idempotent (a
+ * re-run derives the identical value). NEVER null: a NULL `updated_at_ms`
+ * would sort unpredictably and break the `> ?` keyset predicate.
+ */
+const UNPARSEABLE_UPDATED_AT_MS = 0;
 
 export const SCHEMA_SQL = `
 -- Notes: the universal record.
@@ -26,6 +37,13 @@ export const SCHEMA_SQL = `
 -- (mcp, surface:NAME, agent:ID, operator/cli, api). Legacy rows stay NULL —
 -- we don't fabricate authors for writes that predate attribution. See
 -- migrateToV23.
+-- updated_at_ms (v26, vault#586) is the integer millisecond-epoch mirror of
+-- updated_at, and the SINGLE source of truth for cursor keyset ordering. The
+-- keyset walk-order, boundary predicate, and watermark all read this one
+-- numeric column, so they can't diverge the way three separate readings of the
+-- TEXT updated_at did on aged/imported vaults with non-canonical timestamps.
+-- Maintained on every write (createNote / updateNote / restore / cascades) via
+-- core/src/cursor.ts timestampToMs; existing rows backfilled by migrateToV26.
 CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
   content TEXT DEFAULT '',
@@ -37,7 +55,8 @@ CREATE TABLE IF NOT EXISTS notes (
   created_by TEXT,
   created_via TEXT,
   last_updated_by TEXT,
-  last_updated_via TEXT
+  last_updated_via TEXT,
+  updated_at_ms INTEGER
 );
 
 -- Tags: first-class identity carrying schema, hierarchy, and typed-link
@@ -528,6 +547,12 @@ export function initSchema(db: Database): void {
   // Migrate v24 → v25: rebuild notes_fts with path+content columns +
   // porter stemming, repopulate from every existing note. See vault#551.
   migrateToV25(db);
+
+  // Migrate v25 → v26: add the integer `notes.updated_at_ms` column — the
+  // single source of truth for cursor keyset ordering — plus its
+  // (updated_at_ms, id) index, and backfill every existing row from its
+  // `updated_at` string with a UTC-correct parse. See vault#586.
+  migrateToV26(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1489,6 +1514,80 @@ function migrateToV25(db: Database): void {
   console.log(
     `[vault] migrated to schema v25 (vault#551): notes_fts rebuilt with path+content columns + porter stemming; repopulated ${repopulated} note(s).`,
   );
+}
+
+/**
+ * Migrate v25 → v26: integer `notes.updated_at_ms` as the single source of
+ * truth for cursor keyset ordering (vault#586).
+ *
+ * THE BUG this closes: the `(updated_at, id)` cursor keyset used THREE
+ * inconsistent orderings of `updated_at` that agree only when every timestamp
+ * is canonical `.toISOString()` output — TEXT-lexicographic walk order, a
+ * canonical-ISO boundary string compared as TEXT, and a `Date.parse`-derived
+ * millis watermark that read space-form timestamps in LOCAL time. Import
+ * stores frontmatter timestamps VERBATIM, so aged/imported vaults carry
+ * non-canonical `updated_at` (`2024-11-02 14:30:00` space-form, `+02:00`
+ * offset, no-`Z`) — under which the three orderings diverge and cursor
+ * pagination silently skipped notes, re-delivered rows in a loop, or 400'd the
+ * whole walk. A single integer column makes walk-order, keyset boundary, and
+ * watermark ONE numeric ordering.
+ *
+ * Backfill parse (`timestampToMs`) is UTC-correct — it does NOT use
+ * `Date.parse` for zone-less forms (the live bug was space-form read as LOCAL
+ * time). A genuinely unparseable `updated_at` falls back to the row's
+ * `created_at` ms, then to a stable sentinel ({@link UNPARSEABLE_UPDATED_AT_MS})
+ * — never NULL, never a throw.
+ *
+ * ALL-OR-NOTHING (matches the #565 migrateToV25 pattern): the ALTER + backfill
+ * run inside a SINGLE `transaction`. The idempotency guard is
+ * `hasColumn(db, "notes", "updated_at_ms")`; if the ALTER committed but the
+ * backfill then crashed, the guard would see the column on the next boot and
+ * skip — leaving rows with NULL `updated_at_ms` and a permanently broken
+ * keyset. Wrapping the whole sequence means a rollback removes the column too,
+ * so the guard correctly re-detects "not migrated" and the next boot re-runs
+ * it cleanly. The index create lives OUTSIDE the wrapped block (`CREATE INDEX
+ * IF NOT EXISTS`) so a fresh vault — column already present from SCHEMA_SQL —
+ * still gets the index; on a fresh vault the ALTER+backfill guard short-
+ * circuits and only the index-ensure runs.
+ */
+function migrateToV26(db: Database): void {
+  if (!hasTable(db, "notes")) return;
+
+  if (!hasColumn(db, "notes", "updated_at_ms")) {
+    let backfilled = 0;
+    let fellBack = 0;
+    transaction(db, () => {
+      db.exec("ALTER TABLE notes ADD COLUMN updated_at_ms INTEGER");
+      const rows = db.prepare(
+        "SELECT id, created_at, updated_at FROM notes",
+      ).all() as { id: string; created_at: string | null; updated_at: string | null }[];
+      const update = db.prepare("UPDATE notes SET updated_at_ms = ? WHERE id = ?");
+      for (const row of rows) {
+        // `updated_at` is the ordering authority; fall back to `created_at`
+        // (legacy rows can carry NULL updated_at), then the stable sentinel.
+        let ms = timestampToMs(row.updated_at);
+        if (ms === null) {
+          ms = timestampToMs(row.created_at);
+          fellBack++;
+        }
+        if (ms === null) ms = UNPARSEABLE_UPDATED_AT_MS;
+        update.run(ms, row.id);
+        backfilled++;
+      }
+    });
+    if (backfilled > 0) {
+      console.log(
+        `[vault] migrated to schema v26 (vault#586): backfilled updated_at_ms for ${backfilled} note(s)` +
+          (fellBack > 0 ? ` (${fellBack} fell back to created_at / sentinel for an unparseable updated_at)` : "") +
+          `.`,
+      );
+    }
+  }
+
+  // Index lives outside the ALTER transaction (idx_tokens_vault_name /
+  // idx_notes_updated precedent): a fresh vault has the column from SCHEMA_SQL
+  // but not yet the index, so this ensures it for both paths. Idempotent.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_notes_updated_ms ON notes(updated_at_ms, id)");
 }
 
 function hasTable(db: Database, name: string): boolean {
