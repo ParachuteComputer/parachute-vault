@@ -1100,9 +1100,12 @@ Query params:
     of `created_at`; the field must be declared `indexed: true` in a tag
     schema or the request 400s `invalid_query` / `FIELD_NOT_INDEXED` (vault#555
     fix — this previously listed `created_at`/`updated_at` as example valid
-    values; neither is a metadata field, so both actually error). The special
-    value `link_count` sorts by link DEGREE and needs no declaration — see
-    `include_link_count` below.
+    values; `created_at` is not a metadata field, so it still errors). Two
+    special values need no `indexed: true` declaration: `link_count` sorts by
+    link DEGREE (see `include_link_count` below), and `updated_at` (vault#585)
+    sorts on the integer `updated_at_ms` mirror column — correct on
+    non-canonical/imported timestamps, unlike a plain TEXT sort — with `id`
+    as the tiebreaker instead of `created_at`.
   - `limit=N` — default 50. Must be a non-negative integer; `limit=-1` or a
     non-numeric value is a `400 invalid_query` (vault#550) — a negative
     limit used to silently mean "unlimited" (SQLite semantics leaking

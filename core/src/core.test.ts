@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { generateMcpTools } from "./mcp.js";
 import { initSchema } from "./schema.js";
-import { decodeCursor } from "./cursor.js";
+import { decodeCursor, timestampToMs } from "./cursor.js";
 import { traverseLinks } from "./links.js";
 import * as indexedFieldOps from "./indexed-fields.js";
 import { resolveLinkTarget } from "./wikilinks.js";
@@ -1493,11 +1493,15 @@ describe("queryNotes", async () => {
       await store.updateNote(b.id, { append: " edit" });
 
       // Pin each note's updated_at deterministically so the assertion isn't
-      // racing real wall-clock writes from the test harness.
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-        .run("2026-01-15T00:00:00.000Z", a.id);
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-        .run("2026-04-25T00:00:00.000Z", b.id);
+      // racing real wall-clock writes from the test harness. Mirror
+      // production (vault#586): EVERY write maintains `updated_at_ms` in
+      // lockstep with `updated_at` — the vault#585 fix compares the ms
+      // mirror, not the TEXT column, so a raw pin that only touched the
+      // TEXT column would silently stop affecting this filter.
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-01-15T00:00:00.000Z", Date.parse("2026-01-15T00:00:00.000Z"), a.id);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", Date.parse("2026-04-25T00:00:00.000Z"), b.id);
 
       const results = await store.queryNotes({
         dateFilter: { field: "updated_at", from: "2026-04-01" },
@@ -1519,15 +1523,68 @@ describe("queryNotes", async () => {
     it("dateFilter on updated_at honors the upper-bound exclusive `to`", async () => {
       const a = await store.createNote("inside-window");
       const b = await store.createNote("after-window");
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-        .run("2026-04-25T00:00:00.000Z", a.id);
-      db.prepare("UPDATE notes SET updated_at = ? WHERE id = ?")
-        .run("2026-05-15T00:00:00.000Z", b.id);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-04-25T00:00:00.000Z", Date.parse("2026-04-25T00:00:00.000Z"), a.id);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run("2026-05-15T00:00:00.000Z", Date.parse("2026-05-15T00:00:00.000Z"), b.id);
 
       const results = await store.queryNotes({
         dateFilter: { field: "updated_at", from: "2026-04-01", to: "2026-05-01" },
       });
       expect(results.map((n) => n.content)).toEqual(["inside-window"]);
+    });
+
+    // ---- vault#585: date_filter on updated_at compares the ms mirror ----
+    //
+    // Simulates a post-vault#586-migration vault: `updated_at_ms` is
+    // correctly backfilled from the non-canonical stored `updated_at` TEXT
+    // via `timestampToMs` (exactly what `migrateToV26` does on import), but
+    // the TEXT column itself stays non-canonical — import stores frontmatter
+    // timestamps VERBATIM. Before vault#585, `date_filter` on `updated_at`
+    // still compared the RAW TEXT column lexicographically — wrong on these
+    // non-canonical forms even though the correct ms value already sat in
+    // `updated_at_ms`.
+    function pinNonCanonicalUpdatedAt(id: string, rawTimestamp: string) {
+      const ms = timestampToMs(rawTimestamp);
+      if (ms === null) throw new Error(`test fixture bug: unparseable timestamp ${rawTimestamp}`);
+      db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+        .run(rawTimestamp, ms, id);
+    }
+
+    it("dateFilter `from` on updated_at is correct against a space-form non-canonical timestamp (vault#585)", async () => {
+      // "2024-11-02 14:30:00" (space separator, no zone) is UTC-correct
+      // 14:30 on Nov 2 per timestampToMs — 4.5 hours AFTER the 10:00 bound,
+      // so it MUST be included. Lexicographic TEXT comparison disagrees:
+      // the space (0x20) sorts BEFORE 'T' (0x54), so the space-form string
+      // compares as LESS than the canonical `T`-separated bound on the same
+      // calendar day — the old TEXT-compare code wrongly EXCLUDED it.
+      const included = await store.createNote("space-form, after bound");
+      pinNonCanonicalUpdatedAt(included.id, "2024-11-02 14:30:00");
+      const excluded = await store.createNote("canonical, before bound");
+      pinNonCanonicalUpdatedAt(excluded.id, "2024-11-01T00:00:00.000Z");
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", from: "2024-11-02T10:00:00.000Z" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["space-form, after bound"]);
+    });
+
+    it("dateFilter `to` on updated_at is correct against an offset non-canonical timestamp (vault#585)", async () => {
+      // "2024-11-02T21:00:00+13:00" is UTC-correct 08:00 on Nov 2 per
+      // timestampToMs (21:00 minus the 13-hour offset) — BEFORE the 10:00
+      // bound, so it MUST be included (`to` is the exclusive-upper `<`).
+      // Lexicographic TEXT comparison disagrees: the wall-clock hour "21"
+      // sorts AFTER the bound's "10" as a plain string, so the old
+      // TEXT-compare code wrongly EXCLUDED it.
+      const included = await store.createNote("offset, actually before bound");
+      pinNonCanonicalUpdatedAt(included.id, "2024-11-02T21:00:00+13:00");
+      const excluded = await store.createNote("canonical, after bound");
+      pinNonCanonicalUpdatedAt(excluded.id, "2024-11-02T15:00:00.000Z");
+
+      const results = await store.queryNotes({
+        dateFilter: { field: "updated_at", to: "2024-11-02T10:00:00.000Z" },
+      });
+      expect(results.map((n) => n.content)).toEqual(["offset, actually before bound"]);
     });
   });
 
@@ -2112,6 +2169,52 @@ describe("queryNotes", async () => {
     it("order_by on a non-indexed field throws FIELD_NOT_INDEXED", async () => {
       await store.createNote("x", { metadata: { foo: 1 } });
       expect(store.queryNotes({ orderBy: "foo" })).rejects.toThrow(/not indexed/);
+    });
+
+    // ---- vault#585: order_by "updated_at" is a pseudo-field like link_count ----
+    //
+    // Before vault#585, `order_by: "updated_at"` always threw
+    // FIELD_NOT_INDEXED — `updated_at` is a native `notes` column, not a
+    // declared-indexed metadata field, and the generic order_by branch
+    // gated every field (including this one) through `requireIndexedField`
+    // (see the 2026-06 MCP-tool-description-audit CHANGELOG entry — this
+    // was documented, intentional behavior, not a silent mis-sort). This
+    // test proves the NEW capability lands correct from day one: ordering
+    // on the integer `updated_at_ms` mirror (vault#586), immune to the
+    // TEXT-lexicographic trap a plain `ORDER BY updated_at` would fall
+    // into — a space-form timestamp's ' ' (0x20) always sorts BEFORE any
+    // canonical `T`-separated timestamp's 'T' (0x54) on the same calendar
+    // day, regardless of the actual wall-clock instant either encodes.
+    it("order_by: \"updated_at\" sorts correctly across canonical + non-canonical timestamps (vault#585)", async () => {
+      const p = await store.createNote("P earliest (canonical)");
+      const q = await store.createNote("Q middle (space-form, non-canonical)");
+      const r = await store.createNote("R latest (canonical)");
+      const pin = (id: string, raw: string) => {
+        const ms = timestampToMs(raw);
+        if (ms === null) throw new Error(`test fixture bug: unparseable timestamp ${raw}`);
+        db.prepare("UPDATE notes SET updated_at = ?, updated_at_ms = ? WHERE id = ?").run(raw, ms, id);
+      };
+      // True chronological order: P (08:00) < Q (12:00) < R (16:00). Q's
+      // space-form TEXT ("2024-11-02 12:00:00") sorts BEFORE P's canonical
+      // TEXT ("2024-11-02T08:00:00.000Z") under a plain string compare
+      // (' ' < 'T'), which is exactly backwards.
+      pin(p.id, "2024-11-02T08:00:00.000Z");
+      pin(q.id, "2024-11-02 12:00:00");
+      pin(r.id, "2024-11-02T16:00:00.000Z");
+
+      const asc = await store.queryNotes({ orderBy: "updated_at", sort: "asc" });
+      expect(asc.map((n) => n.content)).toEqual([
+        "P earliest (canonical)",
+        "Q middle (space-form, non-canonical)",
+        "R latest (canonical)",
+      ]);
+
+      const desc = await store.queryNotes({ orderBy: "updated_at", sort: "desc" });
+      expect(desc.map((n) => n.content)).toEqual([
+        "R latest (canonical)",
+        "Q middle (space-form, non-canonical)",
+        "P earliest (canonical)",
+      ]);
     });
 
     it("unknown operator throws UNKNOWN_OPERATOR with supported-op list", async () => {

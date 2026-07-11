@@ -237,6 +237,14 @@ export interface QueryOpts {
   // raw row count — using the same directional-sum definition as the
   // `linkCount` response field, so the sort key equals the field value for
   // every note (self-loops included). See `queryNotes`/`getLinkCounts`.
+  //
+  // The pseudo-field `updated_at` is also special-cased (vault#585): it
+  // orders on the integer `notes.updated_at_ms` mirror column (vault#586),
+  // NOT the TEXT `updated_at`, with `id` appended as the tiebreaker instead
+  // of `created_at` — a TEXT sort mis-orders non-canonical stored timestamps
+  // (space-form / offset / no-`Z`) the same way the pre-v26 cursor keyset
+  // did. `created_at` itself has no ms mirror and is not special-cased here
+  // (its default/no-`orderBy` sort still reads the TEXT column).
   orderBy?: string;
   limit?: number;
   offset?: number;

@@ -78,6 +78,7 @@ import type { Store, Note, Link, Attachment } from "./types.js";
 import type { TagRecord } from "./tag-schemas.js";
 import { ParentCycleError } from "./tag-schemas.js";
 import { transactionAsync } from "./txn.js";
+import { timestampToMs } from "./cursor.js";
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -1627,9 +1628,40 @@ function disambiguateFilename(path: string, extension: string, noteId: string): 
   return `${path}__${idShort}.${extension}`;
 }
 
+/**
+ * Incremental-export inclusion test (vault#585). Compares millisecond
+ * epochs via {@link timestampToMs} — the SAME UTC-correct parse the
+ * `notes.updated_at_ms` column mirror was backfilled with (vault#586
+ * `migrateToV26`) — instead of a TEXT `>=` comparison on the stored ISO
+ * string. Import stores frontmatter timestamps VERBATIM, so an
+ * aged/imported vault routinely carries non-canonical `updated_at`
+ * (space-separated `2024-11-02 14:30:00`, a `+02:00` offset, no trailing
+ * `Z`); those sort WRONG against a canonical `.toISOString()` bound under
+ * plain string comparison, silently including or excluding notes from an
+ * incremental export.
+ *
+ * The fallback chain mirrors `migrateToV26`'s exactly — `updatedAt` →
+ * `createdAt` → the `0` (epoch) sentinel — so this function's answer for
+ * any given note is identical to what filtering on the real
+ * `updated_at_ms` column would produce; a note whose stored timestamp is
+ * genuinely unparseable sorts as "ancient" and drops out of an
+ * incremental export rather than being (wrongly) always-included or
+ * always-excluded by an arbitrary string comparison.
+ *
+ * `since` is caller input (CLI `--since`), already validated upstream
+ * (`Date.parse`-checked in `src/cli.ts` before this is ever reached from
+ * the CLI) — `timestampToMs` is tried first for UTC-correctness on the
+ * same non-canonical shapes, falling back to `Date.parse` for any exotic
+ * shape `timestampToMs`'s stricter grammar doesn't cover. A genuinely
+ * unparseable `since` (only reachable by calling the engine directly,
+ * bypassing the CLI guard) yields `NaN`, against which `>=` is always
+ * `false` — every note is excluded rather than the prior TEXT compare's
+ * arbitrary (and possibly all-inclusive) result.
+ */
 function shouldIncludeForSince(note: Note, since: string): boolean {
-  const stamp = note.updatedAt ?? note.createdAt;
-  return stamp >= since;
+  const stampMs = timestampToMs(note.updatedAt) ?? timestampToMs(note.createdAt) ?? 0;
+  const sinceMs = timestampToMs(since) ?? Date.parse(since);
+  return stampMs >= sinceMs;
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,49 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.2-rc.6] - 2026-07-11
+
+**Fix (P1 correctness): date-range filtering, sorting, and incremental
+export by update-time are now correct on imported/aged vaults** — closes
+#585, the round-4 follow-up to rc.2's cursor fix (#586). rc.2 gave the
+cursor keyset a single integer source of truth (`notes.updated_at_ms`)
+because the TEXT `updated_at` column is stored **verbatim** on import —
+non-canonical forms like space-separated `2024-11-02 14:30:00`, a `+02:00`
+offset, or a missing `Z` sort/compare WRONG lexicographically. Three other
+`updated_at` consumers were still comparing that TEXT column directly and
+are fixed here the same way:
+
+- **`date_filter: { field: "updated_at" }` range queries** now compare the
+  integer `updated_at_ms` mirror instead of the TEXT column. A bound
+  (`from`/`to`) is converted to milliseconds with the same UTC-correct
+  parser the cursor uses before binding, so a range query against a
+  non-canonical `updated_at` no longer mis-includes or mis-excludes rows
+  around the boundary. `date_filter` on `created_at` is unaffected — it has
+  no ms mirror and keeps its existing (canonical-timestamp-only) TEXT
+  compare.
+- **`order_by: "updated_at"` now works, and is correct from day one.**
+  Previously `updated_at` (like `created_at`) was rejected outright with
+  `FIELD_NOT_INDEXED` — a real column, not a declared-indexed metadata
+  field, so it never reached a sort at all (this was documented,
+  intentional behavior, not a silent mis-sort — see the REST/MCP doc-audit
+  entry below). It's now a pseudo-field, alongside the existing
+  `order_by: "link_count"`: no `indexed: true` declaration needed, ordered
+  on `updated_at_ms` with `id` as the stable tiebreaker.
+- **`export --since <iso>` (incremental export) now compares by ms**
+  instead of a TEXT `>=` on the stored `updated_at`, so a poll/watch cycle
+  against an aged/imported vault no longer silently drops or double-ships
+  notes around the `--since` boundary.
+
+Every write path already kept `updated_at_ms` in lockstep with `updated_at`
+(rc.2) — this release is purely about pointing the three remaining readers
+at the column that's already been the source of truth since rc.2. No schema
+change, no migration; `updated_at`, note IDs, and every response shape are
+unchanged.
+
+Docs updated for contract accuracy: `docs/HTTP_API.md` and the `query-notes`
+MCP tool description no longer say `order_by=updated_at` errors — it's now
+a documented, working pseudo-field like `link_count`.
+
 ## [0.7.2-rc.5] - 2026-07-10
 
 **Typed reference fields grow up: one-to-many links + retroactive backfill**
