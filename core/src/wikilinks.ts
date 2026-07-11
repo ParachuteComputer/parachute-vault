@@ -624,9 +624,13 @@ function syncUnresolvedWikilinks(
  * (a structured link queued via {@link queueUnresolvedLink} backfills with
  * the caller's original relationship, not "wikilink").
  *
- * Deferred resolution matches WRITE-TIME resolution on all four legs of
+ * Deferred resolution now covers all four legs of
  * {@link resolveWikilinkDetailed}: exact path, basename, H1 title, and the
- * explicit `path.ext` form. Before this, the sweep matched a pending row to
+ * explicit `path.ext` form. (Caveat: the candidate pre-filter below matches the
+ * title/ext legs via SQL `COLLATE NOCASE`, which case-folds ASCII only — a
+ * non-ASCII title differing from the target only in letter case is missed at
+ * the candidate stage and re-heals on the source's next save instead. Rare;
+ * tracked as a follow-up.) Before this, the sweep matched a pending row to
  * the new note by PATH TEXT ONLY (`target_path = path OR path LIKE
  * '%/'||target_path`) — so a `[[John Doe]]` that resolved at write time via
  * the H1-title fallback (its note's displayed title differs from its path,

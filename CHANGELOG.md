@@ -55,10 +55,12 @@ and a confusing dead-end error message.
   inbound `[[wikilink]]` edge that pointed at it as pending, so recreating a
   note that the original `[[link]]` resolves to auto-heals the edge exactly
   as if it had never resolved — matching the documented "unresolved links
-  auto-resolve when the target is created" contract. This covers **every way
-  a wikilink resolves** — exact path, basename, H1 **title**, and the
-  `[[Foo.csv]]` **extension** form — because deferred resolution now runs
-  each pending link through the *same* resolver used when a note is saved.
+  auto-resolve when the target is created" contract. This covers path,
+  basename, H1 **title**, and the `[[Foo.csv]]` **extension** form — because
+  deferred resolution now runs each pending link through the *same* resolver
+  used when a note is saved. (One rare edge remains: a non-ASCII title
+  differing only in letter case re-heals on the source note's next save
+  rather than on the target's recreate.)
   (That closes a pre-existing gap beyond delete/recreate: a `[[John Doe]]`
   that resolves by a note's H1 title, or a `[[budget.csv]]` by extension,
   now also backfills correctly when its target is created *after* the
