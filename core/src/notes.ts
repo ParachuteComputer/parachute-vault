@@ -1,5 +1,6 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow } from "./types.js";
+import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow, SemanticSearchResult } from "./types.js";
+import { decodeVector, dot } from "./embedding/vector-codec.js";
 import { normalizePath } from "./paths.js";
 import { transaction } from "./txn.js";
 import {
@@ -962,7 +963,7 @@ function resolveUpdatedAtBoundMs(field: string, value: string): number {
  * semantics a normal query applies, rather than risking the two drifting
  * apart.
  */
-function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: string[]; params: SQLQueryBindings[] } {
+export function buildFilterConditions(db: Database, opts: QueryOpts): { conditions: string[]; params: SQLQueryBindings[] } {
   const conditions: string[] = [];
   const params: SQLQueryBindings[] = [];
 
@@ -1911,6 +1912,108 @@ export function searchNotes(
     if (err instanceof QueryError) throw err;
     throw searchSyntaxError(query, err, mode);
   }
+}
+
+/**
+ * Semantic-search scan (EXPERIMENTAL — `SEMANTIC-MVP-PLAN.md`). Structural
+ * sibling of `searchNotes`: text-shaped filters compose the same way, but
+ * ranking is cosine similarity over `note_vectors` instead of FTS5 bm25.
+ *
+ * Filter-then-rank (per the plan): `buildFilterConditions` — the SAME
+ * filter builder `queryNotes` uses — narrows to the candidate note set
+ * FIRST (tags/metadata/dates/path/etc. all apply), so "notes about X that
+ * are also #project" is one call, exactly like `search` composes with
+ * structured filters. Only THEN does the brute-force cosine scan run, and
+ * only over that (usually much smaller) candidate set — this is the perf
+ * lever the architecture doc calls out (filter shrinks N before the O(N)
+ * vector work).
+ *
+ * `model` restricts the scan to vectors recorded under the CURRENTLY
+ * configured embedding model — a row left over from a prior model (see
+ * `core/src/embedding/staleness.ts`) never contributes to ranking, so a
+ * model change can't silently blend two incomparable vector spaces.
+ *
+ * Ranking is best-CHUNK-per-note (max cosine over a note's chunks, per the
+ * ratified per-section chunking decision), but the returned unit is
+ * always the NOTE (via `fetchNotesByIdsOrdered`), never a bare chunk —
+ * matching `search`'s "text in → ranked notes out" contract.
+ *
+ * `queryVector` MUST already be L2-normalized (so the dot product below
+ * IS cosine similarity) — `Store.semanticSearch` normalizes right after
+ * embedding the query text; stored vectors are normalized at write time.
+ */
+export function semanticSearchNotes(
+  db: Database,
+  queryVector: Float32Array,
+  opts: QueryOpts,
+  model: string,
+): SemanticSearchResult {
+  const limit = typeof opts.limit === "number" ? opts.limit : 10;
+  const { conditions, params } = buildFilterConditions(db, opts);
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const idRows = db.prepare(`SELECT n.id FROM notes n ${whereClause}`).all(...params) as {
+    id: string;
+  }[];
+  const candidateIds = idRows.map((r) => r.id);
+  if (candidateIds.length === 0) {
+    return { notes: [], pendingCount: 0, totalCandidates: 0 };
+  }
+
+  // Pull every candidate's vector rows for the ACTIVE model, batched to
+  // stay under the DO 100-bound-param cap (same chunking `fetchNotesByIdsOrdered`
+  // uses). A note absent from this map has no fresh vector yet — pending.
+  const vecRowsByNote = new Map<string, { chunk_ix: number; vector: Uint8Array }[]>();
+  for (const idChunk of chunkForInClause(candidateIds)) {
+    const placeholders = idChunk.map(() => "?").join(", ");
+    const rows = db.prepare(
+      `SELECT note_id, chunk_ix, vector FROM note_vectors WHERE model = ? AND note_id IN (${placeholders})`,
+    ).all(model, ...idChunk) as { note_id: string; chunk_ix: number; vector: Uint8Array }[];
+    for (const row of rows) {
+      let list = vecRowsByNote.get(row.note_id);
+      if (!list) {
+        list = [];
+        vecRowsByNote.set(row.note_id, list);
+      }
+      list.push(row);
+    }
+  }
+
+  // Best-chunk-per-note cosine (max over the note's chunks) — a long note
+  // whose 3rd section matches outranks a note with weak whole-note
+  // similarity, which is the whole point of per-section chunking.
+  const scored: { id: string; score: number }[] = [];
+  for (const id of candidateIds) {
+    const rows = vecRowsByNote.get(id);
+    if (!rows || rows.length === 0) continue;
+    let best = -Infinity;
+    for (const row of rows) {
+      const score = dot(decodeVector(row.vector), queryVector);
+      if (score > best) best = score;
+    }
+    scored.push({ id, score: best });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, limit);
+
+  // Reuse the existing hydration machinery — same as every other id-list
+  // fetch path (tags batched, no N+1).
+  const hydrated = fetchNotesByIdsOrdered(db, top.map((t) => t.id));
+  const byId = new Map(hydrated.map((n) => [n.id, n]));
+  const scoreById = new Map(top.map((t) => [t.id, t.score]));
+  const notes: Note[] = [];
+  for (const t of top) {
+    const note = byId.get(t.id);
+    if (!note) continue; // defensive: row vanished between the two queries
+    note.score = scoreById.get(t.id);
+    notes.push(note);
+  }
+
+  return {
+    notes,
+    pendingCount: candidateIds.length - vecRowsByNote.size,
+    totalCandidates: candidateIds.length,
+  };
 }
 
 /**

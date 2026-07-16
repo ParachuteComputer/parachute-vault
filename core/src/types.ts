@@ -278,6 +278,43 @@ export interface QueryOpts {
    * row per group, not a paginated note list.
    */
   aggregate?: AggregateSpec;
+  /**
+   * Semantic-search MVP (EXPERIMENTAL — `SEMANTIC-MVP-PLAN.md`). Free text
+   * to rank notes by MEANING rather than keyword. Requires `semantic:
+   * true` and is mutually exclusive with `search` (structurally the same
+   * "text in → ranked notes with a score out" shape as `search`, but
+   * routed through `note_vectors` cosine similarity instead of FTS5
+   * bm25). Every other filter on this `QueryOpts` (tags, metadata, date
+   * range, path, ...) narrows the candidate set FIRST, exactly like
+   * `search` — see `core/src/notes.ts:semanticSearchNotes`.
+   */
+  nearText?: string;
+  /**
+   * Opt into vector ranking. `true` requires `nearText`; omitting it (or
+   * passing `false`) is a plain structured/keyword query, byte-identical
+   * to pre-semantic-search behavior. See `nearText`.
+   */
+  semantic?: boolean;
+}
+
+/**
+ * Result of a semantic-search scan (EXPERIMENTAL — see
+ * `QueryOpts.nearText`/`semantic`). Returned by
+ * `core/src/notes.ts:semanticSearchNotes` and `Store.semanticSearch`.
+ */
+export interface SemanticSearchResult {
+  /** Notes ranked by cosine similarity (best matching chunk per note), highest first. Each carries `.score`. */
+  notes: Note[];
+  /**
+   * Count of candidate notes (post structured-filter, pre-rank) with NO
+   * vector row yet for the active embedding model — the `embeddings_pending`
+   * signal. A note with SOME but not all chunks embedded still counts as
+   * "has a vector" here (coarse-but-honest: it can be ranked, just not on
+   * its full content yet) — see the doc comment on `semanticSearchNotes`.
+   */
+  pendingCount: number;
+  /** Total candidate notes considered, after structured filters, before ranking/limit. */
+  totalCandidates: number;
 }
 
 /**
@@ -463,6 +500,17 @@ export interface Store {
    * `created_at` ordering. See `core/src/search-query.ts`.
    */
   searchNotes(query: string, opts?: { tags?: string[]; limit?: number; expand?: TagExpandMode; mode?: SearchMode; sort?: "asc" | "desc" }): Promise<Note[]>;
+  /**
+   * Semantic search (EXPERIMENTAL — see `QueryOpts.nearText`/`semantic`).
+   * The one invocation point for the store's `EmbeddingProvider`: embeds
+   * `nearText`, ranks notes by cosine similarity over `note_vectors`
+   * (best chunk per note), and applies every other filter on `opts`
+   * (tags/metadata/dates/...) first, exactly like `queryNotes`. Throws a
+   * structured `QueryError` (`error_type: "semantic_unavailable"`) when no
+   * provider is configured or the configured one isn't ready — never a
+   * silent fallback to keyword search.
+   */
+  semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult>;
 
   // Tags
   tagNote(noteId: string, tags: string[]): Promise<void>;

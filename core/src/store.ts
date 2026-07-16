@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow } from "./types.js";
+import type { Store, Note, Link, Attachment, QueryOpts, QueryNotesPage, AggregateRow, SemanticSearchResult } from "./types.js";
 import { initSchema } from "./schema.js";
 import * as noteOps from "./notes.js";
 import * as linkOps from "./links.js";
@@ -47,6 +47,9 @@ import {
 } from "./conformance.js";
 import type { SearchMode } from "./search-query.js";
 import { runDoctorScan, type DoctorReport, type DoctorScanOpts } from "./doctor.js";
+import type { EmbeddingProvider } from "./embedding/provider.js";
+import { normalize } from "./embedding/vector-codec.js";
+import { QueryError } from "./query-operators.js";
 
 /**
  * Normalize a `type: "reference"` field value (scalar OR array — see
@@ -94,9 +97,21 @@ export class BunSqliteStore implements Store {
   private _tagHierarchy: TagHierarchy | null = null;
   private _schemaConfig: ResolvedSchemas | null = null;
 
-  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry }) {
+  /**
+   * The active `EmbeddingProvider` (EXPERIMENTAL — semantic search MVP),
+   * when one is configured. `undefined` on a vault with no provider —
+   * `semanticSearch` reports that honestly (`semantic_unavailable`)
+   * rather than silently falling back to keyword search. Resolved ONCE at
+   * construction (mirrors `hooks`) — self-host/cloud each build the
+   * concrete provider (ONNX/external-API, Workers AI) and pass it in here;
+   * core never imports a model library itself (dependency-purity rule).
+   */
+  public readonly embeddingProvider?: EmbeddingProvider;
+
+  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider }) {
     initSchema(db);
     this.hooks = opts?.hooks ?? new HookRegistry();
+    this.embeddingProvider = opts?.embeddingProvider;
   }
 
   /**
@@ -812,6 +827,48 @@ export class BunSqliteStore implements Store {
       return noteOps.searchNotes(this.db, query, _rest);
     }
     return noteOps.searchNotes(this.db, query, opts);
+  }
+
+  /**
+   * Semantic search (EXPERIMENTAL — `SEMANTIC-MVP-PLAN.md`). The ONE
+   * invocation point for `embeddingProvider`: resolves it, embeds
+   * `nearText` into a query vector, normalizes it (stored vectors are
+   * ALSO L2-normalized — see `note_vectors`'s schema comment — so the
+   * scan's dot product is cosine similarity), and calls
+   * `noteOps.semanticSearchNotes` with the SAME tag-hierarchy expansion
+   * `queryNotes` applies (so `semantic: true, tag: "manual"` composes with
+   * the tag `expand` axis identically to a structured query).
+   *
+   * Throws a `QueryError` (`error_type: "semantic_unavailable"`) when no
+   * provider is configured, or the configured one reports itself not
+   * ready — NEVER a silent fallback to keyword search. Callers (MCP/REST)
+   * let this propagate uncaught, same as `invalid_search_syntax` above.
+   */
+  async semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult> {
+    if (!this.embeddingProvider) {
+      throw new QueryError(
+        `semantic search requires an embedding provider — none is configured on this vault`,
+        "SEMANTIC_UNAVAILABLE",
+        {
+          error_type: "semantic_unavailable",
+          hint: "configure EMBEDDING_API_URL/EMBEDDING_API_KEY/EMBEDDING_MODEL, or rely on the bundled floor provider (self-host); semantic search is not yet available on this door otherwise",
+        },
+      );
+    }
+    const availability = await this.embeddingProvider.available();
+    if (!availability.ok) {
+      throw new QueryError(
+        `semantic search is unavailable: ${availability.reason ?? "embedding provider not ready"}`,
+        "SEMANTIC_UNAVAILABLE",
+        { error_type: "semantic_unavailable", hint: availability.reason },
+      );
+    }
+
+    const { vectors } = await this.embeddingProvider.embed({ texts: [nearText] });
+    const queryVector = normalize(vectors[0]!);
+
+    const filterOpts = this.expandQueryTags(this.normalizeQueryTags(opts ?? {}));
+    return noteOps.semanticSearchNotes(this.db, queryVector, filterOpts, this.embeddingProvider.model);
   }
 
   // ---- Tags ----

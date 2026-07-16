@@ -19,7 +19,8 @@ import { readVaultConfig, readGlobalConfig, writeGlobalConfig, writeVaultConfig,
 import { existsSync, rmSync } from "fs";
 import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
-import { getVaultStore, getVaultNameForStore } from "./vault-store.ts";
+import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider } from "./vault-store.ts";
+import { EmbeddingWorker, registerEmbeddingHook } from "./embedding-worker.ts";
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
@@ -219,6 +220,22 @@ if (providerName === "transcribe-cpp") {
     console.log("[transcribe] worker disabled (no scribe in services.json and SCRIBE_URL unset)");
   }
 }
+
+// Embedding worker (semantic search MVP — EXPERIMENTAL). Unlike
+// transcription (no-op without a discoverable scribe), a provider is
+// ALWAYS resolved here — the bundled floor tier (`onnx-transformers.ts`)
+// is the zero-config default, so a fresh install gets working semantic
+// search with no operator action. The event hook embeds on every note
+// create/update (a no-op edit makes zero provider calls — see
+// `embedding-worker.ts`); the sweep drains the backfill for pre-existing
+// notes and catches anything a dropped dispatch left behind.
+const embeddingWorker = new EmbeddingWorker({
+  provider: getSharedEmbeddingProvider(),
+  vaultList: () => listVaults(),
+  getStore: (name: string) => getVaultStore(name),
+});
+registerEmbeddingHook(defaultHookRegistry, embeddingWorker, (store) => getVaultNameForStore(store as never));
+embeddingWorker.start();
 
 if (process.env.VAULT_AUTH_TOKEN?.trim()) {
   console.log("[auth] VAULT_AUTH_TOKEN set — server-wide operator bearer active");
@@ -599,7 +616,9 @@ async function shutdown(signal: string): Promise<void> {
             ),
           ),
         );
-        // Then drain hooks + stop the transcription worker in parallel.
+        // Then drain hooks + stop the transcription/embedding workers in
+        // parallel.
+        embeddingWorker.stop();
         await Promise.all([
           defaultHookRegistry.drain(),
           transcriptionWorker?.stop() ?? Promise.resolve(),
