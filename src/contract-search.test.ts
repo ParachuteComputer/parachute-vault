@@ -305,6 +305,32 @@ describe("contract: search — escaping edge cases, tag-scope, warnings (#551)",
     expect(warnings!.some((w: any) => w.code === "ignored_param" && w.param === "search_mode")).toBe(true);
   });
 
+  it("offset alongside search is a no-op that surfaces an ignored_param warning, results unchanged (V1.2)", async () => {
+    await store.createNote("findable one", { tags: ["probe"] });
+    await store.createNote("findable two", { tags: ["probe"] });
+
+    const plain = await search("search=findable&tag=probe");
+    const withOffset = await search("search=findable&tag=probe&offset=1");
+    expect(withOffset.status).toBe(200);
+
+    const plainBody = await bodyOf(plain);
+    const offsetBody = await bodyOf(withOffset);
+    // Page 1 either way — offset has no effect on FTS5 relevance ordering.
+    expect(offsetBody.map((n: any) => n.id).sort()).toEqual(plainBody.map((n: any) => n.id).sort());
+
+    const warnings = decodeWarningsHeader(withOffset);
+    expect(warnings).not.toBeNull();
+    expect(warnings!.some((w: any) => w.code === "ignored_param" && w.param === "offset")).toBe(true);
+
+    // No search → no warning (offset only means nothing UNDER search; the
+    // structured-query path honors it for real).
+    const structuredNoWarning = await search("tag=probe&offset=1");
+    const structuredWarnings = decodeWarningsHeader(structuredNoWarning);
+    expect(
+      structuredWarnings?.some((w: any) => w.code === "ignored_param" && w.param === "offset") ?? false,
+    ).toBe(false);
+  });
+
   it("an unrecognized search_mode value is a structured 400 invalid_query", async () => {
     const res = await search("search=widgets&search_mode=bogus");
     expect(res.status).toBe(400);
@@ -458,6 +484,21 @@ describe("contract: search — MCP parity (#551)", () => {
     const result = (await query.execute({ search_mode: "advanced" })) as any;
     expect(result.warnings).toBeDefined();
     expect(result.warnings.some((w: any) => w.code === "ignored_param" && w.param === "search_mode")).toBe(true);
+  });
+
+  it("query-notes: offset alongside search is a no-op that surfaces an ignored_param warning (V1.2)", async () => {
+    await store.createNote("mcp findable", { tags: ["probe"] });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ search: "findable", offset: 5 })) as any;
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings.some((w: any) => w.code === "ignored_param" && w.param === "offset")).toBe(true);
+
+    // Structured query (no search) — offset is honored for real, no warning.
+    const structured = (await query.execute({ tag: "probe", offset: 0 })) as any;
+    expect(
+      (structured.warnings ?? []).some((w: any) => w.code === "ignored_param" && w.param === "offset"),
+    ).toBe(false);
   });
 
   it("query-notes: search_mode:\"advanced\" + malformed syntax throws a structured invalid_search_syntax error", async () => {

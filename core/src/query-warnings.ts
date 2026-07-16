@@ -220,6 +220,26 @@ export function ignoredParamWarning(param: string, reason: string): QueryWarning
 }
 
 /**
+ * `truncated` warning (vault contracts-brief V1.3) — a structured, non-
+ * cursor list query returned exactly `limit` rows with no watermark to page
+ * from. That's ambiguous on its own: it might be the whole result set
+ * (coincidence), or there might be more rows silently cut off. Combined
+ * with the engine's default order (`created_at ASC` — oldest first,
+ * core/src/notes.ts) this is the concrete failure mode: a bare `GET
+ * /api/notes` on a >limit-note vault returns the OLDEST rows with zero
+ * signal that the NEWEST ones didn't make it. `?cursor=` (bootstrap or
+ * watermark) sidesteps this entirely — the warning only fires in its
+ * absence.
+ */
+export function truncatedResultsWarning(limit: number): QueryWarning {
+  return {
+    code: "truncated",
+    message: `${limit} = limit rows returned; there may be more. Pass ?cursor= to page, or sort=desc for newest-first.`,
+    limit,
+  };
+}
+
+/**
  * Cheap zero-result search suggestion (vault#551 WS2B — mirrors the tag
  * `did_you_mean` above via the SAME `suggestSimilarTag` scorer, just over a
  * different candidate pool). Callers MUST only invoke this AFTER a search

@@ -248,6 +248,48 @@ describe("contract: honest queries — warnings channel (#550)", () => {
   });
 });
 
+describe("contract: truncation-honesty warning (V1.3)", () => {
+  it("a structured non-cursor list that hits its limit carries a `truncated` warning", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`note ${i}`);
+    const res = await getNotes("limit=2");
+    expect(res.status).toBe(200);
+    const body: any[] = await res.json();
+    expect(body.length).toBe(2); // the limit itself is unaffected — warning only
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings).not.toBeNull();
+    const truncated = warnings!.find((w) => w.code === "truncated");
+    expect(truncated).toBeDefined();
+    expect(truncated.limit).toBe(2);
+  });
+
+  it("an under-limit list carries no `truncated` warning", async () => {
+    await store.createNote("only one");
+    const res = await getNotes("limit=50");
+    expect(res.status).toBe(200);
+    const warnings = decodeWarningsHeader(res);
+    expect(warnings?.some((w) => w.code === "truncated") ?? false).toBe(false);
+  });
+
+  it("cursor mode never carries a `truncated` warning — `next_cursor` is already the honest signal", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`note ${i}`);
+    const res = await getNotes("limit=2&cursor=");
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.notes.length).toBe(2);
+    expect(typeof body.next_cursor).toBe("string");
+    expect((body.warnings ?? []).some((w: any) => w.code === "truncated")).toBe(false);
+  });
+
+  it("MCP query-notes mirrors the same truncated warning on a limit-hit non-cursor list", async () => {
+    for (let i = 0; i < 3; i++) await store.createNote(`mcp note ${i}`);
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const result = (await query.execute({ limit: 2 })) as any;
+    expect(result.warnings).toBeDefined();
+    expect(result.warnings.some((w: any) => w.code === "truncated" && w.limit === 2)).toBe(true);
+  });
+});
+
 describe("contract: honest queries — cursor bootstrap (#550, the P1)", () => {
   it("an empty cursor (`?cursor=`) engages the {notes, next_cursor} envelope on the VERY FIRST call, and the returned next_cursor sees only notes written after it", async () => {
     const n1 = await store.createNote("existing note");
@@ -408,5 +450,51 @@ describe("contract: honest queries — find-path hydration (#550, additive)", ()
     expect(result.edges).toEqual([
       { source: "a", target: "b", relationship: "mentions", sourcePath: "People/Alice", targetPath: "Projects/X" },
     ]);
+  });
+});
+
+describe("contract: metadata always present on the wire (V1.1)", () => {
+  it("GET /api/notes?id= on a metadata-less note carries `metadata: {}`, not an absent key", async () => {
+    const note = await store.createNote("No metadata here");
+    const res = await getNotes(`id=${note.id}`);
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body).toHaveProperty("metadata");
+    expect(body.metadata).toEqual({});
+    // `tags` has always been unconditionally present — confirm it still is.
+    expect(body.tags).toEqual([]);
+  });
+
+  it("GET /api/notes (list) carries `metadata: {}` on metadata-less entries", async () => {
+    await store.createNote("List entry, no metadata");
+    const res = await getNotes("");
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+    expect(body.length).toBeGreaterThan(0);
+    for (const entry of body) {
+      expect(entry).toHaveProperty("metadata");
+      expect(entry.metadata).toEqual({});
+    }
+  });
+
+  it("GET /api/notes?search= carries `metadata: {}` on metadata-less results", async () => {
+    await store.createNote("Findable via search, no metadata");
+    const res = await getNotes("search=Findable");
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+    expect(body.length).toBeGreaterThan(0);
+    for (const entry of body) {
+      expect(entry).toHaveProperty("metadata");
+      expect(entry.metadata).toEqual({});
+    }
+  });
+
+  it("a note WITH real metadata is unaffected — the fix only changes the empty case", async () => {
+    const note = await store.createNote("Has metadata", { metadata: { source: "import" } });
+    const res = await getNotes(`id=${note.id}`);
+    const body: any = await res.json();
+    expect(body.metadata).toEqual({ source: "import" });
   });
 });

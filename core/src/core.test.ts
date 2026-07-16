@@ -3910,6 +3910,78 @@ describe("MCP tools", async () => {
     expect(result.updatedAt).toBe(note.updatedAt);
   });
 
+  describe("metadata is always present on the wire (V1.1)", () => {
+    it("a note created with no metadata reads back with an empty-object `metadata` key, not an absent one", async () => {
+      const note = await store.createNote("No metadata here");
+      expect("metadata" in note).toBe(true);
+      expect(note.metadata).toEqual({});
+      // The real acid test: does the key survive a JSON round-trip, or does
+      // `JSON.stringify` drop it because it's `undefined`?
+      expect(JSON.parse(JSON.stringify(note))).toHaveProperty("metadata", {});
+
+      const fetched = await store.getNote(note.id);
+      expect(fetched).toHaveProperty("metadata", {});
+      expect(JSON.parse(JSON.stringify(fetched))).toHaveProperty("metadata", {});
+
+      // `tags` has always been unconditionally present ([]) — confirm that
+      // invariant still holds alongside the metadata fix.
+      expect(note.tags).toEqual([]);
+    });
+
+    it("a note whose metadata was explicitly written as {} also reads back with metadata: {}", async () => {
+      const note = await store.createNote("Explicit empty metadata", { metadata: {} });
+      expect(note.metadata).toEqual({});
+      const fetched = await store.getNote(note.id);
+      expect(fetched!.metadata).toEqual({});
+    });
+
+    it("a note WITH real metadata is unchanged by the fix", async () => {
+      const note = await store.createNote("Has metadata", { metadata: { source: "import", version: 2 } });
+      expect(note.metadata).toEqual({ source: "import", version: 2 });
+      const fetched = await store.getNote(note.id);
+      expect(fetched!.metadata).toEqual({ source: "import", version: 2 });
+    });
+
+    it("queryNotes list results carry metadata: {} on metadata-less notes", async () => {
+      await store.createNote("List entry, no metadata");
+      const results = await store.queryNotes({});
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r).toHaveProperty("metadata", {});
+      }
+    });
+
+    it("searchNotes results carry metadata: {} on metadata-less notes", async () => {
+      await store.createNote("Findable via search, no metadata");
+      const results = await store.searchNotes("Findable");
+      expect(results.length).toBeGreaterThan(0);
+      for (const r of results) {
+        expect(r).toHaveProperty("metadata", {});
+      }
+    });
+
+    it("MCP query-notes (single by id) carries metadata: {} on a metadata-less note", async () => {
+      const note = await store.createNote("MCP single, no metadata");
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const result = await query.execute({ id: note.id }) as any;
+      expect(result).toHaveProperty("metadata", {});
+      expect(JSON.parse(JSON.stringify(result))).toHaveProperty("metadata", {});
+    });
+
+    it("MCP query-notes (list) carries metadata: {} on metadata-less notes", async () => {
+      await store.createNote("MCP list, no metadata");
+      const tools = generateMcpTools(store);
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const result = await query.execute({}) as any;
+      const list = Array.isArray(result) ? result : result.notes;
+      expect(list.length).toBeGreaterThan(0);
+      for (const r of list) {
+        expect(r).toHaveProperty("metadata", {});
+      }
+    });
+  });
+
   it("query-notes single note by path", async () => {
     await store.createNote("By Path", { path: "Projects/README" });
     const tools = generateMcpTools(store);
@@ -4173,14 +4245,21 @@ describe("MCP tools", async () => {
     expect(projects).toHaveLength(3);
     expect(projects.every((n) => n.path!.startsWith("Projects"))).toBe(true);
 
-    // limit + offset
-    const page = await query.execute({
+    // limit + offset. Returning exactly `limit` rows with no cursor also
+    // trips the V1.3 truncation-honesty warning (results.length === limit,
+    // an inherent heuristic — it can't distinguish "exactly this many rows
+    // exist" from "capped, more may follow" without a lookahead), which
+    // wraps the response in { notes, warnings } instead of a bare array —
+    // same envelope shape the tool already uses for other warnings.
+    const pageResult = await query.execute({
       path_prefix: "Projects",
       sort: "asc",
       limit: 2,
       offset: 1,
-    }) as any[];
+    }) as any;
+    const page = Array.isArray(pageResult) ? pageResult : pageResult.notes;
     expect(page).toHaveLength(2);
+    expect(pageResult.warnings?.some((w: any) => w.code === "truncated" && w.limit === 2)).toBe(true);
   });
 
   it("query-notes full-text search works", async () => {
@@ -6614,10 +6693,10 @@ describe("create-note if_exists (vault#555)", async () => {
       if_exists: "replace",
     }) as any;
     expect(second.content).toBe("");
-    // An empty `{}` metadata collapses to `undefined` on read — the same
-    // convention every note with no metadata follows (rowToNote), not
-    // something special about `replace`.
-    expect(second.metadata).toBeUndefined();
+    // An empty `{}` metadata reads back as `{}`, not an absent key — the
+    // same convention every note with no metadata follows (rowToNote,
+    // vault V1.1), not something special about `replace`.
+    expect(second.metadata).toEqual({});
   });
 
   it("if_exists is a no-op without a path — a pathless create can never conflict", async () => {

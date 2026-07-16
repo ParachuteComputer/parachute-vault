@@ -34,6 +34,72 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.1] - 2026-07-16
+
+**Cross-door contract-consistency fixes (V1 of the vault↔cloud contract-drift
+brief).** Five findings from a read-only drift audit comparing this door
+against parachute-cloud's REST port, each closed here in shared `core/` (so
+both doors inherit the fix) or `src/` where door-specific.
+
+### Fixed
+
+- **`metadata` is now always present on the wire, never an absent key** —
+  `core/src/notes.ts` `rowToNote` collapsed a NULL/`"{}"`/unparseable
+  `metadata` column to `undefined`, which `JSON.stringify` then drops
+  entirely from the response. A note with no metadata now reads back with
+  `metadata: {}` instead — matching `tags`, which has always been
+  unconditionally present (`[]`). This was a real third-party crash: a
+  client assuming `note.metadata` exists breaks the moment it hits a
+  metadata-less note. **Wire-visible change** — additive (a key that used
+  to be absent is now present-and-empty), but flagged since it changes
+  observable response shape on a door with real users. Covers REST
+  (single/list/search), MCP `query-notes`, and the underlying
+  create/update/get paths (all funnel through `rowToNote`).
+- **`?search=x&offset=N` now warns instead of silently returning page 1** —
+  full-text search has no offset parameter at all (FTS5 ranks by relevance,
+  not a stable row order), so `offset` alongside `search` was a silent
+  no-op on both REST and MCP. It now surfaces an `ignored_param` warning via
+  the existing warnings channel (`X-Parachute-Warnings` / MCP inline
+  `warnings`) — results are unchanged; the structured-query path's real
+  offset support is unaffected. A hard-400 upgrade was considered and
+  deliberately deferred (behavior-visible on a real-users surface).
+- **Bearer scheme casing is now RFC 7235 case-insensitive** — `Authorization:
+  bearer <token>` / `BeArEr <token>` now authenticate identically to the
+  canonical `Bearer`. The auth-scheme token itself is case-insensitive per
+  spec; only the credentials that follow stay case-sensitive.
+- **Scribe (transcription) discovery no longer requires a vault restart to
+  notice scribe** — `src/scribe-discovery.ts`'s URL cache was
+  process-lifetime (computed once at first call, reused forever). Scribe
+  installing, moving, or starting after vault has already booted was
+  invisible until the next restart. Replaced with a 30s TTL: cheap enough
+  to redo (an env read + a `services.json` stat) that steady-state cost is
+  negligible, while a scribe appearing mid-process is picked up within the
+  TTL window with no restart.
+- **Unsorted list queries that hit their `limit` now carry a `truncated`
+  warning** — the REST/MCP structured-query default order is `created_at
+  ASC` (oldest first) with no `?cursor=`; hitting the limit with no
+  pagination signal silently truncates the NEWEST notes with zero
+  indication anything was cut. A `results.length === limit` non-cursor list
+  now warns (`"N = limit rows returned; there may be more. Pass ?cursor= to
+  page, or sort=desc for newest-first."`) via the same warnings channel.
+  Cursor-mode queries are exempt (`next_cursor` is already the honest
+  signal). This is a heuristic, not a precise "more rows exist" guarantee —
+  it can't distinguish "exactly `limit` rows exist" from "capped, more
+  follow" without a lookahead query, and the message says "may," not "are."
+  The REST default-sort flip to `desc` is a separate, deliberately deferred
+  breaking-adjacent change. **MCP consumers note:** warnings ride the
+  pre-existing `{notes, warnings}` envelope on non-cursor `query-notes`
+  (the #550 three-variant contract) — previously rare, this envelope is now
+  ROUTINE, arriving whenever a default page fills (any `limit`-sized result,
+  e.g. 50 notes on a ≥50-note vault). Programmatic MCP consumers that
+  assume a bare array will hit it immediately; handle both variants. REST
+  is unaffected (warnings stay in the `X-Parachute-Warnings` header; body
+  shape unchanged).
+
+See the contracts-brief PR description for full file:line evidence per
+item. A matching mirror + conformance-pin PR lands in parachute-cloud
+(C1) once this reaches `@rc`.
+
 ## [0.7.2] - 2026-07-11
 
 **Round-4 reliability release — promoted to `@latest`.** Consolidates rc.1–rc.7
