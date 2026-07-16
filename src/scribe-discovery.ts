@@ -68,24 +68,43 @@ export function resolveScribeUrl(
 }
 
 /**
- * Process-lifetime cache. Computed at first call (typically during server
- * boot), reused for every subsequent transcription request. Operators who
- * change the scribe URL via `services.json` (re-install of scribe with a
- * different port) need to restart vault; we deliberately don't watch the
- * file because the v0.6 deploy model has a single restart-on-change story.
+ * Short-TTL cache (vault contracts-brief V1.5 — was process-lifetime).
+ * `resolveScribeUrl` is just an env read + a `services.json` stat/read, cheap
+ * enough to redo on this cadence — but the transcription capability probe
+ * (`GET /api/vault`, `src/transcription/capability.ts`) can be hit often
+ * enough that re-reading the manifest on EVERY call is wasteful. A TTL
+ * splits the difference: scribe installing/moving/starting mid-process (the
+ * real deploy sequencing — hub can bring scribe up after vault) is picked up
+ * within `SCRIBE_URL_CACHE_TTL_MS` instead of requiring a vault restart,
+ * while a steady-state deployment still avoids a filesystem read per
+ * request. Previously this was a `let ... = null` sentinel computed once at
+ * first call and reused for the rest of the process — that's the staleness
+ * this replaces.
  *
  * Tests should pass an explicit `env` + `readManifestImpl` to `resolveScribeUrl`
- * directly to bypass the cache.
+ * directly to bypass the cache, or use the `now` injection seam here to
+ * simulate TTL expiry without real sleeps.
  */
-let cachedScribeUrl: string | undefined | null = null;
+const SCRIBE_URL_CACHE_TTL_MS = 30_000;
 
-export function getCachedScribeUrl(): string | undefined {
-  if (cachedScribeUrl === null) {
-    cachedScribeUrl = resolveScribeUrl();
+let cachedScribeUrl: string | undefined | null = null;
+let cachedAt = 0;
+
+export function getCachedScribeUrl(
+  env: NodeJS.ProcessEnv = process.env,
+  readManifestImpl: typeof readManifest = readManifest,
+  logger: { warn?: (...args: unknown[]) => void } = console,
+  now: () => number = Date.now,
+): string | undefined {
+  const t = now();
+  if (cachedScribeUrl === null || t - cachedAt >= SCRIBE_URL_CACHE_TTL_MS) {
+    cachedScribeUrl = resolveScribeUrl(env, readManifestImpl, logger);
+    cachedAt = t;
   }
   return cachedScribeUrl;
 }
 
 export function clearScribeUrlCache(): void {
   cachedScribeUrl = null;
+  cachedAt = 0;
 }

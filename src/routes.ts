@@ -17,6 +17,7 @@ import {
   collectUnknownTagWarnings,
   emptySearchWarning,
   ignoredParamWarning,
+  truncatedResultsWarning,
   computeSearchDidYouMean,
   searchDidYouMeanWarning,
   type QueryWarning,
@@ -1254,6 +1255,23 @@ async function handleNotesInner(
         const sort = (parseQuery(url, "sort") as "asc" | "desc" | null) ?? undefined;
 
         const searchWarnings: QueryWarning[] = [];
+        // `offset` under full-text search (vault contracts-brief V1.2):
+        // `searchNotes` has no offset parameter at all — FTS5 ranks by
+        // relevance, not a stable row order, so paging by offset over it
+        // is unsound. Rather than silently return page 1 with no signal
+        // (the pre-existing behavior — `?search=x&offset=50` == `?search=x`),
+        // flag it. Presence check (not truthiness) so `offset=0` — a caller
+        // being explicit about "start" — still warns; it's equally
+        // meaningless here. The structured-query path (below) has real
+        // offset support and is unaffected.
+        if (parseQuery(url, "offset") !== null) {
+          searchWarnings.push(
+            ignoredParamWarning(
+              "offset",
+              "full-text search has no stable row order to offset into — results are always page 1, ranked by relevance",
+            ),
+          );
+        }
         let rawResults: Note[];
         // "Only whitespace/quotes" (vault#551 edge case) — short-circuit
         // BEFORE ever calling FTS5 rather than risk a syntax error (or a
@@ -1557,6 +1575,15 @@ async function handleNotesInner(
           return json({ error: e.message, code: e.code ?? "cursor_invalid", error_type: e.code ?? "cursor_invalid" }, 400);
         }
         throw e;
+      }
+      // Truncation-honesty (vault contracts-brief V1.3): captured BEFORE
+      // near/tag-scope filtering, which can only shrink the set further —
+      // this reflects whether the underlying store query actually hit its
+      // `limit` (i.e. there may be more rows the caller never saw). Cursor
+      // mode is exempt — it already carries `next_cursor` as the honest
+      // "more may follow" signal, so a second warning would be redundant.
+      if (!cursorMode && results.length === queryOpts.limit) {
+        queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
       }
 
       // Near-scope filter (graph neighborhood)

@@ -280,14 +280,20 @@ export function isMethodAllowed(method: string, permission: TokenPermission): bo
   return READ_METHODS.has(method);
 }
 
+// RFC 7235: the auth-scheme token is case-insensitive (`Bearer`/`bearer`/
+// `BEARER` are all the same scheme) — only the token68/credentials that
+// follow are case-sensitive. `\s+` (not a single literal space) tolerates
+// the rare client that sends more than one space after the scheme.
+const BEARER_PREFIX = /^Bearer\s+/i;
+
 /**
  * Extract API key/token from request.
  * Priority: Authorization header → X-API-Key header → ?key= query param.
  */
 export function extractApiKey(req: Request): string | null {
   const authHeader = req.headers.get("authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7);
+  if (authHeader && BEARER_PREFIX.test(authHeader)) {
+    return authHeader.replace(BEARER_PREFIX, "");
   }
   const xApiKey = req.headers.get("x-api-key");
   if (xApiKey) return xApiKey;

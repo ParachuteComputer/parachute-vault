@@ -31,6 +31,13 @@ export interface Note {
    * `core/src/portable-md.ts:supportsInlineFrontmatter`.
    */
   extension?: string;
+  /**
+   * Always present on notes read back from the store — NULL/`"{}"`/
+   * unparseable metadata all collapse to `{}` rather than an absent key
+   * (mirrors `tags`, which is likewise always `[]`). Optional here only so
+   * write-input shapes (`createNote`/`updateNote` options) can share this
+   * type without forcing every caller to pass an empty object.
+   */
   metadata?: Record<string, unknown>;
   createdAt: string; // ISO-8601
   updatedAt?: string;
@@ -352,6 +359,7 @@ export interface NoteIndex {
   lastUpdatedBy?: string | null;
   lastUpdatedVia?: string | null;
   tags?: string[];
+  /** Always present (`{}` when empty) — see `Note.metadata`. */
   metadata?: Record<string, unknown>;
   byteSize: number;
   preview: string;

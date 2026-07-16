@@ -10,6 +10,7 @@ import {
   collectUnknownTagWarnings,
   emptySearchWarning,
   ignoredParamWarning,
+  truncatedResultsWarning,
   computeSearchDidYouMean,
   searchDidYouMeanWarning,
   type QueryWarning,
@@ -771,6 +772,22 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // never leaks via `did_you_mean`.
         let queryWarnings: QueryWarning[] = [];
         if (params.search) {
+          // `offset` under full-text search (vault contracts-brief V1.2):
+          // `searchNotes` has no offset parameter at all — FTS5 ranks by
+          // relevance, not a stable row order, so paging by offset over it
+          // is unsound. Rather than silently return page 1 with no signal,
+          // flag it. Presence check (`!== undefined`) so `offset: 0` — a
+          // caller being explicit about "start" — still warns. The
+          // structured-query branch (below) has real offset support and is
+          // unaffected.
+          if (params.offset !== undefined) {
+            queryWarnings.push(
+              ignoredParamWarning(
+                "offset",
+                "full-text search has no stable row order to offset into — results are always page 1, ranked by relevance",
+              ),
+            );
+          }
           // Normalize tag param
           const tags = normalizeTags(params.tag);
           const mode: SearchMode = searchMode ?? "literal";
@@ -887,6 +904,13 @@ Response shape (vault#550 — three variants, pick by what you passed):
             nextCursor = page.next_cursor;
           } else {
             results = await store.queryNotes(queryOpts);
+            // Truncation-honesty (vault contracts-brief V1.3): no cursor was
+            // requested, so `next_cursor` never surfaces as an honest
+            // "more may follow" signal — this is that signal. Mirrors the
+            // REST structured-query path in src/routes.ts.
+            if (results.length === queryOpts.limit) {
+              queryWarnings.push(truncatedResultsWarning(queryOpts.limit));
+            }
           }
         }
 

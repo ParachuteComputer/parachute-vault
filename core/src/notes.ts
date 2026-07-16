@@ -2980,7 +2980,12 @@ interface NoteRow {
 }
 
 function rowToNote(row: NoteRow): Note {
-  let metadata: Record<string, unknown> | undefined;
+  // `metadata` is always present on the wire — NULL/"{}"/unparseable all
+  // collapse to `{}` rather than an absent key. `tags` is already always
+  // `[]` (see getNote/queryNotes/searchNotes hydration below); this keeps
+  // the note shape internally consistent and fixes a real third-party
+  // crash on clients that assumed `note.metadata` always exists.
+  let metadata: Record<string, unknown> = {};
   if (row.metadata && row.metadata !== "{}") {
     try { metadata = JSON.parse(row.metadata); } catch {}
   }

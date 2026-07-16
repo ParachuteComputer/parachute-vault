@@ -272,9 +272,9 @@ describe("metadata", async () => {
     expect(published[0].content).toBe("Published");
   });
 
-  test("notes without metadata return undefined metadata", async () => {
+  test("notes without metadata return metadata: {} (vault V1.1 — not an absent key)", async () => {
     const note = await store.createNote("Plain note");
-    expect(note.metadata).toBeUndefined();
+    expect(note.metadata).toEqual({});
   });
 
   test("creates link with metadata", async () => {
@@ -7600,6 +7600,31 @@ describe("extractApiKey", () => {
       headers: { Authorization: "Bearer pvt_abc123" },
     });
     expect(extractApiKey(req)).toBe("pvt_abc123");
+  });
+
+  // RFC 7235: the auth-scheme token is case-insensitive (V1.4). A client
+  // sending `bearer`/`BEARER`/`BeArEr` must authenticate identically to
+  // one sending the canonical `Bearer` — only the credentials that follow
+  // the scheme are case-sensitive, and those come through verbatim.
+  test("extracts from a lowercase `bearer` scheme (RFC 7235 case-insensitivity)", () => {
+    const req = new Request("http://localhost/api/notes", {
+      headers: { Authorization: "bearer pvt_abc123" },
+    });
+    expect(extractApiKey(req)).toBe("pvt_abc123");
+  });
+
+  test("extracts from a mixed-case `BeArEr` scheme", () => {
+    const req = new Request("http://localhost/api/notes", {
+      headers: { Authorization: "BeArEr pvt_abc123" },
+    });
+    expect(extractApiKey(req)).toBe("pvt_abc123");
+  });
+
+  test("the token itself stays case-sensitive — only the scheme is folded", () => {
+    const req = new Request("http://localhost/api/notes", {
+      headers: { Authorization: "bearer PvT_MixedCase123" },
+    });
+    expect(extractApiKey(req)).toBe("PvT_MixedCase123");
   });
 
   test("extracts from X-API-Key header", () => {

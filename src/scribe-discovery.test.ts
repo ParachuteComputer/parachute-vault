@@ -7,7 +7,7 @@
  */
 
 import { describe, test, expect, beforeEach } from "bun:test";
-import { resolveScribeUrl, clearScribeUrlCache } from "./scribe-discovery.ts";
+import { resolveScribeUrl, getCachedScribeUrl, clearScribeUrlCache } from "./scribe-discovery.ts";
 
 function mkManifest(services: Array<{ name: string; port: number; origin?: string }>): typeof import("./services-manifest.ts").readManifest {
   return () => ({
@@ -73,5 +73,80 @@ describe("resolveScribeUrl", () => {
     const manifest = mkManifest([{ name: "parachute-scribe", port: 1943 }]);
     // Whitespace-only env falls through to services.json.
     expect(resolveScribeUrl(env, manifest)).toBe("http://127.0.0.1:1943");
+  });
+});
+
+describe("getCachedScribeUrl (vault contracts-brief V1.5 — TTL, not process-lifetime)", () => {
+  // A manifest fn that counts calls, so tests can prove whether the cache
+  // actually skipped a re-read (rather than just asserting the RESULT,
+  // which would pass even if the cache silently didn't cache at all).
+  function mkCountingManifest(port: number): { impl: typeof import("./services-manifest.ts").readManifest; calls: () => number } {
+    let calls = 0;
+    const impl = (() => {
+      calls++;
+      return {
+        services: [
+          { name: "parachute-scribe", port, paths: ["/parachute-scribe"], health: "/health", version: "0.0.0-test" },
+        ],
+      };
+    }) as unknown as typeof import("./services-manifest.ts").readManifest;
+    return { impl, calls: () => calls };
+  }
+
+  test("within the TTL window, repeated calls reuse the cached value (manifest read once)", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    const { impl, calls } = mkCountingManifest(1943);
+    let t = 1_000_000;
+    const now = () => t;
+
+    expect(getCachedScribeUrl(env, impl, console, now)).toBe("http://127.0.0.1:1943");
+    t += 1_000; // well inside the 30s TTL
+    expect(getCachedScribeUrl(env, impl, console, now)).toBe("http://127.0.0.1:1943");
+    expect(calls()).toBe(1);
+  });
+
+  test("after the TTL expires, the next call re-resolves — a scribe that appeared mid-process is picked up without a restart", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    // First manifest: no scribe registered yet.
+    let manifestCalls = 0;
+    let portToReturn: number | null = null;
+    const impl = (() => {
+      manifestCalls++;
+      return {
+        services: portToReturn === null
+          ? []
+          : [{ name: "parachute-scribe", port: portToReturn, paths: ["/parachute-scribe"], health: "/health", version: "0.0.0-test" }],
+      };
+    }) as unknown as typeof import("./services-manifest.ts").readManifest;
+    let t = 1_000_000;
+    const now = () => t;
+
+    // Nothing registered yet — vault boots before scribe.
+    expect(getCachedScribeUrl(env, impl, console, now)).toBeUndefined();
+
+    // Scribe installs and registers itself mid-process — still within TTL,
+    // so the stale "undefined" is what a caller sees (this is the bound the
+    // TTL accepts, not the bug being fixed).
+    portToReturn = 1943;
+    t += 1_000;
+    expect(getCachedScribeUrl(env, impl, console, now)).toBeUndefined();
+    expect(manifestCalls).toBe(1); // still cached — didn't re-read
+
+    // TTL elapses — next probe re-reads and picks up the now-live scribe,
+    // with no vault restart in between.
+    t += 30_000;
+    expect(getCachedScribeUrl(env, impl, console, now)).toBe("http://127.0.0.1:1943");
+    expect(manifestCalls).toBe(2);
+  });
+
+  test("clearScribeUrlCache forces a fresh resolve even within the TTL window", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    const { impl, calls } = mkCountingManifest(1943);
+    const now = () => 1_000_000;
+
+    expect(getCachedScribeUrl(env, impl, console, now)).toBe("http://127.0.0.1:1943");
+    clearScribeUrlCache();
+    expect(getCachedScribeUrl(env, impl, console, now)).toBe("http://127.0.0.1:1943");
+    expect(calls()).toBe(2);
   });
 });
