@@ -87,7 +87,14 @@ both doors inherit the fix) or `src/` where door-specific.
   it can't distinguish "exactly `limit` rows exist" from "capped, more
   follow" without a lookahead query, and the message says "may," not "are."
   The REST default-sort flip to `desc` is a separate, deliberately deferred
-  breaking-adjacent change.
+  breaking-adjacent change. **MCP consumers note:** warnings ride the
+  pre-existing `{notes, warnings}` envelope on non-cursor `query-notes`
+  (the #550 three-variant contract) — previously rare, this envelope is now
+  ROUTINE, arriving whenever a default page fills (any `limit`-sized result,
+  e.g. 50 notes on a ≥50-note vault). Programmatic MCP consumers that
+  assume a bare array will hit it immediately; handle both variants. REST
+  is unaffected (warnings stay in the `X-Parachute-Warnings` header; body
+  shape unchanged).
 
 See the contracts-brief PR description for full file:line evidence per
 item. A matching mirror + conformance-pin PR lands in parachute-cloud
