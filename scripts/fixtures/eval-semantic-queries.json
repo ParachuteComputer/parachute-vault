@@ -1,0 +1,30 @@
+[
+  {
+    "id": "example-memory-1",
+    "class": "memory-recall",
+    "query": "that idea about music remixes as a way of building community",
+    "target_ids": ["REPLACE-with-a-real-note-id-from-your-vault"],
+    "note": "SYNTHETIC EXAMPLE. Replace target_ids with real note ids from YOUR vault and phrase queries the way you'd ask from memory. Keep your real query set OUT of any public repo — it is a meaning-summary of your private notes. Pass your local file: bun scripts/eval-semantic.ts /path/to/your-queries.json"
+  },
+  {
+    "id": "example-memory-2",
+    "class": "memory-recall",
+    "query": "the note where I compared two libraries before picking one for the project",
+    "target_ids": ["REPLACE-me"],
+    "note": "SYNTHETIC EXAMPLE — memory-recall class: things you know are in the vault, phrased naturally, ideally with words that don't appear in the note."
+  },
+  {
+    "id": "example-paraphrase-1",
+    "class": "paraphrase",
+    "query": "achieving balance between screen time and being present",
+    "target_ids": ["REPLACE-me"],
+    "note": "SYNTHETIC EXAMPLE — paraphrase class: describe one specific note purely by meaning with zero shared keywords (verify the overlap is really zero)."
+  },
+  {
+    "id": "example-lexical-1",
+    "class": "lexical-control",
+    "query": "ProjectAtlas kickoff checklist",
+    "target_ids": ["REPLACE-me"],
+    "note": "SYNTHETIC EXAMPLE — lexical-control class: exact names/slugs/rare terms that keyword search SHOULD win; measures what semantic would cost if it replaced (rather than complemented) FTS."
+  }
+]

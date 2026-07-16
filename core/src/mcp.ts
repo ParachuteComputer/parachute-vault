@@ -13,6 +13,7 @@ import {
   truncatedResultsWarning,
   computeSearchDidYouMean,
   searchDidYouMeanWarning,
+  embeddingsPendingWarning,
   type QueryWarning,
 } from "./query-warnings.js";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "./search-query.js";
@@ -412,6 +413,16 @@ Response shape (vault#550 — three variants, pick by what you passed):
             description:
               'How `search` text is turned into an FTS5 query (vault#551). "literal" (DEFAULT): escape + phrase-quote the text so punctuation is literal content, not FTS5 syntax — the fix for `search: "didn\'t"` / "eleven-day" / "18.6" silently returning `[]`. "advanced": pass the text through to FTS5 raw, for callers who want boolean (AND/OR/NOT), manual phrase quoting, or prefix (`*`) syntax — a malformed advanced query throws a structured error (`error_type: "invalid_search_syntax"`) instead of silently returning `[]`. Has no effect without `search` (an `ignored_param` warning fires if you pass it without `search`). Omit for the default ("literal").',
           },
+          near_text: {
+            type: "string",
+            description:
+              'EXPERIMENTAL (semantic search MVP — may change or be removed while quality is validated). Free text to rank notes by MEANING rather than keyword — "that idea about music remixes as community building" finds the note even if it never uses those exact words. Requires `semantic: true`; mutually exclusive with `search`/`aggregate`/`cursor`. Composes with every other filter (`tag`, `metadata`, date range, ...) exactly like `search` does — those narrow the candidate set FIRST, then ranking runs over just that set. Long notes are chunked internally and ranked by their BEST-matching section, so a match buried in one part of a long note still surfaces the whole note. Results carry a `score` field — cosine similarity in `[-1, 1]` (typically 0.2–0.9), NOT the same scale as `search`\'s bm25 `score`; only meaningful as a relative ranking within one result set.',
+          },
+          semantic: {
+            type: "boolean",
+            description:
+              'EXPERIMENTAL. Opt into vector ranking via `near_text` (required when true). No embedding provider configured, or the vault hasn\'t finished indexing, is reported HONESTLY — never a silent fallback to keyword search: a provider-less vault throws a structured `semantic_unavailable` error; a mid-backfill vault returns real (possibly partial) results plus an `embeddings_pending` warning naming how many candidate notes aren\'t embedded yet.',
+          },
           metadata: {
             type: "object",
             description: "Filter by metadata values. Each value is either a primitive (exact match, scans JSON) or an operator object: `{eq|ne|gt|gte|lt|lte|in|not_in|exists: value}`. Operator objects require the field to be declared `indexed: true` in a tag schema — they route through the backing B-tree index. Multiple operators on one field AND together (e.g. `{gt: 5, lt: 10}`). `in`/`not_in` take arrays; `exists` takes a boolean.",
@@ -640,6 +651,12 @@ Response shape (vault#550 — three variants, pick by what you passed):
             "INVALID_QUERY",
           );
         }
+        if (cursorMode && params.semantic) {
+          throw new QueryError(
+            `cursor is incompatible with semantic search — ranking is by similarity, not a stable row order to page through.`,
+            "INVALID_QUERY",
+          );
+        }
         // Tag-expansion axis (vault tag `expand` axis). Validate loudly so a
         // typo'd value doesn't silently fall back to the default.
         let expand: TagExpandMode | undefined;
@@ -677,6 +694,13 @@ Response shape (vault#550 — three variants, pick by what you passed):
               `aggregate is incompatible with cursor pagination — a rollup has no watermark to page through.`,
               "INVALID_QUERY",
               { error_type: "invalid_query", field: "aggregate", hint: "drop `cursor` when using `aggregate`" },
+            );
+          }
+          if (params.semantic) {
+            throw new QueryError(
+              `aggregate is incompatible with semantic search — a rollup returns groups, not ranked notes.`,
+              "INVALID_QUERY",
+              { error_type: "invalid_query", field: "aggregate", hint: "drop `semantic`/`near_text` when using `aggregate`" },
             );
           }
           const aggRaw = params.aggregate as Record<string, unknown>;
@@ -771,7 +795,93 @@ Response shape (vault#550 — three variants, pick by what you passed):
         // before the result reaches the caller, so an out-of-scope tag name
         // never leaks via `did_you_mean`.
         let queryWarnings: QueryWarning[] = [];
-        if (params.search) {
+        // `near_text` only does anything alongside `semantic: true` (mirrors
+        // the `search_mode`-without-`search` ignored_param case above).
+        if (params.near_text !== undefined && !params.semantic) {
+          queryWarnings.push(
+            ignoredParamWarning(
+              "near_text",
+              "`semantic: true` is required to activate near_text — pass both together",
+            ),
+          );
+        }
+        // --- Semantic search (EXPERIMENTAL — semantic search MVP) ---
+        if (params.semantic) {
+          if (params.search) {
+            throw new QueryError(
+              `semantic is incompatible with full-text search — pick one (semantic ranks by meaning via near_text; search ranks by keyword).`,
+              "INVALID_QUERY",
+              {
+                error_type: "invalid_query",
+                field: "semantic",
+                hint: "drop `search` when using `semantic`, or drop `semantic`/`near_text` to use keyword search",
+              },
+            );
+          }
+          if (typeof params.near_text !== "string" || params.near_text.trim() === "") {
+            throw new QueryError(
+              `semantic: true requires \`near_text\` — the free text to rank notes by meaning.`,
+              "INVALID_QUERY",
+              {
+                error_type: "invalid_query",
+                field: "near_text",
+                hint: `pass near_text: "..." alongside semantic: true`,
+              },
+            );
+          }
+          // `search_mode` only shapes `search` text parsing — a stray value
+          // alongside `semantic` is almost certainly a leftover from a
+          // keyword query, so flag it (same policy as the structured-query
+          // branch below).
+          if (searchMode !== undefined) {
+            queryWarnings.push(
+              ignoredParamWarning(
+                "search_mode",
+                "no `search` was provided — search_mode only affects full-text search query parsing",
+              ),
+            );
+          }
+          const tags = normalizeTags(params.tag);
+          const excludeTagsRaw = params.exclude_tags ?? params.excludeTags ?? params.exclude_tag;
+          const excludeTags = normalizeTags(excludeTagsRaw);
+          const semanticOpts: QueryOpts = {
+            tags,
+            tagMatch: (params.tag_match as "all" | "any") ?? (tags && tags.length > 1 ? "any" : undefined),
+            expand,
+            excludeTags,
+            hasTags: params.has_tags as boolean | undefined,
+            hasLinks: params.has_links as boolean | undefined,
+            hasBrokenLinks: params.has_broken_links as boolean | undefined,
+            path: params.path as string | undefined,
+            pathPrefix: params.path_prefix as string | undefined,
+            extension: params.extension as string | string[] | undefined,
+            // Same `near[]` neighborhood push-down `search`/structured-query
+            // use — a semantic query can be scoped to a graph neighborhood too.
+            ids: nearScope ? [...nearScope] : undefined,
+            metadata: params.metadata as Record<string, unknown> | undefined,
+            createdBy: params.created_by as string | undefined,
+            lastUpdatedBy: params.last_updated_by as string | undefined,
+            createdVia: params.created_via as string | undefined,
+            lastUpdatedVia: params.last_updated_via as string | undefined,
+            dateFrom: params.date_from as string | undefined,
+            dateTo: params.date_to as string | undefined,
+            dateFilter: params.date_filter as
+              | { field?: string; from?: string; to?: string }
+              | undefined,
+            limit: (params.limit as number) ?? 50,
+          };
+          // Uncaught on purpose: `semantic_unavailable` (no/not-ready
+          // provider) propagates to src/mcp-http.ts's QueryError → JSON-RPC
+          // error mapping, same as `invalid_search_syntax` above — never a
+          // silent fallback to keyword search.
+          const semanticResult = await store.semanticSearch(params.near_text, semanticOpts);
+          results = semanticResult.notes;
+          if (semanticResult.pendingCount > 0) {
+            queryWarnings.push(
+              embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
+            );
+          }
+        } else if (params.search) {
           // `offset` under full-text search (vault contracts-brief V1.2):
           // `searchNotes` has no offset parameter at all — FTS5 ranks by
           // relevance, not a stable row order, so paging by offset over it

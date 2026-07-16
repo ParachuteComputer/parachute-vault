@@ -395,3 +395,23 @@ export function searchDidYouMeanWarning(rawQuery: string, suggestion: string): Q
     did_you_mean: suggestion,
   };
 }
+
+/**
+ * `embeddings_pending` warning (semantic search MVP, EXPERIMENTAL —
+ * `SEMANTIC-MVP-PLAN.md`) — a `semantic: true` query ran and returned
+ * REAL results, but `pending` of the `total_candidates` structured-filter
+ * matches have no vector yet for the active embedding model (a fresh
+ * note, or the backfill sweep hasn't reached it yet). Attached alongside
+ * honest (possibly incomplete) results — NEVER instead of them, and never
+ * a silent keyword fallback: the caller always knows it got a partial
+ * semantic ranking, not a complete one. Callers only push this when
+ * `pending > 0` (the common steady-state case attaches nothing).
+ */
+export function embeddingsPendingWarning(pending: number, totalCandidates: number): QueryWarning {
+  return {
+    code: "embeddings_pending",
+    message: `${pending} of ${totalCandidates} candidate note(s) have no embedding yet for the active model — results may be incomplete until the backfill catches up.`,
+    pending,
+    total_candidates: totalCandidates,
+  };
+}

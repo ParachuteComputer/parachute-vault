@@ -34,6 +34,115 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.2] - 2026-07-16
+
+**Semantic search — EXPERIMENTAL.** Find notes by MEANING, not keyword —
+`query-notes { near_text: "...", semantic: true }` (MCP) / `GET
+/notes?near_text=...&semantic=true` (REST). Shipped in ONE PR, both doors
+at once: the shared engine + self-host provider land here; the cloud
+Workers-AI twin (C2) follows. Ratified 2026-07-16 after a P0 real-corpus
+eval (Aaron's 3,467-note vault): best model 64.3% hit@10 on
+meaning-only-recall queries vs. 7.1% for keyword search — semantic finds
+what keyword search structurally can't. See `SEMANTIC-MVP-PLAN.md` /
+`RESULTS.md` for the full evidence and the go decision.
+
+Loudly experimental: documented as such in the MCP tool description and
+this entry — the wire shape may change while quality is validated.
+
+### Added
+
+- **The seam** — `core/src/embedding/provider.ts`'s `EmbeddingProvider`
+  interface (`embed`/`available`, `EmbeddingError`), a verbatim clone of the
+  shipped `TranscriptionProvider` seam. Core stays dependency-pure — no
+  model library lives in `core/`.
+- **Per-section chunking** (`core/src/embedding/chunker.ts`) — pulled
+  forward from "full-phase" into this MVP's scope (Aaron-ratified) after P0
+  found whole-note embedding was the dominant miss cause on long, multi-
+  topic morning-pages notes. Splits on markdown headings, then paragraphs,
+  targeting ~450 tokens/chunk (chars/4 approximation, documented); tiny
+  fragments merge into a neighbor so recall isn't fragmented. A short note
+  is a single degenerate chunk — byte-equivalent in spirit to whole-note v1.
+- **Schema v27** — `note_vectors` table (PK `(note_id, chunk_ix)`, `model` +
+  `content_hash` freshness gate, `ON DELETE CASCADE`) + its stale-scan
+  index. `migrateToV27` is pure schema, zero data movement — every
+  pre-existing note's absent vector rows are ALREADY the "needs embedding"
+  signal the async drain reads; the migration never calls a provider.
+- **The scan + store wrapper** — `core/src/notes.ts:semanticSearchNotes`
+  (structured filters narrow the candidate set FIRST, then brute-force
+  cosine — stored vectors are L2-normalized so ranking is a dot product;
+  best-CHUNK-per-note, note-level results); `Store.semanticSearch` is the
+  one place a provider is ever invoked.
+- **Wire:** `QueryOpts.nearText`/`semantic`; MCP `query-notes` `near_text`/
+  `semantic` params (mutually exclusive with `search`/`aggregate`/`cursor`);
+  REST `?near_text=&semantic=` on `GET /notes`. `semantic_unavailable`
+  structured error (MCP: thrown `QueryError`; REST: 503) when no provider is
+  configured/ready; `embeddings_pending` warning (with counts) on a
+  mid-backfill vault — results are still real, just possibly incomplete.
+  **Never a silent keyword fallback** — a caller always knows whether it got
+  meaning or nothing. `GET /api/vault` gains `embeddings: {enabled,
+  provider?, model?}` (transcription-capability precedent).
+- **Two-tier self-host provider** (Aaron-ratified shape): **bundled floor**
+  (`src/embedding/onnx-transformers.ts`) — `bge-small-en-v1.5` (q8 ONNX,
+  34MB — P0 confirmed genuinely bundle-sized) via `@huggingface/
+  transformers`, zero-config, lazy-loaded on first use, lazy-fails to
+  `unavailable` rather than crashing if the runtime ever misbehaves.
+  **Config upgrade** (`src/embedding/external-api.ts`) — an
+  OpenAI-compatible `/v1/embeddings` client reading `EMBEDDING_API_URL`/
+  `EMBEDDING_API_KEY`/`EMBEDDING_MODEL` (covers a local Ollama running
+  `bge-m3`, the recommended quality tier — fully private, `ollama pull
+  bge-m3` + three env lines). Config wins over the floor when present.
+- **Embed-on-write + backfill** (`src/embedding-worker.ts`) — an `onNote`
+  hook embeds a note's stale chunks after every create/update (a no-op edit
+  makes ZERO provider calls — the content-hash freshness gate short-
+  circuits first); a background sweep drains the backfill for pre-existing
+  notes and catches anything a dropped dispatch left behind. Rides the
+  existing `HookRegistry`/`HOOK_CONCURRENCY` cap — a bulk import can't spawn
+  unbounded parallel embed calls.
+- **`scripts/eval-semantic.ts`** — the P0 spike's harness, graduated into a
+  permanent regression eval. Now a thin REST client against a live vault's
+  real `near_text`/`semantic` endpoint (the product does the embedding now,
+  not the script) scored against a query set of the shape
+  `{id, class, query, target_ids, note?}`. The shipped
+  `scripts/fixtures/eval-semantic-queries.json` is a SYNTHETIC example
+  fixture, not a real query set — a real one is a meaning-summary of
+  private note content and must stay local, never ride a public repo; bring
+  your own file with real note ids and pass its path as the CLI arg — hit@5/
+  hit@10/MRR per class, plus the plan's "classes 1+2 combined hit@10"
+  verdict number.
+- **Off switch** — `EMBEDDINGS_ENABLED=false` (mirrors the `EMBEDDINGS_ENABLED`
+  wrangler var C2 plans for the cloud door) short-circuits BOTH self-host
+  tiers: `buildEmbeddingProvider` resolves to no provider at all, the
+  `embeddings` capability reports `enabled: false`, `semantic: true` throws
+  `semantic_unavailable`, and the embed-on-write drain simply has nothing to
+  invoke (no-op, not an error).
+- **A mid-`embed()` failure now maps to `semantic_unavailable` too** (MCP
+  `QueryError` / REST 503), not a raw unstructured 500 — `available()` is
+  only a cheap readiness probe (never a real network/model round-trip), so
+  a provider whose actual first `embed()` call fails (e.g. the bundled ONNX
+  floor's lazy model load blowing up) previously surfaced as an uncaught
+  error. `Store.semanticSearch` now catches any embed()-time failure and
+  reports it honestly, same shape as "no provider configured."
+- **Blank/whitespace-only notes are excluded from the embed pipeline** —
+  they have nothing embeddable, so both the staleness plan (chunker output
+  is filtered before it reaches the provider) and the backfill sweep's
+  candidate query now skip them. Without this, a blank note would stay
+  "pending" forever (never gets a vector row) and the sweep would re-select
+  it — and re-call the provider with empty input — every `sweepIntervalMs`.
+
+### Notes
+
+- **`package.json` gains `trustedDependencies: ["onnxruntime-node",
+  "protobufjs"]`** — required for the bundled floor provider's native ONNX
+  Runtime binary postinstall to run on a fresh `bun install` without a
+  manual `bun pm trust` step. Verified working end-to-end under bun 1.3.13
+  (both the isolated dependency and, live, a fresh vault install reporting
+  `embeddings: {enabled: true, provider: "onnx-transformers"}` with zero
+  operator action).
+- Portability is unaffected: vectors are derived data, never exported, never
+  in portable-md — a door switch or re-import just re-embeds.
+- Cloud twin (C2, Workers AI) and the live quality re-measurement on
+  Aaron's real vault (V2-live) follow in separate PRs/ops steps.
+
 ## [0.7.3-rc.1] - 2026-07-16
 
 **Cross-door contract-consistency fixes (V1 of the vault↔cloud contract-drift

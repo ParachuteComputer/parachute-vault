@@ -20,6 +20,7 @@ import {
   truncatedResultsWarning,
   computeSearchDidYouMean,
   searchDidYouMeanWarning,
+  embeddingsPendingWarning,
   type QueryWarning,
 } from "../core/src/query-warnings.ts";
 import { SEARCH_MODES, buildLiteralSearchQuery, isValidSearchMode, type SearchMode } from "../core/src/search-query.ts";
@@ -51,6 +52,11 @@ import {
   resolveTranscriptionCapability,
   type TranscriptionCapability,
 } from "./transcription/capability.ts";
+import {
+  resolveEmbeddingCapability,
+  type EmbeddingCapability,
+} from "./embedding/capability.ts";
+import { getSharedEmbeddingProvider } from "./vault-store.ts";
 import { loadSchemaConfig } from "../core/src/schema-defaults.ts";
 import {
   buildExpandVisibility,
@@ -1213,6 +1219,118 @@ async function handleNotesInner(
         return json(result);
       }
 
+      // Semantic search (EXPERIMENTAL — semantic search MVP). Mirrors the
+      // MCP `query-notes` tool's `near_text`/`semantic` params — see
+      // `core/src/mcp.ts`'s `query-notes` handler for the identical
+      // validation/shape this branch reproduces over REST. Checked BEFORE
+      // the search/cursor exclusivity check below so `semantic=true`
+      // combined with `search=` or `cursor=` gets its OWN error naming
+      // `semantic`, not silently routed into the search branch.
+      const nearText = parseQuery(url, "near_text");
+      const semantic = parseBool(parseQuery(url, "semantic"), false);
+      if (semantic) {
+        if (search) {
+          return json(
+            {
+              error: "semantic is incompatible with full-text search — pick one (semantic ranks by meaning via near_text; search ranks by keyword).",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "semantic",
+              hint: "drop `search` when using `semantic`, or drop `semantic`/`near_text` to use keyword search",
+            },
+            400,
+          );
+        }
+        if (parseQuery(url, "cursor") !== null) {
+          return json(
+            {
+              error: "cursor is incompatible with semantic search — ranking is by similarity, not a stable row order to page through.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "semantic",
+              hint: "drop `cursor` when using `semantic`",
+            },
+            400,
+          );
+        }
+        if (!nearText || !nearText.trim()) {
+          return json(
+            {
+              error: "semantic=true requires `near_text` — the free text to rank notes by meaning.",
+              code: "INVALID_QUERY",
+              error_type: "invalid_query",
+              field: "near_text",
+              hint: "pass ?near_text=...&semantic=true",
+            },
+            400,
+          );
+        }
+        const parsed = parseNotesQueryOpts(url);
+        if (parsed.error) return parsed.error;
+        try {
+          const semanticResult = await store.semanticSearch(nearText, { ...parsed.queryOpts, cursor: undefined });
+          const semanticWarnings: QueryWarning[] = [];
+          if (semanticResult.pendingCount > 0) {
+            semanticWarnings.push(
+              embeddingsPendingWarning(semanticResult.pendingCount, semanticResult.totalCandidates),
+            );
+          }
+          const filtered = filterNotesByTagScope(semanticResult.notes, tagScope.allowed, tagScope.raw);
+          const includeContent = parseBool(parseQuery(url, "include_content"), false);
+          const contentRange = parseContentRangeQuery(url, includeContent);
+          if (contentRange.error) return contentRange.error;
+          const inclMeta = parseIncludeMetadata(url);
+          let output: any[] = includeContent ? filtered.map((n) => ({ ...n })) : filtered.map(toNoteIndex);
+          const expand = parseExpandParams(url, db, tagScope);
+          if (expand && includeContent) {
+            for (const n of output) expand.ctx.expanded.add(n.id);
+            for (const n of output) {
+              if (typeof n.content === "string") {
+                n.content = expandContent(n.content, expand.ctx, expand.depth);
+              }
+            }
+          }
+          if (contentRange.range && includeContent) {
+            for (const n of output) applyContentRange(n, contentRange.range);
+          }
+          if (inclMeta !== undefined && inclMeta !== true) {
+            output = output.map((n: any) => filterMetadata(n, inclMeta));
+          }
+          if (parseBool(parseQuery(url, "include_link_count"), false)) {
+            const counts = linkOps.getLinkCounts(db, output.map((n: any) => n.id), parseLinkCountDirection(url));
+            for (const n of output) n.linkCount = counts.get(n.id) ?? 0;
+          }
+          return jsonWithWarnings(output, semanticWarnings);
+        } catch (e: any) {
+          if (e && e.name === "QueryError") {
+            // `semantic_unavailable` (no/not-ready provider) is a capability
+            // gap, not a malformed request — 503, distinct from every other
+            // QueryError's 400. Never a silent fallback to keyword search.
+            const status = e.error_type === "semantic_unavailable" ? 503 : 400;
+            return json(
+              {
+                error: e.message,
+                code: e.code ?? "INVALID_QUERY",
+                error_type: e.error_type ?? "invalid_query",
+                ...(e.field !== undefined ? { field: e.field } : {}),
+                ...(e.got !== undefined ? { got: e.got } : {}),
+                ...(e.hint !== undefined ? { hint: e.hint } : {}),
+              },
+              status,
+            );
+          }
+          throw e;
+        }
+      }
+      // `near_text` without `semantic: true` is inert — same ignored_param
+      // convention as `search_mode` without `search` (below). Rather than a
+      // whole extra branch, this warning rides whichever normal path (search
+      // or structured query) actually runs — appended just before each
+      // branch's own `jsonWithWarnings` call would otherwise return.
+      const nearTextIgnored: QueryWarning[] = nearText !== null
+        ? [ignoredParamWarning("near_text", "`semantic=true` is required to activate near_text — pass both together")]
+        : [];
+
       // Cursor + full-text search is mutually exclusive (vault#313 reviewer).
       // FTS owns its own ordering (relevance, not updated_at), so a cursor
       // would skip rows. MCP rejects this combo at `core/src/mcp.ts`; REST
@@ -1254,7 +1372,7 @@ async function handleNotesInner(
         // (default, unchanged); explicit asc/desc switches to created_at.
         const sort = (parseQuery(url, "sort") as "asc" | "desc" | null) ?? undefined;
 
-        const searchWarnings: QueryWarning[] = [];
+        const searchWarnings: QueryWarning[] = [...nearTextIgnored];
         // `offset` under full-text search (vault contracts-brief V1.2):
         // `searchNotes` has no offset parameter at all — FTS5 ranks by
         // relevance, not a stable row order, so paging by offset over it
@@ -1519,6 +1637,7 @@ async function handleNotesInner(
       // IS the structured-query path precisely because `search` was absent
       // or empty, so a `search_mode` param here is always a no-op.
       const queryWarnings: QueryWarning[] = [
+        ...nearTextIgnored,
         ...collectRemovedParamWarnings(url),
         ...(parseQuery(url, "search_mode")
           ? [
@@ -3651,6 +3770,14 @@ export async function handleVault(
    * which pass this — is unaffected.
    */
   tagScope: TagScopeCtx = NO_TAG_SCOPE,
+  /**
+   * Injection seam (semantic search MVP, EXPERIMENTAL) for the embeddings
+   * capability probe — same shape as `resolveCapability` above. Production
+   * omits it and resolves the shared embedding provider's availability;
+   * tests inject a deterministic resolver.
+   */
+  resolveEmbeddingCap: () => Promise<EmbeddingCapability> = () =>
+    resolveEmbeddingCapability(getSharedEmbeddingProvider()),
 ): Promise<Response> {
   const url = new URL(req.url);
 
@@ -3660,6 +3787,12 @@ export async function handleVault(
     // and available. `minutes_remaining` is omitted (cloud/plan concern;
     // self-host is unmetered). This is the field Notes gates the mic on.
     result.transcription = await resolveCapability();
+    // Embeddings capability flag (semantic search MVP, EXPERIMENTAL) — same
+    // "configured AND available" contract as transcription above. This is
+    // the honest advertisement `query-notes { semantic: true }` backs: a
+    // vault reporting `enabled: false` gets `semantic_unavailable`, never a
+    // silent keyword fallback.
+    result.embeddings = await resolveEmbeddingCap();
     // Front-door structural map — ALWAYS included (unlike `stats`, which is
     // include_stats-gated): three cheap grouped-COUNT queries, so a fresh
     // reader orients in one call. Scope-aware: a tag-scoped token's map

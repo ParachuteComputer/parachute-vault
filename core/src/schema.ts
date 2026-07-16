@@ -5,7 +5,7 @@ import { findMixedTypeIndexedFieldNotes } from "./doctor.js";
 import { transaction } from "./txn.js";
 import { timestampToMs } from "./cursor.js";
 
-export const SCHEMA_VERSION = 26;
+export const SCHEMA_VERSION = 27;
 
 /**
  * Deterministic last-resort epoch for a note whose `updated_at` AND
@@ -111,6 +111,35 @@ CREATE TABLE IF NOT EXISTS links (
   created_at TEXT NOT NULL,
   UNIQUE(source_id, target_id, relationship)
 );
+
+-- note_vectors (v27, semantic search MVP — EXPERIMENTAL): one row per
+-- embedded CHUNK of a note (see core/src/embedding/chunker.ts). chunk_ix=0
+-- is either the whole note (short notes, the degenerate/v1-equivalent
+-- case) or the first section of a long, multi-section note.
+--
+-- vector is a Float32Array serialized to raw bytes (core/src/embedding/
+-- vector-codec.ts), stored L2-NORMALIZED so ranking is a plain dot
+-- product. model is recorded per-row so a provider/model change is
+-- detectable (see core/src/embedding/staleness.ts) — a chunk_ix's row is
+-- REPLACED wholesale on re-embed, never appended, so a vault only ever
+-- carries vectors from ONE model at a time. content_hash is the freshness
+-- gate: a create/update whose chunk text hashes the same as the stored
+-- row is a no-op (no wasted embed on a metadata-only save).
+-- ON DELETE CASCADE mirrors attachments/links above — a deleted note
+-- drops its vectors for free.
+CREATE TABLE IF NOT EXISTS note_vectors (
+  note_id      TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+  chunk_ix     INTEGER NOT NULL DEFAULT 0,
+  vector       BLOB NOT NULL,
+  dims         INTEGER NOT NULL,
+  model        TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  embedded_at  TEXT NOT NULL,
+  PRIMARY KEY (note_id, chunk_ix)
+);
+-- Backs the staleness diff (per-note row fetch) and the model-mismatch
+-- sweep (a model <> ? scan) the backfill/drain use to find pending work.
+CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content_hash);
 
 -- tag_schemas (v6) was retired in v14; description + fields lifted onto the
 -- tags row directly. The CREATE TABLE was removed from SCHEMA_SQL after the
@@ -553,6 +582,12 @@ export function initSchema(db: Database): void {
   // (updated_at_ms, id) index, and backfill every existing row from its
   // `updated_at` string with a UTC-correct parse. See vault#586.
   migrateToV26(db);
+
+  // Migrate v26 → v27: create the `note_vectors` table (semantic search
+  // MVP, EXPERIMENTAL) — one row per embedded note chunk. No backfill loop:
+  // every pre-existing note simply has zero rows, which the staleness gate
+  // already reads as "needs embedding." See vault semantic-search MVP plan.
+  migrateToV27(db);
 
   // Rebuild any generated columns + indexes declared in indexed_fields.
   // No-op for a fresh vault; idempotent on existing vaults.
@@ -1615,6 +1650,51 @@ function migrateToV26(db: Database): void {
   // idx_notes_updated precedent): a fresh vault has the column from SCHEMA_SQL
   // but not yet the index, so this ensures it for both paths. Idempotent.
   db.exec("CREATE INDEX IF NOT EXISTS idx_notes_updated_ms ON notes(updated_at_ms, id)");
+}
+
+/**
+ * Migrate v26 → v27: the `note_vectors` table (semantic search MVP,
+ * EXPERIMENTAL — `SEMANTIC-MVP-PLAN.md`). Created by SCHEMA_SQL's
+ * `CREATE TABLE IF NOT EXISTS` above, so on a FRESH vault this is a no-op
+ * confirmation hook (same pattern as `migrateToV7`/`V20`/`V21` — the table
+ * is new, not a column added to existing rows). On an EXISTING vault
+ * upgrading through this version, the `CREATE TABLE IF NOT EXISTS` +
+ * `CREATE INDEX IF NOT EXISTS` calls create it for the first time.
+ *
+ * Deliberately NO backfill loop, and no embedding call of any kind — this
+ * function never resolves an `EmbeddingProvider` or does network/CPU work.
+ * "Backfill" for existing notes is implicit and free: every note that
+ * predates this migration simply has ZERO rows in the (now-created, empty)
+ * `note_vectors` table, which `core/src/embedding/staleness.ts:planStaleness`
+ * already treats as "stale — needs embedding" (no existing row at a given
+ * `chunk_ix` ⇒ stale). The async drain (self-host: the `onNote` hook +
+ * its sweep; cloud: the DO-alarm drain) discovers this pending work by
+ * scanning for notes lacking a fresh vector row — the exact same "queue is
+ * implicit in the diff, not a separate table" property the `updated_at_ms`
+ * self-heal above relies on. So this migration is intentionally ALL
+ * schema, zero data movement — the whole point of "enqueue, never embed
+ * inside the migration."
+ *
+ * Wrapped in a transaction for symmetry with `migrateToV25`/`V26` (a
+ * multi-statement DDL block should commit or roll back as one unit), even
+ * though there's no row data to lose here.
+ */
+function migrateToV27(db: Database): void {
+  transaction(db, () => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS note_vectors (
+        note_id      TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        chunk_ix     INTEGER NOT NULL DEFAULT 0,
+        vector       BLOB NOT NULL,
+        dims         INTEGER NOT NULL,
+        model        TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        embedded_at  TEXT NOT NULL,
+        PRIMARY KEY (note_id, chunk_ix)
+      )
+    `);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_note_vectors_stale ON note_vectors(model, content_hash)");
+  });
 }
 
 function hasTable(db: Database, name: string): boolean {
