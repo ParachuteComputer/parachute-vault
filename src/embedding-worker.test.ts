@@ -226,6 +226,28 @@ describe("EmbeddingWorker.sweepOnce", () => {
     expect(second.processed).toBe(0);
     expect(provider.calls.length).toBe(0);
   });
+
+  it("L4: end-to-end — a blank note present in the vault never leaves a phantom embeddings_pending after the sweep", async () => {
+    const real = await store.createNote("real content about something", { path: "real" });
+    await store.createNote("", { path: "blank" });
+
+    await worker.sweepOnce(); // embeds `real`; skips `blank` (never a candidate)
+    expect(getNoteVectorRows(db, real.id).length).toBe(1);
+
+    // A second store over the SAME db, this one wired with the provider
+    // (the shared `store` fixture above intentionally has none — this
+    // suite tests the worker's direct DB effects, not semanticSearch) —
+    // exercises the real Store.semanticSearch pendingCount path against
+    // what the worker actually left behind.
+    const searchStore = new SqliteStore(db, { embeddingProvider: provider });
+    // Before the L4 fix, semanticSearchNotes' own candidate query counted
+    // the blank note as a "pending" candidate forever (it has no vector
+    // and never will), so pendingCount would report 1 here, permanently,
+    // even after every EMBEDDABLE note in the vault is fully drained.
+    const result = await searchStore.semanticSearch("something");
+    expect(result.totalCandidates).toBe(1); // only the real note is a candidate
+    expect(result.pendingCount).toBe(0);
+  });
 });
 
 describe("registerEmbeddingHook", () => {

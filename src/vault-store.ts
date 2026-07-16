@@ -9,7 +9,7 @@ import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import type { Store } from "../core/src/types.ts";
 import type { EmbeddingProvider } from "../core/src/embedding/provider.ts";
-import { buildEmbeddingProvider } from "./embedding/select.ts";
+import { buildEmbeddingProvider, embeddingsExplicitlyDisabled } from "./embedding/select.ts";
 import { openVaultDb } from "./db.ts";
 
 export { SqliteStore as BunStore };
@@ -67,8 +67,18 @@ export function getVaultStore(name: string): SqliteStore {
     // handlers once at startup and have them fire for every vault. Same
     // for the embedding provider (see `getSharedEmbeddingProvider`'s doc
     // comment) — every vault's semantic search resolves the SAME provider
-    // instance.
-    store = new SqliteStore(db, { hooks: defaultHookRegistry, embeddingProvider: getSharedEmbeddingProvider() });
+    // instance. `embeddingDisabledReason` is only ever set here (core can't
+    // read env vars itself — see `Store.embeddingDisabledReason`'s doc
+    // comment), so `semanticSearch`'s no-provider hint can say "explicitly
+    // disabled" instead of generic provider-setup instructions when that's
+    // actually why.
+    store = new SqliteStore(db, {
+      hooks: defaultHookRegistry,
+      embeddingProvider: getSharedEmbeddingProvider(),
+      embeddingDisabledReason: embeddingsExplicitlyDisabled()
+        ? "semantic search is disabled by EMBEDDINGS_ENABLED=false"
+        : undefined,
+    });
     stores.set(name, store);
     storeToVault.set(store, name);
   }

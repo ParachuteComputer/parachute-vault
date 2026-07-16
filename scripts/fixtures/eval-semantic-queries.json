@@ -4,7 +4,7 @@
     "class": "memory-recall",
     "query": "that idea about music remixes as a way of building community",
     "target_ids": ["REPLACE-with-a-real-note-id-from-your-vault"],
-    "note": "SYNTHETIC EXAMPLE. Replace target_ids with real note ids from YOUR vault and phrase queries the way you'd ask from memory. Keep your real query set OUT of any public repo — it is a meaning-summary of your private notes. Pass your local file: bun scripts/eval-semantic.ts --queries /path/to/your-queries.json"
+    "note": "SYNTHETIC EXAMPLE. Replace target_ids with real note ids from YOUR vault and phrase queries the way you'd ask from memory. Keep your real query set OUT of any public repo — it is a meaning-summary of your private notes. Pass your local file: bun scripts/eval-semantic.ts /path/to/your-queries.json"
   },
   {
     "id": "example-memory-2",

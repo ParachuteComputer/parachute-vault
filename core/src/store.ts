@@ -108,10 +108,27 @@ export class BunSqliteStore implements Store {
    */
   public readonly embeddingProvider?: EmbeddingProvider;
 
-  constructor(public readonly db: Database, opts?: { hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider }) {
+  /**
+   * WHY `embeddingProvider` is absent, when the caller knows a specific
+   * reason (currently: the operator set `EMBEDDINGS_ENABLED=false` — see
+   * `src/embedding/select.ts`). Core never reads env vars itself
+   * (dependency-purity rule — see `embeddingProvider`'s doc comment
+   * above), so it can't distinguish "explicitly turned off" from "never
+   * configured" on its own; the caller passes this through so
+   * `semanticSearch`'s error hint can be honest either way instead of
+   * defaulting to generic provider-setup instructions when the operator
+   * deliberately opted out.
+   */
+  public readonly embeddingDisabledReason?: string;
+
+  constructor(
+    public readonly db: Database,
+    opts?: { hooks?: HookRegistry; embeddingProvider?: EmbeddingProvider; embeddingDisabledReason?: string },
+  ) {
     initSchema(db);
     this.hooks = opts?.hooks ?? new HookRegistry();
     this.embeddingProvider = opts?.embeddingProvider;
+    this.embeddingDisabledReason = opts?.embeddingDisabledReason;
   }
 
   /**
@@ -851,12 +868,18 @@ export class BunSqliteStore implements Store {
    */
   async semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult> {
     if (!this.embeddingProvider) {
+      // Honest either way: if the caller told us WHY (operator explicitly
+      // set EMBEDDINGS_ENABLED=false), say that — not generic provider-setup
+      // instructions that would be actively misleading for a deliberate
+      // opt-out. See `embeddingDisabledReason`'s doc comment.
       throw new QueryError(
         `semantic search requires an embedding provider — none is configured on this vault`,
         "SEMANTIC_UNAVAILABLE",
         {
           error_type: "semantic_unavailable",
-          hint: "configure EMBEDDING_API_URL/EMBEDDING_API_KEY/EMBEDDING_MODEL, or rely on the bundled floor provider (self-host); semantic search is not yet available on this door otherwise",
+          hint:
+            this.embeddingDisabledReason ??
+            "configure EMBEDDING_API_URL/EMBEDDING_API_KEY/EMBEDDING_MODEL, or rely on the bundled floor provider (self-host); semantic search is not yet available on this door otherwise",
         },
       );
     }

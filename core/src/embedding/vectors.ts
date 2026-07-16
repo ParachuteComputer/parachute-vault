@@ -12,6 +12,31 @@ import { encodeVector } from "./vector-codec.js";
 import type { Chunk } from "./chunker.js";
 import type { ExistingVectorRow } from "./staleness.js";
 
+/**
+ * SQL fragment: `<colRef>` (a `content` column reference — bare `content`
+ * or an aliased `n.content`) is non-blank. A blank/whitespace-only note
+ * has nothing embeddable (see `embedding-worker.ts`'s chunk filter) and
+ * NEVER gets a `note_vectors` row, so every "which notes still need
+ * embedding" query — the backfill-sweep candidate list
+ * (`getNotesPendingEmbedding`), the progress count
+ * (`countNotesPendingEmbedding`), and the semantic-search scan's own
+ * `pendingCount` (`notes.ts:semanticSearchNotes`) — must exclude it, or a
+ * vault with even one blank note carries a permanent phantom "pending"
+ * count that never drains.
+ *
+ * SQLite's `TRIM(x)` (no second arg) only strips literal SPACE
+ * characters, unlike JS's `.trim()` — a note that's only tabs/newlines
+ * would slip through a bare `TRIM(content) = ''` check. `TRIM(x, y)`'s
+ * second-argument form strips every character IN `y` from both ends, so
+ * passing the space/tab/LF/VT/FF/CR set (`char(32,9,10,11,12,13)`) makes
+ * this match JS whitespace semantics closely enough for a "nothing here"
+ * check (exotic Unicode whitespace isn't covered — not worth the
+ * complexity for a defensive filter, not user-facing validation).
+ */
+export function nonBlankContentClause(colRef: string): string {
+  return `TRIM(COALESCE(${colRef}, ''), char(32,9,10,11,12,13)) != ''`;
+}
+
 /** Read a note's existing `note_vectors` rows — the shape `planStaleness` diffs against. */
 export function getNoteVectorRows(db: Database, noteId: string): ExistingVectorRow[] {
   return db
@@ -63,12 +88,17 @@ export function upsertNoteVector(
 
 /**
  * Count notes that have zero `note_vectors` rows under `model` — the same
- * "pending" definition `semanticSearchNotes` uses. Used by the
- * `embeddings` capability field (`GET /api/vault`) to report backfill
- * progress without a full semantic scan.
+ * "pending" definition `semanticSearchNotes`/`getNotesPendingEmbedding`
+ * use (see `nonBlankContentClause`'s doc for why blank notes are excluded
+ * from `total`, not just `pending` — otherwise `pending` could go
+ * negative, or a vault with only blank notes would report 100% pending
+ * forever). Used by the `embeddings` capability field (`GET /api/vault`)
+ * to report backfill progress without a full semantic scan.
  */
 export function countNotesPendingEmbedding(db: Database, model: string): { total: number; pending: number } {
-  const total = (db.prepare("SELECT COUNT(*) AS n FROM notes").get() as { n: number }).n;
+  const total = (
+    db.prepare(`SELECT COUNT(*) AS n FROM notes WHERE ${nonBlankContentClause("content")}`).get() as { n: number }
+  ).n;
   const embedded = (
     db
       .prepare("SELECT COUNT(DISTINCT note_id) AS n FROM note_vectors WHERE model = ?")
@@ -88,22 +118,9 @@ export function countNotesPendingEmbedding(db: Database, model: string): { total
  * `planStaleness`, so a partially-embedded note self-heals on its next
  * edit even if the sweep doesn't re-visit it.
  *
- * Excludes blank/whitespace-only notes — an empty note has nothing
- * embeddable (see `embedding-worker.ts`'s chunk filter), so leaving it in
- * this list would make it "pending" FOREVER: it never gets a
- * `note_vectors` row (there's no text to write a vector for), so every
- * sweep pass would re-select it and re-call the provider with empty
- * input — some providers reject that outright, and even the ones that
- * don't, it's pure waste every `sweepIntervalMs` forever.
- *
- * SQLite's `TRIM(x)` (no second arg) only strips literal SPACE
- * characters, unlike JS's `.trim()` — a note that's only tabs/newlines
- * would slip through a bare `TRIM(content) = ''` check. `TRIM(x, y)`'s
- * second-argument form strips every character IN `y` from both ends, so
- * passing the space/tab/LF/VT/FF/CR set (`char(32,9,10,11,12,13)`) makes
- * this match JS whitespace semantics closely enough for a "nothing here"
- * check (exotic Unicode whitespace isn't covered — not worth the
- * complexity for a defensive filter, not user-facing validation).
+ * Excludes blank/whitespace-only notes — see `nonBlankContentClause`'s
+ * doc comment for why (they'd otherwise be "pending" FOREVER, hammering
+ * the provider with empty input every sweep pass forever).
  */
 export function getNotesPendingEmbedding(
   db: Database,
@@ -112,9 +129,7 @@ export function getNotesPendingEmbedding(
 ): { id: string; content: string }[] {
   const sql = `SELECT id, content FROM notes
     WHERE id NOT IN (SELECT DISTINCT note_id FROM note_vectors WHERE model = ?)
-      AND TRIM(COALESCE(content, ''), char(32,9,10,11,12,13)) != ''${
-        typeof limit === "number" ? " LIMIT ?" : ""
-      }`;
+      AND ${nonBlankContentClause("content")}${typeof limit === "number" ? " LIMIT ?" : ""}`;
   const params: (string | number)[] = typeof limit === "number" ? [model, limit] : [model];
   return db.prepare(sql).all(...params) as { id: string; content: string }[];
 }

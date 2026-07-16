@@ -178,4 +178,59 @@ describe("Store.semanticSearch", () => {
     expect(result.totalCandidates).toBe(2);
     expect(result.pendingCount).toBe(1);
   });
+
+  it("L4: a blank note never counts as pending — pendingCount 0 even though it will NEVER get a vector row", async () => {
+    const provider = new MockEmbeddingProvider();
+    const store = new SqliteStore(db, { embeddingProvider: provider });
+    const real = await store.createNote("real content", { path: "real" });
+    await store.createNote("", { path: "blank" });
+    db.prepare(
+      `INSERT INTO note_vectors (note_id, chunk_ix, vector, dims, model, content_hash, embedded_at) VALUES (?, 0, ?, ?, ?, ?, ?)`,
+    ).run(real.id, encodeVector(normalize(new Float32Array([1, 0, 0, 0]))), DIMS, MODEL, "h", new Date().toISOString());
+
+    // Simulates "after sweep": the real note is embedded (a real sweep
+    // would embed it), the blank note is skipped (a real sweep would
+    // never select it — core/src/embedding/vectors.ts's
+    // getNotesPendingEmbedding already excludes it). Before this fix, the
+    // blank note would count as a candidate lacking a vector FOREVER —
+    // a phantom embeddings_pending that never drains.
+    const result = await store.semanticSearch("query");
+    expect(result.totalCandidates).toBe(1); // the blank note isn't even a candidate
+    expect(result.pendingCount).toBe(0);
+  });
+
+  it("L4: a whitespace-only note is excluded the same way", async () => {
+    const provider = new MockEmbeddingProvider();
+    const store = new SqliteStore(db, { embeddingProvider: provider });
+    await store.createNote("   \n\t  ", { path: "whitespace" });
+    const result = await store.semanticSearch("query");
+    expect(result.totalCandidates).toBe(0);
+    expect(result.pendingCount).toBe(0);
+  });
+
+  it("nano: no-provider hint names the explicit off switch when the caller supplied embeddingDisabledReason", async () => {
+    const store = new SqliteStore(db, {
+      embeddingDisabledReason: "semantic search is disabled by EMBEDDINGS_ENABLED=false",
+    });
+    let caught: unknown;
+    try {
+      await store.semanticSearch("anything");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(QueryError);
+    expect((caught as QueryError).error_type).toBe("semantic_unavailable");
+    expect((caught as QueryError).hint).toBe("semantic search is disabled by EMBEDDINGS_ENABLED=false");
+  });
+
+  it("nano: falls back to the generic provider-setup hint when no embeddingDisabledReason was supplied", async () => {
+    const store = new SqliteStore(db); // no provider, no reason — "never configured," not "explicitly off"
+    let caught: unknown;
+    try {
+      await store.semanticSearch("anything");
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as QueryError).hint).toContain("configure EMBEDDING_API_URL");
+  });
 });

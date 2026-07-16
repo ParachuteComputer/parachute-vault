@@ -111,6 +111,19 @@ describe("countNotesPendingEmbedding", () => {
   it("zero notes: zero total, zero pending", () => {
     expect(countNotesPendingEmbedding(db, MODEL)).toEqual({ total: 0, pending: 0 });
   });
+
+  it("L4: a blank note is excluded from `total` too, not just `pending` — it never counts as pending, and never inflates the denominator either", async () => {
+    const real = await store.createNote("real content", { path: "real" });
+    await store.createNote("", { path: "blank" });
+    // No vector for `real` yet — before this fix `total` would be 2
+    // (counting the blank note), so `pending` would be 2 forever (the
+    // blank note can never get embedded) instead of settling to 0 once
+    // `real` is embedded.
+    expect(countNotesPendingEmbedding(db, MODEL)).toEqual({ total: 1, pending: 1 });
+
+    upsertNoteVector(db, real.id, { ix: 0, text: "real content" }, normalize(new Float32Array([1, 0])), MODEL, "h");
+    expect(countNotesPendingEmbedding(db, MODEL)).toEqual({ total: 1, pending: 0 });
+  });
 });
 
 describe("getNotesPendingEmbedding", () => {

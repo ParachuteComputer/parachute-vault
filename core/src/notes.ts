@@ -1,6 +1,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import type { Note, NoteIndex, QueryOpts, QueryNotesPage, VaultStats, VaultMap, AggregateSpec, AggregateRow, SemanticSearchResult } from "./types.js";
 import { decodeVector, dot } from "./embedding/vector-codec.js";
+import { nonBlankContentClause } from "./embedding/vectors.js";
 import { normalizePath } from "./paths.js";
 import { transaction } from "./txn.js";
 import {
@@ -1950,7 +1951,13 @@ export function semanticSearchNotes(
 ): SemanticSearchResult {
   const limit = typeof opts.limit === "number" ? opts.limit : 10;
   const { conditions, params } = buildFilterConditions(db, opts);
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  // Blank/whitespace-only notes are never candidates: they have nothing
+  // embeddable and never get a note_vectors row (see `embedding-worker.ts`'s
+  // chunk filter), so counting one as a "pending" candidate would produce a
+  // phantom embeddings_pending warning that never drains. See
+  // `nonBlankContentClause`'s doc comment.
+  const allConditions = [...conditions, nonBlankContentClause("n.content")];
+  const whereClause = `WHERE ${allConditions.join(" AND ")}`;
 
   const idRows = db.prepare(`SELECT n.id FROM notes n ${whereClause}`).all(...params) as {
     id: string;
