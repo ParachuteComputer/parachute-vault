@@ -33,18 +33,29 @@ const storeToVault = new WeakMap<SqliteStore, string>();
  * from `process.env` on first access (so `.env` loaded via
  * `loadEnvFile()` in `server.ts` is visible) and reused for every
  * subsequent vault opened this process.
+ *
+ * `undefined` is a legitimate, cacheable resolution — `EMBEDDINGS_ENABLED=
+ * false` (the off switch, see `select.ts`) means "no provider," not
+ * "not resolved yet." A separate `resolved` flag (rather than null-
+ * checking the provider itself) distinguishes the two, so an explicitly-
+ * disabled vault doesn't re-run `buildEmbeddingProvider()` on every call.
  */
-let sharedEmbeddingProvider: EmbeddingProvider | null = null;
+let sharedEmbeddingProvider: EmbeddingProvider | undefined;
+let sharedEmbeddingProviderResolved = false;
 
-/** The shared embedding provider (see `sharedEmbeddingProvider`'s doc comment). */
-export function getSharedEmbeddingProvider(): EmbeddingProvider {
-  if (!sharedEmbeddingProvider) sharedEmbeddingProvider = buildEmbeddingProvider();
+/** The shared embedding provider (see `sharedEmbeddingProvider`'s doc comment). `undefined` when `EMBEDDINGS_ENABLED=false`. */
+export function getSharedEmbeddingProvider(): EmbeddingProvider | undefined {
+  if (!sharedEmbeddingProviderResolved) {
+    sharedEmbeddingProvider = buildEmbeddingProvider();
+    sharedEmbeddingProviderResolved = true;
+  }
   return sharedEmbeddingProvider;
 }
 
 /** Test-only: force a fresh provider on the next `getSharedEmbeddingProvider()` call. */
 export function resetSharedEmbeddingProviderForTests(): void {
-  sharedEmbeddingProvider = null;
+  sharedEmbeddingProvider = undefined;
+  sharedEmbeddingProviderResolved = false;
 }
 
 /** Get or create a store for a vault. */

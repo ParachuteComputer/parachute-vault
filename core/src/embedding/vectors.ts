@@ -87,15 +87,34 @@ export function countNotesPendingEmbedding(db: Database, model: string): { total
  * the embed-on-write hook re-derives full freshness per note via
  * `planStaleness`, so a partially-embedded note self-heals on its next
  * edit even if the sweep doesn't re-visit it.
+ *
+ * Excludes blank/whitespace-only notes — an empty note has nothing
+ * embeddable (see `embedding-worker.ts`'s chunk filter), so leaving it in
+ * this list would make it "pending" FOREVER: it never gets a
+ * `note_vectors` row (there's no text to write a vector for), so every
+ * sweep pass would re-select it and re-call the provider with empty
+ * input — some providers reject that outright, and even the ones that
+ * don't, it's pure waste every `sweepIntervalMs` forever.
+ *
+ * SQLite's `TRIM(x)` (no second arg) only strips literal SPACE
+ * characters, unlike JS's `.trim()` — a note that's only tabs/newlines
+ * would slip through a bare `TRIM(content) = ''` check. `TRIM(x, y)`'s
+ * second-argument form strips every character IN `y` from both ends, so
+ * passing the space/tab/LF/VT/FF/CR set (`char(32,9,10,11,12,13)`) makes
+ * this match JS whitespace semantics closely enough for a "nothing here"
+ * check (exotic Unicode whitespace isn't covered — not worth the
+ * complexity for a defensive filter, not user-facing validation).
  */
 export function getNotesPendingEmbedding(
   db: Database,
   model: string,
   limit?: number,
 ): { id: string; content: string }[] {
-  const sql = `SELECT id, content FROM notes WHERE id NOT IN (SELECT DISTINCT note_id FROM note_vectors WHERE model = ?)${
-    typeof limit === "number" ? " LIMIT ?" : ""
-  }`;
+  const sql = `SELECT id, content FROM notes
+    WHERE id NOT IN (SELECT DISTINCT note_id FROM note_vectors WHERE model = ?)
+      AND TRIM(COALESCE(content, ''), char(32,9,10,11,12,13)) != ''${
+        typeof limit === "number" ? " LIMIT ?" : ""
+      }`;
   const params: (string | number)[] = typeof limit === "number" ? [model, limit] : [model];
   return db.prepare(sql).all(...params) as { id: string; content: string }[];
 }

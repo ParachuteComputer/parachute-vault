@@ -94,6 +94,18 @@ describe("GET /notes?near_text=&semantic= (REST, EXPERIMENTAL)", () => {
     expect(body.error_type).toBe("semantic_unavailable");
   });
 
+  it("M2: 503s (not a raw 500) when the provider's embed() call fails mid-flight, e.g. a lazy model load blowing up on the first real query", async () => {
+    const provider = new MockEmbeddingProvider();
+    provider.embed = async () => {
+      throw new Error("bundled ONNX embedding model failed to load: simulated ORT failure");
+    };
+    store = new BunStore(db, { embeddingProvider: provider });
+    const res = await get(store, "?semantic=true&near_text=anything");
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error_type).toBe("semantic_unavailable");
+  });
+
   it("near_text without semantic=true is inert and carries an ignored_param warning (via the header, bare-array body)", async () => {
     store = new BunStore(db, { embeddingProvider: new MockEmbeddingProvider() });
     await store.createNote("hello world");

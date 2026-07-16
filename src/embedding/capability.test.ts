@@ -25,4 +25,9 @@ describe("resolveEmbeddingCapability", () => {
     const cap = await resolveEmbeddingCapability(new FakeProvider(false, "not ready"));
     expect(cap).toEqual({ enabled: false });
   });
+
+  test("enabled:false when no provider at all (EMBEDDINGS_ENABLED=false, M1) — no available() call needed", async () => {
+    const cap = await resolveEmbeddingCapability(undefined);
+    expect(cap).toEqual({ enabled: false });
+  });
 });

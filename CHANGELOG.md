@@ -101,10 +101,33 @@ this entry — the wire shape may change while quality is validated.
 - **`scripts/eval-semantic.ts`** — the P0 spike's harness, graduated into a
   permanent regression eval. Now a thin REST client against a live vault's
   real `near_text`/`semantic` endpoint (the product does the embedding now,
-  not the script) scored against Aaron's fixed query set
-  (`scripts/fixtures/eval-semantic-queries.json`, kept intact) — hit@5/
+  not the script) scored against a query set of the shape
+  `{id, class, query, target_ids, note?}`. The shipped
+  `scripts/fixtures/eval-semantic-queries.json` is a SYNTHETIC example
+  fixture, not a real query set — a real one is a meaning-summary of
+  private note content and must stay local, never ride a public repo; bring
+  your own file with real note ids and pass its path as the CLI arg — hit@5/
   hit@10/MRR per class, plus the plan's "classes 1+2 combined hit@10"
   verdict number.
+- **Off switch** — `EMBEDDINGS_ENABLED=false` (mirrors the `EMBEDDINGS_ENABLED`
+  wrangler var C2 plans for the cloud door) short-circuits BOTH self-host
+  tiers: `buildEmbeddingProvider` resolves to no provider at all, the
+  `embeddings` capability reports `enabled: false`, `semantic: true` throws
+  `semantic_unavailable`, and the embed-on-write drain simply has nothing to
+  invoke (no-op, not an error).
+- **A mid-`embed()` failure now maps to `semantic_unavailable` too** (MCP
+  `QueryError` / REST 503), not a raw unstructured 500 — `available()` is
+  only a cheap readiness probe (never a real network/model round-trip), so
+  a provider whose actual first `embed()` call fails (e.g. the bundled ONNX
+  floor's lazy model load blowing up) previously surfaced as an uncaught
+  error. `Store.semanticSearch` now catches any embed()-time failure and
+  reports it honestly, same shape as "no provider configured."
+- **Blank/whitespace-only notes are excluded from the embed pipeline** —
+  they have nothing embeddable, so both the staleness plan (chunker output
+  is filtered before it reaches the provider) and the backfill sweep's
+  candidate query now skip them. Without this, a blank note would stay
+  "pending" forever (never gets a vector row) and the sweep would re-select
+  it — and re-call the provider with empty input — every `sweepIntervalMs`.
 
 ### Notes
 

@@ -43,7 +43,14 @@ import { normalize } from "../core/src/embedding/vector-codec.ts";
 const DEFAULT_SWEEP_MS = 30_000;
 
 export interface EmbeddingWorkerOpts {
-  provider: EmbeddingProvider;
+  /**
+   * `undefined` when `EMBEDDINGS_ENABLED=false` (the off switch — see
+   * `src/embedding/select.ts`). The worker is still constructed and
+   * started either way (simpler wiring in `server.ts`, always one
+   * lifecycle to manage) — `embedNote`/`sweepOnce` just no-op when there's
+   * no provider to invoke, which is the entire "drain no-ops" contract.
+   */
+  provider: EmbeddingProvider | undefined;
   /** Every vault name currently open (mirrors the transcription worker's `vaultList`). */
   vaultList: () => string[];
   /** Resolve (or open) a vault's `Store` by name. */
@@ -54,7 +61,7 @@ export interface EmbeddingWorkerOpts {
 }
 
 export class EmbeddingWorker {
-  private readonly provider: EmbeddingProvider;
+  private readonly provider: EmbeddingProvider | undefined;
   private readonly vaultList: () => string[];
   private readonly getStore: (name: string) => Store;
   private readonly sweepIntervalMs: number;
@@ -77,20 +84,33 @@ export class EmbeddingWorker {
    * this reach the provider — and if the provider reports itself
    * unavailable, this returns without erroring (the chunk stays stale;
    * the next edit or sweep pass retries once a provider is configured).
+   *
+   * No provider at all (`EMBEDDINGS_ENABLED=false`) → no-op, immediately —
+   * the drain contract's off switch (see `EmbeddingWorkerOpts.provider`).
+   *
+   * Empty-content chunks (a blank note, or a note whose content is only
+   * whitespace) are filtered out of the staleness plan before it reaches
+   * the provider — an empty chunk is never meaningfully embeddable, and
+   * without this filter a blank note would re-enter `getNotesPendingEmbedding`
+   * every sweep forever (nothing to write makes it "pending" again next
+   * pass), hammering a provider that may reject empty input outright.
    */
   async embedNote(store: Store, note: Note): Promise<void> {
+    if (!this.provider) return; // off switch — see EmbeddingWorkerOpts.provider
     if (typeof note.content !== "string") return;
     const db = store.db;
-    const chunks = chunkNoteContent(note.content);
+    const chunks = chunkNoteContent(note.content).filter((c) => c.text.trim().length > 0);
     const existing = getNoteVectorRows(db, note.id);
     const plan = planStaleness(existing, chunks, this.provider.model);
 
     // Cheap sync write — prunes ghost chunks from a shrunk note or a model
     // change BEFORE any embed call, so a concurrent semantic search never
     // ranks against stale content. See core/src/embedding/staleness.ts.
+    // An empty note's chunks were just filtered to [] above, so this also
+    // prunes any leftover rows from before the note went empty.
     deleteObsoleteVectorRows(db, note.id, plan.obsoleteIxs);
 
-    if (plan.stale.length === 0) return; // no-op edit — zero provider calls
+    if (plan.stale.length === 0) return; // no-op edit (or nothing embeddable) — zero provider calls
 
     const avail = await this.provider.available();
     if (!avail.ok) return; // not configured/ready — leave stale, retried later
@@ -120,8 +140,19 @@ export class EmbeddingWorker {
    * One backfill/safety-net pass across every open vault. Returns counts
    * for caller logging. Re-entrancy guarded (`sweeping`) — a slow pass
    * (a big vault, a slow provider) never overlaps with the next timer tick.
+   * No provider at all → no-op immediately (same off switch as `embedNote`).
+   *
+   * L1 (reviewer): no per-note lock between this sweep and a concurrent
+   * `embedNote` triggered by the event-path hook for the SAME note — by
+   * design, matching `HookRegistry`'s own documented "no per-note
+   * serialization, last write wins" contract. Worst case is a transient
+   * window where a stored vector reflects a slightly-stale version; it
+   * self-heals on the NEXT edit (or the next sweep pass), since
+   * `planStaleness` re-diffs against the note's CURRENT content_hash every
+   * time, never trusting a prior run's result.
    */
   async sweepOnce(): Promise<{ processed: number; vaults: number }> {
+    if (!this.provider) return { processed: 0, vaults: 0 }; // off switch
     if (this.sweeping) return { processed: 0, vaults: 0 };
     this.sweeping = true;
     try {

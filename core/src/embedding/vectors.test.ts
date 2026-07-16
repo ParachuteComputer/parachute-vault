@@ -135,4 +135,16 @@ describe("getNotesPendingEmbedding", () => {
     upsertNoteVector(db, a.id, { ix: 0, text: "a" }, normalize(new Float32Array([1, 0])), MODEL, "h");
     expect(getNotesPendingEmbedding(db, MODEL)).toEqual([]);
   });
+
+  it("M3: excludes a blank note — never returned as pending, so the sweep can't hammer it forever", async () => {
+    await store.createNote("", { path: "blank" });
+    const real = await store.createNote("real content", { path: "real" });
+    const pending = getNotesPendingEmbedding(db, MODEL);
+    expect(pending.map((n) => n.id)).toEqual([real.id]);
+  });
+
+  it("M3: excludes a whitespace-only note", async () => {
+    await store.createNote("   \n\t  ", { path: "whitespace" });
+    expect(getNotesPendingEmbedding(db, MODEL)).toEqual([]);
+  });
 });

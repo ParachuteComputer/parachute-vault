@@ -19,7 +19,15 @@ export interface EmbeddingCapability {
   model?: string;
 }
 
-export async function resolveEmbeddingCapability(provider: EmbeddingProvider): Promise<EmbeddingCapability> {
+/**
+ * `provider` is `undefined` when `EMBEDDINGS_ENABLED=false` (the off
+ * switch — see `select.ts`'s `buildEmbeddingProvider`) — resolves to
+ * `{enabled: false}` directly, no `available()` probe to call.
+ */
+export async function resolveEmbeddingCapability(
+  provider: EmbeddingProvider | undefined,
+): Promise<EmbeddingCapability> {
+  if (!provider) return { enabled: false };
   const avail = await provider.available();
   if (!avail.ok) return { enabled: false };
   return { enabled: true, provider: provider.name, model: provider.model };

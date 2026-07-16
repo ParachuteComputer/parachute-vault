@@ -10,8 +10,8 @@
  * does — this script is a THIN REST client against a LIVE vault's real
  * `GET /notes?semantic=true&near_text=...` endpoint (the exact call
  * Adam's Claude — or any MCP client calling `query-notes { near_text,
- * semantic }` — makes), scored against the same fixed query set. It's
- * the permanent way to re-measure retrieval quality whenever the
+ * semantic }` — makes), scored against a query set of the shape below.
+ * It's the permanent way to re-measure retrieval quality whenever the
  * chunker, provider, or model changes.
  *
  * Usage:
@@ -21,13 +21,17 @@
  * Defaults: VAULT_URL=http://localhost:1940, VAULT_NAME=default, no auth
  * header when VAULT_TOKEN is unset (fine for a loopback dev server with
  * no api_keys configured). Queries default to
- * `scripts/fixtures/eval-semantic-queries.json` — Aaron's fixed set
- * (memory-recall / paraphrase / lexical-control), kept intact from P0.
+ * `scripts/fixtures/eval-semantic-queries.json` — a SYNTHETIC example
+ * fixture (see its own header), not a real query set.
  *
- * NOTE: the shipped query fixture's `target_ids` are real note IDs from
- * Aaron's personal vault — running this against a DIFFERENT vault will
- * correctly report near-zero hits (the notes don't exist there). Bring
- * your own `queries.json` (same shape) to eval a different corpus.
+ * IMPORTANT (privacy — the reason the shipped fixture is a placeholder,
+ * not a real one): a real query set is a meaning-summary of your private
+ * notes ("that idea about X...", phrased from memory) — it MUST NOT ride
+ * a public repo. Build your own `queries.json` (same shape:
+ * `{id, class, query, target_ids: string[], note?}`) with real note ids
+ * from YOUR vault, keep it local/private, and pass its path as the CLI
+ * arg. Running the shipped placeholder as-is will correctly report
+ * near-zero hits (its `target_ids` are unresolvable on any real vault).
  *
  * Requires `GET /api/vault` to report `embeddings.enabled: true` — the
  * script fails loudly (not a silent zero-score run) if semantic search

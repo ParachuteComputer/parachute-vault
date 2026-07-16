@@ -47,7 +47,7 @@ import {
 } from "./conformance.js";
 import type { SearchMode } from "./search-query.js";
 import { runDoctorScan, type DoctorReport, type DoctorScanOpts } from "./doctor.js";
-import type { EmbeddingProvider } from "./embedding/provider.js";
+import { EmbeddingError, type EmbeddingProvider } from "./embedding/provider.js";
 import { normalize } from "./embedding/vector-codec.js";
 import { QueryError } from "./query-operators.js";
 
@@ -840,9 +840,14 @@ export class BunSqliteStore implements Store {
    * the tag `expand` axis identically to a structured query).
    *
    * Throws a `QueryError` (`error_type: "semantic_unavailable"`) when no
-   * provider is configured, or the configured one reports itself not
-   * ready — NEVER a silent fallback to keyword search. Callers (MCP/REST)
-   * let this propagate uncaught, same as `invalid_search_syntax` above.
+   * provider is configured, the configured one reports itself not ready,
+   * OR the embed call itself fails mid-flight (e.g. the bundled ONNX
+   * floor's lazy model load fails on this — the FIRST — real `embed()`
+   * attempt, after `available()` optimistically reported `ok: true`; see
+   * `onnx-transformers.ts`'s "lazy-fail, not crash" doc) — NEVER a silent
+   * fallback to keyword search, and never a raw unstructured 500. Callers
+   * (MCP/REST) let this propagate uncaught, same as
+   * `invalid_search_syntax` above.
    */
   async semanticSearch(nearText: string, opts?: QueryOpts): Promise<SemanticSearchResult> {
     if (!this.embeddingProvider) {
@@ -864,7 +869,23 @@ export class BunSqliteStore implements Store {
       );
     }
 
-    const { vectors } = await this.embeddingProvider.embed({ texts: [nearText] });
+    let vectors: Float32Array[];
+    try {
+      ({ vectors } = await this.embeddingProvider.embed({ texts: [nearText] }));
+    } catch (err) {
+      // `available()` passing is only a CHEAP readiness check (never a real
+      // network/model round-trip — see EmbeddingProvider.available's doc
+      // comment) — it can't catch a provider whose actual first embed call
+      // fails (a lazy model load blowing up, a transient upstream error).
+      // Map ANY embed()-time failure to the same honest semantic_unavailable
+      // shape as the checks above, rather than letting a raw EmbeddingError
+      // (or whatever else a provider throws) surface as an unstructured 500.
+      const reason = err instanceof EmbeddingError ? err.message : err instanceof Error ? err.message : String(err);
+      throw new QueryError(`semantic search is unavailable: ${reason}`, "SEMANTIC_UNAVAILABLE", {
+        error_type: "semantic_unavailable",
+        hint: reason,
+      });
+    }
     const queryVector = normalize(vectors[0]!);
 
     const filterOpts = this.expandQueryTags(this.normalizeQueryTags(opts ?? {}));

@@ -120,6 +120,43 @@ describe("EmbeddingWorker.embedNote", () => {
     const rows = getNoteVectorRows(db, note.id);
     expect(rows.map((r) => r.chunk_ix)).toEqual([0]);
   });
+
+  it("M1: no-ops (no throw, zero provider calls) when the worker has no provider at all (EMBEDDINGS_ENABLED=false)", async () => {
+    const offWorker = new EmbeddingWorker({
+      provider: undefined,
+      vaultList: () => ["default"],
+      getStore: () => store,
+      logger: silentLogger,
+    });
+    const note = await store.createNote("hello world", { path: "n" });
+    await expect(offWorker.embedNote(store, note)).resolves.toBeUndefined();
+    expect(getNoteVectorRows(db, note.id)).toEqual([]);
+    expect(provider.calls.length).toBe(0); // the shared FakeProvider from beforeEach was never touched
+  });
+
+  it("M3: a blank note makes zero provider calls and writes no vector rows", async () => {
+    const note = await store.createNote("", { path: "blank" });
+    await worker.embedNote(store, note);
+    expect(provider.calls.length).toBe(0);
+    expect(getNoteVectorRows(db, note.id)).toEqual([]);
+  });
+
+  it("M3: a whitespace-only note makes zero provider calls", async () => {
+    const note = await store.createNote("   \n\t  ", { path: "whitespace" });
+    await worker.embedNote(store, note);
+    expect(provider.calls.length).toBe(0);
+    expect(getNoteVectorRows(db, note.id)).toEqual([]);
+  });
+
+  it("M3: a note that's edited down to blank prunes its old vector rows (no ghost match survives)", async () => {
+    const note = await store.createNote("real content", { path: "n" });
+    await worker.embedNote(store, note);
+    expect(getNoteVectorRows(db, note.id).length).toBe(1);
+
+    const emptied = await store.updateNote(note.id, { content: "" });
+    await worker.embedNote(store, emptied);
+    expect(getNoteVectorRows(db, note.id)).toEqual([]);
+  });
 });
 
 describe("EmbeddingWorker.kick", () => {
@@ -160,6 +197,35 @@ describe("EmbeddingWorker.sweepOnce", () => {
     expect(r2).toEqual({ processed: 0, vaults: 0 });
     expect(r1.processed).toBe(1);
   });
+
+  it("M1: no-ops immediately when the worker has no provider (off switch)", async () => {
+    const offWorker = new EmbeddingWorker({
+      provider: undefined,
+      vaultList: () => ["default"],
+      getStore: () => store,
+      logger: silentLogger,
+    });
+    await store.createNote("note a", { path: "a" });
+    const result = await offWorker.sweepOnce();
+    expect(result).toEqual({ processed: 0, vaults: 0 });
+  });
+
+  it("M3: a mix of blank and real notes only processes the real ones — the sweep never gets stuck re-selecting the blank one", async () => {
+    const real = await store.createNote("real content", { path: "real" });
+    await store.createNote("", { path: "blank" });
+    await store.createNote("   ", { path: "whitespace" });
+
+    const first = await worker.sweepOnce();
+    expect(first.processed).toBe(1); // only the real note
+    expect(getNoteVectorRows(db, real.id).length).toBe(1);
+
+    // A second pass finds nothing left pending — the blank notes never
+    // enter getNotesPendingEmbedding, so they can't loop the sweep forever.
+    provider.calls = [];
+    const second = await worker.sweepOnce();
+    expect(second.processed).toBe(0);
+    expect(provider.calls.length).toBe(0);
+  });
 });
 
 describe("registerEmbeddingHook", () => {
@@ -189,5 +255,24 @@ describe("registerEmbeddingHook", () => {
     await hooks.drain();
 
     expect(loggedError).toBeTruthy();
+  });
+
+  it("M1: a note create/update through the hook is a harmless no-op when the worker has no provider", async () => {
+    const offWorker = new EmbeddingWorker({
+      provider: undefined,
+      vaultList: () => ["default"],
+      getStore: () => store,
+      logger: silentLogger,
+    });
+    const hooks = new HookRegistry({ concurrency: 4, logger: silentLogger });
+    const hookedStore = new SqliteStore(db, { hooks });
+    registerEmbeddingHook(hooks, offWorker, () => "default", silentLogger);
+
+    const note = await hookedStore.createNote("hooked content", { path: "n" });
+    await Promise.resolve();
+    await Promise.resolve();
+    await hooks.drain();
+
+    expect(getNoteVectorRows(db, note.id)).toEqual([]);
   });
 });

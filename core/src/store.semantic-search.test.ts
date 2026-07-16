@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SqliteStore } from "./store.js";
 import { QueryError } from "./query-operators.js";
-import type { EmbeddingProvider, EmbedInput, EmbedResult, ProviderAvailability } from "./embedding/provider.js";
+import { EmbeddingError, type EmbeddingProvider, type EmbedInput, type EmbedResult, type ProviderAvailability } from "./embedding/provider.js";
 import { encodeVector, normalize } from "./embedding/vector-codec.js";
 
 const MODEL = "mock-model";
@@ -122,6 +122,46 @@ describe("Store.semanticSearch", () => {
 
     const result = await store.semanticSearch("query", { tags: ["project"] });
     expect(result.notes.map((n) => n.id)).toEqual([tagged.id]);
+  });
+
+  it("M2: maps a mid-embed() EmbeddingError to semantic_unavailable, never a raw throw (e.g. a lazy model load failing on the FIRST real embed call)", async () => {
+    const provider = new MockEmbeddingProvider();
+    // available() optimistically says ok — mirrors onnx-transformers.ts's
+    // "lazy-fail, not crash" contract: readiness is cheap and never a real
+    // load attempt, so a broken load only surfaces on the actual embed() call.
+    provider.embed = async () => {
+      throw new EmbeddingError("bundled ONNX embedding model failed to load: simulated ORT failure", {
+        code: "onnx_unavailable",
+        retriable: false,
+      });
+    };
+    const store = new SqliteStore(db, { embeddingProvider: provider });
+    let caught: unknown;
+    try {
+      await store.semanticSearch("anything");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(QueryError);
+    expect((caught as QueryError).error_type).toBe("semantic_unavailable");
+    expect((caught as QueryError).hint).toContain("simulated ORT failure");
+  });
+
+  it("M2: maps a mid-embed() PLAIN Error (not an EmbeddingError) to semantic_unavailable too — the catch isn't narrowly typed", async () => {
+    const provider = new MockEmbeddingProvider();
+    provider.embed = async () => {
+      throw new TypeError("fetch failed: network unreachable");
+    };
+    const store = new SqliteStore(db, { embeddingProvider: provider });
+    let caught: unknown;
+    try {
+      await store.semanticSearch("anything");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(QueryError);
+    expect((caught as QueryError).error_type).toBe("semantic_unavailable");
+    expect((caught as QueryError).hint).toContain("network unreachable");
   });
 
   it("reports pendingCount for candidates not yet embedded under the active model", async () => {
