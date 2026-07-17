@@ -65,6 +65,25 @@ existing "paths are normalized on write" precedent (rejecting offsets would
 defeat the type's own calendar-integration motivation). A bare
 `YYYY-MM-DD` value has no offset and is left untouched.
 
+**Two follow-up fixes from delta review (round 2).** (1) A tag-add +
+date-metadata combo in the SAME `update-note`/`create-note if_exists:update`
+call skipped normalization — both handlers issue `store.tagNote` (the
+actual tag mutation) AFTER the core `UPDATE` (deliberate: a `ConflictError`
+from the guarded UPDATE must leave the note fully untouched), so
+`normalizeDateFields` was resolving the schema against the note's STALE
+pre-write tag set and never saw a `date` field newly declared by the tag
+being added. Fixed by threading the PROJECTED final tag set (already
+computed for the strict-schema gate) into `store.updateNote` as a new
+`tagsForSchemaResolution` override, so both the tag-add AND the metadata
+normalization land in the SAME atomic write. (2) `normalizeDateFields` used
+to mutate its input `metadata` object in place — `core/` is a published
+library, and a direct embedder holding a reference to the object they
+passed in would see it change out from under them. Now copy-on-write:
+returns the SAME reference when nothing needs rewriting, a lazily-allocated
+shallow copy the first time a field actually needs rewriting. Every call
+site reassigns its local binding from the return value rather than relying
+on the old side effect.
+
 **Backward compatible by construction.** `date` is opt-in per schema edit —
 every existing `type: "string"` date field remains valid forever, no
 migration, no data change. Schema edits are never retroactive: tightening
@@ -87,20 +106,31 @@ tightening already carries — see `core/src/conformance.ts`'s pre-check).
 - `core/src/conformance.ts`'s pre-tighten violation counter now recognizes
   `type: "date"` (previously dropped the type check for any type outside
   its narrower whitelist).
-- `schema-defaults.ts:normalizeDateFields` — the offset-normalization fix.
-  Wired into every write path that reaches the DB: `store.createNote`,
-  `store.updateNote` (covers merge-patch too — the merge already happened
-  upstream by the time `store.updateNote` sees it), `store.createNotes`
-  (bulk), and `store.createNoteRaw` (the legacy Obsidian importer).
+- `schema-defaults.ts:normalizeDateFields` — the offset-normalization fix,
+  copy-on-write (round 2). Wired into every write path that reaches the DB:
+  `store.createNote`, `store.updateNote` (covers merge-patch too — the
+  merge already happened upstream by the time `store.updateNote` sees it),
+  `store.createNotes` (bulk), and `store.createNoteRaw` (the legacy
+  Obsidian importer).
+- `store.updateNote`'s `updates` gains an optional `tagsForSchemaResolution`
+  override (round 2) — lets a caller that's ALSO adding a tag in the same
+  logical update pass the PROJECTED final tag set for schema resolution,
+  instead of the note's stale pre-write tags. Wired at both mcp.ts call
+  sites that combine tags + metadata in one item: `update-note`'s single-
+  item handler and `create-note`'s `if_exists: "update"`/`"replace"`
+  batch-upsert branch.
 - Tests: type acceptance/rejection (both ISO forms), `default` validation,
   `type_mismatch` advisory + strict + indexed-forced-strict enforcement,
   `gt`/`gte`/`lt`/`lte` + `order_by` + `date_filter` on a schema-declared
   indexed `date` field, the no-retroactive-revalidation schema-edit
-  compat guarantee, indexed-field-catalog introspection carry-through, and
-  the reviewer's exact mixed-offset repro as a regression test (offset +
-  `Z` values sort/filter correctly post-normalization; write-then-read
-  proves the stored/returned value is canonical `Z`-form; bare-date
-  passthrough pinned).
+  compat guarantee, indexed-field-catalog introspection carry-through, the
+  reviewer's exact mixed-offset repro as a regression test (offset + `Z`
+  values sort/filter correctly post-normalization; write-then-read proves
+  the stored/returned value is canonical `Z`-form; bare-date passthrough
+  pinned), the round-2 tag-add + date-metadata combo (both call sites,
+  sanity-checked to fail without the fix before landing), and a
+  no-mutation pin on `store.createNote`/`updateNote`'s caller-supplied
+  metadata object.
 
 ## [0.7.3-rc.2] - 2026-07-16
 

@@ -6683,6 +6683,79 @@ describe("date field type — offset normalization (vault#date-field-type review
     expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
   });
 
+  // ---- round 2: tag-add + date-metadata in the SAME call (vault#date-
+  // field-type review round 2) ----
+  //
+  // `store.tagNote` (the actual tag mutation) runs AFTER the core UPDATE in
+  // both mcp.ts call sites that combine tags + metadata in one item — the
+  // reviewer live-verified that without passing the PROJECTED tag set into
+  // `store.updateNote`, normalization resolved the schema against the
+  // note's STALE pre-write tags and missed a field newly declared by the
+  // tag being added in this same call.
+
+  it("update-note: tags.add + an offset date value in the SAME call still normalizes (bare, untagged note)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const update = tools.find((t) => t.name === "update-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    // Bare, untagged note — "meeting" (and its meeting_date:date field) is
+    // NOT yet on this note; it's added in the SAME update-note call below.
+    const created = await create.execute({ content: "standup" }) as any;
+
+    const result = await update.execute({
+      id: created.id,
+      tags: { add: ["meeting"] },
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      force: true,
+    }) as any;
+
+    expect(result.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    expect(fresh.tags).toContain("meeting");
+  });
+
+  it("create-note if_exists:update: tags + an offset date value in the SAME call still normalizes (bare, untagged note)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({ content: "standup", path: "Inbox/round2-upsert" }) as any;
+
+    const result = await create.execute({
+      path: "Inbox/round2-upsert",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      if_exists: "update",
+    }) as any;
+
+    expect(result.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    expect(fresh.tags).toContain("meeting");
+  });
+
+  // ---- round 2: copy-on-write, never mutate the caller's object ----
+
+  it("store.createNote does NOT mutate the caller's metadata object", async () => {
+    await declareIndexedMeetingDate();
+    const callerMetadata = { meeting_date: "2026-07-16T10:00:00+02:00" };
+    const callerMetadataSnapshot = { ...callerMetadata };
+    await store.createNote("standup", { tags: ["meeting"], metadata: callerMetadata });
+    // The caller's own object must be byte-identical to before the call —
+    // core is a published library; a direct embedder's reference must
+    // never change out from under them.
+    expect(callerMetadata).toEqual(callerMetadataSnapshot);
+  });
+
+  it("store.updateNote does NOT mutate the caller's metadata object", async () => {
+    await declareIndexedMeetingDate();
+    const note = await store.createNote("standup", { tags: ["meeting"] });
+    const callerMetadata = { meeting_date: "2026-07-16T10:00:00+02:00" };
+    const callerMetadataSnapshot = { ...callerMetadata };
+    await store.updateNote(note.id, { metadata: callerMetadata });
+    expect(callerMetadata).toEqual(callerMetadataSnapshot);
+  });
+
   it("a bare YYYY-MM-DD value passes through untouched (no offset to normalize)", async () => {
     const tools = await declareIndexedMeetingDate();
     const create = tools.find((t) => t.name === "create-note")!;

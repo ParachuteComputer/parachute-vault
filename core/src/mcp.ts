@@ -1355,6 +1355,12 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
               ...updates,
               actor: writeActor,
               via: writeVia,
+              // `tagsForSchemaResolution` (vault#date-field-type review round
+              // 2) — same bug/fix as the update-note handler: `store.tagNote`
+              // below runs AFTER this UPDATE, so without the PROJECTED tag
+              // set here, `date`-field normalization inside store.updateNote
+              // would miss a field newly declared by an incoming tag.
+              tagsForSchemaResolution: [...projectedTags],
             });
           }
 
@@ -2070,10 +2076,18 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             // --- Strict-schema gate (vault#299 Part A) ---
             // Validate the PROSPECTIVE shape (final tags + merged metadata,
             // including a state_transition's `to`) before the write so a
-            // rejection leaves the note untouched.
+            // rejection leaves the note untouched. `projectedTags` is hoisted
+            // out of this block (not just used here) — the `store.updateNote`
+            // call below also needs it, as `tagsForSchemaResolution`, so that
+            // `date`-field normalization sees a tag ADDED in this SAME call
+            // (vault#date-field-type review round 2 — the actual `store.tagNote`
+            // mutation happens AFTER the core UPDATE, so without this the
+            // schema resolution inside `store.updateNote` would still be
+            // looking at the note's stale pre-write tag set).
+            let projectedTags: Set<string>;
             {
               const removeSet = new Set<string>((item.tags as any)?.remove ?? []);
-              const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
+              projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
               for (const t of ((item.tags as any)?.add as string[] | undefined) ?? []) projectedTags.add(t);
               const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
               const projectedMeta = stItem !== undefined
@@ -2117,6 +2131,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               // updated_at on a no-op).
               updates.actor = writeActor;
               updates.via = writeVia;
+              // `tagsForSchemaResolution` (vault#date-field-type review round
+              // 2) — the PROJECTED final tag set, so `date`-field
+              // normalization inside store.updateNote sees a tag ADDED in
+              // this same call, not just the note's pre-write tags. See the
+              // comment on `projectedTags`'s declaration above.
+              updates.tagsForSchemaResolution = [...projectedTags];
               // store.updateNote routes through noteOps.updateNote, which runs
               // the UPDATE (with optional `AND updated_at IS ?`) atomically and
               // throws ConflictError on mismatch. No mutations have happened

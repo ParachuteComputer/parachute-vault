@@ -450,7 +450,7 @@ export interface Store {
    */
   getNoteByPath(path: string, extension?: string): Promise<Note | null>;
   getNotes(ids: string[]): Promise<Note[]>;
-  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; actor?: string | null; via?: string | null; if_updated_at?: string }): Promise<Note>;
+  updateNote(id: string, updates: { content?: string; append?: string; prepend?: string; path?: string; extension?: string; metadata?: Record<string, unknown>; created_at?: string; skipUpdatedAt?: boolean; actor?: string | null; via?: string | null; if_updated_at?: string; tagsForSchemaResolution?: string[] }): Promise<Note>;
   /**
    * Set a note's `created_at` and `updated_at` explicitly. Import-only:
    * used by the portable-md round-trip path to restore timestamps from

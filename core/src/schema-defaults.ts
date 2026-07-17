@@ -353,18 +353,25 @@ export function resolveNoteSchemas(
  * day. A value that fails `timestampToMs` is left untouched too — that's a
  * `type_mismatch` for `valueMatchesType` to catch, not this function's job.
  *
- * Mutates `metadata` in place and returns it (a no-op passthrough when
- * `metadata` is undefined or nothing needs rewriting) — safe because every
- * call site already owns a private object: `store.createNote`'s caller-
- * supplied `opts.metadata`, or `store.updateNote`'s `updates.metadata`
- * (itself already the merge-patch OUTPUT by the time it reaches the store,
- * never the note's persisted metadata by reference). Called from
- * `store.createNote`/`updateNote` — the lowest chokepoint every write path
- * (MCP, REST, import) funnels through — BEFORE the row is persisted, so the
- * value that's validated by `validateNote`/`valueMatchesType` upstream
- * (offset-tolerant, so normalization can't newly fail a write) and the value
- * that's written + echoed back on the response are the SAME normalized
- * string.
+ * COPY-ON-WRITE, never mutates the input `metadata` object (vault#date-
+ * field-type review round 2) — `core/` is a published library; a direct
+ * embedder holding a reference to the object THEY passed in must never see
+ * it change out from under them. Returns the SAME reference when nothing
+ * needs rewriting (the common case — no unnecessary allocation on the
+ * no-op path) or `metadata` is undefined; returns a freshly shallow-copied
+ * object, with only the rewritten field(s) replaced, the first time a
+ * rewrite is actually needed. Every call site must use the RETURNED value
+ * (not assume its input was mutated) — see `store.createNote`/`updateNote`/
+ * `createNotes`/`createNoteRaw`, all of which reassign their local
+ * `opts`/`updates`/`input` binding from the return rather than relying on a
+ * side effect.
+ *
+ * Called from `store.createNote`/`updateNote`/`createNotes`/`createNoteRaw`
+ * — the lowest chokepoint every write path (MCP, REST, import) funnels
+ * through — BEFORE the row is persisted, so the value that's validated by
+ * `validateNote`/`valueMatchesType` upstream (offset-tolerant, so
+ * normalization can't newly fail a write) and the value that's written +
+ * echoed back on the response are the SAME normalized string.
  */
 export function normalizeDateFields(
   resolved: ResolvedSchemas,
@@ -373,6 +380,7 @@ export function normalizeDateFields(
   const metadata = note.metadata;
   if (!metadata) return metadata;
   const { mergedFields } = resolveNoteSchemas(resolved, note);
+  let copy: Record<string, unknown> | undefined;
   for (const [fieldName, { spec }] of mergedFields) {
     if (spec.type !== "date") continue;
     const value = metadata[fieldName];
@@ -382,9 +390,11 @@ export function normalizeDateFields(
     const ms = timestampToMs(value);
     if (ms === null) continue; // unparseable — valueMatchesType's job, not ours
     const canonical = new Date(ms).toISOString();
-    if (canonical !== value) metadata[fieldName] = canonical;
+    if (canonical === value) continue;
+    if (!copy) copy = { ...metadata }; // lazy: only copy once a rewrite is due
+    copy[fieldName] = canonical;
   }
-  return metadata;
+  return copy ?? metadata;
 }
 
 function fieldSpecsEqual(a: SchemaField, b: SchemaField): boolean {
