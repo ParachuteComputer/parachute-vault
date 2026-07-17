@@ -29,7 +29,15 @@ const { handleScopedMcp } = await import("./mcp-http.ts");
 const { getServerInstruction } = await import("./mcp-tools.ts");
 const { writeVaultConfig } = await import("./config.ts");
 const { getVaultStore } = await import("./vault-store.ts");
-const { getSharedAttachmentTicketProvider } = await import("./attachment-tickets.ts");
+const {
+  getSharedAttachmentTicketProvider,
+  InProcessAttachmentTicketProvider,
+  sweepExpiredAttachmentTickets,
+  startAttachmentTicketSweep,
+  stopAttachmentTicketSweep,
+} = await import("./attachment-tickets.ts");
+const { generateTicketId } = await import("../core/src/attachment/tickets.ts");
+import type { AttachmentTicket } from "../core/src/attachment/tickets.ts";
 const { attachmentsInstructionBlock } = await import("../core/src/vault-projection.ts");
 
 /** `route()` takes the pathname as a separate arg (server.ts derives it from `req.url`) — this wrapper matches that call shape everywhere below. */
@@ -346,5 +354,122 @@ describe("attachment tickets — discoverability", () => {
     const md = await getServerInstruction(vaultName);
     expect(md).toContain("## Attachments");
     expect(md).toContain("request-attachment-upload");
+  });
+
+  test("attachmentsInstructionBlock teaches read-attachment when readEnabled, and omits it when not", () => {
+    const enabled = attachmentsInstructionBlock({ ticketsEnabled: true, readEnabled: true });
+    expect(enabled).toContain("read-attachment");
+
+    const disabled = attachmentsInstructionBlock({ ticketsEnabled: true, readEnabled: false });
+    expect(disabled).not.toContain("read-attachment");
+  });
+
+  test("bun's connect-time getServerInstruction teaches read-attachment too", async () => {
+    const vaultName = freshVault("tickets-instructions-read");
+    const md = await getServerInstruction(vaultName);
+    expect(md).toContain("read-attachment");
+  });
+});
+
+describe("attachment ticket sweep (vault#612)", () => {
+  // Isolated instance — no risk of touching the one process-wide provider
+  // every OTHER test in this file (and every other test FILE, via
+  // getSharedAttachmentTicketProvider) also shares.
+  function ticketExpiringAt(id: string, expiresAt: number): AttachmentTicket {
+    return {
+      id,
+      kind: "download",
+      vaultName: "sweep-unit-test",
+      createdAt: expiresAt - 60_000,
+      expiresAt,
+      attachmentId: "att-1",
+    };
+  }
+
+  test("sweepExpired drops only expired-unspent tickets and returns the count dropped", async () => {
+    const provider = new InProcessAttachmentTicketProvider();
+    const now = Date.now();
+    await provider.put(ticketExpiringAt("expired-1", now - 5000));
+    await provider.put(ticketExpiringAt("expired-2", now - 1));
+    await provider.put(ticketExpiringAt("fresh-1", now + 60_000));
+    expect(provider.size()).toBe(3);
+
+    const dropped = provider.sweepExpired(now);
+    expect(dropped).toBe(2);
+    expect(provider.size()).toBe(1);
+
+    // Dropped tickets are gone — take() returns null, same as "never existed".
+    expect(await provider.take("expired-1")).toBeNull();
+    expect(await provider.take("expired-2")).toBeNull();
+    // The unexpired ticket survived the sweep and is still spendable.
+    const fresh = await provider.take("fresh-1");
+    expect(fresh?.id).toBe("fresh-1");
+  });
+
+  test("a ticket expiring exactly `now` counts as expired (< comparison, not <=)", async () => {
+    const provider = new InProcessAttachmentTicketProvider();
+    const now = Date.now();
+    await provider.put(ticketExpiringAt("boundary", now));
+    expect(provider.sweepExpired(now)).toBe(0); // expiresAt === now is NOT yet expired
+    expect(provider.sweepExpired(now + 1)).toBe(1); // one ms later, it is
+  });
+
+  test("a no-op sweep (nothing expired) drops nothing", () => {
+    const provider = new InProcessAttachmentTicketProvider();
+    expect(provider.sweepExpired(Date.now())).toBe(0);
+    expect(provider.size()).toBe(0);
+  });
+
+  test("sweepExpiredAttachmentTickets delegates to the shared provider (unique ids — safe alongside concurrent tests)", async () => {
+    const provider = getSharedAttachmentTicketProvider();
+    const now = Date.now();
+    const expiredId = generateTicketId();
+    const freshId = generateTicketId();
+    await provider.put(ticketExpiringAt(expiredId, now - 1));
+    await provider.put(ticketExpiringAt(freshId, now + 60_000));
+
+    sweepExpiredAttachmentTickets(now);
+
+    expect(await provider.take(expiredId)).toBeNull();
+    const fresh = await provider.take(freshId);
+    expect(fresh?.id).toBe(freshId);
+  });
+
+  test("sweepExpiredAttachmentTickets always returns a number (the `?? 0` fallback path never throws)", () => {
+    // By this point in the suite the shared provider already exists (other
+    // tests above created it) — this doesn't re-prove the true
+    // never-created case in isolation, but pins the return type/no-throw
+    // contract the periodic sweep timer depends on every tick.
+    expect(typeof sweepExpiredAttachmentTickets()).toBe("number");
+  });
+
+  test("start/stop the periodic sweep: idempotent start, a short-interval real timer actually drops an expired ticket, clean stop", async () => {
+    // Poll via `size()`, NOT `take(id)` — `take()` deletes unconditionally
+    // on any lookup (expired or not; see its own doc comment), so polling
+    // with it would consume the ticket itself on the FIRST poll — before
+    // the timer ever fires — and the test would pass for the wrong reason.
+    const provider = getSharedAttachmentTicketProvider() as InstanceType<typeof InProcessAttachmentTicketProvider>;
+    const now = Date.now();
+    const id = generateTicketId();
+    await provider.put(ticketExpiringAt(id, now - 1)); // already expired
+    const baseline = provider.size();
+
+    startAttachmentTicketSweep(15); // 15ms — short enough to observe within the test timeout
+    startAttachmentTicketSweep(15); // idempotent — no-op, doesn't create a second timer
+
+    // Poll briefly rather than a single fixed sleep — bounded by the test
+    // runner's own timeout.
+    let sizeDropped = false;
+    for (let i = 0; i < 20 && !sizeDropped; i++) {
+      await new Promise((r) => setTimeout(r, 15));
+      if (provider.size() < baseline) sizeDropped = true;
+    }
+    stopAttachmentTicketSweep();
+    stopAttachmentTicketSweep(); // idempotent — no-op on an already-stopped sweep
+
+    expect(sizeDropped).toBe(true);
+    // Confirm it was genuinely OUR ticket the sweep dropped, not a
+    // coincidental size change from something else.
+    expect(await provider.take(id)).toBeNull();
   });
 });

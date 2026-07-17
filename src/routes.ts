@@ -143,7 +143,7 @@ import {
   type ExpandMode,
 } from "../core/src/expand.ts";
 import { join, extname, normalize } from "path";
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
 import { shouldAutoTranscribe } from "./auto-transcribe.ts";
 // usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
@@ -4453,6 +4453,37 @@ export const MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 20 * 1024 * 1024; // 12
 const BLOCKED_EXTENSIONS = BLOCKED_ATTACHMENT_EXTENSIONS;
 const MIME_TYPES = ATTACHMENT_MIME_TYPES;
 
+/**
+ * Parse a single-range `Range: bytes=a-b` header (RFC 7233 §2.1 — single
+ * range only, attachments-for-agents design D9, the REST twin of MCP's
+ * `content_offset`). Returns `null` — meaning "serve the full 200 response"
+ * — for a missing header, a malformed value, an unrecognized unit, a
+ * multi-range list (`bytes=0-10,20-30` — ignored, not an error, per D9),
+ * or a range this file can't satisfy (a `start` past EOF). `start`/`end`
+ * are both INCLUSIVE byte offsets; `end` is clamped to `total - 1` when the
+ * request left it open (`bytes=500-`) or asked past EOF.
+ */
+export function parseByteRangeHeader(header: string | null, total: number): { start: number; end: number } | null {
+  if (!header || total <= 0) return null;
+  const match = header.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) return null; // malformed, unrecognized unit, or a multi-range list
+  const [, startRaw, endRaw] = match;
+  if (startRaw === "" && endRaw === "") return null;
+
+  if (startRaw === "") {
+    // Suffix range: last N bytes (`bytes=-500`).
+    const suffixLength = Number(endRaw);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+    return { start: Math.max(0, total - suffixLength), end: total - 1 };
+  }
+
+  const start = Number(startRaw);
+  if (!Number.isSafeInteger(start) || start < 0 || start >= total) return null;
+  const end = endRaw === "" ? total - 1 : Math.min(Number(endRaw), total - 1);
+  if (!Number.isSafeInteger(end) || end < start) return null;
+  return { start, end };
+}
+
 export async function handleStorage(
   req: Request,
   path: string,
@@ -4615,12 +4646,38 @@ export async function handleStorage(
     const stat = statSync(filePath);
     const ext = extname(filePath).toLowerCase();
     const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
-    const fileBuffer = readFileSync(filePath);
+    const total = stat.size;
 
-    return new Response(fileBuffer, {
+    // vault attachments-for-agents design (D9) — the REST twin of MCP's
+    // `content_offset`. `Bun.file(filePath)` resolves lazily: `.slice()`
+    // creates a bounded view and only the requested bytes are actually read
+    // on `.arrayBuffer()`/streaming, replacing the prior whole-file
+    // `readFileSync` (a standing memory smell on a large attachment, e.g. a
+    // 90 MB video) on BOTH the ranged and full-file paths below.
+    const bunFile = Bun.file(filePath);
+    const range = parseByteRangeHeader(req.headers.get("range"), total);
+
+    if (range) {
+      const { start, end } = range; // inclusive
+      return new Response(bunFile.slice(start, end + 1), {
+        status: 206,
+        headers: {
+          "Content-Type": contentType,
+          "Content-Length": String(end - start + 1),
+          "Content-Range": `bytes ${start}-${end}/${total}`,
+          "Accept-Ranges": "bytes",
+          // Defense-in-depth: never let a browser MIME-sniff a stored asset
+          // into an active type — see the full-response branch below.
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
+
+    return new Response(bunFile, {
       headers: {
         "Content-Type": contentType,
-        "Content-Length": String(stat.size),
+        "Content-Length": String(total),
+        "Accept-Ranges": "bytes",
         // Defense-in-depth: never let a browser MIME-sniff a stored asset into
         // an active type (e.g. an octet-stream body sniffed as text/html).
         // Combined with the upload blocklist (no .svg/.html) this closes the

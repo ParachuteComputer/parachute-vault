@@ -21,6 +21,7 @@ import { migrateVaultKeys } from "./token-store.ts";
 import { resolveFirstBootVaultName, reservedNameSquatWarnings } from "./vault-name.ts";
 import { getVaultStore, getVaultNameForStore, getSharedEmbeddingProvider } from "./vault-store.ts";
 import { EmbeddingWorker, registerEmbeddingHook } from "./embedding-worker.ts";
+import { startAttachmentTicketSweep, stopAttachmentTicketSweep } from "./attachment-tickets.ts";
 import { seedOnboardingNotesBestEffort } from "./onboarding-seed.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import { registerTriggers } from "./triggers.ts";
@@ -236,6 +237,11 @@ const embeddingWorker = new EmbeddingWorker({
 });
 registerEmbeddingHook(defaultHookRegistry, embeddingWorker, (store) => getVaultNameForStore(store as never));
 embeddingWorker.start();
+
+// Attachment-ticket sweep (vault#612) — drops expired-unspent tickets from
+// the in-process store so an abandoned mint (an agent that never curls)
+// doesn't sit in memory forever. See src/attachment-tickets.ts.
+startAttachmentTicketSweep();
 
 if (process.env.VAULT_AUTH_TOKEN?.trim()) {
   console.log("[auth] VAULT_AUTH_TOKEN set — server-wide operator bearer active");
@@ -619,6 +625,7 @@ async function shutdown(signal: string): Promise<void> {
         // Then drain hooks + stop the transcription/embedding workers in
         // parallel.
         embeddingWorker.stop();
+        stopAttachmentTicketSweep();
         await Promise.all([
           defaultHookRegistry.drain(),
           transcriptionWorker?.stop() ?? Promise.resolve(),

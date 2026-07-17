@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import type { Store, Note, QueryOpts } from "./types.js";
+import type { Store, Note, QueryOpts, Attachment } from "./types.js";
 import { transactionAsync } from "./txn.js";
 import * as noteOps from "./notes.js";
 import { filterMetadata, MAX_BATCH_SIZE, validateExtension, ExtensionValidationError, validatePath } from "./notes.js";
@@ -43,10 +43,13 @@ import {
   parseContentRange,
   applyContentRange,
   contentRangeRequiresContent,
+  parseAttachmentContentRange,
+  alignByteWindow,
   MIN_CONTENT_LENGTH,
 } from "./content-range.js";
 import {
   BLOCKED_ATTACHMENT_EXTENSIONS,
+  ATTACHMENT_MIME_TYPES,
   sanitizeAttachmentExtension,
   mimeForAttachmentExtension,
 } from "./attachment/policy.js";
@@ -57,6 +60,23 @@ import {
   type AttachmentTicket,
   type AttachmentTicketProvider,
 } from "./attachment/tickets.js";
+import {
+  MAX_ATTACHMENT_IMAGE_BYTES,
+  type AttachmentBytesProvider,
+} from "./attachment/bytes-provider.js";
+
+/**
+ * A single MCP tool-result content block. Mirrors the subset of the MCP SDK's
+ * `CallToolResult.content` shape this codebase actually emits — a plain text
+ * block (the existing, universal shape) or a real image block (`read-attachment`'s
+ * image branch, D3). Kept as a local, minimal type rather than importing the
+ * SDK's own (broader — audio, resource links, ...) union, since core has no
+ * dependency on `@modelcontextprotocol/sdk` today and this is the only shape
+ * any tool here produces.
+ */
+export type McpContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
 
 export interface McpToolDef {
   name: string;
@@ -75,6 +95,17 @@ export interface McpToolDef {
    * future addition that forgets to stamp this gets the safer treatment.
    */
   requiredVerb: "read" | "write" | "admin";
+  /**
+   * OPTIONAL override for how `execute()`'s return value becomes MCP
+   * `content` blocks. Every tool WITHOUT this wraps its result as the single
+   * `JSON.stringify` text block the HTTP layer has always produced
+   * (`src/mcp-http.ts`) — unchanged default behavior. `read-attachment`'s
+   * image branch is the only current user: it needs a REAL `{type:"image"}`
+   * block alongside the row-JSON text block so the model actually SEES the
+   * picture, not just its metadata (D3, attachments-for-agents design "the
+   * one wrapper change").
+   */
+  resultContent?: (result: unknown) => McpContentBlock[];
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +195,172 @@ function removeWikilinkBrackets(content: string, targetPath: string): string {
     `${targetPath}$1`,
   );
   return content;
+}
+
+// ---------------------------------------------------------------------------
+// read-attachment helpers (Wave 2 model lane — D2-D5)
+// ---------------------------------------------------------------------------
+
+/** Non-`text/*` mime types `read-attachment` still treats as text (D2's "text/* + TEXT_MIMES allowlist"). `text/csv` and `text/markdown` already match `text/*` via ATTACHMENT_MIME_TYPES, so they need no entry here. */
+const TEXT_MIME_ALLOWLIST = new Set([
+  "application/json",
+  "application/ndjson",
+  "application/x-ndjson",
+  "application/yaml",
+  "application/x-yaml",
+]);
+
+function baseMime(mimeType: string): string {
+  return mimeType.split(";")[0]!.trim().toLowerCase();
+}
+
+function isTextMime(mimeType: string): boolean {
+  const base = baseMime(mimeType);
+  return base.startsWith("text/") || TEXT_MIME_ALLOWLIST.has(base);
+}
+
+function isImageMime(mimeType: string): boolean {
+  return baseMime(mimeType).startsWith("image/");
+}
+
+function isAudioOrVideoMime(mimeType: string): boolean {
+  const base = baseMime(mimeType);
+  return base.startsWith("audio/") || base.startsWith("video/");
+}
+
+/**
+ * Effective mime for `read-attachment` — same discipline the REST byte-serve
+ * route uses (`src/routes.ts`'s `GET /storage/<path>`): the stored file's
+ * EXTENSION wins over the row's `mime_type` column, since the row's mime is
+ * caller-asserted at upload time and never verified against the bytes. Falls
+ * back to the row's mime_type, then `application/octet-stream`.
+ */
+function effectiveAttachmentMime(attachment: Attachment): string {
+  const ext = sanitizeAttachmentExtension(attachment.path);
+  return ATTACHMENT_MIME_TYPES[ext] ?? attachment.mimeType ?? "application/octet-stream";
+}
+
+/** Stat the attachment's bytes, or throw the `attachment_binary_missing` refusal (D5's "row outlived bytes" case — e.g. an audio-retention eviction). */
+async function statAttachmentOrMissing(
+  attachment: Attachment,
+  provider: AttachmentBytesProvider,
+): Promise<{ size: number }> {
+  const stat = await provider.stat(attachment);
+  if (!stat) {
+    throw structuredError(`Attachment binary missing: "${attachment.id}"`, {
+      error_type: "attachment_binary_missing",
+      how_to:
+        "the attachment row exists but its bytes are gone (e.g. an audio-retention eviction after transcription) — this content can't be read",
+    });
+  }
+  return stat;
+}
+
+/**
+ * Text branch: byte-windowed read using the exact query-notes pagination
+ * contract (`content`/`content_offset`/`content_total_length`/
+ * `content_next_offset`). Does a BOUNDED positional read — never the whole
+ * file — via `alignByteWindow` (see its doc comment for the exact window
+ * the provider is asked to fetch).
+ */
+async function readTextAttachment(
+  attachment: Attachment,
+  mimeType: string,
+  params: Record<string, unknown>,
+  provider: AttachmentBytesProvider,
+): Promise<Record<string, unknown>> {
+  const range = parseAttachmentContentRange(params.content_offset, params.content_length);
+  const stat = await statAttachmentOrMissing(attachment, provider);
+  const total = stat.size;
+
+  if (range.offset >= total) {
+    return {
+      attachment_id: attachment.id,
+      mime_type: mimeType,
+      content: "",
+      content_offset: total,
+      content_total_length: total,
+      content_next_offset: null,
+    };
+  }
+
+  const rawStart = Math.max(0, range.offset - 3);
+  // +1: alignByteWindow's end-boundary check reads the byte AT the window's
+  // exclusive end — see its doc comment precondition.
+  const rawEnd = Math.min(total, range.offset + range.length + 1);
+  const raw = await provider.readRange(attachment, rawStart, rawEnd);
+  const fields = alignByteWindow(raw, rawStart, range, total);
+
+  return {
+    attachment_id: attachment.id,
+    mime_type: mimeType,
+    ...fields,
+  };
+}
+
+/**
+ * Image branch: whole-file read, gated by {@link MAX_ATTACHMENT_IMAGE_BYTES}
+ * (checked via `stat` BEFORE any bytes are read — an over-cap image never
+ * touches `readRange` at all). The base64 payload rides in `_mcpImage`, a
+ * field this tool's own `resultContent` consumes to build the real MCP image
+ * block and then strips before the text block is serialized (see the tool
+ * definition below) — no other caller should read `_mcpImage`.
+ */
+async function readImageAttachment(
+  attachment: Attachment,
+  mimeType: string,
+  provider: AttachmentBytesProvider,
+): Promise<Record<string, unknown>> {
+  const stat = await statAttachmentOrMissing(attachment, provider);
+  if (stat.size > MAX_ATTACHMENT_IMAGE_BYTES) {
+    throw structuredError(
+      `Image attachment (${stat.size} bytes) exceeds the ${MAX_ATTACHMENT_IMAGE_BYTES} byte (4 MiB) read cap`,
+      {
+        error_type: "image_too_large",
+        size: stat.size,
+        max_bytes: MAX_ATTACHMENT_IMAGE_BYTES,
+        how_to: "mint a download ticket with request-attachment-download and process the image locally",
+      },
+    );
+  }
+  const raw = await provider.readRange(attachment, 0, stat.size);
+  return {
+    attachment_id: attachment.id,
+    mime_type: mimeType,
+    size_bytes: stat.size,
+    _mcpImage: { data: Buffer.from(raw).toString("base64"), mimeType },
+  };
+}
+
+/**
+ * Audio/video branch: never bytes. Returns a transcript pointer built
+ * entirely from metadata the transcription pipeline already stamps
+ * (`attachment.metadata.transcribe_status`) plus the provider's OPTIONAL
+ * sibling-note resolution — no bytes are read or even stat'd.
+ */
+async function readAudioPointer(
+  attachment: Attachment,
+  provider: AttachmentBytesProvider,
+): Promise<Record<string, unknown>> {
+  const meta = attachment.metadata as Record<string, unknown> | undefined;
+  const transcribeStatus = typeof meta?.transcribe_status === "string" ? meta.transcribe_status : undefined;
+  if (!transcribeStatus) {
+    throw structuredError(`Audio/video attachment "${attachment.id}" has no transcript`, {
+      error_type: "audio_bytes_not_supported",
+      how_to:
+        "re-attach with transcribe: true to get a transcript, or mint a download ticket with request-attachment-download to process the bytes locally",
+    });
+  }
+  const result: Record<string, unknown> = {
+    attachment_id: attachment.id,
+    transcribe_status: transcribeStatus,
+    note_id: attachment.noteId,
+  };
+  if (provider.resolveTranscriptNote) {
+    const transcriptNote = await provider.resolveTranscriptNote(attachment);
+    if (transcriptNote) result.transcript_note = transcriptNote;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +485,25 @@ export interface GenerateMcpToolsOpts {
      * code and so need the shared pre-resolved-allowlist-holder
      * machinery), so this can just be awaited inline. Omitted (unscoped /
      * internal callers) → every note/attachment is visible.
+     */
+    noteVisible?: (note: Note) => boolean | Promise<boolean>;
+  };
+  /**
+   * `AttachmentBytesProvider` seam (Wave 2 model lane — D10, same "tools
+   * omitted when unwired" posture as `attachmentTickets` above). When
+   * provided, `generateMcpTools` appends `read-attachment` to the returned
+   * tool list. Omitted (a door that hasn't wired byte access yet) →
+   * `read-attachment` is ABSENT from the list entirely.
+   */
+  attachmentBytes?: {
+    provider: AttachmentBytesProvider;
+    /**
+     * OPTIONAL per-note visibility predicate — identical contract to
+     * `attachmentTickets.noteVisible` above (same tag-scope confidentiality
+     * intent; kept as a separate field since a caller could in principle
+     * wire one seam without the other, though the server layer always wires
+     * both from the same underlying check). Omitted → every attachment is
+     * visible.
      */
     noteVisible?: (note: Note) => boolean | Promise<boolean>;
   };
@@ -3017,6 +3233,120 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
         },
       },
     );
+  }
+
+  // =====================================================================
+  // 14. read-attachment — model-lane byte reads (Wave 2). Present ONLY
+  // when the server layer wires an AttachmentBytesProvider — see
+  // `GenerateMcpToolsOpts.attachmentBytes`'s doc comment (D10). Dispatches
+  // by mime family: text ranges come back as `content`/`content_offset`/
+  // `content_total_length`/`content_next_offset` (the exact query-notes
+  // pagination contract); images come back as a real MCP image block (see
+  // this tool's `resultContent`); audio/video never send bytes — a
+  // transcript pointer instead; PDF/other binary refuse with a
+  // download-ticket pointer. Unlike the ticket tools, bytes (or a base64
+  // encoding of them) DO pass through this tool — that's the whole point
+  // of the model lane.
+  // =====================================================================
+  const bytesSeam = opts?.attachmentBytes;
+  if (bytesSeam) {
+    tools.push({
+      name: "read-attachment",
+      requiredVerb: "read",
+      description:
+        "Read an attachment's content directly into this conversation (the model lane — bytes DO pass through this tool, unlike request-attachment-upload/download). Behavior depends on mime type: text/* (+ json/ndjson/yaml — csv/markdown are already text/*) returns a byte-windowed `content` slice using the exact query-notes content_offset/content_length/content_next_offset pagination contract (default 65536 bytes / 64 KiB, max 262144 / 256 KiB per call — loop, feeding content_next_offset back as content_offset, for more). image/* returns a real image you can see, capped at 4 MiB raw (over-cap refuses with a pointer to request-attachment-download; content_offset/content_length don't apply to images). audio/video never send bytes — you get back a transcript pointer (transcribe_status, note_id, and a transcript_note when one exists) instead of the audio itself. PDF and other binary formats aren't directly readable here — mint a download ticket with request-attachment-download and process the file with your own runtime.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          attachment_id: {
+            type: "string",
+            description: "The attachment's id (from a note's attachment rows, e.g. include_attachments: true on query-notes)",
+          },
+          content_offset: {
+            type: "number",
+            description: "Text attachments only. Byte offset to start reading from (UTF-8 bytes). Defaults to 0.",
+          },
+          content_length: {
+            type: "number",
+            description: "Text attachments only. Byte budget for this call. Defaults to 65536 (64 KiB); max 262144 (256 KiB).",
+          },
+        },
+        required: ["attachment_id"],
+      },
+      execute: async (params) => {
+        const attachmentId = params.attachment_id;
+        if (typeof attachmentId !== "string" || attachmentId.trim() === "") {
+          throw structuredError("`attachment_id` is required", {
+            error_type: "missing_required_field",
+            field: "attachment_id",
+            how_to: "pass the attachment id from a note's attachment rows",
+          });
+        }
+
+        const attachment = await store.getAttachment(attachmentId);
+        if (!attachment) {
+          throw structuredError(`Attachment not found: "${attachmentId}"`, {
+            error_type: "not_found",
+            field: "attachment_id",
+          });
+        }
+
+        if (bytesSeam.noteVisible) {
+          const owningNote = await store.getNote(attachment.noteId);
+          // Same uniform not_found posture as the ticket tools — a
+          // tag-scoped caller learns nothing about an out-of-scope note's
+          // existence via a differential error.
+          if (!owningNote || !(await bytesSeam.noteVisible(owningNote))) {
+            throw structuredError(`Attachment not found: "${attachmentId}"`, {
+              error_type: "not_found",
+              field: "attachment_id",
+            });
+          }
+        }
+
+        const mimeType = effectiveAttachmentMime(attachment);
+
+        if (isImageMime(mimeType)) {
+          if (params.content_offset !== undefined || params.content_length !== undefined) {
+            throw structuredError("content_offset/content_length don't apply to image attachments", {
+              error_type: "invalid_query",
+              field: "content_offset",
+              hint: "omit content_offset/content_length for an image read — the whole image (up to the 4 MiB cap) comes back in one call",
+            });
+          }
+          return await readImageAttachment(attachment, mimeType, bytesSeam.provider);
+        }
+        if (isTextMime(mimeType)) {
+          return await readTextAttachment(attachment, mimeType, params, bytesSeam.provider);
+        }
+        if (isAudioOrVideoMime(mimeType)) {
+          return await readAudioPointer(attachment, bytesSeam.provider);
+        }
+
+        // Other binary (PDF, zip, docx, ...) — refuse honestly rather than
+        // returning garbage or truncated bytes; extraction is a v2 concern
+        // (D5). Still stats first so a row whose bytes are ALSO gone gets
+        // the more accurate attachment_binary_missing instead.
+        const stat = await statAttachmentOrMissing(attachment, bytesSeam.provider);
+        throw structuredError(`Attachment type "${mimeType}" isn't directly readable by this tool`, {
+          error_type: "unsupported_attachment_type",
+          mime_type: mimeType,
+          size: stat.size,
+          how_to: "mint a download ticket with request-attachment-download and process the file locally",
+        });
+      },
+      resultContent: (result) => {
+        const r = result as ({ _mcpImage?: { data: string; mimeType: string } } & Record<string, unknown>) | null;
+        if (r && r._mcpImage) {
+          const { _mcpImage, ...rest } = r;
+          return [
+            { type: "text", text: JSON.stringify(rest, null, 2) },
+            { type: "image", data: _mcpImage.data, mimeType: _mcpImage.mimeType },
+          ];
+        }
+        return [{ type: "text", text: JSON.stringify(result, null, 2) }];
+      },
+    });
   }
 
   return tools;

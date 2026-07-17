@@ -30,7 +30,7 @@ const testDir = join(
 process.env.PARACHUTE_HOME = testDir;
 process.env.ASSETS_DIR = join(testDir, "assets");
 
-const { handleStorage, MAX_UPLOAD_BYTES, MAX_REQUEST_BODY_BYTES } = await import("./routes.ts");
+const { handleStorage, MAX_UPLOAD_BYTES, MAX_REQUEST_BODY_BYTES, parseByteRangeHeader } = await import("./routes.ts");
 const { expandTokenTagScope } = await import("./tag-scope.ts");
 
 // The upload-allowlist tests never touch the store (POST /upload writes to
@@ -561,6 +561,193 @@ describe("storage POST parity (finding D)", () => {
       "default",
       uploadStore,
     );
+    expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REST Range (206) — vault attachments-for-agents design D9, the REST twin
+// of MCP's content_offset/content_length.
+// ---------------------------------------------------------------------------
+
+describe("parseByteRangeHeader", () => {
+  test("no header → null (full response)", () => {
+    expect(parseByteRangeHeader(null, 100)).toBeNull();
+  });
+
+  test("bytes=0-99 on a 100-byte file → the whole file as one satisfiable range", () => {
+    expect(parseByteRangeHeader("bytes=0-99", 100)).toEqual({ start: 0, end: 99 });
+  });
+
+  test("bytes=10-19 → an inclusive mid-file window", () => {
+    expect(parseByteRangeHeader("bytes=10-19", 100)).toEqual({ start: 10, end: 19 });
+  });
+
+  test("bytes=90- (open-ended) → reads to EOF", () => {
+    expect(parseByteRangeHeader("bytes=90-", 100)).toEqual({ start: 90, end: 99 });
+  });
+
+  test("bytes=-10 (suffix range) → the last 10 bytes", () => {
+    expect(parseByteRangeHeader("bytes=-10", 100)).toEqual({ start: 90, end: 99 });
+  });
+
+  test("bytes=-1000 (suffix longer than the file) → clamps to the whole file", () => {
+    expect(parseByteRangeHeader("bytes=-1000", 100)).toEqual({ start: 0, end: 99 });
+  });
+
+  test("bytes=50-1000 (end past EOF) → clamps end to the last byte", () => {
+    expect(parseByteRangeHeader("bytes=50-1000", 100)).toEqual({ start: 50, end: 99 });
+  });
+
+  test("start past EOF → null (unsatisfiable, falls back to full 200)", () => {
+    expect(parseByteRangeHeader("bytes=100-200", 100)).toBeNull();
+    expect(parseByteRangeHeader("bytes=1000-", 100)).toBeNull();
+  });
+
+  test("start > end → null (malformed)", () => {
+    expect(parseByteRangeHeader("bytes=50-10", 100)).toBeNull();
+  });
+
+  test("bytes=- (both empty) → null", () => {
+    expect(parseByteRangeHeader("bytes=-", 100)).toBeNull();
+  });
+
+  test("a multi-range list (bytes=0-10,20-30) → null (ignored per D9, not an error)", () => {
+    expect(parseByteRangeHeader("bytes=0-10,20-30", 100)).toBeNull();
+  });
+
+  test("an unrecognized unit → null", () => {
+    expect(parseByteRangeHeader("items=0-10", 100)).toBeNull();
+  });
+
+  test("garbage value → null, not a throw", () => {
+    expect(parseByteRangeHeader("bytes=abc-def", 100)).toBeNull();
+    expect(parseByteRangeHeader("nonsense", 100)).toBeNull();
+  });
+
+  test("a zero-byte file → null regardless of header (nothing to range over)", () => {
+    expect(parseByteRangeHeader("bytes=0-0", 0)).toBeNull();
+  });
+});
+
+describe("storage GET Range support (vault attachments-for-agents design D9)", () => {
+  const VAULT = "range-vault";
+  // 26 bytes, byte-identical to its own index — content[i] === i (0x00..0x19)
+  // — so any slice's bytes can be asserted exactly by index, not just length.
+  const CONTENT = Buffer.from(Array.from({ length: 26 }, (_, i) => i));
+
+  async function setup(): Promise<{ store: SqliteStore; assets: string; relPath: string }> {
+    const store = freshStore();
+    const assets = join(testDir, "assets", VAULT, "data");
+    mkdirSync(join(assets, "2026-05-28"), { recursive: true });
+    process.env.ASSETS_DIR = assets;
+
+    const relPath = "2026-05-28/ranged.bin";
+    writeFileSync(join(assets, relPath), CONTENT);
+    const note = await store.createNote("range note", { tags: ["misc"] });
+    await store.addAttachment(note.id, relPath, "application/octet-stream");
+
+    return { store, assets, relPath };
+  }
+
+  function getReq(reqPath: string, range?: string): Request {
+    const headers: Record<string, string> = {};
+    if (range !== undefined) headers.range = range;
+    return new Request(`http://localhost:1940/storage/${reqPath}`, { method: "GET", headers });
+  }
+
+  test("no Range header → 200, full body, Accept-Ranges advertised", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(res.headers.get("Content-Length")).toBe("26");
+    expect(res.headers.has("Content-Range")).toBe(false);
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT)).toBe(true);
+  });
+
+  test("Range: bytes=0-9 → 206, first 10 bytes, correct Content-Range", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath, "bytes=0-9"), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("Content-Range")).toBe("bytes 0-9/26");
+    expect(res.headers.get("Content-Length")).toBe("10");
+    expect(res.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT.subarray(0, 10))).toBe(true);
+  });
+
+  test("Range: bytes=16-25 (to EOF) → 206, correct tail bytes", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath, "bytes=16-25"), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("Content-Range")).toBe("bytes 16-25/26");
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT.subarray(16, 26))).toBe(true);
+  });
+
+  test("Range: bytes=-5 (suffix) → 206, last 5 bytes", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath, "bytes=-5"), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("Content-Range")).toBe("bytes 21-25/26");
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT.subarray(21, 26))).toBe(true);
+  });
+
+  test("paging the whole file via sequential ranges reassembles byte-identical content", async () => {
+    const { store, relPath } = await setup();
+    const chunkSize = 7; // doesn't divide 26 evenly — exercises a short final chunk
+    const chunks: Buffer[] = [];
+    for (let start = 0; start < 26; start += chunkSize) {
+      const end = Math.min(start + chunkSize - 1, 25);
+      const res = await handleStorage(getReq(relPath, `bytes=${start}-${end}`), `/${relPath}`, VAULT, store);
+      expect(res.status).toBe(206);
+      chunks.push(Buffer.from(await res.arrayBuffer()));
+    }
+    expect(Buffer.concat(chunks).equals(CONTENT)).toBe(true);
+  });
+
+  test("a malformed Range header → 200 full response, not an error (D9: ignore, don't fail)", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath, "not-a-range"), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(200);
+    expect(res.headers.has("Content-Range")).toBe(false);
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT)).toBe(true);
+  });
+
+  test("a multi-range Range header → 200 full response (multipart ranges unsupported, ignored per D9)", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath, "bytes=0-5,10-15"), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(200);
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT)).toBe(true);
+  });
+
+  test("an unsatisfiable Range (start past EOF) → 200 full response (no 416 — falls back, per parseByteRangeHeader's null contract)", async () => {
+    const { store, relPath } = await setup();
+    const res = await handleStorage(getReq(relPath, "bytes=1000-2000"), `/${relPath}`, VAULT, store);
+    expect(res.status).toBe(200);
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT)).toBe(true);
+  });
+
+  test("Range is still honored for a tag-scoped in-scope request (206)", async () => {
+    const { store, relPath } = await setup();
+    const ctx = await tagScopeCtx(store, ["misc"]);
+    const res = await handleStorage(getReq(relPath, "bytes=0-3"), `/${relPath}`, VAULT, store, ctx);
+    expect(res.status).toBe(206);
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.equals(CONTENT.subarray(0, 4))).toBe(true);
+  });
+
+  test("Range on an out-of-scope attachment still 404s (same confinement guard, byte-identical to the non-ranged path)", async () => {
+    const { store, relPath } = await setup();
+    const ctx = await tagScopeCtx(store, ["totally-unrelated-tag"]);
+    const res = await handleStorage(getReq(relPath, "bytes=0-3"), `/${relPath}`, VAULT, store, ctx);
     expect(res.status).toBe(404);
   });
 });

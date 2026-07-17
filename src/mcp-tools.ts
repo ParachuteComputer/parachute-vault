@@ -45,6 +45,7 @@ import { looksLikeJwt } from "./hub-jwt.ts";
 import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
 import { getBaseUrl } from "./oauth-discovery.ts";
 import { getSharedAttachmentTicketProvider } from "./attachment-tickets.ts";
+import { createFsAttachmentBytesProvider } from "./attachment-bytes.ts";
 
 /**
  * Filter a vault projection to entries an in-scope tag contributes to.
@@ -112,10 +113,12 @@ export async function getServerInstruction(
     description: config?.description ?? null,
     projection,
     coordinates: resolveVaultCoordinates(),
-    // Bun always wires an in-process AttachmentTicketProvider (see
+    // Bun always wires an in-process AttachmentTicketProvider AND a fresh
+    // fs-backed AttachmentBytesProvider per session (see
     // `generateScopedMcpTools` below) — the connect-time brief can
-    // unconditionally teach the ticket tools on this door.
-    attachments: { ticketsEnabled: true },
+    // unconditionally teach both the ticket tools and read-attachment on
+    // this door.
+    attachments: { ticketsEnabled: true, readEnabled: true },
   });
 }
 
@@ -271,6 +274,15 @@ export function generateScopedMcpTools(
       provider: getSharedAttachmentTicketProvider(),
       vaultName,
       urlBase: ticketUrlBase,
+      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
+    },
+    // Attachment bytes (Wave 2 model lane): bun always wires a fresh fs
+    // provider per session — cheap (stateless), unlike the ticket
+    // provider's process-wide shared Map. Same `ticketNoteVisible`
+    // tag-scope predicate as the ticket seam above (identical contract:
+    // "is the owning note in scope").
+    attachmentBytes: {
+      provider: createFsAttachmentBytesProvider(vaultName),
       ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
     },
   });

@@ -283,27 +283,34 @@ function sqliteToUserType(t: string): string {
  * its own context on them (bytes never ride MCP either way).
  *
  * `ticketsEnabled` reflects whether THIS door has wired an
- * `AttachmentTicketProvider` (bun: always, as of this PR; cloud: not yet
- * — its mirror is a separate PR). An unwired door omits BOTH the ticket
- * tools from `tools/list` (see `generateMcpTools`'s `attachmentTickets`
- * opt) AND the ticket-tool sentences here — the brief never dangles a
- * pointer at a tool the agent can't actually call.
+ * `AttachmentTicketProvider` (bun: always, as of the Wave 1 PR; cloud: not
+ * yet — its mirror is a separate PR). `readEnabled` reflects whether it's
+ * wired an `AttachmentBytesProvider` (bun: always, as of this PR — Wave 2).
+ * An unwired seam omits BOTH its tool(s) from `tools/list` (see
+ * `generateMcpTools`'s `attachmentTickets` / `attachmentBytes` opts) AND
+ * its sentence here — the brief never dangles a pointer at a tool the
+ * agent can't actually call.
  *
  * Kept as a single dense paragraph (not its own multi-line list) to stay
  * inside the connect-time brief's token budget — see
  * `projectionToMarkdown`'s doc comment.
  */
-export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean }): string {
+export function attachmentsInstructionBlock(opts: { ticketsEnabled: boolean; readEnabled?: boolean }): string {
   const sentences: string[] = [
-    "Notes can carry file attachments (`include_attachments: true` on `query-notes` returns their rows; bytes don't ride MCP).",
+    "Notes can carry file attachments (`include_attachments: true` on `query-notes` returns their rows; bytes don't ride MCP tool RESULTS unless you ask for them).",
   ];
   if (opts.ticketsEnabled) {
     sentences.push(
-      "To move bytes, call `request-attachment-upload` / `request-attachment-download` — each mints a short-lived, single-use URL (with a ready-to-run `curl_example`) your shell spends directly; no MCP session credential is needed to spend it.",
+      "To move bytes without spending your own context, call `request-attachment-upload` / `request-attachment-download` — each mints a short-lived, single-use URL (with a ready-to-run `curl_example`) your shell spends directly; no MCP session credential is needed to spend it.",
+    );
+  }
+  if (opts.readEnabled) {
+    sentences.push(
+      "To read an attachment directly into this conversation, call `read-attachment` — text comes back as a paginated `content` slice, images as a real image you can see, audio/video as a transcript pointer (never raw bytes), and PDF/other binary formats point you at a download ticket instead.",
     );
   }
   sentences.push(
-    "If your runtime holds this vault's own API token, REST works too: upload = `POST {base}/storage/upload` (multipart `file`, ≤100 MB) then `POST {base}/notes/{id}/attachments` `{path, mimeType, transcribe?}`; download = `GET {base}/storage/{path}` with the same `Authorization: Bearer`. Audio attached with `transcribe: true` is transcribed automatically.",
+    "If your runtime holds this vault's own API token, REST works too: upload = `POST {base}/storage/upload` (multipart `file`, ≤100 MB) then `POST {base}/notes/{id}/attachments` `{path, mimeType, transcribe?}`; download = `GET {base}/storage/{path}` with the same `Authorization: Bearer` (honors a `Range: bytes=a-b` header for partial reads). Audio attached with `transcribe: true` is transcribed automatically.",
   );
   return sentences.join(" ");
 }
@@ -344,7 +351,7 @@ export function projectionToMarkdown(args: {
    * that hasn't wired ticket support yet (or a test fixture) never
    * accidentally advertises tools it can't back.
    */
-  attachments?: { ticketsEnabled: boolean };
+  attachments?: { ticketsEnabled: boolean; readEnabled?: boolean };
 }): string {
   const { vaultName, description, projection, coordinates } = args;
   const stats = projection.stats;
