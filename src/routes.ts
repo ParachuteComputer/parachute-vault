@@ -4456,12 +4456,31 @@ const MIME_TYPES = ATTACHMENT_MIME_TYPES;
 /**
  * Parse a single-range `Range: bytes=a-b` header (RFC 7233 §2.1 — single
  * range only, attachments-for-agents design D9, the REST twin of MCP's
- * `content_offset`). Returns `null` — meaning "serve the full 200 response"
- * — for a missing header, a malformed value, an unrecognized unit, a
- * multi-range list (`bytes=0-10,20-30` — ignored, not an error, per D9),
- * or a range this file can't satisfy (a `start` past EOF). `start`/`end`
- * are both INCLUSIVE byte offsets; `end` is clamped to `total - 1` when the
+ * `content_offset`). Returns `null` — this function's own contract is
+ * "serve the full response, unranged" — for a missing header, a
+ * MALFORMED value, an unrecognized unit, a multi-range list
+ * (`bytes=0-10,20-30` — ignored, not an error, per D9), or a range this
+ * file can't satisfy (a `start` past EOF). `start`/`end` are both
+ * INCLUSIVE byte offsets; `end` is clamped to `total - 1` when the
  * request left it open (`bytes=500-`) or asked past EOF.
+ *
+ * IMPORTANT — this `null` contract is NOT the last word for an
+ * unsatisfiable (syntactically-valid but out-of-bounds) range on a real
+ * `Bun.serve()` deployment. Live-verified against an actual socket (not
+ * the in-process `handleStorage()` call the test suite uses): when the
+ * response body is a `Bun.file()` — which `handleStorage`'s full-response
+ * branch below always hands back — Bun's OWN runtime transparently
+ * reinterprets the incoming request's `Range` header a second time and,
+ * for an out-of-bounds range, overrides our 200 with a native
+ * **416 Range Not Satisfiable**, regardless of what this function or
+ * `handleStorage` returned. That's RFC 7233-correct and is being KEPT,
+ * not fought — so in practice, `null` from an out-of-bounds `start`
+ * still results in a 200 from `handleStorage`'s own logic, but the byte
+ * that actually reaches a real client for that specific case is a 416
+ * courtesy of Bun itself. MALFORMED and multi-range headers are NOT
+ * range-shaped at all, so Bun's native layer doesn't touch them — those
+ * two cases genuinely serve the full 200, in-process harness and real
+ * socket alike.
  */
 export function parseByteRangeHeader(header: string | null, total: number): { start: number; end: number } | null {
   if (!header || total <= 0) return null;

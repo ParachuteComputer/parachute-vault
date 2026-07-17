@@ -599,7 +599,7 @@ describe("parseByteRangeHeader", () => {
     expect(parseByteRangeHeader("bytes=50-1000", 100)).toEqual({ start: 50, end: 99 });
   });
 
-  test("start past EOF → null (unsatisfiable, falls back to full 200)", () => {
+  test("start past EOF → null (this function's own contract; a real Bun.serve() socket overrides with a native 416 — see doc comment)", () => {
     expect(parseByteRangeHeader("bytes=100-200", 100)).toBeNull();
     expect(parseByteRangeHeader("bytes=1000-", 100)).toBeNull();
   });
@@ -727,7 +727,19 @@ describe("storage GET Range support (vault attachments-for-agents design D9)", (
     expect(body.equals(CONTENT)).toBe(true);
   });
 
-  test("an unsatisfiable Range (start past EOF) → 200 full response (no 416 — falls back, per parseByteRangeHeader's null contract)", async () => {
+  test("an unsatisfiable Range (start past EOF) → handleStorage's OWN logic returns 200 (parseByteRangeHeader's null contract)", async () => {
+    // IMPORTANT — this is NOT the whole live story. `handleStorage` is
+    // called here directly, in-process, so this only exercises OUR
+    // fallback logic (parseByteRangeHeader → null → the unranged 200
+    // branch). Live-verified against a real `Bun.serve()` socket (not
+    // this harness): Bun's own runtime independently reinterprets the
+    // incoming `Range` header on a `Bun.file()`-backed response body and
+    // overrides an out-of-bounds range with a native
+    // **416 Range Not Satisfiable** — RFC 7233-correct, and kept, not
+    // fought. This in-process harness has no socket for Bun's native
+    // layer to intercept, so it can only ever observe the 200 our own
+    // code returns — see `parseByteRangeHeader`'s doc comment
+    // (`src/routes.ts`) for the full explanation.
     const { store, relPath } = await setup();
     const res = await handleStorage(getReq(relPath, "bytes=1000-2000"), `/${relPath}`, VAULT, store);
     expect(res.status).toBe(200);
