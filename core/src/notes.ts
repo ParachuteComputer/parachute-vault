@@ -2779,6 +2779,22 @@ export const DISPLAY_TITLE_MAX_LEN = 120;
 const FRONTMATTER_SCAN_LINES = 100;
 
 /**
+ * Shared by `computeDisplayTitle` and `computeLede`: given `content` already
+ * split into `lines`, return the index of the first line that counts as the
+ * start of the DOCUMENT body — after a leading closed frontmatter block, if
+ * `content` opens with one (see `computeDisplayTitle`'s frontmatter-skip
+ * doc for the full rationale). `0` when there's no leading frontmatter.
+ */
+function skipLeadingFrontmatter(lines: string[]): number {
+  if (lines[0]?.trim() !== "---") return 0;
+  const scanLimit = Math.min(lines.length, FRONTMATTER_SCAN_LINES);
+  for (let i = 1; i < scanLimit; i++) {
+    if (lines[i]?.trim() === "---") return i + 1;
+  }
+  return 0;
+}
+
+/**
  * Derive a note's display title: the first non-empty line of `content`,
  * with a leading markdown heading marker (`#` through `######`) and its
  * following whitespace stripped, truncated to `DISPLAY_TITLE_MAX_LEN` code
@@ -2807,16 +2823,7 @@ const FRONTMATTER_SCAN_LINES = 100;
 export function computeDisplayTitle(content: string | null | undefined): string | null {
   if (!content) return null;
   const lines = content.split("\n");
-  let startIndex = 0;
-  if (lines[0]?.trim() === "---") {
-    const scanLimit = Math.min(lines.length, FRONTMATTER_SCAN_LINES);
-    for (let i = 1; i < scanLimit; i++) {
-      if (lines[i]?.trim() === "---") {
-        startIndex = i + 1;
-        break;
-      }
-    }
-  }
+  const startIndex = skipLeadingFrontmatter(lines);
   for (let i = startIndex; i < lines.length; i++) {
     const stripped = lines[i]!.replace(/^#{1,6}\s*/, "").trim();
     if (stripped === "") continue;
@@ -2827,6 +2834,58 @@ export function computeDisplayTitle(content: string | null | undefined): string 
       : stripped;
   }
   return null;
+}
+
+/** Max code points in a computed `lede` (summaries-as-content, 2026-07-17 dialogue). */
+export const LEDE_MAX_LEN = 400;
+
+/**
+ * Derive a note's "lede": the first non-empty PARAGRAPH after the title
+ * line (a run of consecutive non-blank lines, whitespace-collapsed to one
+ * line, truncated to `LEDE_MAX_LEN` code points). `null` when there's no
+ * paragraph after the title — a title-only note has no lede to report, and
+ * callers must not fall back to repeating the title itself.
+ *
+ * This is the machinery half of a soft convention (2026-07-17 dialogue):
+ * summaries work better as visible CONTENT — a note's opening paragraph —
+ * than as hidden metadata, because visible text gets corrected by the notes
+ * that reference it while hidden metadata rots unnoticed. Nothing validates
+ * that a note actually opens with a title + lede; this function just reports
+ * what it finds, honestly, using the SAME title-line rule as
+ * `computeDisplayTitle` (including its frontmatter skip) so a caller that
+ * shows both title and lede sees them agree on where the title ends.
+ */
+export function computeLede(content: string | null | undefined): string | null {
+  if (!content) return null;
+  const lines = content.split("\n");
+  const bodyStart = skipLeadingFrontmatter(lines);
+
+  let titleLine = -1;
+  for (let i = bodyStart; i < lines.length; i++) {
+    if (lines[i]!.replace(/^#{1,6}\s*/, "").trim() !== "") {
+      titleLine = i;
+      break;
+    }
+  }
+  if (titleLine === -1) return null; // no title at all — nothing to find a lede after
+
+  let i = titleLine + 1;
+  while (i < lines.length && lines[i]!.trim() === "") i++; // skip blank lines after the title
+
+  const paragraphLines: string[] = [];
+  while (i < lines.length && lines[i]!.trim() !== "") {
+    paragraphLines.push(lines[i]!);
+    i++;
+  }
+  if (paragraphLines.length === 0) return null; // title-only note
+
+  const paragraph = paragraphLines.join(" ").replace(/\s+/g, " ").trim();
+  if (paragraph === "") return null;
+
+  const codePoints = Array.from(paragraph);
+  return codePoints.length > LEDE_MAX_LEN
+    ? codePoints.slice(0, LEDE_MAX_LEN).join("")
+    : paragraph;
 }
 
 /**
