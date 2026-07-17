@@ -23,14 +23,17 @@ import { BunStore } from "./vault-store.ts";
 import { seedOnboardingNotes } from "./onboarding-seed.ts";
 import {
   applySeedPack,
+  ARCHIVED_TAG,
   CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   GETTING_STARTED_PATH,
   NOTES_REQUIRED_TAGS,
+  STARTER_ONTOLOGY_PACK,
   SURFACE_STARTER_PACK,
   SURFACE_STARTER_PATH,
   TAGS_GRAPH_PATH,
   WELCOME_PATH,
+  welcomePack,
   YOURS_TO_KEEP_PATH,
 } from "../core/src/seed-packs.ts";
 import {
@@ -287,6 +290,67 @@ describe("applySeedPack — surface-starter via add-pack", () => {
     expect(after!.content).toBe(edited);
     const all = await store.queryNotes({});
     expect(all.filter((n) => n.path === SURFACE_STARTER_PATH)).toHaveLength(1);
+  });
+});
+
+describe("applySeedPack — tag description preservation on re-apply (Aaron-ratified 2026-07-17)", () => {
+  test("fresh apply: a brand-new tag gets the pack's description, reported as touched not preserved", async () => {
+    const result = await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    expect(result.tags).toContain(ARCHIVED_TAG.name);
+    expect(result.preservedTagDescriptions).toEqual([]);
+
+    const record = await store.getTagRecord(ARCHIVED_TAG.name);
+    expect(record!.description).toBe(ARCHIVED_TAG.description);
+  });
+
+  test("re-apply unmodified: description is still the pack's text — upserted, not preserved", async () => {
+    await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    const rerun = await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    expect(rerun.preservedTagDescriptions).toEqual([]);
+
+    const record = await store.getTagRecord(ARCHIVED_TAG.name);
+    expect(record!.description).toBe(ARCHIVED_TAG.description);
+  });
+
+  test("re-apply after a user edit: the hand-tuned description survives and is reported preserved", async () => {
+    await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    const edited = "My own house rules for archiving — nothing like the default.";
+    await store.upsertTagRecord(ARCHIVED_TAG.name, { description: edited });
+
+    const rerun = await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    expect(rerun.preservedTagDescriptions).toContain(ARCHIVED_TAG.name);
+    // Still listed in `tags` — the tag itself was touched (fields/parent_names
+    // upsert unconditionally); only the description write was skipped.
+    expect(rerun.tags).toContain(ARCHIVED_TAG.name);
+
+    const record = await store.getTagRecord(ARCHIVED_TAG.name);
+    expect(record!.description).toBe(edited);
+  });
+
+  test("capture byte-identity anchor (NOTES_REQUIRED_TAGS) holds under either apply order", async () => {
+    // welcome, then starter-ontology.
+    await applySeedPack(store, welcomePack());
+    expect((await store.getTagRecord("capture"))!.description).toBe(
+      NOTES_REQUIRED_TAGS[0]!.description,
+    );
+    const afterOntology = await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    expect(afterOntology.preservedTagDescriptions).not.toContain("capture");
+    expect((await store.getTagRecord("capture"))!.description).toBe(
+      NOTES_REQUIRED_TAGS[0]!.description,
+    );
+  });
+
+  test("capture byte-identity anchor holds in the reverse order too", async () => {
+    // starter-ontology, then welcome.
+    await applySeedPack(store, STARTER_ONTOLOGY_PACK);
+    expect((await store.getTagRecord("capture"))!.description).toBe(
+      NOTES_REQUIRED_TAGS[0]!.description,
+    );
+    const afterWelcome = await applySeedPack(store, welcomePack());
+    expect(afterWelcome.preservedTagDescriptions).not.toContain("capture");
+    expect((await store.getTagRecord("capture"))!.description).toBe(
+      NOTES_REQUIRED_TAGS[0]!.description,
+    );
   });
 });
 
