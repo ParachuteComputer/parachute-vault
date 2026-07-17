@@ -34,6 +34,67 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.6] - 2026-07-17
+
+**Title axis — computed `displayTitle` + search title-boost.** Ratified
+model (2026-07-17): a note's title IS its first line, derived from content,
+never stored. Two engine pieces land here:
+
+- **`displayTitle` on list shapes.** `toNoteIndex` (the same layer that
+  computes `preview`/`byteSize`) now derives `displayTitle`: the first
+  non-empty line of content, leading markdown heading marker (`#`–`######`)
+  and whitespace stripped, truncated to 120 code points; `null` when
+  content has no non-empty line. Free — every caller already has the full
+  note's content in hand by this layer (queryNotes's phase-1 id-only
+  ordering step is followed by a phase-2 full-row fetch before
+  `toNoteIndex` ever runs), so this adds no new content reads on the
+  `include_content=false` hot path. Lands on the `query-notes` MCP tool's
+  list mode and the REST `GET /notes` (and other list-shape) responses —
+  both inherit from the shared core `toNoteIndex`/`NoteIndex`. The hosted
+  door's REST notes handler (`parachute-cloud`'s `workers/vault/src/rest/
+  notes.ts`) already imports `toNoteIndex` from `@openparachute/core`
+  (currently a local `file:` path dependency in that repo, not an npm
+  pin) — it inherits `displayTitle` at its next core refresh + deploy, no
+  code change needed there.
+- **Search title-boost.** Literal-mode `search=` results whose
+  `displayTitle` contains every query term are post-ranked ahead of
+  body-only matches — an in-memory re-rank of the already-fetched result
+  page (`applySearchTitleBoost`/`boostTitleMatches` in `core/src/notes.ts`),
+  not a `notes_fts` schema migration. This is a SEPARATE axis from the
+  existing `SEARCH_WEIGHT_PATH` bm25 weighting (vault#551) — that one
+  boosts by note `path`, a different concept from the ratified title
+  (first line of *content*). Skipped under an explicit `sort=asc`/`desc`
+  (caller wants chronological order) and under `search_mode=advanced` (raw
+  FTS5 syntax isn't safely tokenizable into boost "terms" — see
+  `extractLiteralBoostTerms`'s doc comment in `core/src/search-query.ts`).
+  Stable: notes in the same tier (both title-match, or both not) keep
+  their existing relative order.
+- Semantic search (`near_text`) is untouched — out of scope by design, so
+  its eval baseline doesn't churn.
+
+### Added
+
+- `core/src/notes.ts`: `computeDisplayTitle`, `DISPLAY_TITLE_MAX_LEN`;
+  `NoteIndex.displayTitle` (`core/src/types.ts`); `boostTitleMatches`,
+  `titleMatchesAllTerms`, `applySearchTitleBoost` (wired into both
+  `searchNotes` return paths, tagged and untagged).
+- `core/src/search-query.ts`: `extractLiteralBoostTerms` — lowercase
+  whitespace-tokenization of raw literal-mode search text for the boost,
+  intentionally separate from `buildLiteralSearchQuery`'s FTS5-escaping
+  tokens (strips literal quote characters a caller typed; doesn't attempt
+  FTS5-tokenizer parity — a heuristic re-rank signal, not a second index).
+- Tests: `core/src/display-title.test.ts` (derivation: first non-empty
+  line, heading-marker stripping, truncation, code-point-safe truncation,
+  null-on-empty; list-shape presence via MCP `query-notes`),
+  `core/src/search-title-boost.test.ts` (title-match-outranks-body-match,
+  ALL-terms-required for the boost tier, stable tie order, explicit-sort
+  and advanced-mode opt-outs), `extractLiteralBoostTerms` cases in
+  `core/src/search-query.test.ts`, REST `GET /notes` lean-shape
+  `displayTitle` presence/null cases in `src/vault.test.ts`. Adjusted the
+  `search-fts-v25.test.ts` path-vs-body ranking fixture (`legacy-1`) to a
+  multi-line body so its single-line-content coincidentally containing the
+  query term doesn't collide with the new content-title axis — see the
+  inline comment there for why.
 ## [0.7.3-rc.5] - 2026-07-17
 
 **Seed-pack re-apply preserves user-edited tag descriptions.** Aaron-ratified

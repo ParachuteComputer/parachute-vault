@@ -25,6 +25,7 @@ import { computeExpandedTagCounts, loadTagHierarchy, stripTagHash } from "./tag-
 import { chunkForInClause, IN_VIA_JSON_EACH, jsonEachParam } from "./sql-in.js";
 import {
   buildLiteralSearchQuery,
+  extractLiteralBoostTerms,
   SEARCH_WEIGHT_PATH,
   SEARCH_WEIGHT_CONTENT,
   type SearchMode,
@@ -1810,6 +1811,61 @@ function searchSyntaxError(rawQuery: string, err: unknown, mode: SearchMode): Qu
   });
 }
 
+/**
+ * Post-rank a search result page (title axis, ratified 2026-07-17) so
+ * notes whose display title (first line of content) contains EVERY boost
+ * term outrank the rest — a title-match tier ahead of a body-only-match
+ * tier. Stable partition: within a tier, the incoming order (FTS5
+ * relevance, or an explicit `sort`) is preserved untouched — two notes
+ * that both match, or both don't, keep their relative order.
+ *
+ * No-migration by design (see the search-seam note on `searchNotes`
+ * below): re-orders the already-fetched page in memory instead of adding
+ * a weighted title column to `notes_fts`, which would need a schema
+ * migration + backfill. `notes_fts`'s existing `SEARCH_WEIGHT_PATH` bm25
+ * weighting (above) already boosts by note PATH — a different axis from
+ * the ratified title model (title = first line of CONTENT, not path).
+ * This function is the one that boosts by the content-derived title.
+ */
+function boostTitleMatches(notes: Note[], terms: string[]): Note[] {
+  if (terms.length === 0) return notes;
+  return notes
+    .map((note, index) => ({ note, index, titleMatch: titleMatchesAllTerms(note.content, terms) }))
+    .sort((a, b) => {
+      if (a.titleMatch === b.titleMatch) return a.index - b.index; // stable
+      return a.titleMatch ? -1 : 1;
+    })
+    .map((x) => x.note);
+}
+
+function titleMatchesAllTerms(content: string | null | undefined, terms: string[]): boolean {
+  const title = computeDisplayTitle(content);
+  if (!title) return false;
+  const lower = title.toLowerCase();
+  return terms.every((t) => lower.includes(t));
+}
+
+/**
+ * Apply the title-boost post-rank to a fetched search page. Skipped
+ * whenever it would fight the caller's intent:
+ *   - an explicit `sort: "asc"|"desc"` means the caller wants chronological
+ *     order, not relevance re-ranking;
+ *   - `search_mode: "advanced"` text carries raw FTS5 syntax (boolean
+ *     operators, column filters, prefix `*`) — naively tokenizing it into
+ *     "terms" would misread operators as content (see
+ *     `extractLiteralBoostTerms`'s doc comment). Only literal-mode queries
+ *     (the default) get boosted today.
+ */
+function applySearchTitleBoost(
+  notes: Note[],
+  mode: SearchMode,
+  rawQuery: string,
+  sort: "asc" | "desc" | undefined,
+): Note[] {
+  if (sort !== undefined || mode !== "literal") return notes;
+  return boostTitleMatches(notes, extractLiteralBoostTerms(rawQuery));
+}
+
 export function searchNotes(
   db: Database,
   query: string,
@@ -1846,6 +1902,14 @@ export function searchNotes(
   // The weights are our own numeric constants (not user input) interpolated
   // directly — bm25()'s weight arguments are positional per-column
   // multipliers, not general SQL expressions callers can influence.
+  //
+  // NOTE: "title" here means the note's `path` — this predates the title
+  // axis (ratified 2026-07-17), under which a note's title is its first
+  // CONTENT line, not its path. `applySearchTitleBoost` (below) is the
+  // mechanism for THAT axis: a post-rank pass over the already-scored page,
+  // not a third FTS column. The two are complementary, not redundant — a
+  // note can have a matching path with a non-matching first line, or vice
+  // versa.
   const scoreExpr = `(-1.0 * bm25(notes_fts, ${SEARCH_WEIGHT_PATH}, ${SEARCH_WEIGHT_CONTENT}))`;
 
   // `sort` honored under search (vault#551 WS2A item 3): default stays FTS5
@@ -1886,7 +1950,7 @@ export function searchNotes(
         ORDER BY ${orderBy}
         LIMIT ?
       `).all(ftsQuery, ...searchTags, limit) as (NoteRow & { score: number })[];
-      return notesWithTags(db, rows, scoresById(rows));
+      return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
     } catch (err) {
       // Surface EVERY FTS5 error structured, never a raw rethrow (vault#551):
       // advanced mode expects it (the caller passed raw syntax); literal
@@ -1908,7 +1972,7 @@ export function searchNotes(
       ORDER BY ${orderBy}
       LIMIT ?
     `).all(ftsQuery, limit) as (NoteRow & { score: number })[];
-    return notesWithTags(db, rows, scoresById(rows));
+    return applySearchTitleBoost(notesWithTags(db, rows, scoresById(rows)), mode, query, opts?.sort);
   } catch (err) {
     if (err instanceof QueryError) throw err;
     throw searchSyntaxError(query, err, mode);
@@ -2702,10 +2766,52 @@ export function mergeTags(
 /** Max code points in a NoteIndex preview. */
 export const NOTE_INDEX_PREVIEW_LEN = 120;
 
+/** Max code points in a computed `displayTitle` (title axis, ratified 2026-07-17). */
+export const DISPLAY_TITLE_MAX_LEN = 120;
+
+/**
+ * Derive a note's display title: the first non-empty line of `content`,
+ * with a leading markdown heading marker (`#` through `######`) and its
+ * following whitespace stripped, truncated to `DISPLAY_TITLE_MAX_LEN` code
+ * points. `null` when content has no non-empty line (empty or
+ * whitespace/heading-marker-only note).
+ *
+ * The ratified title model (2026-07-17): a note's title IS its first line
+ * — derived from content, NEVER stored as its own column. This function is
+ * the one place that derivation happens; callers (`toNoteIndex` below) call
+ * it fresh at read time. Timestamp-path formatting — what a surface shows
+ * in place of a `null` title — is deliberately NOT this function's job; it
+ * reports the honest content-derived value (or its absence) and leaves
+ * rendering to the caller.
+ */
+export function computeDisplayTitle(content: string | null | undefined): string | null {
+  if (!content) return null;
+  for (const rawLine of content.split("\n")) {
+    const stripped = rawLine.replace(/^#{1,6}\s*/, "").trim();
+    if (stripped === "") continue;
+    // Iterate by Unicode code points so we don't split surrogate pairs mid-character.
+    const codePoints = Array.from(stripped);
+    return codePoints.length > DISPLAY_TITLE_MAX_LEN
+      ? codePoints.slice(0, DISPLAY_TITLE_MAX_LEN).join("")
+      : stripped;
+  }
+  return null;
+}
+
 /**
  * Convert a full Note into its lean index shape:
- * drops `content`, adds `byteSize` and a whitespace-collapsed `preview`.
- * Shared between the `query-notes` MCP tool, HTTP /notes endpoints, and /graph.
+ * drops `content`, adds `byteSize`, a whitespace-collapsed `preview`, and a
+ * computed `displayTitle`. Shared between the `query-notes` MCP tool, HTTP
+ * /notes endpoints, and /graph.
+ *
+ * Perf note: `displayTitle` costs nothing extra here — every caller of this
+ * function already has the full `Note` (content included) in hand by the
+ * time it's called. `queryNotes`'s two-phase page fetch selects a narrow
+ * `id`-only column list for the ORDER BY/pagination phase, but the second
+ * phase (`fetchNotesByIdsOrdered`) always `SELECT *`s the page's full rows
+ * before `toNoteIndex` ever runs — same as `preview`/`byteSize` today. If a
+ * future lean-list path is added that genuinely avoids a content read, it
+ * must NOT call this function (or `toNoteIndex`) on a content-less row.
  */
 export function toNoteIndex(note: Note): NoteIndex {
   const content = note.content ?? "";
@@ -2732,6 +2838,7 @@ export function toNoteIndex(note: Note): NoteIndex {
     metadata: note.metadata,
     byteSize,
     preview,
+    displayTitle: computeDisplayTitle(note.content),
     ...(note.score !== undefined ? { score: note.score } : {}),
   };
 }

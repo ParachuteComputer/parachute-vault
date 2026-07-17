@@ -4,6 +4,7 @@ import {
   escapeFtsToken,
   buildLiteralSearchQuery,
   isValidSearchMode,
+  extractLiteralBoostTerms,
 } from "./search-query.js";
 
 describe("escapeFtsToken", () => {
@@ -145,5 +146,46 @@ describe("isValidSearchMode / SEARCH_MODES", () => {
     expect(isValidSearchMode(null)).toBe(false);
     expect(isValidSearchMode(undefined)).toBe(false);
     expect(isValidSearchMode(["literal"])).toBe(false);
+  });
+});
+
+describe("extractLiteralBoostTerms (search title-boost input, title axis)", () => {
+  it("lowercases and whitespace-splits", () => {
+    expect(extractLiteralBoostTerms("Budget Review")).toEqual(["budget", "review"]);
+  });
+
+  it("collapses whitespace runs", () => {
+    expect(extractLiteralBoostTerms("widgets    gadgets")).toEqual(["widgets", "gadgets"]);
+  });
+
+  it("trims leading/trailing whitespace", () => {
+    expect(extractLiteralBoostTerms("  widgets  ")).toEqual(["widgets"]);
+  });
+
+  it("strips literal quote characters a caller typed, unlike buildLiteralSearchQuery", () => {
+    // buildLiteralSearchQuery treats a manually-typed `"` as ordinary
+    // content (escaped into the FTS phrase); the boost-term extractor
+    // strips it instead, since a title-string comparison shouldn't
+    // require the title to contain a literal quote mark.
+    expect(extractLiteralBoostTerms(`"eleven-day capping delay"`)).toEqual([
+      "eleven-day",
+      "capping",
+      "delay",
+    ]);
+  });
+
+  it("preserves punctuation that isn't a quote (hyphen, period, apostrophe)", () => {
+    expect(extractLiteralBoostTerms("eleven-day")).toEqual(["eleven-day"]);
+    expect(extractLiteralBoostTerms("18.6")).toEqual(["18.6"]);
+    expect(extractLiteralBoostTerms("didn't")).toEqual(["didn't"]);
+  });
+
+  it("returns an empty array for blank/whitespace-only input", () => {
+    expect(extractLiteralBoostTerms("")).toEqual([]);
+    expect(extractLiteralBoostTerms("   ")).toEqual([]);
+  });
+
+  it("sanitizes control characters as separators, matching buildLiteralSearchQuery", () => {
+    expect(extractLiteralBoostTerms("hello\x00world")).toEqual(["hello", "world"]);
   });
 });

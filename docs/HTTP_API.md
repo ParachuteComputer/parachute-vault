@@ -175,8 +175,8 @@ with a structured envelope:
 ### `NoteIndex` (lean shape)
 
 Returned by list endpoints by default. Same as `Note` minus `content`, plus
-`byteSize` and a one-line `preview` (~120 code points, whitespace
-collapsed).
+`byteSize`, a one-line `preview` (~120 code points, whitespace collapsed),
+and a computed `displayTitle`.
 
 ```ts
 {
@@ -188,6 +188,7 @@ collapsed).
   metadata?: Record<string, unknown>;
   byteSize: number;  // UTF-8 bytes of the full content
   preview: string;   // first ~120 chars, single line
+  displayTitle: string | null;  // title axis (ratified 2026-07-17) — first non-empty content line, heading markers stripped, ~120 chars max; null when content is empty. Never stored — computed fresh from content at read time.
   score?: number;    // vault#551 — search results ONLY, carried onto the lean shape too (search's default response IS NoteIndex[])
   broken_links?: { target: string; relationship: string }[];  // vault#555 — only when include_broken_links=true was passed
 }
@@ -991,6 +992,17 @@ Query params:
     the number is only meaningful as a RELATIVE comparison within one
     result set (different queries have no shared scale). Absent on every
     non-search response.
+  - **Content-title boost (title axis, ratified 2026-07-17).** A SEPARATE
+    signal from the `path` bm25 weighting above: literal-mode results
+    (`search_mode=advanced` is unaffected — see below) whose `displayTitle`
+    (the first non-empty line of CONTENT, not the note's `path`) contains
+    every search term are moved ahead of body-only-match results —
+    implemented as an in-memory post-rank pass over the already-fetched
+    page, not a `notes_fts` schema change. Only applies to the default
+    relevance ordering; an explicit `sort=asc`/`sort=desc` disables it (the
+    caller asked for chronological order, not relevance). Within a tier,
+    relative order is preserved (stable) — two results that both match, or
+    both don't, keep the order FTS5 (or the explicit sort) gave them.
   - **Porter stemming.** The FTS5 tokenizer is now `porter unicode61`
     (previously bare `unicode61`) — regular English affixes match across
     forms: `search=firefighter` finds "firefighters", `search=microbe`

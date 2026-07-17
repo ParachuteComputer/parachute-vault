@@ -2139,6 +2139,22 @@ describe("HTTP /notes", async () => {
     expect(body[0]).not.toHaveProperty("content");
     expect(body[0]).toHaveProperty("byteSize");
     expect(body[0]).toHaveProperty("preview");
+    expect(body[0]).toHaveProperty("displayTitle");
+  });
+
+  // Title axis (ratified 2026-07-17) — displayTitle on the REST lean shape.
+  test("GET /notes lean shape carries the computed displayTitle", async () => {
+    await store.createNote("# Meeting Notes\nagenda: budget", { path: "meeting" });
+    const res = await handleNotes(mkReq("GET", "/notes"), store, "");
+    const body = await res.json() as any[];
+    expect(body[0].displayTitle).toBe("Meeting Notes");
+  });
+
+  test("GET /notes lean shape reports null displayTitle for an empty note", async () => {
+    await store.createNote("", { path: "empty" });
+    const res = await handleNotes(mkReq("GET", "/notes"), store, "");
+    const body = await res.json() as any[];
+    expect(body[0].displayTitle).toBeNull();
   });
 
   test("GET /notes?include_content=true returns full notes", async () => {
