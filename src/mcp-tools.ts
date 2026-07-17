@@ -43,6 +43,8 @@ import {
 import { chooseHubOrigin, mintHubJwt, revokeHubJwt } from "./mcp-install.ts";
 import { looksLikeJwt } from "./hub-jwt.ts";
 import { readGlobalConfig, DEFAULT_PORT } from "./config.ts";
+import { getBaseUrl } from "./oauth-discovery.ts";
+import { getSharedAttachmentTicketProvider } from "./attachment-tickets.ts";
 
 /**
  * Filter a vault projection to entries an in-scope tag contributes to.
@@ -110,6 +112,10 @@ export async function getServerInstruction(
     description: config?.description ?? null,
     projection,
     coordinates: resolveVaultCoordinates(),
+    // Bun always wires an in-process AttachmentTicketProvider (see
+    // `generateScopedMcpTools` below) — the connect-time brief can
+    // unconditionally teach the ticket tools on this door.
+    attachments: { ticketsEnabled: true },
   });
 }
 
@@ -143,6 +149,16 @@ export function generateScopedMcpTools(
   vaultName: string,
   auth?: AuthResult,
   callerBearer?: string | null,
+  /**
+   * The incoming MCP request, when available (omitted by the many
+   * test-only call sites that construct tools without a live request).
+   * Threaded through ONLY so the attachment-ticket tools can resolve a
+   * request-accurate `urlBase` (honoring `X-Forwarded-Host`/proto, same as
+   * `getBaseUrl`) — falls back to `resolveVaultCoordinates()`'s configured/
+   * expose-state origin when omitted, so ticket tools are still present
+   * (just less precisely origined) in that case.
+   */
+  req?: Request,
 ): McpToolDef[] {
   const store = getVaultStore(vaultName);
 
@@ -225,20 +241,39 @@ export function generateScopedMcpTools(
     ? (info) => logStrictBypass(info)
     : undefined;
 
-  const tools = generateMcpTools(
-    store,
-    expandVisibility || nearTraversable || ifExistsVisible || aggregateVisibility || writeContext || strictBypass
-      ? {
-          ...(expandVisibility ? { expandVisibility } : {}),
-          ...(nearTraversable ? { nearTraversable } : {}),
-          ...(ifExistsVisible ? { ifExistsVisible } : {}),
-          ...(aggregateVisibility ? { aggregateVisibility } : {}),
-          ...(writeContext ? { writeContext } : {}),
-          ...(strictBypass ? { strictBypass } : {}),
-          ...(onStrictBypass ? { onStrictBypass } : {}),
-        }
-      : undefined,
-  );
+  // Attachment tickets (Wave 1): bun always wires the in-process provider
+  // (see src/attachment-tickets.ts) — unlike the tag-scope predicates
+  // above, this isn't conditional on `scoped` because the tools should be
+  // listed for every session, scoped or not. Tag-scope confidentiality is
+  // still enforced (`noteVisible`, awaited inline inside the ticket tools'
+  // own async execute — see its doc comment in generateMcpTools for why
+  // this doesn't need the shared allowedHolder machinery the OTHER
+  // predicates above do).
+  const ticketNoteVisible = scoped
+    ? async (note: Note) => {
+        const allowed = await expandTokenTagScope(store, rawTags);
+        return noteWithinTagScope(note, allowed, rawTags);
+      }
+    : undefined;
+  const ticketUrlBase = req
+    ? `${getBaseUrl(req).replace(/\/$/, "")}/vault/${vaultName}`
+    : `${resolveVaultCoordinates().hubOrigin.replace(/\/$/, "")}/vault/${vaultName}`;
+
+  const tools = generateMcpTools(store, {
+    ...(expandVisibility ? { expandVisibility } : {}),
+    ...(nearTraversable ? { nearTraversable } : {}),
+    ...(ifExistsVisible ? { ifExistsVisible } : {}),
+    ...(aggregateVisibility ? { aggregateVisibility } : {}),
+    ...(writeContext ? { writeContext } : {}),
+    ...(strictBypass ? { strictBypass } : {}),
+    ...(onStrictBypass ? { onStrictBypass } : {}),
+    attachmentTickets: {
+      provider: getSharedAttachmentTicketProvider(),
+      vaultName,
+      urlBase: ticketUrlBase,
+      ...(ticketNoteVisible ? { noteVisible: ticketNoteVisible } : {}),
+    },
+  });
 
   overrideVaultInfo(tools, vaultName, auth);
   applyTagDependencyGuards(tools, vaultName);

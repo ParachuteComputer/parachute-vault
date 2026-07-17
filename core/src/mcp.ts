@@ -45,6 +45,18 @@ import {
   contentRangeRequiresContent,
   MIN_CONTENT_LENGTH,
 } from "./content-range.js";
+import {
+  BLOCKED_ATTACHMENT_EXTENSIONS,
+  sanitizeAttachmentExtension,
+  mimeForAttachmentExtension,
+} from "./attachment/policy.js";
+import {
+  computeTicketTtlMs,
+  generateTicketId,
+  MAX_TICKET_UPLOAD_BYTES,
+  type AttachmentTicket,
+  type AttachmentTicketProvider,
+} from "./attachment/tickets.js";
 
 export interface McpToolDef {
   name: string;
@@ -80,7 +92,7 @@ export interface McpToolDef {
  */
 function structuredError(
   message: string,
-  fields: { error_type: string; field?: string; hint?: string },
+  fields: { error_type: string; field?: string; hint?: string } & Record<string, unknown>,
 ): Error {
   return Object.assign(new Error(message), fields);
 }
@@ -246,6 +258,39 @@ export interface GenerateMcpToolsOpts {
    * path with no extra fetch.
    */
   aggregateVisibility?: (note: Note) => boolean;
+  /**
+   * `AttachmentTicketProvider` seam (vault attachment-tickets design,
+   * Wave 1 — D10 "tools omitted when unwired"). When provided,
+   * `generateMcpTools` appends `request-attachment-upload` /
+   * `request-attachment-download` to the returned tool list. Omitted (a
+   * door that hasn't wired its ticket seam yet) → the two tools are
+   * ABSENT from the list entirely — not merely erroring on call — so an
+   * agent is never shown an affordance the runtime can't back.
+   */
+  attachmentTickets?: {
+    provider: AttachmentTicketProvider;
+    /** This vault's own name — stamped onto every minted ticket so the spend route can cheaply reject a cross-vault replay. */
+    vaultName: string;
+    /**
+     * Absolute base URL for this vault's ticket spend path, no trailing
+     * slash — e.g. `https://host/vault/<name>`. A minted ticket's URL is
+     * `${urlBase}/tickets/<id>`. Resolved by the caller (server layer)
+     * from the incoming request's `X-Forwarded-Host`/proto — core stays
+     * request-unaware.
+     */
+    urlBase: string;
+    /**
+     * OPTIONAL per-note visibility predicate (tag-scope confidentiality —
+     * same intent as `expandVisibility`/`ifExistsVisible` above, kept
+     * separate because it needs to be awaitable). Both ticket tools run
+     * fully async execute() paths (unlike `expandVisibility`/
+     * `ifExistsVisible`, which feed core's SYNCHRONOUS wikilink/if_exists
+     * code and so need the shared pre-resolved-allowlist-holder
+     * machinery), so this can just be awaited inline. Omitted (unscoped /
+     * internal callers) → every note/attachment is visible.
+     */
+    noteVisible?: (note: Note) => boolean | Promise<boolean>;
+  };
 }
 
 /**
@@ -312,7 +357,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
     });
   };
 
-  return [
+  const tools: McpToolDef[] = [
 
     // =====================================================================
     // 1. query-notes — the universal read tool
@@ -2779,6 +2824,202 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
     },
 
   ];
+
+  // =====================================================================
+  // 12/13. request-attachment-upload / request-attachment-download —
+  // runtime-lane attachment tickets (Wave 1). Present ONLY when the
+  // server layer wires an AttachmentTicketProvider — see
+  // `GenerateMcpToolsOpts.attachmentTickets`'s doc comment (D10, "tools
+  // omitted when unwired"). Bytes never pass through either tool: the
+  // model gets back a URL + a literal curl_example; a runtime with a
+  // shell spends it directly, outside this MCP session entirely.
+  // =====================================================================
+  const ticketSeam = opts?.attachmentTickets;
+  if (ticketSeam) {
+    tools.push(
+      {
+        name: "request-attachment-upload",
+        requiredVerb: "write",
+        description:
+          "Mint a short-lived, single-use upload URL for a note attachment. Bytes never pass through this tool — you get back a URL (+ a ready-to-run `curl_example`) your runtime's shell spends directly; no MCP session credential is needed to spend it. Provide the target `note` (id or path), the `filename`, and its exact `size_bytes` — declared here and enforced at spend (a mismatch, or exceeding the 100 MiB REST upload cap, fails the mint or the upload). `mime_type` is inferred from the filename's extension when omitted. Pass `transcribe: true` for an audio file to enqueue it exactly like the REST attach flow does. The ticket's `expires_at` scales with declared size (10 minutes base + 10s per MiB, capped at 30 minutes) and can be spent exactly once — a failed curl means re-minting, not retrying the same URL.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            note: { type: "string", description: "Target note ID or path" },
+            filename: { type: "string", description: "Original filename — sanitized for a blocked extension (active-content types: .html/.svg/.xml/.js/.css/…) and used to infer the MIME type when `mime_type` is omitted." },
+            size_bytes: {
+              type: "number",
+              description: `Declared upload size in bytes. Must be > 0 and <= ${MAX_TICKET_UPLOAD_BYTES} (100 MiB — the same ceiling REST's own /storage/upload enforces). The spend endpoint rejects (413) any upload that exceeds this declared size.`,
+            },
+            mime_type: { type: "string", description: "MIME type to store on the attachment row. Inferred from `filename`'s extension when omitted (`application/octet-stream` for an uncurated extension)." },
+            transcribe: { type: "boolean", description: "Opt into transcription for an audio attachment — mirrors the REST `POST /notes/:id/attachments` `transcribe` flag." },
+          },
+          required: ["note", "filename", "size_bytes"],
+        },
+        execute: async (params) => {
+          const noteRef = params.note;
+          if (typeof noteRef !== "string" || noteRef.trim() === "") {
+            throw structuredError("`note` is required", {
+              error_type: "missing_required_field",
+              field: "note",
+              how_to: "pass the target note's id or path",
+            });
+          }
+          const filename = params.filename;
+          if (typeof filename !== "string" || filename.trim() === "") {
+            throw structuredError("`filename` is required", {
+              error_type: "missing_required_field",
+              field: "filename",
+              how_to: "pass the original filename you're about to upload",
+            });
+          }
+          const sizeBytes = params.size_bytes;
+          if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+            throw structuredError("`size_bytes` must be a positive number", {
+              error_type: "invalid_query",
+              field: "size_bytes",
+              how_to: "pass the exact byte length of the file you're about to upload",
+            });
+          }
+          if (sizeBytes > MAX_TICKET_UPLOAD_BYTES) {
+            throw structuredError(
+              `size_bytes (${sizeBytes}) exceeds the ${MAX_TICKET_UPLOAD_BYTES} byte (100 MiB) upload cap`,
+              {
+                error_type: "file_too_large",
+                field: "size_bytes",
+                limit: MAX_TICKET_UPLOAD_BYTES,
+                got: sizeBytes,
+                how_to: "REST /storage/upload shares this same 100 MiB ceiling — split the file or upload it out-of-band",
+              },
+            );
+          }
+
+          const note = requireNote(db, noteRef);
+          if (ticketSeam.noteVisible && !(await ticketSeam.noteVisible(note))) {
+            // Uniform not_found — a tag-scoped caller learns nothing about
+            // an out-of-scope note's existence (same posture as every other
+            // scope-gated tool in this file).
+            throw structuredError(`Note not found: "${noteRef}"`, { error_type: "not_found", field: "note" });
+          }
+
+          const ext = sanitizeAttachmentExtension(filename);
+          if (BLOCKED_ATTACHMENT_EXTENSIONS.has(ext)) {
+            throw structuredError(`File type ${ext} not allowed (active/executable content)`, {
+              error_type: "blocked_upload_extension",
+              field: "filename",
+              extension: ext,
+              how_to: "rename with a non-executable extension, or store the content as note text instead",
+            });
+          }
+
+          const mimeType =
+            typeof params.mime_type === "string" && params.mime_type.trim() !== ""
+              ? params.mime_type
+              : mimeForAttachmentExtension(ext);
+
+          const now = Date.now();
+          const expiresAt = now + computeTicketTtlMs(sizeBytes);
+          const id = generateTicketId();
+          const ticket: AttachmentTicket = {
+            id,
+            kind: "upload",
+            vaultName: ticketSeam.vaultName,
+            createdAt: now,
+            expiresAt,
+            noteId: note.id,
+            filename,
+            mimeType,
+            sizeBytes,
+            transcribe: params.transcribe === true,
+          };
+          await ticketSeam.provider.put(ticket);
+
+          const url = `${ticketSeam.urlBase}/tickets/${id}`;
+          return {
+            method: "PUT",
+            url,
+            headers: { "content-type": mimeType },
+            expires_at: new Date(expiresAt).toISOString(),
+            max_bytes: sizeBytes,
+            curl_example: `curl -X PUT -H 'content-type: ${mimeType}' --data-binary @${filename} '${url}'`,
+          };
+        },
+      },
+      {
+        name: "request-attachment-download",
+        requiredVerb: "read",
+        description:
+          "Mint a short-lived, single-use download URL for an existing attachment's bytes. Bytes never pass through this tool — you get back a URL (+ a ready-to-run `curl_example`) your runtime's shell spends directly; no MCP session credential is needed to spend it. Pass the `attachment_id` from a note's `include_attachments: true` rows (query-notes) or `GET .../attachments`. The ticket's `expires_at` follows the same size-scaled window as upload tickets (10 minutes base, up to 30) and can be spent exactly once.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            attachment_id: { type: "string", description: "The attachment's id (from a note's attachment rows)" },
+          },
+          required: ["attachment_id"],
+        },
+        execute: async (params) => {
+          const attachmentId = params.attachment_id;
+          if (typeof attachmentId !== "string" || attachmentId.trim() === "") {
+            throw structuredError("`attachment_id` is required", {
+              error_type: "missing_required_field",
+              field: "attachment_id",
+              how_to: "pass the attachment id from a note's attachment rows",
+            });
+          }
+
+          const attachment = await store.getAttachment(attachmentId);
+          if (!attachment) {
+            throw structuredError(`Attachment not found: "${attachmentId}"`, {
+              error_type: "not_found",
+              field: "attachment_id",
+            });
+          }
+
+          if (ticketSeam.noteVisible) {
+            const owningNote = await store.getNote(attachment.noteId);
+            // A missing owning note (shouldn't happen — ON DELETE CASCADE —
+            // but never trust it) collapses to the same not_found as an
+            // out-of-scope note: no oracle either way.
+            if (!owningNote || !(await ticketSeam.noteVisible(owningNote))) {
+              throw structuredError(`Attachment not found: "${attachmentId}"`, {
+                error_type: "not_found",
+                field: "attachment_id",
+              });
+            }
+          }
+
+          const metaSize = attachment.metadata?.size;
+          const declaredSize = typeof metaSize === "number" ? metaSize : undefined;
+          const now = Date.now();
+          const expiresAt = now + computeTicketTtlMs(declaredSize);
+          const id = generateTicketId();
+          const ticket: AttachmentTicket = {
+            id,
+            kind: "download",
+            vaultName: ticketSeam.vaultName,
+            createdAt: now,
+            expiresAt,
+            attachmentId: attachment.id,
+            mimeType: attachment.mimeType,
+            sizeBytes: declaredSize,
+          };
+          await ticketSeam.provider.put(ticket);
+
+          const url = `${ticketSeam.urlBase}/tickets/${id}`;
+          return {
+            method: "GET",
+            url,
+            mime_type: attachment.mimeType,
+            ...(declaredSize !== undefined ? { size_bytes: declaredSize } : {}),
+            expires_at: new Date(expiresAt).toISOString(),
+            curl_example: `curl -o downloaded${sanitizeAttachmentExtension(attachment.path) || ""} '${url}'`,
+          };
+        },
+      },
+    );
+  }
+
+  return tools;
 }
 
 // ---------------------------------------------------------------------------

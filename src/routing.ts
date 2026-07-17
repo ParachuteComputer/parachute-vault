@@ -103,6 +103,7 @@ import {
 } from "./mirror-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
+import { handleTicketSpend } from "./attachment-tickets.ts";
 
 /**
  * Decorate a 401 response from the MCP endpoint with the RFC 9728 challenge
@@ -488,6 +489,22 @@ export async function route(
   }
   if (subpath === "/.well-known/oauth-authorization-server") {
     return handleAuthorizationServer(req, vaultName);
+  }
+
+  // Attachment ticket spend (attachment-tickets design, Wave 1) — no auth
+  // beyond the ticket itself; the ticket IS the credential (single-use,
+  // short TTL, scoped to exactly one upload slot or one attachment's
+  // bytes). Deliberately placed BEFORE `authenticateVaultRequest` below —
+  // a bearer-less runtime (a bare `curl`) must be able to spend a ticket
+  // without ever holding this vault's API key. The path segment
+  // (`/tickets/<id>`) is outside the authed `/api` tree and outside
+  // `/mcp` on purpose — see `request-attachment-upload`/`-download`
+  // (core/src/mcp.ts) for where tickets are minted.
+  const vaultTicketMatch = subpath.match(/^\/tickets\/([^/]+)$/);
+  if (vaultTicketMatch) {
+    const ticketId = decodeURIComponent(vaultTicketMatch[1]!);
+    const store = getVaultStore(vaultName);
+    return handleTicketSpend(req, ticketId, vaultName, store);
   }
 
   // ---------------------------------------------------------------------
