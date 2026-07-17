@@ -153,3 +153,30 @@ export function buildLiteralSearchQuery(raw: string): LiteralSearchQuery {
   const tokens = cleaned.trim().split(/\s+/).filter(Boolean);
   return { query: tokens.map(escapeFtsToken).join(" "), isEmpty: false };
 }
+
+/**
+ * Extract lowercase whitespace-delimited terms from raw literal-mode search
+ * text, for the search title-boost post-rank (title axis, ratified
+ * 2026-07-17) — NOT used to build the FTS5 MATCH query itself (that's
+ * `buildLiteralSearchQuery`, above). Sanitizes control characters the same
+ * way, plus strips any literal `"` a caller typed (kept as ordinary content
+ * by `buildLiteralSearchQuery`, but a display-title substring check
+ * shouldn't require the title to contain a literal quote mark).
+ *
+ * This is a heuristic re-rank signal, not a second index — it deliberately
+ * does not attempt FTS5-tokenizer parity (stemming, unicode normalization).
+ * It only needs to answer "does the note's first line plausibly contain the
+ * query," not reproduce FTS5's match semantics exactly. Restricted to
+ * literal-mode callers by convention (see `core/src/notes.ts` `searchNotes`)
+ * — `search_mode: "advanced"` text carries FTS5 boolean/column/prefix
+ * operators (`AND`, `path:`, `foo*`) that would leak into the term list as
+ * false "content" if tokenized the same naive way.
+ */
+export function extractLiteralBoostTerms(raw: string): string[] {
+  const cleaned = raw.replace(CONTROL_CHARS, " ").toLowerCase();
+  return cleaned
+    .trim()
+    .split(/\s+/)
+    .map((t) => t.replace(/^"+|"+$/g, ""))
+    .filter(Boolean);
+}

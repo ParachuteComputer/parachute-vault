@@ -132,7 +132,15 @@ describe("search — v24 → v25 migration (legacy vault upgrade)", () => {
     );
     insert.run(
       "legacy-1",
-      "a dedicated writeup mentioning propolis only once in passing text",
+      // Deliberately multi-line, with the "propolis" mention on a LATER
+      // line — this fixture isolates the PATH-weighted bm25 axis (below)
+      // from the separate content-title-boost axis (title axis, ratified
+      // 2026-07-17): that boost derives a note's "title" from its FIRST
+      // content line, and a single-line note IS its own title in full, so
+      // a one-line body mentioning "propolis" would (correctly, under the
+      // newer axis) count as a title match and confound this test's
+      // path-only signal. See `search-title-boost.test.ts` for that axis.
+      "Notes on foraging patterns\n\na dedicated writeup mentioning propolis only once in passing text",
       "beekeeping-notes",
       "2026-01-01T00:00:00.000Z",
       "2026-01-01T00:00:00.000Z",

@@ -400,6 +400,12 @@ export interface NoteIndex {
   metadata?: Record<string, unknown>;
   byteSize: number;
   preview: string;
+  /** Derived from the first non-empty line of content (title axis, ratified
+   *  2026-07-17) — NEVER stored, computed fresh at read time by
+   *  `computeDisplayTitle`. `null` when content has no non-empty line.
+   *  Surfaces decide how to render a `null` title (e.g. a timestamp/path
+   *  fallback); core just reports the honest content-derived value. */
+  displayTitle: string | null;
   /** Opt-in link degree (see `Note.linkCount`). */
   linkCount?: number;
   /** Full-text search relevance score (see `Note.score`). Carried onto the
