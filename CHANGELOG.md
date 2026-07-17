@@ -34,6 +34,44 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.8] - 2026-07-17
+
+**`computeDisplayTitle` skips a leading frontmatter block.** Follow-up
+from #608's review: content that literally *starts* with a YAML
+frontmatter block (`---\ntitle: X\n---\n# Real Title`) derived the
+literal string `"---"` as its display title instead of the real one.
+Normal ingestion strips frontmatter into `metadata` before create, so
+this only bites direct MCP/REST creates that paste raw
+frontmatter-bearing text — a misuse path, but a cheap fix under the
+ratified "title = first line" model: the first line of the DOCUMENT is
+not the first line of its delimiter.
+
+- `computeDisplayTitle` (`core/src/notes.ts`) now detects a leading
+  `---` line and, if a matching closing `---` is found within a bounded
+  scan (the first 100 lines), derives the title from the first
+  non-empty line AFTER the closing fence instead. An unterminated
+  opening `---` (no closing fence within the scan window) falls back to
+  the pre-existing behavior — deriving from line 0 — so a note whose
+  real first line is literally `---` (e.g. a markdown horizontal rule)
+  isn't mangled. A note whose entire content is a closed frontmatter
+  block (nothing meaningful after it) derives `null`, same as any other
+  note with no non-empty line.
+- The search title-boost (`titleMatchesAllTerms` in the same file) calls
+  `computeDisplayTitle` directly — it inherits the fix automatically, no
+  separate change needed.
+- Tests: `core/src/display-title.test.ts` — closed-frontmatter skip
+  (single field and multi-field/blank-line variants), unterminated `---`
+  fallback, whole-content-is-frontmatter → null (with and without a
+  trailing newline, and with trailing blank lines), bounded-scan-window
+  miss falls back, byte-identical regression pin on non-frontmatter
+  content; `core/src/search-title-boost.test.ts` — a frontmatter-led note
+  still boosts to the front on its real (post-frontmatter) title.
+
+### Fixed
+
+- `core/src/notes.ts`: `computeDisplayTitle` no longer derives `"---"`
+  as the display title for content that opens with a closed YAML
+  frontmatter block.
 ## [0.7.3-rc.7] - 2026-07-17
 
 **Attachment tickets — agent upload/download via short-lived capability

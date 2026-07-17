@@ -2770,6 +2770,15 @@ export const NOTE_INDEX_PREVIEW_LEN = 120;
 export const DISPLAY_TITLE_MAX_LEN = 120;
 
 /**
+ * Bounded line-count a leading frontmatter block's closing fence is
+ * searched within (see `computeDisplayTitle`). Frontmatter blocks are a
+ * handful of lines in practice; capping the scan keeps a pathological
+ * "content starts with `---` but never closes it" note O(1)-ish rather
+ * than a full-content scan on every derivation.
+ */
+const FRONTMATTER_SCAN_LINES = 100;
+
+/**
  * Derive a note's display title: the first non-empty line of `content`,
  * with a leading markdown heading marker (`#` through `######`) and its
  * following whitespace stripped, truncated to `DISPLAY_TITLE_MAX_LEN` code
@@ -2783,11 +2792,33 @@ export const DISPLAY_TITLE_MAX_LEN = 120;
  * in place of a `null` title — is deliberately NOT this function's job; it
  * reports the honest content-derived value (or its absence) and leaves
  * rendering to the caller.
+ *
+ * Frontmatter skip: normal ingestion strips a YAML frontmatter block into
+ * `metadata` before create, so `content` never carries one — but a direct
+ * MCP/REST create can paste raw frontmatter-bearing text
+ * (`---\ntitle: X\n---\n# Real Title`), and the first line of that
+ * DOCUMENT is not the first line of its delimiter. When `content` opens
+ * with a `---` line, derivation starts after the matching CLOSING `---`
+ * (searched within the first `FRONTMATTER_SCAN_LINES` lines). An
+ * unterminated opening `---` falls back to the pre-existing behavior —
+ * scanning from line 0 — so a note whose real first line is literally
+ * `---` isn't mangled.
  */
 export function computeDisplayTitle(content: string | null | undefined): string | null {
   if (!content) return null;
-  for (const rawLine of content.split("\n")) {
-    const stripped = rawLine.replace(/^#{1,6}\s*/, "").trim();
+  const lines = content.split("\n");
+  let startIndex = 0;
+  if (lines[0]?.trim() === "---") {
+    const scanLimit = Math.min(lines.length, FRONTMATTER_SCAN_LINES);
+    for (let i = 1; i < scanLimit; i++) {
+      if (lines[i]?.trim() === "---") {
+        startIndex = i + 1;
+        break;
+      }
+    }
+  }
+  for (let i = startIndex; i < lines.length; i++) {
+    const stripped = lines[i]!.replace(/^#{1,6}\s*/, "").trim();
     if (stripped === "") continue;
     // Iterate by Unicode code points so we don't split surrogate pairs mid-character.
     const codePoints = Array.from(stripped);

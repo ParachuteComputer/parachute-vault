@@ -83,6 +83,47 @@ describe("computeDisplayTitle", () => {
     const result = computeDisplayTitle(emojiTitle)!;
     expect(Array.from(result).length).toBe(DISPLAY_TITLE_MAX_LEN);
   });
+
+  describe("leading frontmatter block (misuse path — direct create with raw frontmatter)", () => {
+    it("skips a closed frontmatter block and derives the first line of the DOCUMENT", () => {
+      expect(computeDisplayTitle("---\ntitle: X\n---\n# Real Title")).toBe("Real Title");
+    });
+
+    it("skips a closed frontmatter block with multiple fields + blank lines after", () => {
+      expect(
+        computeDisplayTitle("---\ntitle: X\ntags: [a, b]\n---\n\n\nReal Title\nbody"),
+      ).toBe("Real Title");
+    });
+
+    it("falls back to treating an UNTERMINATED opening `---` as ordinary content", () => {
+      // No closing fence anywhere in the content — a note whose real first
+      // line is literally "---" (e.g. a markdown horizontal rule opener)
+      // must not be mangled.
+      expect(computeDisplayTitle("---\nnot frontmatter, just a rule\nmore text")).toBe("---");
+    });
+
+    it("returns null when content is EXACTLY a closed frontmatter block (nothing after)", () => {
+      expect(computeDisplayTitle("---\ntitle: X\n---\n")).toBeNull();
+      expect(computeDisplayTitle("---\ntitle: X\n---")).toBeNull();
+    });
+
+    it("returns null when only blank lines follow a closed frontmatter block", () => {
+      expect(computeDisplayTitle("---\ntitle: X\n---\n\n  \n")).toBeNull();
+    });
+
+    it("does not treat a closing fence found past the bounded scan window as a frontmatter close", () => {
+      // Opening `---` with the closing fence past FRONTMATTER_SCAN_LINES
+      // (100): the scan gives up and falls back to ordinary-content
+      // behavior, deriving from line 0.
+      const filler = Array.from({ length: 150 }, (_, i) => `line ${i}`).join("\n");
+      expect(computeDisplayTitle(`---\n${filler}\n---\nReal Title`)).toBe("---");
+    });
+
+    it("normal content with no leading `---` is byte-identical to prior behavior", () => {
+      expect(computeDisplayTitle("# Grocery List\nmilk, eggs")).toBe("Grocery List");
+      expect(computeDisplayTitle("Just a note\nbody text")).toBe("Just a note");
+    });
+  });
 });
 
 describe("toNoteIndex — displayTitle wiring", () => {
