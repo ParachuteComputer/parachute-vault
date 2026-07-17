@@ -34,6 +34,61 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.4] - 2026-07-16
+
+**`starter-ontology` seed pack (opt-in).** From the 2026-07-16 design
+dialogue (Letter 1, Q5: "yes — tiny, opinionated, removable"): a fourth
+named pack, `core/src/seed-packs.ts`, adding exactly four starter tags —
+`view`, `archived`, `pinned`, `capture` — with constitution-style
+descriptions (plain, warm, non-prescriptive: they describe the DEFAULT
+convention and invite each vault to adapt it) plus four seed `#view` notes
+mirroring the app's default pages (All notes, Recent, Pinned, Archive), so
+"default app pages are shipped views" has its data half from day one.
+
+- **"Meta tag" naming.** `view` is the one tag here that carries a schema —
+  the ratified user-facing term for that is now **meta tag** (a tag with a
+  schema), and `VIEW_TAG`'s description names itself as one. `archived`,
+  `pinned`, and `capture` are plain tags — no fields, just a taught
+  convention.
+- **`view`'s schema**: `kind` (`list | board | calendar | gallery`, default
+  `"list"` — an unrecognized or absent kind should degrade to list rather
+  than fail), `query` (the saved query — a JSON string of query-notes
+  params), `lane_by` (board lanes, optional), `date_field` (the date-typed
+  field a calendar plots against, optional — pairs with the `date` field
+  type added in 0.7.3-rc.3). A `#view` note IS a saved view: metadata
+  carries the machine-readable definition, the body is prose for people —
+  so any surface can render it and any agent can write one.
+- **`archived`**: out of the flow of the present — default views exclude it
+  unless a view's own query asks for it back. **`pinned`**: surfaced first
+  as its own partition, not a sort — reintroduced with these ratified
+  semantics after the old sort-first `#pinned` was dropped as vestigial
+  (rc.18 / PR #547); this pack never stamps it onto an existing note, and
+  ships a `Pinned` view that actually surfaces it. **`capture`** is reused
+  verbatim (same object reference) from `NOTES_REQUIRED_TAGS` — notes-ui's
+  connect-time schema audit compares its description byte-for-byte, so the
+  pack must never be able to drift that string regardless of apply order.
+- **Seed views are authored explicitly, not magically**: `All notes` and
+  `Recent` write `exclude_tags: ["archived"]` into their own query rather
+  than leaning on a surface-side default; `Recent` adds `order_by:
+  "updated_at", sort: "desc"`; `Pinned` queries `tag: "pinned"`; `Archive`
+  queries `tag: "archived"` with no exclusion — the deliberate exception.
+- **Deliberately opt-in.** `src/onboarding-seed.ts`'s default materialization
+  (`welcomePack()` + `GETTING_STARTED_PACK`) is untouched — a fresh-vault UX
+  change needs its own decision. Available today via `parachute-vault
+  add-pack starter-ontology` or a console affordance; the pack existing
+  makes shipping it by default later a one-line flip.
+
+### Added
+
+- `core/src/seed-packs.ts`: `VIEW_TAG`, `ARCHIVED_TAG`, `PINNED_TAG`,
+  `STARTER_ONTOLOGY_PACK`, the four `*_VIEW_PATH` constants, and
+  `VIEWS_PATH_PREFIX`; `"starter-ontology"` added to `SEED_PACK_NAMES` /
+  `getSeedPack`.
+- Tests: tag order + schema shape, the capture byte/reference-equality pin
+  against `NOTES_REQUIRED_TAGS`, seed-view query JSON validity and content
+  (exclude_tags / order_by / tag filters per view), no-dangling-wikilinks,
+  and the registry listing.
+
 ## [0.7.3-rc.3] - 2026-07-16
 
 **`date` field type.** Meta-tag schemas gain `date` alongside `string`/

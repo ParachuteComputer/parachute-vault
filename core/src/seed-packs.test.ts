@@ -20,7 +20,10 @@
 
 import { describe, test, expect } from "bun:test";
 import {
+  ALL_NOTES_VIEW_PATH,
   applySeedPack,
+  ARCHIVE_VIEW_PATH,
+  ARCHIVED_TAG,
   CAPTURE_ANYTHING_PATH,
   CONNECT_AI_PATH,
   DEFAULT_VAULT_DESCRIPTION,
@@ -33,11 +36,17 @@ import {
   GUIDE_TAG,
   listSeedPacks,
   NOTES_REQUIRED_TAGS,
+  PINNED_TAG,
+  PINNED_VIEW_PATH,
+  RECENT_VIEW_PATH,
   SEED_PACK_NAMES,
+  STARTER_ONTOLOGY_PACK,
   SURFACE_STARTER_CONTENT,
   SURFACE_STARTER_PACK,
   SURFACE_STARTER_PATH,
   TAGS_GRAPH_PATH,
+  VIEW_TAG,
+  VIEWS_PATH_PREFIX,
   WELCOME_PATH,
   welcomePack,
   YOURS_TO_KEEP_PATH,
@@ -335,12 +344,119 @@ describe("surface-starter pack", () => {
   });
 });
 
+describe("starter-ontology pack", () => {
+  test("exactly four tags, in constitution order: view, archived, pinned, capture", () => {
+    expect(STARTER_ONTOLOGY_PACK.name).toBe("starter-ontology");
+    expect(STARTER_ONTOLOGY_PACK.tags.map((t) => t.name)).toEqual([
+      "view",
+      "archived",
+      "pinned",
+      "capture",
+    ]);
+  });
+
+  test("opt-in, not seeded by default", () => {
+    expect(STARTER_ONTOLOGY_PACK.description).toContain("Opt-in — not seeded by default.");
+  });
+
+  test("view is the one meta tag — carries the kind/query/lane_by/date_field schema", () => {
+    expect(VIEW_TAG.name).toBe("view");
+    expect(VIEW_TAG.description).toContain("meta tag");
+    expect(VIEW_TAG.fields).toBeDefined();
+    expect(Object.keys(VIEW_TAG.fields!)).toEqual([
+      "kind",
+      "query",
+      "lane_by",
+      "date_field",
+    ]);
+
+    const kind = VIEW_TAG.fields!.kind!;
+    expect(kind.type).toBe("string");
+    expect(kind.enum).toEqual(["list", "board", "calendar", "gallery"]);
+    expect(kind.default).toBe("list");
+
+    const query = VIEW_TAG.fields!.query!;
+    expect(query.type).toBe("string");
+
+    // lane_by / date_field are optional (no default — absent stays absent).
+    expect(VIEW_TAG.fields!.lane_by!.default).toBeUndefined();
+    expect(VIEW_TAG.fields!.date_field!.default).toBeUndefined();
+  });
+
+  test("archived + pinned are plain tags — no schema", () => {
+    expect(ARCHIVED_TAG.name).toBe("archived");
+    expect(ARCHIVED_TAG.fields).toBeUndefined();
+    expect(ARCHIVED_TAG.description).toContain("out of the flow of the present");
+
+    expect(PINNED_TAG.name).toBe("pinned");
+    expect(PINNED_TAG.fields).toBeUndefined();
+    expect(PINNED_TAG.description).toContain("partition");
+  });
+
+  test("capture is reused verbatim from NOTES_REQUIRED_TAGS — byte-equal, no drift risk", () => {
+    const capture = STARTER_ONTOLOGY_PACK.tags.find((t) => t.name === "capture");
+    expect(capture).toBe(NOTES_REQUIRED_TAGS[0]); // SAME object reference, not just equal content
+    expect(capture!.description).toBe(NOTES_REQUIRED_TAGS[0]!.description);
+  });
+
+  test("four seed #view notes mirroring the app's default pages", () => {
+    expect(STARTER_ONTOLOGY_PACK.notes.map((n) => n.path)).toEqual([
+      ALL_NOTES_VIEW_PATH,
+      RECENT_VIEW_PATH,
+      PINNED_VIEW_PATH,
+      ARCHIVE_VIEW_PATH,
+    ]);
+    for (const note of STARTER_ONTOLOGY_PACK.notes) {
+      expect(note.path.startsWith(VIEWS_PATH_PREFIX)).toBe(true);
+      expect(note.tags).toEqual(["view"]);
+      expect(note.metadata?.kind).toBe("list");
+      expect(typeof note.metadata?.query).toBe("string");
+      // Every seeded query must itself be valid JSON — a downstream reader
+      // parses it as query-notes params.
+      expect(() => JSON.parse(note.metadata!.query as string)).not.toThrow();
+    }
+  });
+
+  test("All notes / Recent exclude archived explicitly (authoring-time default, not magic)", () => {
+    for (const path of [ALL_NOTES_VIEW_PATH, RECENT_VIEW_PATH]) {
+      const note = noteAt(STARTER_ONTOLOGY_PACK, path);
+      const query = JSON.parse(note.metadata!.query as string);
+      expect(query.exclude_tags).toEqual(["archived"]);
+    }
+  });
+
+  test("Recent orders by updated_at desc", () => {
+    const query = JSON.parse(noteAt(STARTER_ONTOLOGY_PACK, RECENT_VIEW_PATH).metadata!.query as string);
+    expect(query.order_by).toBe("updated_at");
+    expect(query.sort).toBe("desc");
+  });
+
+  test("Pinned queries tag:pinned; Archive queries tag:archived (the deliberate exception to exclude_tags)", () => {
+    const pinnedQuery = JSON.parse(noteAt(STARTER_ONTOLOGY_PACK, PINNED_VIEW_PATH).metadata!.query as string);
+    expect(pinnedQuery.tag).toBe("pinned");
+
+    const archiveQuery = JSON.parse(noteAt(STARTER_ONTOLOGY_PACK, ARCHIVE_VIEW_PATH).metadata!.query as string);
+    expect(archiveQuery.tag).toBe("archived");
+    expect(archiveQuery.exclude_tags).toBeUndefined();
+  });
+
+  test("no dangling wikilinks within the pack", () => {
+    const seededPaths = new Set(STARTER_ONTOLOGY_PACK.notes.map((n) => n.path));
+    for (const note of STARTER_ONTOLOGY_PACK.notes) {
+      for (const target of wikilinkTargets(note.content)) {
+        expect(seededPaths.has(target)).toBe(true);
+      }
+    }
+  });
+});
+
 describe("pack registry", () => {
-  test("lists exactly the three packs, in order", () => {
+  test("lists exactly the four packs, in order", () => {
     expect([...SEED_PACK_NAMES]).toEqual([
       "welcome",
       "getting-started",
       "surface-starter",
+      "starter-ontology",
     ]);
     expect(listSeedPacks().map((p) => p.name)).toEqual([...SEED_PACK_NAMES]);
     for (const p of listSeedPacks()) {
