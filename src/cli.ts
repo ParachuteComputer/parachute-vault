@@ -4842,7 +4842,11 @@ async function cmdAddPack(args: string[]) {
       console.log(`  = note  ${path} (already exists — left untouched)`);
     }
     for (const tag of result.tags) {
-      console.log(`  ~ tag   ${tag} (upserted)`);
+      if (result.preservedTagDescriptions.includes(tag)) {
+        console.log(`  ~ tag   ${tag} (kept user description)`);
+      } else {
+        console.log(`  ~ tag   ${tag} (upserted)`);
+      }
     }
     if (result.seededNotes.length === 0 && result.tags.length === 0) {
       console.log("  Nothing to add — everything was already in place.");

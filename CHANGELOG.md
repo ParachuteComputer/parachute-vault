@@ -34,6 +34,52 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.5] - 2026-07-17
+
+**Seed-pack re-apply preserves user-edited tag descriptions.** Aaron-ratified
+2026-07-17: `applySeedPack` (`core/src/seed-packs.ts`) used to unconditionally
+overwrite a tag's `description` on every re-apply — a user's hand-tuned
+constitution (e.g. an edited `#archived` or `#capture` description) got
+silently reverted the next time a pack landed (default create-time seed,
+`add-pack`, or the cloud vault DO's equivalent path). New contract: a pack
+writes a tag's description only when (a) the tag has no prior description
+(brand-new tag, or an existing bare row nothing ever described), or (b) the
+prior description is still byte-identical to the pack's own text — i.e.
+genuinely unmodified. The instant a description differs from the pack's
+current text, it's treated as a deliberate edit and is left alone on every
+future re-apply.
+
+- `ApplySeedPackResult` gains `preservedTagDescriptions: string[]` — the
+  subset of `tags` whose description write was skipped this run.
+  `fields` / `parent_names` / `relationships` are unaffected by this change —
+  they keep upserting unconditionally (more entangled with schema-validation
+  side effects; description-only is the ratified scope for this pass).
+- `parachute-vault add-pack`'s report now distinguishes the two outcomes:
+  `~ tag   <name> (upserted)` vs `~ tag   <name> (kept user description)`.
+- **Known, accepted tradeoff**: the comparison is against the pack's CURRENT
+  canonical text only, not any prior version. If a pack's description changes
+  upstream, an un-edited vault reads as "matches the OLD text, therefore
+  edited" and keeps the old text too — same outcome as a genuine hand edit.
+  Constitutions aren't security patches that must propagate to every vault; a
+  future `doctor`-style scan can surface "description drifted from the
+  current pack text" as an informational finding without the applier having
+  to guess intent.
+- Tests: re-apply after a user edit preserves + reports it; re-apply of an
+  untouched description still upserts; a fresh tag still gets seeded; the
+  `capture` byte-identity anchor against `NOTES_REQUIRED_TAGS` holds under
+  either pack apply order (`welcome` then `starter-ontology`, and reverse); a
+  CLI-level test pins the new `(kept user description)` report line.
+
+### Fixed
+
+- `core/src/seed-packs.ts`: `applySeedPack` no longer clobbers a hand-edited
+  tag description on re-apply.
+
+### Added
+
+- `ApplySeedPackResult.preservedTagDescriptions`.
+- `src/cli.ts`: `add-pack` reports `(kept user description)` vs `(upserted)`.
+
 ## [0.7.3-rc.4] - 2026-07-16
 
 **`starter-ontology` seed pack (opt-in).** From the 2026-07-16 design

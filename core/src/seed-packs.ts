@@ -1025,6 +1025,14 @@ export interface ApplySeedPackResult {
   pack: string;
   /** Tag names upserted (upserts are idempotent; always every declared tag). */
   tags: string[];
+  /**
+   * Subset of `tags` whose DESCRIPTION was left untouched this run because it
+   * had been hand-edited away from the pack's canonical text (see
+   * `applySeedPack`'s description-preservation rule below). `fields` /
+   * `parent_names` / `relationships` are still upserted unconditionally for
+   * these tags — only the description write was skipped.
+   */
+  preservedTagDescriptions: string[];
   /** Note paths written this run (absent ones). */
   seededNotes: string[];
   /** Note paths skipped because a note already lives there (idempotency). */
@@ -1036,6 +1044,30 @@ export interface ApplySeedPackResult {
  * when no note exists at its path, and the tag upserts converge on the same
  * rows — so a re-run can never duplicate, and never clobbers a note the
  * operator/AI has since edited or recreated.
+ *
+ * **Tag description preservation** (Aaron-ratified 2026-07-17): a pack writes
+ * a tag's `description` only when (a) the tag has no prior description (new
+ * tag, or an existing bare row nothing ever described), or (b) the prior
+ * description is still byte-identical to the pack's own text — i.e. no one
+ * has touched it. The moment a description differs from the pack's current
+ * text, it's treated as a deliberate hand edit (a user-tuned "constitution")
+ * and is never overwritten by a re-apply; omitting the `description` key from
+ * the `upsertTagRecord` patch is what preserves it (the store keeps whatever
+ * is already there). `fields` / `parent_names` / `relationships` are NOT
+ * given this treatment here — they still upsert unconditionally, same as
+ * before this change; those axes are more entangled with schema-validation
+ * side effects (indexed-column lifecycle, cross-tag type agreement) to
+ * safely split out in this pass. Description-only is the ratified scope.
+ *
+ * Known, accepted tradeoff: this compares against the pack's CURRENT text
+ * only, not any prior canonical version. If a pack's canonical description
+ * changes upstream, a vault that never touched it reads as "matches the OLD
+ * text, therefore edited" from the new pack's point of view, and keeps the
+ * old text too — same outcome as a genuine hand edit. That's fine:
+ * constitutions aren't security patches that must propagate; a future
+ * doctor-style scan can surface "description drifted from the current pack
+ * text" as an informational finding without this applier needing to guess
+ * intent. See CHANGELOG.
  *
  * Errors propagate — best-effort semantics (seed-must-never-fail-a-create)
  * belong to the caller, which knows its failure policy.
@@ -1051,6 +1083,7 @@ export async function applySeedPack(
   const result: ApplySeedPackResult = {
     pack: pack.name,
     tags: [],
+    preservedTagDescriptions: [],
     seededNotes: [],
     skippedNotes: [],
   };
@@ -1058,12 +1091,19 @@ export async function applySeedPack(
   // Parents first so `parent_names` reads naturally in logs (the store accepts
   // forward references, but the order matches the conceptual model).
   for (const decl of pack.tags) {
+    const existing = await store.getTagRecord(decl.name);
+    const priorDescription = existing?.description ?? null;
+    const isUserEdited = priorDescription != null && priorDescription !== decl.description;
+
     await store.upsertTagRecord(decl.name, {
-      description: decl.description,
+      // Omitted (not `undefined`-valued) when preserving — `upsertTagRecord`
+      // treats an absent `description` key as "keep the current value".
+      ...(isUserEdited ? {} : { description: decl.description }),
       ...(decl.parent_names ? { parent_names: decl.parent_names } : {}),
       ...(decl.fields ? { fields: decl.fields } : {}),
     });
     result.tags.push(decl.name);
+    if (isUserEdited) result.preservedTagDescriptions.push(decl.name);
   }
 
   for (const note of pack.notes) {

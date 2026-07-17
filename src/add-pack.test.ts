@@ -140,3 +140,35 @@ describe("add-pack surface-starter", () => {
     expect(stdout).toContain("~ tag   capture (upserted)");
   });
 });
+
+describe("add-pack — tag description preservation on re-apply (Aaron-ratified 2026-07-17)", () => {
+  test("a hand-edited description survives a re-apply and is reported 'kept', not 'upserted'", () => {
+    expect(runCli(["create", "packed", "--json"], { PARACHUTE_HOME: home }).exitCode).toBe(0);
+
+    // Simulate an operator/AI hand-editing the capture tag's constitution.
+    const dbPath = join(home, "vault", "data", "packed", "vault.db");
+    const editedDescription = "Our house rules for capture — not the default text.";
+    const writeDb = new Database(dbPath);
+    writeDb.query("UPDATE tags SET description = ? WHERE name = ?").run(
+      editedDescription,
+      "capture",
+    );
+    writeDb.close();
+
+    const { exitCode, stdout } = runCli(
+      ["add-pack", "welcome", "--vault", "packed"],
+      { PARACHUTE_HOME: home },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("~ tag   capture (kept user description)");
+    // guide wasn't edited, so it still reports the old vocabulary.
+    expect(stdout).toContain("~ tag   guide (upserted)");
+
+    const readDb = new Database(dbPath, { readonly: true });
+    const row = readDb
+      .query("SELECT description FROM tags WHERE name = ?")
+      .get("capture") as { description: string };
+    readDb.close();
+    expect(row.description).toBe(editedDescription);
+  });
+});
