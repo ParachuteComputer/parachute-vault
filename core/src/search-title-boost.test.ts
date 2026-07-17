@@ -104,4 +104,22 @@ describe("search title-boost", () => {
     const hits = await store.searchNotes("nonexistent_term_xyz");
     expect(hits).toEqual([]);
   });
+
+  it("boosts on the post-frontmatter title line, not the `---` delimiter (shares computeDisplayTitle's frontmatter skip)", async () => {
+    // Direct-create misuse path: raw frontmatter-bearing content. Without
+    // the frontmatter skip, the derived "title" would be the literal
+    // string "---", which never matches any query term, so this note
+    // would wrongly land in the body-only tier.
+    await store.createNote(
+      "---\ntitle: irrelevant\n---\n# Budget Review\nQ3 numbers",
+      { path: "frontmatter-led" },
+    );
+    await store.createNote(
+      "Weekly Standup\nsomewhere we discuss the budget in passing",
+      { path: "body-only" },
+    );
+
+    const hits = await store.searchNotes("budget review");
+    expect(hits[0].path).toBe("frontmatter-led");
+  });
 });
