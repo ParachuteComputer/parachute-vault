@@ -34,6 +34,155 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.11] - 2026-07-17
+
+**`read-attachment` — model-lane byte reads (Wave 2, bun door) + REST
+`Range`.** Ratified design (Attachments for Agents, rev 2): the runtime
+lane (Wave 1, tickets, rc.7) moves bytes without ever touching the model;
+this wave is the complementary model lane — a new MCP tool that lets the
+model actually *see* an attachment's content, dispatched by mime family
+so the shape stays honest about what each type can and can't do. Two
+ratified amendments over the spec stand: `attach-file` (inline
+base64/text write) stays cut — tickets remain the only write path; and
+this wave is result-side read only.
+
+- **`read-attachment`** (`core/src/mcp.ts`) — new MCP tool, present ONLY
+  when a door wires an `AttachmentBytesProvider` (D10, same "tools
+  omitted when unwired" posture as the ticket tools). Resolves the
+  attachment, tag-scope-checks its owning note (uniform `not_found`, same
+  no-oracle posture as the ticket tools), then dispatches on the
+  attachment's EFFECTIVE mime type — extension lookup in the shared
+  `ATTACHMENT_MIME_TYPES` map first (the same discipline the REST
+  byte-serve route uses), then the row's own `mime_type`, then
+  `application/octet-stream`:
+  - **text** (`text/*` + a small allowlist — `application/json`,
+    `application/ndjson`/`x-ndjson`, `application/yaml`/`x-yaml`; `text/csv`
+    and `text/markdown` are already `text/*`) — a byte-windowed `content`
+    slice using the EXACT `query-notes` pagination contract
+    (`content`/`content_offset`/`content_total_length`/`content_next_offset`).
+    Default window 65,536 bytes (64 KiB); hard max 262,144 (256 KiB) per
+    call. Does a BOUNDED positional read — never the whole file — via a
+    new `alignByteWindow` in `core/src/content-range.ts`, the byte-level
+    counterpart to `sliceContentRange` for when loading a multi-hundred-MB
+    attachment into memory to slice a string is exactly what the design
+    forbids.
+  - **image** (`image/*`; SVG can't exist — blocked at upload) — a REAL
+    MCP `{type:"image"}` content block the model can see, alongside the
+    row-JSON text block. Capped at 4 MiB raw (`MAX_ATTACHMENT_IMAGE_BYTES`,
+    `core/src/attachment/bytes-provider.ts`), checked via `stat()` BEFORE
+    any bytes are read — an over-cap image never touches `readRange` at
+    all, refusing with `image_too_large` (`size`, `max_bytes`, `how_to` →
+    a download ticket). Range params on an image → `invalid_query` (images
+    don't page).
+  - **audio/video** — never bytes, ever. Returns a transcript pointer:
+    `{attachment_id, transcribe_status, note_id, transcript_note?}` built
+    entirely from metadata the transcription pipeline already stamps
+    (`transcribe_status: pending|done|failed`) plus an OPTIONAL
+    `resolveTranscriptNote` hook a door can implement (bun: resolves the
+    `<path>.transcript` sibling note; a door without one — e.g. cloud,
+    whose transcript lives in the owning note's body — falls back to
+    `note_id` alone). No `transcribe_status` at all (never requested) →
+    `audio_bytes_not_supported` with a `how_to` pointing at `transcribe:
+    true` or a download ticket.
+  - **other binary** (PDF, zip, docx, …) — honest
+    `unsupported_attachment_type` refusal (`mime_type`, `size`, `how_to` →
+    download ticket); extraction is a v2 concern. Stats first, so a row
+    whose bytes are ALSO gone gets `attachment_binary_missing` instead —
+    the more accurate refusal.
+  - **missing binary** (row outlived bytes — e.g. an `audio_retention`
+    eviction after a successful transcription) — `attachment_binary_missing`
+    on the text/image/other-binary paths (audio never touches bytes, so
+    it's immune by construction).
+- **`core/src/attachment/bytes-provider.ts`** — the `AttachmentBytesProvider`
+  seam: `stat` + a bounded `readRange`, plus the optional
+  `resolveTranscriptNote` hook. Deliberately narrow — all POLICY (mime
+  dispatch, size caps, range validation, tag-scope) lives in the tool
+  itself, mirroring the ticket seam's division.
+- **`src/attachment-bytes.ts`** (bun's Wave 2 implementation) —
+  `createFsAttachmentBytesProvider`, a stateless per-session factory (no
+  shared singleton needed — unlike tickets, there's no cross-request state).
+  `readRange` uses `Bun.file(path).slice(start, end)` — a bounded,
+  positional read — never `readFileSync`.
+- **`core/src/mcp.ts`: `McpToolDef.resultContent`** — the one wrapper
+  change the design called for. An optional `(result) => McpContentBlock[]`
+  override; every tool without it keeps the universal single-text-block
+  default. `read-attachment`'s image branch is the only current user
+  (`src/mcp-http.ts`'s `CallTool` handler now prefers it when present, ~5
+  lines).
+- **REST `Range` (206)** on the existing byte-serve route (`GET
+  /storage/<path>`, `src/routes.ts`) — the REST twin of MCP's
+  `content_offset` (D9). A new `parseByteRangeHeader` honors a single
+  `Range: bytes=a-b` header (`bytes=a-`, `bytes=-b` suffix ranges; a
+  MALFORMED or multi-range header falls back to `null` → the full 200
+  response, not an error). A syntactically-valid-but-UNSATISFIABLE range
+  (e.g. `bytes=999999999-` past EOF) is NOT handled by this fallback in
+  practice — live-verified against a real `Bun.serve` socket (not the
+  in-process test harness): Bun's native range handling on a `Response`
+  body backed by `Bun.file()` intercepts satisfiable-shaped-but-out-of-
+  bounds ranges and returns **416 Range Not Satisfiable** itself, before
+  `parseByteRangeHeader`'s `null` return would otherwise fall through to
+  the full-200 branch. This is RFC 7233-correct behavior — kept as-is;
+  `parseByteRangeHeader`'s own `null` return for that case is effectively
+  moot at the `Bun.serve` layer (the in-process test harness used by
+  `storage.test.ts` calls `handleStorage` directly, bypassing `Bun.serve`
+  entirely, so it can't observe the 416 — see that test's comment). The
+  whole-file `readFileSync` this route used is gone on BOTH the ranged
+  (206) and full (200) paths — replaced with `Bun.file(filePath)`, a
+  bounded/streamed read that fixes the standing memory smell of buffering
+  a large attachment (e.g. a 90 MB video) entirely in memory. Same
+  confinement + tag-scope guards, byte-identical.
+- **`core/src/mcp.ts` / `src/mcp-http.ts` error-field forwarding** — the
+  generic `error_type` catch-all now also forwards `size`/`max_bytes`/
+  `mime_type` when present (the `read-attachment` refusal fields), same
+  forward-when-present discipline `how_to`/`limit`/`got`/`extension`
+  already had.
+- **Discoverability** — `attachmentsInstructionBlock()`
+  (`core/src/vault-projection.ts`) gains a `readEnabled` flag and a new
+  sentence teaching `read-attachment` (present only when the seam is
+  wired), folded into the same connect-time brief the ticket tools use.
+
+### Rider: attachment-ticket sweep (vault#612)
+
+`InProcessAttachmentTicketProvider` (`src/attachment-tickets.ts`) gains
+`sweepExpired()` — drops every unspent ticket whose TTL has elapsed.
+`take()` already enforces expiry AT SPEND TIME (a stale ticket can never
+be successfully spent), so this is purely a memory-hygiene backstop: an
+agent that mints and then abandons the flow (a curl that never runs)
+would otherwise sit in the process-wide `Map` forever. `startAttachmentTicketSweep`
+/ `stopAttachmentTicketSweep` run it on a 30s interval (`.unref()`'d, same
+cadence family as `EmbeddingWorker`'s default sweep) — wired into
+`src/server.ts` alongside the embedding worker's own start/stop.
+
+### Tests
+
+`core/src/content-range.test.ts` — `parseAttachmentContentRange` (default
+window, explicit length within/above/below bounds) and `alignByteWindow`
+(matches `sliceContentRange` byte-for-byte under a SIMULATED bounded read,
+never splits a codepoint, and a reassembly-property test chaining
+`content_next_offset` through bounded reads reproduces arbitrary
+mixed-width unicode content exactly). `src/read-attachment.test.ts` — full
+end-to-end through the real `tools/call` path: every mime-family behavior
+above, a range-paging round-trip on a >256 KiB multi-byte-UTF-8 file, the
+image block's two-content-block shape + base64 fidelity + cap refusal,
+every `transcribe_status` value (including a resolved vs. unresolved
+sibling transcript note), PDF/zip refusal shape, `attachment_binary_missing`
+for text/image/PDF rows with no bytes on disk, tag-scope uniform-404, and
+the read-tier visibility check. `src/storage.test.ts` — `parseByteRangeHeader`
+unit coverage (satisfiable/suffix/open-ended/unsatisfiable/malformed/
+multi-range) and a `storage GET Range support` suite (206 shape, a
+paging-reassembly round-trip through the real route, malformed/multi-range
+→ 200 fallback as the in-process harness observes it — see the live-416
+note above for what a real `Bun.serve` does instead on an unsatisfiable
+range, tag-scope interaction). `src/attachment-tickets.test.ts` — the
+vault#612 sweep (isolated-instance drop/keep + exact-boundary `<` vs `<=`,
+shared-provider delegation via unique ids, and a real short-interval
+timer actually dropping an expired ticket) plus two new discoverability
+pins for `readEnabled`. Existing MCP tool-count/tool-list pins in
+`src/vault.test.ts` updated for the new tool — the unscoped/no-opt-in
+base count stays 13 (`read-attachment` is opt-in, like the ticket tools);
+the scoped-session (opt-in-wired) pins move: read-tier 6→7, read+write
+10→11, admin 16→17.
+
 ## [0.7.3-rc.10] - 2026-07-17
 
 **`expand_mode: "summary"` falls back to the note's lede when

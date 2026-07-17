@@ -6625,12 +6625,15 @@ describe("stateless MCP transport", async () => {
     expect(toolNames).not.toContain("merge-tags");
     // Admin tools (vault#376) are hidden too
     expect(toolNames).not.toContain("manage-token");
-    // request-attachment-download is read-tier (upload is write-tier).
+    // request-attachment-download and read-attachment are read-tier
+    // (upload is write-tier).
     expect(toolNames).toContain("request-attachment-download");
     expect(toolNames).not.toContain("request-attachment-upload");
-    // Read tier is exactly 6 tools (doctor added by the re-tier;
-    // request-attachment-download added by the attachment-tickets design).
-    expect(toolNames.length).toBe(6);
+    expect(toolNames).toContain("read-attachment");
+    // Read tier is exactly 7 tools (doctor added by the re-tier;
+    // request-attachment-download by the attachment-tickets design;
+    // read-attachment by Wave 2).
+    expect(toolNames.length).toBe(7);
 
     closeAllStores();
   });
@@ -6911,15 +6914,23 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     return names;
   }
 
-  test("vault:read sees exactly the 6 read tools (doctor moved admin → read; request-attachment-download is read-tier)", async () => {
+  test("vault:read sees exactly the 7 read tools (doctor moved admin → read; read-attachment and request-attachment-download are read-tier)", async () => {
     const names = await listToolNames(["vault:read"]);
     expect(new Set(names)).toEqual(
-      new Set(["query-notes", "list-tags", "find-path", "vault-info", "doctor", "request-attachment-download"]),
+      new Set([
+        "query-notes",
+        "list-tags",
+        "find-path",
+        "vault-info",
+        "doctor",
+        "request-attachment-download",
+        "read-attachment",
+      ]),
     );
-    expect(names.length).toBe(6);
+    expect(names.length).toBe(7);
   });
 
-  test("vault:read + vault:write sees the 10 read+write tools (tag-schema tools moved write → admin; request-attachment-upload is write-tier)", async () => {
+  test("vault:read + vault:write sees the 11 read+write tools (tag-schema tools moved write → admin; request-attachment-upload is write-tier)", async () => {
     const names = await listToolNames(["vault:read", "vault:write"]);
     expect(new Set(names)).toEqual(
       new Set([
@@ -6933,9 +6944,10 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
         "delete-note",
         "request-attachment-upload",
         "request-attachment-download",
+        "read-attachment",
       ]),
     );
-    expect(names.length).toBe(10);
+    expect(names.length).toBe(11);
     expect(names).not.toContain("manage-token");
     // Re-tier (this PR): update-tag/delete-tag/rename-tag/merge-tags are now
     // admin-tier — structure/taxonomy curation, not content authorship.
@@ -6947,7 +6959,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("delete-note");
   });
 
-  test("vault:admin sees all 16 tools including manage-token + prune-schema + the tag-schema tools + both attachment-ticket tools", async () => {
+  test("vault:admin sees all 17 tools including manage-token + prune-schema + the tag-schema tools + all three attachment tools", async () => {
     const names = await listToolNames(["vault:read", "vault:write", "vault:admin"]);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
@@ -6958,10 +6970,11 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     expect(names).toContain("merge-tags");
     expect(names).toContain("request-attachment-upload");
     expect(names).toContain("request-attachment-download");
-    expect(names.length).toBe(16);
+    expect(names).toContain("read-attachment");
+    expect(names.length).toBe(17);
   });
 
-  test("legacy-derived full token sees all 16 tools (back-compat)", async () => {
+  test("legacy-derived full token sees all 17 tools (back-compat)", async () => {
     const { handleScopedMcp } = await import("./mcp-http.ts");
     const { writeVaultConfig } = await import("./config.ts");
     const { closeAllStores } = await import("./vault-store.ts");
@@ -6994,7 +7007,7 @@ describe("MCP tools/list scope tiers (vault#376)", () => {
     } as any);
     const body = await res.json() as any;
     const names: string[] = body.result.tools.map((t: any) => t.name);
-    expect(names.length).toBe(16);
+    expect(names.length).toBe(17);
     expect(names).toContain("manage-token");
     expect(names).toContain("prune-schema");
     expect(names).toContain("doctor");

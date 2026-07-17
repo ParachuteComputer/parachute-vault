@@ -183,3 +183,103 @@ export function applyContentRange(
   result.content_total_length = fields.content_total_length;
   result.content_next_offset = fields.content_next_offset;
 }
+
+// ---------------------------------------------------------------------------
+// Attachment byte-window reads (`read-attachment`, Wave 2 model lane)
+// ---------------------------------------------------------------------------
+
+/** Default `read-attachment` text window when the caller omits `content_length` — small enough to never nuke a context budget. */
+export const DEFAULT_ATTACHMENT_WINDOW_BYTES = 65_536; // 64 KiB
+
+/** Hard per-call ceiling on `read-attachment`'s `content_length` — a deliberate-big-bite max, not a default. */
+export const MAX_ATTACHMENT_WINDOW_BYTES = 262_144; // 256 KiB
+
+/**
+ * Parse `read-attachment`'s `content_offset` / `content_length` pair.
+ * Unlike {@link parseContentRange} (query-notes: omitted params mean "range
+ * mode off, return everything"), a `read-attachment` call ALWAYS reads a
+ * bounded window — omitting `content_length` defaults it to
+ * {@link DEFAULT_ATTACHMENT_WINDOW_BYTES} rather than "the whole file" (an
+ * attachment can be arbitrarily large; a note can't cheaply be). Returns a
+ * fully-resolved `{offset, length}` (never the query-notes "null = off"
+ * shape). Throws `QueryError` (INVALID_QUERY) on a negative/non-integer
+ * value, a `content_length` below {@link MIN_CONTENT_LENGTH}, or one above
+ * {@link MAX_ATTACHMENT_WINDOW_BYTES}.
+ */
+export function parseAttachmentContentRange(
+  offsetRaw: unknown,
+  lengthRaw: unknown,
+): { offset: number; length: number } {
+  const offset = toNonNegativeInt(offsetRaw, "content_offset") ?? 0;
+  const length = toNonNegativeInt(lengthRaw, "content_length");
+  if (length !== undefined && length < MIN_CONTENT_LENGTH) {
+    throw new QueryError(
+      `invalid \`content_length\` value ${JSON.stringify(lengthRaw)} — must be at least ${MIN_CONTENT_LENGTH} bytes (the size of the largest UTF-8 codepoint, so every window makes progress).`,
+      "INVALID_QUERY",
+    );
+  }
+  if (length !== undefined && length > MAX_ATTACHMENT_WINDOW_BYTES) {
+    throw new QueryError(
+      `invalid \`content_length\` value ${JSON.stringify(lengthRaw)} — exceeds the ${MAX_ATTACHMENT_WINDOW_BYTES} byte (256 KiB) per-call max for read-attachment.`,
+      "INVALID_QUERY",
+    );
+  }
+  return { offset, length: length ?? DEFAULT_ATTACHMENT_WINDOW_BYTES };
+}
+
+/**
+ * Byte-level counterpart to {@link sliceContentRange} for `read-attachment`'s
+ * text path, where loading the WHOLE file into memory to slice a string
+ * (`sliceContentRange`'s approach) is exactly the thing a 500 MB attachment
+ * forbids. The caller does a BOUNDED positional read first — `raw` is
+ * whatever bytes it actually fetched, starting at file offset `rawStart`
+ * — and this function applies the identical alignment rules
+ * `sliceContentRange` applies to a full in-memory string, operating only on
+ * that window.
+ *
+ * Precondition (caller's responsibility, not re-validated here): `raw`
+ * covers at least `[max(0, range.offset - 3), min(total, range.offset +
+ * range.length) + 1)` — i.e. from 3 bytes before the requested offset
+ * through ONE byte past the requested end, clamped to `total`. The 3-byte
+ * lookback is enough to find the leading byte of any UTF-8 codepoint the
+ * requested `offset` might land inside (a codepoint is at most 4 bytes,
+ * i.e. at most 3 continuation bytes after its leading byte); the 1-byte
+ * lookahead is what the end-alignment check reads to decide whether the
+ * budget cut lands mid-codepoint (mirroring `sliceContentRange`, which
+ * checks `bytes[end]` — the byte AT the exclusive cut point).
+ */
+export function alignByteWindow(
+  raw: Uint8Array,
+  rawStart: number,
+  range: { offset: number; length: number },
+  total: number,
+): ContentRangeFields {
+  if (range.offset >= total) {
+    return {
+      content: "",
+      content_offset: total,
+      content_total_length: total,
+      content_next_offset: null,
+    };
+  }
+
+  const byteAt = (idx: number): number => raw[idx - rawStart]!;
+
+  // Align the start DOWN to the leading byte of the codepoint containing
+  // `offset` — same rule as sliceContentRange, bounded to what's in `raw`.
+  let start = range.offset;
+  while (start > rawStart && isContinuationByte(byteAt(start))) start--;
+
+  // Window end: budget capped at total, then clamped to what's actually in
+  // `raw` (defense-in-depth — a caller that under-read would otherwise
+  // index past the buffer). Aligned DOWN so the slice never ends mid-codepoint.
+  let end = Math.min(start + range.length, total, rawStart + raw.length);
+  while (end > start && end < total && isContinuationByte(byteAt(end))) end--;
+
+  return {
+    content: Buffer.from(raw.subarray(start - rawStart, end - rawStart)).toString("utf8"),
+    content_offset: start,
+    content_total_length: total,
+    content_next_offset: end >= total ? null : end,
+  };
+}

@@ -180,9 +180,15 @@ export async function handleMcp(
     }
     try {
       const result = await tool.execute((args ?? {}) as Record<string, unknown>);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
+      // The one wrapper change (attachments-for-agents design, Wave 2):
+      // `resultContent`, when a tool defines it, decides the MCP content
+      // blocks instead of the universal single-text-block default —
+      // `read-attachment`'s image branch is the only current user (needs a
+      // REAL {type:"image"} block alongside the row-JSON text block).
+      const content = tool.resultContent
+        ? tool.resultContent(result)
+        : [{ type: "text" as const, text: JSON.stringify(result, null, 2) }];
+      return { content };
     } catch (err) {
       // vault#555 fix 6 — never re-wrap an already-formed McpError. Passing
       // the SAME instance straight through is strictly correct (no
@@ -231,6 +237,12 @@ export async function handleMcp(
         referencing_tags?: unknown;
         /** Attachment-tickets design (§2c "errors as JIT docs") — a short, imperative next-step, distinct from the older free-form `hint`. */
         how_to?: string;
+        /** `read-attachment` (Wave 2) refusals — `image_too_large` / `unsupported_attachment_type` carry the attachment's actual byte size. */
+        size?: number;
+        /** `read-attachment` `image_too_large` — the 4 MiB cap it exceeded. */
+        max_bytes?: number;
+        /** `read-attachment` `unsupported_attachment_type` — the mime type that couldn't be read. */
+        mime_type?: string;
       };
       // Honest-queries validation errors (vault#550) — `limit`/`offset`/date
       // values that are structurally invalid rather than merely "no
@@ -411,6 +423,11 @@ export async function handleMcp(
           ...(e.got !== undefined ? { got: e.got } : {}),
           ...(e.extension !== undefined ? { extension: e.extension } : {}),
           ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
+          // read-attachment (Wave 2) refusal fields — same forward-when-present
+          // discipline as the ticket fields just above.
+          ...(e.size !== undefined ? { size: e.size } : {}),
+          ...(e.max_bytes !== undefined ? { max_bytes: e.max_bytes } : {}),
+          ...(e.mime_type !== undefined ? { mime_type: e.mime_type } : {}),
         });
       }
       return {

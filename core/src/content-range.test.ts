@@ -23,8 +23,13 @@ import {
   parseContentRange,
   sliceContentRange,
   applyContentRange,
+  parseAttachmentContentRange,
+  alignByteWindow,
   MIN_CONTENT_LENGTH,
+  DEFAULT_ATTACHMENT_WINDOW_BYTES,
+  MAX_ATTACHMENT_WINDOW_BYTES,
 } from "./content-range.js";
+import { QueryError } from "./query-operators.js";
 
 // ---------------------------------------------------------------------------
 // 1. parseContentRange
@@ -233,6 +238,128 @@ describe("content range — reassembly property", () => {
       expect(assembled).toBe(content);
       expect(Buffer.from(assembled, "utf8").equals(Buffer.from(content, "utf8"))).toBe(true);
       expect(lastTotal).toBe(totalBytes);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2c. parseAttachmentContentRange + alignByteWindow (read-attachment)
+// ---------------------------------------------------------------------------
+
+describe("parseAttachmentContentRange", () => {
+  it("defaults offset=0, length=DEFAULT_ATTACHMENT_WINDOW_BYTES when both are omitted", () => {
+    expect(parseAttachmentContentRange(undefined, undefined)).toEqual({
+      offset: 0,
+      length: DEFAULT_ATTACHMENT_WINDOW_BYTES,
+    });
+  });
+
+  it("offset only → length still defaults (never 'read to end' — that's the query-notes shape, not this one)", () => {
+    expect(parseAttachmentContentRange(1000, undefined)).toEqual({
+      offset: 1000,
+      length: DEFAULT_ATTACHMENT_WINDOW_BYTES,
+    });
+  });
+
+  it("accepts an explicit length up to the max", () => {
+    expect(parseAttachmentContentRange(0, MAX_ATTACHMENT_WINDOW_BYTES)).toEqual({
+      offset: 0,
+      length: MAX_ATTACHMENT_WINDOW_BYTES,
+    });
+  });
+
+  it("rejects a length below MIN_CONTENT_LENGTH", () => {
+    expect(() => parseAttachmentContentRange(0, 2)).toThrow(QueryError);
+  });
+
+  it("rejects a length above MAX_ATTACHMENT_WINDOW_BYTES", () => {
+    expect(() => parseAttachmentContentRange(0, MAX_ATTACHMENT_WINDOW_BYTES + 1)).toThrow(QueryError);
+  });
+
+  it("rejects a negative offset", () => {
+    expect(() => parseAttachmentContentRange(-1, undefined)).toThrow(QueryError);
+  });
+});
+
+describe("alignByteWindow", () => {
+  /**
+   * Simulates the real caller: a BOUNDED positional read of
+   * `[max(0, offset-3), min(total, offset+length))` from `full`, THEN
+   * alignment — never handing the whole buffer to `alignByteWindow`, so a
+   * pass here proves the "never load the whole file" contract actually
+   * holds and isn't just true by accident of the test passing the full
+   * buffer.
+   */
+  function boundedRead(full: Buffer, offset: number, length: number): { raw: Uint8Array; rawStart: number } {
+    const total = full.byteLength;
+    const rawStart = Math.max(0, offset - 3);
+    // +1: alignByteWindow's end-boundary check reads the byte AT the
+    // (exclusive) window end to decide whether it's a continuation byte —
+    // that's one byte past `offset + length`, so the read must include it
+    // (see alignByteWindow's doc comment precondition).
+    const rawEnd = Math.min(total, offset + length + 1);
+    return { raw: full.subarray(rawStart, Math.max(rawStart, rawEnd)), rawStart };
+  }
+
+  it("offset past end → empty slice, complete (mirrors sliceContentRange)", () => {
+    const full = Buffer.from("abc", "utf8");
+    const { raw, rawStart } = boundedRead(full, 999, 16);
+    const r = alignByteWindow(raw, rawStart, { offset: 999, length: 16 }, full.byteLength);
+    expect(r.content).toBe("");
+    expect(r.content_offset).toBe(3);
+    expect(r.content_total_length).toBe(3);
+    expect(r.content_next_offset).toBeNull();
+  });
+
+  it("matches sliceContentRange byte-for-byte on a plain ASCII window", () => {
+    const s = "hello world";
+    const full = Buffer.from(s, "utf8");
+    const { raw, rawStart } = boundedRead(full, 0, 5);
+    const bounded = alignByteWindow(raw, rawStart, { offset: 0, length: 5 }, full.byteLength);
+    const whole = sliceContentRange(s, { offset: 0, length: 5 });
+    expect(bounded).toEqual(whole);
+  });
+
+  it("never splits a codepoint under a bounded read (matches sliceContentRange across a 4-byte emoji)", () => {
+    const s = "ab\u{1F600}cd"; // emoji occupies bytes 2..5 of 8
+    const full = Buffer.from(s, "utf8");
+    for (const [offset, length] of [
+      [0, 5], // budget cuts mid-emoji → backs off to byte 2
+      [2, 4], // exact emoji window
+      [4, 8], // offset lands mid-emoji → aligns down to byte 2
+      [6, 4], // final ASCII tail
+    ] as const) {
+      const { raw, rawStart } = boundedRead(full, offset, length);
+      const bounded = alignByteWindow(raw, rawStart, { offset, length }, full.byteLength);
+      const whole = sliceContentRange(s, { offset, length });
+      expect(bounded).toEqual(whole);
+    }
+  });
+
+  it("reassembly property: chaining content_next_offset through BOUNDED reads reproduces the full content", () => {
+    const rand = mulberry32(0xba5eba11);
+    const POOL = ["a", "Z", "9", " ", "\n", "é", "ψ", "你", "‱", "\u{1F600}", "\u{1D11E}"];
+    for (let iter = 0; iter < 40; iter++) {
+      const charCount = Math.floor(rand() * 100);
+      let content = "";
+      for (let i = 0; i < charCount; i++) content += POOL[Math.floor(rand() * POOL.length)]!;
+      const full = Buffer.from(content, "utf8");
+      const total = full.byteLength;
+      const budget = MIN_CONTENT_LENGTH + Math.floor(rand() * 13); // 4..16 bytes
+
+      let offset = 0;
+      let assembled = "";
+      for (let step = 0; step <= total + 2; step++) {
+        const { raw, rawStart } = boundedRead(full, offset, budget);
+        const slice = alignByteWindow(raw, rawStart, { offset, length: budget }, total);
+        expect(Buffer.byteLength(slice.content, "utf8")).toBeLessThanOrEqual(budget);
+        expect(slice.content_total_length).toBe(total);
+        assembled += slice.content;
+        if (slice.content_next_offset === null) break;
+        expect(slice.content_next_offset).toBeGreaterThan(offset);
+        offset = slice.content_next_offset;
+      }
+      expect(assembled).toBe(content);
     }
   });
 });

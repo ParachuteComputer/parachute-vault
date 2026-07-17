@@ -37,7 +37,11 @@ function json(data: unknown, status = 200): Response {
  * `take` returns, collapsing "expired" into the same null as "spent" /
  * "unknown" so the HTTP layer can give a uniform 404 (no oracle).
  */
-class InProcessAttachmentTicketProvider implements AttachmentTicketProvider {
+// Exported (alongside the shared-singleton accessors below) so
+// vault#612's sweep logic can be unit-tested against an ISOLATED instance
+// — no risk of a test's reset touching the one process-wide provider every
+// OTHER test file's ticket mint/spend flow also shares.
+export class InProcessAttachmentTicketProvider implements AttachmentTicketProvider {
   private readonly tickets = new Map<string, AttachmentTicket>();
 
   async put(ticket: AttachmentTicket): Promise<void> {
@@ -49,6 +53,30 @@ class InProcessAttachmentTicketProvider implements AttachmentTicketProvider {
     if (!ticket) return null;
     this.tickets.delete(id);
     return ticket;
+  }
+
+  /**
+   * Drop every unspent ticket whose TTL has elapsed (vault#612). `take()`
+   * already enforces expiry AT SPEND TIME — a caller can never successfully
+   * spend a stale ticket — so this is purely a memory-hygiene backstop: an
+   * agent that mints and then abandons the flow (network drop, a curl that
+   * never runs) would otherwise leave its ticket in this Map forever. Returns
+   * the count dropped, for test assertions / logging.
+   */
+  sweepExpired(now: number = Date.now()): number {
+    let dropped = 0;
+    for (const [id, ticket] of this.tickets) {
+      if (ticket.expiresAt < now) {
+        this.tickets.delete(id);
+        dropped++;
+      }
+    }
+    return dropped;
+  }
+
+  /** Test-only visibility into how many tickets are currently held. */
+  size(): number {
+    return this.tickets.size;
   }
 }
 
@@ -63,6 +91,54 @@ export function getSharedAttachmentTicketProvider(): AttachmentTicketProvider {
 /** Test-only: force a fresh provider so ticket state doesn't leak between test files. */
 export function resetSharedAttachmentTicketProviderForTests(): void {
   sharedProvider = undefined;
+}
+
+/** Test-only: how many tickets the shared provider currently holds (0 if never created). */
+export function sharedAttachmentTicketCountForTests(): number {
+  return sharedProvider?.size() ?? 0;
+}
+
+/**
+ * Drop every expired-unspent ticket from the shared provider (vault#612). A
+ * no-op (returns 0) before the shared provider has ever been created — the
+ * periodic sweep below calls this unconditionally, so this must tolerate
+ * running before the first mint.
+ */
+export function sweepExpiredAttachmentTickets(now: number = Date.now()): number {
+  return sharedProvider?.sweepExpired(now) ?? 0;
+}
+
+/**
+ * Sweep cadence (vault#612) — same cadence family as `EmbeddingWorker`'s
+ * default sweep interval (`src/embedding-worker.ts`'s `DEFAULT_SWEEP_MS`).
+ * Tickets are short-TTL (10-30 min, `computeTicketTtlMs`) and low-volume, so
+ * a 30s sweep is comfortably frequent without being wasteful.
+ */
+const TICKET_SWEEP_INTERVAL_MS = 30_000;
+
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start the periodic expired-ticket sweep. No-op if already started. Mirrors
+ * `EmbeddingWorker.start()`'s shape (`.unref()` so the timer never keeps the
+ * process alive on its own — `server.ts`'s graceful-shutdown path still
+ * calls `stopAttachmentTicketSweep()` explicitly for a clean stop, same as
+ * `embeddingWorker.stop()`).
+ */
+export function startAttachmentTicketSweep(intervalMs: number = TICKET_SWEEP_INTERVAL_MS): void {
+  if (sweepTimer) return;
+  sweepTimer = setInterval(() => {
+    sweepExpiredAttachmentTickets();
+  }, intervalMs);
+  sweepTimer.unref?.();
+}
+
+/** Stop the periodic expired-ticket sweep. */
+export function stopAttachmentTicketSweep(): void {
+  if (sweepTimer) {
+    clearInterval(sweepTimer);
+    sweepTimer = null;
+  }
 }
 
 /**
