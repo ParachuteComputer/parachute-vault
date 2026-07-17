@@ -3,8 +3,9 @@
  *
  * Used by `query-notes` when `expand_links=true`. Replaces wikilink matches
  * with delimited blocks containing the linked note's content (full mode) or
- * metadata summary (summary mode). Deduplicates across the query and guards
- * against cycles via a shared `expanded` set.
+ * a summary (summary mode): `metadata.summary` when present, else the
+ * target note's lede (see `summaryText`). Deduplicates across the query and
+ * guards against cycles via a shared `expanded` set.
  */
 
 import { Database } from "bun:sqlite";
@@ -152,11 +153,18 @@ function renderSummary(note: Note): string {
   return `<expanded path="${pathAttr}" mode="summary">\n${summary}\n</expanded>`;
 }
 
+/**
+ * `metadata.summary` wins when present (no behavior change for existing
+ * callers). Absent it, falls back to the target note's lede — its opening
+ * paragraph, per `computeLede` — so a note that was never given a
+ * `metadata.summary` still yields something useful in summary-mode
+ * expansion instead of an empty block.
+ */
 function summaryText(note: Note): string {
   const meta = note.metadata as Record<string, unknown> | undefined;
   const s = meta?.summary;
   if (typeof s === "string" && s.trim()) return s.trim();
-  return "";
+  return noteOps.computeLede(note.content) ?? "";
 }
 
 function escapeAttr(s: string): string {

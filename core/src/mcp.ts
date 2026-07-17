@@ -555,7 +555,7 @@ Response shape (vault#550 — three variants, pick by what you passed):
           include_attachments: { type: "boolean", description: "Include attachment records (default: false)" },
           expand_links: { type: "boolean", description: "Inline [[wikilinks]] in returned content (default: false). Has no effect if content is not included (e.g., default list mode with include_content=false); wikilinks inside fenced or inline code are not expanded." },
           expand_depth: { type: "number", description: "Recursion depth for link expansion (default 1, max 3). Only meaningful in 'full' mode — 'summary' mode does not recurse." },
-          expand_mode: { type: "string", enum: ["full", "summary"], description: "Expansion rendering: 'full' inlines the linked note's content, 'summary' inlines only metadata.summary. Default: 'full'." },
+          expand_mode: { type: "string", enum: ["full", "summary"], description: "Expansion rendering: 'full' inlines the linked note's content, 'summary' inlines metadata.summary — falling back to the note's opening paragraph when no metadata.summary exists. Default: 'full'." },
         },
       },
       execute: async (params) => {

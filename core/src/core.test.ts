@@ -5893,8 +5893,10 @@ describe("query-notes link expansion", async () => {
     expect(result[0].preview).toBeTruthy();
   });
 
-  it("expand_mode=summary with no metadata.summary renders empty body inline", async () => {
-    await store.createNote("unsummarized body", { path: "Plain" });
+  it("expand_mode=summary with no metadata.summary AND no lede (title-only note) renders empty body inline", async () => {
+    // Single-line content: the whole thing IS the title, so there's no
+    // paragraph after it for computeLede to fall back to.
+    await store.createNote("unsummarized title-only body", { path: "Plain" });
     await store.createNote("see [[Plain]]", { path: "Src" });
     const tools = generateMcpTools(store);
     const query = tools.find((t) => t.name === "query-notes")!;
@@ -5905,8 +5907,68 @@ describe("query-notes link expansion", async () => {
       expand_mode: "summary",
     }) as any;
     expect(result.content).toContain('mode="summary"');
-    // Summary is empty — we still get the block but with nothing between delimiters.
-    expect(result.content).not.toContain("unsummarized body");
+    // No summary, no lede — we still get the block but with nothing between delimiters.
+    expect(result.content).not.toContain("unsummarized title-only body");
+  });
+
+  it("expand_mode=summary with no metadata.summary falls back to the note's lede", async () => {
+    await store.createNote(
+      "# Long canonical statement\n\nUnforced / wu wei, in one paragraph.\n\n(Many paragraphs of detail follow...)",
+      { path: "Statements/NoSummary" },
+    );
+    await store.createNote("Overview: [[Statements/NoSummary]]", { path: "Index2" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index2",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain('mode="summary"');
+    expect(result.content).toContain("Unforced / wu wei, in one paragraph.");
+    expect(result.content).not.toContain("Many paragraphs of detail");
+    // The heading/title itself isn't repeated as the summary.
+    expect(result.content).not.toContain("Long canonical statement");
+  });
+
+  it("expand_mode=summary: metadata.summary still wins over the lede when both are present", async () => {
+    await store.createNote(
+      "# Title\n\nThis is the lede paragraph, not the summary.",
+      { path: "Statements/Both", metadata: { summary: "The curated summary." } },
+    );
+    await store.createNote("see [[Statements/Both]]", { path: "Index3" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index3",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain("The curated summary.");
+    expect(result.content).not.toContain("This is the lede paragraph");
+  });
+
+  it("expand_mode=summary lede fallback respects a leading frontmatter block", async () => {
+    await store.createNote(
+      "---\ntitle: X\n---\n# Real Title\n\nThe lede after frontmatter and title.",
+      { path: "Statements/Frontmatter" },
+    );
+    await store.createNote("see [[Statements/Frontmatter]]", { path: "Index4" });
+    const tools = generateMcpTools(store);
+    const query = tools.find((t) => t.name === "query-notes")!;
+
+    const result = await query.execute({
+      id: "Index4",
+      expand_links: true,
+      expand_mode: "summary",
+    }) as any;
+
+    expect(result.content).toContain("The lede after frontmatter and title.");
+    expect(result.content).not.toContain("Real Title");
   });
 });
 

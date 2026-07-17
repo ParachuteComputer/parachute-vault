@@ -34,6 +34,57 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.10] - 2026-07-17
+
+**`expand_mode: "summary"` falls back to the note's lede when
+`metadata.summary` is absent.** Machinery half of a soft convention from
+Aaron/Adam's-AI dialogue (2026-07-17, not formally ratified): summaries
+work better as visible CONTENT — a note's opening paragraph — than as
+hidden metadata, because visible text gets corrected by the notes that
+reference it while a hidden `metadata.summary` rots unnoticed. This PR
+doesn't validate that convention or force it; it just makes
+`query-notes`' summary-mode link expansion reward it when a note
+happens to follow it, without changing behavior for notes that already
+carry `metadata.summary`.
+
+- `computeLede` (`core/src/notes.ts`, new): derives a note's lede — the
+  first non-empty paragraph AFTER its title line (a run of consecutive
+  non-blank lines, whitespace-collapsed, capped at 400 code points on a
+  code-point boundary). Shares its title-line rule, including the
+  leading-frontmatter skip, with `computeDisplayTitle` via an extracted
+  `skipLeadingFrontmatter` helper — the two functions agree on where a
+  note's title ends. Returns `null` for a title-only note (no paragraph
+  to report) rather than repeating the title as a fake lede.
+- `core/src/expand.ts`'s `summaryText` now falls back to `computeLede`
+  when `metadata.summary` is absent or blank. `metadata.summary`, when
+  present, still wins — no behavior change for existing summary-bearing
+  notes (e.g. Aaron's vault).
+- `query-notes`' `expand_mode` parameter description documents the
+  fallback in one place (the MCP tool schema).
+- Tests: `core/src/lede.test.ts` (new) — paragraph-after-title
+  derivation, multi-line paragraph collapsing, whitespace collapsing,
+  title-only → null, frontmatter-block skip (including title
+  immediately after frontmatter with no blank line), length cap +
+  Unicode code-point-safe truncation; `core/src/core.test.ts` — the
+  `expand_mode: "summary"` MCP path: fallback fires when
+  `metadata.summary` is absent, `metadata.summary` still wins when both
+  exist, fallback respects a leading frontmatter block, and the
+  pre-existing title-only/no-lede case still renders an empty summary
+  block (renamed from "no metadata.summary" to "no metadata.summary AND
+  no lede" — it was only ever exercising the title-only case, not the
+  general "no metadata.summary" case this PR adds).
+
+### Added
+
+- `core/src/notes.ts`: `computeLede` + `LEDE_MAX_LEN` — derives a note's
+  opening paragraph after its title line, for use as a fallback when a
+  note has no `metadata.summary`.
+
+### Changed
+
+- `core/src/expand.ts`: `expand_mode: "summary"` link expansion falls
+  back to `computeLede` when `metadata.summary` is absent; unaffected
+  when `metadata.summary` is present.
 ## [0.7.3-rc.9] - 2026-07-17
 
 **Docs catch-up — CLAUDE.md + HTTP_API.md + README against six same-day
