@@ -42,6 +42,10 @@ import {
   type ContentRange,
 } from "../core/src/content-range.ts";
 import { attachValidationStatus, enforceStrictWrite, applySchemaDefaults } from "../core/src/mcp.ts";
+import {
+  BLOCKED_ATTACHMENT_EXTENSIONS,
+  ATTACHMENT_MIME_TYPES,
+} from "../core/src/attachment/policy.ts";
 import type { ValidationWarning } from "../core/src/schema-defaults.ts";
 import { logStrictBypass } from "./scopes.ts";
 import * as linkOps from "../core/src/links.ts";
@@ -4440,97 +4444,14 @@ export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB
  */
 export const MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 20 * 1024 * 1024; // 120MB
 
-// Storage upload policy: DENY-LIST (vault#517). A knowledge vault stores
-// arbitrary files — ebooks, office docs, datasets, archives, binaries — so we
-// accept ANY upload EXCEPT the handful of types a browser can execute as
-// active content in our origin when served back from /storage/. (The prior
-// allowlist rejected the long tail: .epub/.csv/.zip/… all came back "File type
-// not allowed".)
-//
-// BLOCKED — same-origin-XSS / active-content set:
-//   .html/.htm/.xhtml/.shtml/.xht  HTML — embeds <script>
-//   .svg                           XML image — embeds <script>
-//   .xml                           can carry XSLT / be parsed as XHTML
-//   .js/.mjs/.cjs                  JavaScript
-//   .css                           style-injection / UI-redress vector
-//
-// Two independent guards keep every STORED file inert when served:
-//   1. Only the curated MIME_TYPES below map to a real (always passive) type;
-//      every other extension serves as application/octet-stream — a download,
-//      never rendered.
-//   2. The GET byte-serve response pins `X-Content-Type-Options: nosniff`, so
-//      a browser can't sniff an octet-stream body into an executable type.
-// The blocklist is belt-and-suspenders on top of those: even if a future MIME
-// entry or an upstream proxy weakened (1) or (2), these extensions still never
-// land on disk. If a future use case needs SVG, sanitize on read (strip
-// <script>/<foreignObject>) and revisit.
-const BLOCKED_EXTENSIONS = new Set([
-  ".html", ".htm", ".xhtml", ".shtml", ".xht",
-  ".svg",
-  ".xml",
-  ".js", ".mjs", ".cjs",
-  ".css",
-]);
-
-// Explicit MIME types for the commonly-previewed formats. Anything accepted
-// but absent here serves as application/octet-stream — a download, never
-// rendered (e.g. .pages/.key/.numbers/.azw3/.exe/arbitrary binaries). None of
-// these map to an active type (text/html, image/svg+xml), so a served asset
-// can't execute script; `nosniff` on the GET response makes that ironclad.
-//
-// INVARIANT: never add an entry that maps to a browser-active type —
-// text/html, image/svg+xml, application/xhtml+xml, text/javascript,
-// application/wasm, text/css. Doing so re-enables same-origin execution for
-// that extension (and would mean it must also join BLOCKED_EXTENSIONS).
-const MIME_TYPES: Record<string, string> = {
-  // Audio
-  ".wav": "audio/wav",
-  ".mp3": "audio/mpeg",
-  ".m4a": "audio/mp4",
-  ".ogg": "audio/ogg",
-  ".oga": "audio/ogg",
-  ".opus": "audio/opus",
-  ".aac": "audio/aac",
-  ".flac": "audio/flac",
-  ".webm": "audio/webm",
-  // Image
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".bmp": "image/bmp",
-  ".tiff": "image/tiff",
-  ".tif": "image/tiff",
-  ".heic": "image/heic",
-  ".heif": "image/heif",
-  ".avif": "image/avif",
-  // Video
-  ".mp4": "video/mp4",
-  ".m4v": "video/x-m4v",
-  ".mov": "video/quicktime",
-  // Documents / ebooks / data
-  ".pdf": "application/pdf",
-  ".epub": "application/epub+zip",
-  ".mobi": "application/x-mobipocket-ebook",
-  ".txt": "text/plain; charset=utf-8",
-  ".md": "text/markdown; charset=utf-8",
-  ".markdown": "text/markdown; charset=utf-8",
-  ".rtf": "application/rtf",
-  ".csv": "text/csv; charset=utf-8",
-  ".tsv": "text/tab-separated-values; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".doc": "application/msword",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".ppt": "application/vnd.ms-powerpoint",
-  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ".xls": "application/vnd.ms-excel",
-  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".odt": "application/vnd.oasis.opendocument.text",
-  ".ods": "application/vnd.oasis.opendocument.spreadsheet",
-  ".odp": "application/vnd.oasis.opendocument.presentation",
-  ".zip": "application/zip",
-};
+// Storage upload policy (extension blocklist + MIME lookup) now lives in
+// core/src/attachment/policy.ts — the canonical source shared with the
+// attachment-ticket mint/spend path (vault attachment-tickets design,
+// "shared BLOCKED_EXTENSIONS"), so a blocked extension can never diverge
+// between REST and tickets. See that module's doc comment for the full
+// same-origin-XSS rationale and the MIME curation invariant.
+const BLOCKED_EXTENSIONS = BLOCKED_ATTACHMENT_EXTENSIONS;
+const MIME_TYPES = ATTACHMENT_MIME_TYPES;
 
 export async function handleStorage(
   req: Request,

@@ -34,6 +34,120 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.7] - 2026-07-17
+
+**Attachment tickets — agent upload/download via short-lived capability
+URLs (Wave 0 + Wave 1, bun door).** Ratified design (Attachments for
+Agents, rev 2, 2026-07-17): MCP tool arguments are model-emitted, so a
+base64 upload through a tool call spends ~1 token per 2.5–3 bytes —
+lossy, expensive, effectively impossible past a few hundred KB. The
+runtime lane closes this without ever putting bytes through the model:
+two new MCP tools mint a short-lived, single-use, capability-in-URL
+ticket; a runtime with a shell spends it directly against a bare HTTP
+endpoint outside the authed API tree. Three Aaron-ratified amendments
+over the spec's original numbers: TTL defaults to 10 minutes (not 120s)
+with 10s/MiB size scaling and a 30-minute hard cap; the inline
+base64 `attach-file` tool is cut entirely (tickets are the only write
+path); inline reads (`read-attachment`, text/image result-side) are
+deferred to Wave 2.
+
+- **`request-attachment-upload` / `request-attachment-download`**
+  (`core/src/mcp.ts`) — new MCP tools, present ONLY when a door wires an
+  `AttachmentTicketProvider` (D10, "tools omitted when unwired" — an
+  agent never sees an affordance the runtime can't back). Upload mint
+  resolves the target note, tag-scope-checks it, sanitizes the filename's
+  extension against the shared blocklist, enforces `size_bytes <= 100
+  MiB` (mirrors REST's own cap), infers `mime_type` from the extension
+  when omitted, and returns `{method, url, headers, expires_at,
+  max_bytes, curl_example}` — `curl_example` is a literal, ready-to-run
+  string (discoverability-by-tool-result). Download mint resolves the
+  attachment (tag-scoped via its owning note), returns the same envelope
+  shape with `mime_type`/`size_bytes` when known.
+- **`core/src/attachment/tickets.ts`** — the wire-shape-defining seam:
+  `AttachmentTicket` record shape, the deliberately-dumb
+  `AttachmentTicketProvider` interface (`put`/`take` — a single-use KV,
+  no policy; ALL policy runs at mint in the tools themselves so doors
+  can't drift), `computeTicketTtlMs` (10 min base + 10s/MiB, 30 min cap),
+  `generateTicketId` (256-bit, Web Crypto `getRandomValues`).
+- **`core/src/attachment/policy.ts`** — the extension blocklist + MIME
+  lookup used by both REST upload and ticket mint, moved out of
+  `src/routes.ts` into core as the single shared source ("shared
+  BLOCKED_EXTENSIONS") so a blocked extension can never diverge between
+  the two upload doors into a vault. `src/routes.ts` now imports these
+  constants rather than declaring its own — REST behavior is unchanged
+  (same Set/Record, just relocated).
+- **`src/attachment-tickets.ts`** (bun's Wave 1 implementation) —
+  `InProcessAttachmentTicketProvider`, a process-wide `Map` (not
+  per-vault — ticket ids are already globally unguessable). A daemon
+  restart drops every outstanding ticket; acceptable at a ≤30-minute TTL,
+  documented at the call site. `handleTicketSpend` streams an upload to
+  `assetsDir` with the existing server-generated `<date>/<ts>-<uuid><ext>`
+  discipline and registers the attachment row (+ transcribe pipeline,
+  mirroring the REST `POST /notes/:id/attachments` decision exactly) in
+  the same spend — one step, not REST's two; a download spend streams the
+  file back with the same path-confinement + `nosniff` discipline as the
+  existing byte-serve route.
+- **`/vault/<name>/tickets/<id>`** (`src/routing.ts`) — the bare spend
+  route, dispatched BEFORE `authenticateVaultRequest` (deliberately — the
+  ticket IS the credential; a bearer-less `curl` must be able to spend
+  it). PUT or POST spends an upload ticket; GET spends a download ticket.
+- **Wave 0 discoverability** — `attachmentsInstructionBlock()`
+  (`core/src/vault-projection.ts`) folded into the connect-time markdown
+  brief (`projectionToMarkdown` → `getServerInstruction`), teaching both
+  the ticket tools and the REST fallback recipe every session.
+- **Errors as JIT docs** — every new refusal (mint validation, spend
+  size-cap, spend not-found) carries a `how_to` field alongside the
+  existing `error_type`/`field`. The MCP error-mapping backstop in
+  `src/mcp-http.ts` (the generic `error_type` catch-all) now forwards
+  `how_to`/`limit`/`got`/`extension` when present — previously it
+  silently truncated any `structuredError()` call down to
+  `error_type`/`field`/`hint`, which would have dropped these on the
+  ticket tools' errors specifically.
+
+**Security posture:** capability-in-URL is safe to place in a shell
+command (history, process list, proxy logs) because a ticket is
+single-use (atomic delete-on-take — no oracle on spent/expired/unknown,
+all three collapse to the same 404), short-lived (10–30 min, scaled by
+declared size), and scoped to exactly one upload slot or one
+attachment's bytes. Mint inherits everything the minting MCP call
+already proved (token verification, per-vault scope, tag scope) — the
+ticket is an *attenuation* of that authority, never an escalation. IDs
+are 256-bit random (Web Crypto). No new credential class, no R2/S3
+presigned URLs — bun's ticket state is an in-process map; the wire
+shape (`AttachmentTicketProvider`, TTL formula, error taxonomy) is
+pinned in core so a future cloud mirror can't drift on it.
+
+**What the cloud mirror needs** (next PR, `parachute-cloud`): a
+`AttachmentTicketProvider` implementation persisting to the vault's
+Durable Object (`ctx.storage`, atomic delete-on-take under
+`transactionSync` — DO's single-writer model makes single-use
+race-free by construction), the same `/tickets/<id>` spend route
+wired into the Worker's fetch handler (before its own auth), the mint
+tools' policy extended with the full gate ladder against DECLARED size
+(frozen → `plan_required`, Entry → `attachments_not_included`, cap →
+`storage_cap_exceeded`) so an agent learns before curling, and
+`attachmentsInstructionBlock({ ticketsEnabled: true })` appended to
+`workers/vault/src/mcp.ts`'s `serverInstruction` once wired. Until that
+PR lands, cloud's tool list simply omits both ticket tools (D10) — no
+behavior change on that door from this PR.
+
+### Tests
+
+`core/src/attachment/tickets.test.ts` (TTL scaling + cap, id
+uniqueness/shape), `core/src/attachment/policy.test.ts` (extension
+sanitize, blocklist, MIME lookup, active-type invariant),
+`core/src/attachment-tickets-tool.test.ts` (tools omitted when unwired;
+mint validation errors incl. `how_to`; size cap; blocked extension;
+tag-scope uniform-404 for both tools), `src/attachment-tickets.test.ts`
+(end-to-end mint→spend for both directions through the real MCP +
+routing layers: single-use/second-spend-404, size-cap 413 incl. a
+Content-Length-only pre-check, expiry 404, wrong-vault-scope 404,
+upload→row+transcribe+`transcribe_stub`, download streaming + byte
+equality + path-confinement, connect-time instructions presence).
+Existing MCP tool-count/tool-list pins in `src/vault.test.ts` updated
+for the two new tools (13 → 15 core tools; read-tier 5→6, read+write
+8→10, admin 14→16).
+
 ## [0.7.3-rc.6] - 2026-07-17
 
 **Title axis — computed `displayTitle` + search title-boost.** Ratified

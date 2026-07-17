@@ -109,7 +109,7 @@ export async function handleScopedMcp(
   const instruction = await getServerInstruction(vaultName, auth);
   return handleMcp(
     req,
-    () => generateScopedMcpTools(vaultName, auth, callerBearer ?? null),
+    () => generateScopedMcpTools(vaultName, auth, callerBearer ?? null, req),
     `parachute-vault/${vaultName}`,
     vaultName,
     auth,
@@ -229,6 +229,8 @@ export async function handleMcp(
         tag?: string;
         cycle?: unknown;
         referencing_tags?: unknown;
+        /** Attachment-tickets design (§2c "errors as JIT docs") — a short, imperative next-step, distinct from the older free-form `hint`. */
+        how_to?: string;
       };
       // Honest-queries validation errors (vault#550) — `limit`/`offset`/date
       // values that are structurally invalid rather than merely "no
@@ -399,6 +401,16 @@ export async function handleMcp(
           error_type: e.error_type,
           field: e.field,
           hint: e.hint,
+          // Forwarded when present (undefined keys are fine — JSON-RPC
+          // `data` just omits them) so a `structuredError()` call site that
+          // stamps extra fields — `limit`/`got`/`extension` (size/type
+          // refusals) or `how_to` (attachment-tickets' JIT-docs field, §2c)
+          // — isn't silently truncated down to error_type/field/hint by
+          // this backstop.
+          ...(e.limit !== undefined ? { limit: e.limit } : {}),
+          ...(e.got !== undefined ? { got: e.got } : {}),
+          ...(e.extension !== undefined ? { extension: e.extension } : {}),
+          ...(e.how_to !== undefined ? { how_to: e.how_to } : {}),
         });
       }
       return {
