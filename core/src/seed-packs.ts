@@ -14,6 +14,13 @@
  *     surface (UI) over the vault. NOT default-seeded (ratified 2026-07-02:
  *     Surface Starter is out of the default seed) — added on demand via
  *     `parachute-vault add-pack surface-starter` or a console affordance.
+ *   - `starter-ontology` — four starter **meta tags** (`view`, `archived`,
+ *     `pinned`, `capture`) with constitution-style descriptions, plus seed
+ *     `#view` notes mirroring the app's default pages (All notes, Recent,
+ *     Pinned, Archive). NOT default-seeded (ratified 2026-07-16 design
+ *     dialogue — deliberately opt-in; a fresh-vault materialization change
+ *     needs its own decision) — added on demand via `parachute-vault
+ *     add-pack starter-ontology` or a console affordance.
  *
  * Guides are the vault's skill files — the Parachute equivalent of a
  * `SKILL.md`. They're tagged `#guide` (GUIDE_TAG): notes that teach how this
@@ -799,6 +806,172 @@ export const SURFACE_STARTER_PACK: SeedPack = {
 };
 
 // ---------------------------------------------------------------------------
+// `starter-ontology` pack — four starter meta tags (opt-in)
+// ---------------------------------------------------------------------------
+
+/**
+ * The starter ontology, ratified in the 2026-07-16 design dialogue (Letter 1,
+ * Q5: "yes — tiny, opinionated, removable"): exactly four tags, no more.
+ * "Really want to start simple" / "don't be too prescriptive" — the vault
+ * ships the mechanisms; each parachute writes its own rules on top.
+ *
+ * A **meta tag** (the ratified user-facing term for "a tag with a schema")
+ * is `view` alone here — it carries `fields`. `archived`, `pinned`, and
+ * `capture` are plain tags: no schema, just a description that teaches the
+ * convention. Every description below is written as a constitution — it's
+ * read by both a human deciding whether to use the tag and an agent deciding
+ * how to behave around it — plain and warm, describing the DEFAULT
+ * convention rather than dictating one ("different people will draw that
+ * line differently").
+ *
+ * `capture` is NOT redeclared with new text — it's the exact `NOTES_REQUIRED_TAGS`
+ * entry, reused verbatim, because notes-ui's connect-time schema audit
+ * compares its `description` byte-for-byte (see the comment on
+ * `NOTES_REQUIRED_TAGS` above). Applying this pack must never be able to
+ * drift that string out from under the welcome pack, in either apply order.
+ *
+ * `pinned` shipped once before and was dropped as vestigial (PR #547,
+ * 2026-07-07): it was seeded onto `Welcome` with old sort-first semantics,
+ * which did nothing visible on a fresh vault (the Notes app had no list
+ * badge, and Welcome was already first). This is a different tag: the
+ * ratified semantics are partition-not-sort, it isn't stamped onto any
+ * existing note, and the pack ships a `Pinned` view that actually surfaces
+ * it.
+ */
+export const VIEW_TAG: SeedPackTag = {
+  name: "view",
+  description:
+    'A meta tag — it carries a schema, which is what makes a #view note a saved view rather than just a label. Tag a note #view and its metadata becomes the definition: `query` is the saved query itself (the same JSON shape query-notes accepts — tag, exclude_tags, search, metadata, order_by, ...), and `kind` says how to render the result (list, board, calendar, or gallery; an unrecognized or missing kind should degrade to list rather than fail — a view is never wrong to render as a list). `lane_by` names the metadata field a board\'s lanes come from; `date_field` names the date-typed field a calendar plots against — both only meaningful for their matching `kind`, and unset otherwise. The note\'s body is for people: what this view is for, when to reach for it. Because the definition lives in the vault as an ordinary note, any surface can read it and render the same view, and any agent can write one — "make me a board of my active drafts" is just creating a note. Authoring convention worth keeping: most views should write `exclude_tags: ["archived"]` into their own query rather than leaning on some surface-side default — an Archive view is the deliberate exception.',
+  fields: {
+    kind: {
+      type: "string",
+      description:
+        "How to render this view. Unrecognized or absent degrades to list — a view is never wrong to render as a list.",
+      enum: ["list", "board", "calendar", "gallery"],
+      default: "list",
+    },
+    query: {
+      type: "string",
+      description:
+        "The saved query — a JSON string of query-notes parameters (tag, exclude_tags, search, metadata, order_by, sort, ...). This is what actually determines which notes the view shows; kind only says how to draw them.",
+    },
+    lane_by: {
+      type: "string",
+      description:
+        "Board views only: the metadata field whose distinct values become the board's lanes/columns. Unset outside kind: board.",
+    },
+    date_field: {
+      type: "string",
+      description:
+        "Calendar views only: the date-typed metadata field the calendar plots notes against. Unset outside kind: calendar.",
+    },
+  },
+};
+
+export const ARCHIVED_TAG: SeedPackTag = {
+  name: "archived",
+  description:
+    "A plain tag — no schema, just a convention: this note is out of the flow of the present. Not deleted, not wrong, just done, closed, or set aside for now. The one behavior worth relying on: default views exclude archived notes unless a view's own query says otherwise (an Archive view, for instance, asks for them back on purpose). Archiving a note doesn't touch its content, tags, or links — it only changes whether it shows up by default. What actually gets archived, and when, is yours to decide: a finished project, last month's drafts, a conversation that's resolved. Different people will draw that line differently, and that's fine — the tag only promises the one thing above.",
+};
+
+export const PINNED_TAG: SeedPackTag = {
+  name: "pinned",
+  description:
+    "A plain tag — no schema, just a convention: this note gets surfaced first. Pinning is a partition, not a sort — a view that honors it renders pinned notes as their own small group above everything else, rather than nudging them up the existing order. That also means pinning doesn't fight with however the rest of a view is sorted; it just carves out a \"see this first\" spot above it. There's no built-in limit on how many notes can be pinned, and no rule about what belongs there — a current focus, something you keep needing to find, a note you're mid-thought on. Unpin by removing the tag. Different people, and different views, will use it differently; the tag only promises the placement, not the policy.",
+};
+
+export const VIEWS_PATH_PREFIX = "Views/";
+export const ALL_NOTES_VIEW_PATH = `${VIEWS_PATH_PREFIX}All notes`;
+export const RECENT_VIEW_PATH = `${VIEWS_PATH_PREFIX}Recent`;
+export const PINNED_VIEW_PATH = `${VIEWS_PATH_PREFIX}Pinned`;
+export const ARCHIVE_VIEW_PATH = `${VIEWS_PATH_PREFIX}Archive`;
+
+/**
+ * Build the `starter-ontology` pack: the four meta tags above, plus four
+ * seed `#view` notes mirroring the app's default pages — All notes, Recent,
+ * Pinned, Archive — so "default app pages are shipped views" has its data
+ * half from day one. Each view's `query` is written out explicitly
+ * (`exclude_tags: ["archived"]` where it applies) rather than relying on any
+ * surface-side default, per the authoring convention in `VIEW_TAG`'s own
+ * description. Kept tiny on purpose — these are starting points, not a
+ * demonstration of everything the schema can do.
+ *
+ * NOT applied by `src/onboarding-seed.ts`'s default materialization — opt-in
+ * only, via `parachute-vault add-pack starter-ontology` or a console
+ * affordance. A fresh-vault UX change (making this part of the default seed)
+ * is a separate decision; this pack existing makes that a one-line flip
+ * later, deliberately not taken here.
+ */
+export const STARTER_ONTOLOGY_PACK: SeedPack = {
+  name: "starter-ontology",
+  description:
+    "The starter ontology: one meta tag (view, with a schema) and three plain tags (archived, pinned, capture), each with a constitution-style description — plus four seed #view notes (All notes, Recent, Pinned, Archive) mirroring the app's default pages. Opt-in — not seeded by default.",
+  // `capture` reused verbatim from NOTES_REQUIRED_TAGS (byte-equal to the
+  // welcome pack's — see the module doc above and NOTES_REQUIRED_TAGS'
+  // comment). Order matches the constitution ordering, not upsert order.
+  tags: [VIEW_TAG, ARCHIVED_TAG, PINNED_TAG, ...NOTES_REQUIRED_TAGS],
+  notes: [
+    {
+      path: ALL_NOTES_VIEW_PATH,
+      tags: ["view"],
+      content: `# All notes
+
+Everything in the vault except what's archived. The default view — no tag
+filter, no sort override, just the whole thing minus the notes you've set
+aside.
+`,
+      metadata: {
+        kind: "list",
+        query: JSON.stringify({ exclude_tags: ["archived"] }),
+      },
+    },
+    {
+      path: RECENT_VIEW_PATH,
+      tags: ["view"],
+      content: `# Recent
+
+The vault, newest edits first. Same notes as [[${ALL_NOTES_VIEW_PATH}]] —
+archived excluded — just ordered by when they last changed.
+`,
+      metadata: {
+        kind: "list",
+        query: JSON.stringify({
+          exclude_tags: ["archived"],
+          order_by: "updated_at",
+          sort: "desc",
+        }),
+      },
+    },
+    {
+      path: PINNED_VIEW_PATH,
+      tags: ["view"],
+      content: `# Pinned
+
+Whatever you've marked #pinned — the notes surfaced first, regardless of how
+anything else in the vault is organized.
+`,
+      metadata: {
+        kind: "list",
+        query: JSON.stringify({ tag: "pinned" }),
+      },
+    },
+    {
+      path: ARCHIVE_VIEW_PATH,
+      tags: ["view"],
+      content: `# Archive
+
+Everything tagged #archived — out of the flow of the present, but never
+gone. The one view that asks archived notes back on purpose.
+`,
+      metadata: {
+        kind: "list",
+        query: JSON.stringify({ tag: "archived" }),
+      },
+    },
+  ],
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -807,6 +980,7 @@ export const SEED_PACK_NAMES = [
   "welcome",
   "getting-started",
   "surface-starter",
+  "starter-ontology",
 ] as const;
 
 export type SeedPackName = (typeof SEED_PACK_NAMES)[number];
@@ -835,6 +1009,8 @@ export function getSeedPack(
       return GETTING_STARTED_PACK;
     case "surface-starter":
       return SURFACE_STARTER_PACK;
+    case "starter-ontology":
+      return STARTER_ONTOLOGY_PACK;
     default:
       return null;
   }
