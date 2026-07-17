@@ -1244,7 +1244,7 @@ export class BunSqliteStore implements Store {
         const mapped = indexedFieldOps.mapFieldType(spec.type);
         if (!mapped) {
           throw new indexedFieldOps.IndexedFieldError(
-            `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean, reference)`,
+            `field "${fieldName}" has unsupported type "${spec.type}" for indexing (supported: string, integer, boolean, reference, date)`,
           );
         }
         // Throws IndexedFieldError on an invalid identifier (e.g. kebab-case).

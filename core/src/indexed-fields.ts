@@ -27,13 +27,21 @@ export type SqliteType = "TEXT" | "INTEGER";
 // `string` — because the metadata VALUE (an id/path/title) is what's
 // indexed here; the resolved graph link is a separate concern maintained by
 // `core/src/store.ts`'s write path. See tag-schemas.ts's `VALID_FIELD_TYPES`.
-export type FieldType = "string" | "integer" | "boolean" | "reference";
+// `date` is also stored as TEXT: an indexed `date` field holds an ISO-8601
+// string (validated by `tag-schemas.ts`'s `defaultMatchesType` /
+// `schema-defaults.ts`'s `valueMatchesType`), and ISO-8601 strings are
+// lexicographically comparable — the same reason TEXT-stored `updated_at`
+// range queries already work — so `gt`/`gte`/`lt`/`lte`, `date_filter`, and
+// `order_by` all fall out of the generic TEXT-column machinery with no
+// type-specific SQL.
+export type FieldType = "string" | "integer" | "boolean" | "reference" | "date";
 
 export const TYPE_MAP: Record<FieldType, SqliteType> = {
   string: "TEXT",
   integer: "INTEGER",
   boolean: "INTEGER",
   reference: "TEXT",
+  date: "TEXT",
 };
 
 export interface IndexedField {

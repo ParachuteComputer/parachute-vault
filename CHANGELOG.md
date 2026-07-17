@@ -34,6 +34,52 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.3] - 2026-07-16
+
+**`date` field type.** Meta-tag schemas gain `date` alongside `string`/
+`number`/`integer`/`boolean`/`array`/`object`/`reference` — an ISO-8601
+date (`"2026-07-09"`) or full RFC3339 timestamp (`"2026-07-09T00:00:00.000Z"`).
+Motivation: date-ish fields (e.g. a `meeting` tag's `meeting_date`) could
+only be declared `type: "string"` with "ISO date" explained in prose, so
+nothing could programmatically discover date-candidate fields for
+calendar-view UIs. Validated with the SAME parser `date_filter`'s
+`updated_at` bound already uses (`core/src/cursor.ts`'s `timestampToMs`) —
+one ISO-parsing implementation, not two. Indexable (`indexed: true`) — an
+indexed `date` field stores TEXT (ISO strings sort correctly under a plain
+lexicographic compare), so `gt`/`gte`/`lt`/`lte`, `date_filter: { field }`,
+and `order_by` all fall out of the EXISTING string-indexed-field machinery
+with no new SQL path. `list-tags`/`vault-info`'s indexed-field catalog and
+`update-tag`'s response carry the type through unchanged (nothing filters
+unknown/newer types out).
+
+**Backward compatible by construction.** `date` is opt-in per schema edit —
+every existing `type: "string"` date field remains valid forever, no
+migration, no data change. Schema edits are never retroactive: tightening
+an existing field from `string` to `date` does NOT revalidate notes already
+written under the old contract — only the field's NEXT write is checked
+against the new type (the same sharp edge `strict`/`required`/enum
+tightening already carries — see `core/src/conformance.ts`'s pre-check).
+
+### Added
+
+- `date` added to `VALID_FIELD_TYPES` (`core/src/tag-schemas.ts`) and to
+  `indexed-fields.ts`'s `TYPE_MAP` (→ `TEXT`) — the recognized-type
+  vocabulary and the indexable subset both grow by one.
+- `defaultMatchesType` (tag-schemas.ts) and `valueMatchesType`
+  (schema-defaults.ts) both gain a `"date"` case, reusing `cursor.ts`'s
+  `timestampToMs` — a `default` or a note's metadata value on a `date`
+  field is validated identically to every other typed field (advisory
+  `type_mismatch` by default; hard rejection under `strict: true` or
+  `indexed: true`, per the existing vault#553 Decision A rule).
+- `core/src/conformance.ts`'s pre-tighten violation counter now recognizes
+  `type: "date"` (previously dropped the type check for any type outside
+  its narrower whitelist).
+- Tests: type acceptance/rejection (both ISO forms), `default` validation,
+  `type_mismatch` advisory + strict + indexed-forced-strict enforcement,
+  `gt`/`gte`/`lt`/`lte` + `order_by` + `date_filter` on a schema-declared
+  indexed `date` field, the no-retroactive-revalidation schema-edit
+  compat guarantee, and indexed-field-catalog introspection carry-through.
+
 ## [0.7.3-rc.2] - 2026-07-16
 
 **Semantic search — EXPERIMENTAL.** Find notes by MEANING, not keyword —

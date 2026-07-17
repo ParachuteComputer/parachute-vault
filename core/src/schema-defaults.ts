@@ -41,6 +41,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { timestampToMs } from "./cursor.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,7 +58,7 @@ export interface SchemaField {
    * `type_mismatch` warning that previously fired on every integer-shaped
    * field because the validator had no `"integer"` case. See vault#310.
    */
-  type?: "string" | "number" | "integer" | "boolean" | "array" | "object" | "reference";
+  type?: "string" | "number" | "integer" | "boolean" | "array" | "object" | "reference" | "date";
   enum?: string[];
   description?: string;
   /**
@@ -390,6 +391,13 @@ function valueMatchesType(value: unknown, type: SchemaField["type"], cardinality
         return Array.isArray(value) && value.every((item) => typeof item === "string");
       }
       return typeof value === "string";
+    // `date` validates like `string` — an ISO-8601 date (`YYYY-MM-DD`) or
+    // full RFC3339 timestamp. Reuses `cursor.ts`'s `timestampToMs` (the SAME
+    // UTC-correct parser `date_filter`'s `updated_at` bound uses), not a
+    // second date parser — see tag-schemas.ts's `VALID_FIELD_TYPES` doc
+    // comment.
+    case "date":
+      return typeof value === "string" && timestampToMs(value) !== null;
   }
 }
 
