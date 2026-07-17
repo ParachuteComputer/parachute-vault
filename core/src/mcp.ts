@@ -1355,6 +1355,12 @@ A note's response carries \`existed\` (true/false) whenever ITS \`if_exists\` wa
               ...updates,
               actor: writeActor,
               via: writeVia,
+              // `tagsForSchemaResolution` (vault#date-field-type review round
+              // 2) — same bug/fix as the update-note handler: `store.tagNote`
+              // below runs AFTER this UPDATE, so without the PROJECTED tag
+              // set here, `date`-field normalization inside store.updateNote
+              // would miss a field newly declared by an incoming tag.
+              tagsForSchemaResolution: [...projectedTags],
             });
           }
 
@@ -2070,10 +2076,18 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             // --- Strict-schema gate (vault#299 Part A) ---
             // Validate the PROSPECTIVE shape (final tags + merged metadata,
             // including a state_transition's `to`) before the write so a
-            // rejection leaves the note untouched.
+            // rejection leaves the note untouched. `projectedTags` is hoisted
+            // out of this block (not just used here) — the `store.updateNote`
+            // call below also needs it, as `tagsForSchemaResolution`, so that
+            // `date`-field normalization sees a tag ADDED in this SAME call
+            // (vault#date-field-type review round 2 — the actual `store.tagNote`
+            // mutation happens AFTER the core UPDATE, so without this the
+            // schema resolution inside `store.updateNote` would still be
+            // looking at the note's stale pre-write tag set).
+            let projectedTags: Set<string>;
             {
               const removeSet = new Set<string>((item.tags as any)?.remove ?? []);
-              const projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
+              projectedTags = new Set<string>((note.tags ?? []).filter((t) => !removeSet.has(t)));
               for (const t of ((item.tags as any)?.add as string[] | undefined) ?? []) projectedTags.add(t);
               const baseMeta = updates.metadata ?? ((note.metadata as Record<string, unknown>) ?? {});
               const projectedMeta = stItem !== undefined
@@ -2117,6 +2131,12 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
               // updated_at on a no-op).
               updates.actor = writeActor;
               updates.via = writeVia;
+              // `tagsForSchemaResolution` (vault#date-field-type review round
+              // 2) — the PROJECTED final tag set, so `date`-field
+              // normalization inside store.updateNote sees a tag ADDED in
+              // this same call, not just the note's pre-write tags. See the
+              // comment on `projectedTags`'s declaration above.
+              updates.tagsForSchemaResolution = [...projectedTags];
               // store.updateNote routes through noteOps.updateNote, which runs
               // the UPDATE (with optional `AND updated_at IS ?`) atomically and
               // throws ConflictError on mismatch. No mutations have happened
@@ -2380,11 +2400,11 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
             additionalProperties: {
               type: "object",
               properties: {
-                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object, reference — all seven are accepted for storage + advisory validation; any OTHER value is rejected outright (error_type invalid_field_type, vault#555 — bundled with every other violation in the same call, see the `update-tag` tool description). Only string/integer/boolean/reference are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field). `reference` is a DUAL-WRITE type (typed-reference-field): the value is stored + validated exactly like `string` (pass a note id, path, or title), AND create-note/update-note additionally resolve that value to a note and maintain a graph `links` edge from this note to it, with `relationship` set to the field name — kept in sync on every write that changes the field (a new value re-points the link; clearing the field drops it). A target that doesn't resolve yet is queued and backfills automatically, same as a structured `links` entry — see `docs/design/typed-reference-field.md`." },
+                type: { type: "string", description: "Field type: string, boolean, integer, number, array, object, reference, date — all eight are accepted for storage + advisory validation; any OTHER value is rejected outright (error_type invalid_field_type, vault#555 — bundled with every other violation in the same call, see the `update-tag` tool description). Only string/integer/boolean/reference/date are INDEXABLE (see `indexed` below); declaring `indexed: true` with number/array/object is rejected (unsupported_indexed_type / invalid_indexed_field). `reference` is a DUAL-WRITE type (typed-reference-field): the value is stored + validated exactly like `string` (pass a note id, path, or title), AND create-note/update-note additionally resolve that value to a note and maintain a graph `links` edge from this note to it, with `relationship` set to the field name — kept in sync on every write that changes the field (a new value re-points the link; clearing the field drops it). A target that doesn't resolve yet is queued and backfills automatically, same as a structured `links` entry — see `docs/design/typed-reference-field.md`. `date` stores/validates exactly like `string`, but the value must be an ISO-8601 date (`2026-07-09`) or full timestamp (`2026-07-09T00:00:00.000Z`) — an unparseable value is a type_mismatch (advisory) or a rejected write (`strict: true` / `indexed: true`), same treatment as any other type mismatch. A full timestamp carrying an explicit `±HH:MM` offset is normalized to canonical UTC (`Z`-suffixed) on write — the offset is accepted, but not persisted verbatim — so indexed `date` fields sort/filter correctly under the TEXT comparison `gt`/`gte`/`lt`/`lte`/`date_filter`/`order_by` all use; a bare date (no time component) is left as-is." },
                 description: { type: "string" },
                 enum: { type: "array", items: { type: "string" }, description: "Allowed values. Does NOT auto-backfill — a note that omits this field stays without it unless `default` is also set (vault#553; the pre-0.7.0 behavior of silently defaulting to the first enum value is retired). Set `default` explicitly if you want backfill." },
                 default: { description: "Explicit backfill value (vault#553) applied when a note gains this tag without setting the field. Must conform to this field's own `type` (and `enum`, if declared) — a non-conforming default is rejected (invalid_default / invalid_field_default) rather than silently stored. Omit entirely to leave the field ABSENT (not backfilled) on notes that don't set it — this is what makes `exists:false` a trustworthy \"never set\" query." },
-                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed. Only string/integer/boolean/reference are indexable. Indexed ⇒ a type-mismatched write is HARD-REJECTED (schema_validation), not just warned — vault#553." },
+                indexed: { type: "boolean", description: "When true, a generated column + index are maintained on notes.metadata.<field>, making it queryable via metadata operator objects and order_by. Global: all tags declaring the field must agree on both type and indexed. Only string/integer/boolean/reference/date are indexable. Indexed ⇒ a type-mismatched write is HARD-REJECTED (schema_validation), not just warned — vault#553." },
                 strict: { type: "boolean", description: "vault#299. Default false (advisory). When true, ALL of this field's declared constraints (type + enum + required + cardinality) are ENFORCED — a violating write is rejected with a schema_validation error, not just warned. All-or-nothing per field; free-form fields on a strict tag simply leave strict off. Note: `indexed: true` fields enforce their TYPE constraint regardless of this flag (vault#553)." },
                 required: { type: "boolean", description: "vault#299. The field must be present + non-null on a note with this tag. Advisory unless `strict: true`." },
                 cardinality: { type: "string", enum: ["one", "many"], description: "vault#299. 'one' (scalar, default) or 'many' (array). Advisory unless `strict: true`." },

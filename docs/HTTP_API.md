@@ -564,9 +564,9 @@ actually affected by the bug — only the message string could double.
 | `error_type` | HTTP | Key fields | Meaning |
 |---|---|---|---|
 | `tag_field_conflict` | 422 | `tag`, `violations[]` (`{field, reason, message, other_tag?}`) | One or more fields in this call conflict with another tag's declaration, OR a field's declared `default` doesn't conform to its own `type`/`enum` (vault#553 Decision B), OR a field declares a `type` outside the recognized vocabulary (vault#555 fix 4). Carries EVERY violation found in one response (vault#553; extended to `invalid_default`/`invalid_type` by vault#555 fix 5 — both REST and MCP used to report only the FIRST bad field of these two classes) and states explicitly that **no changes were applied**. `reason` is `type_conflict` (NON-indexed incoming fields only — see `invalid_indexed_field` for the both-indexed case), `indexed_flag_conflict`, `invalid_default`, or `invalid_type` (the latter two are own-field — no `other_tag`, nothing to scope-scrub); `other_tag` names the conflicting declarer for the cross-tag reasons. **Tag-scope generalization:** for a tag-scoped session, a violation whose conflicting declarer is outside the token's allowlist is generalized — the write is still rejected, but the message names no tag and reveals no declared type/flag, and `other_tag` is omitted. In-scope declarers keep full detail; own-field violations (`invalid_default`/`invalid_type`) are never scrubbed (they never named another tag). |
-| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean/reference — this ALSO covers a recognized-but-unindexable type like `array`/`object`/`number`, a different case from a genuinely unrecognized type string, which is `invalid_field_type` below), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
+| `invalid_indexed_field` | 400 | (message only) | An indexed-field declaration failed: an unsupported type for indexing (only string/integer/boolean/reference/date — this ALSO covers a recognized-but-unindexable type like `array`/`object`/`number`, a different case from a genuinely unrecognized type string, which is `invalid_field_type` below), an invalid identifier (must match `[A-Za-z_][A-Za-z0-9_]{0,62}`), or a cross-tag TYPE conflict where the incoming field is itself `indexed: true` (the pre-existing vault#478 contract — this case stays 400 here rather than joining `tag_field_conflict`'s 422). **Tag-scope generalization:** the cross-declarer message names the other declarer tag(s) + their storage type; for a tag-scoped session with any out-of-scope declarer, the message is generalized (no tag names, no existing type) — same status, same `error_type`. |
 | `invalid_field_default` | 400 | `field` | vault#553 Decision B: a field's declared `default` doesn't match its own `type` (or isn't one of its own `enum` values). Own-field error — a DEFENSE-IN-DEPTH path only as of vault#555 fix 5: both REST's `PUT /api/tags/:name` and MCP's `update-tag` now pre-validate every field and report this bundled as `tag_field_conflict`'s `invalid_default` reason instead (every invalid field in the call, not just the first); this single-violation 400 only surfaces for a caller that bypasses that pre-check (e.g. a direct `store.upsertTagRecord` call from outside REST/MCP). **BREAKING (vault#555 fix 5):** a REST `PUT /api/tags/:name` client that previously pinned on a **400 `invalid_field_default`** for the single-bad-default case now receives **422 `tag_field_conflict`** (with the bad default in `violations[]` as reason `invalid_default`). Re-key on the `tag_field_conflict` 422 + its `violations[]`; the 400 path above is now unreachable from REST/MCP. This aligns REST with MCP's already-bundled reporting. |
-| `invalid_field_type` | 400 | `field`, `type`, `valid_types[]` | vault#555 fix 4: a field's declared `type` isn't one of the seven recognized values (`string`/`number`/`integer`/`boolean`/`array`/`object`/`reference`) — e.g. `type: "frobnicator"`. Before this fix a NON-indexed field's `type` was never validated at all and a bogus type was silently accepted and persisted verbatim (indexed fields already got a type check, but scoped to "unsupported for indexing," not "unrecognized"). Same defense-in-depth posture as `invalid_field_default` — the normal path reports this bundled as `tag_field_conflict`'s `invalid_type` reason (see that row); this single-violation 400 only surfaces for a caller that bypasses the pre-check. |
+| `invalid_field_type` | 400 | `field`, `type`, `valid_types[]` | vault#555 fix 4: a field's declared `type` isn't one of the recognized values (`string`/`number`/`integer`/`boolean`/`array`/`object`/`reference`/`date`) — e.g. `type: "frobnicator"`. Before this fix a NON-indexed field's `type` was never validated at all and a bogus type was silently accepted and persisted verbatim (indexed fields already got a type check, but scoped to "unsupported for indexing," not "unrecognized"). Same defense-in-depth posture as `invalid_field_default` — the normal path reports this bundled as `tag_field_conflict`'s `invalid_type` reason (see that row); this single-violation 400 only surfaces for a caller that bypasses the pre-check. |
 | `invalid_relationships` | 400 | (message only) | `relationships` isn't a JSON object, or isn't JSON-serializable. |
 | `invalid_parent_names` | 400 | `field: "parent_names"` | `parent_names` isn't an array of tag-name strings. |
 | `tag_not_found` | 404 | `tag`, `did_you_mean?` | The named tag has no identity row AND no notes carrying it. `did_you_mean` (a close match) is present only when found AND — for a tag-scoped session — itself in-scope. |
@@ -1710,13 +1710,13 @@ the existing schema (mirrors MCP `update-tag`).
   from "explicitly set to the default." **Blast radius:** this only changes
   FUTURE writes — notes already backfilled under the old behavior keep their
   values; no migration touches them.
-- **Honest type list.** `type` accepts all seven of `string`/`boolean`/
-  `integer`/`number`/`array`/`object`/`reference` for storage and advisory
-  validation, but only `string`/`integer`/`boolean`/`reference` are
-  INDEXABLE — declaring `indexed: true` with `number`/`array`/`object` is
-  rejected (`unsupported_indexed_type` / `invalid_indexed_field`, unchanged
-  behavior from before 0.7.0 — only the DOCUMENTED type list was dishonest,
-  not the enforcement).
+- **Honest type list.** `type` accepts all eight of `string`/`boolean`/
+  `integer`/`number`/`array`/`object`/`reference`/`date` for storage and
+  advisory validation, but only `string`/`integer`/`boolean`/`reference`/
+  `date` are INDEXABLE — declaring `indexed: true` with `number`/`array`/
+  `object` is rejected (`unsupported_indexed_type` / `invalid_indexed_field`,
+  unchanged behavior from before 0.7.0 — only the DOCUMENTED type list was
+  dishonest, not the enforcement).
 
 **`type: "reference"` — typed reference field (0.7.1).** A dual-write field
 type: the value is stored + validated exactly like `string` (pass a note id,
@@ -1737,6 +1737,42 @@ metadata-equality filter works either way. Scalar values only in this
 release — an array (`cardinality: "many"`) reference value is stored and
 validated but does NOT create a link. See
 `docs/design/typed-reference-field.md` for the full design and known gaps.
+
+**`type: "date"` — ISO-8601 date field (0.7.3).** Stores/validates exactly
+like `string` — the value must be an ISO-8601 date (`"2026-07-09"`) or a
+full RFC3339 timestamp (`"2026-07-09T00:00:00.000Z"`) — validated with the
+SAME parser `date_filter`'s `updated_at` bound uses
+(`core/src/cursor.ts`'s `timestampToMs`), so there's one ISO-parsing
+implementation, not a second one that could drift. An unparseable value is a
+`type_mismatch` (advisory by default; hard-rejected under `strict: true` or
+`indexed: true`, same as any other typed field — vault#553). Declare
+`indexed: true` alongside `type: "date"` to get a B-tree index backing
+`gt`/`gte`/`lt`/`lte` range queries, `date_filter: { field }`, and
+`order_by` — the index stores TEXT, so no new SQL path was needed; the
+existing string-indexed-field machinery does the comparing. **Offset
+normalization (write-time):** a value carrying an explicit `±HH:MM` offset
+does NOT persist verbatim — a raw TEXT compare only sorts ISO-8601
+timestamps correctly when every value shares the SAME offset
+representation, and a mixed-offset vault (`"...+02:00"` alongside `"...Z"`)
+would otherwise silently mis-order/mis-filter. `create-note`/`update-note`
+rewrite any FULL timestamp on a `date`-typed field to canonical UTC
+(`Z`-suffixed, millisecond precision) before writing — the same
+"normalized, not rejected" treatment `paths are normalized on write`
+already gets elsewhere, chosen because rejecting offsets outright would
+defeat the type's own motivation (calendar integrations commonly emit
+offsets, not always `Z`). A bare `YYYY-MM-DD` value has no offset and is
+left untouched — it's already canonical and prefix-sorts correctly against
+full timestamps on the same calendar day. Motivation: before this, a
+date-ish field (e.g. a `meeting` tag's `meeting_date`) could only be
+declared `type: "string"` with "ISO date" explained in prose, so nothing
+could programmatically discover date-candidate fields for calendar-view
+UIs. **Backward compat:** existing `type: "string"` date fields remain
+valid forever — `date` is opt-in per schema edit, and switching a field's
+declared `type` does NOT retroactively revalidate existing notes (no
+migration, no data rewrite) — only the field's NEXT write is checked
+against the new type. `POST /vault/{name}/api/tags/{name}/conformance`
+(admin-SPA-internal, undocumented above) counts how many existing notes
+would fail the tightened type before you commit the schema edit.
 
 **Startup migration (schema v24).** Existing vaults get a one-time,
 idempotent startup pass (`migrateToV24`) that reuses `doctor`'s

@@ -34,6 +34,104 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.3] - 2026-07-16
+
+**`date` field type.** Meta-tag schemas gain `date` alongside `string`/
+`number`/`integer`/`boolean`/`array`/`object`/`reference` — an ISO-8601
+date (`"2026-07-09"`) or full RFC3339 timestamp (`"2026-07-09T00:00:00.000Z"`).
+Motivation: date-ish fields (e.g. a `meeting` tag's `meeting_date`) could
+only be declared `type: "string"` with "ISO date" explained in prose, so
+nothing could programmatically discover date-candidate fields for
+calendar-view UIs. Validated with the SAME parser `date_filter`'s
+`updated_at` bound already uses (`core/src/cursor.ts`'s `timestampToMs`) —
+one ISO-parsing implementation, not two. Indexable (`indexed: true`) — an
+indexed `date` field stores TEXT, so `gt`/`gte`/`lt`/`lte`,
+`date_filter: { field }`, and `order_by` all fall out of the EXISTING
+string-indexed-field machinery with no new SQL path. `list-tags`/
+`vault-info`'s indexed-field catalog and `update-tag`'s response carry the
+type through unchanged (nothing filters unknown/newer types out).
+
+**Offset normalization (write-time, review fix).** A raw TEXT compare only
+sorts ISO-8601 timestamps correctly when every stored value shares the SAME
+offset representation — `timestampToMs` correctly VALIDATES an explicit
+`±HH:MM` offset, but persisting it verbatim let a mixed-offset vault
+silently mis-order/mis-filter (`"...+02:00"` sorting after `"...Z"` even
+when the actual instant is earlier — the same bug class `updated_at` got a
+dedicated ms-mirror column for, vault#585/#586, that hadn't yet extended to
+user-declared `date` fields). `create-note`/`update-note` now rewrite any
+FULL timestamp on a `date`-typed field to canonical UTC (`Z`-suffixed,
+millisecond precision) before writing — normalize, not reject, matching the
+existing "paths are normalized on write" precedent (rejecting offsets would
+defeat the type's own calendar-integration motivation). A bare
+`YYYY-MM-DD` value has no offset and is left untouched.
+
+**Two follow-up fixes from delta review (round 2).** (1) A tag-add +
+date-metadata combo in the SAME `update-note`/`create-note if_exists:update`
+call skipped normalization — both handlers issue `store.tagNote` (the
+actual tag mutation) AFTER the core `UPDATE` (deliberate: a `ConflictError`
+from the guarded UPDATE must leave the note fully untouched), so
+`normalizeDateFields` was resolving the schema against the note's STALE
+pre-write tag set and never saw a `date` field newly declared by the tag
+being added. Fixed by threading the PROJECTED final tag set (already
+computed for the strict-schema gate) into `store.updateNote` as a new
+`tagsForSchemaResolution` override, so both the tag-add AND the metadata
+normalization land in the SAME atomic write. (2) `normalizeDateFields` used
+to mutate its input `metadata` object in place — `core/` is a published
+library, and a direct embedder holding a reference to the object they
+passed in would see it change out from under them. Now copy-on-write:
+returns the SAME reference when nothing needs rewriting, a lazily-allocated
+shallow copy the first time a field actually needs rewriting. Every call
+site reassigns its local binding from the return value rather than relying
+on the old side effect.
+
+**Backward compatible by construction.** `date` is opt-in per schema edit —
+every existing `type: "string"` date field remains valid forever, no
+migration, no data change. Schema edits are never retroactive: tightening
+an existing field from `string` to `date` does NOT revalidate notes already
+written under the old contract — only the field's NEXT write is checked
+against the new type (the same sharp edge `strict`/`required`/enum
+tightening already carries — see `core/src/conformance.ts`'s pre-check).
+
+### Added
+
+- `date` added to `VALID_FIELD_TYPES` (`core/src/tag-schemas.ts`) and to
+  `indexed-fields.ts`'s `TYPE_MAP` (→ `TEXT`) — the recognized-type
+  vocabulary and the indexable subset both grow by one.
+- `defaultMatchesType` (tag-schemas.ts) and `valueMatchesType`
+  (schema-defaults.ts) both gain a `"date"` case, reusing `cursor.ts`'s
+  `timestampToMs` — a `default` or a note's metadata value on a `date`
+  field is validated identically to every other typed field (advisory
+  `type_mismatch` by default; hard rejection under `strict: true` or
+  `indexed: true`, per the existing vault#553 Decision A rule).
+- `core/src/conformance.ts`'s pre-tighten violation counter now recognizes
+  `type: "date"` (previously dropped the type check for any type outside
+  its narrower whitelist).
+- `schema-defaults.ts:normalizeDateFields` — the offset-normalization fix,
+  copy-on-write (round 2). Wired into every write path that reaches the DB:
+  `store.createNote`, `store.updateNote` (covers merge-patch too — the
+  merge already happened upstream by the time `store.updateNote` sees it),
+  `store.createNotes` (bulk), and `store.createNoteRaw` (the legacy
+  Obsidian importer).
+- `store.updateNote`'s `updates` gains an optional `tagsForSchemaResolution`
+  override (round 2) — lets a caller that's ALSO adding a tag in the same
+  logical update pass the PROJECTED final tag set for schema resolution,
+  instead of the note's stale pre-write tags. Wired at both mcp.ts call
+  sites that combine tags + metadata in one item: `update-note`'s single-
+  item handler and `create-note`'s `if_exists: "update"`/`"replace"`
+  batch-upsert branch.
+- Tests: type acceptance/rejection (both ISO forms), `default` validation,
+  `type_mismatch` advisory + strict + indexed-forced-strict enforcement,
+  `gt`/`gte`/`lt`/`lte` + `order_by` + `date_filter` on a schema-declared
+  indexed `date` field, the no-retroactive-revalidation schema-edit
+  compat guarantee, indexed-field-catalog introspection carry-through, the
+  reviewer's exact mixed-offset repro as a regression test (offset + `Z`
+  values sort/filter correctly post-normalization; write-then-read proves
+  the stored/returned value is canonical `Z`-form; bare-date passthrough
+  pinned), the round-2 tag-add + date-metadata combo (both call sites,
+  sanity-checked to fail without the fix before landing), and a
+  no-mutation pin on `store.createNote`/`updateNote`'s caller-supplied
+  metadata object.
+
 ## [0.7.3-rc.2] - 2026-07-16
 
 **Semantic search — EXPERIMENTAL.** Find notes by MEANING, not keyword —

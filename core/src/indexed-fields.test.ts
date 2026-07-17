@@ -67,13 +67,16 @@ describe("indexed-fields: module", () => {
     expect(() => validateFieldName("'; DROP TABLE notes; --")).toThrow(IndexedFieldError);
   });
 
-  it("TYPE_MAP covers string/integer/boolean/reference", () => {
+  it("TYPE_MAP covers string/integer/boolean/reference/date", () => {
     expect(TYPE_MAP.string).toBe("TEXT");
     expect(TYPE_MAP.integer).toBe("INTEGER");
     expect(TYPE_MAP.boolean).toBe("INTEGER");
     // vault#typed-reference-field: `reference` stores like `string` — the
     // metadata VALUE (an id/path/title) is what's indexed here.
     expect(TYPE_MAP.reference).toBe("TEXT");
+    // vault#date-field-type: `date` also stores like `string` — an ISO-8601
+    // string, which sorts correctly under a plain TEXT comparison.
+    expect(TYPE_MAP.date).toBe("TEXT");
   });
 
   it("declareField creates column + index on first declaration", () => {
@@ -212,12 +215,15 @@ describe("update-tag: indexed flag", () => {
   });
 
   it("unsupported field type for indexing throws", async () => {
+    // vault#date-field-type: `date` JOINED the indexable subset (stores TEXT,
+    // same as string/reference) — `number` (a float) is the current example
+    // of a recognized-but-unindexable type; see TYPE_MAP.
     expect(() =>
       findTool("update-tag").execute({
         tag: "project",
-        fields: { weird: { type: "date", indexed: true } },
+        fields: { weird: { type: "number", indexed: true } },
       }),
-    ).toThrow(/unsupported type "date"/);
+    ).toThrow(/unsupported type "number"/);
   });
 
   it("invalid field name for indexing throws", async () => {

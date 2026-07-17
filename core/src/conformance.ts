@@ -78,7 +78,8 @@ function toStrictSchemaField(spec: TagFieldSchema): SchemaField {
     spec.type === "integer" ||
     spec.type === "boolean" ||
     spec.type === "array" ||
-    spec.type === "object"
+    spec.type === "object" ||
+    spec.type === "date"
   ) {
     out.type = spec.type;
   }

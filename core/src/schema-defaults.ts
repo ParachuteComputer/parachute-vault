@@ -41,6 +41,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { timestampToMs } from "./cursor.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,7 +58,7 @@ export interface SchemaField {
    * `type_mismatch` warning that previously fired on every integer-shaped
    * field because the validator had no `"integer"` case. See vault#310.
    */
-  type?: "string" | "number" | "integer" | "boolean" | "array" | "object" | "reference";
+  type?: "string" | "number" | "integer" | "boolean" | "array" | "object" | "reference" | "date";
   enum?: string[];
   description?: string;
   /**
@@ -320,6 +321,82 @@ export function resolveNoteSchemas(
   return { effectiveTags, mergedFields, conflicts };
 }
 
+/**
+ * Normalize `date`-typed field VALUES in `metadata` to canonical UTC ISO
+ * form (`Z`-suffixed) BEFORE persisting (vault#date-field-type — mixed-
+ * offset corruption, caught in review).
+ *
+ * The bug: every consumer of an indexed `date` field — `buildOperatorClause`
+ * (query-operators.ts), `date_filter` and `order_by` (notes.ts) — compares
+ * the generated `meta_<field>` column as raw TEXT. ISO-8601 strings sort
+ * correctly under a TEXT compare ONLY when every value shares the same
+ * offset representation. `timestampToMs` (cursor.ts) — the validator both
+ * `defaultMatchesType` and `valueMatchesType` reuse — correctly ACCEPTS an
+ * explicit `±HH:MM` offset (validation was never the gap), but a value like
+ * `"2026-07-16T10:00:00+02:00"` (= `08:00Z`) persisted VERBATIM sorts AFTER
+ * `"2026-07-16T09:00:00Z"` (= `09:00Z`) under a raw string compare, even
+ * though the actual instant is earlier — a mixed-offset vault silently gets
+ * wrong range-query/order_by/date_filter results. This is the exact bug
+ * class `updated_at` got a dedicated ms-mirror column for (vault#585/#586,
+ * see `notes.ts`'s `dateFilter` block) that never extended to user-declared
+ * `date` fields.
+ *
+ * The fix is normalize-on-write, not reject-on-write (matching the
+ * "paths are normalized on write" precedent — instant preserved,
+ * representation canonicalized) — rejecting offsets would defeat the
+ * type's own motivation (calendar integrations and other emitters commonly
+ * produce offset timestamps, not always `Z`). Only a FULL timestamp (has a
+ * time component) is rewritten, to `new Date(ms).toISOString()` — always
+ * UTC, millisecond precision, `Z`-suffixed. A bare `YYYY-MM-DD` value is
+ * left untouched: it has no offset to normalize, is already canonical, and
+ * prefix-sorts correctly against full timestamps sharing the same calendar
+ * day. A value that fails `timestampToMs` is left untouched too — that's a
+ * `type_mismatch` for `valueMatchesType` to catch, not this function's job.
+ *
+ * COPY-ON-WRITE, never mutates the input `metadata` object (vault#date-
+ * field-type review round 2) — `core/` is a published library; a direct
+ * embedder holding a reference to the object THEY passed in must never see
+ * it change out from under them. Returns the SAME reference when nothing
+ * needs rewriting (the common case — no unnecessary allocation on the
+ * no-op path) or `metadata` is undefined; returns a freshly shallow-copied
+ * object, with only the rewritten field(s) replaced, the first time a
+ * rewrite is actually needed. Every call site must use the RETURNED value
+ * (not assume its input was mutated) — see `store.createNote`/`updateNote`/
+ * `createNotes`/`createNoteRaw`, all of which reassign their local
+ * `opts`/`updates`/`input` binding from the return rather than relying on a
+ * side effect.
+ *
+ * Called from `store.createNote`/`updateNote`/`createNotes`/`createNoteRaw`
+ * — the lowest chokepoint every write path (MCP, REST, import) funnels
+ * through — BEFORE the row is persisted, so the value that's validated by
+ * `validateNote`/`valueMatchesType` upstream (offset-tolerant, so
+ * normalization can't newly fail a write) and the value that's written +
+ * echoed back on the response are the SAME normalized string.
+ */
+export function normalizeDateFields(
+  resolved: ResolvedSchemas,
+  note: { tags?: string[]; metadata?: Record<string, unknown> },
+): Record<string, unknown> | undefined {
+  const metadata = note.metadata;
+  if (!metadata) return metadata;
+  const { mergedFields } = resolveNoteSchemas(resolved, note);
+  let copy: Record<string, unknown> | undefined;
+  for (const [fieldName, { spec }] of mergedFields) {
+    if (spec.type !== "date") continue;
+    const value = metadata[fieldName];
+    if (typeof value !== "string") continue;
+    // Bare `YYYY-MM-DD` (no time component) has no offset to normalize.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) continue;
+    const ms = timestampToMs(value);
+    if (ms === null) continue; // unparseable — valueMatchesType's job, not ours
+    const canonical = new Date(ms).toISOString();
+    if (canonical === value) continue;
+    if (!copy) copy = { ...metadata }; // lazy: only copy once a rewrite is due
+    copy[fieldName] = canonical;
+  }
+  return copy ?? metadata;
+}
+
 function fieldSpecsEqual(a: SchemaField, b: SchemaField): boolean {
   if (a.type !== b.type) return false;
   if (!stringArraysEqual(a.enum, b.enum)) return false;
@@ -390,6 +467,13 @@ function valueMatchesType(value: unknown, type: SchemaField["type"], cardinality
         return Array.isArray(value) && value.every((item) => typeof item === "string");
       }
       return typeof value === "string";
+    // `date` validates like `string` — an ISO-8601 date (`YYYY-MM-DD`) or
+    // full RFC3339 timestamp. Reuses `cursor.ts`'s `timestampToMs` (the SAME
+    // UTC-correct parser `date_filter`'s `updated_at` bound uses), not a
+    // second date parser — see tag-schemas.ts's `VALID_FIELD_TYPES` doc
+    // comment.
+    case "date":
+      return typeof value === "string" && timestampToMs(value) !== null;
   }
 }
 

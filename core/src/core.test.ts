@@ -1478,6 +1478,42 @@ describe("queryNotes", async () => {
       expect(results.map((n) => n.content)).toEqual(["recent email"]);
     });
 
+    // ---- `date` field type (vault#date-field-type) ----
+    //
+    // Same date_filter machinery as `email_date` above, but declared via a
+    // real tag schema (`type: "date", indexed: true`) rather than raw
+    // `declareField`, and mixing both accepted ISO forms (bare date + full
+    // RFC3339 timestamp) in one vault.
+    it("date_filter works on a schema-declared, indexed `date` field, accepting both ISO forms", async () => {
+      const tools = generateMcpTools(store);
+      // Indexed-field reconciliation (declareField → generated column + index)
+      // runs through the `update-tag` tool / `store.upsertTagRecord` — the
+      // legacy `store.upsertTagSchema` facade writes description+fields only
+      // and does NOT create the backing column. See store.ts's upsertTagRecord.
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", indexed: true } },
+      });
+      await store.createNote("too early", { tags: ["meeting"], metadata: { meeting_date: "2025-12-01" } });
+      await store.createNote("in window (date-only)", { tags: ["meeting"], metadata: { meeting_date: "2026-04-15" } });
+      await store.createNote("in window (full timestamp)", {
+        tags: ["meeting"],
+        metadata: { meeting_date: "2026-04-25T09:00:00.000Z" },
+      });
+      await store.createNote("too late", { tags: ["meeting"], metadata: { meeting_date: "2026-06-01" } });
+
+      const query = tools.find((t) => t.name === "query-notes")!;
+      const results = await query.execute({
+        date_filter: { field: "meeting_date", from: "2026-04-01", to: "2026-05-01" },
+        include_content: true,
+      }) as any[];
+      expect(results.map((n) => n.content).sort()).toEqual([
+        "in window (date-only)",
+        "in window (full timestamp)",
+      ]);
+    });
+
     // ---- updated_at filter (vault#285 friction point 1.5) ----
     //
     // Incremental-rebuild flows ask "what changed since X." Like `created_at`,
@@ -2229,6 +2265,50 @@ describe("queryNotes", async () => {
       expect(
         store.queryNotes({ metadata: { priority: { in: 5 } as any } }),
       ).rejects.toThrow(/expects an array/);
+    });
+
+    // ---- `date` field type: gt/gte/lt/lte + order_by (vault#date-field-type) ----
+    //
+    // Indexed `date` fields store TEXT (ISO-8601 strings compare correctly
+    // lexicographically), so this exercises the SAME generic string-indexed-
+    // field machinery `email_date`/`status` above already use — no
+    // date-specific SQL was added. Uses a real tag schema (`type: "date",
+    // indexed: true`), not raw `declareField`, to prove the wiring end to end.
+    it("gt/gte/lt/lte compose into range queries on an indexed `date` field", async () => {
+      // Indexed-field reconciliation (declareField → generated column +
+      // index) runs through the `update-tag` tool / `store.upsertTagRecord`
+      // — `store.upsertTagSchema` is the legacy description+fields-only
+      // facade and does NOT create the backing column.
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", indexed: true } },
+      });
+      await store.createNote("jan", { tags: ["meeting"], metadata: { meeting_date: "2026-01-15" } });
+      await store.createNote("apr", { tags: ["meeting"], metadata: { meeting_date: "2026-04-15" } });
+      await store.createNote("jul", { tags: ["meeting"], metadata: { meeting_date: "2026-07-09T14:30:00.000Z" } });
+      await store.createNote("oct", { tags: ["meeting"], metadata: { meeting_date: "2026-10-15" } });
+
+      const range = await store.queryNotes({
+        metadata: { meeting_date: { gte: "2026-04-01", lt: "2026-10-01" } },
+      });
+      expect(range.map((n) => n.content).sort()).toEqual(["apr", "jul"]);
+    });
+
+    it("order_by sorts by an indexed `date` field", async () => {
+      const tools = generateMcpTools(store);
+      const updateTag = tools.find((t) => t.name === "update-tag")!;
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", indexed: true } },
+      });
+      await store.createNote("later", { tags: ["meeting"], metadata: { meeting_date: "2026-07-09" } });
+      await store.createNote("earlier", { tags: ["meeting"], metadata: { meeting_date: "2026-01-15" } });
+      await store.createNote("middle", { tags: ["meeting"], metadata: { meeting_date: "2026-04-01" } });
+
+      const asc = await store.queryNotes({ orderBy: "meeting_date" });
+      expect(asc.map((n) => n.content)).toEqual(["earlier", "middle", "later"]);
     });
   });
 });
@@ -4556,11 +4636,54 @@ describe("MCP tools", async () => {
         e: { type: "array" },
         f: { type: "object" },
         g: { type: "reference" },
+        h: { type: "date" },
       },
     }) as any;
     expect(result.fields.a.type).toBe("string");
     expect(result.fields.f.type).toBe("object");
     expect(result.fields.g.type).toBe("reference");
+    expect(result.fields.h.type).toBe("date");
+  });
+
+  // vault#date-field-type: `date` stores/validates like `string` — an
+  // ISO-8601 date or full RFC3339 timestamp — reusing cursor.ts's
+  // `timestampToMs` (the same parser `date_filter`'s `updated_at` bound
+  // uses) rather than a second, independently-drifting date parser.
+  it("update-tag accepts a `date` field's default in both ISO forms", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    const dateOnly = await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", default: "2026-07-09" } },
+    }) as any;
+    expect(dateOnly.fields.meeting_date.default).toBe("2026-07-09");
+
+    const fullTimestamp = await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", default: "2026-07-09T14:30:00.000Z" } },
+    }) as any;
+    expect(fullTimestamp.fields.meeting_date.default).toBe("2026-07-09T14:30:00.000Z");
+  });
+
+  it("update-tag rejects a non-ISO default on a `date` field (invalid_default)", async () => {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    let caught: any;
+    try {
+      await updateTag.execute({
+        tag: "meeting",
+        fields: { meeting_date: { type: "date", default: "not-a-date" } },
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.error_type).toBe("tag_field_conflict");
+    expect(caught.violations[0].field).toBe("meeting_date");
+    expect(caught.violations[0].reason).toBe("invalid_default");
+    // Nothing persisted.
+    const record = await store.getTagRecord("meeting");
+    expect(record?.fields ?? null).toBeFalsy();
   });
 
   // ---- Typed reference field: indexed value + auto-link (vault#typed-reference-field) ----
@@ -6050,6 +6173,113 @@ describe("schema validation (tags.fields)", async () => {
     expect(result.validation_status.warnings[0].reason).toBe("enum_mismatch");
   });
 
+  // ---- `date` field type (vault#date-field-type) ----
+  //
+  // Motivation: today a date-ish field (e.g. a `meeting` tag's
+  // `meeting_date`) can only be declared `type: "string"`, with "ISO date"
+  // explained in prose — nothing can programmatically discover
+  // date-candidate fields for a calendar view. `date` validates like
+  // `string` but requires an ISO-8601 date or full RFC3339 timestamp,
+  // parsed by the SAME `timestampToMs` (cursor.ts) `date_filter`'s
+  // `updated_at` bound uses.
+
+  it("no warning when a `date` field's value is a bare ISO date (YYYY-MM-DD)", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-09" },
+    }) as any;
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("no warning when a `date` field's value is a full RFC3339 timestamp", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-09T14:30:00.000Z" },
+    }) as any;
+    expect(result.validation_status.warnings).toEqual([]);
+  });
+
+  it("type_mismatch warning when a `date` field's value isn't a parseable ISO string", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const result = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "not-a-date" },
+    }) as any;
+    expect(result.validation_status.warnings).toHaveLength(1);
+    expect(result.validation_status.warnings[0].reason).toBe("type_mismatch");
+    expect(result.validation_status.warnings[0].field).toBe("meeting_date");
+  });
+
+  it("a `date` field's type_mismatch is a HARD REJECTION under strict:true, same as any other type", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date", strict: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await expect(create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "not-a-date" },
+    })).rejects.toThrow();
+  });
+
+  it("an indexed `date` field's type_mismatch is ALWAYS a hard rejection, independent of strict (vault#553 Decision A)", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    await expect(create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "not-a-date" },
+    })).rejects.toThrow();
+  });
+
+  // Sharp edge (docs/HTTP_API.md's "type: date" callout): a schema edit
+  // that tightens an existing field from `string` to `date` does NOT
+  // retroactively revalidate notes already carrying a non-ISO value —
+  // only the field's NEXT write is checked. No migration, no data change.
+  it("tightening an existing field from string to date does not retroactively touch existing notes", async () => {
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "string" } },
+    });
+    const tools = generateMcpTools(store);
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const note = await create.execute({
+      content: "old-style note",
+      tags: ["meeting"],
+      metadata: { meeting_date: "sometime next week" }, // not ISO — fine under type:"string"
+    }) as any;
+    expect(note.validation_status.warnings).toEqual([]);
+
+    // Tighten the schema. This must not touch the existing note.
+    await store.upsertTagSchema("meeting", {
+      fields: { meeting_date: { type: "date" } },
+    });
+
+    const fresh = await query.execute({ id: note.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("sometime next week");
+  });
+
   // vault#555 fix 3 — an enum-membership violation on an INDEXED
   // (non-strict) field is stored, findable via `eq` (indexed⇒strict is
   // TYPE-only, not enum-domain — a ratified policy, not a bug), but the
@@ -6343,6 +6573,212 @@ describe("schema validation (tags.fields)", async () => {
       .toBe("type_mismatch");
     expect(validateNote(resolved, { tags: ["k"], metadata: { c: Number.POSITIVE_INFINITY } })?.warnings[0]?.reason)
       .toBe("type_mismatch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `date` field type — offset normalization on write (vault#date-field-type
+// review fix). A raw TEXT compare only sorts ISO-8601 timestamps correctly
+// when every stored value shares the SAME offset representation.
+// `timestampToMs` correctly VALIDATES an explicit ±HH:MM offset, but the
+// value used to persist VERBATIM — a mixed-offset vault silently
+// mis-ordered/mis-filtered. `normalizeDateFields` (schema-defaults.ts),
+// wired into every store write path, rewrites a full timestamp to canonical
+// UTC (`Z`-suffixed) before the row is written.
+// ---------------------------------------------------------------------------
+
+describe("date field type — offset normalization (vault#date-field-type review fix)", async () => {
+  async function declareIndexedMeetingDate() {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+    return tools;
+  }
+
+  // The reviewer's exact repro: "2026-07-16T10:00:00+02:00" (= 08:00Z) vs
+  // "2026-07-16T09:00:00Z" (= 09:00Z). Persisted verbatim, a raw string
+  // compare gets these BACKWARDS (comparing "10" vs "09" after the shared
+  // "2026-07-16T" prefix says the +02:00 value sorts LATER, when its actual
+  // instant — 08:00Z — is EARLIER). Post-normalization both values are
+  // Z-form UTC, so the string compare IS the instant compare.
+  it("order_by ASC returns mixed-offset values in true chronological order", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      content: "earlier (offset form)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" }, // = 08:00Z
+    });
+    await create.execute({
+      content: "later (Z form)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00Z" }, // = 09:00Z
+    });
+
+    const asc = await store.queryNotes({ orderBy: "meeting_date" });
+    expect(asc.map((n) => n.content)).toEqual(["earlier (offset form)", "later (Z form)"]);
+  });
+
+  it("a gt bound correctly excludes an earlier instant expressed with an offset", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      content: "before threshold (offset form, = 08:00Z)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+    });
+    await create.execute({
+      content: "after threshold (Z form, = 09:00Z)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00Z" },
+    });
+
+    // Threshold sits BETWEEN the two instants (08:30Z). Pre-fix, the
+    // unnormalized "+02:00" value's raw string ("...10:00:00+02:00")
+    // compared GREATER than the threshold string despite its instant being
+    // earlier — a false match. Post-fix it correctly falls below.
+    const results = await store.queryNotes({
+      metadata: { meeting_date: { gt: "2026-07-16T08:30:00Z" } },
+    });
+    expect(results.map((n) => n.content)).toEqual(["after threshold (Z form, = 09:00Z)"]);
+  });
+
+  it("create-note normalizes an offset timestamp to canonical Z-form; the stored/returned value is not the verbatim input", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+    }) as any;
+
+    // The create response itself already reflects the normalized value...
+    expect(created.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    // ...and so does a fresh read-back (round-trips through the DB, not an echo).
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+  });
+
+  it("update-note (merge-patch) normalizes an offset timestamp the same way create-note does", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const update = tools.find((t) => t.name === "update-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+    }) as any;
+
+    await update.execute({
+      id: created.id,
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      force: true,
+    });
+
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+  });
+
+  // ---- round 2: tag-add + date-metadata in the SAME call (vault#date-
+  // field-type review round 2) ----
+  //
+  // `store.tagNote` (the actual tag mutation) runs AFTER the core UPDATE in
+  // both mcp.ts call sites that combine tags + metadata in one item — the
+  // reviewer live-verified that without passing the PROJECTED tag set into
+  // `store.updateNote`, normalization resolved the schema against the
+  // note's STALE pre-write tags and missed a field newly declared by the
+  // tag being added in this same call.
+
+  it("update-note: tags.add + an offset date value in the SAME call still normalizes (bare, untagged note)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const update = tools.find((t) => t.name === "update-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    // Bare, untagged note — "meeting" (and its meeting_date:date field) is
+    // NOT yet on this note; it's added in the SAME update-note call below.
+    const created = await create.execute({ content: "standup" }) as any;
+
+    const result = await update.execute({
+      id: created.id,
+      tags: { add: ["meeting"] },
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      force: true,
+    }) as any;
+
+    expect(result.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    expect(fresh.tags).toContain("meeting");
+  });
+
+  it("create-note if_exists:update: tags + an offset date value in the SAME call still normalizes (bare, untagged note)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({ content: "standup", path: "Inbox/round2-upsert" }) as any;
+
+    const result = await create.execute({
+      path: "Inbox/round2-upsert",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      if_exists: "update",
+    }) as any;
+
+    expect(result.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    expect(fresh.tags).toContain("meeting");
+  });
+
+  // ---- round 2: copy-on-write, never mutate the caller's object ----
+
+  it("store.createNote does NOT mutate the caller's metadata object", async () => {
+    await declareIndexedMeetingDate();
+    const callerMetadata = { meeting_date: "2026-07-16T10:00:00+02:00" };
+    const callerMetadataSnapshot = { ...callerMetadata };
+    await store.createNote("standup", { tags: ["meeting"], metadata: callerMetadata });
+    // The caller's own object must be byte-identical to before the call —
+    // core is a published library; a direct embedder's reference must
+    // never change out from under them.
+    expect(callerMetadata).toEqual(callerMetadataSnapshot);
+  });
+
+  it("store.updateNote does NOT mutate the caller's metadata object", async () => {
+    await declareIndexedMeetingDate();
+    const note = await store.createNote("standup", { tags: ["meeting"] });
+    const callerMetadata = { meeting_date: "2026-07-16T10:00:00+02:00" };
+    const callerMetadataSnapshot = { ...callerMetadata };
+    await store.updateNote(note.id, { metadata: callerMetadata });
+    expect(callerMetadata).toEqual(callerMetadataSnapshot);
+  });
+
+  it("a bare YYYY-MM-DD value passes through untouched (no offset to normalize)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16" },
+    }) as any;
+    expect(created.metadata.meeting_date).toBe("2026-07-16");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16");
+  });
+
+  it("a value already in canonical Z-form passes through unchanged (no spurious rewrite)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00.000Z" },
+    }) as any;
+    expect(created.metadata.meeting_date).toBe("2026-07-16T09:00:00.000Z");
   });
 });
 
@@ -8126,6 +8562,25 @@ describe("vault projection (vault#271)", async () => {
     expect(byName.priority).toBeTruthy();
     expect(byName.priority.type).toBe("integer");
     expect(byName.priority.tags).toEqual(["project"]);
+  });
+
+  // vault#date-field-type: `type: "date"` carries through the indexed-field
+  // catalog like any other type — nothing in the projection filters unknown
+  // or newer types out.
+  it("catalogs an indexed `date` field with its declared type", async () => {
+    const { buildVaultProjection } = await import("./vault-projection.ts");
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+
+    const projection = buildVaultProjection(db);
+    const byName = Object.fromEntries(projection.indexed_fields.map((f) => [f.name, f]));
+    expect(byName.meeting_date).toBeTruthy();
+    expect(byName.meeting_date.type).toBe("date");
+    expect(byName.meeting_date.tags).toEqual(["meeting"]);
   });
 
   it("includes the static query-hint catalog", async () => {
