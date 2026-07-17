@@ -30,7 +30,7 @@ For remote access from Claude Desktop or mobile apps, see [Deployment](#deployme
 
 A server on port 1940 with:
 
-- **MCP** — 9 tools for AI agents (notes, tags, graph, vault info)
+- **MCP** — tools for AI agents (notes, tags, graph, vault info, attachments)
 - **REST API** — Full CRUD for notes, tags, links, full-text search
 - **Wikilink auto-linking** — `[[wikilinks]]` in note content automatically create links in the graph
 - **Obsidian import/export** — Bidirectional interop with Obsidian vaults
@@ -252,12 +252,14 @@ parachute-vault backup --schedule daily        # hourly | daily | weekly | manua
 parachute-vault backup status                  # schedule, last run, destinations, next run
 ```
 
-## MCP tools (9)
+## MCP tools (13 core, + attachments + admin)
 
 **Notes**: `query-notes` (universal read — single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata), `delete-note`
-**Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`
+**Tags**: `list-tags` (with optional schema detail), `update-tag` (upsert description + schema fields), `delete-tag`, `rename-tag`, `merge-tags`
 **Graph**: `find-path` (BFS between two notes)
 **Vault**: `vault-info` (get/update description + stats)
+**Admin**: `prune-schema`, `doctor` (taxonomy/metadata integrity scan), `manage-token`
+**Attachments** (2, present when the door wires an attachment-ticket provider — always true on this server): `request-attachment-upload`, `request-attachment-download` — mint a short-lived, single-use ticket a runtime's shell spends directly at `/vault/{name}/tickets/{id}`; bytes never pass through the tool call. See [`docs/HTTP_API.md`](./docs/HTTP_API.md#attachment-tickets-vault611--wave-1-bun-only).
 
 ### Vault descriptions
 

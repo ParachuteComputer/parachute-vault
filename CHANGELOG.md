@@ -34,6 +34,44 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.9] - 2026-07-17
+
+**Docs catch-up — CLAUDE.md + HTTP_API.md + README against six same-day
+releases (rc.3–rc.8).** No code change. Corrects drift that had accumulated
+across `date` field type (#604), the `starter-ontology` seed pack (#605),
+seed-pack re-apply preserving hand-edited descriptions (#606), computed
+`displayTitle` + search title-boost (#608), attachment tickets (#611), and
+the frontmatter-skip follow-up (#610):
+
+- `CLAUDE.md`: the "MCP Tools" count was a stale flat "13, +1 server-layer."
+  Restated honestly as 13 core (unconditional) + 2 conditionally-appended
+  attachment-ticket tools (present whenever a door wires an
+  `attachmentTickets` seam — always true on bun's own server) + `manage-token`
+  at the server layer — 16 total on a fully-provisioned admin session. Added
+  the `date` field type and computed `displayTitle` to the Data Model section,
+  and folded the four seed packs (`welcome`/`getting-started`/
+  `surface-starter`/`starter-ontology`, the last opt-in) into the "Bare
+  primitives" design-decision bullet.
+- `docs/HTTP_API.md`: new "Attachment tickets" section documenting
+  `PUT|POST /vault/{name}/tickets/{id}` and `GET /vault/{name}/tickets/{id}`
+  — the no-auth, ticket-is-the-credential spend routes that sit deliberately
+  outside the authed `/api` and `/mcp` trees. The MCP tool-tier table gains
+  `request-attachment-upload`/`request-attachment-download` with a footnote
+  on their conditional presence. `date` field type and `displayTitle` were
+  already documented correctly by #604/#608 themselves — verified, not
+  rewritten.
+- `README.md`: the "MCP tools (9)" section and "9 tools" bullet were already
+  stale before today's six releases (missing `rename-tag`/`merge-tags`/
+  `prune-schema`/`doctor`/`manage-token` from a much earlier pass) —
+  corrected alongside the same-day drift rather than left inconsistent next
+  to the freshly-fixed counts elsewhere. Quickstart `bun` commands spot-checked
+  against `package.json`'s `bin` entry and `src/cli.ts`'s `init` case — accurate,
+  unchanged.
+
+Version bump only to keep the rc-per-PR convention (docs-only PRs #584 and
+#540 both took one) — assumes this is the next PR to land after rc.8;
+whichever merges second renumbers.
+
 ## [0.7.3-rc.8] - 2026-07-17
 
 **`computeDisplayTitle` skips a leading frontmatter block.** Follow-up

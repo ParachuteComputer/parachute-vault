@@ -2197,6 +2197,60 @@ an owning note exists but falls outside the token's scope. The same `404`
 either way keeps the endpoint from acting as an existence oracle. Unscoped
 tokens keep the path-only behavior.
 
+### Attachment tickets (vault#611 — Wave 1, bun-only)
+
+MCP tool args are model-emitted, so a base64 upload through a tool call is
+effectively impossible past a few hundred KB. The `request-attachment-upload`
+/ `request-attachment-download` MCP tools (`core/src/mcp.ts`) mint a
+short-lived, single-use, capability-in-URL ticket instead of moving bytes
+through the tool call itself — a runtime's shell spends the ticket directly
+against the two routes below. Bytes never touch the model.
+
+**Auth: none — the ticket itself is the credential.** These two routes are
+deliberately outside the authed `/api` and `/mcp` trees (`src/routing.ts`
+dispatches them *before* `authenticateVaultRequest` runs) so a bearer-less
+shell (a bare `curl`) can spend a ticket without ever holding the vault's
+API key. Every ticket is single-use — deleted from the process-wide ticket
+store on the first spend attempt, whether or not that attempt succeeds —
+scoped to exactly one upload slot or one existing attachment's bytes, and
+expires on a size-scaled window (10 minutes base + 10s/MiB, capped at 30
+minutes). A daemon restart drops every outstanding ticket; a caller
+mid-upload across a restart just re-mints.
+
+A ticket that doesn't exist, was already spent, has expired, names the
+wrong vault, or is spent against the wrong route (a `GET` against an
+upload ticket, etc.) all collapse to the SAME `404 not_found` — no oracle
+on which of those actually happened.
+
+#### `PUT|POST /vault/{name}/tickets/{id}` — no auth (spends an upload ticket)
+Spends a ticket minted by `request-attachment-upload`. `PUT` is what the
+mint response's `curl_example` advertises; `POST` is accepted too for
+runtimes/proxies that rewrite methods. Body is the raw file bytes. The
+ticket's declared `size_bytes` (set at mint time) is the enforced cap here
+— tighter than the flat 100MB REST `/storage/upload` ceiling — checked
+against both the `Content-Length` header (when present) and the actual
+received body length; exceeding it is `413 file_too_large`. On success,
+writes the file under the vault's assets dir (same path convention as
+`POST /storage/upload`), registers the attachment row, and — mirroring the
+REST attach flow's transcribe decision — enqueues transcription when the
+mint call passed `transcribe: true` or the vault's auto-transcribe config
+opts the MIME type in. Returns the created `Attachment` shape, `201`.
+
+#### `GET /vault/{name}/tickets/{id}` — no auth (spends a download ticket)
+Spends a ticket minted by `request-attachment-download`. Serves the
+attachment's raw bytes with its stored `Content-Type`
+(`X-Content-Type-Options: nosniff`, same defense-in-depth as
+`GET /storage/{date}/{filename}`). `404` if the attachment row was deleted
+between mint and spend, or if its bytes are missing on disk
+(`error_type: "attachment_binary_missing"`).
+
+**Cloud parity.** Bun always wires the ticket provider — a process-wide (not
+per-vault) in-memory store, since the 256-bit ticket id is already globally
+unguessable. Cloud's Durable-Object-backed mirror is a separate PR that
+hasn't landed yet; until it does, `request-attachment-upload` /
+`request-attachment-download` are simply absent from cloud's MCP tool list
+(D10 — an agent is never shown an affordance the runtime can't back).
+
 ### MCP
 
 `GET|POST /vault/{name}/mcp[/*]` — Streaming HTTP transport. Auth is by
@@ -2207,9 +2261,13 @@ enforced inside the MCP layer; the same `vault:read` / `vault:write` /
 
 | Verb | Tools |
 |---|---|
-| `read` | `query-notes`, `list-tags`, `find-path`, `vault-info` (get/stats), `doctor` |
-| `write` (additive over read) | `create-note`, `update-note`, `delete-note` |
+| `read` | `query-notes`, `list-tags`, `find-path`, `vault-info` (get/stats), `doctor`, `request-attachment-download`¹ |
+| `write` (additive over read) | `create-note`, `update-note`, `delete-note`, `request-attachment-upload`¹ |
 | `admin` (additive over write) | `update-tag`, `delete-tag`, `rename-tag`, `merge-tags`, `prune-schema`, `manage-token`, `vault-info` (description update) |
+
+¹ Conditionally appended (vault#611) — present only when the door wires an
+attachment-ticket provider. Always true on bun's server. See "Attachment
+tickets" below.
 
 **BREAKING (this release):** `update-tag`/`delete-tag`/`rename-tag`/`merge-tags`
 moved `write` → `admin` (schema/taxonomy curation is a distinct tier from

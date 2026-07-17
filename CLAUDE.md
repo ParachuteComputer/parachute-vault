@@ -45,7 +45,11 @@ Metadata is a JSON column on notes, links, and attachments. Queryable via `json_
 
 Path is unique (when set), normalized (no .md, no trailing slashes), and used for wikilink resolution.
 
-### MCP Tools (13, +1 server-layer)
+Tag-schema fields (`update-tag`'s `fields`) type vocabulary: `string`/`number`/`integer`/`boolean`/`array`/`object`/`reference`/`date` (vault#604 added `date` — ISO-8601 date or full RFC3339 timestamp, validated with the same parser `date_filter`'s `updated_at` bound uses, normalized to canonical UTC `Z` form on write so a mixed-offset value can't sort wrong against a `Z`-suffixed one; indexable like `string`/`reference` — gt/gte/lt/lte, date_filter, order_by). Opt-in per schema edit — existing `string` date fields stay valid forever; tightening `string`→`date` never retroactively revalidates existing notes.
+
+`NoteIndex` list-shape responses (REST lean `GET /notes`, MCP `query-notes`) carry a computed `displayTitle` — a note's title IS its first non-empty content line (heading markers stripped, ~120 chars, `null` for empty content), derived fresh at read time, never stored (vault#608; a leading YAML frontmatter block in raw content is skipped before deriving the title, vault#610 — only matters for a direct MCP/REST create that pastes raw frontmatter-bearing text). Literal-mode search also boosts a first-line title match above a body-only match using the same computation.
+
+### MCP Tools (13 core + 2 conditionally-appended + manage-token at server layer)
 
 Notes: `query-notes` (single by ID/path, filter, search, graph neighborhood), `create-note` (single or batch), `update-note` (single or batch — content, tags, links, metadata merge), `delete-note`
 
@@ -55,7 +59,9 @@ Graph: `find-path` (BFS shortest path)
 
 Vault: `vault-info` (get/update description + stats)
 
-Admin: `prune-schema` (drop orphaned indexed-field columns), `doctor` (read-only taxonomy/metadata integrity scan — vault#552); `manage-token` is appended at the server layer (src/mcp-tools.ts), not generated in core.
+Admin: `prune-schema` (drop orphaned indexed-field columns), `doctor` (read-only taxonomy/metadata integrity scan — vault#552)
+
+The 13 above are what `generateMcpTools` (`core/src/mcp.ts`) returns unconditionally. Attachments (2, conditionally appended — vault#611): `request-attachment-upload` (write), `request-attachment-download` (read) — mint a short-lived, single-use ticket; a runtime's shell spends it directly at `/vault/<name>/tickets/<id>`, deliberately outside the authed `/api` and `/mcp` trees (no Bearer required — the ticket itself, single-use + short-TTL, is the credential), so bytes never touch the model. Appended only when the caller wires an `attachmentTickets` seam — bun's server (`src/mcp-tools.ts`) always does, so both are present on every real running session; a bare `generateMcpTools(store)` call with no opts (e.g. `scripts/scale-bench.ts`) still gets just the 13. `manage-token` is separately appended at the server layer (`src/mcp-tools.ts`), not generated in core — always present on bun, admin-scoped. Full admin session on bun: 16 tools total.
 
 
 ## Bun-native
@@ -69,7 +75,7 @@ Use Bun for everything. No Node.js.
 
 ## Key design decisions
 
-- **Bare primitives**: Vault has no opinions about tags or conventions. It's the engine, not the schema. Clients (parachute-daily, etc.) bring their own tag schema.
+- **Bare primitives, opt-in seed packs**: Vault has no opinions about tags or conventions by default — it's the engine, not the schema, and clients (parachute-daily, etc.) bring their own tag schema. `parachute-vault add-pack <name>` can apply a named `core/src/seed-packs.ts` pack on request: `welcome` (five-guide onboarding ring, seeded by default on new vaults), `getting-started`, `surface-starter`, and `starter-ontology` (four starter meta tags — `view`/`archived`/`pinned`/`capture` — with constitution-style descriptions; NOT applied by default, opt-in only, vault#605). Re-applying a pack never clobbers a tag's hand-edited description — only a description still byte-identical to the pack's own text gets upserted; `fields`/`parent_names`/`relationships` keep upserting unconditionally (vault#606).
 - **Multi-vault**: One server hosts many vaults. Each vault = own SQLite DB + config + API keys.
 - **Per-vault MCP descriptions**: vault.yaml is sent as MCP server instruction at session start. The vault teaches the AI how to use it.
 - **Wikilink auto-linking**: `[[wikilinks]]` in note content are automatically parsed and maintained as links. Unresolved links auto-resolve when target notes are created.
