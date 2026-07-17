@@ -6577,6 +6577,139 @@ describe("schema validation (tags.fields)", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// `date` field type — offset normalization on write (vault#date-field-type
+// review fix). A raw TEXT compare only sorts ISO-8601 timestamps correctly
+// when every stored value shares the SAME offset representation.
+// `timestampToMs` correctly VALIDATES an explicit ±HH:MM offset, but the
+// value used to persist VERBATIM — a mixed-offset vault silently
+// mis-ordered/mis-filtered. `normalizeDateFields` (schema-defaults.ts),
+// wired into every store write path, rewrites a full timestamp to canonical
+// UTC (`Z`-suffixed) before the row is written.
+// ---------------------------------------------------------------------------
+
+describe("date field type — offset normalization (vault#date-field-type review fix)", async () => {
+  async function declareIndexedMeetingDate() {
+    const tools = generateMcpTools(store);
+    const updateTag = tools.find((t) => t.name === "update-tag")!;
+    await updateTag.execute({
+      tag: "meeting",
+      fields: { meeting_date: { type: "date", indexed: true } },
+    });
+    return tools;
+  }
+
+  // The reviewer's exact repro: "2026-07-16T10:00:00+02:00" (= 08:00Z) vs
+  // "2026-07-16T09:00:00Z" (= 09:00Z). Persisted verbatim, a raw string
+  // compare gets these BACKWARDS (comparing "10" vs "09" after the shared
+  // "2026-07-16T" prefix says the +02:00 value sorts LATER, when its actual
+  // instant — 08:00Z — is EARLIER). Post-normalization both values are
+  // Z-form UTC, so the string compare IS the instant compare.
+  it("order_by ASC returns mixed-offset values in true chronological order", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      content: "earlier (offset form)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" }, // = 08:00Z
+    });
+    await create.execute({
+      content: "later (Z form)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00Z" }, // = 09:00Z
+    });
+
+    const asc = await store.queryNotes({ orderBy: "meeting_date" });
+    expect(asc.map((n) => n.content)).toEqual(["earlier (offset form)", "later (Z form)"]);
+  });
+
+  it("a gt bound correctly excludes an earlier instant expressed with an offset", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    await create.execute({
+      content: "before threshold (offset form, = 08:00Z)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+    });
+    await create.execute({
+      content: "after threshold (Z form, = 09:00Z)",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00Z" },
+    });
+
+    // Threshold sits BETWEEN the two instants (08:30Z). Pre-fix, the
+    // unnormalized "+02:00" value's raw string ("...10:00:00+02:00")
+    // compared GREATER than the threshold string despite its instant being
+    // earlier — a false match. Post-fix it correctly falls below.
+    const results = await store.queryNotes({
+      metadata: { meeting_date: { gt: "2026-07-16T08:30:00Z" } },
+    });
+    expect(results.map((n) => n.content)).toEqual(["after threshold (Z form, = 09:00Z)"]);
+  });
+
+  it("create-note normalizes an offset timestamp to canonical Z-form; the stored/returned value is not the verbatim input", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+    }) as any;
+
+    // The create response itself already reflects the normalized value...
+    expect(created.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+    // ...and so does a fresh read-back (round-trips through the DB, not an echo).
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+  });
+
+  it("update-note (merge-patch) normalizes an offset timestamp the same way create-note does", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const update = tools.find((t) => t.name === "update-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+    }) as any;
+
+    await update.execute({
+      id: created.id,
+      metadata: { meeting_date: "2026-07-16T10:00:00+02:00" },
+      force: true,
+    });
+
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16T08:00:00.000Z");
+  });
+
+  it("a bare YYYY-MM-DD value passes through untouched (no offset to normalize)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const query = tools.find((t) => t.name === "query-notes")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16" },
+    }) as any;
+    expect(created.metadata.meeting_date).toBe("2026-07-16");
+    const fresh = await query.execute({ id: created.id }) as any;
+    expect(fresh.metadata.meeting_date).toBe("2026-07-16");
+  });
+
+  it("a value already in canonical Z-form passes through unchanged (no spurious rewrite)", async () => {
+    const tools = await declareIndexedMeetingDate();
+    const create = tools.find((t) => t.name === "create-note")!;
+    const created = await create.execute({
+      content: "standup",
+      tags: ["meeting"],
+      metadata: { meeting_date: "2026-07-16T09:00:00.000Z" },
+    }) as any;
+    expect(created.metadata.meeting_date).toBe("2026-07-16T09:00:00.000Z");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // update-note `if_missing: "create"` — idempotent upsert (vault#309)
 // ---------------------------------------------------------------------------
 

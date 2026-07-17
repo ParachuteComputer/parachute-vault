@@ -45,12 +45,25 @@ nothing could programmatically discover date-candidate fields for
 calendar-view UIs. Validated with the SAME parser `date_filter`'s
 `updated_at` bound already uses (`core/src/cursor.ts`'s `timestampToMs`) —
 one ISO-parsing implementation, not two. Indexable (`indexed: true`) — an
-indexed `date` field stores TEXT (ISO strings sort correctly under a plain
-lexicographic compare), so `gt`/`gte`/`lt`/`lte`, `date_filter: { field }`,
-and `order_by` all fall out of the EXISTING string-indexed-field machinery
-with no new SQL path. `list-tags`/`vault-info`'s indexed-field catalog and
-`update-tag`'s response carry the type through unchanged (nothing filters
-unknown/newer types out).
+indexed `date` field stores TEXT, so `gt`/`gte`/`lt`/`lte`,
+`date_filter: { field }`, and `order_by` all fall out of the EXISTING
+string-indexed-field machinery with no new SQL path. `list-tags`/
+`vault-info`'s indexed-field catalog and `update-tag`'s response carry the
+type through unchanged (nothing filters unknown/newer types out).
+
+**Offset normalization (write-time, review fix).** A raw TEXT compare only
+sorts ISO-8601 timestamps correctly when every stored value shares the SAME
+offset representation — `timestampToMs` correctly VALIDATES an explicit
+`±HH:MM` offset, but persisting it verbatim let a mixed-offset vault
+silently mis-order/mis-filter (`"...+02:00"` sorting after `"...Z"` even
+when the actual instant is earlier — the same bug class `updated_at` got a
+dedicated ms-mirror column for, vault#585/#586, that hadn't yet extended to
+user-declared `date` fields). `create-note`/`update-note` now rewrite any
+FULL timestamp on a `date`-typed field to canonical UTC (`Z`-suffixed,
+millisecond precision) before writing — normalize, not reject, matching the
+existing "paths are normalized on write" precedent (rejecting offsets would
+defeat the type's own calendar-integration motivation). A bare
+`YYYY-MM-DD` value has no offset and is left untouched.
 
 **Backward compatible by construction.** `date` is opt-in per schema edit —
 every existing `type: "string"` date field remains valid forever, no
@@ -74,11 +87,20 @@ tightening already carries — see `core/src/conformance.ts`'s pre-check).
 - `core/src/conformance.ts`'s pre-tighten violation counter now recognizes
   `type: "date"` (previously dropped the type check for any type outside
   its narrower whitelist).
+- `schema-defaults.ts:normalizeDateFields` — the offset-normalization fix.
+  Wired into every write path that reaches the DB: `store.createNote`,
+  `store.updateNote` (covers merge-patch too — the merge already happened
+  upstream by the time `store.updateNote` sees it), `store.createNotes`
+  (bulk), and `store.createNoteRaw` (the legacy Obsidian importer).
 - Tests: type acceptance/rejection (both ISO forms), `default` validation,
   `type_mismatch` advisory + strict + indexed-forced-strict enforcement,
   `gt`/`gte`/`lt`/`lte` + `order_by` + `date_filter` on a schema-declared
   indexed `date` field, the no-retroactive-revalidation schema-edit
-  compat guarantee, and indexed-field-catalog introspection carry-through.
+  compat guarantee, indexed-field-catalog introspection carry-through, and
+  the reviewer's exact mixed-offset repro as a regression test (offset +
+  `Z` values sort/filter correctly post-normalization; write-then-read
+  proves the stored/returned value is canonical `Z`-form; bare-date
+  passthrough pinned).
 
 ## [0.7.3-rc.2] - 2026-07-16
 

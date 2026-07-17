@@ -38,6 +38,7 @@ import {
   loadSchemaConfig,
   validateNote as runValidateNote,
   resolveNoteSchemas,
+  normalizeDateFields,
   type ResolvedSchemas,
   type ValidationStatus,
 } from "./schema-defaults.js";
@@ -500,6 +501,12 @@ export class BunSqliteStore implements Store {
   // ---- Notes ----
 
   async createNote(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string; actor?: string | null; via?: string | null }): Promise<Note> {
+    // Normalize `date`-typed field values to canonical UTC ISO form BEFORE
+    // the write (vault#date-field-type — mixed-offset TEXT-compare
+    // corruption). Mutates `opts.metadata` in place; see
+    // `normalizeDateFields`'s doc comment for the full rationale.
+    if (opts?.metadata) normalizeDateFields(this.getSchemaConfig(), { tags: opts.tags, metadata: opts.metadata });
+
     const note = noteOps.createNote(this.db, content, opts);
 
     if (content) {
@@ -561,7 +568,17 @@ export class BunSqliteStore implements Store {
     if (updates.path !== undefined || updates.metadata !== undefined) {
       const existing = noteOps.getNote(this.db, id);
       if (updates.path !== undefined) oldPath = existing?.path;
-      if (updates.metadata !== undefined) priorMetadataForRefs = existing?.metadata;
+      if (updates.metadata !== undefined) {
+        priorMetadataForRefs = existing?.metadata;
+        // Normalize `date`-typed field values to canonical UTC ISO form
+        // BEFORE the write (vault#date-field-type — mixed-offset TEXT-
+        // compare corruption). `updates.metadata` at this point is already
+        // the FULL final metadata object (a direct replace, or the merge-
+        // patch OUTPUT computed upstream — either way it's a private object,
+        // safe to mutate). Resolves against the note's CURRENT tags — this
+        // call carries no `tags` key, so the tag set can't be changing.
+        normalizeDateFields(this.getSchemaConfig(), { tags: existing?.tags, metadata: updates.metadata });
+      }
     }
 
     const note = noteOps.updateNote(this.db, id, updates);
@@ -1034,6 +1051,12 @@ export class BunSqliteStore implements Store {
   // ---- Bulk Operations ----
 
   async createNotes(inputs: noteOps.BulkNoteInput[]): Promise<Note[]> {
+    // Same pre-write `date`-field normalization as singleton createNote
+    // (vault#date-field-type) — this bulk path bypasses it otherwise.
+    const schemaConfig = this.getSchemaConfig();
+    for (const input of inputs) {
+      if (input.metadata) normalizeDateFields(schemaConfig, { tags: input.tags, metadata: input.metadata });
+    }
     const notes = noteOps.createNotes(this.db, inputs);
     for (const note of notes) {
       // Bulk path needs the same config-cache invalidation as singleton
@@ -1376,6 +1399,10 @@ export class BunSqliteStore implements Store {
    * place.)
    */
   async createNoteRaw(content: string, opts?: { id?: string; path?: string; tags?: string[]; metadata?: Record<string, unknown>; created_at?: string; extension?: string }): Promise<Note> {
+    // Same pre-write `date`-field normalization as createNote
+    // (vault#date-field-type) — the legacy Obsidian importer (obsidian.ts)
+    // funnels through this path and bypasses createNote's copy otherwise.
+    if (opts?.metadata) normalizeDateFields(this.getSchemaConfig(), { tags: opts.tags, metadata: opts.metadata });
     return noteOps.createNote(this.db, content, opts);
   }
 

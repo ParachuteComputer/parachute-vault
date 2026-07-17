@@ -1748,9 +1748,21 @@ implementation, not a second one that could drift. An unparseable value is a
 `indexed: true`, same as any other typed field — vault#553). Declare
 `indexed: true` alongside `type: "date"` to get a B-tree index backing
 `gt`/`gte`/`lt`/`lte` range queries, `date_filter: { field }`, and
-`order_by` — the index stores TEXT (ISO strings compare correctly
-lexicographically), so no new SQL path was needed; the existing
-string-indexed-field machinery just works. Motivation: before this, a
+`order_by` — the index stores TEXT, so no new SQL path was needed; the
+existing string-indexed-field machinery does the comparing. **Offset
+normalization (write-time):** a value carrying an explicit `±HH:MM` offset
+does NOT persist verbatim — a raw TEXT compare only sorts ISO-8601
+timestamps correctly when every value shares the SAME offset
+representation, and a mixed-offset vault (`"...+02:00"` alongside `"...Z"`)
+would otherwise silently mis-order/mis-filter. `create-note`/`update-note`
+rewrite any FULL timestamp on a `date`-typed field to canonical UTC
+(`Z`-suffixed, millisecond precision) before writing — the same
+"normalized, not rejected" treatment `paths are normalized on write`
+already gets elsewhere, chosen because rejecting offsets outright would
+defeat the type's own motivation (calendar integrations commonly emit
+offsets, not always `Z`). A bare `YYYY-MM-DD` value has no offset and is
+left untouched — it's already canonical and prefix-sorts correctly against
+full timestamps on the same calendar day. Motivation: before this, a
 date-ish field (e.g. a `meeting` tag's `meeting_date`) could only be
 declared `type: "string"` with "ISO date" explained in prose, so nothing
 could programmatically discover date-candidate fields for calendar-view
