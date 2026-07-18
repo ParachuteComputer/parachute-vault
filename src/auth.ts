@@ -30,6 +30,7 @@ import {
   hasScope,
   hasScopeForVault,
   legacyPermissionToScopes,
+  narrowedVaultNames,
   SCOPE_ADMIN,
   SCOPE_READ,
   SCOPE_WRITE,
@@ -711,4 +712,67 @@ export async function authenticateGlobalRequest(
     return { error: droppedPvtTokenResponse() };
   }
   return { error: Response.json({ error: "Unauthorized", message: "Invalid API key" }, { status: 401 }) };
+}
+
+/**
+ * Outcome of deriving a target vault from a request's bearer at the canonical
+ * root `/mcp` endpoint (U1). `vaultName` on success; a coarse failure `error`
+ * otherwise. Both failure reasons map to the SAME 401 + root-PRM challenge at
+ * the router — the distinction exists for logging/tests, never leaks to the
+ * client. `no_bearer` = no credential presented; `not_derivable` = a credential
+ * that names no single vault (non-JWT operator/legacy bearer, invalid /
+ * expired / revoked JWT, or a JWT whose scope / `aud` / `vault_scope` sources
+ * name zero or conflicting vaults).
+ */
+export type VaultDerivation =
+  | { vaultName: string }
+  | { error: "no_bearer" | "not_derivable" };
+
+/**
+ * Derive the target vault from a request's bearer token WITHOUT authorizing the
+ * request. The caller re-dispatches the derived name through the full per-vault
+ * auth machinery (`authenticateVaultRequest`), which re-validates the token
+ * WITH the audience pin — derive-then-redispatch, so a bad derivation FAILS the
+ * inner check rather than bypassing it (defense in depth). This function only
+ * reads the claims well enough to name the vault; it is never the authorization
+ * gate.
+ *
+ * Only hub-issued JWTs name a vault. The operator `VAULT_AUTH_TOKEN` and legacy
+ * YAML keys are vault-agnostic (they name no resource — see scopes.ts), so they
+ * return `not_derivable` here and keep working at the URL-addressed
+ * `/vault/<name>/*` surface. The JWT is validated with the SAME scope-guard
+ * trust kernel the per-vault path uses (signature, `iss` pin, `jti` +
+ * revocation, expiry) but WITHOUT `expectedAudience` — at the root we don't yet
+ * know which audience to expect; that pin is re-applied by the re-dispatch.
+ *
+ * From the validated claims, three independent sources can name a vault:
+ *   1. a narrowed `vault:<name>:<verb>` scope,
+ *   2. an `aud` of the form `vault.<name>`,
+ *   3. a single-element `vault_scope` claim.
+ * On a hub-minted token these AGREE. We collect every name any source provides
+ * and require EXACTLY ONE distinct name: zero (nothing named a vault) and
+ * two-or-more (the sources disagree) both fail closed with `not_derivable`. We
+ * never pick a winner from a precedence order — an ambiguous or unnamed token
+ * gets the discovery challenge, not a silent guess.
+ */
+export async function deriveVaultFromToken(req: Request): Promise<VaultDerivation> {
+  const key = extractApiKey(req);
+  if (!key) return { error: "no_bearer" };
+  if (!looksLikeJwt(key)) return { error: "not_derivable" };
+  let claims;
+  try {
+    // No `expectedAudience`: the per-vault trust kernel minus the aud pin
+    // (which the re-dispatch re-applies). A bad signature / iss / expiry /
+    // revoked jti throws here → not_derivable → the standard 401 challenge.
+    claims = await validateHubJwt(key, {});
+  } catch {
+    return { error: "not_derivable" };
+  }
+  const named = new Set<string>();
+  for (const name of narrowedVaultNames(claims.scopes)) named.add(name);
+  const audMatch = claims.aud?.match(/^vault\.(.+)$/);
+  if (audMatch) named.add(audMatch[1]!);
+  if (claims.vaultScope.length === 1) named.add(claims.vaultScope[0]!);
+  if (named.size !== 1) return { error: "not_derivable" };
+  return { vaultName: [...named][0]! };
 }
