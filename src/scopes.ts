@@ -264,6 +264,28 @@ export function validateMintedScopes(
 }
 
 /**
+ * Distinct vault names NAMED by narrowed `vault:<name>:<verb>` scopes in the
+ * granted list. Broad `vault:<verb>` scopes name no vault (a legacy/operator
+ * shape) and are skipped; the `migrate` axis isn't a read/write/admin verb so
+ * `decomposeVaultScope` returns null for it and it too is skipped.
+ *
+ * Used by the canonical root `/mcp` endpoint (U1) to read the target vault
+ * from a token's scope claim — one of three agreeing sources (scope / `aud` /
+ * single-element `vault_scope`) that `deriveVaultFromToken` cross-checks. A
+ * hub-minted token carries scopes for exactly one vault, so this returns a
+ * single-element list in practice; a return of length ≠ 1 signals a
+ * malformed/multi-vault scope set the derivation treats as a disagreement.
+ */
+export function narrowedVaultNames(granted: string[]): string[] {
+  const names = new Set<string>();
+  for (const s of granted) {
+    const d = decomposeVaultScope(s);
+    if (d && d.vault !== null) names.add(d.vault);
+  }
+  return [...names];
+}
+
+/**
  * Detect a broad `vault:<verb>` scope in a granted list. Hub-issued JWTs
  * must NOT carry broad vault scopes — the hub mints `vault:<name>:<verb>` so
  * the resource is named on the wire. `authenticateHubJwt` calls this to

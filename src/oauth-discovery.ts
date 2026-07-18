@@ -27,6 +27,7 @@
  */
 
 import { getHubOrigin } from "./hub-jwt.ts";
+import { SCOPE_READ, SCOPE_WRITE } from "./scopes.ts";
 
 /**
  * OAuth scopes vault publishes through discovery, RESOURCE-NARROWED to the
@@ -83,6 +84,36 @@ export function handleProtectedResource(req: Request, vaultName: string): Respon
     resource: `${base}${prefix}/mcp`,
     authorization_servers: [getHubOrigin()],
     scopes_supported: scopesSupportedFor(vaultName),
+    bearer_methods_supported: ["header"],
+  });
+}
+
+/**
+ * Protected Resource Metadata (RFC 9728) for the CANONICAL ROOT `/mcp`
+ * endpoint (U1). Same document shape as `handleProtectedResource`, with two
+ * deliberate differences that follow from the root being vault-AGNOSTIC (the
+ * vault is derived from the token, not the URL):
+ *
+ *   - `resource` is the origin-root `<base>/mcp`, not a `/vault/<name>/mcp`.
+ *   - `scopes_supported` advertises the UN-NARROWED forms `vault:read` /
+ *     `vault:write` (there's no vault name to narrow to here). A spec-following
+ *     client reads these and requests the broad forms; the hub's consent picker
+ *     narrows the grant to a chosen vault at authorization time (that path
+ *     already exists hub-side), minting a token stamped with a
+ *     `vault:<name>:<verb>` scope + `aud=vault.<name>` — exactly what the root
+ *     endpoint derives the target vault from. `admin` is intentionally omitted:
+ *     the interactive connect flow grants read/write; admin is an operator
+ *     concern, not something the consent picker offers.
+ *
+ * Served at the RFC 9728 §3.1 path-insertion location for the root resource:
+ * `/.well-known/oauth-protected-resource/mcp`.
+ */
+export function handleRootProtectedResource(req: Request): Response {
+  const base = getBaseUrl(req);
+  return Response.json({
+    resource: `${base}/mcp`,
+    authorization_servers: [getHubOrigin()],
+    scopes_supported: [SCOPE_READ, SCOPE_WRITE],
     bearer_methods_supported: ["header"],
   });
 }

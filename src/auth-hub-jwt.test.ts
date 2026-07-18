@@ -28,7 +28,7 @@ import { tmpdir } from "os";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { writeVaultConfig, readVaultConfig } from "./config.ts";
 import { getVaultStore, clearVaultStoreCache } from "./vault-store.ts";
-import { authenticateVaultRequest, authenticateGlobalRequest } from "./auth.ts";
+import { authenticateVaultRequest, authenticateGlobalRequest, deriveVaultFromToken } from "./auth.ts";
 import { resetJwksCache, resetRevocationCache } from "./hub-jwt.ts";
 
 interface Keypair {
@@ -703,5 +703,122 @@ describe("pvt_* DROP (vault#282 Stage 2 — unvalidatable)", () => {
 
     const result = await authenticateVaultRequest(bearer(token), config);
     expect("error" in result).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveVaultFromToken — the derivation precedence for the canonical root
+// `/mcp` endpoint (U1). This function READS a validated token's claims to name
+// the target vault; it never authorizes (the router re-dispatches through the
+// full per-vault machinery). These cases isolate the three naming sources —
+// narrowed scope / `aud=vault.<name>` / single-element `vault_scope` — and the
+// fail-closed rules (agree → one name; disagree or none → `not_derivable`).
+// The end-to-end routing.test.ts covers the wired behavior; this pins the
+// precedence logic directly.
+// ---------------------------------------------------------------------------
+describe("deriveVaultFromToken — root /mcp vault derivation (U1)", () => {
+  test("all three sources agree → that vault", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      vaultScope: ["journal"],
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ vaultName: "journal" });
+  });
+
+  test("narrowed scope alone names the vault (non-vault aud, no vault_scope)", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "urn:opaque-resource",
+      scope: "vault:journal:read",
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ vaultName: "journal" });
+  });
+
+  test("aud=vault.<name> alone names the vault (broad scope names nothing)", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:read",
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ vaultName: "journal" });
+  });
+
+  test("single-element vault_scope alone names the vault", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "urn:opaque-resource",
+      scope: "vault:read",
+      vaultScope: ["journal"],
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ vaultName: "journal" });
+  });
+
+  test("multi-element vault_scope is NOT a single name → not_derivable (nothing else names)", async () => {
+    // Phase-2 multi-vault shape: a multi-element vault_scope doesn't name ONE
+    // vault, so at the single-vault root it can't be the sole source.
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "urn:opaque-resource",
+      scope: "vault:read",
+      vaultScope: ["journal", "work"],
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ error: "not_derivable" });
+  });
+
+  test("sources disagree (scope vs aud) → not_derivable, never a guess", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.work",
+      scope: "vault:journal:write",
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ error: "not_derivable" });
+  });
+
+  test("no source names a vault → not_derivable", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "urn:opaque-resource",
+      scope: "vault:read",
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ error: "not_derivable" });
+  });
+
+  test("no bearer → no_bearer", async () => {
+    const req = new Request("https://vault.test/mcp");
+    expect(await deriveVaultFromToken(req)).toEqual({ error: "no_bearer" });
+  });
+
+  test("non-JWT bearer (operator / legacy shape) names no vault → not_derivable", async () => {
+    // The operator VAULT_AUTH_TOKEN and legacy YAML keys are vault-agnostic —
+    // they can't route the token-derived root endpoint (they keep working at
+    // the per-vault URL).
+    expect(await deriveVaultFromToken(bearer("opaque-operator-secret"))).toEqual({
+      error: "not_derivable",
+    });
+  });
+
+  test("expired JWT → not_derivable (validated with the full trust kernel)", async () => {
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      ttlSeconds: -10, // already expired
+    });
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ error: "not_derivable" });
+  });
+
+  test("revoked JWT → not_derivable (revocation runs in derivation too)", async () => {
+    const jti = "u1-derive-revoked";
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: "vault.journal",
+      scope: "vault:journal:write",
+      jti,
+    });
+    fixture.setRevoked([jti]);
+    resetRevocationCache();
+    expect(await deriveVaultFromToken(bearer(token))).toEqual({ error: "not_derivable" });
   });
 });

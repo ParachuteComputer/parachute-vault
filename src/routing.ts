@@ -1,15 +1,23 @@
 /**
  * HTTP request router for the multi-vault server.
  *
- * All per-vault resources live under `/vault/<name>/...`. There is no
- * unscoped fallback — a request must name the vault it targets. A fresh
- * install creates a vault named `default`, so `/vault/default/...` is the
- * baseline URL for single-vault deployments.
+ * Per-vault resources live under `/vault/<name>/...` — a request names the
+ * vault it targets in the URL. The one exception is the canonical root `/mcp`
+ * endpoint (U1), which is vault-AGNOSTIC: the vault is derived from the token,
+ * not the URL. A fresh install creates a vault named `default`, so
+ * `/vault/default/...` is the baseline URL for single-vault deployments.
  *
  * Dispatch shape:
  *
  *   /.well-known/parachute.json        — NOT served here (CLI owns it at
  *                                        origin root; vault never handles it)
+ *   /.well-known/oauth-protected-resource/mcp
+ *                                      — root-endpoint PRM (RFC 9728) for the
+ *                                        canonical `/mcp` below (U1)
+ *   /mcp[/*]                           — canonical root MCP endpoint; the vault
+ *                                        is DERIVED FROM THE TOKEN, then the
+ *                                        request re-dispatches through the same
+ *                                        per-vault machinery (U1)
  *   /health                            — liveness ping, vault names leaked
  *                                        only to authenticated callers
  *   /vaults/list                       — public vault-name discovery (can be
@@ -21,15 +29,20 @@
  *   /vault/<name>/.well-known/oauth-*  — discovery forwarder; metadata names
  *                                        the hub as the authorization server
  *                                        (vault is resource-server only)
- *   /vault/<name>/mcp[/*]              — MCP endpoint (Bearer auth)
+ *   /vault/<name>/mcp[/*]              — MCP endpoint (Bearer auth); the
+ *                                        URL-addressed twin of root `/mcp`,
+ *                                        untouched and permanent
  *   /vault/<name>/view/<idOrPath>      — auth-aware HTML view
  *   /vault/<name>/public/<noteId>      — legacy alias → /view redirect
  *   /vault/<name>                      — vault metadata + stats (auth)
  *   /vault/<name>/api/...              — REST surface (auth)
  *
- * There is deliberately no compat for the old `/api/*`, `/mcp`, `/oauth/*`,
- * `/view/*`, or `/vaults/<name>/*` prefixes. Clients must re-authenticate
- * after the upgrade and point at the new URLs.
+ * The root `/mcp` here is NOT the old unscoped compat prefix (that pre-0.5.0
+ * `/mcp` — an alias for a single default vault — is gone). It's the token-
+ * derived door: same auth machinery as the per-vault endpoint, reached without
+ * the client having to know the vault's URL name. There is still deliberately
+ * no compat for the old `/api/*`, `/oauth/*`, `/view/*`, or `/vaults/<name>/*`
+ * prefixes; clients using those must re-authenticate and point at the new URLs.
  *
  * **No standalone OAuth issuer.** vault does not mint OAuth tokens or
  * render a consent UI. Hub is the issuer; vault validates hub-signed
@@ -50,6 +63,7 @@ import {
 import {
   authenticateVaultRequest,
   authenticateGlobalRequest,
+  deriveVaultFromToken,
   extractApiKey,
 } from "./auth.ts";
 import { hasScopeForVault, hasMigrateScopeForVault, SCOPE_ADMIN, SCOPE_READ, scopeForMethod, verbForMethod } from "./scopes.ts";
@@ -78,6 +92,7 @@ import { handleTriggers } from "./triggers-api.ts";
 import { expandTokenTagScope } from "./tag-scope.ts";
 import {
   handleProtectedResource,
+  handleRootProtectedResource,
   handleAuthorizationServer,
   getBaseUrl,
 } from "./oauth-discovery.ts";
@@ -133,6 +148,58 @@ async function withMcpChallenge(
   const headers = new Headers(res.headers);
   headers.set("WWW-Authenticate", mcpWwwAuthenticate(req, vaultName));
   return new Response(body, { status: 401, headers });
+}
+
+/**
+ * 401 + RFC 9728 challenge for the canonical ROOT `/mcp` endpoint (U1), when
+ * the token is absent / invalid / names no single vault. Mirrors
+ * `withMcpChallenge` but points at the ROOT protected-resource metadata
+ * (`/.well-known/oauth-protected-resource/mcp`) rather than a vault-scoped one,
+ * since the root resource is vault-agnostic. A spec-following MCP client
+ * follows this pointer to the root PRM, discovers the hub, and requests the
+ * un-narrowed scopes the hub's consent picker narrows to a chosen vault.
+ */
+function rootMcpChallenge(req: Request): Response {
+  const base = getBaseUrl(req);
+  return Response.json(
+    { error: "Unauthorized", message: "API key required" },
+    {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`,
+      },
+    },
+  );
+}
+
+/**
+ * Shared scoped-MCP dispatch tail used by BOTH the URL-addressed per-vault
+ * endpoint (`/vault/<name>/mcp`) and the token-derived root endpoint (`/mcp`,
+ * U1). Runs the FULL per-vault auth machinery via `authenticateVaultRequest`
+ * (audience strict-check, `vault_scope` pin, broad-scope rejection, tag-scope
+ * parse) and, on success, hands off to `handleScopedMcp`. A 401 is decorated
+ * with the per-vault RFC 9728 challenge. Because both entry points funnel
+ * through this one function, a root request behaves byte-identically to the
+ * same token at the per-vault URL — and, for the root, the re-validation here
+ * is the authoritative gate: a derivation that named the wrong vault fails the
+ * audience strict-check, it never bypasses it.
+ */
+async function dispatchScopedMcp(
+  req: Request,
+  vaultName: string,
+  vaultConfig: VaultConfig,
+): Promise<Response> {
+  const auth = await authenticateVaultRequest(req, vaultConfig);
+  if ("error" in auth) return withMcpChallenge(auth.error, req, vaultName);
+  // Thread the RAW caller bearer (the exact credential the session presented)
+  // into the MCP layer so the manage-token tool can forward it to hub's
+  // mint-token attenuation proxy (vault#403, MGT). Only the raw validated
+  // bearer — never a fabricated one. extractApiKey returns the same value
+  // `authenticateVaultRequest` validated above; non-forwardable credentials
+  // (env-var secret, legacy pvt_*) are handled by manage-token itself (it only
+  // forwards JWT-shaped bearers).
+  const callerBearer = extractApiKey(req);
+  return handleScopedMcp(req, vaultName, auth, callerBearer);
 }
 
 /**
@@ -260,6 +327,18 @@ export async function route(
     return handleAuthorizationServer(req, vaultName);
   }
 
+  // Root-endpoint protected-resource metadata (RFC 9728 §3.1 path-insertion)
+  // for the canonical `/mcp` endpoint (U1). The root resource is vault-
+  // agnostic — the target vault is derived from the token, not the URL — so
+  // this document carries no vault name and advertises the un-narrowed
+  // `vault:read` / `vault:write` scopes; the hub's consent picker narrows them
+  // to a chosen vault at authorization time. Distinct from the per-vault
+  // insertion shapes above (which require a `/vault/<name>` segment), so there
+  // is no overlap. The `rootMcpChallenge` 401 points clients here.
+  if (path === "/.well-known/oauth-protected-resource/mcp") {
+    return handleRootProtectedResource(req);
+  }
+
   // ---------------------------------------------------------------------
   // Cross-vault / origin-root endpoints
   // ---------------------------------------------------------------------
@@ -366,6 +445,43 @@ export async function route(
       };
     });
     return Response.json({ vaults });
+  }
+
+  // ---------------------------------------------------------------------
+  // Canonical root MCP endpoint — token-derived vault dispatch (U1).
+  //
+  // `POST /mcp` (plus the GET/DELETE the streamable-HTTP transport uses, and
+  // the `/mcp/*` subpaths) is the vault-AGNOSTIC entry point: the target vault
+  // is derived from the TOKEN, not the URL. We validate the bearer with the
+  // same scope-guard trust kernel the per-vault path uses, read the vault name
+  // from the token's claims, then RE-DISPATCH through the identical per-vault
+  // machinery (`dispatchScopedMcp` → `authenticateVaultRequest` →
+  // `handleScopedMcp`). The re-dispatch re-validates WITH the audience pin, so
+  // a bad derivation fails the inner check rather than bypassing it (defense in
+  // depth). The legacy URL-addressed `/vault/<name>/mcp` is untouched and lives
+  // forever.
+  //
+  // No / invalid / unnameable token → 401 whose `WWW-Authenticate` points at
+  // the ROOT PRM (`/.well-known/oauth-protected-resource/mcp`), so a spec-
+  // following MCP client discovers the hub and requests the un-narrowed scopes
+  // its consent picker narrows to a chosen vault.
+  if (path === "/mcp" || path.startsWith("/mcp/")) {
+    const derived = await deriveVaultFromToken(req);
+    if ("error" in derived) {
+      return rootMcpChallenge(req);
+    }
+    const vaultConfig = readVaultConfig(derived.vaultName);
+    if (!vaultConfig) {
+      // A validly-signed hub token naming a vault that isn't on THIS server.
+      // Mirror the per-vault 404 (`/vault/<name>/mcp` on a missing vault) — the
+      // holder knows which vault their token targets; nothing is leaked to an
+      // anonymous caller (they never validate a token to reach here).
+      return Response.json(
+        { error: "Vault not found", vault: derived.vaultName },
+        { status: 404 },
+      );
+    }
+    return dispatchScopedMcp(req, derived.vaultName, vaultConfig);
   }
 
   // ---------------------------------------------------------------------
@@ -507,28 +623,24 @@ export async function route(
     return handleTicketSpend(req, ticketId, vaultName, store);
   }
 
+  // MCP (per-vault, single-vault session) — the URL names the vault. Shares
+  // the exact dispatch tail with the token-derived root `/mcp` (U1), so both
+  // behave identically. Handled BEFORE the shared authenticated-surface auth
+  // below because `dispatchScopedMcp` owns its own auth + 401 challenge; a
+  // non-MCP 401 further down never carries the RFC 9728 challenge (it's
+  // MCP-only).
+  if (subpath === "/mcp" || subpath.startsWith("/mcp/")) {
+    return dispatchScopedMcp(req, vaultName, vaultConfig);
+  }
+
   // ---------------------------------------------------------------------
   // Authenticated surface
   // ---------------------------------------------------------------------
 
   const store = getVaultStore(vaultName);
   const auth = await authenticateVaultRequest(req, vaultConfig);
-  const isScopedMcp = subpath === "/mcp" || subpath.startsWith("/mcp/");
   if ("error" in auth) {
-    return isScopedMcp ? withMcpChallenge(auth.error, req, vaultName) : auth.error;
-  }
-
-  // MCP (per-vault, single-vault session).
-  if (isScopedMcp) {
-    // Thread the RAW caller bearer (the exact credential the session
-    // presented) into the MCP layer so the manage-token tool can forward it
-    // to hub's mint-token attenuation proxy (vault#403, MGT). Only the raw
-    // validated bearer — never a fabricated one. extractApiKey returns the
-    // same value `authenticateVaultRequest` validated above; non-forwardable
-    // credentials (env-var secret, legacy pvt_*) are handled by manage-token
-    // itself (it only forwards JWT-shaped bearers).
-    const callerBearer = extractApiKey(req);
-    return handleScopedMcp(req, vaultName, auth, callerBearer);
+    return auth.error;
   }
 
   // Bare `/vault/<name>` — single-vault root. Returns name, description,

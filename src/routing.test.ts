@@ -10,8 +10,10 @@
  *  3. `/vault/<name>/...` — per-vault routing (OAuth, MCP, view, API).
  *  4. The RFC 9728 WWW-Authenticate challenge that decorates MCP 401s.
  *
- * No unscoped `/mcp`, `/api/*`, `/oauth/*` routes exist — every per-vault
- * resource must name the vault it targets.
+ * No unscoped `/api/*` or `/oauth/*` routes exist — those per-vault resources
+ * must name the vault in the URL. The canonical root `/mcp` (U1) is the one
+ * vault-agnostic exception: it derives the target vault from the token, then
+ * re-dispatches through the same per-vault machinery.
  *
  * Uses PARACHUTE_HOME override so each test's vaults live in a tmp dir and
  * never touch ~/.parachute.
@@ -706,12 +708,25 @@ describe("per-vault routing under /vault/<name>/", () => {
     }
   });
 
-  test("no /mcp, /api, /oauth unscoped routes — all 404", async () => {
+  test("no /api, /oauth unscoped routes — all 404", async () => {
     createVault("journal");
-    for (const path of ["/mcp", "/api/notes", "/oauth/register", "/oauth/authorize"]) {
+    for (const path of ["/api/notes", "/oauth/register", "/oauth/authorize"]) {
       const res = await route(new Request(`http://localhost:1940${path}`), path);
       expect(res.status).toBe(404);
     }
+  });
+
+  test("root /mcp is NOT a 404 — it's the token-derived MCP endpoint (401 unauthenticated)", async () => {
+    // The old unscoped `/mcp` compat prefix returned 404. The canonical root
+    // `/mcp` (U1) replaces it: unauthenticated it 401s + carries the root PRM
+    // challenge, exactly like the per-vault endpoint but pointed at the root
+    // metadata document.
+    createVault("journal");
+    const res = await route(new Request("http://localhost:1940/mcp", { method: "POST" }), "/mcp");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBe(
+      'Bearer resource_metadata="http://localhost:1940/.well-known/oauth-protected-resource/mcp"',
+    );
   });
 
   test("bare /vault/<name> returns metadata for authenticated callers", async () => {
@@ -807,6 +822,216 @@ describe("MCP 401 WWW-Authenticate challenge (RFC 9728)", () => {
     expect(res.headers.get("WWW-Authenticate")).toBe(
       'Bearer resource_metadata="https://vault.example.com/vault/journal/.well-known/oauth-protected-resource"',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Canonical root MCP endpoint — token-derived vault dispatch (U1).
+//
+// `/mcp` at the origin root derives the target vault from the TOKEN, not the
+// URL, then re-dispatches through the identical per-vault machinery. These
+// tests pin the two load-bearing properties: (1) a token for vault A behaves
+// byte-identically at root `/mcp` and at `/vault/A/mcp` (equivalence), and
+// (2) the vault is ALWAYS the one the token names — a token can't be steered
+// to another vault, and an unnameable/ambiguous token is refused with the root
+// discovery challenge rather than a guess (derivation honesty).
+// ---------------------------------------------------------------------------
+
+describe("canonical root /mcp — token-derived vault dispatch (U1)", () => {
+  const INIT = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "u1-test", version: "0" },
+    },
+  };
+  const LIST = { jsonrpc: "2.0", id: 2, method: "tools/list" };
+  const QUERY = {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: { name: "query-notes", arguments: {} },
+  };
+
+  async function mcpPost(path: string, token: string | null, rpc: object): Promise<Response> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    };
+    if (token) headers.authorization = `Bearer ${token}`;
+    return route(
+      new Request(`http://localhost:1940${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(rpc),
+      }),
+      path,
+    );
+  }
+
+  /** Parse a JSON-RPC frame off an MCP response, tolerating either the JSON
+   *  body (enableJsonResponse) or an SSE `data:` framing. */
+  async function rpcFrame(res: Response): Promise<unknown> {
+    const text = await res.text();
+    const trimmed = text.trimStart();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) return JSON.parse(trimmed);
+    const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
+    return JSON.parse(dataLine!.slice("data:".length).trim());
+  }
+
+  /** Sign a token directly (bypassing `mintJwt`'s `aud=vault.<name>` coupling)
+   *  so a test can craft a token whose sources name no vault, or disagree. */
+  async function signRaw(payload: Record<string, unknown>, aud: string): Promise<string> {
+    const iat = Math.floor(Date.now() / 1000);
+    return new SignJWT({ client_id: "u1-test", ...payload })
+      .setProtectedHeader({ alg: "RS256", kid: KID })
+      .setIssuer(`http://127.0.0.1:${hubServer.port}`)
+      .setSubject("u1-test-user")
+      .setAudience(aud)
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 60)
+      .setJti(`jti-${Math.random().toString(36).slice(2)}`)
+      .sign(signingKey);
+  }
+
+  test("root PRM mirrors the per-vault PRM shape (root resource, un-narrowed scopes)", async () => {
+    createVault("journal");
+    const path = "/.well-known/oauth-protected-resource/mcp";
+    const res = await route(new Request(`http://localhost:1940${path}`), path);
+    expect(res.status).toBe(200);
+    const prm = (await res.json()) as {
+      resource: string;
+      authorization_servers: string[];
+      scopes_supported: string[];
+      bearer_methods_supported: string[];
+    };
+    expect(prm.resource).toBe("http://localhost:1940/mcp");
+    // Un-narrowed forms — the hub's consent picker narrows them to a vault.
+    expect(prm.scopes_supported).toEqual(["vault:read", "vault:write"]);
+    expect(prm.bearer_methods_supported).toEqual(["header"]);
+    expect(Array.isArray(prm.authorization_servers)).toBe(true);
+    expect(prm.authorization_servers.length).toBe(1);
+  });
+
+  test("unauthenticated → 401 whose challenge names the root PRM (self-consistent pointer)", async () => {
+    createVault("journal");
+    const res = await mcpPost("/mcp", null, INIT);
+    expect(res.status).toBe(401);
+    const header = res.headers.get("WWW-Authenticate")!;
+    const prmUrl = header.match(/resource_metadata="([^"]+)"/)![1]!;
+    const prmPath = new URL(prmUrl).pathname;
+    expect(prmPath).toBe("/.well-known/oauth-protected-resource/mcp");
+    // The pointer resolves to a real PRM that names the root resource.
+    const prmRes = await route(new Request(prmUrl), prmPath);
+    expect(prmRes.status).toBe(200);
+    expect(((await prmRes.json()) as { resource: string }).resource).toBe(
+      "http://localhost:1940/mcp",
+    );
+  });
+
+  test("x-forwarded-* shape the root challenge URL", async () => {
+    createVault("journal");
+    const req = new Request("http://127.0.0.1:1940/mcp", {
+      method: "POST",
+      headers: {
+        "x-forwarded-host": "vault.example.com",
+        "x-forwarded-proto": "https",
+      },
+    });
+    const res = await route(req, "/mcp");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBe(
+      'Bearer resource_metadata="https://vault.example.com/.well-known/oauth-protected-resource/mcp"',
+    );
+  });
+
+  test("token for A at root /mcp === same token at /vault/A/mcp (initialize, tools/list, tool call)", async () => {
+    createVault("journal");
+    const store = getVaultStore("journal");
+    await store.createNote("root-mcp equivalence fixture", { path: "fixture", tags: ["probe"] });
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:admin"] });
+
+    for (const rpc of [INIT, LIST, QUERY]) {
+      const rootRes = await mcpPost("/mcp", token, rpc);
+      const perVaultRes = await mcpPost("/vault/journal/mcp", token, rpc);
+      expect(rootRes.status).toBe(200);
+      expect(perVaultRes.status).toBe(200);
+      // Byte-identical JSON-RPC frame — the root path derived `journal`, so the
+      // server name, tool list, and tool result all match the URL-addressed
+      // endpoint exactly.
+      expect(await rpcFrame(rootRes)).toEqual(await rpcFrame(perVaultRes));
+    }
+  });
+
+  test("a read-only token narrows the root tool list identically to the per-vault endpoint", async () => {
+    createVault("journal");
+    getVaultStore("journal");
+    const readToken = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const rootList = await rpcFrame(await mcpPost("/mcp", readToken, LIST));
+    const perVaultList = await rpcFrame(await mcpPost("/vault/journal/mcp", readToken, LIST));
+    expect(rootList).toEqual(perVaultList);
+    // Sanity: a read token sees the read tools but not write/admin ones.
+    const names = (rootList as { result: { tools: { name: string }[] } }).result.tools.map(
+      (t) => t.name,
+    );
+    expect(names).toContain("query-notes");
+    expect(names).not.toContain("create-note");
+    expect(names).not.toContain("manage-token");
+  });
+
+  test("a vault-A token ALWAYS lands in A through root /mcp — never another vault's data", async () => {
+    createVault("alpha");
+    createVault("beta");
+    // Seed a secret in BETA. A token minted for ALPHA must never surface it.
+    await getVaultStore("beta").createNote("BETA-ONLY-SECRET", { path: "secret" });
+    getVaultStore("alpha");
+    const alphaToken = await mintJwt({ vaultName: "alpha", scopes: ["vault:alpha:admin"] });
+
+    const res = await mcpPost("/mcp", alphaToken, QUERY);
+    expect(res.status).toBe(200);
+    // The vault is derived from the token (alpha); beta's note is unreachable.
+    expect(JSON.stringify(await rpcFrame(res))).not.toContain("BETA-ONLY-SECRET");
+  });
+
+  test("scope and aud naming DIFFERENT vaults → 401 (disagreement, never guess)", async () => {
+    createVault("alpha");
+    createVault("beta");
+    // aud=vault.alpha (from vaultName) but the scope names beta — two sources
+    // disagree, so derivation refuses rather than picking a winner.
+    const token = await mintJwt({ vaultName: "alpha", scopes: ["vault:beta:admin"] });
+    const res = await mcpPost("/mcp", token, INIT);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toContain("/.well-known/oauth-protected-resource/mcp");
+  });
+
+  test("a token that names NO vault (broad scope, non-vault aud, no vault_scope) → 401", async () => {
+    createVault("journal");
+    // Broad `vault:read` names no vault; aud is not `vault.<name>`; no
+    // vault_scope claim. Nothing derives a target → the discovery challenge.
+    const token = await signRaw({ scope: "vault:read" }, "some-other-resource");
+    const res = await mcpPost("/mcp", token, INIT);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toContain("/.well-known/oauth-protected-resource/mcp");
+  });
+
+  test("an invalid / unverifiable token → 401 + root challenge (no vault leaked)", async () => {
+    createVault("journal");
+    const res = await mcpPost("/mcp", "not-a-real-jwt", INIT);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toContain("/.well-known/oauth-protected-resource/mcp");
+  });
+
+  test("a validly-signed token naming a vault absent on THIS server → 404 (mirrors per-vault)", async () => {
+    createVault("journal");
+    // Token is real (signed by the fixture hub) but names a vault that isn't
+    // installed here. The per-vault URL 404s for a missing vault; root matches.
+    const token = await mintJwt({ vaultName: "ghost", scopes: ["vault:ghost:admin"] });
+    const res = await mcpPost("/mcp", token, INIT);
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("Vault not found");
   });
 });
 
