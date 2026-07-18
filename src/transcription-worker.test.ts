@@ -1627,3 +1627,154 @@ describe("transcription worker — legacy in-body memo content safety (finding F
     expect(note!.content).toContain("retry text with $& and $0 and $$ literal");
   });
 });
+
+// ---------------------------------------------------------------------------
+// voice W2 — segmented recordings. The app slices a long recording into
+// ~10-min segments, each linked as its own attachment on ONE note carrying a
+// client-set `segment_index` (0-based). The legacy in-body path targets that
+// part's markers — `_Transcript pending (part N)._` / `_Transcription
+// unavailable (part N)._`, N = segment_index + 1 — so each transcript lands in
+// its own pre-allocated slot regardless of completion order. Marker strings
+// are a BYTE-EXACT cross-door + cross-repo contract (the cloud worker ships
+// the identical text), so these assertions pin the exact bytes.
+// ---------------------------------------------------------------------------
+
+describe("transcription worker — segmented recordings (voice W2)", () => {
+  test("three parts completing OUT OF ORDER (2 ok, 0 fails, 1 ok) each land in their own slot", async () => {
+    // One note, three pre-allocated part slots + the shared stub opt-in.
+    const body =
+      "# 🎙️ Voice memo\n\n" +
+      "_Transcript pending (part 1)._\n\n" +
+      "_Transcript pending (part 2)._\n\n" +
+      "_Transcript pending (part 3)._\n";
+    await store.createNote(body, { id: "seg-note", metadata: { transcribe_stub: true } });
+
+    seedAudio("memos/seg0.webm");
+    seedAudio("memos/seg1.webm");
+    seedAudio("memos/seg2.webm");
+    const seg0 = await store.addAttachment("seg-note", "memos/seg0.webm", "audio/webm", {
+      transcribe_status: "pending",
+      segment_index: 0,
+    });
+    const seg1 = await store.addAttachment("seg-note", "memos/seg1.webm", "audio/webm", {
+      transcribe_status: "pending",
+      segment_index: 1,
+    });
+    const seg2 = await store.addAttachment("seg-note", "memos/seg2.webm", "audio/webm", {
+      transcribe_status: "pending",
+      segment_index: 2,
+    });
+
+    // Complete part 3 (segment_index 2) FIRST — success.
+    const w2 = makeWorker({ fetchImpl: mkFetchMock([{ text: "part three text" }]) });
+    try { await w2.kick("default", seg2); } finally { await w2.stop(); }
+
+    // Then part 1 (segment_index 0) — terminal failure (maxAttempts=1).
+    const w0 = makeWorker({
+      fetchImpl: mkFetchMock([{ error: "scribe down", status: 500 }]),
+      maxAttempts: 1,
+    });
+    try { await w0.kick("default", seg0); } finally { await w0.stop(); }
+
+    // Finally part 2 (segment_index 1) — success.
+    const w1 = makeWorker({ fetchImpl: mkFetchMock([{ text: "part two text" }]) });
+    try { await w1.kick("default", seg1); } finally { await w1.stop(); }
+
+    const note = await store.getNote("seg-note");
+    // Each part landed in its own slot: part 1 → failure marker, part 2/3 →
+    // their transcripts, despite completing 3 → 1 → 2.
+    expect(note!.content).toBe(
+      "# 🎙️ Voice memo\n\n" +
+      "_Transcription unavailable (part 1)._\n\n" +
+      "part two text\n\n" +
+      "part three text\n",
+    );
+    // Shared stub SURVIVES — sibling parts each needed the gate open; a
+    // per-part clear (the un-segmented behavior) would have blocked parts 2 & 3.
+    expect((note!.metadata as any)?.transcribe_stub).toBe(true);
+
+    // Attachment rows reflect their individual outcomes.
+    const atts = await store.getAttachments("seg-note");
+    const byIndex = Object.fromEntries(atts.map((a) => [a.metadata?.segment_index, a]));
+    expect(byIndex[0]!.metadata?.transcribe_status).toBe("failed");
+    expect(byIndex[1]!.metadata?.transcribe_status).toBe("done");
+    expect(byIndex[1]!.metadata?.transcript).toBe("part two text");
+    expect(byIndex[2]!.metadata?.transcribe_status).toBe("done");
+    expect(byIndex[2]!.metadata?.transcript).toBe("part three text");
+  });
+
+  test("un-segmented attachment → BARE markers, one-shot stub cleared (regression pin)", async () => {
+    // No `segment_index` → byte-for-byte the pre-W2 behavior: replace the bare
+    // placeholder, clear the stub. A stray `(part N)` marker in the body is
+    // left untouched (the bare path never targets part markers).
+    await store.createNote(
+      "# 🎙️ Voice memo\n\n_Transcript pending._\n\n_Transcript pending (part 2)._\n",
+      { id: "unseg-note", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/unseg.webm");
+    const att = await store.addAttachment("unseg-note", "memos/unseg.webm", "audio/webm", {
+      transcribe_status: "pending",
+    });
+
+    const worker = makeWorker({ fetchImpl: mkFetchMock([{ text: "bare transcript" }]) });
+    try { await worker.kick("default", att); } finally { await worker.stop(); }
+
+    const note = await store.getNote("unseg-note");
+    // Bare marker replaced; the part-2 marker is NOT touched by the bare path.
+    expect(note!.content).toBe(
+      "# 🎙️ Voice memo\n\nbare transcript\n\n_Transcript pending (part 2)._\n",
+    );
+    // One-shot stub cleared, exactly as today.
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+  });
+
+  test("malformed segment_index falls back to bare markers (contract: integer ≥ 0)", async () => {
+    // A non-integer / negative `segment_index` must NOT fabricate a `(part N)`
+    // marker — it degrades to the bare path (fully backward compatible).
+    await store.createNote(
+      "# 🎙️ Voice memo\n\n_Transcript pending._\n",
+      { id: "seg-bad", metadata: { transcribe_stub: true } },
+    );
+    seedAudio("memos/segbad.webm");
+    const att = await store.addAttachment("seg-bad", "memos/segbad.webm", "audio/webm", {
+      transcribe_status: "pending",
+      segment_index: -1, // invalid → bare path
+    });
+
+    const worker = makeWorker({ fetchImpl: mkFetchMock([{ text: "fallback transcript" }]) });
+    try { await worker.kick("default", att); } finally { await worker.stop(); }
+
+    const note = await store.getNote("seg-bad");
+    expect(note!.content).toBe("# 🎙️ Voice memo\n\nfallback transcript\n");
+    expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+  });
+
+  test("segmented part whose marker was edited away → transcript appended (graceful fallback)", async () => {
+    // The user rewrote part 2's slot by hand, removing its pending marker.
+    // Mirror the un-segmented replace-or-append policy scoped to the part:
+    // with neither of part 2's markers present, append the transcript
+    // (no `(part N)` prefix) rather than destroying the user's edit.
+    const editedBody =
+      "# 🎙️ Voice memo\n\n" +
+      "_Transcript pending (part 1)._\n\n" +
+      "User rewrote part two by hand.\n";
+    await store.createNote(editedBody, { id: "seg-edit", metadata: { transcribe_stub: true } });
+    seedAudio("memos/segedit.webm");
+    const seg1 = await store.addAttachment("seg-edit", "memos/segedit.webm", "audio/webm", {
+      transcribe_status: "pending",
+      segment_index: 1, // part 2
+    });
+
+    const worker = makeWorker({ fetchImpl: mkFetchMock([{ text: "the real part two" }]) });
+    try { await worker.kick("default", seg1); } finally { await worker.stop(); }
+
+    const note = await store.getNote("seg-edit");
+    // Part 2's transcript appended; the user's edit + part 1's pending slot
+    // both survive untouched.
+    expect(note!.content).toBe(`${editedBody}\n\nthe real part two`);
+    expect(note!.content).toContain("User rewrote part two by hand.");
+    expect(note!.content).toContain("_Transcript pending (part 1)._");
+    // Segmented → shared stub preserved (part 1 still needs the gate open).
+    expect((note!.metadata as any)?.transcribe_stub).toBe(true);
+  });
+});
