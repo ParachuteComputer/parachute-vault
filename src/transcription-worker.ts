@@ -64,41 +64,57 @@ import {
 } from "../core/src/transcription/provider.ts";
 import { ScribeHttpProvider } from "./transcription/providers/scribe-http.ts";
 
-/** Placeholder pattern written by the voice-memo capture stub. */
-const TRANSCRIPT_PLACEHOLDER = /_Transcript pending\._/;
+/**
+ * The in-body transcription markers.
+ *
+ * The BARE markers are the un-segmented default; voice W2 (segmented
+ * recordings) targets per-part variants built by `markersFor`. Both are a
+ * BYTE-EXACT cross-door + cross-repo contract — the cloud Workers-AI
+ * transcription path ships the identical strings, and the notes-ui status
+ * chip (parachute-surface TranscriptionStatus.tsx) keys off the failure
+ * marker's exact copy. Don't change any of this text without a coordinated
+ * change in both places. A friendlier "retry available" copy + chip
+ * affordance is a tracked parachute-surface follow-up.
+ *
+ * Owning the failure marker here (it used to be written by Lens's now-removed
+ * scribe client) means a failed upload stops reading "Transcript pending"
+ * forever regardless of which client uploaded the audio.
+ */
+const BARE_PENDING = "_Transcript pending._";
+const BARE_UNAVAILABLE = "_Transcription unavailable._";
+
+/** Escape a literal string for safe embedding in a `RegExp`. */
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /**
- * Body written when transcription reaches a terminal failure (maxAttempts
- * exhausted, or the audio file is missing). This used to be written by
- * Lens's now-removed scribe client; owning it here means a failed upload
- * stops reading "Transcript pending" forever regardless of which client
- * uploaded the audio.
- *
- * NOTE: the notes-ui status chip (parachute-surface TranscriptionStatus.tsx)
- * keys off this exact string, so don't change the copy without a coordinated
- * change there. A friendlier "retry available" copy + chip affordance is a
- * tracked parachute-surface follow-up.
+ * The pending + terminal-failure markers for an attachment, honoring
+ * `segment_index` (voice W2 — segmented recordings). `undefined` yields the
+ * bare markers (fully backward compatible — un-segmented flows are byte-
+ * unchanged). An integer ≥ 0 yields this part's markers, with the human-
+ * facing part number N = segment_index + 1 (1-based, decimal):
+ *   `_Transcript pending (part N)._` / `_Transcription unavailable (part N)._`
  */
-const TRANSCRIPT_UNAVAILABLE = "_Transcription unavailable._";
+function markersFor(segmentIndex: number | undefined): { pending: string; unavailable: string } {
+  if (segmentIndex === undefined) return { pending: BARE_PENDING, unavailable: BARE_UNAVAILABLE };
+  const n = segmentIndex + 1;
+  return {
+    pending: `_Transcript pending (part ${n})._`,
+    unavailable: `_Transcription unavailable (part ${n})._`,
+  };
+}
 
 /**
- * On a successful (re)transcription of a legacy in-body memo, the transcript
- * replaces whichever marker is currently in the body — the original
- * `_Transcript pending._` on a first-try success, OR `_Transcription
- * unavailable._` if a prior attempt failed and we're now retrying. Matching
- * both means a retried success lands in the same spot a first-try success
- * would, preserving the surrounding capture body (the `![[memo]]` embed,
- * the `_Recorded …_` line, the header).
- *
- * Deliberately NO `/g` flag — `.replace` swaps only the FIRST match. A
- * canonical capture body holds exactly one marker, so first-match is the
- * correct target. `applyFailureMarker`'s includes-guard (no-op when the
- * marker is already present) prevents markers accumulating across repeated
- * terminal failures, so the body never carries two of the same marker. A
- * hand-edited body that somehow contains both markers patches only the
- * first — accepted (degenerate, operator-induced).
+ * A valid segment index (integer ≥ 0) off attachment metadata, else
+ * `undefined` — the un-segmented path. Client-set at link time; anything that
+ * isn't a non-negative integer falls back to the bare markers rather than
+ * fabricating a `(part N)`.
  */
-const TRANSCRIPT_SUCCESS_TARGET = /_Transcript pending\._|_Transcription unavailable\._/;
+function segmentIndexOf(meta: { segment_index?: unknown }): number | undefined {
+  const raw = meta.segment_index;
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : undefined;
+}
 
 /**
  * Default sweep cadence (ms). The sweep is the safety net for backoff-
@@ -195,6 +211,14 @@ interface PendingMeta {
    * worker preserves the original stub-patching behavior (Lens flow).
    */
   transcribe_origin?: "auto" | "legacy";
+  /**
+   * Voice W2 (segmented recordings): a client-set 0-based index marking this
+   * attachment as one segment of a longer recording sliced into ~10-min parts,
+   * all linked on ONE note. When present, the legacy in-body path targets this
+   * part's markers (`… (part N)._`, N = segment_index + 1) rather than the bare
+   * ones — making per-part ordering structurally guaranteed. See `markersFor`.
+   */
+  segment_index?: number;
   [k: string]: unknown;
 }
 
@@ -357,17 +381,28 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
    * attachment failure we're trying to record.
    *
    * Body policy (finding F — never destroy content):
-   *   - Placeholder PRESENT → surgical replace of `_Transcript pending._`
-   *     with the marker. The `![[memo]]` embed + any surrounding text survive.
-   *   - Marker ALREADY PRESENT → no-op (idempotent; a double-terminal-failure
-   *     must not stack markers).
-   *   - Otherwise (placeholder absent — the user edited the note while it was
-   *     pending) → APPEND `\n\n` + marker to the existing content. The old
-   *     code full-replaced the body here, destroying the embed AND the user's
-   *     edits. We append instead so nothing is lost. If the content is empty,
-   *     the marker alone becomes the body (avoids a leading blank line).
+   *   - Pending marker PRESENT → surgical replace of the pending marker with
+   *     the failure marker. The `![[memo]]` embed + any surrounding text
+   *     survive. For a segmented attachment (`segment_index` set) this is the
+   *     per-part `_Transcript pending (part N)._`; otherwise the bare marker.
+   *   - Failure marker ALREADY PRESENT → no-op (idempotent; a double-terminal-
+   *     failure must not stack markers).
+   *   - Otherwise (pending marker absent — the user edited the note while it
+   *     was pending) → APPEND `\n\n` + failure marker to the existing content.
+   *     The old code full-replaced the body here, destroying the embed AND the
+   *     user's edits. We append instead so nothing is lost. If the content is
+   *     empty, the marker alone becomes the body (avoids a leading blank line).
    */
-  async function applyFailureMarker(store: Store, noteId: string): Promise<void> {
+  async function applyFailureMarker(
+    store: Store,
+    noteId: string,
+    segmentIndex: number | undefined,
+  ): Promise<void> {
+    // Bare markers by default; this segment's `(part N)` markers when the
+    // attachment carries a `segment_index` (voice W2). String-search replace
+    // targets the FIRST occurrence (a canonical body holds exactly one), and
+    // the includes-guard below keeps a repeated terminal failure from stacking.
+    const { pending, unavailable } = markersFor(segmentIndex);
     // OC-guarded (vault#435): the read-transform-write below is re-run against
     // fresh content on a conflict so a concurrent user edit isn't clobbered.
     // The transform is pure w.r.t. the note it's handed; the stub-set and
@@ -381,17 +416,24 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         if (noteMeta.transcribe_stub !== true) return null;
 
         let body: string;
-        if (TRANSCRIPT_PLACEHOLDER.test(note.content)) {
-          body = note.content.replace(TRANSCRIPT_PLACEHOLDER, TRANSCRIPT_UNAVAILABLE);
-        } else if (note.content.includes(TRANSCRIPT_UNAVAILABLE)) {
+        if (note.content.includes(pending)) {
+          // Function replacer so the search string is treated literally and the
+          // (fixed) failure marker is inserted verbatim.
+          body = note.content.replace(pending, () => unavailable);
+        } else if (note.content.includes(unavailable)) {
           // Marker already present — nothing to do. Clear the stub and
           // return without rewriting the body so we don't stack markers.
           body = note.content;
         } else {
           body = note.content.length > 0
-            ? `${note.content}\n\n${TRANSCRIPT_UNAVAILABLE}`
-            : TRANSCRIPT_UNAVAILABLE;
+            ? `${note.content}\n\n${unavailable}`
+            : unavailable;
         }
+        // Segmented: the stub is SHARED across this note's parts — keep it set
+        // so sibling parts still resolve their own slots. Return content only
+        // (leave note metadata untouched). Un-segmented: clear the one-shot
+        // stub as before (byte-unchanged).
+        if (segmentIndex !== undefined) return { content: body };
         const { transcribe_stub: _drop, ...restMeta } = noteMeta;
         return { content: body, metadata: restMeta };
       },
@@ -449,6 +491,12 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
     // vs. the legacy stub-patching path (Lens flow). Auto-write notes also
     // surface failures so the user can retry from the transcript note.
     const isAutoOrigin = meta.transcribe_origin === "auto";
+    // Voice W2: when this attachment is one segment of a longer recording
+    // (client-set `segment_index`), the legacy in-body path targets this
+    // part's markers instead of the bare ones. Undefined for un-segmented
+    // attachments — byte-unchanged behavior. Only the legacy path consults it;
+    // the auto/transcript-note path is untouched (segments are a memo concern).
+    const segmentIndex = segmentIndexOf(meta);
 
     // Honor backoff — we re-check here in case another tick queued this
     // attachment between the listing and now.
@@ -469,7 +517,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       if (isAutoOrigin) {
         await writeFailureTranscriptNote(store, attachment, "audio file not found", undefined, undefined);
       } else {
-        await applyFailureMarker(store, attachment.noteId);
+        await applyFailureMarker(store, attachment.noteId, segmentIndex);
       }
       return;
     }
@@ -527,7 +575,7 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
         if (isAutoOrigin) {
           await writeFailureTranscriptNote(store, attachment, errMsg, apiErr?.code, undefined);
         } else {
-          await applyFailureMarker(store, attachment.noteId);
+          await applyFailureMarker(store, attachment.noteId, segmentIndex);
         }
         // retention=never drops the audio on any terminal state, including
         // failure. The user opted in to "I don't want the audio kept around
@@ -578,6 +626,16 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
       // before the transcript arrives opts out of the overwrite. OC-guarded
       // (vault#435): re-applied against fresh content on a conflict so a
       // concurrent user edit isn't clobbered.
+      //
+      // Success replaces whichever of THIS part's markers is present (bare, or
+      // `(part N)` when segmented). Built with no `/g` flag so `.replace`
+      // swaps only the FIRST match — a canonical capture body holds exactly
+      // one marker per part; alternation preserves positional-first semantics
+      // (a retried success replaces the failure marker where a first-try
+      // success replaced the pending one) so byte-for-byte matching today's
+      // un-segmented behavior.
+      const { pending, unavailable } = markersFor(segmentIndex);
+      const successTarget = new RegExp(`${escapeRegExp(pending)}|${escapeRegExp(unavailable)}`);
       await applyNoteTransformWithOC(
         store,
         attachment.noteId,
@@ -586,28 +644,31 @@ export function startTranscriptionWorker(opts: TranscriptionWorkerOpts): Transcr
           const noteMeta = (note.metadata as Record<string, unknown> | undefined) ?? {};
           if (noteMeta.transcribe_stub !== true) return null;
           // Body policy (finding F — never destroy content):
-          //   - placeholder OR failure-marker present → surgical replace in
-          //     place (a retried success replaces the `_Transcription
-          //     unavailable._` marker, landing exactly where a first-try
-          //     success would). The embed + surrounding capture body survive.
+          //   - pending OR failure marker present → surgical replace in place.
+          //     The embed + surrounding capture body survive.
           //   - neither present (user edited the note while pending) → APPEND
           //     the transcript instead of full-replacing the body, so the
           //     user's edits + the `![[memo]]` embed are preserved. The old
           //     code full-replaced here, which destroyed both.
           let body: string;
-          if (TRANSCRIPT_SUCCESS_TARGET.test(note.content)) {
+          if (successTarget.test(note.content)) {
             // Function replacer, NOT a string — speech-to-text is arbitrary
             // user content, and String.replace treats `$&`, `$\``, `$'`,
             // `$1`-`$9` as special patterns in a string replacement. A
             // transcript containing `$&` would otherwise inject the matched
             // marker text into the body. `() => transcript` returns the text
             // verbatim.
-            body = note.content.replace(TRANSCRIPT_SUCCESS_TARGET, () => transcript);
+            body = note.content.replace(successTarget, () => transcript);
           } else {
             body = note.content.length > 0
               ? `${note.content}\n\n${transcript}`
               : transcript;
           }
+          // Segmented: the stub is SHARED across this note's parts — keep it
+          // set so sibling parts still resolve their own slots. Return content
+          // only (leave note metadata untouched). Un-segmented: clear the
+          // one-shot stub as before (byte-unchanged).
+          if (segmentIndex !== undefined) return { content: body };
           const { transcribe_stub: _drop, ...restMeta } = noteMeta;
           return { content: body, metadata: restMeta };
         },
