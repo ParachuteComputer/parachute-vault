@@ -31,6 +31,7 @@
 
 import type { Server, ServerWebSocket, WebSocketHandler } from "bun";
 import type { Store } from "../core/src/types.ts";
+import { toNoteIndex } from "../core/src/notes.ts";
 import type { VaultConfig } from "./config.ts";
 import { readVaultConfig } from "./config.ts";
 import { getVaultStore } from "./vault-store.ts";
@@ -229,6 +230,9 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
       closeWs(ws, WS_CLOSE.PROTOCOL, "invalid subscription query");
       return;
     }
+    // Lean list subscriptions (`include_content=false`) ship the `NoteIndex`
+    // projection — snapshot + live upserts — instead of full note bodies.
+    const lean = !validated.includeContent;
 
     let tagScopeAllowed: Set<string> | null;
     let matcher;
@@ -247,7 +251,10 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
       closeWs(ws, WS_CLOSE.PROTOCOL, "snapshot query failed");
       return;
     }
-    const frames = buildSnapshotFrames(snapshotNotes);
+    // Project AFTER the tag-scope filter (which reads note.tags). `toNoteIndex`
+    // is the SAME lean shape the REST list route returns, so a client that
+    // renders REST lists renders these snapshot frames unchanged.
+    const frames = buildSnapshotFrames(lean ? snapshotNotes.map(toNoteIndex) : snapshotNotes);
 
     // --- SYNCHRONOUS from here (no await) so no write interleaves between
     //     register and the snapshot flush.
@@ -261,6 +268,7 @@ export function createSubscribeWsBinding(deps: SubscribeWsDeps = {}): {
       tagScopeAllowed,
       tagScopeRaw: auth.scoped_tags,
       sink: new WsSink(ws),
+      lean,
       tracksFlush: false,
       countsTowardCap: false,
     });

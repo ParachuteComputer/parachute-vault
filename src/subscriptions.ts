@@ -63,6 +63,7 @@
 import type { Note, Store } from "../core/src/types.ts";
 import type { DeletedNoteRef, HookEvent, NoteHookPayload } from "../core/src/hooks.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
+import { toNoteIndex } from "../core/src/notes.ts";
 import { getVaultNameForStore } from "./vault-store.ts";
 import { noteWithinTagScope } from "./tag-scope.ts";
 import type { LiveMatcher } from "./live-match.ts";
@@ -98,6 +99,11 @@ interface Subscription {
   /** Raw root-tag allowlist (null = unscoped) — `noteWithinTagScope` arg. */
   readonly tagScopeRaw: string[] | null;
   readonly sink: SubscriptionSink;
+  /** When true, `upsert` payloads carry the lean `NoteIndex` projection
+   *  (`toNoteIndex`) instead of the full `Note` — for a subscription that opted
+   *  into `include_content=false` (list views). `remove` is unaffected (already
+   *  a thin `{id}` ref); the initial snapshot is projected at the route. */
+  readonly lean: boolean;
   /** SSE tracks unflushed frames to bound memory; WS delegates to the runtime. */
   readonly tracksFlush: boolean;
   /** Whether this sub counts against the per-vault manager cap (SSE) — the WS
@@ -205,6 +211,9 @@ export class SubscriptionManager {
     tagScopeRaw: string[] | null;
     sink: SubscriptionSink;
     maxBuffered?: number;
+    /** Opt into the lean `NoteIndex` upsert shape (default false = full `Note`).
+     *  Set for a list subscription that requested `include_content=false`. */
+    lean?: boolean;
     /** SSE (default true) tracks unflushed frames; WS passes false. */
     tracksFlush?: boolean;
     /** SSE (default true) counts against the per-vault manager cap; WS passes
@@ -223,6 +232,7 @@ export class SubscriptionManager {
       tagScopeAllowed: args.tagScopeAllowed,
       tagScopeRaw: args.tagScopeRaw,
       sink: args.sink,
+      lean: args.lean ?? false,
       tracksFlush: args.tracksFlush ?? true,
       countsTowardCap,
       buffered: 0,
@@ -320,7 +330,9 @@ export class SubscriptionManager {
       const matches = sub.matcher.match(note) && inScope;
 
       if (matches) {
-        this.emit(sub, "upsert", { note });
+        // A lean subscription (list view, `include_content=false`) carries the
+        // same `NoteIndex` projection REST lists return — never the full body.
+        this.emit(sub, "upsert", { note: sub.lean ? toNoteIndex(note) : note });
       } else if (event === "updated" && inScope) {
         // Left the set (predicate no longer true) BUT still within this
         // token's scope, so the sub could have held it — idempotent remove

@@ -98,6 +98,18 @@ describe("buildSnapshotFrames — chunking + done flag", () => {
     for (const f of frames) expect(new TextEncoder().encode(f).byteLength).toBeLessThan(1_000_000);
     expect(frames.flatMap((f) => JSON.parse(f).notes).length).toBe(8);
   });
+
+  it("is shape-agnostic — frames a lean NoteIndex entry verbatim", () => {
+    // A lean subscription hands `toNoteIndex`-projected entries; the framer
+    // serializes them byte-for-byte, no content field re-added.
+    const lean = { id: "x", byteSize: 3, preview: "abc", displayTitle: "abc", tags: ["chat"], metadata: {} };
+    const frames = buildSnapshotFrames([lean as any]);
+    expect(frames.length).toBe(1);
+    const f = JSON.parse(frames[0]!);
+    expect(f.done).toBe(true);
+    expect(f.notes).toEqual([lean]);
+    expect(f.notes[0].content).toBeUndefined();
+  });
 });
 
 describe("parseClientMessage", () => {
@@ -170,6 +182,15 @@ describe("validateWsSubscribeQuery — same rejects as the SSE route (byte-ident
   it("accepts a supported query", () => {
     const v = validateWsSubscribeQuery(new URL("http://x/vault/v/api/subscribe?tag=chat&path_prefix=meetings/"));
     expect("queryOpts" in v).toBe(true);
+  });
+  it("resolves include_content — default TRUE (full), `false`/`0` → lean, `true`/`1` → full", () => {
+    const at = (q: string) =>
+      validateWsSubscribeQuery(new URL(`http://x/vault/v/api/subscribe?tag=chat${q}`)) as { includeContent: boolean };
+    expect(at("").includeContent).toBe(true); // absent → full (byte-unchanged default)
+    expect(at("&include_content=false").includeContent).toBe(false); // opt into lean
+    expect(at("&include_content=0").includeContent).toBe(false);
+    expect(at("&include_content=true").includeContent).toBe(true);
+    expect(at("&include_content=1").includeContent).toBe(true);
   });
   it("shares the SSE route's queryOpts-level guard (cursor/has_links/date filters)", () => {
     // The belt-and-suspenders layer both doors + the SSE route route through:
