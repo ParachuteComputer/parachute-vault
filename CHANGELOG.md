@@ -4,6 +4,45 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.3-rc.15] - 2026-07-20
+
+**MCP tool manifest — pure-data extraction (front-of-house Wave 0).** The
+inert foundation for an account-level front-of-house MCP layer: the tool
+set's *metadata* (name, description, inputSchema, scope verb, inclusion
+condition) is now a pure-data manifest both the vault and a future
+identity-worker / hub layer can import. ZERO wire or behavior change — a
+byte-identical refactor, pinned.
+
+- **`core/src/mcp-manifest.ts`** (new) — `MCP_TOOL_MANIFEST`, an ordered
+  array of `{name, description, inputSchema, requiredVerb, condition}` for
+  all 16 tools (13 `core` + 2 `attachment-tickets` + 1 `attachment-bytes`).
+  No store, no closures, no execution — data only. Its transitive import
+  graph is deliberately free of `bun:sqlite` (and every `bun:`/`node:`
+  runtime builtin) so it loads under Cloudflare workerd via the same
+  `file:../../../parachute-vault/core` dep the vault worker already uses;
+  the front-of-house layer can enumerate/verb-filter the tool set without
+  ever touching the store code.
+- **`generateMcpTools`** (`core/src/mcp.ts`) now BUILDS its tool set by
+  iterating the manifest and zipping each entry with a store-bound
+  `execute` closure (keyed by tool name), rather than carrying the
+  metadata inline. The manifest is the single source of
+  name/description/inputSchema/verb; `generateMcpTools` only adds behavior.
+  Conditional tools are gated by their `condition` exactly as before —
+  ticket tools present only with an `attachmentTickets` seam,
+  `read-attachment` only with an `attachmentBytes` seam.
+- **`core/src/content-range-constants.ts`** (new) — `MIN_CONTENT_LENGTH`
+  extracted here (dependency-free) so the manifest can reference it in a
+  tool description without pulling `bun:sqlite` in through
+  `content-range.ts`; the latter re-exports it, so every existing importer
+  is unchanged.
+- **Pin** (`core/src/mcp-manifest.test.ts`) — asserts the emitted tool set
+  is byte-for-byte the manifest (name/description/inputSchema/verb, in
+  order, gated by condition), the ordered name/verb/condition contract
+  matches what `main` emitted at extraction time, and — with a positive
+  control over `mcp.ts` — that the manifest's transitive import closure
+  reaches no `bun:sqlite`. Fails the moment the manifest and the built
+  tools drift.
+
 ## A note on versioning between launch (0.2.4) and 0.4.5
 
 CHANGELOG entries between `0.2.4` and `0.4.5` narrate development work,

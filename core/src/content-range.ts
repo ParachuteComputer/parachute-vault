@@ -30,14 +30,11 @@
 
 import { QueryError } from "./query-operators.js";
 
-/**
- * Minimum accepted `content_length`. A UTF-8 codepoint is at most 4 bytes,
- * so any budget >= 4 is guaranteed to make progress (the codepoint at the
- * window start always fits). Budgets 1–3 could stall forever on a 4-byte
- * emoji (empty slice, next_offset == offset); rejecting them up front is
- * deterministic and simpler than a runtime "no progress" error.
- */
-export const MIN_CONTENT_LENGTH = 4;
+// `MIN_CONTENT_LENGTH` lives in the dependency-free `content-range-constants.ts`
+// so the pure-data MCP tool manifest can import it without pulling `bun:sqlite`
+// (front-of-house Wave 0). Re-exported here so existing importers are unchanged.
+export { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
+import { MIN_CONTENT_LENGTH } from "./content-range-constants.js";
 
 export interface ContentRange {
   /** Byte offset (UTF-8) to start reading from. */
