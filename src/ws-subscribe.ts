@@ -30,7 +30,7 @@
  * visible to browser JS: 4400 protocol, 4401 unauthorized/expired/revoked,
  * 4403 scope, 4408 auth-timeout.
  */
-import type { Note, QueryOpts } from "../core/src/types.ts";
+import type { Note, NoteIndex, QueryOpts } from "../core/src/types.ts";
 import { parseNotesQueryOpts } from "./routes.ts";
 import { unsupportedSubscriptionReason } from "./live-match.ts";
 import { hasScopeForVault, type VaultVerb } from "./scopes.ts";
@@ -82,9 +82,20 @@ function json(data: unknown, status = 200): Response {
  * filters can't be evaluated against a single changed note. The 400 bodies +
  * `UNSUPPORTED_SUBSCRIPTION_QUERY` code are byte-identical to the SSE route (and
  * to the cloud door) so all three agree. Returns a ready 400 Response on
- * rejection, else the parsed `QueryOpts`.
+ * rejection, else the parsed `QueryOpts` plus the resolved `includeContent`
+ * intent.
+ *
+ * `include_content` — the lean-snapshot knob. Unlike the REST list
+ * route (which defaults `include_content=false`, i.e. lean), a live subscription
+ * defaults to `true` (FULL notes) so every already-deployed subscriber — cached
+ * notes-ui bundles, surface-client — keeps receiving byte-identical full-note
+ * snapshots/upserts. A subscriber opts INTO the lean `NoteIndex` wire shape (the
+ * same projection REST lists return) by passing `include_content=false`; list
+ * views do this, the single-note view leaves it default → full. Truthiness
+ * mirrors the REST route's `parseBool` (`true`/`1` → full; anything else → lean)
+ * so the two doors read the flag identically.
  */
-export function validateWsSubscribeQuery(url: URL): { error: Response } | { queryOpts: QueryOpts } {
+export function validateWsSubscribeQuery(url: URL): { error: Response } | { queryOpts: QueryOpts; includeContent: boolean } {
   if (url.searchParams.get("search")) {
     return {
       error: json(
@@ -118,7 +129,11 @@ export function validateWsSubscribeQuery(url: URL): { error: Response } | { quer
   if (unsupported) {
     return { error: json({ error: unsupported, code: "UNSUPPORTED_SUBSCRIPTION_QUERY" }, 400) };
   }
-  return { queryOpts };
+  // Default TRUE (full) — the live protocol has always shipped full notes;
+  // a subscriber opts into the lean shape with `include_content=false`.
+  const rawIncludeContent = url.searchParams.get("include_content");
+  const includeContent = rawIncludeContent === null ? true : rawIncludeContent === "true" || rawIncludeContent === "1";
+  return { queryOpts, includeContent };
 }
 
 /** 503 body for the per-vault WS-subscription cap (mirrors the SSE 503). */
@@ -149,11 +164,15 @@ export function urlFromQuery(q: string): URL {
  * exactly once per (re)connect. The consumer concatenates `notes` across frames
  * until `done:true`, then replaces its set (the SSE self-correcting-reconnect
  * semantics). Byte-shaped identically to the cloud door's `buildSnapshotFrames`.
+ *
+ * Shape-agnostic: the framing only `JSON.stringify`s each entry, so
+ * it carries whichever note shape the caller projected — full `Note` (the
+ * default) or the lean `NoteIndex` for an `include_content=false` subscription.
  */
-export function buildSnapshotFrames(notes: Note[]): string[] {
+export function buildSnapshotFrames(notes: Array<Note | NoteIndex>): string[] {
   const frames: string[] = [];
   const enc = new TextEncoder();
-  let batch: Note[] = [];
+  let batch: Array<Note | NoteIndex> = [];
   let batchBytes = 0;
   for (const note of notes) {
     const noteBytes = enc.encode(JSON.stringify(note)).byteLength + 1; // +1 ~ comma

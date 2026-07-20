@@ -34,6 +34,38 @@ code-touching PR bumps the `rc.N` suffix and gets published to npm
 under the `@rc` dist-tag; stable promotes drop the suffix and publish
 to `@latest`.
 
+## [0.7.3-rc.14] - 2026-07-20
+
+**Lean live-query snapshots for list subscriptions (perf).** A live-query
+subscription's initial snapshot (and its live `upsert` events) shipped the
+COMPLETE matching set as FULL `Note` objects — every note body in the set — even
+for an unfiltered all-notes list view. So subscribing the notes list transferred
+every note's content over the wire, where the REST list path already returns the
+lean `NoteIndex` shape (`byteSize` + `preview` + `displayTitle` + tags/metadata,
+no body). This closes that gap on the live path.
+
+- **`include_content` on the subscribe query** (`src/ws-subscribe.ts`) — a
+  subscriber opts into the lean wire shape by passing `include_content=false` on
+  the `GET /vault/<name>/api/subscribe` query (the SAME knob the REST list route
+  reads). Unlike the REST list route (which defaults lean), a subscription
+  defaults to `true` — FULL notes — so every already-deployed subscriber
+  (cached notes-ui bundles, surface-client) keeps receiving byte-identical
+  full-note snapshots/upserts. List views opt into lean; the single-note view
+  leaves it default → full.
+- **Lean snapshot + upserts** (`src/ws-server.ts`, `src/subscriptions.ts`) —
+  when a subscription is lean, the chunked snapshot frames and every live
+  `upsert` carry the `toNoteIndex` projection (the identical shape REST lists
+  return, so a client that renders REST lists renders these frames unchanged)
+  rather than the full `Note`. Projection happens AFTER the tag-scope filter.
+  `remove` events are unaffected (already a thin `{id}` ref). `buildSnapshotFrames`
+  is now shape-agnostic (`Note | NoteIndex`).
+- This is a WIRE-CONTRACT addition on the live protocol — additive and
+  backward-compatible (default unchanged). The cloud door's live twin
+  (`parachute-cloud workers/vault`) mirrors this for door parity as a sequenced
+  follow-up, and the app opts its list subscriptions into lean separately. This
+  PR fixes the CONTENT bloat (the large win); snapshot windowing (honoring
+  `limit` so a list snapshot is 50, not all-N) is a larger separate follow-up.
+
 ## [0.7.3-rc.11] - 2026-07-17
 
 **`read-attachment` — model-lane byte reads (Wave 2, bun door) + REST

@@ -486,3 +486,90 @@ describe("WS live-query — bad query + cap", () => {
     expect(ok.kind).toBe("upgraded");
   });
 });
+
+describe("WS live-query — lean list subscriptions (include_content=false)", () => {
+  it("ships the lean NoteIndex snapshot shape — no bodies, has preview/displayTitle/byteSize", async () => {
+    await store.createNote("# Title line\n\nbody paragraph here", { tags: ["chat"] });
+    const { server } = makeServer();
+
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=chat&include_content=false`);
+    await h.ready();
+    h.send({ type: "auth", token: "good" });
+
+    const snap = await h.readSnapshot();
+    expect(snap.notes.length).toBe(1);
+    const n = snap.notes[0];
+    // Lean shape = what REST lists return: no `content`, but the index fields.
+    expect(n.content).toBeUndefined();
+    expect(typeof n.byteSize).toBe("number");
+    expect(typeof n.preview).toBe("string");
+    expect(n.displayTitle).toBe("Title line");
+    expect(n.tags).toEqual(["chat"]);
+    h.close();
+  });
+
+  it("a default subscription still ships FULL notes (regression: note-view path unchanged)", async () => {
+    await store.createNote("full body content", { tags: ["chat"] });
+    const { server } = makeServer();
+
+    // No include_content param → full content (the byte-unchanged default).
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=chat`);
+    await h.ready();
+    h.send({ type: "auth", token: "good" });
+
+    const snap = await h.readSnapshot();
+    expect(snap.notes[0].content).toBe("full body content");
+    // Full Note carries no lean-only fields.
+    expect(snap.notes[0].byteSize).toBeUndefined();
+    expect(snap.notes[0].preview).toBeUndefined();
+    h.close();
+  });
+
+  it("emits a LEAN upsert on a matching insert", async () => {
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=chat&include_content=false`);
+    await h.ready();
+    h.send({ type: "auth", token: "good" });
+    await h.readSnapshot();
+
+    await store.createNote("live lean note", { tags: ["chat"] });
+    const m = await h.nextMessage();
+    expect(m.type).toBe("upsert");
+    expect(m.note.content).toBeUndefined();
+    expect(m.note.displayTitle).toBe("live lean note");
+    expect(typeof m.note.byteSize).toBe("number");
+    h.close();
+  });
+
+  it("emits a LEAN upsert when a note in the set CHANGES (live-update correctness)", async () => {
+    const note = await store.createNote("before", { tags: ["chat"] });
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=chat&include_content=false`);
+    await h.ready();
+    h.send({ type: "auth", token: "good" });
+    await h.readSnapshot();
+
+    await store.updateNote(note.id, { content: "after edit" });
+    const m = await h.nextMessage();
+    expect(m.type).toBe("upsert");
+    expect(m.note.id).toBe(note.id);
+    expect(m.note.content).toBeUndefined();
+    expect(m.note.displayTitle).toBe("after edit");
+    h.close();
+  });
+
+  it("still emits a thin remove{id} under a lean subscription", async () => {
+    const note = await store.createNote("doomed lean", { tags: ["chat"] });
+    const { server } = makeServer();
+    const h = connect(server.port, `/vault/${VAULT}/api/subscribe?tag=chat&include_content=false`);
+    await h.ready();
+    h.send({ type: "auth", token: "good" });
+    await h.readSnapshot();
+
+    await store.deleteNote(note.id);
+    const m = await h.nextMessage();
+    expect(m.type).toBe("remove");
+    expect(m.id).toBe(note.id);
+    h.close();
+  });
+});
