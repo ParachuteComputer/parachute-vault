@@ -344,6 +344,22 @@ describe("config", () => {
     expect(readGlobalConfig().autostart).toBe(false);
   });
 
+  test("round-trips embeddings_enabled: true|false (semantic-search opt-in, 0.7.3)", () => {
+    // Absent means off — semantic search is opt-in as of 0.7.3. The key is
+    // only persisted when explicitly set (the self-host settings toggle).
+    writeGlobalConfig({ port: 1940 });
+    expect(readGlobalConfig().embeddings_enabled).toBeUndefined();
+
+    // Explicit true — the operator turned semantic search on without editing
+    // the env file; getSharedEmbeddingProvider threads this in as the default.
+    writeGlobalConfig({ port: 1940, embeddings_enabled: true });
+    expect(readGlobalConfig().embeddings_enabled).toBe(true);
+
+    // Explicit false — persisted opt-out (distinct from absent for clarity).
+    writeGlobalConfig({ port: 1940, embeddings_enabled: false });
+    expect(readGlobalConfig().embeddings_enabled).toBe(false);
+  });
+
   test("round-trips default_mirror: internal|off", () => {
     // Absent: createVault falls back to the in-code default ("internal" —
     // backup-on-by-default). The knob is only persisted when explicitly set.

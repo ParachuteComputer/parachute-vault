@@ -1,12 +1,12 @@
 /**
- * End-to-end wiring test for the `EMBEDDINGS_ENABLED=false` off switch's
- * error hint (review nano flag on #602): `getVaultStore` should thread
- * "explicitly disabled" through to `Store.semanticSearch`'s
- * `semantic_unavailable` hint, not the generic provider-setup message —
- * see `core/src/store.ts`'s `embeddingDisabledReason` doc comment for why
- * core can't determine this on its own. Unit coverage for the underlying
- * `Store` behavior lives in `core/src/store.semantic-search.test.ts`; this
- * file exercises the REAL `src/vault-store.ts` call site.
+ * End-to-end wiring test for the semantic-search opt-in gate (0.7.3) at the
+ * REAL `src/vault-store.ts` call site. Semantic search is OFF by default;
+ * when off, `getVaultStore` builds NO provider and threads the opt-in hint
+ * through to `Store.semanticSearch`'s `semantic_unavailable` error — not the
+ * generic provider-setup message — see `core/src/store.ts`'s
+ * `embeddingDisabledReason` doc comment for why core can't determine this on
+ * its own. Unit coverage for the underlying `Store` behavior lives in
+ * `core/src/store.semantic-search.test.ts`.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync } from "fs";
@@ -17,6 +17,7 @@ import {
   getVaultStore,
   clearVaultStoreCache,
   resetSharedEmbeddingProviderForTests,
+  EMBEDDINGS_DISABLED_REASON,
 } from "./vault-store.ts";
 
 let tmpHome: string;
@@ -43,11 +44,12 @@ afterEach(() => {
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
-describe("getVaultStore — EMBEDDINGS_ENABLED=false hint wiring", () => {
-  test("store.embeddingDisabledReason is set, and semanticSearch's hint names the off switch", async () => {
-    process.env.EMBEDDINGS_ENABLED = "false";
+describe("getVaultStore — semantic-search opt-in gate wiring", () => {
+  test("DEFAULT off (env unset, no persisted setting): no provider, and semanticSearch's hint names the opt-in toggle", async () => {
+    delete process.env.EMBEDDINGS_ENABLED;
     const store = getVaultStore("test");
-    expect(store.embeddingDisabledReason).toBe("semantic search is disabled by EMBEDDINGS_ENABLED=false");
+    expect(store.embeddingProvider).toBeUndefined();
+    expect(store.embeddingDisabledReason).toBe(EMBEDDINGS_DISABLED_REASON);
 
     let caught: unknown;
     try {
@@ -57,13 +59,20 @@ describe("getVaultStore — EMBEDDINGS_ENABLED=false hint wiring", () => {
     }
     expect(caught).toBeInstanceOf(QueryError);
     expect((caught as QueryError).error_type).toBe("semantic_unavailable");
-    expect((caught as QueryError).hint).toBe("semantic search is disabled by EMBEDDINGS_ENABLED=false");
+    expect((caught as QueryError).hint).toBe(EMBEDDINGS_DISABLED_REASON);
   });
 
-  test("no reason set when EMBEDDINGS_ENABLED is unset — the store still has a (bundled-floor) provider", async () => {
-    delete process.env.EMBEDDINGS_ENABLED;
+  test("EMBEDDINGS_ENABLED=false is the same off path — no provider, opt-in hint", () => {
+    process.env.EMBEDDINGS_ENABLED = "false";
     const store = getVaultStore("test");
-    expect(store.embeddingDisabledReason).toBeUndefined();
+    expect(store.embeddingProvider).toBeUndefined();
+    expect(store.embeddingDisabledReason).toBe(EMBEDDINGS_DISABLED_REASON);
+  });
+
+  test("EMBEDDINGS_ENABLED=true enables — the store gets a (bundled-floor) provider and no disabled reason", () => {
+    process.env.EMBEDDINGS_ENABLED = "true";
+    const store = getVaultStore("test");
     expect(store.embeddingProvider).toBeDefined();
+    expect(store.embeddingDisabledReason).toBeUndefined();
   });
 });

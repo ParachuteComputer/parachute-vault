@@ -4,6 +4,84 @@ Operator-facing migration guidance. For the full chronological CHANGELOG,
 see [CHANGELOG.md](./CHANGELOG.md) — note the meta-note at the top about
 what's actually been published to npm.
 
+## 0.7.2 → 0.7.3 — semantic search opt-in + `note_vectors` schema
+
+Mostly additive. One behavior change worth knowing about (semantic search
+is now **opt-in**), one automatic schema migration, and one response-shape
+reminder for programmatic MCP consumers.
+
+### `v26 → v27` `note_vectors` migration runs automatically on first 0.7.3 boot
+
+No manual steps — **automatic, transactional, additive**, run once on first
+boot. Back up your vault's SQLite file first as standard practice.
+
+- **`migrateToV27` (schema v26→27) — the `note_vectors` table
+  (`core/src/schema.ts`).** Creates a new, EMPTY `note_vectors` table (plus
+  its staleness index) for semantic search. It is **all schema, zero data
+  movement**: there is no backfill loop and no embedding call of any kind —
+  the migration never resolves an embedding provider, does no network/CPU
+  work, and downloads no model. Existing notes simply have zero vector rows
+  until (and unless) you opt in to semantic search, at which point the
+  background drain discovers and embeds them. A crash mid-migration rolls
+  back and the next boot re-runs cleanly.
+
+### Semantic search is now OPT-IN (default off)
+
+Previously the bundled embedding provider was resolved on every install, so
+semantic search was on by default and a fresh box paid the embed-on-write
+cost and the first-use model download whether or not anyone used it. As of
+0.7.3 (Aaron-ratified), **semantic search is off unless you turn it on**.
+With it off there is no embedding provider, no embed-on-write hook work, no
+backfill sweep, and no model download — `query-notes { semantic: true }`
+returns an honest `semantic_unavailable` (never a silent keyword fallback).
+
+**To enable it**, either:
+
+- set the env var in `~/.parachute/vault/.env`:
+
+  ```
+  EMBEDDINGS_ENABLED=true
+  ```
+
+- **or** set the persisted toggle in `~/.parachute/vault/config.yaml` (so it
+  survives without an env file):
+
+  ```yaml
+  embeddings_enabled: true
+  ```
+
+  then restart the vault (`parachute restart vault`, or your supervisor's
+  equivalent). The env var is the low-level **override**: `EMBEDDINGS_ENABLED=true`/`1`
+  forces on, `false`/`0` forces off, and anything else defers to
+  `embeddings_enabled`. The process shares one embedding provider resolved at
+  boot, so the toggle takes effect on **(re)start**.
+
+What enabling costs, the first time:
+
+- **A one-time model download (~34MB).** The zero-config bundled floor
+  (`bge-small-en-v1.5`, q8 ONNX) downloads its weights from the Hugging Face
+  hub on first `embed()`, then runs fully in-process, on-box, forever after
+  (no note content leaves the machine). Prefer a local Ollama or any hosted
+  `/v1/embeddings` endpoint? Set `EMBEDDING_API_URL` (+ optional
+  `EMBEDDING_API_KEY` / `EMBEDDING_MODEL`) and that tier is used instead.
+- **Embed-on-write + a backfill sweep.** Once on, every note create/update
+  embeds its changed chunks, and a periodic sweep embeds pre-existing notes
+  (the implicit `note_vectors` backfill). A no-op edit costs zero embed calls.
+- **Note on install size:** `@huggingface/transformers` + `onnxruntime-node`
+  (~270MB) remain a hard dependency and install regardless of the toggle —
+  this keeps enabling a pure config flip (no install-on-enable step that
+  could fail or hang). The opt-in gates the *runtime* work + model download,
+  not the dependency footprint.
+
+### `{notes, warnings}` envelope is now routine on non-cursor `query-notes`
+
+A reminder within the pre-existing **vault#550** contract, not a new break: a
+non-cursor `query-notes` may return **either** a bare array of notes **or**
+an envelope `{ notes: [...], warnings: [...] }` (e.g. when a filter is
+partially applied). Programmatic MCP consumers must handle **both** shapes —
+read `result.notes ?? result` before iterating. Cursor-paginated responses
+are unchanged (they already carry their own `{ notes, cursor }` shape).
+
 ## 0.7.1 → 0.7.2 — cursor keyset correctness on aged/imported vaults
 
 **P0 correctness fix.** If you paginate `query-notes` with a cursor (the
