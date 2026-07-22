@@ -2717,6 +2717,135 @@ describe("/vault/<name>/.parachute/mirror — auth + dispatch", () => {
 });
 
 // ---------------------------------------------------------------------------
+// /vault/<name>/.parachute/embeddings — semantic-search (embeddings) opt-in
+// toggle admin surface (0.7.3 fast-follow, vault#624).
+//
+// Pins the auth gate + GET/PUT dispatch at the routing layer: the endpoint is
+// `vault:admin`-only (a host-global setting reached through the same per-vault
+// admin surface as the sibling `.parachute/mirror` / `.parachute/config`
+// pages). Snapshot shape + the env-override / restart-required semantics are
+// covered in embeddings-routes.test.ts; here we pin the *security* property —
+// unauth → 401, read/write → 403, admin → 200 + the flip persists — so it
+// can't silently regress below the rest of the admin surface. Mirrors the
+// `.parachute/mirror` auth+dispatch describe above.
+// ---------------------------------------------------------------------------
+
+describe("/vault/<name>/.parachute/embeddings — auth + dispatch", () => {
+  const P = "/vault/journal/.parachute/embeddings";
+
+  test("unauthenticated GET → 401", async () => {
+    createVault("journal");
+    const res = await route(new Request(`http://localhost:1940${P}`), P);
+    expect(res.status).toBe(401);
+  });
+
+  test("unauthenticated PUT → 401", async () => {
+    createVault("journal");
+    const res = await route(
+      new Request(`http://localhost:1940${P}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }),
+      P,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("vault:read token PUT → 403 insufficient_scope", async () => {
+    createVault("journal");
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:read"] });
+    const res = await route(
+      new Request(`http://localhost:1940${P}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }),
+      P,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+  });
+
+  test("vault:write token PUT → 403 insufficient_scope (write ranks below admin)", async () => {
+    createVault("journal");
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:journal:write"] });
+    const res = await route(
+      new Request(`http://localhost:1940${P}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }),
+      P,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string; required_scope?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+    expect(body.required_scope).toBe("vault:admin");
+  });
+
+  test("cross-vault admin token → 403 (scope names a different vault)", async () => {
+    createVault("journal");
+    createVault("other");
+    // Audience is `journal` (auth passes) but the admin scope names `other`,
+    // so hasScopeForVault denies it against `journal`.
+    const token = await mintJwt({ vaultName: "journal", scopes: ["vault:other:admin"] });
+    const res = await route(
+      new Request(`http://localhost:1940${P}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      P,
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error_type?: string };
+    expect(body.error_type).toBe("insufficient_scope");
+  });
+
+  test("vault:admin token GET → 200 (default off); admin PUT persists the flip", async () => {
+    createVault("journal");
+    const token = await createAdminToken("journal");
+
+    // GET reaches the handler (auth + admin scope satisfied) → 200 snapshot,
+    // default-off (config seeded with `port` only).
+    const getRes = await route(
+      new Request(`http://localhost:1940${P}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      P,
+    );
+    expect(getRes.status).toBe(200);
+    const getBody = (await getRes.json()) as { enabled?: boolean };
+    expect(getBody.enabled).toBe(false);
+
+    // PUT flips the persisted setting → 200, echoing the new value.
+    const putRes = await route(
+      new Request(`http://localhost:1940${P}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      }),
+      P,
+    );
+    expect(putRes.status).toBe(200);
+    const putBody = (await putRes.json()) as { enabled?: boolean };
+    expect(putBody.enabled).toBe(true);
+
+    // A follow-up GET reads the persisted value back → the write stuck.
+    const reGet = await route(
+      new Request(`http://localhost:1940${P}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      P,
+    );
+    expect(reGet.status).toBe(200);
+    const reBody = (await reGet.json()) as { enabled?: boolean };
+    expect(reBody.enabled).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // /vault/<name>/.parachute/mirror/run-now — manual-trigger endpoint added
 // alongside the SPA UI. Tests pin the auth gate matches the parent
 // endpoint; handler-shape coverage lives in mirror-routes.test.ts.

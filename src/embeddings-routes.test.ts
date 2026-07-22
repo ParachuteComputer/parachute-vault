@@ -19,7 +19,7 @@ import {
   handleEmbeddingsGet,
   handleEmbeddingsPut,
   EMBEDDING_MODEL_DOWNLOAD_MB,
-  type EmbeddingsSettings,
+  type EmbeddingsSettingsSnapshot,
 } from "./embeddings-routes.ts";
 
 let tmpHome: string;
@@ -114,7 +114,7 @@ describe("handleEmbeddingsGet", () => {
     writeGlobalConfig({ port: 1940, embeddings_enabled: true });
     const res = handleEmbeddingsGet(false);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as EmbeddingsSettings;
+    const body = (await res.json()) as EmbeddingsSettingsSnapshot;
     expect(body.enabled).toBe(true);
     expect(body.effective).toBe(true);
     expect(body.active).toBe(false);
@@ -123,7 +123,7 @@ describe("handleEmbeddingsGet", () => {
 
   test("unset persisted → enabled false", async () => {
     const res = handleEmbeddingsGet(false);
-    const body = (await res.json()) as EmbeddingsSettings;
+    const body = (await res.json()) as EmbeddingsSettingsSnapshot;
     expect(body.enabled).toBe(false);
   });
 });
@@ -140,7 +140,7 @@ describe("handleEmbeddingsPut", () => {
   test("enabling persists embeddings_enabled: true via the config write path", async () => {
     const res = await handleEmbeddingsPut(putReq({ enabled: true }), false);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as EmbeddingsSettings;
+    const body = (await res.json()) as EmbeddingsSettingsSnapshot;
     expect(body.enabled).toBe(true);
     expect(body.restart_required).toBe(true); // persisted on, injected active=false
     // The setting is actually on disk (config write path reused, not hand-rolled).
