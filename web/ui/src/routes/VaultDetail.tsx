@@ -39,6 +39,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
   const tokensHref = isPerVaultMount ? "/tokens" : `/vault/${encodeURIComponent(name ?? "")}/tokens`;
   const mirrorHref = isPerVaultMount ? "/mirror" : `/vault/${encodeURIComponent(name ?? "")}/mirror`;
   const schemaHref = isPerVaultMount ? "/schema" : `/vault/${encodeURIComponent(name ?? "")}/schema`;
+  const embeddingsHref = isPerVaultMount ? "/embeddings" : `/vault/${encodeURIComponent(name ?? "")}/embeddings`;
   const [state, setState] = useState<State>({ kind: "loading" });
   const [reloadTick, setReloadTick] = useState(0);
   const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
@@ -207,6 +208,10 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
           <li>
             <Link to={schemaHref}>Schema →</Link>
             <span className="dim"> edit tag schemas — fields, indexing, hierarchy, strict validation</span>
+          </li>
+          <li>
+            <Link to={embeddingsHref}>Semantic search →</Link>
+            <span className="dim"> turn embeddings on or off — rank notes by meaning, not just keywords</span>
           </li>
           <PermissionsLink vaultName={vault.name} />
         </ul>

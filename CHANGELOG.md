@@ -4,6 +4,32 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.4-rc.1] - 2026-07-22
+
+**Admin-UI toggle for semantic search (0.7.3 fast-follow).** 0.7.3 made
+semantic search opt-in with a persisted `embeddings_enabled` config.yaml
+setting, but the only way to flip it was hand-editing config or setting an env
+var. This adds a real toggle over that setting to the vault admin SPA, so an
+operator turns semantic search on from the UI.
+
+- **New endpoint** `GET|PUT /vault/<name>/.parachute/embeddings` (`vault:admin`)
+  — reads/writes the persisted `embeddings_enabled` through the existing config
+  write path (`writeGlobalConfig`, no hand-rolled YAML). The snapshot reports
+  `enabled` (persisted), `active` (live in the running process), `effective`
+  (what a restart would produce), `restart_required` (the gap), and
+  `env_override`/`env_forced` (when `EMBEDDINGS_ENABLED` is forcing a value).
+- **New admin-SPA page** under a vault's detail → "Semantic search". A toggle
+  with copy warning that enabling triggers a one-time model download (~34MB) on
+  first embed + embeds-on-write, and that the setting is host-wide.
+- **Activation is restart-to-apply, not hot.** The embedding provider is
+  resolved once at boot and captured into every store + the embedding worker,
+  so a flip persists the setting and the UI shows a "restart the vault to
+  apply" banner rather than pretending to hot-activate. Hot-reconfigure is a
+  possible follow-up.
+- **`EMBEDDINGS_ENABLED` env still wins** as the low-level override; when it's
+  forcing a value the UI shows an advisory banner so the toggle never lies
+  about what's actually in force.
+
 ## [0.7.3] - 2026-07-22
 
 **Stable promotion of the 0.7.3 line (16 commits over 0.7.2).** Promotes the

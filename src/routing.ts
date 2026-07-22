@@ -116,6 +116,7 @@ import {
   handleMirrorPut,
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
+import { handleEmbeddingsGet, handleEmbeddingsPut } from "./embeddings-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
@@ -685,6 +686,33 @@ export async function route(
     const fresh = new URL(req.url).searchParams.get("fresh") === "1";
     const stats = await store.getVaultStats();
     return Response.json(buildUsageReport(vaultName, stats, { fresh }));
+  }
+
+  // /.parachute/embeddings — Admin-gated read+write of the semantic-search
+  // (embeddings) opt-in toggle. The 0.7.3 fast-follow: gives the admin SPA a
+  // real toggle over the persisted `embeddings_enabled` config.yaml setting so
+  // an operator flips semantic search on from the UI instead of hand-editing
+  // config or setting an env var. Host-global setting (affects every vault),
+  // reached through the same per-vault admin surface as the other settings
+  // pages. Activation is restart-to-apply — the endpoint persists the setting
+  // and reports `restart_required`; see embeddings-routes.ts for why the boot-
+  // captured provider isn't hot-reconfigured.
+  if (subpath === "/.parachute/embeddings") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (req.method === "GET") return handleEmbeddingsGet();
+    if (req.method === "PUT") return handleEmbeddingsPut(req);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 
   // The per-vault `/tokens` REST surface (pvt_* mint/list/revoke) was removed
