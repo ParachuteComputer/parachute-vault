@@ -6,20 +6,28 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { BunStore } from "./vault-store.ts";
+import { BunStore, resetSharedEmbeddingProviderForTests } from "./vault-store.ts";
 import { handleVault } from "./routes.ts";
 import type { EmbeddingCapability } from "./embedding/capability.ts";
 
 let db: Database;
 let store: BunStore;
+let prevEnabled: string | undefined;
 
 beforeEach(() => {
   db = new Database(":memory:");
   store = new BunStore(db);
+  // The production-default tests below exercise the memoized shared provider;
+  // reset it + control the opt-in env so the default resolves deterministically.
+  prevEnabled = process.env.EMBEDDINGS_ENABLED;
+  resetSharedEmbeddingProviderForTests();
 });
 
 afterEach(() => {
   db.close();
+  if (prevEnabled === undefined) delete process.env.EMBEDDINGS_ENABLED;
+  else process.env.EMBEDDINGS_ENABLED = prevEnabled;
+  resetSharedEmbeddingProviderForTests();
 });
 
 const BASE = "http://localhost/api";
@@ -66,13 +74,27 @@ describe("GET /api/vault embeddings capability", () => {
     expect(body.embeddings).toEqual({ enabled: false });
   });
 
-  test("the production default resolves the shared embedding provider (zero-config -> the bundled floor, enabled:true)", async () => {
+  test("the production DEFAULT is off (opt-in, 0.7.3) — no provider, enabled:false", async () => {
+    delete process.env.EMBEDDINGS_ENABLED;
+    resetSharedEmbeddingProviderForTests();
     const cfg = { name: "default" };
     // No resolver override — exercises the real default wiring
-    // (getSharedEmbeddingProvider() -> resolveEmbeddingCapability()).
-    // Zero-config env -> the bundled onnx-transformers floor, which is
-    // optimistically available() before any real model load — see
-    // src/embedding/onnx-transformers.ts's "lazy-fail, not crash" doc.
+    // (getSharedEmbeddingProvider() -> resolveEmbeddingCapability()). Semantic
+    // search is opt-in as of 0.7.3, so with nothing enabling it the shared
+    // provider is undefined and the capability advertises disabled.
+    const res = await handleVault(new Request(`${BASE}/vault`, { method: "GET" }), store, cfg as any);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.embeddings).toEqual({ enabled: false });
+  });
+
+  test("once ENABLED (EMBEDDINGS_ENABLED=true) the default wiring resolves the bundled floor, enabled:true", async () => {
+    process.env.EMBEDDINGS_ENABLED = "true";
+    resetSharedEmbeddingProviderForTests();
+    const cfg = { name: "default" };
+    // The bundled onnx-transformers floor is optimistically available() before
+    // any real model load — see src/embedding/onnx-transformers.ts's
+    // "lazy-fail, not crash" doc.
     const res = await handleVault(new Request(`${BASE}/vault`, { method: "GET" }), store, cfg as any);
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;

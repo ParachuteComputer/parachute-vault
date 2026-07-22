@@ -222,14 +222,16 @@ if (providerName === "transcribe-cpp") {
   }
 }
 
-// Embedding worker (semantic search MVP — EXPERIMENTAL). Unlike
-// transcription (no-op without a discoverable scribe), a provider is
-// ALWAYS resolved here — the bundled floor tier (`onnx-transformers.ts`)
-// is the zero-config default, so a fresh install gets working semantic
-// search with no operator action. The event hook embeds on every note
-// create/update (a no-op edit makes zero provider calls — see
-// `embedding-worker.ts`); the sweep drains the backfill for pre-existing
-// notes and catches anything a dropped dispatch left behind.
+// Embedding worker (semantic search MVP — EXPERIMENTAL). Semantic search
+// is OPT-IN as of 0.7.3 (Aaron-ratified): `getSharedEmbeddingProvider()`
+// returns `undefined` unless the operator enabled it (env override
+// `EMBEDDINGS_ENABLED=true`, or the persisted `embeddings_enabled` setting
+// — see `vault-store.ts`). With no provider the worker is constructed +
+// started but every path no-ops immediately (no embed-on-write hook work,
+// no backfill sweep, no ~270MB model download). Once enabled, the event
+// hook embeds on every note create/update (a no-op edit makes zero
+// provider calls — see `embedding-worker.ts`) and the sweep drains the
+// backfill for pre-existing notes.
 const embeddingWorker = new EmbeddingWorker({
   provider: getSharedEmbeddingProvider(),
   vaultList: () => listVaults(),

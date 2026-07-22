@@ -17,15 +17,28 @@
  *     in-process. This is what makes semantic search work on a fresh
  *     install with no operator action.
  *
- * **Off switch:** `EMBEDDINGS_ENABLED=false` short-circuits BOTH tiers —
- * `buildEmbeddingProvider` returns `undefined` regardless of what else is
- * configured. Mirrors the `EMBEDDINGS_ENABLED` wrangler var C2 (cloud)
- * plans for the same gate. A caller wired against an `undefined` provider
- * (see `Store.embeddingProvider`) reports the `embeddings` capability as
+ * **Opt-in gate (0.7.3, Aaron-ratified):** semantic search is OFF by
+ * default. `buildEmbeddingProvider` returns a provider ONLY when the
+ * feature is explicitly enabled — otherwise it returns `undefined` and
+ * BOTH tiers are short-circuited. The enable signal is resolved with a
+ * two-level precedence (see `resolveEmbeddingsEnabled`):
+ *
+ *   1. **`EMBEDDINGS_ENABLED` env var** — the low-level override. `true`/`1`
+ *      forces ON, `false`/`0` forces OFF, anything else (incl. unset)
+ *      defers to the persisted setting. Mirrors the cloud wrangler var.
+ *   2. **Persisted `embeddings_enabled`** (config.yaml, wired in by the
+ *      caller — see `getSharedEmbeddingProvider`) — the self-host settings
+ *      toggle, so an operator can turn semantic search on without editing
+ *      the env file. Defaults OFF when unset.
+ *
+ * A caller wired against an `undefined` provider (see
+ * `Store.embeddingProvider`) reports the `embeddings` capability as
  * disabled and `semanticSearch` throws `semantic_unavailable` — the exact
  * same honest-failure path as "no provider configured" (never a silent
  * keyword fallback). The embed-on-write drain simply has nothing to
- * invoke, so it no-ops.
+ * invoke, so it no-ops — no hook work, no backfill sweep, and (because the
+ * ~270MB `@huggingface/transformers` import is dynamic and only happens
+ * inside a real `embed()` call) no model download until a user opts in.
  *
  * `EMBEDDING_MODEL` alone (no `EMBEDDING_API_URL`) has no effect — it only
  * shapes the config-upgrade tier. Resolved per-call (not cached here) so
@@ -58,28 +71,56 @@ export function resolveEmbeddingApiConfig(env: NodeJS.ProcessEnv = process.env):
 }
 
 /**
- * `true` only when `EMBEDDINGS_ENABLED` is explicitly the literal string
- * `"false"` (case-insensitive, trimmed) — the off switch. Every other
- * value, INCLUDING unset, is "enabled": the feature defaults ON (the
- * bundled floor tier makes that safe — zero-config still works), and this
- * var exists to opt OUT, not to opt in.
+ * Parse `EMBEDDINGS_ENABLED` as an explicit tri-state OVERRIDE of the
+ * persisted config setting (all matches case-insensitive + trimmed):
+ *
+ *   - `"true"` / `"1"`  → `true`  (force semantic search ON)
+ *   - `"false"` / `"0"` → `false` (force it OFF)
+ *   - unset / blank / anything unrecognized → `undefined` (no opinion —
+ *     defer to the persisted `embeddings_enabled` setting)
+ *
+ * Returning `undefined` (rather than guessing) for an unrecognized value is
+ * what lets the env var be a true override: only an explicit true/false
+ * short-circuits the persisted setting.
  */
-export function embeddingsExplicitlyDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.EMBEDDINGS_ENABLED?.trim().toLowerCase() === "false";
+export function embeddingsEnabledEnvOverride(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+  const raw = env.EMBEDDINGS_ENABLED?.trim().toLowerCase();
+  if (!raw) return undefined;
+  if (raw === "true" || raw === "1") return true;
+  if (raw === "false" || raw === "0") return false;
+  return undefined;
+}
+
+/**
+ * The effective enabled state for semantic search. Env override wins; else
+ * the persisted config setting; else OFF — semantic search is opt-in as of
+ * 0.7.3. Pure so both the provider factory and the "why is it off" hint
+ * derive from the same rule.
+ */
+export function resolveEmbeddingsEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+  persistedEnabled?: boolean,
+): boolean {
+  return embeddingsEnabledEnvOverride(env) ?? persistedEnabled ?? false;
 }
 
 /**
  * Build the provider the current config selects, or `undefined` when
- * `EMBEDDINGS_ENABLED=false` (see the off-switch doc above). Pure factory
- * (no caching, no I/O beyond what the provider's own constructor does —
- * which is none; both providers lazy-load/lazy-connect on first
- * `embed()`), so it's cheap to call repeatedly in tests. Production
- * callers should go through the shared singleton
+ * semantic search is not enabled (see `resolveEmbeddingsEnabled` — env
+ * override, else the persisted `embeddings_enabled` setting, else OFF).
+ * Pure factory (no caching, no I/O beyond what the provider's own
+ * constructor does — which is none; both providers lazy-load/lazy-connect
+ * on first `embed()`), so it's cheap to call repeatedly in tests.
+ * Production callers should go through the shared singleton
  * (`getSharedEmbeddingProvider`) instead of calling this directly, so the
- * bundled ONNX model — when selected — loads at most once per process.
+ * bundled ONNX model — when selected — loads at most once per process, and
+ * so the persisted setting is threaded in.
  */
-export function buildEmbeddingProvider(env: NodeJS.ProcessEnv = process.env): EmbeddingProvider | undefined {
-  if (embeddingsExplicitlyDisabled(env)) return undefined;
+export function buildEmbeddingProvider(
+  env: NodeJS.ProcessEnv = process.env,
+  opts?: { persistedEnabled?: boolean },
+): EmbeddingProvider | undefined {
+  if (!resolveEmbeddingsEnabled(env, opts?.persistedEnabled)) return undefined;
   const config = resolveEmbeddingApiConfig(env);
   if (config.url) {
     return new ExternalApiEmbeddingProvider({

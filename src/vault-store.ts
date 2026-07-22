@@ -9,8 +9,17 @@ import { SqliteStore } from "../core/src/store.ts";
 import { defaultHookRegistry } from "../core/src/hooks.ts";
 import type { Store } from "../core/src/types.ts";
 import type { EmbeddingProvider } from "../core/src/embedding/provider.ts";
-import { buildEmbeddingProvider, embeddingsExplicitlyDisabled } from "./embedding/select.ts";
+import { buildEmbeddingProvider } from "./embedding/select.ts";
+import { readGlobalConfig } from "./config.ts";
 import { openVaultDb } from "./db.ts";
+
+/**
+ * The honest hint `semanticSearch` surfaces when semantic search is OFF
+ * (the 0.7.3 opt-in default). Points the operator at both the env override
+ * and the persisted settings toggle — see `src/embedding/select.ts`.
+ */
+export const EMBEDDINGS_DISABLED_REASON =
+  "semantic search is off — it is opt-in as of 0.7.3; enable it with EMBEDDINGS_ENABLED=true, or set embeddings_enabled: true in ~/.parachute/vault/config.yaml, then restart the vault";
 
 export { SqliteStore as BunStore };
 export { defaultHookRegistry };
@@ -34,19 +43,26 @@ const storeToVault = new WeakMap<SqliteStore, string>();
  * `loadEnvFile()` in `server.ts` is visible) and reused for every
  * subsequent vault opened this process.
  *
- * `undefined` is a legitimate, cacheable resolution — `EMBEDDINGS_ENABLED=
- * false` (the off switch, see `select.ts`) means "no provider," not
- * "not resolved yet." A separate `resolved` flag (rather than null-
- * checking the provider itself) distinguishes the two, so an explicitly-
- * disabled vault doesn't re-run `buildEmbeddingProvider()` on every call.
+ * `undefined` is a legitimate, cacheable resolution — semantic search is
+ * OFF by default (opt-in as of 0.7.3), so the common case is "no provider,"
+ * not "not resolved yet." A separate `resolved` flag (rather than null-
+ * checking the provider itself) distinguishes the two, so a disabled vault
+ * doesn't re-run `buildEmbeddingProvider()` on every call.
+ *
+ * Resolution threads the persisted `embeddings_enabled` config.yaml setting
+ * in as the default, with the `EMBEDDINGS_ENABLED` env var as the override
+ * (see `select.ts`'s `resolveEmbeddingsEnabled`). Because it's memoized at
+ * first access, flipping the setting takes effect on the next server start.
  */
 let sharedEmbeddingProvider: EmbeddingProvider | undefined;
 let sharedEmbeddingProviderResolved = false;
 
-/** The shared embedding provider (see `sharedEmbeddingProvider`'s doc comment). `undefined` when `EMBEDDINGS_ENABLED=false`. */
+/** The shared embedding provider (see `sharedEmbeddingProvider`'s doc comment). `undefined` when semantic search is off (the opt-in default). */
 export function getSharedEmbeddingProvider(): EmbeddingProvider | undefined {
   if (!sharedEmbeddingProviderResolved) {
-    sharedEmbeddingProvider = buildEmbeddingProvider();
+    sharedEmbeddingProvider = buildEmbeddingProvider(process.env, {
+      persistedEnabled: readGlobalConfig().embeddings_enabled,
+    });
     sharedEmbeddingProviderResolved = true;
   }
   return sharedEmbeddingProvider;
@@ -68,16 +84,16 @@ export function getVaultStore(name: string): SqliteStore {
     // for the embedding provider (see `getSharedEmbeddingProvider`'s doc
     // comment) — every vault's semantic search resolves the SAME provider
     // instance. `embeddingDisabledReason` is only ever set here (core can't
-    // read env vars itself — see `Store.embeddingDisabledReason`'s doc
-    // comment), so `semanticSearch`'s no-provider hint can say "explicitly
-    // disabled" instead of generic provider-setup instructions when that's
-    // actually why.
+    // read env/config itself — see `Store.embeddingDisabledReason`'s doc
+    // comment), so `semanticSearch`'s no-provider hint can name the opt-in
+    // toggle instead of generic provider-setup instructions. Derived from
+    // provider-absence directly, so the hint is present exactly when (and
+    // because) semantic search is off — no second read of the resolution.
+    const embeddingProvider = getSharedEmbeddingProvider();
     store = new SqliteStore(db, {
       hooks: defaultHookRegistry,
-      embeddingProvider: getSharedEmbeddingProvider(),
-      embeddingDisabledReason: embeddingsExplicitlyDisabled()
-        ? "semantic search is disabled by EMBEDDINGS_ENABLED=false"
-        : undefined,
+      embeddingProvider,
+      embeddingDisabledReason: embeddingProvider ? undefined : EMBEDDINGS_DISABLED_REASON,
     });
     stores.set(name, store);
     storeToVault.set(store, name);

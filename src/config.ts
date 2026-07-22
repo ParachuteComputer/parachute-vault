@@ -387,6 +387,18 @@ export interface GlobalConfig {
     /** Master toggle. Default false; the worker is a no-op when unset. */
     enabled?: boolean;
   };
+  /**
+   * Semantic-search opt-in (0.7.3, Aaron-ratified). Semantic search is OFF
+   * by default; set this to `true` to build the embedding provider and turn
+   * on embed-on-write + the backfill sweep. This is the persisted,
+   * settings-surface-friendly toggle a self-host operator flips without
+   * editing the env file. The `EMBEDDINGS_ENABLED` env var is the low-level
+   * OVERRIDE (`true`/`1` forces on, `false`/`0` forces off, anything else
+   * defers here) — see `src/embedding/select.ts`'s `resolveEmbeddingsEnabled`.
+   * Unset ⇒ off. Takes effect on server (re)start, since the process shares
+   * one embedding provider resolved at boot.
+   */
+  embeddings_enabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,6 +1320,7 @@ export function readGlobalConfig(): GlobalConfig {
       const discoveryMatch = yaml.match(/^discovery:\s*(enabled|disabled)/m);
       const autostartMatch = yaml.match(/^autostart:\s*(true|false)/m);
       const autoCreateMatch = yaml.match(/^auto_create:\s*(true|false)/m);
+      const embeddingsEnabledMatch = yaml.match(/^embeddings_enabled:\s*(true|false)/m);
       const defaultMirrorMatch = yaml.match(/^default_mirror:\s*(internal|off)/m);
       // auto_transcribe block — currently single boolean `enabled` (vault#353).
       // Parsed as a nested 2-space-indent block so future fields can grow under
@@ -1339,6 +1352,9 @@ export function readGlobalConfig(): GlobalConfig {
       }
       if (autoCreateMatch) {
         config.auto_create = autoCreateMatch[1]! === "true";
+      }
+      if (embeddingsEnabledMatch) {
+        config.embeddings_enabled = embeddingsEnabledMatch[1]! === "true";
       }
       if (defaultMirrorMatch) {
         config.default_mirror = defaultMirrorMatch[1]! as "internal" | "off";
@@ -1416,6 +1432,7 @@ export function writeGlobalConfig(config: GlobalConfig): void {
   if (config.discovery) lines.push(`discovery: ${config.discovery}`);
   if (config.autostart !== undefined) lines.push(`autostart: ${config.autostart}`);
   if (config.auto_create !== undefined) lines.push(`auto_create: ${config.auto_create}`);
+  if (config.embeddings_enabled !== undefined) lines.push(`embeddings_enabled: ${config.embeddings_enabled}`);
   if (config.default_mirror) lines.push(`default_mirror: ${config.default_mirror}`);
   if (config.owner_password_hash) {
     lines.push(`owner_password_hash: "${config.owner_password_hash}"`);

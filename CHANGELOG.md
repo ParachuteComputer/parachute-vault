@@ -4,6 +4,39 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.3] - 2026-07-22
+
+**Stable promotion of the 0.7.3 line (16 commits over 0.7.2).** Promotes the
+rc.1–rc.15 work to `@latest`. Highlights: **semantic search** (`query-notes`
+`near_text`, embed-on-write, per-section chunking, a two-tier self-host
+provider) — now **opt-in, default off** (see below); **attachment tickets**
+(agent upload/download via short-lived capability URLs) + a read-attachment
+model lane with REST Range support; **canonical root `/mcp`** with
+token-derived vault dispatch; **computed `display_title`** on list shapes
+with lexical title-boost ranking (frontmatter-aware); the **`starter-ontology`
+seed pack** (view/archived/pinned/capture meta tags) with re-apply that
+preserves user-edited descriptions; a **`date` field type** for meta-tag
+schemas; **per-segment transcript slots** (segmented voice recordings);
+`expand_mode:"summary"` lede fallback; lean live-query snapshots; and the
+pure-data MCP tool manifest extraction.
+
+Two things for consumers to note at the stable line:
+
+- **Semantic search is now OPT-IN (default off).** With it off there is no
+  embedding provider, no embed-on-write hook, no backfill sweep, and no model
+  download; `query-notes { semantic: true }` returns an honest
+  `semantic_unavailable`. Enable with `EMBEDDINGS_ENABLED=true` (env override)
+  or the persisted `embeddings_enabled: true` in `config.yaml`, then restart.
+  `@huggingface/transformers` + `onnxruntime-node` (~270MB) remain a hard
+  dependency so enabling is a pure config flip. See
+  [UPGRADING.md](./UPGRADING.md#072--073--semantic-search-opt-in--note_vectors-schema).
+- **One response-shape reminder (within the pre-existing vault#550 contract):**
+  a non-cursor `query-notes` may return a bare array **or** a `{ notes,
+  warnings }` envelope — programmatic MCP consumers must handle both.
+
+Automatic `v26 → v27` `note_vectors` schema migration on first boot (additive,
+transactional, no backfill). No other operator action required.
+
 ## [0.7.3-rc.15] - 2026-07-20
 
 **MCP tool manifest — pure-data extraction (front-of-house Wave 0).** The
