@@ -68,6 +68,21 @@ export function getSharedEmbeddingProvider(): EmbeddingProvider | undefined {
   return sharedEmbeddingProvider;
 }
 
+/**
+ * Whether semantic search is LIVE in this running process right now — i.e.
+ * the boot-resolved shared provider is present. This is the honest
+ * "currently active" signal the admin settings surface reports, distinct
+ * from the *persisted* `embeddings_enabled` setting: because the provider
+ * is memoized at boot (into every open store + the embedding worker),
+ * flipping the persisted setting does NOT change this until the next
+ * server restart. The admin toggle compares this against the freshly
+ * resolved effective state to tell the operator when a restart is pending
+ * (see `src/embeddings-routes.ts`).
+ */
+export function isSharedEmbeddingProviderActive(): boolean {
+  return getSharedEmbeddingProvider() !== undefined;
+}
+
 /** Test-only: force a fresh provider on the next `getSharedEmbeddingProvider()` call. */
 export function resetSharedEmbeddingProviderForTests(): void {
   sharedEmbeddingProvider = undefined;

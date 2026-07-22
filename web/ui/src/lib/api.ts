@@ -694,6 +694,70 @@ export async function postMirrorImport(
   return (await res.json()) as MirrorImportResult;
 }
 
+// ---------------------------------------------------------------------------
+// Embeddings — `/vault/<name>/.parachute/embeddings`
+//
+// The semantic-search opt-in toggle (0.7.3 fast-follow). Reads/writes the
+// host-global persisted `embeddings_enabled` setting. Activation is restart-
+// to-apply: `active` is what's live in the running process now; `effective`
+// is what a restart would produce; `restartRequired` is the gap between them.
+// Field semantics live in `src/embeddings-routes.ts:EmbeddingsSettingsSnapshot`.
+// ---------------------------------------------------------------------------
+
+export interface EmbeddingsSettings {
+  /** Persisted `embeddings_enabled` — what the toggle reflects (false when unset). */
+  enabled: boolean;
+  /** `EMBEDDINGS_ENABLED` env override: true (forced on), false (forced off), null (defers). */
+  env_override: boolean | null;
+  /** True exactly when `env_override` is non-null — an env var is forcing the value. */
+  env_forced: boolean;
+  /** What a fresh boot would resolve (env override, else persisted, else off). */
+  effective: boolean;
+  /** Whether semantic search is LIVE in the running process right now. */
+  active: boolean;
+  /** True when `active !== effective` — persisted change awaits a restart. */
+  restart_required: boolean;
+  /** First-enable model-download size hint (MB) for the copy. */
+  model_download_mb: number;
+}
+
+/** GET the current embeddings settings snapshot. */
+export async function getEmbeddingsSettings(vaultName: string): Promise<EmbeddingsSettings> {
+  const res = await authedFetch(
+    vaultName,
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/embeddings`,
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as EmbeddingsSettings;
+}
+
+/**
+ * PUT a new persisted `embeddings_enabled` value. Returns the updated
+ * snapshot. The server persists the setting (even when an env var is forcing
+ * a value) and reports `restart_required` when the running process hasn't
+ * picked up the change yet.
+ */
+export async function putEmbeddingsSettings(
+  vaultName: string,
+  enabled: boolean,
+): Promise<EmbeddingsSettings> {
+  const res = await authedFetch(
+    vaultName,
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/embeddings`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    },
+  );
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as EmbeddingsSettings;
+}
+
 async function readError(res: Response): Promise<string> {
   return (await readErrorParts(res)).message;
 }
