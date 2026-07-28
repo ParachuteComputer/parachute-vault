@@ -37,6 +37,15 @@ export interface AttachmentTicket {
   noteId?: string;
   filename?: string;
   transcribe?: boolean;
+  /**
+   * Upload only, voice W2 parity with the REST path's `segment_index`
+   * (`src/routes.ts` POST `/notes/:id/attachments`) — an integer >= 0 lets
+   * one recording split across several ticket-minted attachments on ONE
+   * note, each resolving into its own `(part N)` marker. Only meaningful
+   * alongside `transcribe: true`; validated at mint (`generateMcpTools`'s
+   * `request-attachment-upload`), consumed at spend (`handleTicketSpend`).
+   */
+  segmentIndex?: number;
   /** Download only. */
   attachmentId?: string;
 }

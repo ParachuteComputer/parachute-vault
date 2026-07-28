@@ -4,6 +4,41 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.4-rc.2] - 2026-07-28
+
+**`segment_index` self-host parity fix (voice W2 two-door bug).** A segmented
+voice recording (multiple audio parts on one note, each transcribing into its
+own `_Transcript pending (part N)._` marker) was silently losing all but one
+part's transcript on self-host: the door never read `segment_index` off the
+attachment POST body at all, so every part fell back to the shared bare
+`_Transcript pending._` marker, the replace missed, transcripts appended out
+of order, and completing one part cleared the shared `transcribe_stub` —
+locking the other parts out entirely. Cloud already had this right
+(`workers/vault/src/rest/notes.ts`); this is the self-host twin catching up.
+Companion fix `parachute-app#126` corrects the OTHER half — the client was
+nesting `segment_index` under a `metadata` object no door reads at top level;
+top level is the one agreed shape going forward, nested is not newly
+supported. **Either half alone leaves the bug live.**
+
+- **`POST /notes/:id/attachments`** (`src/routes.ts`) now reads a top-level
+  `segment_index`, validated exactly like cloud (`typeof === "number"`,
+  `Number.isInteger`, `>= 0`), and includes it on the attachment's metadata
+  when valid. A malformed value doesn't error the request — it silently falls
+  back to the un-segmented bare markers, matching cloud's own fallback.
+- **Ticket-mint parity** (`request-attachment-upload`, `core/src/mcp.ts` +
+  `core/src/mcp-manifest.ts` + `core/src/attachment/tickets.ts` +
+  `src/attachment-tickets.ts`): the same validated `segment_index` now threads
+  through an agent's ticket-based upload too, for consistency between the two
+  attachment-creation paths (the app's own segmented-voice flow doesn't use
+  this path today, but any MCP client minting a segmented upload now gets the
+  same correct behavior).
+- **New end-to-end test** (`src/vault.test.ts`) drives the real REST endpoint
+  with a top-level `segment_index` on two attachments and runs the
+  transcription worker to confirm each part's marker resolves independently,
+  out of completion order — the door's full loop, not just metadata storage.
+  It does NOT prove the app's real request body actually reaches this state;
+  that join has no test yet, filed as vault#629.
+
 ## [0.7.4-rc.1] - 2026-07-22
 
 **Admin-UI toggle for semantic search (0.7.3 fast-follow).** 0.7.3 made

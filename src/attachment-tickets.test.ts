@@ -270,6 +270,52 @@ describe("attachment tickets — upload lifecycle", () => {
     expect((updatedNote!.metadata as any)?.transcribe_stub).toBe(true);
   });
 
+  test("segment_index (voice W2): a valid integer >= 0 rides ticket mint through to the attachment row", async () => {
+    const vaultName = freshVault("tickets-segment");
+    const store = getVaultStore(vaultName);
+    const note = await store.createNote("# Voice memo\n\n_Transcript pending (part 2)._", { path: "memo-seg" });
+
+    const mint = await callTool(vaultName, "request-attachment-upload", {
+      note: note.id,
+      filename: "part-2.wav",
+      size_bytes: 4,
+      transcribe: true,
+      segment_index: 1,
+    });
+    const res = await routeReq(
+      new Request(mint.url, { method: "PUT", headers: { "content-type": "audio/wav" }, body: new Uint8Array([1, 2, 3, 4]) }),
+    );
+    expect(res.status).toBe(201);
+    const attachment = (await res.json()) as any;
+    expect(attachment.metadata.segment_index).toBe(1);
+    expect(attachment.metadata.transcribe_status).toBe("pending");
+  });
+
+  test.each([
+    ["negative", -1],
+    ["non-integer", 1.5],
+    ["string", "1"],
+  ])("segment_index (voice W2): an invalid value (%s) is dropped at mint, not stored — same fallback as the REST path", async (_label, bad) => {
+    const vaultName = freshVault(`tickets-segment-bad-${_label}`);
+    const store = getVaultStore(vaultName);
+    const note = await store.createNote("# Voice memo\n\n_Transcript pending._", { path: "memo-seg-bad" });
+
+    const mint = await callTool(vaultName, "request-attachment-upload", {
+      note: note.id,
+      filename: "bad.wav",
+      size_bytes: 4,
+      transcribe: true,
+      segment_index: bad,
+    });
+    const res = await routeReq(
+      new Request(mint.url, { method: "PUT", headers: { "content-type": "audio/wav" }, body: new Uint8Array([1, 2, 3, 4]) }),
+    );
+    expect(res.status).toBe(201);
+    const attachment = (await res.json()) as any;
+    expect(attachment.metadata.segment_index).toBeUndefined();
+    expect(attachment.metadata.transcribe_status).toBe("pending");
+  });
+
   test("blocked extension is refused at MINT — no ticket is ever created", async () => {
     const vaultName = freshVault("tickets-blocked-ext");
     const store = getVaultStore(vaultName);

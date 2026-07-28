@@ -2334,7 +2334,12 @@ async function handleNotesInner(
       }
       const parsedBody = await parseJsonBody(req);
       if (!parsedBody.ok) return parsedBody.response;
-      const body = parsedBody.body as { path: string; mimeType: string; transcribe?: boolean };
+      const body = parsedBody.body as {
+        path: string;
+        mimeType: string;
+        transcribe?: boolean;
+        segment_index?: unknown;
+      };
       if (!body.path || !body.mimeType) {
         return json(
           { error: "path and mimeType are required", error_type: "missing_required_field", hint: "pass both `path` and `mimeType`" },
@@ -2365,11 +2370,20 @@ async function handleNotesInner(
         ? readVaultConfig(vault)?.auto_transcribe?.enabled
         : undefined;
       const autoOptIn = !explicitOptIn && shouldAutoTranscribe(body.mimeType, { perVaultEnabled });
+      // Per-segment slots (voice W2, cloud twin: workers/vault/src/rest/notes.ts
+      // ~791-800): an optional `segment_index` (integer >= 0) lets one recording
+      // split across several attachments on ONE note, each resolving into its
+      // own `(part N)` marker (N = segment_index + 1, see transcription-worker.ts
+      // markersFor). A malformed value is silently ignored — the attachment
+      // still links, it just falls back to the bare, un-segmented markers.
+      const segIdx = body.segment_index;
+      const validSegment = typeof segIdx === "number" && Number.isInteger(segIdx) && segIdx >= 0;
       const attMeta = (explicitOptIn || autoOptIn)
         ? {
             transcribe_status: "pending" as const,
             transcribe_requested_at: new Date().toISOString(),
             transcribe_origin: (explicitOptIn ? "legacy" : "auto") as "legacy" | "auto",
+            ...(validSegment ? { segment_index: segIdx } : {}),
           }
         : undefined;
 

@@ -2558,6 +2558,13 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
               ? params.mime_type
               : mimeForAttachmentExtension(ext);
 
+          // Per-segment slots (voice W2), ticket-mint parity with the REST
+          // path's own validation (`src/routes.ts` POST /notes/:id/attachments):
+          // an integer >= 0, else silently dropped — a malformed value falls
+          // back to the un-segmented bare markers rather than erroring the mint.
+          const segIdx = params.segment_index;
+          const validSegment = typeof segIdx === "number" && Number.isInteger(segIdx) && segIdx >= 0;
+
           const now = Date.now();
           const expiresAt = now + computeTicketTtlMs(sizeBytes);
           const id = generateTicketId();
@@ -2572,6 +2579,7 @@ export function generateMcpTools(store: Store, opts?: GenerateMcpToolsOpts): Mcp
             mimeType,
             sizeBytes,
             transcribe: params.transcribe === true,
+            ...(validSegment ? { segmentIndex: segIdx } : {}),
           };
           await ticketSeam.provider.put(ticket);
 
