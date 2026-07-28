@@ -4,6 +4,28 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.4] - 2026-07-28
+
+**Stable promotion of the 0.7.4 line (3 commits over 0.7.3).** Promotes rc.1–rc.2
+to `@latest`. Two user-facing changes:
+
+- **`segment_index` self-host parity (#630)** — a segmented voice recording (one
+  note carrying several audio parts, each transcribing into its own
+  `_Transcript pending (part N)._` marker) silently lost all but one part's
+  transcript on self-host. The REST and MCP attach paths never read
+  `segment_index` off the request body, so every part resolved to the same
+  unnumbered marker: the last writer won, the other markers were left stranded in
+  the note, and the recovered transcripts sat unreachable in attachment metadata.
+  Both doors now read it, matching the hosted door's shape. **Long voice memos
+  keep all of their transcript.**
+- **Admin-UI toggle for embeddings (#624)** — semantic search shipped opt-in and
+  default-off in 0.7.3; operators can now turn it on from the self-host settings
+  page instead of editing config by hand.
+
+Also: CLAUDE.md slimmed to purpose + gotchas (#625, docs-only).
+
+No schema migration — `SCHEMA_VERSION` stays at 27, unchanged since 0.7.3.
+
 ## [0.7.4-rc.2] - 2026-07-28
 
 **`segment_index` self-host parity fix (voice W2 two-door bug).** A segmented
