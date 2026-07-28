@@ -677,7 +677,7 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
       name: "request-attachment-upload",
       requiredVerb: "write",
       description:
-        "Mint a short-lived, single-use upload URL for a note attachment. Bytes never pass through this tool — you get back a URL (+ a ready-to-run `curl_example`) your runtime's shell spends directly; no MCP session credential is needed to spend it. Provide the target `note` (id or path), the `filename`, and its exact `size_bytes` — declared here and enforced at spend (a mismatch, or exceeding the 100 MiB REST upload cap, fails the mint or the upload). `mime_type` is inferred from the filename's extension when omitted. Pass `transcribe: true` for an audio file to enqueue it exactly like the REST attach flow does. The ticket's `expires_at` scales with declared size (10 minutes base + 10s per MiB, capped at 30 minutes) and can be spent exactly once — a failed curl means re-minting, not retrying the same URL.",
+        "Mint a short-lived, single-use upload URL for a note attachment. Bytes never pass through this tool — you get back a URL (+ a ready-to-run `curl_example`) your runtime's shell spends directly; no MCP session credential is needed to spend it. Provide the target `note` (id or path), the `filename`, and its exact `size_bytes` — declared here and enforced at spend (a mismatch, or exceeding the 100 MiB REST upload cap, fails the mint or the upload). `mime_type` is inferred from the filename's extension when omitted. Pass `transcribe: true` for an audio file to enqueue it exactly like the REST attach flow does; `segment_index` additionally splits one recording across several attachments on the same note (voice W2 — see that field's description). The ticket's `expires_at` scales with declared size (10 minutes base + 10s per MiB, capped at 30 minutes) and can be spent exactly once — a failed curl means re-minting, not retrying the same URL.",
       inputSchema: {
         type: "object",
         properties: {
@@ -689,6 +689,10 @@ Write-attribution (vault#298): every result carries \`createdBy\`/\`createdVia\`
           },
           mime_type: { type: "string", description: "MIME type to store on the attachment row. Inferred from `filename`'s extension when omitted (`application/octet-stream` for an uncurated extension)." },
           transcribe: { type: "boolean", description: "Opt into transcription for an audio attachment — mirrors the REST `POST /notes/:id/attachments` `transcribe` flag." },
+          segment_index: {
+            type: "number",
+            description: "Only meaningful alongside `transcribe: true`. An integer >= 0 that marks this attachment as one part of a multi-part recording linked to the same note — each part resolves into its own `_Transcript pending (part N)._` marker (N = segment_index + 1) instead of overwriting a shared bare marker. A malformed value (non-integer, negative, non-number) is silently ignored, falling back to the un-segmented bare marker.",
+          },
         },
         required: ["note", "filename", "size_bytes"],
       },

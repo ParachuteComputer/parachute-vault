@@ -2913,6 +2913,173 @@ describe("HTTP /notes", async () => {
     });
   });
 
+  describe("POST /notes/:id/attachments with segment_index (voice W2)", async () => {
+    test("valid segment_index (integer >= 0) lands on the attachment's metadata", async () => {
+      await store.createNote("# 🎙️ Voice memo\n\n_Transcript pending (part 1)._", { id: "seg1" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/seg1/attachments", {
+          path: "memos/part-1.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+          segment_index: 0,
+        }),
+        store,
+        "/seg1/attachments",
+      );
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      expect(att.metadata?.segment_index).toBe(0);
+      expect(att.metadata?.transcribe_status).toBe("pending");
+    });
+
+    test.each([
+      ["negative", -1],
+      ["non-integer", 1.5],
+      ["string", "1"],
+    ])("invalid segment_index (%s) is dropped, not stored, same as cloud's fallback", async (_label, bad) => {
+      await store.createNote("# 🎙️ Voice memo\n\n_Transcript pending._", { id: `seg-bad-${_label}` });
+      const res = await handleNotes(
+        mkReq("POST", `/notes/seg-bad-${_label}/attachments`, {
+          path: "memos/bad.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+          segment_index: bad,
+        }),
+        store,
+        `/seg-bad-${_label}/attachments`,
+      );
+      // Malformed segment_index is NOT a request error — it silently falls
+      // back to the un-segmented path (mirrors cloud's notes.ts validSegment
+      // check), so linking still succeeds.
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      expect(att.metadata?.segment_index).toBeUndefined();
+      expect(att.metadata?.transcribe_status).toBe("pending");
+    });
+
+    test("absent segment_index leaves the un-segmented path byte-unchanged", async () => {
+      await store.createNote("# 🎙️ Voice memo\n\n_Transcript pending._", { id: "seg-absent" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/seg-absent/attachments", {
+          path: "memos/bare.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+        }),
+        store,
+        "/seg-absent/attachments",
+      );
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      expect(att.metadata?.segment_index).toBeUndefined();
+      expect(att.metadata?.transcribe_status).toBe("pending");
+    });
+
+    // ---- The join test, not just the door's half ------------------------
+    //
+    // The three tests above post `segment_index` at TOP LEVEL — the shape
+    // both doors have now agreed on (cloud always read it there; self-host
+    // didn't read it at all until this PR). That's a deliberate contract
+    // choice, not a guess at what any client sends: the app was found
+    // nesting it under `metadata` instead, which is the OTHER half of this
+    // bug and is being fixed separately in sibling PR parachute-app#126
+    // ("segment_index rides top-level on the wire"). Top-level is the one
+    // true shape going forward; nested is a bug in the emitter, not a shape
+    // either door should learn to accept.
+    //
+    // What this test proves: given a top-level `segment_index`, self-host
+    // stores it AND the transcription worker resolves the correct per-part
+    // marker from it — the full loop this door owns.
+    // What it does NOT prove: that any real client actually sends this
+    // shape today. app#126 pins the app's emission; this pins the door's
+    // reception. Proving the two actually join — the app's real request
+    // body landing on a running self-host vault and coming out right —
+    // needs a cross-repo conformance test that doesn't exist yet (filed as
+    // vault#629; that gap is exactly how this bug shipped in the first
+    // place, since cloud's own conformance test was green against a shape
+    // the app never sent).
+    test("end-to-end: top-level segment_index on TWO real attachments resolves each part's marker independently", async () => {
+      const assetsRoot = join(tmpDir, "assets");
+      mkdirSync(join(assetsRoot, "memos"), { recursive: true });
+      writeFileSync(join(assetsRoot, "memos/e2e-0.webm"), Buffer.from([1, 2, 3]));
+      writeFileSync(join(assetsRoot, "memos/e2e-1.webm"), Buffer.from([4, 5, 6]));
+      process.env.ASSETS_DIR = assetsRoot;
+
+      await store.createNote(
+        "# 🎙️ Voice memo\n\n_Transcript pending (part 1)._\n\n_Transcript pending (part 2)._\n",
+        { id: "seg-e2e", metadata: { transcribe_stub: true } },
+      );
+
+      // Link both parts through the REAL REST endpoint, exactly as the
+      // (now-fixed) app will call it: top-level segment_index, not nested.
+      const res0 = await handleNotes(
+        mkReq("POST", "/notes/seg-e2e/attachments", {
+          path: "memos/e2e-0.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+          segment_index: 0,
+        }),
+        store,
+        "/seg-e2e/attachments",
+      );
+      const res1 = await handleNotes(
+        mkReq("POST", "/notes/seg-e2e/attachments", {
+          path: "memos/e2e-1.webm",
+          mimeType: "audio/webm",
+          transcribe: true,
+          segment_index: 1,
+        }),
+        store,
+        "/seg-e2e/attachments",
+      );
+      expect(res0.status).toBe(201);
+      expect(res1.status).toBe(201);
+      const att0 = await res0.json() as any;
+      const att1 = await res1.json() as any;
+
+      const worker = startTranscriptionWorker({
+        vaultList: () => ["default"],
+        getStore: () => store as unknown as Store,
+        scribeUrl: "http://scribe.test",
+        resolveAssetsDir: () => process.env.ASSETS_DIR!,
+        pollIntervalMs: 10_000_000,
+        maxAttempts: 3,
+        fetchImpl: (async () => new Response(
+          JSON.stringify({ text: "part text" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        )) as typeof fetch,
+        logger: { error: () => {}, info: () => {} },
+      });
+      try {
+        // Complete part 2 first, then part 1 — out of order, same as the
+        // original bug report.
+        await worker.kick("default", att1);
+        const midway = await store.getNote("seg-e2e");
+        expect(midway!.content).toBe(
+          "# 🎙️ Voice memo\n\n_Transcript pending (part 1)._\n\npart text\n",
+        );
+        // Shared stub SURVIVES — part 1 still needs the gate open. Before
+        // this fix, an unstored segment_index made every part look
+        // un-segmented, so completing ONE part cleared the stub and locked
+        // the other out (the exact production bug).
+        expect((midway!.metadata as any)?.transcribe_stub).toBe(true);
+
+        await worker.kick("default", att0);
+        const final = await store.getNote("seg-e2e");
+        expect(final!.content).toBe(
+          "# 🎙️ Voice memo\n\npart text\n\npart text\n",
+        );
+        // Segmented notes never auto-clear the shared stub, even once every
+        // part is done (pre-existing worker contract, pinned separately in
+        // transcription-worker.test.ts) — out of scope here, asserted only
+        // so this test doesn't silently rely on behavior this PR didn't add.
+        expect((final!.metadata as any)?.transcribe_stub).toBe(true);
+      } finally {
+        await worker.stop();
+        delete process.env.ASSETS_DIR;
+      }
+    });
+  });
+
   describe("DELETE /notes/:id/attachments/:attId", async () => {
     test("happy path: 204, DB row gone, storage file unlinked", async () => {
       const assetsRoot = join(tmpDir, "assets");

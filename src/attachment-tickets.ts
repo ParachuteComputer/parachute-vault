@@ -274,6 +274,12 @@ async function handleUploadSpend(
     attMeta.transcribe_status = "pending";
     attMeta.transcribe_requested_at = new Date().toISOString();
     attMeta.transcribe_origin = explicitOptIn ? "legacy" : "auto";
+    // Per-segment slots (voice W2) — already validated at mint (the ticket
+    // only carries `segmentIndex` when it passed the integer->=0 check), so
+    // just thread it through onto the attachment row's metadata.
+    if (ticket.segmentIndex !== undefined) {
+      attMeta.segment_index = ticket.segmentIndex;
+    }
   }
 
   const attachment = await store.addAttachment(ticket.noteId, relativePath, ticket.mimeType, attMeta);
