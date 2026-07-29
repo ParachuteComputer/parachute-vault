@@ -51,6 +51,7 @@ import {
   type MirrorCredentialStatus,
   type MirrorImportCredentials,
   type MirrorImportResult,
+  type MirrorImportStage,
   type MirrorSnapshot,
   type MirrorStatus,
   type SelectGithubRepoResult,
@@ -59,6 +60,7 @@ import {
   getGithubInstallations,
   getMirror,
   getMirrorAuth,
+  getMirrorImportJob,
   listGithubRepos,
   pollGithubDeviceFlow,
   postMirrorAuthPat,
@@ -2492,9 +2494,34 @@ type ImportMode = "merge" | "replace";
 
 type ImportPhase =
   | { kind: "idle" }
-  | { kind: "running"; stage: "cloning" | "importing" }
+  | {
+      kind: "running";
+      stage: MirrorImportStage;
+      /** Live line from `git --progress`, when there is one. */
+      detail?: string;
+      jobId: string;
+      startedAt: number;
+    }
   | { kind: "success"; result: MirrorImportResult; remoteUrl: string; mode: ImportMode }
   | { kind: "error"; message: string };
+
+/** How often we ask the server how the import is going. */
+const IMPORT_POLL_INTERVAL_MS = 1500;
+
+/** Stage → the sentence shown next to the spinner. */
+const IMPORT_STAGE_COPY: Record<MirrorImportStage, string> = {
+  cloning: "Cloning the repo…",
+  importing: "Importing notes into this vault…",
+  syncing: "Setting up sync back to this repo…",
+};
+
+/** "3m 12s" — so a long import reads as progress, not as a hang. */
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+}
 
 function ImportFromGitSection({
   vaultName,
@@ -2507,9 +2534,10 @@ function ImportFromGitSection({
   const [mode, setMode] = useState<ImportMode>("merge");
   const [usePerCallPat, setUsePerCallPat] = useState(false);
   const [perCallPat, setPerCallPat] = useState("");
-  // vault#416 — default-on: also sync changes back to this repo. The operator
-  // can uncheck before importing.
-  const [enableSync, setEnableSync] = useState(true);
+  // vault#641 — default-OFF. Import is a read; arming push-back to the source
+  // repo is a separate, consequential decision (it can repoint this vault's
+  // backup at a repo another box owns). The operator opts in deliberately.
+  const [enableSync, setEnableSync] = useState(false);
   const [phase, setPhase] = useState<ImportPhase>({ kind: "idle" });
   // Typed-name confirmation for replace mode. The operator types the
   // literal vault name to unlock the Start button.
@@ -2531,7 +2559,6 @@ function ImportFromGitSection({
     (!usePerCallPat || perCallPat.trim().length > 0);
 
   const onStart = async () => {
-    setPhase({ kind: "running", stage: "cloning" });
     let credentials: MirrorImportCredentials;
     if (usePerCallPat) {
       credentials = { kind: "pat", token: perCallPat.trim() };
@@ -2541,30 +2568,119 @@ function ImportFromGitSection({
       credentials = { kind: "none" };
     }
     try {
-      // Stage flip is a UI nicety — the server is synchronous from our POV
-      // so the spinner copy can hint at "importing" partway through.
-      const stageTimer = window.setTimeout(
-        () => setPhase((p) => (p.kind === "running" ? { kind: "running", stage: "importing" } : p)),
-        1500,
-      );
-      const result = await postMirrorImport(vaultName, {
+      // 202 — the import is running server-side now (or we attached to one
+      // that already was). The polling effect below takes it from here; it
+      // survives however long the clone needs.
+      const { job } = await postMirrorImport(vaultName, {
         remote_url: remoteUrl.trim(),
         mode,
         credentials,
         enable_sync: enableSync,
       });
-      window.clearTimeout(stageTimer);
-      setPhase({ kind: "success", result, remoteUrl: remoteUrl.trim(), mode });
+      setPhase({
+        kind: "running",
+        stage: job.stage,
+        detail: job.detail,
+        jobId: job.job_id,
+        startedAt: Date.parse(job.started_at) || Date.now(),
+      });
     } catch (err) {
-      const message =
-        err instanceof HttpError
-          ? `${err.status === 409 ? "Already running. " : ""}${err.message}`
-          : err instanceof Error
-            ? err.message
-            : String(err);
+      const message = err instanceof Error ? err.message : String(err);
       setPhase({ kind: "error", message });
     }
   };
+
+  // Ticking elapsed clock for the running state. Its own 1s interval rather
+  // than piggybacking on the poll, so the timer reads smoothly even when a
+  // poll is slow or briefly failing.
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const runningStartedAt = phase.kind === "running" ? phase.startedAt : 0;
+  useEffect(() => {
+    if (!runningStartedAt) {
+      setElapsedMs(0);
+      return;
+    }
+    setElapsedMs(Date.now() - runningStartedAt);
+    const id = window.setInterval(
+      () => setElapsedMs(Date.now() - runningStartedAt),
+      1000,
+    );
+    return () => window.clearInterval(id);
+  }, [runningStartedAt]);
+
+  // ---- Poll the running job ------------------------------------------------
+  //
+  // Runs for as long as the import does. The previous implementation had no
+  // equivalent: the POST blocked, so a big vault's import was invisible until
+  // it timed out. Now every tick refreshes the stage + the live `git
+  // --progress` line, and the terminal states land here rather than on the
+  // request that started it.
+  const phaseKind = phase.kind;
+  const phaseJobId = phase.kind === "running" ? phase.jobId : null;
+  useEffect(() => {
+    if (phaseKind !== "running" || !phaseJobId) return;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const job = await getMirrorImportJob(vaultName, phaseJobId);
+        if (cancelled) return;
+        if (job.status === "running") {
+          setPhase({
+            kind: "running",
+            stage: job.stage,
+            detail: job.detail,
+            jobId: phaseJobId,
+            startedAt: runningStartedAt,
+          });
+        } else if (job.status === "succeeded" && job.result) {
+          setPhase({
+            kind: "success",
+            result: job.result,
+            remoteUrl: remoteUrl.trim(),
+            mode,
+          });
+          return;
+        } else {
+          setPhase({
+            kind: "error",
+            message:
+              job.error?.message ?? "The import failed for an unknown reason.",
+          });
+          return;
+        }
+      } catch (err) {
+        if (cancelled) return;
+        // A 404 means the vault forgot the job — in practice, it restarted
+        // mid-import. Say that, rather than leaving a spinner up forever.
+        if (err instanceof HttpError && err.status === 404) {
+          setPhase({
+            kind: "error",
+            message:
+              "Lost track of this import — the vault restarted while it was running. Check the vault's contents, then retry (merge mode is safe to re-run).",
+          });
+          return;
+        }
+        // Anything else is likely transient (a proxy hiccup, a token refresh).
+        // Keep polling rather than failing the import over it — the import
+        // itself is unaffected by our ability to observe it.
+      }
+      timer = window.setTimeout(() => void tick(), IMPORT_POLL_INTERVAL_MS);
+    };
+
+    // First poll fires IMMEDIATELY, not one interval late. A short import can
+    // already be done by the time the POST resolves, and making the operator
+    // stare at a detail-less spinner for a poll interval before the first real
+    // status arrives is needless.
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phaseKind, phaseJobId, vaultName]);
 
   const onReset = () => {
     setPhase({ kind: "idle" });
@@ -2641,13 +2757,31 @@ function ImportFromGitSection({
                 .
               </p>
             ) : null}
-            {!hasStoredCreds && !usePerCallPat ? (
+            {/*
+              Which credential this import will use, stated plainly. The old
+              copy only mentioned the missing-credentials case, which left the
+              common question unanswered — "whose token is this about to
+              use?" — and pushed operators toward configuring BACKUP
+              credentials just to authenticate a read (vault#641).
+            */}
+            {usePerCallPat ? (
               <p className="hint" style={{ marginTop: "0.35rem", fontSize: "0.85em" }}>
-                No saved git credentials. The import will be unauthenticated —
-                works for public repos; private repos will fail with a clear
-                error. Use the one-time credential toggle below if needed.
+                Using the one-time token below. It's used for this clone only —
+                not saved, and not used for backup.
               </p>
-            ) : null}
+            ) : hasStoredCreds ? (
+              <p className="hint" style={{ marginTop: "0.35rem", fontSize: "0.85em" }}>
+                Using your saved git credentials to <strong>read</strong> this
+                repo. Reading doesn't change them, and doesn't back anything up.
+              </p>
+            ) : (
+              <p className="hint" style={{ marginTop: "0.35rem", fontSize: "0.85em" }}>
+                No saved git credentials — the import will be unauthenticated.
+                Fine for a public repo; a private one will fail with a clear
+                error. For a private repo, use the one-time token below —{" "}
+                <strong>you don't need to set up backup in order to import</strong>.
+              </p>
+            )}
           </div>
 
           <div className="form-row">
@@ -2718,11 +2852,11 @@ function ImportFromGitSection({
                 disabled={phase.kind === "running"}
                 style={{ width: "auto", marginRight: "0.5rem" }}
               />
-              One-time credential for this import only
+              Use a one-time token for this import
             </label>
             <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.85em" }}>
-              Use a different Personal Access Token just for this clone, without
-              changing your saved credentials.
+              A read-only Personal Access Token is enough. It's used for this
+              clone and then discarded — never saved, never used to push.
             </p>
             {usePerCallPat ? (
               <input
@@ -2752,11 +2886,23 @@ function ImportFromGitSection({
                 disabled={phase.kind === "running"}
                 style={{ width: "auto", marginRight: "0.5rem" }}
               />
-              Also sync changes back to this repo
+              After importing, also back this vault up to the same repo
             </label>
             <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.85em" }}>
-              Pushes future changes to this repo automatically. Uses the access
-              you provide above.
+              {enableSync ? (
+                <>
+                  <strong>This vault will start pushing to that repo.</strong> If
+                  another machine already backs up there, leave this off — set
+                  backup up separately once you've checked the import looks
+                  right.
+                </>
+              ) : (
+                <>
+                  Off by default. The import only <strong>reads</strong> the
+                  repo — nothing is written back to it, and your existing backup
+                  settings are left alone.
+                </>
+              )}
             </p>
           </div>
 
@@ -2781,13 +2927,41 @@ function ImportFromGitSection({
                       : undefined
               }
             >
-              {phase.kind === "running"
-                ? phase.stage === "cloning"
-                  ? "Cloning…"
-                  : "Importing…"
-                : "Start import"}
+              {phase.kind === "running" ? "Importing…" : "Start import"}
             </button>
           </div>
+
+          {/*
+            Live progress. Before vault#640 there was nothing to show here —
+            the request blocked and the operator watched a button that said
+            "Cloning…" until it timed out at 60s. A big vault legitimately
+            takes many minutes; showing the stage, git's own progress line, and
+            elapsed time is what makes that legible instead of alarming.
+          */}
+          {phase.kind === "running" ? (
+            <div className="form-row" aria-live="polite">
+              <p style={{ margin: "0 0 0.25rem" }}>
+                {IMPORT_STAGE_COPY[phase.stage]}{" "}
+                <span className="dim">({formatElapsed(elapsedMs)})</span>
+              </p>
+              {phase.detail ? (
+                <p
+                  className="dim"
+                  style={{
+                    margin: 0,
+                    fontSize: "0.85em",
+                    fontFamily: "var(--mono, monospace)",
+                  }}
+                >
+                  {phase.detail}
+                </p>
+              ) : null}
+              <p className="dim" style={{ margin: "0.35rem 0 0", fontSize: "0.85em" }}>
+                Large vaults can take a while. This keeps running on the server
+                — you can leave this page and come back.
+              </p>
+            </div>
+          ) : null}
         </>
       )}
 

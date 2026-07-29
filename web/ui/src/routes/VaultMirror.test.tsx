@@ -29,6 +29,9 @@ vi.mock("../lib/api.ts", async () => {
     putMirror: vi.fn(),
     runMirrorNow: vi.fn(),
     pushMirrorNow: vi.fn(),
+    // Import is a two-call flow since vault#640: POST starts a job, GET polls
+    // it. Both must be mocked or the polling effect hits the real fetch.
+    getMirrorImportJob: vi.fn(),
     // Credential surface (vault#384 — UI-configurable push credentials).
     // Default mocks return "no credentials configured" so existing tests
     // see the expected pre-credentials shape. Per-test overrides via
@@ -1077,6 +1080,59 @@ describe("VaultMirror — Import from git section", () => {
     });
   });
 
+  /**
+   * Stand up the async import pair (vault#640): the POST resolves with a
+   * `running` job, and the first poll resolves terminal.
+   *
+   * The import outcome no longer arrives on the POST — it can't, because the
+   * request would have to outlive the whole clone. Tests drive the same two
+   * calls the component does.
+   */
+  function mockImportSucceeds(result: Partial<api.MirrorImportResult> = {}) {
+    const job: api.MirrorImportJob = {
+      job_id: "job-1",
+      vault_name: "work",
+      status: "running",
+      stage: "cloning",
+      started_at: "2026-07-29T00:00:00.000Z",
+      updated_at: "2026-07-29T00:00:00.000Z",
+    };
+    vi.mocked(api.postMirrorImport).mockResolvedValue({ attached: false, job });
+    vi.mocked(api.getMirrorImportJob).mockResolvedValue({
+      ...job,
+      status: "succeeded",
+      finished_at: "2026-07-29T00:00:05.000Z",
+      result: {
+        notes_imported: 1,
+        tags_imported: 0,
+        attachments_imported: 0,
+        warnings: [],
+        sync_enabled: false,
+        ...result,
+      },
+    });
+    return job;
+  }
+
+  /** Same, but the job ends in `failed` with the given error. */
+  function mockImportFails(error: api.MirrorImportError) {
+    const job: api.MirrorImportJob = {
+      job_id: "job-fail",
+      vault_name: "work",
+      status: "running",
+      stage: "cloning",
+      started_at: "2026-07-29T00:00:00.000Z",
+      updated_at: "2026-07-29T00:00:00.000Z",
+    };
+    vi.mocked(api.postMirrorImport).mockResolvedValue({ attached: false, job });
+    vi.mocked(api.getMirrorImportJob).mockResolvedValue({
+      ...job,
+      status: "failed",
+      finished_at: "2026-07-29T00:00:05.000Z",
+      error,
+    });
+  }
+
   it("renders the import section heading + multi-pusher caveat", async () => {
     renderRoute();
     const user = userEvent.setup();
@@ -1134,7 +1190,11 @@ describe("VaultMirror — Import from git section", () => {
     expect(startBtn).not.toBeDisabled();
   });
 
-  it("the 'Also sync changes back' checkbox is checked by default", async () => {
+  // vault#641 — the default INVERTED. An import is a read; it must not arm a
+  // write to the source repo unless the operator asks. Pinned as its own test
+  // because the previous default (checked) is what made operators distrust the
+  // whole flow: authenticating a PULL appeared to arm a PUSH.
+  it("the back-up-to-this-repo checkbox is UNCHECKED by default", async () => {
     renderRoute();
     const user = userEvent.setup();
     await openAdvanced(user);
@@ -1142,17 +1202,45 @@ describe("VaultMirror — Import from git section", () => {
       expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
     );
     const syncCheckbox = screen.getByLabelText(
-      /Also sync changes back to this repo/i,
+      /also back this vault up to the same repo/i,
     ) as HTMLInputElement;
-    expect(syncCheckbox.checked).toBe(true);
+    expect(syncCheckbox.checked).toBe(false);
+    // And the copy says so plainly, so nobody has to infer it.
+    expect(screen.getByText(/nothing is written back to it/i)).toBeInTheDocument();
+  });
+
+  it("a default import sends enable_sync false and wires no push-back", async () => {
+    mockImportSucceeds({ notes_imported: 12 });
+    renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/vault.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
+        remote_url: "https://github.com/aaron/vault.git",
+        mode: "merge",
+        credentials: { kind: "none" },
+        enable_sync: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/Sync enabled/i)).not.toBeInTheDocument();
   });
 
   it("Start import fires postMirrorImport (enable_sync true) + shows sync-enabled confirmation", async () => {
-    vi.mocked(api.postMirrorImport).mockResolvedValue({
+    mockImportSucceeds({
       notes_imported: 42,
       tags_imported: 3,
       attachments_imported: 5,
-      warnings: [],
       sync_enabled: true,
     });
     renderRoute();
@@ -1163,11 +1251,14 @@ describe("VaultMirror — Import from git section", () => {
     );
     const importUrlInput = screen.getByLabelText(/Remote URL/i) as HTMLInputElement;
     await user.type(importUrlInput, "https://github.com/aaron/vault.git");
+    // Opt in explicitly — this is no longer the default (vault#641).
+    await user.click(
+      screen.getByLabelText(/also back this vault up to the same repo/i),
+    );
     await user.click(screen.getByRole("button", { name: /Start import/i }));
     await waitFor(() =>
       expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
     );
-    // enable_sync defaults ON and is sent in the POST body.
     expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
       remote_url: "https://github.com/aaron/vault.git",
       mode: "merge",
@@ -1180,14 +1271,8 @@ describe("VaultMirror — Import from git section", () => {
     expect(screen.getByText(/Sync enabled/i)).toBeInTheDocument();
   });
 
-  it("unchecking the sync checkbox sends enable_sync false", async () => {
-    vi.mocked(api.postMirrorImport).mockResolvedValue({
-      notes_imported: 4,
-      tags_imported: 0,
-      attachments_imported: 0,
-      warnings: [],
-      sync_enabled: false,
-    });
+  it("checking the box swaps the copy to the push-back warning", async () => {
+    mockImportSucceeds({ notes_imported: 4 });
     renderRoute();
     const user = userEvent.setup();
     await openAdvanced(user);
@@ -1198,31 +1283,23 @@ describe("VaultMirror — Import from git section", () => {
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/aaron/vault.git",
     );
-    await user.click(screen.getByLabelText(/Also sync changes back to this repo/i));
-    await user.click(screen.getByRole("button", { name: /Start import/i }));
-    await waitFor(() =>
-      expect(api.postMirrorImport).toHaveBeenCalledWith("work", {
-        remote_url: "https://github.com/aaron/vault.git",
-        mode: "merge",
-        credentials: { kind: "none" },
-        enable_sync: false,
-      }),
+    // Off: the copy promises nothing is written back.
+    expect(screen.getByText(/nothing is written back to it/i)).toBeInTheDocument();
+    await user.click(
+      screen.getByLabelText(/also back this vault up to the same repo/i),
     );
-    // No sync confirmation, no warning — opted out cleanly.
-    await waitFor(() =>
-      expect(screen.getByText(/Import succeeded/i)).toBeInTheDocument(),
-    );
-    expect(screen.queryByText(/Sync enabled/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Sync not enabled/i)).not.toBeInTheDocument();
+    // On: the copy names the consequence and the multi-machine hazard.
+    expect(
+      screen.getByText(/This vault will start pushing to that repo/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/another machine already backs up there/i),
+    ).toBeInTheDocument();
   });
 
   it("renders sync_warning as an info/warning (not error) when sync wasn't enabled", async () => {
-    vi.mocked(api.postMirrorImport).mockResolvedValue({
+    mockImportSucceeds({
       notes_imported: 9,
-      tags_imported: 0,
-      attachments_imported: 0,
-      warnings: [],
-      sync_enabled: false,
       sync_warning:
         "Sync not enabled — pushing changes back needs write credentials (a PAT or GitHub sign-in).",
     });
@@ -1247,14 +1324,8 @@ describe("VaultMirror — Import from git section", () => {
     expect(screen.getByText(/needs write credentials/i)).toBeInTheDocument();
   });
 
-  it("one-time PAT credential is sent on Start (with enable_sync)", async () => {
-    vi.mocked(api.postMirrorImport).mockResolvedValue({
-      notes_imported: 1,
-      tags_imported: 0,
-      attachments_imported: 0,
-      warnings: [],
-      sync_enabled: true,
-    });
+  it("one-time PAT credential is sent on Start", async () => {
+    mockImportSucceeds({ notes_imported: 1, sync_enabled: true });
     renderRoute();
     const user = userEvent.setup();
     await openAdvanced(user);
@@ -1265,7 +1336,7 @@ describe("VaultMirror — Import from git section", () => {
       screen.getByLabelText(/Remote URL/i),
       "https://github.com/aaron/private.git",
     );
-    await user.click(screen.getByLabelText(/One-time credential/i));
+    await user.click(screen.getByLabelText(/Use a one-time token for this import/i));
     const patField = screen.getByPlaceholderText(/ghp_/) as HTMLInputElement;
     await user.type(patField, "ghp_oneshot_xyz");
     await user.click(screen.getByRole("button", { name: /Start import/i }));
@@ -1274,7 +1345,7 @@ describe("VaultMirror — Import from git section", () => {
         remote_url: "https://github.com/aaron/private.git",
         mode: "merge",
         credentials: { kind: "pat", token: "ghp_oneshot_xyz" },
-        enable_sync: true,
+        enable_sync: false,
       }),
     );
   });
@@ -1289,11 +1360,9 @@ describe("VaultMirror — Import from git section", () => {
         token_preview: "ghp_…1234",
       },
     });
-    vi.mocked(api.postMirrorImport).mockResolvedValue({
+    mockImportSucceeds({
       notes_imported: 7,
       tags_imported: 1,
-      attachments_imported: 0,
-      warnings: [],
       sync_enabled: true,
     });
     renderRoute();
@@ -1312,14 +1381,14 @@ describe("VaultMirror — Import from git section", () => {
         remote_url: "https://github.com/aaron/saved.git",
         mode: "merge",
         credentials: null,
-        enable_sync: true,
+        enable_sync: false,
       }),
     );
   });
 
-  it("surfaces server error message on failure", async () => {
+  it("surfaces a synchronous refusal (validation / git missing) from the POST", async () => {
     vi.mocked(api.postMirrorImport).mockRejectedValue(
-      new api.HttpError(502, "git clone failed for https://***@github.com/missing/repo.git: fatal: not found"),
+      new api.HttpError(503, "git is not installed on this machine."),
     );
     renderRoute();
     const user = userEvent.setup();
@@ -1333,7 +1402,99 @@ describe("VaultMirror — Import from git section", () => {
     );
     await user.click(screen.getByRole("button", { name: /Start import/i }));
     await waitFor(() =>
+      expect(screen.getByText(/git is not installed/i)).toBeInTheDocument(),
+    );
+  });
+
+  // vault#640 — the failure that matters now arrives on the JOB, not on the
+  // POST. A clone that dies ten minutes in has long since returned 202.
+  it("surfaces a clone failure that lands on the job record", async () => {
+    mockImportFails({
+      error_type: "clone_failed",
+      message:
+        "git clone failed for https://***@github.com/missing/repo.git: fatal: not found",
+    });
+    renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/missing/repo.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
       expect(screen.getByText(/git clone failed/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("shows live stage + git progress while the import runs", async () => {
+    const job: api.MirrorImportJob = {
+      job_id: "job-live",
+      vault_name: "work",
+      status: "running",
+      stage: "cloning",
+      started_at: "2026-07-29T00:00:00.000Z",
+      updated_at: "2026-07-29T00:00:00.000Z",
+    };
+    vi.mocked(api.postMirrorImport).mockResolvedValue({ attached: false, job });
+    vi.mocked(api.getMirrorImportJob).mockResolvedValue({
+      ...job,
+      detail: "Receiving objects:  47% (470/1000)",
+    });
+    renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/big.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Cloning the repo/i)).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Receiving objects/)).toBeInTheDocument(),
+    );
+    // And the reassurance that a long import is fine — the thing the old
+    // 60s-timeout flow could never say truthfully.
+    expect(screen.getByText(/keeps running on the server/i)).toBeInTheDocument();
+  });
+
+  it("a vault restart mid-import (404 on poll) explains itself instead of spinning", async () => {
+    const job: api.MirrorImportJob = {
+      job_id: "job-lost",
+      vault_name: "work",
+      status: "running",
+      stage: "importing",
+      started_at: "2026-07-29T00:00:00.000Z",
+      updated_at: "2026-07-29T00:00:00.000Z",
+    };
+    vi.mocked(api.postMirrorImport).mockResolvedValue({ attached: false, job });
+    vi.mocked(api.getMirrorImportJob).mockRejectedValue(
+      new api.HttpError(404, "no such job", "job_not_found"),
+    );
+    renderRoute();
+    const user = userEvent.setup();
+    await openAdvanced(user);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: /Import from a git repo/i })).toBeInTheDocument(),
+    );
+    await user.type(
+      screen.getByLabelText(/Remote URL/i),
+      "https://github.com/aaron/vault.git",
+    );
+    await user.click(screen.getByRole("button", { name: /Start import/i }));
+    await waitFor(() =>
+      expect(
+        screen.getByText(/the vault restarted while it was running/i),
+      ).toBeInTheDocument(),
     );
   });
 });

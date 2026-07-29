@@ -112,6 +112,7 @@ import {
   handleMirrorHistory,
   handleMirrorHistoryShow,
   handleMirrorImport,
+  handleMirrorImportStatus,
   handleMirrorPushNow,
   handleMirrorPut,
   handleMirrorRunNow,
@@ -874,12 +875,18 @@ export async function route(
     return handleMirrorHistory(req, manager);
   }
 
-  // /.parachute/mirror/import — clone a vault export from git + import.
-  // Admin-gated. POST-only. Synchronous (imports finish in <30s for
-  // typical vaults). See mirror-routes.ts:handleMirrorImport for the
+  // /.parachute/mirror/import       — POST: start a clone+import job (202).
+  // /.parachute/mirror/import/<id>  — GET:  poll that job.
+  //
+  // Admin-gated. Async since vault#640 — the synchronous shape couldn't
+  // survive hub's 255s proxy idleTimeout, which is what capped imports at a
+  // vault-sized demo. See mirror-routes.ts:handleMirrorImport for the
   // request/response shape + error map. Symmetric counterpart to the
   // export-to-git flow vault#382 + vault#384 shipped.
-  if (subpath === "/.parachute/mirror/import") {
+  if (
+    subpath === "/.parachute/mirror/import" ||
+    subpath.startsWith("/.parachute/mirror/import/")
+  ) {
     if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
       return Response.json(
         {
@@ -892,10 +899,19 @@ export async function route(
         { status: 403 },
       );
     }
-    if (req.method !== "POST") {
+    if (subpath === "/.parachute/mirror/import") {
+      if (req.method !== "POST") {
+        return Response.json({ error: "Method not allowed" }, { status: 405 });
+      }
+      return handleMirrorImport(req, vaultName);
+    }
+    if (req.method !== "GET") {
       return Response.json({ error: "Method not allowed" }, { status: 405 });
     }
-    return handleMirrorImport(req, vaultName);
+    const jobId = decodeURIComponent(
+      subpath.slice("/.parachute/mirror/import/".length),
+    );
+    return handleMirrorImportStatus(vaultName, jobId);
   }
 
   // /.parachute/mirror/auth/* — UI-configurable git push credentials.

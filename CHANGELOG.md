@@ -4,6 +4,39 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.5-rc.1] - 2026-07-29
+
+**Importing a real vault from git actually works now.** Two changes, one story:
+the import flow assumed vaults were small and assumed you wanted push-back.
+
+- **Import is an async job (#640)** — `POST .../mirror/import` now returns
+  `202 { job_id }` and the work continues server-side; poll
+  `GET .../mirror/import/<job_id>` for stage, live `git --progress` output, and
+  the outcome. The old shape ran the whole clone-and-import inside the request,
+  which could never work at scale: hub fronts the vault with
+  `Bun.serve({ idleTimeout: 255 })`, so anything past ~4 minutes died in the
+  proxy regardless. The **60-second clone timeout is gone** — it was a symptom
+  of that ceiling, and it made any vault bigger than a demo fail with
+  `git clone timed out after 60s`. A clone is now bounded by a **stall** timeout
+  (10 minutes with no progress output) rather than wall-clock, because "big" and
+  "broken" are different conditions and only the second one should be killed.
+  The admin SPA shows the stage, git's own progress line, and elapsed time, and
+  survives a page reload or a second tab by attaching to the running job.
+  Scripted callers that need the old synchronous response can pass
+  `{ "wait": true }`.
+
+- **Import no longer arms backup by itself (#641)** — `enable_sync` now defaults
+  to **false**. It defaulted to true (#416), which meant importing a repo
+  silently turned that repo into this vault's push target: the safe intent
+  (pull a copy onto a new box) required noticing and unchecking a box, while the
+  consequential one (repoint backup, possibly at a repo another machine already
+  pushes to) was what you got by not reading carefully. It also made the
+  credential question incoherent — operators reasonably refused to supply a
+  token to *read* a private repo because supplying it appeared to arm a write.
+  The import form now states which credential it will use, says plainly that a
+  one-time read-only PAT is enough and that **you don't need to configure backup
+  in order to import**, and only mentions push-back if you opt in.
+
 ## [0.7.4] - 2026-07-28
 
 **Stable promotion of the 0.7.4 line (3 commits over 0.7.3).** Promotes rc.1–rc.2
