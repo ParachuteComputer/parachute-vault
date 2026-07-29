@@ -36,6 +36,7 @@ import { TranscribeCppProvider } from "./transcription/providers/transcribe-cpp.
 import { ParakeetMlxProvider } from "./transcription/providers/parakeet-mlx.ts";
 import { OnnxAsrProvider } from "./transcription/providers/onnx-asr.ts";
 import {
+  resolveTranscriptionModelId,
   resolveTranscriptionProviderName,
   resolveTranscribeCppPaths,
   transcribeCppInstalled,
@@ -63,6 +64,15 @@ import {
 } from "./mirror-config.ts";
 import { GLOBAL_CONFIG_PATH } from "./config.ts";
 import { selfRegister } from "./self-register.ts";
+import { join } from "node:path";
+import { TRANSCRIPTION_MODELS, findModel } from "./transcription/models.ts";
+import {
+  candidateBinDirs,
+  managedModelDir,
+  resolveCliBinary,
+  resolveFfmpeg,
+} from "./transcription/resolve-binary.ts";
+import { WhisperCppProvider } from "./transcription/providers/whisper-cpp.ts";
 import { createSubscribeWsBinding, isWebSocketUpgrade } from "./ws-server.ts";
 import { warnLegacyGlobalApiKeys } from "./auth.ts";
 import pkg from "../package.json" with { type: "json" };
@@ -149,7 +159,58 @@ const commonWorkerOpts = {
 // Provider selection (scribe-fold Phase 2a). Default is `scribe-http` — unset
 // TRANSCRIPTION_PROVIDER means the existing scribe-http path runs unchanged.
 const providerName = resolveTranscriptionProviderName();
-if (providerName === "transcribe-cpp") {
+if (providerName === "whisper-cpp") {
+  // whisper.cpp's prebuilt CLIs — the local, no-Python path that actually
+  // ships binaries on both macOS (brew bottle) and Linux (release tarball).
+  // The model decides which CLI runs: parakeet-cli or whisper-cli.
+  //
+  // Binaries are resolved through the ladder in `resolve-binary.ts` rather
+  // than PATH alone, because a launchd-supervised vault does not inherit a
+  // login shell's PATH — on a Mac, `brew install whisper-cpp` otherwise looks
+  // installed to the operator and invisible to us.
+  const model = findModel(resolveTranscriptionModelId());
+  if (!model) {
+    console.warn(
+      `[transcribe] TRANSCRIPTION_MODEL="${resolveTranscriptionModelId()}" is not a known model — ` +
+        `valid ids: ${TRANSCRIPTION_MODELS.map((m) => m.id).join(", ")}`,
+    );
+  } else {
+    const binPath = resolveCliBinary(model.engine);
+    const modelPath = join(managedModelDir(), model.filename);
+    const ffmpegPath = resolveFfmpeg();
+    if (binPath && existsSync(modelPath)) {
+      transcriptionWorker = startTranscriptionWorker({
+        ...commonWorkerOpts,
+        provider: new WhisperCppProvider({
+          binPath,
+          engine: model.engine,
+          modelPath,
+          ffmpegPath,
+        }),
+      });
+      wireTranscriptionWorker(transcriptionWorker);
+      console.log(`[transcribe] worker started → whisper-cpp (${model.label}, ${binPath})`);
+      if (!ffmpegPath) {
+        console.warn(
+          "[transcribe] ffmpeg was not found — audio still has to be transcoded to 16 kHz mono " +
+            "WAV, so transcription will fail until it's installed (`brew install ffmpeg` / `apt install ffmpeg`).",
+        );
+      }
+    } else {
+      // Say WHICH piece is missing and where we looked. "Not installed" with
+      // two possible meanings and different fixes for each is not actionable.
+      const missing = [
+        binPath ? null : `the ${model.engine === "whisper" ? "whisper-cli" : "parakeet-cli"} binary`,
+        existsSync(modelPath) ? null : `the model (${model.label}, ${model.sizeMb} MB)`,
+      ].filter(Boolean);
+      console.warn(
+        `[transcribe] TRANSCRIPTION_PROVIDER=whisper-cpp but ${missing.join(" and ")} ` +
+          `${missing.length > 1 ? "are" : "is"} missing — run \`parachute-vault transcription install\`. ` +
+          `Searched for binaries in: ${candidateBinDirs().slice(0, 4).join(", ")}…`,
+      );
+    }
+  }
+} else if (providerName === "transcribe-cpp") {
   // Local, no-Python provider: subprocess a transcribe-cli. Only start the
   // worker when a runnable CLI + model are actually present — otherwise every
   // pending item would terminal-fail with `missing_provider`. (v0.1.1 ships a
