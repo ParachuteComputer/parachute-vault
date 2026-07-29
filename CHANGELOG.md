@@ -4,6 +4,50 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.5-rc.4] - 2026-07-29
+
+**A local transcription provider that actually runs.**
+
+The 2026-07-03 ratification adopted transcribe.cpp as the local provider, on
+the assumption a `transcribe-cli` binary would ship. It never did. v0.1.3
+(2026-07-12, latest) still publishes only `libtranscribe.{dylib,so}` +
+`libggml*` + `contract.json` — the CLI is build-from-source — and its N-API
+binding crashes on Bun, so the in-process route is closed too. Four weeks and
+three releases after the ratification, `transcription install` still could not
+produce a runnable setup.
+
+whisper.cpp ships what transcribe.cpp doesn't: **prebuilt CLIs on both
+platforms**. `brew install whisper-cpp` (bottled for arm64 macOS) installs
+BOTH `whisper-cli` and `parakeet-cli`; the Linux release tarballs carry the
+same two. Models are prebuilt too, so nothing is converted and no Python is
+involved anywhere.
+
+- **New `whisper-cpp` provider.** The chosen MODEL decides which CLI runs, so
+  an operator never thinks about binaries.
+- **Parakeet is the recommended model.** It beats Whisper large-v3 on the Open
+  ASR Leaderboard (6.32% vs 7.44% avg WER) at ~⅓ the parameters, runs faster,
+  and — the property that matters for voice memos — **doesn't hallucinate
+  during silence**, Whisper's best-known failure mode. Whisper models stay in
+  the catalog for languages outside Parakeet's 25.
+- **A real catalog** (`models.ts`): 7 models from 74 MB to 1549 MB, every URL
+  and size verified live against HuggingFace, with a RAM-aware default picker
+  that steps down rather than handing a 1.5 GB model to a 1 GB box.
+- **Binary resolution that survives launchd** (`resolve-binary.ts`): explicit
+  override → our managed dir → Homebrew prefixes → PATH. Homebrew is probed
+  explicitly because a launchd-supervised vault does NOT inherit a login
+  shell's PATH — on macOS that is the single most likely way this breaks, and
+  "I installed it and it still says not configured" is the worst failure
+  available.
+- **Failures name the missing piece**, its size, the fix, and where we looked.
+
+ffmpeg remains required despite `parakeet-cli` advertising flac/mp3/ogg/wav:
+browser voice capture is webm/opus, which is on neither CLI's list, and
+`whisper-cli` strictly wants 16 kHz mono WAV. Audio is always transcoded — one
+path, no format sniffing.
+
+`transcribe-cpp` is left in place for now (unreachable in practice, since its
+CLI doesn't exist) and retires in a follow-up alongside the default flip.
+
 ## [0.7.5-rc.1] - 2026-07-29
 
 **Importing a real vault from git actually works now.** Two changes, one story:

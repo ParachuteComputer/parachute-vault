@@ -29,8 +29,10 @@
 import { join } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync } from "fs";
+import { DEFAULT_MODEL_ID } from "./models.ts";
 
 export const TRANSCRIPTION_PROVIDERS = [
+  "whisper-cpp",
   "scribe-http",
   "transcribe-cpp",
   "parakeet-mlx",
@@ -54,9 +56,17 @@ export const DEFAULT_ONNX_ASR_MODEL = "nemo-parakeet-tdt-0.6b-v3";
 
 /**
  * Resolve the configured provider name. `TRANSCRIPTION_PROVIDER` selects it;
- * unset (or blank) ⇒ `scribe-http` (the behavior-preserving default). An
- * unrecognized value warns once and falls back to `scribe-http` rather than
- * failing boot — a typo shouldn't take transcription offline hard.
+ * unset (or blank) ⇒ `scribe-http`. An unrecognized value warns once and falls
+ * back rather than failing boot — a typo shouldn't take transcription offline
+ * hard.
+ *
+ * NOTE on the default: `scribe-http` remains the fallback for now because
+ * flipping it is a separate, riskier change — see the `whisper-cpp` entry in
+ * `models.ts`. On a box with nothing configured, `scribe-http` with no
+ * SCRIBE_URL means transcription doesn't run at all, which vault#643 now
+ * reports honestly instead of silently skipping. Making `whisper-cpp` the
+ * default is the follow-up, once `transcription install` can guarantee a
+ * runnable binary + model.
  */
 export function resolveTranscriptionProviderName(
   env: NodeJS.ProcessEnv = process.env,
@@ -394,4 +404,17 @@ export function onnxAsrInstalled(
 ): boolean {
   const bin = resolveOnnxAsrBin(env, deps);
   return !!bin && (deps.existsImpl ?? existsSync)(bin);
+}
+
+/**
+ * Resolve the configured model id for the `whisper-cpp` provider.
+ * `TRANSCRIPTION_MODEL` selects it; unset ⇒ the catalog default.
+ *
+ * Unlike the provider name, an unknown value is NOT silently coerced — the
+ * caller reports it, because a typo'd model id should be visible rather than
+ * quietly transcribing with something the operator didn't choose.
+ */
+export function resolveTranscriptionModelId(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.TRANSCRIPTION_MODEL?.trim();
+  return raw && raw.length > 0 ? raw : DEFAULT_MODEL_ID;
 }
