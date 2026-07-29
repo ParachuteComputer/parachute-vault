@@ -4,6 +4,43 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.5-rc.7] - 2026-07-29
+
+**Audio that can't be transcribed now says so (#643).**
+
+On a fresh install, voice memos silently never transcribed. The transcription
+provider resolves to `scribe-http` by default, nothing sets `SCRIBE_URL`, and
+`shouldAutoTranscribe` collapsed "the operator turned this off" and "nothing is
+configured to do this" into the same `false`. So audio was accepted, nothing was
+enqueued, no marker was written, no status was set, and the attachment came back
+indistinguishable from a plain file upload. The only hint was a boot-time
+`console.log` reading "worker disabled", which states a fact about the worker
+and never names the consequence.
+
+The hosted door already gets this right — it marks a terminal state ("voice not
+enabled for this plan", "monthly voice limit reached") rather than skipping
+quietly, so an operator never faces an eternal spinner. This is the self-hosted
+twin of that posture.
+
+- `classifyAutoTranscribe` replaces the boolean with four honest outcomes:
+  `transcribe` / `not-audio` / `disabled` / `unavailable`. **`disabled` stays
+  silent** — the operator asked for nothing to happen, and dressing that up as a
+  failure would be its own bug. `unavailable` is the misconfiguration.
+- An `unavailable` upload records `transcribe_status: "failed"` plus an
+  actionable `transcribe_error` naming both routes out (a local provider via
+  `transcription install`, or `SCRIBE_URL`), on both the REST and
+  upload-ticket paths.
+- The boot line is now a `warn` that names the consequence — "audio attachments
+  will be accepted but never transcribed" — reports the resolved provider, and
+  says how to silence it if transcription genuinely isn't wanted.
+- The per-upload warning is throttled to once a minute, so importing a hundred
+  memos yields one actionable line rather than a hundred.
+
+`shouldAutoTranscribe` is unchanged in behaviour and remains a thin boolean view
+of the classifier, pinned by a test.
+
+> rc.2 is #633 (admin-SPA auth honesty), open in parallel. A rebase interleaves
+> the two entries; they touch no common source.
 ## [0.7.5-rc.6] - 2026-07-29
 
 **The admin SPA no longer tells a signed-in operator they're signed out (#642).**

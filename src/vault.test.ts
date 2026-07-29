@@ -2877,7 +2877,12 @@ describe("HTTP /notes", async () => {
       expect((note!.metadata as any)?.transcribe_stub).toBe(true);
     });
 
-    test("transcribe: false (default) leaves metadata empty and note untouched", async () => {
+    // vault#643: audio with no explicit `transcribe` flag takes the AUTO path.
+    // In this suite no provider is reachable, so the attachment is no longer
+    // left looking like an ordinary upload — it records WHY nothing happened.
+    // It is still not `pending` (nothing was enqueued) and the note is still
+    // untouched (no stub, since the caller never asked for one).
+    test("audio with no flag + no provider records the failure; note untouched", async () => {
       await store.createNote("note body", { id: "v2" });
       const res = await handleNotes(
         mkReq("POST", "/notes/v2/attachments", {
@@ -2889,10 +2894,27 @@ describe("HTTP /notes", async () => {
       );
       expect(res.status).toBe(201);
       const att = await res.json() as any;
-      expect(att.metadata?.transcribe_status).toBeUndefined();
+      expect(att.metadata?.transcribe_status).toBe("failed");
+      expect(att.metadata?.transcribe_error).toMatch(/no transcription provider configured/i);
 
       const note = await store.getNote("v2");
       expect((note!.metadata as any)?.transcribe_stub).toBeUndefined();
+    });
+
+    test("NON-audio with no flag still leaves metadata completely empty", async () => {
+      await store.createNote("note body", { id: "v2b" });
+      const res = await handleNotes(
+        mkReq("POST", "/notes/v2b/attachments", {
+          path: "docs/spec.pdf",
+          mimeType: "application/pdf",
+        }),
+        store,
+        "/v2b/attachments",
+      );
+      expect(res.status).toBe(201);
+      const att = await res.json() as any;
+      expect(att.metadata?.transcribe_status).toBeUndefined();
+      expect(att.metadata?.transcribe_error).toBeUndefined();
     });
 
     test("transcribe: true preserves other note metadata", async () => {

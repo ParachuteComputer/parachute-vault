@@ -270,6 +270,72 @@ describe("attachment tickets — upload lifecycle", () => {
     expect((updatedNote!.metadata as any)?.transcribe_stub).toBe(true);
   });
 
+  // vault#643 — the fresh-install case. Auto-transcribe is ON by default and
+  // no provider is reachable (SCRIBE_URL unset, no scribe row), which is
+  // exactly what a new box looks like. The upload must not come back looking
+  // like an ordinary file: it carries a `failed` status and an actionable
+  // reason, so the state is visible in the API and the admin SPA.
+  test("audio + auto-transcribe on + NO provider → attachment records the failure, not silence", async () => {
+    const vaultName = freshVault("tickets-no-provider");
+    const store = getVaultStore(vaultName);
+    const note = await store.createNote("# Voice memo\n", { path: "memo-noprov" });
+
+    const mint = await callTool(vaultName, "request-attachment-upload", {
+      note: note.id,
+      filename: "memo.webm",
+      size_bytes: 4,
+      // NO `transcribe: true` — this is the AUTO path, the one that used to
+      // silently do nothing.
+    });
+    const res = await routeReq(
+      new Request(mint.url, {
+        method: "PUT",
+        headers: { "content-type": "audio/webm" },
+        body: new Uint8Array([1, 2, 3, 4]),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const attachment = (await res.json()) as any;
+    expect(attachment.metadata.transcribe_status).toBe("failed");
+    expect(attachment.metadata.transcribe_error).toMatch(/no transcription provider configured/i);
+    // The reason has to be actionable — naming both routes out of it.
+    expect(attachment.metadata.transcribe_error).toMatch(/TRANSCRIPTION_PROVIDER/);
+    expect(attachment.metadata.transcribe_error).toMatch(/SCRIBE_URL/);
+    expect(attachment.metadata.transcribe_origin).toBe("auto");
+  });
+
+  // The counter-case: turning auto-transcribe OFF must stay silent. The
+  // operator asked for nothing to happen, so nothing happening is correct and
+  // must not be dressed up as a failure.
+  test("audio + auto-transcribe explicitly OFF → no transcribe metadata at all", async () => {
+    const vaultName = freshVault("tickets-transcribe-off");
+    const store = getVaultStore(vaultName);
+    writeVaultConfig({
+      name: vaultName,
+      api_keys: [],
+      created_at: new Date().toISOString(),
+      auto_transcribe: { enabled: false },
+    } as never);
+    const note = await store.createNote("# Voice memo\n", { path: "memo-off" });
+
+    const mint = await callTool(vaultName, "request-attachment-upload", {
+      note: note.id,
+      filename: "memo.webm",
+      size_bytes: 4,
+    });
+    const res = await routeReq(
+      new Request(mint.url, {
+        method: "PUT",
+        headers: { "content-type": "audio/webm" },
+        body: new Uint8Array([1, 2, 3, 4]),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const attachment = (await res.json()) as any;
+    expect(attachment.metadata.transcribe_status).toBeUndefined();
+    expect(attachment.metadata.transcribe_error).toBeUndefined();
+  });
+
   test("segment_index (voice W2): a valid integer >= 0 rides ticket mint through to the attachment row", async () => {
     const vaultName = freshVault("tickets-segment");
     const store = getVaultStore(vaultName);

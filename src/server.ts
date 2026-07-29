@@ -279,7 +279,20 @@ if (providerName === "whisper-cpp") {
     wireTranscriptionWorker(transcriptionWorker);
     console.log(`[transcribe] worker started → ${scribeUrl}`);
   } else {
-    console.log("[transcribe] worker disabled (no scribe in services.json and SCRIBE_URL unset)");
+    // vault#643: was a console.log reading "worker disabled", which states a
+    // fact about the worker and says nothing about the CONSEQUENCE. On a fresh
+    // box the provider resolves to `scribe-http` by default and nothing sets
+    // SCRIBE_URL, so this is the DEFAULT state — and audio silently never
+    // transcribes. Name the consequence, and warn rather than log, because the
+    // box is misconfigured for a feature that is on by default.
+    console.warn(
+      "[transcribe] NO transcription provider is reachable — audio attachments " +
+        "will be accepted but never transcribed. " +
+        `Provider resolved to "${providerName}". Fix with either: ` +
+        "`parachute-vault transcription install` + TRANSCRIPTION_PROVIDER=<local provider>, " +
+        "or point SCRIBE_URL at a transcription service. " +
+        "Set `auto_transcribe.enabled: false` to silence this if you don't want transcription.",
+    );
   }
 }
 

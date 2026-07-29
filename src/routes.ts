@@ -145,7 +145,12 @@ import {
 import { join, extname, normalize } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { assetsDir, readGlobalConfig, readVaultConfig } from "./config.ts";
-import { shouldAutoTranscribe } from "./auto-transcribe.ts";
+import {
+  NO_PROVIDER_ERROR,
+  classifyAutoTranscribe,
+  shouldAutoTranscribe,
+  warnNoTranscriptionProvider,
+} from "./auto-transcribe.ts";
 // usage.ts imports `assetsDir` from config.ts (neutral ground), so this import
 // of invalidateUsageCache does NOT form a cycle — routes.ts → usage.ts only.
 import { invalidateUsageCache } from "./usage.ts";
@@ -2369,7 +2374,18 @@ async function handleNotesInner(
       const perVaultEnabled = vault
         ? readVaultConfig(vault)?.auto_transcribe?.enabled
         : undefined;
-      const autoOptIn = !explicitOptIn && shouldAutoTranscribe(body.mimeType, { perVaultEnabled });
+      // vault#643: classify rather than collapse to a boolean. "Operator
+      // turned it off" and "nothing is configured to do it" both used to read
+      // as `false`, so a misconfigured box silently accepted audio and
+      // transcribed nothing — no marker, no status, no log.
+      const autoDecision = explicitOptIn
+        ? ({ kind: "transcribe" } as const)
+        : classifyAutoTranscribe(body.mimeType, { perVaultEnabled });
+      const autoOptIn = !explicitOptIn && autoDecision.kind === "transcribe";
+      // Enabled, audio, but no reachable provider. Record it on the attachment
+      // so the state is visible in the API and the admin SPA instead of the
+      // upload looking like an ordinary file.
+      const transcribeUnavailable = !explicitOptIn && autoDecision.kind === "unavailable";
       // Per-segment slots (voice W2, cloud twin: workers/vault/src/rest/notes.ts
       // ~791-800): an optional `segment_index` (integer >= 0) lets one recording
       // split across several attachments on ONE note, each resolving into its
@@ -2385,7 +2401,16 @@ async function handleNotesInner(
             transcribe_origin: (explicitOptIn ? "legacy" : "auto") as "legacy" | "auto",
             ...(validSegment ? { segment_index: segIdx } : {}),
           }
-        : undefined;
+        : transcribeUnavailable
+          ? {
+              transcribe_status: "failed" as const,
+              transcribe_error: NO_PROVIDER_ERROR,
+              transcribe_requested_at: new Date().toISOString(),
+              transcribe_origin: "auto" as const,
+              ...(validSegment ? { segment_index: segIdx } : {}),
+            }
+          : undefined;
+      if (transcribeUnavailable) warnNoTranscriptionProvider();
 
       const attachment = await store.addAttachment(note.id, body.path, body.mimeType, attMeta);
 
