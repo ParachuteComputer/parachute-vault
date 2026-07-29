@@ -118,6 +118,10 @@ import {
   handleMirrorRunNow,
 } from "./mirror-routes.ts";
 import { handleEmbeddingsGet, handleEmbeddingsPut } from "./embeddings-routes.ts";
+import {
+  handleTranscriptionGet,
+  handleTranscriptionPut,
+} from "./transcription-routes.ts";
 import { getMirrorManager } from "./mirror-registry.ts";
 import { buildUsageReport } from "./usage.ts";
 import { handleTicketSpend } from "./attachment-tickets.ts";
@@ -713,6 +717,38 @@ export async function route(
     }
     if (req.method === "GET") return handleEmbeddingsGet();
     if (req.method === "PUT") return handleEmbeddingsPut(req);
+    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+
+  // /.parachute/transcription — Admin-gated read+write of the transcription
+  // setup. Mirrors the embeddings toggle's shape (persist a preference, report
+  // `restart_required`) but answers a harder question: transcription can be
+  // "configured" and still not work, because it needs a binary and a model on
+  // disk that no config file can promise are there.
+  //
+  // So GET reports readiness with the missing PIECE named, the paths searched,
+  // and the exact command that fixes it. That's the gap this closes: a box
+  // could accept audio for weeks and transcribe nothing, with the only evidence
+  // a boot log line the operator scrolled past (vault#643).
+  //
+  // PUT persists provider/model only — installing downloads hundreds of MB and
+  // shells brew/tar, which belongs in the CLI with a progress bar, not in a
+  // request a browser tab can abandon. See transcription-routes.ts.
+  if (subpath === "/.parachute/transcription") {
+    if (!hasScopeForVault(auth.scopes, vaultName, "admin")) {
+      return Response.json(
+        {
+          error: "Forbidden",
+          error_type: "insufficient_scope",
+          message: `This endpoint requires the '${SCOPE_ADMIN}' scope (or '${SCOPE_ADMIN.replace("vault:", `vault:${vaultName}:`)}').`,
+          required_scope: SCOPE_ADMIN,
+          granted_scopes: auth.scopes,
+        },
+        { status: 403 },
+      );
+    }
+    if (req.method === "GET") return handleTranscriptionGet();
+    if (req.method === "PUT") return handleTranscriptionPut(req);
     return Response.json({ error: "Method not allowed" }, { status: 405 });
   }
 

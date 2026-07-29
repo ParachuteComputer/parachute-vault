@@ -40,6 +40,7 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
   const mirrorHref = isPerVaultMount ? "/mirror" : `/vault/${encodeURIComponent(name ?? "")}/mirror`;
   const schemaHref = isPerVaultMount ? "/schema" : `/vault/${encodeURIComponent(name ?? "")}/schema`;
   const embeddingsHref = isPerVaultMount ? "/embeddings" : `/vault/${encodeURIComponent(name ?? "")}/embeddings`;
+  const transcriptionHref = isPerVaultMount ? "/transcription" : `/vault/${encodeURIComponent(name ?? "")}/transcription`;
   const [state, setState] = useState<State>({ kind: "loading" });
   const [reloadTick, setReloadTick] = useState(0);
   const onRecovered = useCallback(() => setReloadTick((n) => n + 1), []);
@@ -220,6 +221,9 @@ export function VaultDetail({ vaultName }: { vaultName?: string } = {}) {
           </li>
           <li>
             <Link to={embeddingsHref}>Semantic search →</Link>
+          </li>
+          <li>
+            <Link to={transcriptionHref}>Transcription →</Link>
             <span className="dim"> turn embeddings on or off — rank notes by meaning, not just keywords</span>
           </li>
           <PermissionsLink vaultName={vault.name} />

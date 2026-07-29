@@ -3,6 +3,7 @@ import { getMountedVaultName, isMultiVaultMount } from "./lib/mount.ts";
 import { MultiVaultHome } from "./routes/MultiVaultHome.tsx";
 import { VaultDetail } from "./routes/VaultDetail.tsx";
 import { VaultEmbeddings } from "./routes/VaultEmbeddings.tsx";
+import { VaultTranscription } from "./routes/VaultTranscription.tsx";
 import { VaultMirror } from "./routes/VaultMirror.tsx";
 import { VaultSchema } from "./routes/VaultSchema.tsx";
 import { VaultTokens } from "./routes/VaultTokens.tsx";
@@ -64,6 +65,7 @@ export function App() {
           <Route path="/mirror" element={<VaultMirror vaultName={mountedVault} />} />
           <Route path="/schema" element={<VaultSchema vaultName={mountedVault} />} />
           <Route path="/embeddings" element={<VaultEmbeddings vaultName={mountedVault} />} />
+          <Route path="/transcription" element={<VaultTranscription vaultName={mountedVault} />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       ) : (
@@ -74,6 +76,7 @@ export function App() {
           <Route path="/vault/:name/mirror" element={<VaultMirror />} />
           <Route path="/vault/:name/schema" element={<VaultSchema />} />
           <Route path="/vault/:name/embeddings" element={<VaultEmbeddings />} />
+          <Route path="/vault/:name/transcription" element={<VaultTranscription />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       )}
