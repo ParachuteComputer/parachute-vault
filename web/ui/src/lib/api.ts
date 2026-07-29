@@ -790,6 +790,83 @@ export async function getMirrorImportJob(
   return (await res.json()) as MirrorImportJob;
 }
 
+
+// ---------------------------------------------------------------------------
+// Transcription — `/vault/<name>/.parachute/transcription`
+//
+// The setup surface. Unlike the embeddings toggle, transcription can be
+// "configured" and still not work: it needs a binary and a model on disk that
+// no config file can promise are there. So the snapshot carries the missing
+// PIECE, the paths searched, and the command that fixes it — see
+// `src/transcription-routes.ts`.
+// ---------------------------------------------------------------------------
+
+export interface TranscriptionModelOption {
+  id: string;
+  label: string;
+  engine: "parakeet" | "whisper";
+  size_mb: number;
+  min_ram_mb: number;
+  note: string;
+  /** Whether this model's file is already downloaded. */
+  installed: boolean;
+}
+
+export interface TranscriptionSettings {
+  provider: string;
+  available_providers: string[];
+  model_id: string;
+  model: TranscriptionModelOption | null;
+  available_models: TranscriptionModelOption[];
+  /** The CLI this model needs, plus the dirs probed — so "not found" is debuggable. */
+  binary: { name: string; path: string | null; searched: string[] };
+  ffmpeg: { path: string | null };
+  /** Everything needed is present. Distinct from `active`. */
+  ready: boolean;
+  /** A worker is live in the running process right now. */
+  active: boolean;
+  /** `ready !== active` — a persisted preference the worker hasn't picked up. */
+  restart_required: boolean;
+  /** Why `ready` is false; null when ready. */
+  reason: string | null;
+  /** The exact command that fixes it; null when ready. */
+  fix_command: string | null;
+}
+
+/** Read the transcription setup snapshot. */
+export async function getTranscriptionSettings(
+  vaultName: string,
+): Promise<TranscriptionSettings> {
+  const res = await authedFetch(
+    vaultName,
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/transcription`,
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as TranscriptionSettings;
+}
+
+/**
+ * Persist a provider and/or model preference. Does NOT install anything —
+ * downloads and package managers stay in the CLI. Returns the fresh snapshot,
+ * which will report `restart_required`.
+ */
+export async function putTranscriptionSettings(
+  vaultName: string,
+  body: { provider?: string; model_id?: string },
+): Promise<TranscriptionSettings> {
+  const res = await authedFetch(
+    vaultName,
+    `/vault/${encodeURIComponent(vaultName)}/.parachute/transcription`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as TranscriptionSettings;
+}
+
 // ---------------------------------------------------------------------------
 // Embeddings — `/vault/<name>/.parachute/embeddings`
 //
