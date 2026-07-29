@@ -1655,7 +1655,7 @@ export async function applyCredentialsToMirror(
 //     "credentials": null
 //       | { "kind": "pat", "token": "ghp_..." }
 //       | { "kind": "none" },
-//     "enable_sync": true   // optional, DEFAULT TRUE
+//     "enable_sync": false  // optional, DEFAULT FALSE (vault#641)
 //   }
 //
 // `credentials: null` means "use the stored mirror credentials." Passing
@@ -1663,11 +1663,18 @@ export async function applyCredentialsToMirror(
 // for the CLONE, but IS persisted when sync is enabled (it's the push
 // credential for the now-configured mirror).
 //
-// `enable_sync` (vault#416) — DEFAULT TRUE when omitted. After a successful
-// import, auto-enable mirror push-back to the SAME repo, reusing the import's
-// credentials. Makes "import a repo" and "back up to that repo going forward"
-// one fluid flow. The UI ships a checked-by-default checkbox the operator can
-// uncheck. Edge cases (handled in `enableSyncToImportedRepo`, never fail the
+// `enable_sync` — DEFAULT **FALSE** when omitted (vault#641). When explicitly
+// enabled, a successful import also configures mirror push-back to the SAME
+// repo, reusing the import's credentials — "import a repo" and "back up to that
+// repo going forward" in one flow. The UI's checkbox is **unchecked** by default
+// to match.
+//
+// This shipped default-ON in vault#416 and was inverted in vault#641: import is
+// a READ, and defaulting to ON silently made the repo you were reading from into
+// this vault's push target. The full rationale lives at the handler below; keep
+// these two in agreement.
+//
+// Edge cases (handled in `enableSyncToImportedRepo`, never fail the
 // whole import):
 //   - `auth: none` (public repo, no push creds) → skip + warn (can't push
 //     without a credential).

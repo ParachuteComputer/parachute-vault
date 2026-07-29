@@ -4,6 +4,50 @@ All notable changes to Parachute Vault are documented here.
 
 This project loosely follows [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
 
+## [0.7.5] - 2026-07-29
+
+**Stable promotion of the 0.7.5 line (7 commits over 0.7.4).** Promotes rc.1-rc.7
+plus #638 to `@latest`. This is the release that makes self-hosted git import and
+local transcription actually work. Every item below was found on a real box rather
+than in a test, which is why they were all invisible until someone tried to use
+them.
+
+- **Git import no longer times out on a large vault (#632).** The clone ran under a
+  60-second wall-clock cap, so importing any vault big enough to care about failed
+  with a timeout and nothing to resume from. Import is now an async job: `POST`
+  returns `202` with a job to poll, and the limit is a **stall** timer (10 minutes
+  with no git progress output) instead of a total-duration cap -- so a multi-gigabyte
+  clone finishes while a genuinely hung one still fails. Passing `wait: true` keeps
+  the old synchronous shape.
+- **Importing no longer arms backup at the same time (#632).** `enable_sync` shipped
+  default-ON in 0.7.2, which meant importing a repo silently made that repo this
+  vault's push target -- pointing write traffic at the source you were reading from.
+  Import is a read; the default is now OFF and push-back is an explicit opt-in.
+- **A local transcription provider that actually runs (#635, #636).** whisper.cpp
+  with Parakeet TDT and Whisper models, a catalog spanning 74 MB to 1.5 GB, a
+  default chosen from available RAM, and `transcription install` that installs the
+  binary, fetches the model, and then **verifies a real transcription** before
+  reporting success. The previous provider named a `transcribe-cli` binary that was
+  never shipped, so it could not have worked on any box.
+- **Audio that can't be transcribed now says so (#634).** A fresh install accepted
+  voice memos and silently never transcribed them -- no marker, no status, no error,
+  the attachment indistinguishable from a plain file. See rc.7 below.
+- **The admin SPA stops telling signed-in operators they're signed out (#633).** A
+  box that couldn't reach its revocation list rejected every valid token, and the
+  SPA rendered that as "You're not signed in" -- advice that could never work. See
+  rc.6 below.
+- **A transcription setup page (#638).** Reports whether transcription is working
+  *right now*, names the specific missing piece, shows which directories a missing
+  binary was searched for (the macOS launchd-PATH trap, where the binary is
+  installed but invisible to the supervised process), and hands over the exact fix
+  command. Distinguishes "installed" from "running", since conflating those is how
+  a box reports success while transcribing nothing.
+
+Also: publish-on-merge CI (#637), so a merged version bump ships itself rather than
+waiting on a remembered tag push.
+
+No schema migration -- `SCHEMA_VERSION` stays at 27, unchanged since 0.7.3.
+
 ## [0.7.5-rc.7] - 2026-07-29
 
 **Audio that can't be transcribed now says so (#643).**
