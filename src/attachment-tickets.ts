@@ -22,7 +22,11 @@ import type { Store } from "../core/src/types.ts";
 import type { AttachmentTicket, AttachmentTicketProvider } from "../core/src/attachment/tickets.ts";
 import { sanitizeAttachmentExtension } from "../core/src/attachment/policy.ts";
 import { assetsDir, readVaultConfig } from "./config.ts";
-import { shouldAutoTranscribe } from "./auto-transcribe.ts";
+import {
+  NO_PROVIDER_ERROR,
+  classifyAutoTranscribe,
+  warnNoTranscriptionProvider,
+} from "./auto-transcribe.ts";
 import { invalidateUsageCache } from "./usage.ts";
 
 function json(data: unknown, status = 200): Response {
@@ -265,7 +269,13 @@ async function handleUploadSpend(
   // auto-transcribe toggle.
   const explicitOptIn = ticket.transcribe === true;
   const perVaultEnabled = readVaultConfig(vaultName)?.auto_transcribe?.enabled;
-  const autoOptIn = !explicitOptIn && shouldAutoTranscribe(ticket.mimeType, { perVaultEnabled });
+  const autoDecision = explicitOptIn
+    ? ({ kind: "transcribe" } as const)
+    : classifyAutoTranscribe(ticket.mimeType, { perVaultEnabled });
+  const autoOptIn = !explicitOptIn && autoDecision.kind === "transcribe";
+  // vault#643 — same honesty as the REST path: enabled-but-unconfigured is a
+  // misconfiguration, not a silent no-op.
+  const transcribeUnavailable = !explicitOptIn && autoDecision.kind === "unavailable";
   const attMeta: Record<string, unknown> = {
     original_name: ticket.filename,
     size: buffer.length,
@@ -280,6 +290,15 @@ async function handleUploadSpend(
     if (ticket.segmentIndex !== undefined) {
       attMeta.segment_index = ticket.segmentIndex;
     }
+  } else if (transcribeUnavailable) {
+    attMeta.transcribe_status = "failed";
+    attMeta.transcribe_error = NO_PROVIDER_ERROR;
+    attMeta.transcribe_requested_at = new Date().toISOString();
+    attMeta.transcribe_origin = "auto";
+    if (ticket.segmentIndex !== undefined) {
+      attMeta.segment_index = ticket.segmentIndex;
+    }
+    warnNoTranscriptionProvider();
   }
 
   const attachment = await store.addAttachment(ticket.noteId, relativePath, ticket.mimeType, attMeta);
